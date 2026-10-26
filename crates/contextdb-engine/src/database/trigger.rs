@@ -5215,9 +5215,16 @@ impl TriggerState {
     }
 }
 
-#[allow(dead_code)]
 struct RetiredOriginalTriggerState {
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     declarations: BTreeMap<String, TriggerDeclaration>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     callbacks: HashMap<String, TriggerCallback>,
     _callback_original: Option<OwnedMemoryReservation>,
     _original: Option<OwnedMemoryReservation>,

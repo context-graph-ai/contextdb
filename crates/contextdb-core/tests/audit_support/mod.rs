@@ -2,7 +2,6 @@
 //! (timestamp, atomic-wrapper, bincode-path, test-estate, docs). One definition of
 //! "where is the workspace root" and of "which bytes are Rust code" instead of a
 //! copy per audit.
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 
@@ -16,6 +15,10 @@ pub fn workspace_root() -> PathBuf {
 /// The source with every comment, string literal and character literal
 /// replaced by spaces (newlines kept), so a scan sees only Rust code at the
 /// original byte offsets and line numbers.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by docs_audit, test_estate_audit"
+)]
 pub fn rust_scope_text(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut masked = bytes.to_vec();

@@ -304,6 +304,13 @@ impl MirrorCharge {
     pub(crate) fn new(writer: crate::memory_accounting::AccountantHandle) -> Self {
         Self { writer, bytes: 0 }
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -612,6 +619,13 @@ pub(crate) fn probe_for_test(
     durable::probe_for_test(memory, key, bytes)
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from custody_store.rs"
+    )
+)]
 pub(crate) fn decode_refusals_for_test(
     key: &str,
     bytes: &[u8],

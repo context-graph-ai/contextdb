@@ -445,11 +445,9 @@ impl PageAllocation {
             .owners
             .load(Ordering::Acquire)
     }
-    #[allow(dead_code)]
     pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
         left.block == right.block
     }
-    #[allow(dead_code)]
     pub(crate) fn as_ptr(this: &Self) -> *const () {
         this.block.as_ptr().cast()
     }

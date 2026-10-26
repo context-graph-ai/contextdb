@@ -12,7 +12,6 @@
 //! (distinct timeout budget + message per suite) and each suite's `WorkExecutor`
 //! double (`DemoExecutor` diverges between suites; `ReceivedBytesExecutor` is a
 //! distinct variant).
-#![allow(dead_code)]
 
 use contextdb_engine::Database;
 use contextdb_engine::work_ledger::install_work_ledger_schema;
@@ -53,10 +52,18 @@ pub fn start_hub(
     (hub_db, shutdown, task)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by work_ledger_tests, worker_defers_own_submission_tests"
+)]
 pub fn edge(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient) {
     edge_with_identity(broker, tenant, Arc::new(FabricIdentity::generate()))
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by work_ledger_tests, worker_defers_own_submission_tests"
+)]
 pub fn edge_with_identity(
     broker: &InProcessBroker,
     tenant: &str,
@@ -75,6 +82,10 @@ pub fn edge_with_identity(
     (db, client)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by work_ledger_tests, worker_defers_own_submission_tests"
+)]
 pub fn tags(list: &[&str]) -> Vec<String> {
     list.iter().map(|t| t.to_string()).collect()
 }

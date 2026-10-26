@@ -1144,7 +1144,6 @@ impl SyncServer {
         // `record_contact`; push records after the admission decision so a
         // database write cannot strand a retry outside its leader's fanout.
         // An unauthenticated request records nothing.
-        #[allow(unused_mut)]
         let mut handlers = vec![
             HandlerRegistration {
                 subject: crate::subjects::binding_subject(self.tenant_id.as_str()),
@@ -1403,11 +1402,13 @@ fn refused_outcomes_for_request(
 /// payload, so a refusal can answer in the sender's version.
 fn push_request_version(bytes: &[u8]) -> u8 {
     #[derive(serde::Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `EnvelopeHead` format"
+    )]
     struct EnvelopeHead {
         version: u8,
-        #[allow(dead_code)]
         message_type: serde::de::IgnoredAny,
-        #[allow(dead_code)]
         payload: serde::de::IgnoredAny,
     }
     rmp_serde::from_slice::<EnvelopeHead>(bytes)

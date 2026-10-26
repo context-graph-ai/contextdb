@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 use super::maintained_search;
 use contextdb_core::Value;
 use contextdb_engine::database::VectorSearchTraceObservation;
@@ -20,8 +19,41 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 const PARTITIONS: usize = 8;
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 const ROWS_PER_PARTITION: usize = 1_250;
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 const LIVE_ROWS_PER_PARTITION: usize = ROWS_PER_PARTITION / 2;
 
 struct Counter(AtomicU64);
@@ -46,6 +78,17 @@ struct ScoredQuery {
 }
 
 impl ScoredQuery {
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn total_scores(&self) -> u64 {
         self.graph_scores.saturating_add(self.native_scores)
     }
@@ -127,14 +170,47 @@ fn native_score_observer_counts_each_exact_comparison_once() {
     );
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn context_id(partition: usize) -> Uuid {
     Uuid::from_u128(0xC046_0000_0000_0000_0000_0000_0000_0000 + partition as u128)
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn generation_id(partition: usize) -> Uuid {
     Uuid::from_u128(0xC046_1000_0000_0000_0000_0000_0000_0000 + partition as u128)
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn bind_uuid_values(
     params: &mut HashMap<String, Value>,
     column: &str,
@@ -156,6 +232,17 @@ fn bind_uuid_values(
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn scoped_statement(partitions: usize, mode: &str) -> (String, HashMap<String, Value>) {
     let mut params = HashMap::from([("is_current".into(), Value::Bool(true))]);
     let contexts = bind_uuid_values(
@@ -183,6 +270,17 @@ fn scoped_statement(partitions: usize, mode: &str) -> (String, HashMap<String, V
     )
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn set_probe(params: &mut HashMap<String, Value>, probe: usize) {
     params.insert(
         "query".into(),
@@ -190,6 +288,17 @@ fn set_probe(params: &mut HashMap<String, Value>, probe: usize) {
     );
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn overlap_at_ten(indexed: &QueryResult, exact: &QueryResult) -> u64 {
     u64::try_from(
         indexed
@@ -201,6 +310,17 @@ fn overlap_at_ten(indexed: &QueryResult, exact: &QueryResult) -> u64 {
     .unwrap()
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn assert_only_current_rows(result: &QueryResult) {
     for row in result.rows() {
         let [Value::Int64(id)] = row.as_slice() else {
@@ -214,6 +334,17 @@ fn assert_only_current_rows(result: &QueryResult) {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn fixture() -> Database {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -265,6 +396,17 @@ fn fixture() -> Database {
     panic!("maintenance did not publish all eight frozen pair partitions")
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn single_context_fixture() -> Database {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -311,6 +453,17 @@ fn single_context_fixture() -> Database {
     panic!("maintenance did not publish the frozen single-context pair partition")
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn assert_scoped_trace(result: &QueryResult, partitions: usize) -> bool {
     let disclosure = result
         .trace()
@@ -346,6 +499,17 @@ fn assert_scoped_trace(result: &QueryResult, partitions: usize) -> bool {
         .any(|partition| ROWS_PER_PARTITION > partition.hnsw_ef_search)
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn assert_recall(cell: &str, matched: u64) {
     let possible = u64::try_from(maintained_search::HELD_OUT_ROWS * 10).unwrap();
     assert!(

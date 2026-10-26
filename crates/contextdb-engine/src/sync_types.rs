@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! Sync contract types for contextDB change-tracking and replication.
 //!
 //! These types define the public API for sync operations and the durable wire
@@ -1687,8 +1686,11 @@ mod trigger_ddl_binary_compatibility_tests {
     use super::DdlChange;
     use serde::Serialize;
 
-    #[allow(dead_code)]
     #[derive(Serialize)]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `LegacyDdlChange` format"
+    )]
     enum LegacyDdlChange {
         CreateTable,
         DropTable,

@@ -2563,8 +2563,8 @@ impl Database {
     }
 
     sync_test_seam! {
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from schema_stage_registry.rs"))]
     fn open_memory_with_plugin_and_accountant(
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
@@ -3974,8 +3974,8 @@ impl Database {
     sync_test_seam! {
     /// Full constructor with an internal accountant. Test-only outside this
     /// crate; production callers use the numeric startup-limit functions.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from declared_memory_limit_bounds_a_writer.rs"))]
     fn open_with_config(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -3986,8 +3986,8 @@ impl Database {
     }
 
     sync_test_seam! {
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from durable_public_api_surface_tests.rs"))]
     fn open_with_config_and_disk_limit(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -4053,10 +4053,16 @@ impl Database {
 
     /// Sample at a quiescent boundary. Identity scratch belongs to this
     /// reporting operation's declared reader child and never to its writer.
-    #[allow(dead_code)] // Ordinary core, available to memory ownership measurement callers.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from content_size_contract_tests.rs"
+        )
     )]
     pub(crate) fn vector_memory_ownership_receipt(&self) -> Result<VectorMemoryOwnershipReceipt> {
         let sampled = self

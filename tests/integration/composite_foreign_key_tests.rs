@@ -1771,7 +1771,11 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
     // short record, not a declaration without keys: both codecs refuse it, so
     // no reader can turn a missing field into "this table has no foreign key".
     #[derive(serde::Serialize)]
-    #[allow(dead_code, clippy::enum_variant_names)]
+    #[allow(clippy::enum_variant_names)]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `ShortDdlChange` format"
+    )]
     enum ShortDdlChange {
         CreateTable {
             name: String,

@@ -405,12 +405,26 @@ thread_local! {
 /// written, before the request's last check -- so a proof can cancel a
 /// request while its answer is being encoded. Dropping the guard removes it.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+    )
+)]
 pub fn while_encoding_answers_for_test(hook: impl Fn() + 'static) -> AnswerEncodingHookGuard {
     ANSWER_ENCODING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     AnswerEncodingHookGuard(())
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader.rs"
+    )
+)]
 pub struct AnswerEncodingHookGuard(());
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -728,6 +742,13 @@ fn direct_change_state(
 /// because it is the same question: what event types, sinks, routes and
 /// schedules does this store declare.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
+    )
+)]
 pub(crate) fn project_events(database: &Database) -> DirectEventsStatus {
     let bus = database.event_bus_status();
     DirectEventsStatus {
@@ -1285,18 +1306,39 @@ fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, &str, &str) {
 
 /// Length-prefixed absorption, so two different shapes cannot hash alike.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct FamilyDigest {
     hasher: blake3::Hasher,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
 impl FamilyDigest {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn new(_accountant: &Arc<MemoryAccountant>) -> Self {
         Self {
             hasher: blake3::Hasher::new(),
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_hashed_bytes(bytes.len());
@@ -1305,25 +1347,60 @@ impl FamilyDigest {
         self
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn text(&mut self, text: &str) -> &mut Self {
         self.bytes(text.as_bytes())
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn number(&mut self, value: u64) -> &mut Self {
         self.hasher.update(&value.to_le_bytes());
         self
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn flag(&mut self, value: bool) -> &mut Self {
         self.number(u64::from(value))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn finish(&self) -> [u8; 32] {
         *self.hasher.finalize().as_bytes()
     }
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
 fn typed_digest(
     image: &DirectOwnedImage,
     accountant: &Arc<MemoryAccountant>,
@@ -1502,6 +1579,13 @@ fn typed_digest(
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_only_open_loads_only_the_working_set.rs"
+    )
+)]
 pub(crate) fn typed_digest_for_test(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
     typed_digest(image, &Arc::new(MemoryAccountant::no_limit()))
 }

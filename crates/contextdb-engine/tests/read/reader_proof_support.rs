@@ -10,13 +10,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub const ROWS: usize = 10_000;
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub const CONTEXTS: usize = 8;
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub const DIM: usize = 768;
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub const TEXT: usize = 512;
 pub const SESSION_BYTES: usize = 24 * 1024 * 1024;
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub const ROWS_PER_CONTEXT: usize = ROWS / CONTEXTS;
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn runtime(root: &Path) -> PathBuf {
     let dir = root.join("reader-runtime");
     std::fs::create_dir_all(&dir).unwrap();
@@ -38,6 +44,7 @@ pub fn limits() -> ReadLimits {
     }
 }
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn options() -> ReadSessionOptions {
     ReadSessionOptions {
         memory_limit: Some(SESSION_BYTES),
@@ -46,15 +53,19 @@ pub fn options() -> ReadSessionOptions {
     }
 }
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn row_id(row: usize) -> uuid::Uuid {
     uuid::Uuid::from_u128(0x4a11_0000_0000_0000_0000_0000_0000_0000 + row as u128)
 }
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn context_id(context: usize) -> uuid::Uuid {
     uuid::Uuid::from_u128(0xc017_0000_0000_0000_0000_0000_0000_0000 + context as u128)
 }
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn ordinal(id: uuid::Uuid) -> usize {
     usize::try_from(id.as_u128().checked_sub(row_id(0).as_u128()).unwrap()).unwrap()
 }
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn all_context_params() -> HashMap<String, Value> {
     let mut params = HashMap::from([("q".into(), Value::Vector(vector(0)))]);
     for context in 0..CONTEXTS {
@@ -63,9 +74,11 @@ pub fn all_context_params() -> HashMap<String, Value> {
     params
 }
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn payload(row: usize) -> String {
     format!("{row:08x}").repeat(TEXT / 8)
 }
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn vector(row: usize) -> Vec<f32> {
     // Fixed finite unit vectors with nontrivial neighbours; no runtime threshold override.
     let mut state = row as u64 + 0x9e37_79b9;
@@ -84,6 +97,7 @@ pub fn vector(row: usize) -> Vec<f32> {
     v
 }
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn seed_working_set(path: &Path) {
     assert!(
         ROWS * (DIM * 4 + TEXT) > SESSION_BYTES,
@@ -121,6 +135,7 @@ pub fn seed_working_set(path: &Path) {
     db.close().unwrap();
 }
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn finish_maintenance(db: &Database, partitions: usize) {
     for _ in 0..64 {
         db.run_maintenance_cycle()
@@ -134,6 +149,10 @@ pub fn finish_maintenance(db: &Database, partitions: usize) {
 }
 
 #[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read, read_cache_share_option"
+)]
 pub struct Routes(pub Mutex<Vec<ReadSessionEvent>>);
 impl ReadSessionTestObserver for Routes {
     fn observe_event(&self, e: ReadSessionEvent) {
@@ -141,6 +160,10 @@ impl ReadSessionTestObserver for Routes {
     }
 }
 impl Routes {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read, read_cache_share_option"
+    )]
     pub fn file_only(&self) {
         let events = self.0.lock().unwrap();
         assert_eq!(
@@ -169,6 +192,10 @@ impl Routes {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by read, read_cache_share_option"
+)]
 pub fn open_file(path: &Path, opts: ReadSessionOptions, routes: Arc<Routes>) -> ReadSession {
     let clock: Arc<dyn DeadlineClock> = Arc::new(ManualDeadlineClock::default());
     let s = ReadSession::open_with_observations_for_test(path, opts, clock, Some(routes), None)
@@ -180,6 +207,7 @@ pub fn open_file(path: &Path, opts: ReadSessionOptions, routes: Arc<Routes>) -> 
 /// Open proves its history frontiers and checks the copied startup settings
 /// against the ordered digest in the canonical Configuration root. These two
 /// fixtures have distinct history depths, so pin their complete work signatures.
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn assert_open_proves_history_and_startup_digest(
     open: contextdb_engine::direct_file_reader::test_seams::ReadWorkCounters,
     expected_ordered_nodes: u64,

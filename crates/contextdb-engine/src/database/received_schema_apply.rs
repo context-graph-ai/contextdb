@@ -2740,7 +2740,6 @@ impl Database {
     /// wire `ChangeSet` contributes authenticated intent only; it never
     /// directly assigns a receiver row id, MVCC identity, vector owner, or
     /// delete/terminal outcome in the prepared image.
-    #[allow(dead_code)]
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -6025,7 +6024,6 @@ impl Database {
     /// parsing, persistence, or fallible operation: the complete
     /// table projections and event/trigger definitions were prepared before
     /// the matching Redb transaction started.
-    #[allow(dead_code)]
     #[cfg(test)]
     pub(super) fn publish_received_schema_stage(&self, mut stage: ReceivedSchemaStage) {
         self.publish_received_schema_stage_retaining(&mut stage);

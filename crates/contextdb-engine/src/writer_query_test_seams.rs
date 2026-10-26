@@ -179,6 +179,13 @@ pub enum PhysicalFamily {
     Graph,
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from redb_vector_partitions.rs"
+    )
+)]
 pub(crate) fn note_physical_source(family: PhysicalFamily, read: &redb::ReadTransaction) {
     #[cfg(not(any(test, feature = "test-seams")))]
     let _ = (family, read);
@@ -195,6 +202,13 @@ pub(crate) fn note_physical_source(family: PhysicalFamily, read: &redb::ReadTran
     });
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from writer_history.rs"
+    )
+)]
 pub(crate) fn note_ddl_occurrence() {
     #[cfg(any(test, feature = "test-seams"))]
     WORK.with(|slot| {
@@ -267,6 +281,13 @@ pub fn observe_target<T>(table: &str, operation: impl FnOnce() -> T) -> (T, Writ
     let _restore = Restore(TARGET.with(|slot| slot.replace(Some(target_id(table)))));
     observe(operation)
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from constraint_validation.rs"
+    )
+)]
 pub(crate) fn note_target_entry(table: &str) {
     #[cfg(not(any(test, feature = "test-seams")))]
     let _ = table;
@@ -280,12 +301,26 @@ pub(crate) fn note_target_entry(table: &str) {
         });
     }
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from redb_vector_partitions.rs"
+    )
+)]
 pub(crate) fn physical_operation(
     family: PhysicalFamily,
     table: &str,
 ) -> redb::BackendReadObservation {
     physical_operation_selected(family, table, true)
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 fn physical_operation_selected(
     family: PhysicalFamily,
     table: &str,
@@ -378,6 +413,13 @@ pub fn observe_target_key<T>(
     let _restore = Restore(TARGET_KEY.with(|slot| slot.replace(Some(key))));
     observe_target(table, operation)
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_read_source.rs"
+    )
+)]
 pub(crate) fn posting_operation(
     table: &str,
     cursor: &contextdb_relational::mem::BoundedOrderedRowCursor,
@@ -392,6 +434,13 @@ pub(crate) fn posting_operation(
 }
 
 /// Match an exact durable tuple at the source cursor before its physical read.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from writer_source.rs"
+    )
+)]
 pub(crate) fn source_posting_operation(
     table: &str,
     matches: impl FnOnce(&contextdb_core::IndexKey) -> bool,

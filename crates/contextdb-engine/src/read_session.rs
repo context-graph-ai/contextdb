@@ -311,8 +311,14 @@ mod route_observation {
 
     // This vocabulary is exposed only to `test-seams` integration proofs.
     /// The bounded operations whose cancellation identity is observable.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_application_contract.rs"
+        )
+    )]
     pub enum ReadSessionOperation {
         Execute,
         Metadata,
@@ -343,14 +349,19 @@ mod route_observation {
 
     /// Deliberate owner-handshake mismatch used to prove that authentication
     /// failures remain terminal to one route-selection invocation.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum OwnerHandshakeMismatchForTest {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         DatabaseIdentity,
     }
 
     /// Route-assembly events needed by cross-process and no-fallback proofs.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadSessionEvent {
         OwnerResolution {
@@ -381,6 +392,13 @@ mod route_observation {
             retry_attempt: u64,
         },
         RouteSelected(ReadRoute),
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         OpenRegistryAcquired,
         /// Emitted inside a writable open at the moment this writer takes
         /// the companion's FIRST exclusive claim on the store, before it
@@ -390,32 +408,101 @@ mod route_observation {
         /// caller in another process -- the window in which an owner-only
         /// ask must not be told the store is free.
         CompanionClaimTaken,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         PersistenceOpened,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         BlobRepositoryOpened,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         PluginOpened,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         BackgroundWorkerStarted,
         LocalChannelOperation,
         DirectBackendOpen,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from database_open_options_contract.rs"
+            )
+        )]
         OwnerServiceStarted,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+            )
+        )]
         ResponseFrameReceived {
             terminal: bool,
         },
         /// The cursor has registered its provisional hold before asking the
         /// owner for its first page.
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from writer_file_ownership_survives_recycle.rs"
+            )
+        )]
         OwnerCursorHandoffStarted,
         /// The cursor-open response is complete, but the client has not yet
         /// exchanged its provisional page hold for the exact saved root.
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from cursor_survives_writer_handover.rs"
+            )
+        )]
         BeforeOwnerCursorHandoffRegistration,
         /// The deadline watcher released a retained owner cursor while its
         /// caller still held the cursor object.
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from cursor_survives_writer_handover.rs"
+            )
+        )]
         OwnerCursorExpiryReleased,
     }
 
     /// Concrete production source reached by a bounded read. These values are
     /// emitted only by the adapter implementing the bounded kernel's execution
     /// probe; route selection and backend setup have no callback door for them.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+        )
+    )]
     pub enum ReadKernelSource {
         TableRow,
         IndexEntry,
@@ -429,8 +516,14 @@ mod route_observation {
 
     /// Evidence emitted from the bounded source loop, after route and backend
     /// selection and immediately before one real source item is inspected.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+        )
+    )]
     pub struct ReadKernelSourceEvent {
         pub funding_owner: Option<usize>,
         pub control_reservation_bytes: Option<usize>,
@@ -442,8 +535,14 @@ mod route_observation {
 
     /// Evidence emitted by the bounded kernel immediately before it returns its
     /// typed cancellation result.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from a_statement_on_the_file_route_costs_what_the_statement_costs.rs"
+        )
+    )]
     pub struct ReadKernelCancellationEvent {
         pub operation: ReadSessionOperation,
         pub route: ReadRoute,
@@ -464,8 +563,14 @@ mod route_observation {
     /// A narrow observer for route assembly. Implementations may block at an
     /// event, allowing a test to kill an owner between response frames without a
     /// wall-clock race.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub trait ReadSessionTestObserver: Send + Sync {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+            )
+        )]
         fn observe_event(&self, _event: ReadSessionEvent) {}
 
         /// Replace one owner's cursor-fetch page for a proof of client-side
@@ -486,7 +591,6 @@ mod route_observation {
     /// supplies this observer to the selected backend; it must never invoke these
     /// methods itself. The cancellation value is the value consumed by that
     /// kernel invocation, not a route-level preflight copy.
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub trait ReadKernelTestObserver: Send + Sync {
         #[cfg(any(test, feature = "test-seams"))]
         fn registered_snapshot_for_test(
@@ -497,6 +601,13 @@ mod route_observation {
         ) {
         }
 
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from bounded_read_test_support.rs"
+            )
+        )]
         fn before_source_touch(
             &self,
             event: ReadKernelSourceEvent,
@@ -511,6 +622,13 @@ mod route_observation {
         ) {
         }
 
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         fn cancellation_observed(
             &self,
             event: ReadKernelCancellationEvent,
@@ -529,8 +647,28 @@ pub use route_observation::{
     ReadKernelSource, ReadKernelSourceEvent, ReadKernelTestObserver, ReadRouteOpenFailure,
     ReadSessionEvent, ReadSessionOperation, ReadSessionTestObserver,
 };
-#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))]
 #[cfg(not(any(test, feature = "test-seams")))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_application_contract.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from a_statement_on_the_file_route_costs_what_the_statement_costs.rs"
+    )
+)]
 pub(crate) use route_observation::{
     OwnerHandshakeMismatchForTest, ReadKernelCancellationEvent, ReadKernelSource,
     ReadKernelSourceEvent, ReadKernelTestObserver, ReadRouteOpenFailure, ReadSessionEvent,
@@ -818,11 +956,9 @@ struct RouteResources {
     last_query_resident_percent: Mutex<Option<f64>>,
     expiry: SessionExpiry,
     channel_identity: Mutex<Option<ChannelAddress>>,
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     owner_services_started: std::sync::atomic::AtomicU64,
     local_channel_operations: std::sync::atomic::AtomicU64,
     direct_backend_opens: std::sync::atomic::AtomicU64,
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     active_owner_slots: std::sync::atomic::AtomicU64,
     active_cursors: std::sync::atomic::AtomicU64,
     /// Real source items THIS route's reads have finished inspecting. Kept per

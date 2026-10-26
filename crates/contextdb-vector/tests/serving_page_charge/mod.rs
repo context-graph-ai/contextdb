@@ -7,8 +7,6 @@
 //! global counting allocator. Live heap bytes are counted over every thread,
 //! so a binary's proofs are run one at a time through [`serial`].
 
-#![allow(dead_code)]
-
 #[path = "../fixtures/read_owner_test_support.rs"]
 mod read_owner_test_support;
 
@@ -366,6 +364,10 @@ pub struct Reading {
 /// `CACHE_PAGES` pages, charged to `budget`.
 pub struct Fixture {
     pub budget: Arc<Budget>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by a_borrowed_serving_page_keeps_its_charge_through_a_give_back"
+    )]
     pub store: Arc<VectorStore>,
     tx_mgr: Arc<TransactionManager<TestStore>>,
     exec: MemVectorExecutor<TestStore>,

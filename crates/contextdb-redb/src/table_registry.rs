@@ -8,7 +8,6 @@
 
 // The funding methods are reached only through the hidden
 // `contextdb-internal` surface; without it the registry is a plain map.
-#![cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 
 use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 use std::hash::RandomState;
@@ -138,6 +137,13 @@ impl RegistryFunding {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn take_refused(&self) -> Option<Layout> {
         let size = self.refused_size.swap(0, Ordering::SeqCst);
         let align = self.refused_align.swap(0, Ordering::SeqCst);
@@ -193,8 +199,22 @@ unsafe impl Allocator for RegistryAlloc {
 }
 
 /// Sets the per-call funded state and restores it on every exit.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
+    )
+)]
 pub(crate) struct FundedCall<'a>(&'a RegistryFunding);
 impl<'a> FundedCall<'a> {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn enter(funding: &'a RegistryFunding, credit: usize) -> Self {
         funding.take_refused();
         funding.credit.store(credit, Ordering::SeqCst);
@@ -204,10 +224,24 @@ impl<'a> FundedCall<'a> {
 
     /// The layout the last refused allocation asked for, if this call
     /// refused one.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn refused(&self) -> Option<Layout> {
         self.0.take_refused()
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn allocations(&self) -> usize {
         self.0.allocations.load(Ordering::SeqCst)
     }
@@ -221,6 +255,13 @@ impl Drop for FundedCall<'_> {
 
 /// Why the cost of a registry change could not be learned or paid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
+    )
+)]
 pub enum RegistryReserveError {
     /// The requested capacity overflows the hash table's layout arithmetic;
     /// nothing was asked of the allocator.
@@ -232,6 +273,13 @@ pub enum RegistryReserveError {
     ReplacementTooSmall,
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
+    )
+)]
 pub(crate) fn reserve_error(
     error: hashbrown::TryReserveError,
     call: &FundedCall<'_>,
@@ -246,11 +294,25 @@ pub(crate) fn reserve_error(
 
 /// An empty registry array reserved ahead of time, so that putting the open
 /// tables back into a baseline-sized array later allocates nothing.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
+    )
+)]
 pub struct RegistryReplacement {
     pub(crate) map: OpenTables,
 }
 impl RegistryReplacement {
     /// The bytes this replacement's array holds.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from store.rs"
+        )
+    )]
     pub fn allocation_bytes(&self) -> usize {
         self.map.allocation_size()
     }
@@ -258,12 +320,26 @@ impl RegistryReplacement {
 
 /// Counts allocations of the registry made outside a funded reserve for as
 /// long as it is held, and restores the previous state when dropped.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
+    )
+)]
 pub struct RegistryMonitor {
     funding: Arc<RegistryFunding>,
     previous: bool,
     overdraft_at_start: usize,
 }
 impl RegistryMonitor {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn start(funding: &Arc<RegistryFunding>) -> Self {
         let previous = funding.monitoring.swap(true, Ordering::SeqCst);
         Self {
@@ -275,6 +351,13 @@ impl RegistryMonitor {
 
     /// Bytes the registry allocated outside a funded reserve since this
     /// monitor started.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from open_table_registry_allocations.rs"
+        )
+    )]
     pub fn overdraft_bytes(&self) -> usize {
         self.funding.overdraft.load(Ordering::SeqCst) - self.overdraft_at_start
     }

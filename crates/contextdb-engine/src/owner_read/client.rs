@@ -9,6 +9,10 @@ use crate::local_transport::{
     LocalResponseExpectation, OrdinaryResultReceiver, ResultReceiveOutcome,
 };
 #[cfg(unix)]
+#[allow(
+    unused_imports,
+    reason = "KEEP-SHARED: shared test helper used by owner_read"
+)]
 use crate::local_transport::{LocalDeadlineOperation, UnixLocalCarrier, handshake_with_deadline};
 use crate::read_progress::ReadProgressObserver;
 use contextdb_core::read_contract::{
@@ -176,6 +180,13 @@ impl OwnerClient {
         ))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session.rs"
+        )
+    )]
     pub fn channel_path(&self) -> &Path {
         &self.channel_path
     }
@@ -228,6 +239,13 @@ impl OwnerClient {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from every_public_route_installs_its_own_memory_owner.rs"
+        )
+    )]
     pub fn read_envelope(
         reader: &mut dyn FrameReader,
         allocator: &mut dyn FrameBufferAllocator,
@@ -251,6 +269,13 @@ impl OwnerClient {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
     )]
     pub fn encode_envelope(
         envelope: &LocalRequestEnvelope,
@@ -317,6 +342,13 @@ impl OwnerClient {
     /// the owner reports at the same interval it does for a caller in its own
     /// process.
     #[cfg(unix)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_route_progress_and_cancellation.rs"
+        )
+    )]
     pub async fn request_watching(
         &mut self,
         envelope: LocalRequestEnvelope,
@@ -755,6 +787,13 @@ impl OwnerClient {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub fn receive_ordinary(
         receiver: &mut OrdinaryResultReceiver,
         response: LocalResponse,
@@ -794,6 +833,13 @@ impl OwnerClient {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn disconnect_handle(&self) -> OwnerReadScaffoldResult<OwnerDisconnectHandle> {
         let stream = self.stream.try_clone().map_err(|_| {
             OwnerReadScaffoldError::unimplemented("clone selected owner carrier for EOF/HUP")
@@ -807,6 +853,13 @@ impl OwnerClient {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
     )]
     pub fn disconnect(
         &self,
@@ -1050,6 +1103,13 @@ impl OwnerCancelHandle {
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from mod.rs"
+    )
+)]
 pub struct OwnerDisconnectHandle {
     stream: UnixStream,
 }
@@ -1064,6 +1124,13 @@ impl OwnerDisconnectHandle {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
     )]
     pub fn disconnect(self) -> OwnerReadScaffoldResult<()> {
         self.stream

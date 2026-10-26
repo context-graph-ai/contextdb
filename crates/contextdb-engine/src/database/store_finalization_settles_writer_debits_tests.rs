@@ -10,6 +10,13 @@
 //! debit panics in finalization; a missing refund leaves process writer
 //! bytes behind.
 use super::*;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 use crate::local_transport::ManualDeadlineClock;
 
 #[derive(Clone, Copy)]

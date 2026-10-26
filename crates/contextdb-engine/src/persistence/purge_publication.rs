@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! Crash-recoverable, physical-store publication fencing for authoritative erasure.
 
 use super::{

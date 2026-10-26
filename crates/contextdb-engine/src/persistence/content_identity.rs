@@ -1,5 +1,4 @@
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! Incrementally maintained identity of committed logical content.
 //!
 //! Each typed family is split at deterministic key-hash boundaries into
@@ -14,6 +13,13 @@ use super::{
 };
 use crate::direct_file_reader::DirectTypedImageDigest;
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 use crate::memory_accounting::MemoryAccountant;
 use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_core::{
@@ -4488,6 +4494,13 @@ fn mutation_key_capacity(
 #[path = "content_identity/writer_window.rs"]
 mod writer_window;
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 use writer_window::update_family;
 
 /// Reader-test ceiling retained for comparisons with the writer's resident
@@ -6295,7 +6308,6 @@ impl ContentIdentityReadVerifier {
         self.resident.clear()
     }
 
-    #[allow(dead_code)] // Exercised by the bounded proof-cache contract.
     pub(super) fn batch(&self, reserved_bytes: usize) -> ReadAuthenticationBatch<'_> {
         ReadAuthenticationBatch {
             verifier: self,

@@ -1,6 +1,9 @@
 // Counted standalone requesting reader for cross-crate native test fixtures.
-#[allow(dead_code)] // Shared support is compiled in test targets that do not construct this fixture.
 #[derive(Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by bounded_traversal_survives_adjacency_compaction, graph_tests, long_traversal_que"
+)]
 pub struct TestReadMemory {
     used: std::sync::atomic::AtomicUsize,
 }

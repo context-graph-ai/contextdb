@@ -1,5 +1,4 @@
 //! Shared production-path schema assertions and authenticated sync fixture.
-#![allow(dead_code)]
 
 pub mod largest;
 #[path = "../pinned_cg_startup/mod.rs"]
@@ -23,6 +22,10 @@ pub fn empty() -> HashMap<String, Value> {
 
 /// Test callbacks are explicit host registrations, as at cg startup. Preserve
 /// specialized callbacks already installed by behavior tests; never enable relay mode.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
 pub fn initialize_fixture_callbacks(db: &Database) {
     let registered = db.registered_trigger_callbacks();
     for trigger in db.list_triggers() {
@@ -38,6 +41,10 @@ pub fn initialize_fixture_callbacks(db: &Database) {
 /// Existing dependent tables must be staged in full, not merely a subset.
 /// New-table tests keep the separate affected-only bound: those tables do not
 /// have old images to copy. This equality is for the existing-table migration.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables"
+)]
 pub fn assert_dependency_complete(
     observation: &ReceivedSchemaApplyObservationForTest,
     affected: &BTreeSet<String>,
@@ -55,6 +62,10 @@ pub fn assert_dependency_complete(
 /// engine's naming rule: one per declared index, and its `_current` companion.
 /// A caller passes the union of the schema before and after the apply it
 /// observes, so a dropped or added index is still owned.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, custody_schema_replay_"
+)]
 pub fn physical_index_tables(db: &Database, tables: &BTreeSet<String>) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for table in tables {
@@ -74,6 +85,10 @@ pub fn physical_index_tables(db: &Database, tables: &BTreeSet<String>) -> BTreeS
     names
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_is_proportional_to_affected_tables, custody_the_w"
+)]
 pub fn declare(db: &Database, ddls: &[&str]) {
     for (ordinal, ddl) in ddls.iter().enumerate() {
         db.execute(ddl, &empty()).unwrap_or_else(|error| {
@@ -82,6 +97,10 @@ pub fn declare(db: &Database, ddls: &[&str]) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn install(db: &Database, ddls: &[&str]) {
     let tx = db.begin().expect("begin whole source migration");
     for (ordinal, ddl) in ddls.iter().enumerate() {
@@ -97,6 +116,10 @@ pub fn install(db: &Database, ddls: &[&str]) {
         .expect("commit every startup declaration once");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
 pub fn schema(db: &Database) -> Vec<String> {
     let mut answer = db
         .table_names()
@@ -142,6 +165,10 @@ pub fn schema(db: &Database) -> Vec<String> {
     answer
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
 fn canonical_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Object(map) => {
@@ -171,6 +198,10 @@ fn canonical_json(value: &serde_json::Value) -> String {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn reference(ddls: &[&str]) -> Database {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -178,6 +209,10 @@ pub fn reference(ddls: &[&str]) -> Database {
     db
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_full_schema(db: &Database, expected: &Database) {
     let actual = schema(db);
     let expected = schema(expected);
@@ -208,6 +243,10 @@ pub fn assert_full_schema(db: &Database, expected: &Database) {
 /// constraints and indexes, its vector/rank/partition and DAG declarations,
 /// and every trigger, event type, sink and route, by complete serialized
 /// metadata, not by name.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sync_schema_transactions"
+)]
 pub fn assert_whole_image(db: &Database, expected: &Database, phase: &str) {
     let actual = schema(db);
     let expected = schema(expected);
@@ -229,6 +268,10 @@ pub fn assert_whole_image(db: &Database, expected: &Database, phase: &str) {
 /// The same whole-image claim, stated from the DDL text the image is built
 /// from. Every crash-boundary assertion names its image this way so the old
 /// complete state and the complete startup schema are written in one register.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sync_schema_transactions"
+)]
 pub fn assert_whole_image_of(db: &Database, statements: &[&str], phase: &str) {
     assert_whole_image(db, &reference(statements), phase);
 }
@@ -237,6 +280,10 @@ pub fn assert_whole_image_of(db: &Database, statements: &[&str], phase: &str) {
 /// receiver's durable DDL log exactly once, under one commit boundary, with no
 /// unrelated declaration regrouped into it -- so a retry that re-applied a
 /// prefix, or a receiver that split the migration, fails here.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sync_schema_transactions"
+)]
 pub fn assert_unit_kept_once(db: &Database, expected: &[DdlChange], phase: &str) -> Lsn {
     let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let occurrences = changes
@@ -286,6 +333,10 @@ pub fn assert_unit_kept_once(db: &Database, expected: &[DdlChange], phase: &str)
     lsn
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction"
+)]
 pub fn assert_schema_contains(db: &Database, expected: &Database) {
     let actual = schema(db);
     let missing = schema(expected)
@@ -298,6 +349,10 @@ pub fn assert_schema_contains(db: &Database, expected: &Database) {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction"
+)]
 pub fn assert_one_ordered_unit(db: &Database, after: Lsn, expected: &[DdlChange]) -> Lsn {
     let changes = db.changes_since(after).expect("read the declared changes");
     assert_eq!(
@@ -316,6 +371,10 @@ pub fn assert_one_ordered_unit(db: &Database, after: Lsn, expected: &[DdlChange]
     lsn
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_contains_one_ordered_unit(
     db: &Database,
     after: Lsn,
@@ -358,6 +417,10 @@ pub fn assert_contains_one_ordered_unit(
     lsn
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_no_schema(db: &Database) {
     assert_schema_not_visible(db);
     assert!(
@@ -370,6 +433,10 @@ pub fn assert_no_schema(db: &Database) {
 
 /// Metadata inspection is available at an armed commit fence. Change-log
 /// extraction deliberately waits for the commit mutex and belongs after reopen.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_schema_not_visible(db: &Database) {
     assert!(
         schema(db).is_empty(),
@@ -383,6 +450,10 @@ pub fn assert_schema_not_visible(db: &Database) {
     assert!(events.routes.is_empty());
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn seed_cg_artifacts(db: &Database, seed: u128) {
     initialize_fixture_callbacks(db);
     let tx = db.begin().expect("real cg row/vector/graph transaction");
@@ -401,6 +472,10 @@ pub fn seed_cg_artifacts(db: &Database, seed: u128) {
         .expect("publish actual cg vector/graph artifacts");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn cg_artifact_params(seed: u128) -> HashMap<String, Value> {
     let mut vector = vec![0.0; 768];
     vector[0] = 1.0;
@@ -424,6 +499,10 @@ pub fn cg_artifact_params(seed: u128) -> HashMap<String, Value> {
     ])
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_cg_artifact_queries(
     mut execute: impl FnMut(&str, &HashMap<String, Value>) -> contextdb_engine::QueryResult,
     seed: u128,
@@ -452,6 +531,10 @@ pub fn assert_cg_artifact_queries(
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_cg_artifacts(db: &Database, seed: u128) {
     assert!(
         db.column_has_covering_index("edges", "source_id"),
@@ -467,9 +550,21 @@ pub fn assert_cg_artifacts(db: &Database, seed: u128) {
     assert!(db.execute("INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from) VALUES ($back_edge, $target, $context, 'CITES', $context, $tx)", &p).is_err(), "the recovered actual cg DAG still refuses a cycle");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+)]
 pub struct Hub {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read, sql, sync_schema_transactions"
+    )]
     pub db: Arc<Database>,
     pub broker: InProcessBroker,
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read, sql, sync_schema_transactions"
+    )]
     pub server: Arc<SyncServer>,
     stop: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -477,6 +572,10 @@ pub struct Hub {
 }
 
 impl Hub {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub async fn start(db: Arc<Database>, tenant: &str) -> Self {
         let broker = InProcessBroker::new();
         let identity = Arc::new(FabricIdentity::generate());
@@ -514,6 +613,10 @@ impl Hub {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub fn client(&self, db: Arc<Database>) -> SyncClient {
         let identity = Arc::new(FabricIdentity::generate());
         SyncClient::with_authenticated_transport_and_identity_for_test(
@@ -525,6 +628,10 @@ impl Hub {
         .expect("construct the authenticated sync endpoint")
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub async fn bind(&self, client: &SyncClient) {
         // These fixtures declare no tenant-governed application table. An empty
         // expectation still authenticates and durably binds the exact hub life.
@@ -534,12 +641,20 @@ impl Hub {
             .expect("bind the actual authenticated tenant hub before installing schema");
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
+    )]
     pub async fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.task.take().unwrap().await.expect("stop schema hub");
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_bounded_contract, custody_schema_replay_identical_schema_d"
+)]
 pub fn is_data_table(table: &str) -> bool {
     // Receipt/log/format bookkeeping and the required per-exchange liveness
     // row with its authenticated roots are excluded from the schema-image
@@ -565,8 +680,16 @@ pub fn is_data_table(table: &str) -> bool {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_bounded_contract, custody_schema_replay_identical_schema_d"
+)]
 const CONTACT_TABLE: &str = "rel_work_node_contacts";
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_identical_schema_does_no_artifact_work, custody_schema_rep"
+)]
 pub fn is_data_write(event: &TableWriteForTest) -> bool {
     if event.table == "config" {
         return event.key == b"__trigger_declarations"
@@ -581,6 +704,10 @@ pub fn is_data_write(event: &TableWriteForTest) -> bool {
 
 /// Actual serialized payload inserted/removed, grouped by operation in receipts.
 /// Table deletion has no row payload; its directory removal is observed separately.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_bounded_contract, custody_schema_replay_identical_schema_d"
+)]
 pub fn serialized_bytes(event: &TableWriteForTest, count: u64) -> u64 {
     match event.operation {
         TableWriteOperationForTest::DeleteTable => 0,
@@ -588,6 +715,10 @@ pub fn serialized_bytes(event: &TableWriteForTest, count: u64) -> u64 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_identical_schema_does_no_artifact_work, custody_schema_rep"
+)]
 pub fn assert_zero_images(observation: &ReceivedSchemaApplyObservationForTest) {
     assert!(
         observation.durable_observer_attached,
@@ -617,6 +748,10 @@ pub fn assert_zero_images(observation: &ReceivedSchemaApplyObservationForTest) {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, custody_schema_replay_"
+)]
 pub fn assert_affected_only(
     observation: &ReceivedSchemaApplyObservationForTest,
     affected: &BTreeSet<String>,
@@ -1071,6 +1206,10 @@ impl Drop for Hub {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn assert_authored_wire(
     broker: &InProcessBroker,
     expected: &[DdlChange],
@@ -1142,6 +1281,10 @@ pub fn assert_authored_wire(
     units
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 struct Clock;
 impl contextdb_core::read_contract::DeadlineClock for Clock {
     fn now_ms(&self) -> u64 {
@@ -1152,6 +1295,10 @@ impl contextdb_core::read_contract::DeadlineClock for Clock {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_the_whole_startup_schema_installs_in_one_transaction, sync_schema_transa"
+)]
 pub fn committed_identity(path: &std::path::Path) -> [u8; 32] {
     use contextdb_engine::direct_file_reader::test_seams::{
         DirectReaderConfig, open_for_test, verified_image_digest_for_test,

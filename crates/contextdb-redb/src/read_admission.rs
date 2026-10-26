@@ -81,7 +81,6 @@ impl Drop for OwnedReadPageCharge {
 
 // Preserve opaque foreign callers exactly, without silently treating their Box
 // as the concrete free-before-refund protocol used by the closed engine factory.
-#[allow(dead_code)] // Variants own their receipts solely for destruction.
 pub(crate) enum ReadMemoryCharge {
     Legacy(ReadPageCharge),
     #[cfg(feature = "contextdb-internal")]
@@ -330,7 +329,6 @@ impl ScanAllowance {
 }
 
 // The receipt is moved out with the complete node and dropped only after free.
-#[allow(dead_code)] // Native credit is owned solely for destruction.
 enum ScanNodeInvoice {
     Legacy,
     #[cfg(feature = "contextdb-internal")]
@@ -341,10 +339,6 @@ struct ScanScopeNode {
     previous: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
     next: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
     allowance: ScanAllowance,
-    #[allow(
-        dead_code,
-        reason = "Retained for destruction and inspected only with test-seams."
-    )]
     invoice: ScanNodeInvoice,
 }
 

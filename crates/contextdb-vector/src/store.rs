@@ -6789,7 +6789,6 @@ impl IndexState {
         Ok(Some(score))
     }
 
-    #[allow(dead_code)] // Retain the bounded candidate scoring seam for read fallbacks.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

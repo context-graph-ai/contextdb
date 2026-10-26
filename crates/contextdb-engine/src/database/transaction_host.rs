@@ -1129,7 +1129,6 @@ impl Drop for PreparedMemorySwap {
 /// stage.  This is deliberately pure: no store lock, plugin, parser, or
 /// persistence access is allowed while establishing the durable identity and
 /// ordered bytes of the received vector.
-#[allow(dead_code)]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

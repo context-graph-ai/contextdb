@@ -1,5 +1,9 @@
 // Shared replay observations preserve the same wire and storage-work assertions.
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_identical_schema_does_no_artifact_work, custody_s"
+)]
 fn sent_ddl_since(hub: &Hub, start: usize) -> Vec<contextdb_engine::sync_types::DdlChange> {
     use contextdb_server::protocol::{MessageType, PushRequest, decode};
     let mut ddl = Vec::new();
@@ -22,6 +26,10 @@ fn sent_ddl_since(hub: &Hub, start: usize) -> Vec<contextdb_engine::sync_types::
     ddl
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_is_proportional_to_affected_tables, custody_schem"
+)]
 fn sent_push_request_count_since(hub: &Hub, start: usize) -> u64 {
     use contextdb_server::protocol::{MessageType, decode};
     hub.broker
@@ -37,6 +45,10 @@ fn sent_push_request_count_since(hub: &Hub, start: usize) -> u64 {
         .count() as u64
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_is_proportional_to_affected_tables, custody_schem"
+)]
 fn assert_table_work_bound(observation: &ReceivedSchemaApplyObservationForTest, entries: usize) {
     // Retain the exact frozen <=2*entries ceiling. The independent redb
     // directory/delete stream must obey it too, not only engine loop counters.

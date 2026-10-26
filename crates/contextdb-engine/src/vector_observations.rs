@@ -331,11 +331,25 @@ impl Drop for ImportTailLoadObservationForTest {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
+    )
+)]
 pub(crate) fn import_tail_load_observed() -> bool {
     IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.borrow().is_some())
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
+    )
+)]
 pub(crate) fn emit_import_tail_load_for_test(
     event: &ImportTailLoadForTest,
 ) -> Option<Option<usize>> {
@@ -380,6 +394,13 @@ impl Drop for ImportRebuildStepObservationForTest {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
+    )
+)]
 pub(crate) fn emit_import_rebuild_step_for_test(import_decode_held: usize) {
     let observer = IMPORT_REBUILD_STEP_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {

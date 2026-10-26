@@ -49,6 +49,13 @@ impl OwnerAdmission {
         Ok(ReadLimits::stricter_of(requested, owner.limits)?)
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub const fn configured_limits(&self) -> OwnerReadLimits {
         self.limits
     }
@@ -145,6 +152,13 @@ impl OwnerAdmission {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn poll_drained(&self, context: &mut Context<'_>) -> Poll<()> {
         if self.active_readers.load(Ordering::SeqCst) == 0 {
             return Poll::Ready(());
@@ -218,6 +232,13 @@ impl RequestLease {
         &self.cancellation
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn release(mut self) {
         self.release_once();
     }

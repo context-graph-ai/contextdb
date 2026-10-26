@@ -6,10 +6,18 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use uuid::Uuid;
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by mixed_workflows_pr"
+)]
 pub fn empty_params() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by mixed_workflows_pr"
+)]
 pub fn setup_graph_relational_vector_db() -> (Database, Uuid) {
     let db = Database::open_memory();
     db.execute(
@@ -79,6 +87,10 @@ pub fn setup_graph_relational_vector_db() -> (Database, Uuid) {
     (db, root)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by mixed_workflows_pr"
+)]
 pub fn run_graph_relational_vector_query(db: &Database, root: Uuid) {
     let neighborhood = db
         .query_bfs(
@@ -114,6 +126,10 @@ pub fn run_graph_relational_vector_query(db: &Database, root: Uuid) {
     .unwrap();
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by mixed_workflows_pr"
+)]
 pub fn setup_flagship_recall_db() -> Arc<Database> {
     let db = Arc::new(Database::open_memory());
 
@@ -207,6 +223,10 @@ pub fn setup_flagship_recall_db() -> Arc<Database> {
     db
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by mixed_workflows_pr"
+)]
 pub fn run_flagship_recall_query(db: &Database) {
     let result = db
         .execute(
@@ -236,6 +256,10 @@ pub fn run_flagship_recall_query(db: &Database) {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by subscriptions_pr"
+)]
 pub fn setup_subscription_db() -> Arc<Database> {
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -246,10 +270,18 @@ pub fn setup_subscription_db() -> Arc<Database> {
     db
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by subscriptions_pr"
+)]
 pub fn subscription_insert_sql(id: u128) -> String {
     format!("INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-{id:012}', 'row-{id}')")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by subscriptions_pr"
+)]
 pub fn drain_events(rx: &Receiver<contextdb_engine::plugin::CommitEvent>) -> usize {
     let mut count = 0usize;
     while rx.try_recv().is_ok() {

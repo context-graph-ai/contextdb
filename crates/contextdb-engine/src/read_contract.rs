@@ -560,6 +560,13 @@ pub enum ReadEncodingError {
     #[error("canonical output admission failed: {0}")]
     Admission(contextdb_core::Error),
     #[error("canonical read encoding is not implemented")]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from bounded.rs"
+        )
+    )]
     Unimplemented,
     #[error("canonical read payload is invalid")]
     InvalidPayload,
@@ -589,6 +596,13 @@ fn encoding_error_from_transport(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub fn encode_query_result(
     result: &QueryResult,
     caller_owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -602,6 +616,13 @@ pub fn encode_query_result(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
 )]
 fn validate_query_view(view: &CanonicalQueryResultView<'_>) -> Result<(), ReadEncodingError> {
     for row in view.rows {
@@ -1053,6 +1074,13 @@ pub(crate) fn decode_query_result_funded(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_encoding.rs"
+    )
+)]
 pub fn decode_query_result(bytes: &[u8]) -> Result<CanonicalQueryResult, ReadEncodingError> {
     decode_query_result_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
@@ -1085,6 +1113,13 @@ pub fn decode_query_result_under_memory_ceiling(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_encoding.rs"
+    )
+)]
 pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEncodingError> {
     let view = CanonicalQueryResultView::from(result);
     validate_query_view(&view)?;
@@ -1102,6 +1137,13 @@ pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEnco
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from metadata_body_round_trip.rs"
+    )
 )]
 pub fn encode_metadata_body(
     body: &crate::direct_file_reader::DirectMetadataBody,
@@ -1164,6 +1206,10 @@ pub struct CanonicalWriter {
     len: usize,
     /// Measure only: count what would be written and keep none of it.
     counting: bool,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     credit: Option<contextdb_core::read_memory::ReadCredit>,
     overflowed: bool,
 }
@@ -1174,6 +1220,13 @@ impl CanonicalWriter {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
     )]
     pub fn try_new(
         owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -1211,6 +1264,13 @@ impl CanonicalWriter {
         self.len
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1285,6 +1345,13 @@ impl CanonicalWriter {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn raw(&mut self, bytes: &[u8]) -> &mut Self {
         self.count(bytes.len() as u64);
         self.put(bytes);
@@ -1305,6 +1372,13 @@ impl CanonicalWriter {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
     )]
     pub fn finish(self) -> Result<EncodedReadBytes, ReadEncodingError> {
         if self.counting || self.overflowed {
@@ -1331,6 +1405,13 @@ impl CanonicalWriter {
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from metadata_body_round_trip.rs"
+    )
 )]
 pub fn decode_metadata_body(
     bytes: &[u8],
@@ -1379,6 +1460,13 @@ pub struct CanonicalReader<'a> {
 }
 
 impl<'a> CanonicalReader<'a> {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
@@ -1536,6 +1624,13 @@ impl<'a> CanonicalReader<'a> {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader.rs"
+    )
+)]
 pub(crate) fn encode_owned_cursor_page_for_test(
     page: &crate::owned_cursor_page::OwnedCursorPage,
 ) -> Result<Vec<u8>, ReadEncodingError> {
@@ -1547,6 +1642,13 @@ pub(crate) fn encode_owned_cursor_page_for_test(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_encoding.rs"
+    )
 )]
 pub fn encode_cursor_page(
     page: &CursorPage,
@@ -1567,6 +1669,13 @@ pub fn encode_cursor_page(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+    )
+)]
 pub fn decode_cursor_page(bytes: &[u8]) -> Result<CursorPage, ReadEncodingError> {
     decode_cursor_page_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
@@ -1576,6 +1685,13 @@ pub fn decode_cursor_page(bytes: &[u8]) -> Result<CursorPage, ReadEncodingError>
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from every_public_route_installs_its_own_memory_owner.rs"
+    )
 )]
 pub fn decode_cursor_page_under_memory_ceiling(
     bytes: &[u8],
@@ -1624,6 +1740,13 @@ pub fn decode_cursor_page_under_memory_ceiling(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from bounded_pull_execution_contract.rs"
+    )
 )]
 pub fn cursor_page_encoded_size(page: &CursorPage) -> Result<usize, ReadEncodingError> {
     page.validate()
@@ -1689,6 +1812,13 @@ pub(crate) fn encode_metadata_page_funded(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_encoding.rs"
+    )
+)]
 pub fn encode_metadata_page(
     page: &MetadataPage,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -1745,6 +1875,13 @@ pub(crate) fn decode_metadata_page_with_memory(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_encoding.rs"
+    )
+)]
 pub fn metadata_page_encoded_size(page: &MetadataPage) -> Result<usize, ReadEncodingError> {
     page.validate()
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1780,6 +1917,13 @@ pub(crate) fn encoded_size<T: Serialize>(value: &T) -> Result<usize, ReadEncodin
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
 )]
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
     // Measured first and written once into a buffer of exactly that length.

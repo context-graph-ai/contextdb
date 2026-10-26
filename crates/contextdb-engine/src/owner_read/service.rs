@@ -9,6 +9,10 @@ use crate::executor::{
 #[cfg(any(test, feature = "test-seams"))]
 use crate::executor::{BoundedExecutionProbe, BoundedSourceTouch, BoundedWorkSource};
 use crate::local_transport::response_is_encodable;
+#[allow(
+    unused_imports,
+    reason = "KEEP-SHARED: shared test helper used by owner_read"
+)]
 use crate::local_transport::{
     ChannelPathFacts, CursorCloseAcknowledgement, CursorOpenedResponse, CursorPageResponse,
     LocalConfigurationSource, LocalDeadlineOperation, LocalEffectiveLimits, LocalEngineFailure,
@@ -19,12 +23,24 @@ use crate::local_transport::{
     split_payload_answer, validate_channel_path, validate_handshake,
 };
 #[cfg(unix)]
+#[allow(
+    unused_imports,
+    reason = "KEEP-SHARED: shared test helper used by owner_read"
+)]
 use crate::local_transport::{
     UnixLocalCarrier, authenticate_framed_stream_handshake, serve_request_with_deadline,
 };
 use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
+#[allow(
+    unused_imports,
+    reason = "KEEP-SHARED: shared test helper used by owner_read"
+)]
 use crate::read_contract::encode_observed_cursor_page;
 use crate::{Database, OwnerReadConfig};
+#[allow(
+    unused_imports,
+    reason = "KEEP-SHARED: shared test helper used by owner_read"
+)]
 use contextdb_core::read_contract::{
     CursorExpiryKind, DeadlineClock, LocalUserIdentity, MetadataPage, MetadataPageVocabulary,
     OwnerLimitExceededDetail, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus,
@@ -176,6 +192,13 @@ std::thread_local! {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct OwnerServiceStartPublicationObserverGuard {
     previous: Option<Arc<dyn OwnerServicePublicationObserver>>,
 }
@@ -359,6 +382,13 @@ impl OwnerServiceSpec {
     /// independent and is restored even if construction unwinds.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_reader_publication.rs"
+        )
+    )]
     pub fn with_publication_observer_during_start_for_test<T>(
         observer: Arc<dyn OwnerServicePublicationObserver>,
         start: impl FnOnce() -> T,
@@ -371,6 +401,13 @@ impl OwnerServiceSpec {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn with_cursor_identifier_allocator_for_test(
         mut self,
         allocator: Arc<dyn CursorIdentifierAllocator>,
@@ -381,6 +418,13 @@ impl OwnerServiceSpec {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn with_execution_observer_for_test(
         mut self,
         observer: Arc<dyn OwnerBoundedExecutionObserver>,
@@ -391,6 +435,13 @@ impl OwnerServiceSpec {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_route_progress_and_cancellation.rs"
+        )
+    )]
     pub fn with_publication_observer_for_test(
         mut self,
         observer: Arc<dyn OwnerServicePublicationObserver>,
@@ -417,14 +468,35 @@ impl OwnerServiceSpec {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn database(&self) -> &Arc<Database> {
         &self.database
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn config(&self) -> &OwnerReadConfig {
         &self.config
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn clock(&self) -> &Arc<dyn DeadlineClock> {
         &self.clock
     }
@@ -492,6 +564,10 @@ impl OwnerServiceSpec {
 #[derive(Debug)]
 pub struct ConnectionState {
     connection_id: [u8; 16],
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by owner_read"
+    )]
     principal: ReadPrincipal,
     effective_limits: ReadLimits,
     cancellation: OwnerReadCancellation,
@@ -568,6 +644,10 @@ pub struct CursorEntry {
     /// next fetch can publish the same rows without advancing the kernel a
     /// second time.
     unpublished_page: Option<UnpublishedCursorPage>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by owner_read"
+    )]
     lease: RequestLease,
     _store_hold: crate::database::OwnerReadStoreHold,
 }
@@ -889,6 +969,13 @@ impl CompletedOwnerRequest {
 /// Resource counters used by deterministic leak assertions. A live cursor is
 /// the sole documented non-baseline state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+    )
+)]
 pub struct OwnerReadResourceSnapshot {
     pub active_slots: u64,
     pub cursor_count: u64,
@@ -1245,6 +1332,13 @@ pub struct OwnerReadService {
     /// the owner never crossed.
     reader_cancelled_connections: Mutex<BTreeSet<[u8; 16]>>,
     next_connection_sequence: AtomicU64,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     buffered_bytes: AtomicU64,
     cancellations: Mutex<CancellationRegistry>,
     /// Wakes shutdown when the final request registration is released. The
@@ -2222,6 +2316,13 @@ impl OwnerReadService {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn resources(&self) -> OwnerReadResourceSnapshot {
         let usage = self.spec.database.accountant().usage();
         OwnerReadResourceSnapshot {
@@ -2253,6 +2354,13 @@ impl OwnerReadService {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn cancellation_signal_count(&self) -> u64 {
         self.cancellation_signals.load(Ordering::SeqCst)
     }
@@ -4090,6 +4198,13 @@ impl OwnerReadService {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn begin_shutdown(&self) -> OwnerReadScaffoldResult<bool> {
         self.stop_serving()?;
         // "In flight" is every request this owner is still inside, not only
@@ -4515,12 +4630,26 @@ impl OwnerReadService {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn translate_bounded_refusal_for_test(failure: ReadFailure) -> OwnerReadScaffoldError {
         map_bounded_error(BoundedExecutionError::Refused(failure))
     }
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
+    )]
     pub fn translate_bounded_cancelled_for_test() -> OwnerReadScaffoldError {
         map_bounded_error(BoundedExecutionError::Cancelled)
     }
@@ -6016,6 +6145,10 @@ fn wait_for_local_completion<F: std::future::Future>(future: F) -> F::Output {
 /// on: a read refusal keeps its typed detail, and an engine answer keeps the
 /// engine's own error rather than collapsing into a channel failure.
 /// What a caught unwind can be told about itself, in one line.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by owner_read"
+)]
 fn panic_reason(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(reason) = payload.downcast_ref::<&str>() {
         return (*reason).to_owned();

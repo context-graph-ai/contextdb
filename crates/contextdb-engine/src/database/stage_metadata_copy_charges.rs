@@ -13,7 +13,10 @@ use std::sync::Arc;
 
 // Field-for-field pre2 database.rs StagedCopyCharge. Never constructed: its
 // compiler layout is the same-capacity baseline, not a guessed word count.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
+)]
 struct Pre2StagedCopyCharge {
     accountant: crate::memory_accounting::AccountantHandle,
     bytes: usize,

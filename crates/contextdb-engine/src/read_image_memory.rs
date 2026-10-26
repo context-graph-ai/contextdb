@@ -337,6 +337,13 @@ impl ImageMemory {
         clippy::new_ret_no_self,
         reason = "Constructs the funded image handle that retains both the image owner and its control invoice."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn new(limit: Option<usize>) -> Result<ImageMemoryHandle> {
         let accountant = crate::memory_accounting::AccountantHandle::standalone(limit, true)?;
         Self::funded_for(
@@ -398,6 +405,13 @@ impl ImageMemory {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
     )]
     pub(crate) fn funded_for(
         accountant: crate::memory_accounting::AccountantHandle,
@@ -513,6 +527,13 @@ impl ImageMemory {
     /// where the session's limit sees it, allocation by allocation, and given
     /// back when this charge is dropped.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from content_identity.rs"
+        )
+    )]
     pub(crate) fn charging(
         accountant: impl Into<crate::memory_accounting::AccountantHandle>,
     ) -> ImageMemoryHandle {
@@ -982,6 +1003,13 @@ impl ImageMemory {
     }
 
     /// Prepaid output bytes this owner's per-call decodes adopted.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from an_import_tail_charges_each_decoded_vector_once.rs"
+        )
+    )]
     pub(crate) fn adopted_output(&self) -> usize {
         self.prepaid_output
             .as_ref()
@@ -1005,11 +1033,25 @@ impl ImageMemory {
     }
 
     /// `subsystem/operation` this owner's admissions and refusals carry.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn labels(&self) -> (&'static str, &'static str) {
         (self.subsystem, self.operation)
     }
 
     /// Bytes held by this owner, including its current per-call owner.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
+        )
+    )]
     pub(crate) fn held_with_call(&self) -> usize {
         self.held()
             .saturating_add(

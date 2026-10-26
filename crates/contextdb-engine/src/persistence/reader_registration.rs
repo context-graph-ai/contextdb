@@ -1925,7 +1925,6 @@ impl ReadPersistenceLoad {
     }
 }
 
-#[allow(dead_code)]
 impl LoadReadImageError {
     #[cfg(test)]
     pub(crate) fn kind(&self) -> LoadReadImageErrorKind {

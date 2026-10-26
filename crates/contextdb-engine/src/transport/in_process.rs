@@ -474,6 +474,13 @@ impl Default for InProcessBroker {
 /// The producer retains its own input custody. This native receive allocates
 /// only the exact admitted copy, after the original operation has begun.
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 fn receive_native_read_borrowed(
     operation: &crate::owner_read::NativeReadRequest,
     request: &[u8],
@@ -494,6 +501,13 @@ fn receive_native_read_borrowed(
 #[allow(
     clippy::type_complexity,
     reason = "the begun request's three parts are returned together and named at the one call site"
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_delivery_tests.rs"
+    )
 )]
 pub(crate) fn begin_native_in_process(
     installation: &super::ReadBoundStreamInstallation,

@@ -732,6 +732,13 @@ impl Drop for FreeWatch<'_, '_> {
 
 /// The caller borrows the actual constructor owner/invoice through the next
 /// System request. No watch can retain or dereference this address afterward.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_read_memory.rs"
+    )
+)]
 pub(crate) fn funding_next(counter: usize) {
     access(|state| {
         if counter == 0 || state.pending_counter != 0 || state.pending_sample.is_some() {

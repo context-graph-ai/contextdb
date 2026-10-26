@@ -73,10 +73,24 @@ impl Drop for CatchUpCohortCap {
     }
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_paged_build.rs"
+    )
+)]
 pub(crate) fn catch_up_cohorts_per_wake() -> Option<usize> {
     CATCH_UP_COHORTS_PER_WAKE.with(Cell::get)
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_paged.rs"
+    )
+)]
 pub(crate) fn note_build_successor(
     next: &contextdb_vector::hnsw::paged_builder::PagedVectorProgress,
 ) {

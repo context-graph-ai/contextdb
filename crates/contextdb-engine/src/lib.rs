@@ -102,7 +102,6 @@ pub mod persistent_store;
 pub mod plugin;
 pub mod rank_formula;
 #[cfg(not(feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) mod read_contract;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]

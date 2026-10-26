@@ -21,19 +21,52 @@
 // This private production module is a public façade only for `test-seams`
 // integration proofs, so its reexports are intentionally unused by the
 // default build.
-#![cfg_attr(not(feature = "test-seams"), allow(unused_imports))]
-#![allow(dead_code)]
 
 mod admission;
 mod client;
 mod native_request;
 mod service;
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from admission.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from service.rs"
+    )
+)]
 pub use admission::{OwnerAdmission, RequestLease};
 pub use client::OwnerClient;
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub use client::OwnerDisconnectHandle;
 pub(crate) use native_request::NativeReadRequest;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from service.rs"
+    )
+)]
 pub use service::{
     ConnectionState, CursorEntry, CursorIdentifierAllocator, OwnerReadResourceSnapshot,
     OwnerReadService, OwnerServiceSpec, ValidatedOwnerListener,

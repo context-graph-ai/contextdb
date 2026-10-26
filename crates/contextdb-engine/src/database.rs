@@ -528,10 +528,13 @@ pub(crate) struct AuthoredRowShape {
 /// unit.  It never crosses the public `ChangeSet` boundary.  Everything in
 /// it is prepared before durability; `publish_received_schema_stage` contains
 /// only memory replacement after that durability succeeds.
-#[allow(dead_code)]
 pub(crate) struct ReceivedSchemaStage {
     memory_history: Option<PreparedSchemaHistory>,
     custody_memory: Option<custody_store::CustodyDelta>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     source_order: Vec<ReceivedSchemaOrderEntry>,
     relational: Vec<TableProjection>,
     affected_tables: HashSet<String>,
@@ -1771,8 +1774,14 @@ pub enum VectorSearchTailState {
 
 /// Ordinary-build component receipt for memory ownership measurements.
 /// Its consumer surface is supplied by measurement callers.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from maintenance_and_limits.rs"
+    )
+)]
 pub(crate) struct VectorMemoryOwnershipReceipt {
     /// Actual held source/loader metadata credits, deduplicated by Arc identity.
     pub source_metadata: usize,

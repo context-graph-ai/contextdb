@@ -943,7 +943,6 @@ impl Drop for VectorCopyAdmission {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Preserve the no-op budget implementation for explicit fallback routes.
 struct UnlimitedMemoryBudget;
 
 impl MemoryBudget for UnlimitedMemoryBudget {
@@ -960,7 +959,6 @@ impl MemoryBudget for UnlimitedMemoryBudget {
     fn release(&self, _bytes: usize) {}
 }
 
-#[allow(dead_code)] // Preserve the no-op budget constructor for explicit fallback routes.
 #[cfg(test)]
 pub(crate) fn unlimited_memory_budget() -> Arc<dyn MemoryBudget> {
     Arc::new(UnlimitedMemoryBudget)

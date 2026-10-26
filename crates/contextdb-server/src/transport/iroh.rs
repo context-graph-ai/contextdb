@@ -320,6 +320,13 @@ pub fn connection_task_bytes_for_test() -> usize {
 /// connection task frame, which holds the inline subject and terminal buffers.
 /// A test asserts the measured frame stays within it.
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_delivery_tests.rs"
+    )
+)]
 pub(crate) const MAX_CONNECTION_TASK_BYTES: usize = 64 * 1024;
 
 /// How the admitted client classified one reply, by its own status byte.
@@ -353,6 +360,13 @@ static CONNECTION_TASKS: Mutex<Vec<tokio::task::AbortHandle>> = Mutex::new(Vec::
 /// Abort every hub connection task accepted since the last call, as a crash
 /// of the hub's serving task would; the endpoint stays up. Returns how many.
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_delivery_tests.rs"
+    )
+)]
 pub(crate) fn abort_connection_tasks_for_test() -> usize {
     let handles = std::mem::take(
         &mut *CONNECTION_TASKS
@@ -4764,6 +4778,13 @@ impl NativeReplyControl {
 
 /// The exact block one native request pays for its reply control.
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_delivery_tests.rs"
+    )
+)]
 pub(crate) fn native_reply_control_bytes_for_test() -> usize {
     contextdb_core::read_memory::ReadShared::<NativeReplyControl>::layout().size()
 }
@@ -4774,13 +4795,41 @@ pub(crate) enum NativeReplyEvent {
     BeforeAdmission,
     /// The subject and the body are admitted on the operation.
     Admitted {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         subject: usize,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         body: usize,
     },
     BeforeCharge,
     /// The control block and the request's paid edge copy are admitted.
     Charged {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         control: usize,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         edge: usize,
     },
     /// A further holder of the live control, handed to the probe.
@@ -5025,6 +5074,13 @@ struct SyncReplyWriter {
 
 /// Inline size of the reply writer a native finish callback captures.
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_delivery_tests.rs"
+    )
+)]
 pub(crate) fn reply_writer_bytes_for_test() -> usize {
     std::mem::size_of::<SyncReplyWriter>()
 }

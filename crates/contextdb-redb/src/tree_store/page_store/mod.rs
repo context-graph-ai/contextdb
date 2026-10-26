@@ -15,7 +15,7 @@ mod page_manager;
 pub(crate) use page_manager::rewrite_header_for_test;
 mod region;
 mod savepoint;
-#[allow(clippy::pedantic, dead_code)]
+#[allow(clippy::pedantic)]
 mod xxh3;
 
 pub use backends::InMemoryBackend;

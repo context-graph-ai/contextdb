@@ -70,6 +70,10 @@ async fn push_phase(client: &contextdb_server::SyncClient, label: &str) {
     phase(&format!("{label}-end"));
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_identical_schema_does_no_artifact_work, custody_schema_rep"
+)]
 fn declare_one_hundred_tables(edge: &Database) {
     for ordinal in 0usize..100 {
         let name = format!("schema_{ordinal:03}");
@@ -135,6 +139,10 @@ fn seed_unrelated_resident_vectors_with_count(receiver: &Database, row_count: i6
         .expect("commit the resident-vector fixture transaction");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_identical_schema_does_no_artifact_work, custody_schema_rep"
+)]
 fn receiver(path: &std::path::Path) -> Arc<Database> {
     receiver_with_unrelated_rows(path, crate::UNRELATED_RESIDENT_ROWS)
 }

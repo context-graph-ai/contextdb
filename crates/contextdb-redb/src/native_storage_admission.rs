@@ -1,5 +1,4 @@
 //! Internal owned admission for exact byte reads; no host or engine dependency.
-#![cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 use crate::atomic_compat::AtomicUpdate as _;
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
@@ -62,6 +61,13 @@ impl NativeStorageCredit {
     /// The static callbacks must operate on that exact concrete type, check
     /// strong-count overflow and free its cell before refunding its invoice.
     /// No stack/borrowed receiver, synthetic owner or uncharged fallback is legal.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from cache_reserve.rs"
+        )
+    )]
     pub unsafe fn from_owned_receipt(
         receipt: NonNull<()>,
         retain: unsafe fn(NonNull<()>),
@@ -129,6 +135,13 @@ impl NativeStorageAdmission {
     /// The credit contract above also applies to this paid scope cell. `admit`
     /// must be a static callback for the SAME concrete cell, preserving the
     /// original payer and placing its original typed failure in its paid slot.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from cache_reserve.rs"
+        )
+    )]
     pub unsafe fn from_owned_receipt(
         receipt: NonNull<()>,
         retain: unsafe fn(NonNull<()>),
@@ -150,6 +163,13 @@ impl NativeStorageAdmission {
     /// may neither retain the visitor/reference nor allocate or move a primary
     /// into a scope retained by that primary. The receipt contract still holds.
     #[must_use]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from native_storage_admission.rs"
+        )
+    )]
     pub unsafe fn with_failure_inspector(mut self, inspect: NativeFailureInspector) -> Self {
         self.inspect_failure = Some(inspect);
         self
@@ -166,11 +186,25 @@ impl NativeStorageAdmission {
             })
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_admission.rs"
+        )
+    )]
     pub(crate) fn cache_preparation_credit(&self) -> NativeStorageCredit {
         self.owner.clone()
     }
 
     /// Read-only identity comparison; no raw owner address escapes.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_membership_source.rs"
+        )
+    )]
     pub fn same_source(&self, other: &Self) -> bool {
         self.owner.receipt == other.owner.receipt
     }
@@ -209,6 +243,13 @@ impl Clone for NativeStorageAdmission {
 thread_local! {
     static NATIVE: RefCell<Option<NativeStorageAdmission>> = const { RefCell::new(None) };
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct Restore {
     previous: Option<NativeStorageAdmission>,
     _thread: PhantomData<*mut ()>,
@@ -220,6 +261,13 @@ impl Drop for Restore {
     }
 }
 #[doc(hidden)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
+    )
+)]
 pub fn with_native_storage_admission<R>(
     admission: NativeStorageAdmission,
     operation: impl FnOnce() -> R,
@@ -231,6 +279,13 @@ pub fn with_native_storage_admission<R>(
     };
     operation()
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_admission.rs"
+    )
+)]
 pub(crate) fn admit_native_storage(
     layout: Layout,
 ) -> Result<NativeStorageCredit, NativeColdReadError> {
@@ -241,6 +296,13 @@ pub(crate) fn admit_native_storage(
         .map_err(|_| NativeColdReadError::AdmissionRefusedAt(owner))
 }
 #[doc(hidden)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from btree.rs"
+    )
+)]
 pub fn native_storage_active() -> bool {
     NATIVE.with(|slot| slot.borrow().is_some())
 }
@@ -255,6 +317,13 @@ pub struct NativeColdFault {
     pub actual: u128,
 }
 impl NativeColdFault {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn new(reason: &'static str) -> Self {
         Self {
             reason,
@@ -336,8 +405,29 @@ pub enum NativeColdReadError {
         site: &'static str,
         layout: Layout,
     },
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from table_tree.rs"
+        )
+    )]
     TableAbsent,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from table_tree_base.rs"
+        )
+    )]
     TypeMismatch,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from btree.rs"
+        )
+    )]
     Corrupt(NativeColdFault),
     Io(std::io::Error),
     BackendIo(NativeIoCause),
@@ -349,17 +439,38 @@ impl From<NativeStorageRefused> for NativeColdReadError {
 }
 
 /// Exact fresh backing; its invoice is outside Vec's physical destruction.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from btree.rs"
+    )
+)]
 pub(crate) struct NativeStorageBuffer<T> {
     data: ManuallyDrop<Vec<T>>,
     invoice: Mutex<Option<NativeStorageCredit>>,
 }
 impl<T> NativeStorageBuffer<T> {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn new() -> Self {
         Self {
             data: ManuallyDrop::new(Vec::new()),
             invoice: Mutex::new(None),
         }
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn with_capacity(capacity: usize) -> Result<Self, NativeColdReadError> {
         let layout = Layout::array::<T>(capacity).map_err(|_| {
             NativeColdReadError::Corrupt(NativeColdFault::new("native buffer layout overflow"))
@@ -380,6 +491,13 @@ impl<T> NativeStorageBuffer<T> {
             invoice: Mutex::new(Some(invoice)),
         })
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn push(&mut self, item: T) -> Result<(), NativeColdReadError> {
         if self.data.len() == self.data.capacity() {
             let capacity = self
@@ -410,9 +528,23 @@ impl<T> NativeStorageBuffer<T> {
         self.data.push(item);
         Ok(())
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.data.pop()
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn as_slice(&self) -> &[T] {
         &self.data
     }
@@ -431,20 +563,48 @@ impl<T> Drop for NativeStorageBuffer<T> {
     }
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub(crate) struct NativeStorageSharedBlock<T> {
     owners: AtomicUsize,
     payload: ManuallyDrop<T>,
     ownership: Mutex<Option<NativeStorageCredit>>,
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from db.rs"
+    )
+)]
 pub(crate) struct NativeStorageShared<T> {
     block: NonNull<NativeStorageSharedBlock<T>>,
 }
 unsafe impl<T: Send + Sync> Send for NativeStorageShared<T> {}
 unsafe impl<T: Send + Sync> Sync for NativeStorageShared<T> {}
 impl<T> NativeStorageShared<T> {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn layout() -> Layout {
         Layout::new::<NativeStorageSharedBlock<T>>()
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn new(payload: T) -> Result<Self, NativeColdReadError> {
         let layout = Self::layout();
         let invoice = admit_native_storage(layout)?;
@@ -480,6 +640,13 @@ impl<T> Clone for NativeStorageShared<T> {
         Self { block: self.block }
     }
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct SharedFree<T> {
     block: NonNull<NativeStorageSharedBlock<T>>,
     invoice: Option<NativeStorageCredit>,
@@ -522,9 +689,23 @@ impl<T> Drop for NativeStorageShared<T> {
 
 // One physical hash-table allocation, including its original invoice header.
 // This allocator never consults current admission at destruction.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct ReaderRegistryHeader {
     invoice: Option<NativeStorageCredit>,
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transaction_tracker.rs"
+    )
+)]
 pub(crate) struct ReaderRegistryAllocator {
     pub(crate) qualified: bool,
     failure: RefCell<Option<NativeColdReadError>>,
@@ -537,6 +718,13 @@ impl Clone for ReaderRegistryAllocator {
     }
 }
 impl ReaderRegistryAllocator {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn new(qualified: bool) -> Self {
         Self {
             qualified,
@@ -552,6 +740,13 @@ impl ReaderRegistryAllocator {
             .filter(|(_, owner, _)| *owner == accountant)
             .map_or(0, |(_, _, bytes)| bytes)
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn error(&self) -> crate::StorageError {
         self.failure.borrow_mut().take().map_or_else(
             // No observed allocator call: capacity/layout failure is unqualified.
@@ -559,6 +754,13 @@ impl ReaderRegistryAllocator {
             native_storage_error,
         )
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn combined(layout: Layout) -> (Layout, usize) {
         let (whole, offset) = Layout::new::<ReaderRegistryHeader>()
             .extend(layout)
@@ -665,6 +867,13 @@ pub(crate) fn native_storage_error(error: NativeColdReadError) -> crate::Storage
 }
 impl NativeStorageAdmission {
     // Private capability retention for native views, not a snapshot/test accessor.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_admission.rs"
+        )
+    )]
     pub(crate) fn retain_current() -> Result<Self, crate::StorageError> {
         NATIVE
             .with(|slot| slot.borrow().clone())
@@ -820,6 +1029,13 @@ pub(crate) fn pending_allocation_error() -> crate::StorageError {
 /// I/O or corruption. This type is private to the internal feature protocol.
 #[doc(hidden)]
 #[derive(Debug)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_storage_admission.rs"
+    )
+)]
 pub enum PreparedReadError {
     /// Same existing static corruption diagnosis, before String materialization.
     StaticCorrupted(&'static str),
@@ -832,12 +1048,26 @@ pub enum PreparedReadError {
 /// A later formatter can inspect the actual stored type names without having
 /// lost them to a scalar TypeMismatch marker or an allocating owned decoder.
 #[doc(hidden)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from lib.rs"
+    )
+)]
 pub struct PreparedTableDefinitionError {
     pub cause: NativeColdReadError,
     descriptor: crate::AccessGuard<'static, &'static [u8]>,
     requested: NativeStorageBuffer<u8>,
 }
 impl PreparedTableDefinitionError {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn new(
         cause: NativeColdReadError,
         descriptor: crate::AccessGuard<'static, &'static [u8]>,
@@ -849,9 +1079,23 @@ impl PreparedTableDefinitionError {
             requested,
         }
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn requested_table(&self) -> &str {
         std::str::from_utf8(self.requested.as_slice()).expect("copied table name UTF-8")
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn descriptor(&self) -> &[u8] {
         self.descriptor.value()
     }

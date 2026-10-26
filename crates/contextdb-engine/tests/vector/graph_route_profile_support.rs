@@ -20,6 +20,10 @@ const PARTITIONS: usize = 3;
 const PROBES: usize = 100;
 const K: usize = 10;
 // Include the query floor and the larger silent profile in the calibration.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by vector, vector_graph_route_profile_quality"
+)]
 const BREADTH_CANDIDATES: [usize; 9] = [10, 12, 16, 20, 24, 28, 32, 100, 400];
 
 struct Counter(AtomicU64);
@@ -298,10 +302,18 @@ fn fixture(n: usize, shape: &str, seed: usize) -> Database {
     panic!("maintenance did not publish all {PARTITIONS} profile partitions at n={n}")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by vector, vector_graph_route_profile_quality"
+)]
 fn quality_passes(matched: u64, indexed_work: u64, exact_work: u64) -> bool {
     matched * 100 >= (PROBES * K * 95) as u64 && indexed_work <= exact_work
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by vector_graph_recall_50000_isotropic_per_context, vector_graph_recall_50001_aniso"
+)]
 const BUILD_QUALITY_PROFILES: [(usize, &str, usize); 4] = [
     (5_000_usize, "anisotropic", 17_usize),
     (5_001, "topic_clusters", 17),
@@ -309,6 +321,10 @@ const BUILD_QUALITY_PROFILES: [(usize, &str, usize); 4] = [
     (50_001, "anisotropic", 17),
 ];
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by vector_graph_recall_50000_isotropic_per_context, vector_graph_recall_50001_aniso"
+)]
 fn run_build_quality_profile(profile: usize) {
     assert_eq!(
         contextdb_vector::hnsw::f32_hnsw_build_options_for_test(),

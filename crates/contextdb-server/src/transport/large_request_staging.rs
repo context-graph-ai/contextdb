@@ -2051,7 +2051,6 @@ fn reset_errno() {
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn reset_errno() {}
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PausePoint {
     CreateDirectory,

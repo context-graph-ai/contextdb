@@ -6,7 +6,9 @@ use contextdb_engine::Database;
 #[cfg(feature = "test-seams")]
 use contextdb_engine::sync_types as sync;
 use std::collections::{BTreeSet, HashMap};
-#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
+#[rustfmt::skip]
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports, reason = "KEEP-SEAM: live only under the test-seams feature"))]
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports, reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_tests.rs"))]
 use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, TryRecvError}, Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};

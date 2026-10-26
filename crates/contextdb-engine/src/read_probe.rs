@@ -39,6 +39,13 @@ pub(crate) fn note_cancellation(
         });
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader.rs"
+    )
+)]
 pub(crate) fn observed_cancellations() -> Vec<ObservedCancellation> {
     CANCELLATIONS
         .lock()

@@ -3987,7 +3987,21 @@ pub(crate) mod root_observations {
         producer: u8,
         counter: usize,
         payload_bytes: usize,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from allocator_events.rs"
+            )
+        )]
         allocation_attempts: usize,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         before_allocation: u64,
         payer: Option<usize>,
         free_before: u64,

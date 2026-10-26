@@ -20,6 +20,13 @@ mod native_wire;
 #[doc(hidden)]
 pub use native_wire::ReadBoundStreamInstallation;
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub(crate) use native_wire::native_delivery_error;
 #[doc(hidden)]
 pub use native_wire::{AdmittedWireFuture, DispatchedWireFuture};
@@ -712,6 +719,13 @@ pub(crate) mod release_events {
 
     /// Wait until `done()` holds, re-checking after each release event. The
     /// long wait bound only turns a lost event into a failing test.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn wait_until(mut done: impl FnMut() -> bool) -> bool {
         let mut seen = RELEASED.lock().unwrap_or_else(|p| p.into_inner());
         loop {
@@ -759,10 +773,24 @@ pub(crate) mod native_pause {
 
     impl Gate {
         /// Resolves once a request is held at the point (or already was).
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         pub(crate) async fn reached(&self) {
             self.reached.notified().await;
         }
         /// Lets the held request continue.
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         pub(crate) fn release(&self) {
             self.release.notify_one();
         }
@@ -771,6 +799,13 @@ pub(crate) mod native_pause {
     static ARMED: Mutex<Option<(Point, Arc<Gate>)>> = Mutex::new(None);
 
     /// Arm `point` for the next request that reaches it.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn arm(point: Point) -> Arc<Gate> {
         let gate = Arc::new(Gate::default());
         *ARMED.lock().unwrap_or_else(|p| p.into_inner()) = Some((point, gate.clone()));
@@ -1004,6 +1039,13 @@ impl AdmittedWireVec {
     /// Copy a borrowed eager payload only after the authentic operation exists.
     /// The source allocation is external custody, never adopted as prepaid.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from in_process.rs"
+        )
+    )]
     fn copy_for_native(
         bytes: &[u8],
         operation: &crate::owner_read::NativeReadRequest,
@@ -1268,6 +1310,13 @@ struct NativeStopControl {
 struct NativeStopState {
     // Remains true throughout listener retirement, including its release wait.
     // No later registration can overlap the previous registration's writers.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     registered: bool,
     writers: usize,
     waker: Option<contextdb_core::read_memory::NativeReadWakeLease>,
@@ -1327,6 +1376,13 @@ impl NativeStop {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from in_process.rs"
+        )
+    )]
     pub(crate) fn is_stopped(&self) -> bool {
         self.flag.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1345,6 +1401,13 @@ impl NativeStop {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from in_process.rs"
+        )
     )]
     pub(crate) fn try_register_wake<T>(
         &self,
@@ -1372,6 +1435,13 @@ impl NativeStop {
     }
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from in_process.rs"
+    )
+)]
 pub(crate) struct NativeStopListener {
     wake: contextdb_core::read_memory::ReadShared<NativeStopControl>,
 }

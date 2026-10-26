@@ -7,12 +7,33 @@ use serde::Serialize;
 mod borrowed_packet;
 mod paid_request;
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub(crate) use borrowed_packet::PAGE_CUT_SIZES;
 pub(crate) use borrowed_packet::{NativePacketNamespace, encode_custody_outcomes};
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub(crate) use paid_request::page_bound;
 pub(crate) use paid_request::paid_delivery_response;
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from paid_request.rs"
+    )
+)]
 pub(crate) use paid_request::{AFTER_SELECTION, AFTER_SELECTION_ANY_THREAD};
 
 // The wire grammar owns no allocator or request capability. Its concrete

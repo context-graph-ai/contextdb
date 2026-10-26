@@ -362,8 +362,11 @@ impl<'de> serde::Deserialize<'de> for CheckedBytes {
         decoder.deserialize_seq(V)
     }
 }
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
+#[allow(
+    dead_code,
+    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `Tag` format"
+)]
 pub(super) struct Tag {
     pub version: u8,
     name: CheckedBytes,
@@ -372,8 +375,11 @@ pub(super) struct Tag {
     pub format: u8,
     role: BlobTagRole,
 }
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
+#[allow(
+    dead_code,
+    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `Staging` format"
+)]
 pub(super) struct Staging {
     pub version: u8,
     pub object_id: [u8; 16],

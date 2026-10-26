@@ -129,6 +129,10 @@ pub fn encode_query_result(input: &QueryFixture) -> Result<Vec<u8>, ReadEncoding
         .map(|bytes| bytes.to_vec())
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
 pub fn cursor_page(
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
@@ -159,6 +163,10 @@ pub fn encode_cursor_page(
 
 // Outbound framing retains payload and frame simultaneously. The finite setup
 // owner covers exactly both native buffers; the boundary's limits still apply.
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
 pub trait FixtureFrame {
     fn encode_fixture_frame(
         &self,
@@ -194,6 +202,10 @@ impl FixtureFrame for contextdb_engine::local_transport::LocalProtocolBoundary {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
 pub fn encode_metadata_page(
     page: &contextdb_core::read_contract::MetadataPage,
 ) -> Result<Vec<u8>, ReadEncodingError> {
@@ -201,6 +213,10 @@ pub fn encode_metadata_page(
         .map(|bytes| bytes.to_vec())
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
 pub fn engine_failure(
     error: &contextdb_core::Error,
 ) -> contextdb_engine::local_transport::LocalEngineFailure {

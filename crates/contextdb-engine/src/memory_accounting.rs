@@ -1798,7 +1798,6 @@ pub(crate) fn record_domain_ceiling_for_test(ceiling: Option<usize>) {
 }
 
 /// (aggregate bytes, recorded process ceiling) for receipts and rows.
-#[allow(dead_code)] // Keep the aggregate receipt seam available to memory-accounting tests.
 pub(crate) fn process_aggregate_snapshot() -> (usize, Option<usize>) {
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
     (

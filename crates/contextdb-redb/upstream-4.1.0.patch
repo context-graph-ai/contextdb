@@ -3107,9 +3107,8 @@
      /// Returns `true` if the key-value pair was present
 --- /dev/null
 +++ b/src/native_storage_admission.rs
-@@ -0,0 +1,1018 @@
+@@ -0,0 +1,1262 @@
 +//! Internal owned admission for exact byte reads; no host or engine dependency.
-+#![cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 +use crate::atomic_compat::AtomicUpdate as _;
 +use std::alloc::{Layout, alloc, dealloc};
 +use std::cell::RefCell;
@@ -3172,6 +3171,13 @@
 +    /// The static callbacks must operate on that exact concrete type, check
 +    /// strong-count overflow and free its cell before refunding its invoice.
 +    /// No stack/borrowed receiver, synthetic owner or uncharged fallback is legal.
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from cache_reserve.rs"
++        )
++    )]
 +    pub unsafe fn from_owned_receipt(
 +        receipt: NonNull<()>,
 +        retain: unsafe fn(NonNull<()>),
@@ -3239,6 +3245,13 @@
 +    /// The credit contract above also applies to this paid scope cell. `admit`
 +    /// must be a static callback for the SAME concrete cell, preserving the
 +    /// original payer and placing its original typed failure in its paid slot.
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from cache_reserve.rs"
++        )
++    )]
 +    pub unsafe fn from_owned_receipt(
 +        receipt: NonNull<()>,
 +        retain: unsafe fn(NonNull<()>),
@@ -3260,6 +3273,13 @@
 +    /// may neither retain the visitor/reference nor allocate or move a primary
 +    /// into a scope retained by that primary. The receipt contract still holds.
 +    #[must_use]
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from native_storage_admission.rs"
++        )
++    )]
 +    pub unsafe fn with_failure_inspector(mut self, inspect: NativeFailureInspector) -> Self {
 +        self.inspect_failure = Some(inspect);
 +        self
@@ -3276,11 +3296,25 @@
 +            })
 +    }
 +
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_admission.rs"
++        )
++    )]
 +    pub(crate) fn cache_preparation_credit(&self) -> NativeStorageCredit {
 +        self.owner.clone()
 +    }
 +
 +    /// Read-only identity comparison; no raw owner address escapes.
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_membership_source.rs"
++        )
++    )]
 +    pub fn same_source(&self, other: &Self) -> bool {
 +        self.owner.receipt == other.owner.receipt
 +    }
@@ -3319,6 +3353,13 @@
 +thread_local! {
 +    static NATIVE: RefCell<Option<NativeStorageAdmission>> = const { RefCell::new(None) };
 +}
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature"
++    )
++)]
 +struct Restore {
 +    previous: Option<NativeStorageAdmission>,
 +    _thread: PhantomData<*mut ()>,
@@ -3330,6 +3371,13 @@
 +    }
 +}
 +#[doc(hidden)]
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
++    )
++)]
 +pub fn with_native_storage_admission<R>(
 +    admission: NativeStorageAdmission,
 +    operation: impl FnOnce() -> R,
@@ -3341,6 +3389,13 @@
 +    };
 +    operation()
 +}
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_admission.rs"
++    )
++)]
 +pub(crate) fn admit_native_storage(
 +    layout: Layout,
 +) -> Result<NativeStorageCredit, NativeColdReadError> {
@@ -3351,6 +3406,13 @@
 +        .map_err(|_| NativeColdReadError::AdmissionRefusedAt(owner))
 +}
 +#[doc(hidden)]
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from btree.rs"
++    )
++)]
 +pub fn native_storage_active() -> bool {
 +    NATIVE.with(|slot| slot.borrow().is_some())
 +}
@@ -3365,6 +3427,13 @@
 +    pub actual: u128,
 +}
 +impl NativeColdFault {
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn new(reason: &'static str) -> Self {
 +        Self {
 +            reason,
@@ -3446,8 +3515,29 @@
 +        site: &'static str,
 +        layout: Layout,
 +    },
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from table_tree.rs"
++        )
++    )]
 +    TableAbsent,
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from table_tree_base.rs"
++        )
++    )]
 +    TypeMismatch,
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from btree.rs"
++        )
++    )]
 +    Corrupt(NativeColdFault),
 +    Io(std::io::Error),
 +    BackendIo(NativeIoCause),
@@ -3459,17 +3549,38 @@
 +}
 +
 +/// Exact fresh backing; its invoice is outside Vec's physical destruction.
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from btree.rs"
++    )
++)]
 +pub(crate) struct NativeStorageBuffer<T> {
 +    data: ManuallyDrop<Vec<T>>,
 +    invoice: Mutex<Option<NativeStorageCredit>>,
 +}
 +impl<T> NativeStorageBuffer<T> {
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn new() -> Self {
 +        Self {
 +            data: ManuallyDrop::new(Vec::new()),
 +            invoice: Mutex::new(None),
 +        }
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, NativeColdReadError> {
 +        let layout = Layout::array::<T>(capacity).map_err(|_| {
 +            NativeColdReadError::Corrupt(NativeColdFault::new("native buffer layout overflow"))
@@ -3490,6 +3601,13 @@
 +            invoice: Mutex::new(Some(invoice)),
 +        })
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn push(&mut self, item: T) -> Result<(), NativeColdReadError> {
 +        if self.data.len() == self.data.capacity() {
 +            let capacity = self
@@ -3520,9 +3638,23 @@
 +        self.data.push(item);
 +        Ok(())
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn pop(&mut self) -> Option<T> {
 +        self.data.pop()
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn as_slice(&self) -> &[T] {
 +        &self.data
 +    }
@@ -3541,20 +3673,48 @@
 +    }
 +}
 +
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature"
++    )
++)]
 +pub(crate) struct NativeStorageSharedBlock<T> {
 +    owners: AtomicUsize,
 +    payload: ManuallyDrop<T>,
 +    ownership: Mutex<Option<NativeStorageCredit>>,
 +}
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from db.rs"
++    )
++)]
 +pub(crate) struct NativeStorageShared<T> {
 +    block: NonNull<NativeStorageSharedBlock<T>>,
 +}
 +unsafe impl<T: Send + Sync> Send for NativeStorageShared<T> {}
 +unsafe impl<T: Send + Sync> Sync for NativeStorageShared<T> {}
 +impl<T> NativeStorageShared<T> {
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn layout() -> Layout {
 +        Layout::new::<NativeStorageSharedBlock<T>>()
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn new(payload: T) -> Result<Self, NativeColdReadError> {
 +        let layout = Self::layout();
 +        let invoice = admit_native_storage(layout)?;
@@ -3590,6 +3750,13 @@
 +        Self { block: self.block }
 +    }
 +}
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature"
++    )
++)]
 +struct SharedFree<T> {
 +    block: NonNull<NativeStorageSharedBlock<T>>,
 +    invoice: Option<NativeStorageCredit>,
@@ -3632,9 +3799,23 @@
 +
 +// One physical hash-table allocation, including its original invoice header.
 +// This allocator never consults current admission at destruction.
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature"
++    )
++)]
 +struct ReaderRegistryHeader {
 +    invoice: Option<NativeStorageCredit>,
 +}
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from transaction_tracker.rs"
++    )
++)]
 +pub(crate) struct ReaderRegistryAllocator {
 +    pub(crate) qualified: bool,
 +    failure: RefCell<Option<NativeColdReadError>>,
@@ -3647,6 +3828,13 @@
 +    }
 +}
 +impl ReaderRegistryAllocator {
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn new(qualified: bool) -> Self {
 +        Self {
 +            qualified,
@@ -3662,6 +3850,13 @@
 +            .filter(|(_, owner, _)| *owner == accountant)
 +            .map_or(0, |(_, _, bytes)| bytes)
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn error(&self) -> crate::StorageError {
 +        self.failure.borrow_mut().take().map_or_else(
 +            // No observed allocator call: capacity/layout failure is unqualified.
@@ -3669,6 +3864,13 @@
 +            native_storage_error,
 +        )
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    fn combined(layout: Layout) -> (Layout, usize) {
 +        let (whole, offset) = Layout::new::<ReaderRegistryHeader>()
 +            .extend(layout)
@@ -3775,6 +3977,13 @@
 +}
 +impl NativeStorageAdmission {
 +    // Private capability retention for native views, not a snapshot/test accessor.
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_admission.rs"
++        )
++    )]
 +    pub(crate) fn retain_current() -> Result<Self, crate::StorageError> {
 +        NATIVE
 +            .with(|slot| slot.borrow().clone())
@@ -3930,6 +4139,13 @@
 +/// I/O or corruption. This type is private to the internal feature protocol.
 +#[doc(hidden)]
 +#[derive(Debug)]
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_storage_admission.rs"
++    )
++)]
 +pub enum PreparedReadError {
 +    /// Same existing static corruption diagnosis, before String materialization.
 +    StaticCorrupted(&'static str),
@@ -3942,12 +4158,26 @@
 +/// A later formatter can inspect the actual stored type names without having
 +/// lost them to a scalar TypeMismatch marker or an allocating owned decoder.
 +#[doc(hidden)]
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from lib.rs"
++    )
++)]
 +pub struct PreparedTableDefinitionError {
 +    pub cause: NativeColdReadError,
 +    descriptor: crate::AccessGuard<'static, &'static [u8]>,
 +    requested: NativeStorageBuffer<u8>,
 +}
 +impl PreparedTableDefinitionError {
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn new(
 +        cause: NativeColdReadError,
 +        descriptor: crate::AccessGuard<'static, &'static [u8]>,
@@ -3959,9 +4189,23 @@
 +            requested,
 +        }
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub fn requested_table(&self) -> &str {
 +        std::str::from_utf8(self.requested.as_slice()).expect("copied table name UTF-8")
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub fn descriptor(&self) -> &[u8] {
 +        self.descriptor.value()
 +    }
@@ -4234,7 +4478,7 @@
 +}
 --- /dev/null
 +++ b/src/read_admission.rs
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,680 @@
 +//! Operation-scoped admission before allocating a source page. The caller
 +//! keeps admitted bytes owned until its read handles have been released.
 +use crate::StorageError;
@@ -4318,7 +4562,6 @@
 +
 +// Preserve opaque foreign callers exactly, without silently treating their Box
 +// as the concrete free-before-refund protocol used by the closed engine factory.
-+#[allow(dead_code)] // Variants own their receipts solely for destruction.
 +pub(crate) enum ReadMemoryCharge {
 +    Legacy(ReadPageCharge),
 +    #[cfg(feature = "contextdb-internal")]
@@ -4567,7 +4810,6 @@
 +}
 +
 +// The receipt is moved out with the complete node and dropped only after free.
-+#[allow(dead_code)] // Native credit is owned solely for destruction.
 +enum ScanNodeInvoice {
 +    Legacy,
 +    #[cfg(feature = "contextdb-internal")]
@@ -4578,10 +4820,6 @@
 +    previous: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
 +    next: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
 +    allowance: ScanAllowance,
-+    #[allow(
-+        dead_code,
-+        reason = "Retained for destruction and inspected only with test-seams."
-+    )]
 +    invoice: ScanNodeInvoice,
 +}
 +
@@ -5155,7 +5393,7 @@
 +}
 --- /dev/null
 +++ b/src/table_registry.rs
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,403 @@
 +//! The write transaction's set of open tables.
 +//!
 +//! It is the same hash table and the same randomly seeded hasher as
@@ -5166,7 +5404,6 @@
 +
 +// The funding methods are reached only through the hidden
 +// `contextdb-internal` surface; without it the registry is a plain map.
-+#![cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 +
 +use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
 +use std::hash::RandomState;
@@ -5296,6 +5533,13 @@
 +        }
 +    }
 +
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    fn take_refused(&self) -> Option<Layout> {
 +        let size = self.refused_size.swap(0, Ordering::SeqCst);
 +        let align = self.refused_align.swap(0, Ordering::SeqCst);
@@ -5351,8 +5595,22 @@
 +}
 +
 +/// Sets the per-call funded state and restores it on every exit.
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
++    )
++)]
 +pub(crate) struct FundedCall<'a>(&'a RegistryFunding);
 +impl<'a> FundedCall<'a> {
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn enter(funding: &'a RegistryFunding, credit: usize) -> Self {
 +        funding.take_refused();
 +        funding.credit.store(credit, Ordering::SeqCst);
@@ -5362,10 +5620,24 @@
 +
 +    /// The layout the last refused allocation asked for, if this call
 +    /// refused one.
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn refused(&self) -> Option<Layout> {
 +        self.0.take_refused()
 +    }
 +
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn allocations(&self) -> usize {
 +        self.0.allocations.load(Ordering::SeqCst)
 +    }
@@ -5379,6 +5651,13 @@
 +
 +/// Why the cost of a registry change could not be learned or paid.
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
++    )
++)]
 +pub enum RegistryReserveError {
 +    /// The requested capacity overflows the hash table's layout arithmetic;
 +    /// nothing was asked of the allocator.
@@ -5390,6 +5669,13 @@
 +    ReplacementTooSmall,
 +}
 +
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
++    )
++)]
 +pub(crate) fn reserve_error(
 +    error: hashbrown::TryReserveError,
 +    call: &FundedCall<'_>,
@@ -5404,11 +5690,25 @@
 +
 +/// An empty registry array reserved ahead of time, so that putting the open
 +/// tables back into a baseline-sized array later allocates nothing.
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
++    )
++)]
 +pub struct RegistryReplacement {
 +    pub(crate) map: OpenTables,
 +}
 +impl RegistryReplacement {
 +    /// The bytes this replacement's array holds.
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from store.rs"
++        )
++    )]
 +    pub fn allocation_bytes(&self) -> usize {
 +        self.map.allocation_size()
 +    }
@@ -5416,12 +5716,26 @@
 +
 +/// Counts allocations of the registry made outside a funded reserve for as
 +/// long as it is held, and restores the previous state when dropped.
++#[cfg_attr(
++    not(feature = "test-seams"),
++    allow(
++        dead_code,
++        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
++    )
++)]
 +pub struct RegistryMonitor {
 +    funding: Arc<RegistryFunding>,
 +    previous: bool,
 +    overdraft_at_start: usize,
 +}
 +impl RegistryMonitor {
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn start(funding: &Arc<RegistryFunding>) -> Self {
 +        let previous = funding.monitoring.swap(true, Ordering::SeqCst);
 +        Self {
@@ -5433,6 +5747,13 @@
 +
 +    /// Bytes the registry allocated outside a funded reserve since this
 +    /// monitor started.
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature; used from open_table_registry_allocations.rs"
++        )
++    )]
 +    pub fn overdraft_bytes(&self) -> usize {
 +        self.funding.overdraft.load(Ordering::SeqCst) - self.overdraft_at_start
 +    }
@@ -15863,7 +16184,17 @@
      pub(crate) fn trailing_free_pages(&self) -> u32 {
          let mut free_pages = 0;
          let mut next_page = self.len() - 1;
-@@ -218,6 +303,9 @@
+@@ -191,9 +276,7 @@
+         free_pages
+     }
+ 
+-    #[cfg_attr(not(debug_assertions), expect(dead_code))]
+     #[cfg_attr(not(test), expect(clippy::unused_self))]
+-    #[cfg_attr(not(test), expect(unused_variables))]
+     pub(crate) fn check_allocated_pages(&self, region: u32, allocated_pages: &[PageNumber]) {
+         #[cfg(test)]
+         // Check the result against the free index to be sure it matches
+@@ -218,6 +301,9 @@
      }
  
      pub(crate) fn resize(&mut self, new_size: u32) {
@@ -15873,7 +16204,7 @@
          self.debug_check_consistency();
          if new_size > self.len() {
              let mut processed_pages = self.len();
-@@ -285,8 +373,10 @@
+@@ -285,8 +371,10 @@
          self.debug_check_consistency();
      }
  
@@ -15885,7 +16216,7 @@
          // Don't enable when fuzzing, because this is kind of expensive
          #[cfg(all(debug_assertions, not(fuzzing)))]
          {
-@@ -318,7 +408,7 @@
+@@ -318,7 +406,7 @@
                          let buddy = buddy_page(page);
                          if buddy < allocator.len() {
                              let buddy_allocated = allocator.get(buddy);
@@ -15894,7 +16225,7 @@
                          }
                      }
                  }
-@@ -328,16 +418,57 @@
+@@ -328,16 +416,57 @@
  
      // Allocates a page of the given order at the lowest index possible. Will split a higher order page,
      // to get one of lower index
@@ -15956,7 +16287,7 @@
                  let index_at_order = index * multiplier;
                  if index_at_order < best_index_at_order {
                      self.free_inner(best.0, best.1);
-@@ -349,19 +480,12 @@
+@@ -349,19 +478,12 @@
              }
              multiplier *= 2;
          }
@@ -15977,7 +16308,7 @@
          Some(best.0)
      }
  
-@@ -370,6 +494,9 @@
+@@ -370,6 +492,9 @@
      }
  
      pub(crate) fn alloc_inner(&mut self, order: u8) -> Option<u32> {
@@ -15987,7 +16318,7 @@
          if order > self.max_order {
              return None;
          }
-@@ -397,8 +524,14 @@
+@@ -397,8 +522,14 @@
      }
  
      pub(crate) fn record_alloc_inner(&mut self, page_number: u32, order: u8) {
@@ -16004,7 +16335,7 @@
              // Need to split parent page
              let upper_page = next_higher_order(page_number);
              self.record_alloc_inner(upper_page, order + 1);
-@@ -412,7 +545,7 @@
+@@ -412,7 +543,7 @@
                  allocator.clear(free1);
              }
          } else {
@@ -16013,7 +16344,7 @@
          }
      }
  
-@@ -425,6 +558,9 @@
+@@ -425,6 +556,9 @@
      }
  
      pub(crate) fn free_inner(&mut self, page_number: u32, order: u8) {
@@ -16023,7 +16354,7 @@
          if order == self.max_order {
              let allocator = self.get_order_free_mut(order);
              allocator.clear(page_number);
-@@ -453,7 +589,61 @@
+@@ -453,7 +587,61 @@
  
  #[cfg(test)]
  mod test {
@@ -20501,7 +20832,7 @@
  mod backends;
  mod base;
  mod bitmap;
-@@ -8,7 +9,10 @@
+@@ -8,10 +9,13 @@
  mod header;
  mod layout;
  mod lru_cache;
@@ -20511,7 +20842,11 @@
 +pub(crate) use page_manager::rewrite_header_for_test;
  mod region;
  mod savepoint;
- #[allow(clippy::pedantic, dead_code)]
+-#[allow(clippy::pedantic, dead_code)]
++#[allow(clippy::pedantic)]
+ mod xxh3;
+ 
+ pub use backends::InMemoryBackend;
 @@ -19,6 +23,7 @@
  pub(crate) use base::{
      MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageHint, PageNumber, PageTrackerPolicy,
@@ -20540,7 +20875,7 @@
 +pub use cached_file::CheckedWriterBackendForTest;
 --- /dev/null
 +++ b/src/tree_store/page_store/page_allocation.rs
-@@ -0,0 +1,788 @@
+@@ -0,0 +1,786 @@
 +//! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 +//! escape independently of the payer. Native copies retain their separate owner.
 +use crate::atomic_compat::AtomicUpdate as _;
@@ -20988,11 +21323,9 @@
 +            .owners
 +            .load(Ordering::Acquire)
 +    }
-+    #[allow(dead_code)]
 +    pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
 +        left.block == right.block
 +    }
-+    #[allow(dead_code)]
 +    pub(crate) fn as_ptr(this: &Self) -> *const () {
 +        this.block.as_ptr().cast()
 +    }

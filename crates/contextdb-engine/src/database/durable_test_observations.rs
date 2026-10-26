@@ -1,5 +1,4 @@
 // Test observations pin the published durable root and release each admitted window.
-#[allow(dead_code)]
 mod durable_observation {
     use super::*;
     use crate::persistence::writer_source::{WriterCursorFamily};

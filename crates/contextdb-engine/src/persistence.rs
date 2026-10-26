@@ -97,7 +97,6 @@ use source_shared::SourceShared;
 mod authored_history;
 pub(crate) mod blob_selector;
 pub(crate) mod discard_history;
-#[allow(dead_code)]
 // Staged native storage admission is inactive until its integration prerequisites land.
 pub(crate) mod native_storage_admission;
 #[cfg(test)]
@@ -716,7 +715,6 @@ pub(crate) struct ReadPersistenceImage {
 /// transaction, load lock, and runtime breadcrumb have been released. The
 /// separate handoff retains the exact read-only database/descriptor and
 /// registered storage root.
-#[allow(dead_code)]
 pub(crate) struct ReadPersistenceImageParts {
     pub(crate) open_context: crate::executor::bounded::ReadOpenContext,
     pub(crate) content_identity: DirectTypedImageDigest,
@@ -724,6 +722,13 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) relational_tables: HashMap<String, Vec<VersionedRow>>,
     pub(crate) lazy_relational: bool,
     pub(crate) read_bounds: WriterRecoveryBounds,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_image_decode.rs"
+        )
+    )]
     pub(crate) vector_entries: Vec<VectorEntry>,
     pub(crate) current_vectors: HashMap<(VectorIndexRef, RowId), Vec<f32>>,
     pub(crate) sync_source_lsns: HashMap<(String, RowId), Lsn>,
@@ -733,8 +738,22 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) commit_index: BTreeMap<Lsn, TxId>,
     pub(crate) history_on_request: Option<ReadHistoryOnRequest>,
     pub(crate) config_values: Vec<(String, Vec<u8>)>,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from reader_registration.rs"
+        )
+    )]
     pub(crate) sink_audit: Vec<(String, Vec<u8>)>,
     pub(crate) trigger_audit: Vec<(String, Vec<u8>)>,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from reader_registration.rs"
+        )
+    )]
     pub(crate) trigger_audit_stamps: Vec<(String, u64)>,
     pub(crate) sink_queues: BTreeMap<String, Vec<(u64, Vec<u8>)>>,
     pub(crate) sink_queue_extents: BTreeMap<String, SinkQueueExtent>,
@@ -782,7 +801,6 @@ pub(crate) enum ReadImageCorruptionCause {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 #[cfg(test)]
 pub(crate) enum LoadReadImageErrorKind {
     NotImplemented,
@@ -1347,8 +1365,11 @@ struct InspectedSequence<T> {
 
 /// Positional inspection forms of the canonical persisted vector. All route
 /// strings borrow the authenticated input; payload sequences never reserve.
-#[allow(dead_code)]
 #[derive(Deserialize)]
+#[allow(
+    dead_code,
+    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `InspectedPersistedVector` format"
+)]
 enum InspectedPersistedVector {
     F32(InspectedSequence<f32>),
     SQ8 {
@@ -1388,7 +1409,6 @@ struct ReadVectorRename {
 
 /// What kind of history, audit or queued record a file-reader open touched.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(any(test, feature = "test-seams")), allow(dead_code))]
 pub(crate) enum OpenHistoryClass {
     ChangeLog,
     DdlLog,
@@ -1397,6 +1417,13 @@ pub(crate) enum OpenHistoryClass {
     /// fixed-size numbers compared and dropped, nothing decoded or kept.
     CommitIndexScanned,
     Audit,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_image_decode.rs"
+        )
+    )]
     Queued,
 }
 

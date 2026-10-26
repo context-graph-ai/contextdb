@@ -602,7 +602,10 @@ impl Drop for LocalRegistration {
 // constructed or allocated: only their compiler layouts enter same-bucket
 // subtraction. Database and public child layouts retain the pre2 contract;
 // independent pre2/final layout receipts must verify that prerequisite.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
+)]
 struct Pre2TemporaryMemoryReservation {
     accountant: crate::memory_accounting::AccountantHandle,
     bytes: usize,
@@ -623,7 +626,10 @@ pub(crate) struct Pre2PreparedMemorySwap {
     staged_admissions: Option<StagedAdmissionRepricing>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
+)]
 pub(super) struct Pre2PendingLocalSchemaStage {
     working: Pre2Database,
     base_tables: HashMap<String, TableMeta>,
@@ -633,7 +639,10 @@ pub(super) struct Pre2PendingLocalSchemaStage {
     temporary_memory: Pre2TemporaryMemoryReservation,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
+)]
 pub(crate) struct Pre2LocalSchemaStage {
     relational: Vec<TableProjection>,
     affected_tables: HashSet<String>,
@@ -652,7 +661,10 @@ pub(crate) struct Pre2LocalSchemaStage {
     _vector_copy_owner: contextdb_vector::VectorCopyAdmission,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
+)]
 pub(crate) struct Pre2ReceivedSchemaStage {
     custody_memory: Option<custody_store::CustodyDelta>,
     source_order: Vec<ReceivedSchemaOrderEntry>,
@@ -2128,7 +2140,6 @@ fn family_refusal_literals_for_test() {
 // fields have the same pointer layout under the selected private wrappers.
 // It pins only the registry migration; every other field takes its current
 // type, so `tx_mgr` follows the transaction host Database now holds.
-#[allow(dead_code)]
 struct Pre2Database {
     /// This handle's identity, never an address. Every handle gets its own,
     /// including one derived by narrowing another's access, exactly as each

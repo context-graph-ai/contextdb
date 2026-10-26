@@ -18,6 +18,13 @@ struct CommitFault {
 static BEFORE_COMMIT_FAULT: std::sync::Mutex<Option<CommitFault>> = std::sync::Mutex::new(None);
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from fixtures.rs"
+    )
+)]
 pub(crate) fn arm_commit_fault(root: RowRef, digest: [u8; 32]) {
     *BEFORE_COMMIT_FAULT.lock().unwrap() = Some(CommitFault {
         root,
@@ -27,6 +34,13 @@ pub(crate) fn arm_commit_fault(root: RowRef, digest: [u8; 32]) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from fixtures.rs"
+    )
+)]
 pub(crate) fn commit_fault_reached() -> bool {
     BEFORE_COMMIT_FAULT
         .lock()

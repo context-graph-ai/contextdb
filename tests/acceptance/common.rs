@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use contextdb_core::{Direction, Error, Value, VectorIndexRef, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
 use contextdb_server::transport::iroh::IrohServer;
@@ -26,6 +24,10 @@ pub(crate) struct SyncFixture {
     pub(crate) ticket: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn workspace_root() -> PathBuf {
     crate::binary_path::workspace_root()
 }
@@ -66,14 +68,26 @@ pub(crate) fn ensure_release_binaries() {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn empty_params() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn values(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     params(pairs)
 }
@@ -104,6 +118,10 @@ pub(crate) fn run_cli_script(db_path: &Path, extra_args: &[&str], script: &str) 
     child.wait_with_output().expect("CLI should finish")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn run_cli_script_allow_startup_failure(
     db_path: &Path,
     extra_args: &[&str],
@@ -117,6 +135,10 @@ pub(crate) fn run_cli_script_allow_startup_failure(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn run_cli_script_allow_startup_failure_with_timeout(
     db_path: &Path,
     extra_args: &[&str],
@@ -146,6 +168,10 @@ pub(crate) fn run_cli_script_allow_startup_failure_with_timeout(
     output
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn run_cli_script_from_file(
     db_path: &Path,
     extra_args: &[&str],
@@ -163,6 +189,10 @@ pub(crate) fn run_cli_script_from_file(
         .expect("CLI should run")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn spawn_cli(db_path: &Path, extra_args: &[&str]) -> Child {
     ensure_release_binaries();
     Command::new(cli_bin())
@@ -268,6 +298,10 @@ pub(crate) fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn write_child_stdin(child: &mut Child, script: &str) {
     child
         .stdin
@@ -352,6 +386,10 @@ pub(crate) async fn start_sync_fixture() -> SyncFixture {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -363,6 +401,10 @@ pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool)
     false
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 fn wait_for_child_exit(child: &mut Child, timeout: Duration, context: &str) {
     let start = Instant::now();
     loop {
@@ -380,11 +422,19 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration, context: &str) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
     wait_for_child_exit(&mut child, timeout, context);
     child.wait_with_output().expect(context)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn wait_for_server_output(
     mut child: ServerChild,
     timeout: Duration,
@@ -404,12 +454,20 @@ pub(crate) fn temp_db_file(tmp: &TempDir, name: &str) -> PathBuf {
     tmp.path().join(name)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn count_rows(db: &Database, table: &str) -> usize {
     db.scan(table, db.snapshot())
         .expect("scan should succeed")
         .len()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance, acceptance_sync"
+)]
 pub(crate) fn count_rows_from_file(db_path: &Path, table: &str) -> usize {
     let db = Database::open(db_path).expect("db should open");
     let count = count_rows(&db, table);
@@ -417,6 +475,10 @@ pub(crate) fn count_rows_from_file(db_path: &Path, table: &str) -> usize {
     count
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn try_count_rows_from_file(
     db_path: &Path,
     table: &str,
@@ -434,6 +496,10 @@ pub(crate) fn try_count_rows_from_file(
     Ok(count)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn query_count(db: &Database, sql: &str) -> i64 {
     let result = db
         .execute(sql, &empty_params())
@@ -441,6 +507,10 @@ pub(crate) fn query_count(db: &Database, sql: &str) -> i64 {
     extract_i64(&result, 0, 0)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn extract_i64(result: &QueryResult, row: usize, col: usize) -> i64 {
     match &result.rows()[row][col] {
         Value::Int64(value) => value.to_owned(),
@@ -448,6 +518,10 @@ pub(crate) fn extract_i64(result: &QueryResult, row: usize, col: usize) -> i64 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn extract_f64(result: &QueryResult, row: usize, col: usize) -> f64 {
     match &result.rows()[row][col] {
         Value::Float64(value) => value.to_owned(),
@@ -455,6 +529,10 @@ pub(crate) fn extract_f64(result: &QueryResult, row: usize, col: usize) -> f64 {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn text_value<'a>(row: &'a VersionedRow, key: &str) -> &'a str {
     row.values
         .get(key)
@@ -462,6 +540,10 @@ pub(crate) fn text_value<'a>(row: &'a VersionedRow, key: &str) -> &'a str {
         .expect("text value")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn setup_simple_sensor_db(db: &Database) {
     db.execute(
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)",
@@ -470,6 +552,10 @@ pub(crate) fn setup_simple_sensor_db(db: &Database) {
     .expect("create sensors table");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn insert_sensor_rows(db: &Database, count: usize) {
     for idx in 0..count {
         db.execute(
@@ -484,6 +570,10 @@ pub(crate) fn insert_sensor_rows(db: &Database, count: usize) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn setup_graph_entities(db: &Database, ids: &[Uuid]) {
     db.execute(
         "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
@@ -505,6 +595,10 @@ pub(crate) fn setup_graph_entities(db: &Database, ids: &[Uuid]) {
     db.commit(tx).expect("commit entities");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn setup_vector_table(db: &Database, dimension: usize) {
     db.execute(
         &format!("CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR({dimension}))"),
@@ -513,6 +607,10 @@ pub(crate) fn setup_vector_table(db: &Database, dimension: usize) {
     .expect("create vector table");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by acceptance"
+)]
 pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64 {
     let tx = db.begin_or_panic();
     let row_id = db

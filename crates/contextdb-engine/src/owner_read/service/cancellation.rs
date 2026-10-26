@@ -96,6 +96,13 @@ pub(super) struct CancellationRegistry {
     snapshots: usize,
 }
 impl CancellationRegistry {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn len(&self) -> usize {
         self.len
     }

@@ -274,6 +274,10 @@ pub(crate) enum NativeReadStreamBegin {
     Legacy(crate::vector_read_memory::RequestReadOwner),
     Native {
         operation: crate::owner_read::NativeReadRequest,
+        #[allow(
+            dead_code,
+            reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+        )]
         cancellation: contextdb_core::read_contract::NativeReadCancellation,
     },
 }
@@ -422,17 +426,42 @@ pub(crate) struct NativeWireRoutes {
     entries: contextdb_core::read_memory::OwnedReadBox<
         [contextdb_core::read_memory::OwnedReadBox<dyn NativeRouteDispatch>],
     >,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     clock: contextdb_core::read_contract::NativeClockBinding,
     installation: ReadMemoryOwner,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     timeouts: contextdb_core::read_contract::OwnerServiceTimeouts,
 }
 impl NativeWireRoutes {
     pub(crate) fn installation_owner(&self) -> ReadMemoryOwner {
         self.installation.clone()
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn clock(&self) -> &contextdb_core::read_contract::NativeClockBinding {
         &self.clock
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn shutdown_drain_ms(&self) -> u64 {
         self.timeouts.shutdown_drain_ms
     }

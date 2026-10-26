@@ -13,12 +13,20 @@ pub struct OwnerPageFixture {
     pub has_more: bool,
 }
 impl OwnerPageFixture {
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by owner_read, read"
+    )]
     pub fn rows(&self) -> &[Vec<contextdb_core::Value>] {
         &self.rows
     }
     pub fn columns(&self) -> &[String] {
         &self.columns
     }
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by owner_read"
+    )]
     pub fn has_more(&self) -> bool {
         self.has_more
     }
@@ -54,6 +62,7 @@ pub fn decode_owner_cursor_page(bytes: &[u8]) -> Result<OwnerPageFixture, ReadEn
     Ok(decode(bytes)?.page)
 }
 
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn replace_owner_cursor_page(
     bytes: &[u8],
     page: &OwnerPageFixture,
@@ -76,6 +85,10 @@ pub fn replace_owner_cursor_page(
     .map_err(|_| ReadEncodingError::InvalidPayload)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
 pub fn with_empty_observation(page_bytes: Vec<u8>) -> Vec<u8> {
     // Decode the typed page without admission/validation: callers deliberately
     // construct oversized pages to test the receiver's admission boundary.
@@ -88,6 +101,10 @@ pub fn with_empty_observation(page_bytes: Vec<u8>) -> Vec<u8> {
         .expect("encode the typed owner page and observation")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
 pub fn assert_empty_observation(bytes: &[u8], page: &CursorPage) {
     let observed = decode(bytes).expect("decode the complete owner observation");
     assert_eq!(
@@ -109,6 +126,10 @@ pub fn assert_empty_observation(bytes: &[u8], page: &CursorPage) {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
 pub fn owner_response_fixture(prefix: &[u8], page_bytes: &[u8]) -> Vec<u8> {
     let payload = with_empty_observation(page_bytes.to_vec());
     let mut bytes = prefix.to_vec();

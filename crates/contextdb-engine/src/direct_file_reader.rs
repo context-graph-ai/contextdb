@@ -126,7 +126,6 @@ pub struct DirectTypedImageDigest {
 /// One owned relational row in the committed image.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredRow {
     pub table: String,
     pub row_id: RowId,
@@ -136,7 +135,6 @@ pub struct DirectStoredRow {
 /// One owned graph edge, including all persisted edge properties.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredEdge {
     pub source: Uuid,
     pub target: Uuid,
@@ -155,7 +153,6 @@ pub enum DirectVectorQuantization {
 /// owned queryable values during hydration, never by consulting the file later.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
 pub struct DirectStoredVector {
     pub index: VectorIndexRef,
     pub row_id: RowId,
@@ -425,10 +422,16 @@ pub struct DirectOwnedImage {
 }
 
 /// A complete ordinary result and its route-neutral encoding.
-#[allow(dead_code)]
 pub struct DirectQuery {
     pub result: QueryResult,
     pub canonical_bytes: crate::read_contract::EncodedReadBytes,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub snapshot: DirectSnapshot,
 }
 
@@ -578,6 +581,13 @@ impl DirectCursorPage {
 
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub struct DirectCursorPageViewForTest<'a> {
     pub columns: &'a [String],
     pub rows: &'a [Vec<contextdb_core::Value>],
@@ -588,6 +598,13 @@ pub struct DirectCursorPageViewForTest<'a> {
 impl DirectCursorPage {
     /// Borrow the real retained page without exposing its private owning builder.
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
+        )
+    )]
     pub fn page_for_test(&self) -> DirectCursorPageViewForTest<'_> {
         DirectCursorPageViewForTest {
             columns: &self.page.columns,
@@ -597,6 +614,13 @@ impl DirectCursorPage {
     }
     /// Preserve the fixture's explicit copy request and its genuine payer.
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
+        )
+    )]
     pub fn try_clone_page_for_test(
         &self,
         owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -609,6 +633,13 @@ impl DirectCursorPage {
     }
     /// Move the existing prepared publication with all original invoices intact.
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
+        )
+    )]
     pub fn into_public_page_for_test(
         self,
     ) -> contextdb_core::Result<contextdb_core::read_contract::CursorPage> {
@@ -618,6 +649,13 @@ impl DirectCursorPage {
     /// Encode the real retained private page by borrow, through the same
     /// canonical serializer; observing it never copies columns or acquires a child.
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn encode_page_for_test(
         &self,
     ) -> std::result::Result<Vec<u8>, crate::read_contract::ReadEncodingError> {
@@ -625,6 +663,13 @@ impl DirectCursorPage {
     }
     /// Construct the existing empty private-page fixture from moved parts.
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn new_for_test(
         columns: Vec<String>,
         snapshot: DirectSnapshot,
@@ -772,6 +817,13 @@ impl HydrationObservation {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn from_test_observer(observer: Arc<dyn HydrationObserver>) -> Self {
         Self {
             observer: Some(observer),
@@ -803,6 +855,13 @@ impl HydrationObservation {
 /// direct module does not maintain or self-certify any of these counters.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
 pub struct DirectReaderCounters {
     pub persistence_read_only_opens: u64,
     pub persistence_source_accesses: u64,
@@ -851,7 +910,6 @@ pub enum DirectReaderPrerequisite {
     PersistenceLoadReadImage,
     PersistenceSealedReleaseReceipt,
     VerifiedImageIdentityObservation,
-    #[allow(dead_code)]
     CursorResourceObservation,
 }
 
@@ -882,7 +940,6 @@ pub enum DirectFileReaderError {
     CorruptStore(DirectStoreDiagnostic, contextdb_core::error::DiagnosticText),
     DirectReadRequiresWriter {
         failure: ReadFailure,
-        #[allow(dead_code)]
         cause: DirectRepairRequiredCause,
     },
     CursorUnavailable(DirectCursorUnavailable),
@@ -1050,7 +1107,6 @@ pub struct DirectFileReader {
     target: Arc<dyn crate::executor::ReadExecutionTarget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
-    #[allow(dead_code)]
     verified_digest: DirectTypedImageDigest,
     image_memory: crate::read_image_memory::ImageMemoryHandle,
     retained_source: crate::persistence::RetainedReadSource,
@@ -1201,7 +1257,6 @@ fn consume_released_persistence_load(
     )
 }
 
-#[allow(dead_code)]
 fn execute_on_backend_neutral_target(
     reader: &DirectFileReader,
     sql: &str,
@@ -1452,6 +1507,13 @@ impl DirectFileReader {
     /// Obtain the existing reader's operation owner for private page fixtures.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn request_read_memory_for_test(
         &self,
     ) -> Result<contextdb_core::read_memory::ReadMemoryOwner, DirectFileReaderError> {
@@ -1563,6 +1625,13 @@ impl DirectFileReader {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from redb_open_and_format.rs"
+        )
+    )]
     fn open_inner(
         path: &Path,
         config: DirectReaderConfig,
@@ -1651,7 +1720,6 @@ impl DirectFileReader {
         self.retained_source.select_cache_capacity(capacity)
     }
 
-    #[allow(dead_code)]
     pub fn execute(
         &self,
         sql: &str,
@@ -1661,7 +1729,6 @@ impl DirectFileReader {
         self.execute_with_cancellation(sql, params, &cancellation)
     }
 
-    #[allow(dead_code)]
     pub fn execute_with_cancellation(
         &self,
         sql: &str,
@@ -1672,7 +1739,6 @@ impl DirectFileReader {
     }
 
     /// Answer one metadata question from the beginning.
-    #[allow(dead_code)]
     pub fn metadata(
         &self,
         request: DirectMetadataRequest,
@@ -1737,7 +1803,6 @@ impl DirectFileReader {
             })
     }
 
-    #[allow(dead_code)]
     pub fn open_cursor(
         &self,
         sql: &str,
@@ -1841,7 +1906,6 @@ impl DirectCursor {
         }
     }
 
-    #[allow(dead_code)]
     pub fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
@@ -1905,6 +1969,62 @@ pub mod test_seams {
     use std::path::Path;
     use std::sync::Arc;
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from metadata_body_round_trip.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from cron.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from metadata_page.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from executor.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_image.rs"
+        )
+    )]
     pub use super::{
         DirectChangeFrontiers, DirectChangeState, DirectColumnReference, DirectConfigurationState,
         DirectCursor, DirectCursorOpen, DirectCursorPage, DirectCursorResourceWitness,
@@ -1922,7 +2042,56 @@ pub mod test_seams {
         HydrationCheckpoint, HydrationObserver,
     };
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_image.rs"
+        )
+    )]
     pub use crate::read_image::{AnswerEncodingHookGuard, while_encoding_answers_for_test};
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_only_open_loads_only_the_working_set.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from a_historical_index_read_costs_its_rows_and_dead_groups.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_read_memory.rs"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            unused_imports,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_work_probe.rs"
+        )
+    )]
     pub use crate::read_work_probe::{
         CommitDirectoryFunding, CommitDirectorySourceRegistrationFunding, DeclaredReadChildFunding,
         HistoricalReadWorkCounters, ReadWorkCounters, ReadWorkObservation,
@@ -1931,6 +2100,13 @@ pub mod test_seams {
     pub use contextdb_core::read_contract::OwnerReadCancellation as DirectCancellation;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub enum CancellationOperation {
         Execute,
         CursorOpen,
@@ -1938,12 +2114,26 @@ pub mod test_seams {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub struct CancellationTokenObservation {
         pub operation: CancellationOperation,
         pub identity: u64,
         pub initially_cancelled: bool,
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn open_for_test(
         path: impl AsRef<Path>,
         config: DirectReaderConfig,
@@ -1951,6 +2141,13 @@ pub mod test_seams {
         DirectFileReader::open(path, config)
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn open_with_hydration_observer_for_test(
         path: impl AsRef<Path>,
         config: DirectReaderConfig,
@@ -1963,6 +2160,13 @@ pub mod test_seams {
         )
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn reset_counters_for_test() -> Result<(), DirectFileReaderError> {
         crate::read_probe::reset();
         Ok(())
@@ -1980,6 +2184,13 @@ pub mod test_seams {
     /// of one operation (`with_route_source_counter`); this does the same for
     /// a bare `DirectFileReader` call, which has no `ReadSession` to install
     /// one for it.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn with_isolated_bounded_source_touches_for_test<T>(
         operation: impl FnOnce() -> T,
     ) -> (T, u64) {
@@ -1991,6 +2202,13 @@ pub mod test_seams {
         (result, counter.load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from allocator_pager.rs"
+        )
+    )]
     pub fn counters_for_test() -> Result<DirectReaderCounters, DirectFileReaderError> {
         let observed = crate::read_probe::observed();
         Ok(DirectReaderCounters {
@@ -2021,6 +2239,13 @@ pub mod test_seams {
         })
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn cancellation_observations_for_test()
     -> Result<Vec<CancellationTokenObservation>, DirectFileReaderError> {
         Ok(crate::read_probe::observed_cancellations()
@@ -2093,6 +2318,13 @@ pub mod test_seams {
 
     /// Ask one metadata question under a caller-held cancellation, as a
     /// reading route does, so a proof can cancel the request mid-answer.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn metadata_with_cancellation_for_test(
         reader: &DirectFileReader,
         request: DirectMetadataRequest,
@@ -2104,6 +2336,13 @@ pub mod test_seams {
     /// Make the reader's next history answer take the persisted-state
     /// fallback: its history is loaded, then its logs are dropped from
     /// memory. The store file is untouched.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn force_history_log_gap_for_test(reader: &DirectFileReader) {
         reader.target.force_history_log_gap_for_test();
     }
@@ -2111,12 +2350,26 @@ pub mod test_seams {
     /// Make the reader's next history answer take the persisted-state
     /// fallback with its schema history intact: its history is loaded, then
     /// only its change log is dropped from memory. The store is untouched.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn force_change_log_gap_for_test(reader: &DirectFileReader) {
         reader.target.force_change_log_gap_for_test();
     }
 
     /// Hold competing admitted work so a request has exactly `room` left.
     /// The credit is returned by its ordinary owner on drop.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn hold_reader_memory_leaving_for_test(
         reader: &DirectFileReader,
         room: usize,
@@ -2138,11 +2391,25 @@ pub mod test_seams {
 
     /// The memory an answer holds against its reader's limit while it is
     /// held.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn held_answer_bytes_for_test(response: &DirectMetadataResponse) -> usize {
         response.charge.held()
     }
 
     /// Start the reader's high-water mark again from what it holds now.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn reset_charged_high_water_for_test(reader: &DirectFileReader) {
         reader.image_memory.accountant.reset_high_water_for_test();
     }
@@ -2204,6 +2471,13 @@ pub mod test_seams {
     /// (`content_proof`), as ending the statement whose retained pages it
     /// holds does in production. Releases whatever charge those pages still
     /// carry back to the declared session.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn clear_statement_proofs_for_test(reader: &DirectFileReader) {
         reader.retained_source.clear_statement_proofs();
     }
@@ -2212,6 +2486,13 @@ pub mod test_seams {
     /// their bytes, and how many of those bytes are charged to the declared
     /// session -- the cache that persists across statements on the same
     /// reader, distinct from one statement's own `content_proof` set.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
+        )
+    )]
     pub fn resident_proof_chunks_for_test(reader: &DirectFileReader) -> (usize, usize, usize) {
         reader.retained_source.resident_proof_chunks_for_test()
     }
@@ -2223,6 +2504,13 @@ pub mod test_seams {
     /// resident set's own charge only when the statement itself ends
     /// (`clear_statement_proofs_for_test`); dropping an answer built from
     /// this statement does not release it.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub fn statement_own_charge_for_test(reader: &DirectFileReader) -> usize {
         reader.retained_source.statement_own_charge_for_test()
     }
@@ -2240,12 +2528,26 @@ pub mod test_seams {
     /// Force the retained ordered-run cache to disappear after the stated
     /// number of cached postings. This test-only control exercises the real
     /// source-key fallback in the bounded kernel.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
+        )
+    )]
     pub fn arm_verified_ordered_run_eviction_for_test(reader: &DirectFileReader, postings: usize) {
         reader
             .retained_source
             .arm_verified_ordered_run_eviction_for_test(postings);
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn owned_image_for_test(
         reader: &DirectFileReader,
     ) -> Result<DirectOwnedImage, DirectFileReaderError> {
@@ -2259,6 +2561,13 @@ pub mod test_seams {
         Ok(image)
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_only_open_loads_only_the_working_set.rs"
+        )
+    )]
     pub fn typed_digest_for_test(
         image: &DirectOwnedImage,
     ) -> Result<DirectTypedImageDigest, DirectFileReaderError> {
@@ -2266,6 +2575,13 @@ pub mod test_seams {
             .map_err(|error| DirectFileReaderError::Engine(error.to_string().into()))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn verified_image_digest_for_test(
         reader: &DirectFileReader,
     ) -> Result<DirectTypedImageDigest, DirectFileReaderError> {
@@ -2277,6 +2593,13 @@ pub mod test_seams {
         Ok(reader.verified_digest.clone())
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn verified_image_digest_wire_for_test(
         reader: &DirectFileReader,
     ) -> Result<String, DirectFileReaderError> {
@@ -2311,6 +2634,13 @@ pub mod test_seams {
         .join(";"))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
     pub fn canonical_metadata_bytes_for_test(
         body: &DirectMetadataBody,
         owner: contextdb_core::read_memory::ReadMemoryOwner,

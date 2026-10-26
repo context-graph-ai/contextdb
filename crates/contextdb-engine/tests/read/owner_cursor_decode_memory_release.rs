@@ -11,7 +11,6 @@ use contextdb_core::read_contract::{
 };
 use contextdb_core::{Error, Value};
 #[path = "../owner_cursor_test_support.rs"]
-#[allow(dead_code)]
 mod owner_cursor_test_support;
 use contextdb_engine::read_session::ReadSessionTestObserver;
 use contextdb_engine::{Database, ReadSession, ReadSessionOptions};

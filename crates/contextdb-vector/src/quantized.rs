@@ -70,7 +70,6 @@ impl StoredVectorEntry {
 
     /// Legacy void moves retain the body-only caller admission protocol even
     /// when their source was promoted by a previous fallible open.
-    #[allow(dead_code)] // Keep an owned-copy path for callers that retain stored entries.
     #[cfg(test)]
     pub(crate) fn owned_copy(&self) -> Self {
         Self {
@@ -377,7 +376,6 @@ pub fn stored_vector_resident_bytes(dimension: usize, quantization: VectorQuanti
 }
 
 impl StoredVector {
-    #[allow(dead_code)] // Keep the stored-vector copy path beside its entry counterpart.
     #[cfg(test)]
     fn owned_copy(&self) -> Self {
         match self {

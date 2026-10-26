@@ -1,6 +1,5 @@
 #![allow(clippy::duplicate_mod)] // Shared unchanged fixtures retain their original module paths.
 
-#[allow(dead_code, unused_imports)] // Each target uses a subset of the canonical helpers.
 mod graph_route_profile_quality {
     #![cfg(feature = "nightly-tests")]
 

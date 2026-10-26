@@ -4,13 +4,16 @@ impl RedbPersistence {
     /// Repair damaged transaction ordering in the current storage format.
     /// Every keyed MVCC owner and the index switch in one transaction; a
     /// crash cannot expose renumbered rows with the previous snapshot index.
-    #[allow(
-        dead_code,
-        reason = "Full repair is never part of bounded writable startup"
-    )]
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from custody_source.rs"
+        )
     )]
     pub(crate) fn repair_current_transaction_order(
         &self,

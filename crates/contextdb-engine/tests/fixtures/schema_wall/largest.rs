@@ -8,12 +8,24 @@ use contextdb_engine::{Database, sync_types::ChangeSet};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub type Calls = Arc<Mutex<Vec<Value>>>;
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub fn affected_tables() -> BTreeSet<String> {
     (0..100).map(|i| format!("schema_{i:03}")).collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub fn vector(ordinal: usize) -> Value {
     let mut values = vec![0.0; 768];
     values[0] = 1.0;
@@ -21,6 +33,10 @@ pub fn vector(ordinal: usize) -> Value {
     Value::Vector(values)
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub fn prepare_existing_rows_and_vectors(db: &Database) -> Calls {
     let calls = Arc::new(Mutex::new(Vec::new()));
     db.register_trigger_callback("schema_099_insert_trigger", {
@@ -57,6 +73,10 @@ pub fn prepare_existing_rows_and_vectors(db: &Database) -> Calls {
     calls
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables"
+)]
 pub fn author_migration(db: &Database) -> ChangeSet {
     let since = db.current_lsn();
     db.execute("ALTER TABLE schema_000 ADD COLUMN revised TEXT", &empty())
@@ -66,6 +86,10 @@ pub fn author_migration(db: &Database) -> ChangeSet {
     db.changes_since(since).expect("read the declared changes")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
+)]
 pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
     (0..100)
         .map(|ordinal| {
@@ -104,6 +128,10 @@ pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables"
+)]
 pub fn assert_constraints_and_callback(db: &Database, calls: &Calls) {
     db.execute(
         "CREATE EVENT TYPE schema_099_notice WHEN INSERT ON schema_099",

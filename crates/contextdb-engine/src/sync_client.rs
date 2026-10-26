@@ -5306,7 +5306,6 @@ fn classify_push_reply_decode(error: Error) -> PushReplyError {
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // Retain the decoder seam for focused push-response fixtures.
 fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResult, PushReplyError> {
     let envelope = decode_for_version(reply, protocol_version)
         .map_err(|e| PushReplyError::Malformed(Error::SyncError((e.to_string()).into())))?;

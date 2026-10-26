@@ -6563,9 +6563,16 @@ enum SourceUndo {
         eager: crate::ordered_staged::NativeOrderedCheckpoint,
     },
     // held only as retirement custody: dropped with the retired journal node, never read
-    #[allow(dead_code)]
     RetiredAdopt {
+        #[allow(
+            dead_code,
+            reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+        )]
         state: TxState,
+        #[allow(
+            dead_code,
+            reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+        )]
         displaced_eager: crate::ordered_staged::OrderedStagedRows,
     },
 }

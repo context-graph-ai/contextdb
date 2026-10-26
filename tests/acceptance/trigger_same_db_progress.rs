@@ -24,8 +24,22 @@ use contextdb_engine::QueryResult;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::thread;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 

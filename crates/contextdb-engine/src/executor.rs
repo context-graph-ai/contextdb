@@ -723,11 +723,25 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// persisted-state fallback a store takes when its logs do not reach
     /// back to the position asked for. The store itself is untouched.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     fn force_history_log_gap_for_test(&self) {}
 
     /// Load this committed image's history, then drop only its change log
     /// from memory; its schema log stays.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     fn force_change_log_gap_for_test(&self) {}
 
     /// The vector store this target searches, so a proof can arm a store seam
@@ -3662,7 +3676,6 @@ pub(crate) struct BoundedExecutionResult {
     pub(crate) data_statement: bool,
     pub(crate) result: OwnedQueryResult,
     pub(crate) publication: ReadPublicationScope,
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub(crate) telemetry: BoundedExecutionTelemetry,
 }
 

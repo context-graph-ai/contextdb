@@ -836,7 +836,6 @@ fn a_lowered_partition_limit_arriving_over_sync_is_refused_and_changes_nothing()
 
 #[cfg(feature = "test-seams")]
 struct RunningPartitionLimitServer {
-    #[allow(dead_code)]
     server: Arc<SyncServer>,
     shutdown: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
