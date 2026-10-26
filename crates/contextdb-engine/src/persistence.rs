@@ -673,9 +673,6 @@ pub(crate) struct ReadPersistenceImage {
     lazy_relational: bool,
     read_bounds: WriterRecoveryBounds,
     vector_entries: Vec<VectorEntry>,
-    /// Checksummed placement and visibility identities for lazy raw-vector
-    /// point loads. Empty on the complete-hydration fallback.
-    raw_vector_memberships: Vec<VectorPartitionMembershipRecord>,
     current_vectors: HashMap<(VectorIndexRef, RowId), Vec<f32>>,
     sync_source_lsns: HashMap<(String, RowId), Lsn>,
     sync_source_kinds: HashMap<(String, RowId), SyncSourceKind>,
@@ -697,9 +694,6 @@ pub(crate) struct ReadPersistenceImage {
     /// Graph bodies and journal pages remain in the store until a query
     /// actually chooses the dormant indexed route.
     vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
-    /// The released source a dormant generation loader may reopen read-only.
-    /// Hydration never carries a Redb handle into the committed image.
-    source_path: Option<PathBuf>,
     /// How large the store file was when this image was read out of it.
     ///
     /// It is the same number a writer reports as disk usage -- the length of
@@ -908,7 +902,6 @@ struct ReaderBreadcrumbGuard {
 struct ReaderSnapshotFileGuard {
     file: Option<File>,
     path: PathBuf,
-    metadata: std::fs::Metadata,
     registry_lock: ReaderSnapshotRegistryLock,
     nonblocking_teardown: bool,
     /// What the last departing reader needs to prove no purge-capable writer
@@ -1366,20 +1359,13 @@ struct InspectedSequence<T> {
 /// Positional inspection forms of the canonical persisted vector. All route
 /// strings borrow the authenticated input; payload sequences never reserve.
 #[derive(Deserialize)]
-#[allow(
-    dead_code,
-    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `InspectedPersistedVector` format"
-)]
 enum InspectedPersistedVector {
     F32(InspectedSequence<f32>),
     SQ8 {
-        min: f32,
-        max: f32,
         len: u32,
         payload: InspectedSequence<u8>,
     },
     SQ4 {
-        min: f32,
         max: f32,
         len: u32,
         payload: InspectedSequence<u8>,

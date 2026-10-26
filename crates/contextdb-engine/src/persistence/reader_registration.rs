@@ -3622,7 +3622,6 @@ impl ReaderSnapshotFileGuard {
         Ok(Self {
             file: Some(file),
             path,
-            metadata,
             registry_lock,
             nonblocking_teardown,
             database_path: target.database_path.to_path_buf(),

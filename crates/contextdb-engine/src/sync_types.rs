@@ -1687,26 +1687,12 @@ mod trigger_ddl_binary_compatibility_tests {
     use serde::Serialize;
 
     #[derive(Serialize)]
-    #[allow(
-        dead_code,
-        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `LegacyDdlChange` format"
-    )]
     enum LegacyDdlChange {
-        CreateTable,
-        DropTable,
-        AlterTable,
-        CreateIndex,
-        DropIndex,
         CreateTrigger {
             name: String,
             table: String,
             on_events: Vec<String>,
         },
-        DropTrigger,
-        CreateEventType,
-        CreateSink,
-        CreateRoute,
-        DropRoute,
     }
 
     #[test]

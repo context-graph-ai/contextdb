@@ -404,7 +404,6 @@ impl ReadImageSource {
         image: ReadPersistenceImage,
     ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
         let image = ReadPersistenceImage {
-            source_path: Some(self.database_path.clone()),
             store_file_bytes: self.store_file_bytes,
             ..image
         };
@@ -3747,7 +3746,6 @@ pub(super) fn decode_complete_read_image(
         lazy_relational,
         read_bounds: authenticated_bounds.into_bounds(),
         vector_entries,
-        raw_vector_memberships: Vec::new(),
         current_vectors,
         sync_source_lsns,
         sync_source_kinds,
@@ -3762,7 +3760,6 @@ pub(super) fn decode_complete_read_image(
         sink_queues: BTreeMap::new(),
         sink_queue_extents,
         vector_generation_catalog,
-        source_path: None,
         // Filled in by the source that has the file open; the decoder itself
         // is handed a read transaction and never sees a path.
         store_file_bytes: None,

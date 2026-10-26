@@ -369,30 +369,14 @@ impl<'de> serde::Deserialize<'de> for CheckedBytes {
 )]
 pub(super) struct Tag {
     pub version: u8,
-    name: CheckedBytes,
     pub hash: [u8; 32],
     pub generation: u64,
-    pub format: u8,
-    role: BlobTagRole,
 }
 #[derive(serde::Deserialize)]
-#[allow(
-    dead_code,
-    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `Staging` format"
-)]
 pub(super) struct Staging {
     pub version: u8,
     pub object_id: [u8; 16],
-    start_lsn: u64,
-    expected_size: Option<u64>,
-    received_size: u64,
-    payload_chunk_count: u64,
-    outboard_chunk_count: u64,
-    payload_indices: CheckedBytes,
-    outboard_indices: CheckedBytes,
     pub provisional_generation: Option<([u8; 32], u64)>,
-    #[serde(default)]
-    adapter_state: CheckedBytes,
 }
 
 // Both projections contain only scalars, fixed arrays/tuples and CheckedBytes.
