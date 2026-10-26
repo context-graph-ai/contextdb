@@ -246,7 +246,11 @@ async fn a_large_two_way_table_pulls_in_pages_with_a_flat_peak() {
 async fn a_pull_served_from_persisted_state_pages_with_a_flat_peak() {
     let mut lines = Vec::new();
     let mut peaks = Vec::new();
-    for rows in [2_500usize, 5_000] {
+    // A page is one source transaction of 100 rows, so both pulls take
+    // several pages and the peak compared is a maximum over pages. The tables
+    // differ by 2,500 rows, so a peak that held about 460 bytes per row
+    // still moves by more than the quarter the comparison allows.
+    for rows in [400usize, 2_900] {
         let dir = tempfile::tempdir().expect("store directory");
         let db = hub_store(dir.path(), rows, 100);
         db.__force_change_log_gap_for_test();
@@ -261,6 +265,11 @@ async fn a_pull_served_from_persisted_state_pages_with_a_flat_peak() {
         ));
         assert_eq!(pulled.rows, rows, "every row arrives exactly once");
         assert!(pulled.pages > 1, "persisted state is served in pages");
+        assert!(
+            pulled.pages >= 4,
+            "the peak is compared over several pages: {} pages",
+            pulled.pages
+        );
         peaks.push(peak);
     }
     println!("S4_PULL_FALLBACK_PAGES {}", lines.join(" | "));
