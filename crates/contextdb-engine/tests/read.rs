@@ -52,8 +52,8 @@ mod a_reopened_store_never_reuses_a_committed_transaction;
 #[path = "read/a_session_follows_the_stores_writers.rs"]
 mod a_session_follows_the_stores_writers;
 #[cfg(unix)]
-#[path = "read/continuation_support.rs"]
-mod continuation_support;
+#[path = "read/a_session_on_a_companionless_copy_never_reads_backward.rs"]
+mod a_session_on_a_companionless_copy_never_reads_backward;
 #[cfg(unix)]
 #[path = "read/a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins.rs"]
 mod a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins;
@@ -73,6 +73,9 @@ mod completed_read_totals_reach_an_out_of_crate_observer;
 #[cfg(unix)]
 #[path = "read/content_identity_independent_contract.rs"]
 mod content_identity_independent_contract;
+#[cfg(unix)]
+#[path = "read/continuation_support.rs"]
+mod continuation_support;
 #[path = "read/cursor_admission_defers_to_waiting_schema_change.rs"]
 mod cursor_admission_defers_to_waiting_schema_change;
 #[path = "read/cursor_idle_registration_expiry.rs"]

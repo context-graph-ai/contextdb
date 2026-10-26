@@ -333,6 +333,11 @@ fn test_module_regions(content: &str) -> Vec<&str> {
     regions
 }
 
+/// The parts of the `src` file at `rel` this audit reads as unit-test code.
+fn src_test_regions<'a>(_rel: &str, content: &'a str) -> Vec<&'a str> {
+    test_module_regions(content)
+}
+
 /// Every baseline entry must carry a non-empty reason: an entry with an empty
 /// third field defeats the point of the (path, count, reason) shape and fails
 /// the audit outright, rather than silently degrading to an unexplained
@@ -403,7 +408,7 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
             };
             // Audit each cfg(test) MODULE body, not the suffix after the first
             // one. Production items can follow an earlier test module.
-            for test_region in test_module_regions(&content) {
+            for test_region in src_test_regions(&rel, &content) {
                 let sleeps = count_occurrences(test_region, SLEEP_NEEDLES);
                 let allowed = src_sleep_ratchet.get(rel.as_str()).copied().unwrap_or(0);
                 if sleeps > allowed {
@@ -995,5 +1000,136 @@ fn test_estate_default_tier_test_count_matches_its_ratchet() {
         violations.is_empty(),
         "default-tier test count violations:\n{}",
         violations.join("\n")
+    );
+}
+
+/// Every file a `crates/*/src` source declares as an out-of-line
+/// `#[cfg(test)]` module (`#[cfg(test)] mod name;`, with or without a
+/// `#[path]`), as (declaring file, module file) relative to the workspace root.
+/// Such a file is unit-test code from its first byte but carries no
+/// `#[cfg(test)]` marker of its own.
+fn out_of_line_test_modules(root: &Path) -> Vec<(String, String)> {
+    let mut modules = Vec::new();
+    for entry in WalkDir::new(root.join("crates"))
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != "target" && entry.file_name() != ".git")
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .expect("inside the workspace")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !is_src_file(&rel) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let Some(name) = out_of_line_module_name(line) else {
+                continue;
+            };
+            let attributes: Vec<&str> = lines[..index]
+                .iter()
+                .rev()
+                .map(|line| line.trim())
+                .take_while(|line| line.starts_with("#[") || line.starts_with("//"))
+                .collect();
+            if !attributes
+                .iter()
+                .any(|attribute| attribute.replace(' ', "") == "#[cfg(test)]")
+            {
+                continue;
+            }
+            let directory = path.parent().expect("a source file's directory");
+            let declared = attributes.iter().find_map(|attribute| {
+                attribute
+                    .strip_prefix("#[path")
+                    .and_then(|rest| rest.split('"').nth(1))
+            });
+            let module = match declared {
+                Some(declared) => directory.join(declared),
+                None => {
+                    let stem = path.file_stem().expect("a file stem").to_string_lossy();
+                    let base = if matches!(stem.as_ref(), "mod" | "lib" | "main") {
+                        directory.to_path_buf()
+                    } else {
+                        directory.join(stem.as_ref())
+                    };
+                    let flat = base.join(format!("{name}.rs"));
+                    if flat.exists() {
+                        flat
+                    } else {
+                        base.join(name).join("mod.rs")
+                    }
+                }
+            };
+            let mut normal = PathBuf::new();
+            for part in module.components() {
+                match part {
+                    std::path::Component::ParentDir => {
+                        normal.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => normal.push(other.as_os_str()),
+                }
+            }
+            let module = normal
+                .strip_prefix(root)
+                .unwrap_or(&normal)
+                .to_string_lossy()
+                .replace('\\', "/");
+            modules.push((rel.clone(), module));
+        }
+    }
+    modules.sort();
+    modules
+}
+
+/// The module name of a `mod name;` line, when the line declares one out of line.
+fn out_of_line_module_name(line: &str) -> Option<&str> {
+    let declaration = line.trim();
+    let declaration = declaration
+        .strip_prefix("pub(crate) ")
+        .or_else(|| declaration.strip_prefix("pub(super) "))
+        .or_else(|| declaration.strip_prefix("pub "))
+        .unwrap_or(declaration);
+    let name = declaration.strip_prefix("mod ")?.strip_suffix(';')?.trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
+}
+
+/// A unit-test module a source file declares out of line is test code, so the
+/// audit reads all of it, exactly as it reads an in-line `#[cfg(test)]` module
+/// body. Otherwise a sleep or raw clock read moved into such a file is never
+/// counted.
+#[test]
+fn test_estate_audit_scans_every_out_of_line_unit_test_module() {
+    let root = workspace_root();
+    let modules = out_of_line_test_modules(&root);
+    assert!(
+        !modules.is_empty(),
+        "the workspace declares out-of-line unit-test modules"
+    );
+    let mut unscanned = Vec::new();
+    for (declared_in, module) in &modules {
+        let content = std::fs::read_to_string(root.join(module))
+            .unwrap_or_else(|error| panic!("read {module}, declared in {declared_in}: {error}"));
+        let scanned: usize = src_test_regions(module, &content)
+            .iter()
+            .map(|region| region.len())
+            .sum();
+        if scanned < content.len() {
+            unscanned.push(format!("{module} (declared in {declared_in})"));
+        }
+    }
+    assert!(
+        unscanned.is_empty(),
+        "the test-estate audit must read every out-of-line unit-test module whole; {} of {} \
+         are not read: {unscanned:#?}",
+        unscanned.len(),
+        modules.len()
     );
 }
