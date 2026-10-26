@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 use crate::memory_accounting::MemoryAccountant;
 use crate::sync_types::{DdlChange, NaturalKey, natural_key_from_row_values};
 use contextdb_core::{
@@ -1149,37 +1148,6 @@ impl CompositeStore {
             vector_created_tx,
             vector_lsn,
         })
-    }
-
-    /// Resolve every vector write against the finalized rows and declaration,
-    /// then ask the vector store to validate the complete keyed batch without
-    /// mutating it. A relational key-only replacement synthesizes a local
-    /// move for each unchanged live vector column.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn prepare_vector_partition_mutations(
-        &self,
-        ws: &WriteSet,
-        table_meta: &HashMap<String, TableMeta>,
-        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<PreparedVectorPartitionMutationBatch> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        self.prepare_vector_partition_mutations_with_reclamation(
-            ws,
-            table_meta,
-            deleted_rows,
-            HashSet::new(),
-            None,
-            false,
-            false,
-            vector_copy_owner,
-            read_memory.clone(),
-        )
     }
 
     /// Database supplies only states it has proved reclaimable while holding

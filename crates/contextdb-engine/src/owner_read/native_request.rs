@@ -14,19 +14,6 @@ pub struct NativeReadRequest {
 }
 
 impl NativeReadRequest {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn try_new(
-        receipt: NativeReadChildReceipt,
-    ) -> contextdb_core::Result<(Self, NativeReadCancellation)> {
-        let q = receipt.into_owner();
-        let cancellation = NativeReadCancellation::try_new(q.clone())?;
-        let caller_cancellation = cancellation.clone();
-        Ok((Self { q, cancellation }, caller_cancellation))
-    }
-
     /// Native companion of `try_new`: the cancellation token's admission
     /// refuses with a `NativeRefusal`, without an owned diagnostic.
     pub(crate) fn try_new_native(

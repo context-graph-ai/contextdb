@@ -1151,14 +1151,12 @@ static OS_CEILING_SOURCE_FOR_TEST: parking_lot::Mutex<Option<CeilingRead>> =
 /// Test seam: what the operating system reports as the process ceiling, read
 /// through the production observation at each boundary.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn set_os_ceiling_source_for_test(ceiling: Option<usize>) {
     *OS_CEILING_SOURCE_FOR_TEST.lock() = ceiling.map(Ok);
 }
 
 /// Test seam: the operating system's ceiling cannot be discovered.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn fail_os_ceiling_source_for_test() {
     *OS_CEILING_SOURCE_FOR_TEST.lock() = Some(Err(CeilingUnavailable));
 }
@@ -1168,7 +1166,6 @@ static CEILING_OBSERVATIONS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
 
 /// Test seam: how many times this process has read its inherited ceiling.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn ceiling_observations_for_test() -> usize {
     CEILING_OBSERVATIONS_FOR_TEST.load(Ordering::Relaxed)
 }
@@ -1195,7 +1192,6 @@ static FIRST_CEILING_CHECK: AtomicUsize = AtomicUsize::new(0);
 
 /// Test seam: record the inherited ceiling the next admission checks.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn arm_first_ceiling_check_for_test() {
     FIRST_CEILING_CHECK.store(0, Ordering::Release);
     FIRST_CEILING_CHECK_ARMED.store(true, Ordering::Release);
@@ -1204,7 +1200,6 @@ pub(crate) fn arm_first_ceiling_check_for_test() {
 /// Test seam: the inherited ceiling the first admission since arming checked,
 /// or `None` if none has run.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn first_ceiling_check_for_test() -> Option<usize> {
     (!FIRST_CEILING_CHECK_ARMED.load(Ordering::Acquire))
         .then(|| FIRST_CEILING_CHECK.load(Ordering::Acquire))
@@ -1212,7 +1207,6 @@ pub(crate) fn first_ceiling_check_for_test() -> Option<usize> {
 
 /// Test seam: the ceiling admissions currently check, as last observed.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn observed_process_ceiling_for_test() -> usize {
     OBSERVED_CEILING.load(Ordering::Acquire)
 }
@@ -1605,7 +1599,6 @@ thread_local! {
 /// Test seam: make the next `count` system calls of this thread's file reads
 /// report EINTR, as a delivered signal would.
 #[cfg(all(target_os = "linux", any(test, feature = "test-seams")))]
-#[allow(dead_code)]
 pub(crate) fn interrupt_file_reads_for_test(count: usize) {
     INTERRUPTIONS_FOR_TEST.with(|left| left.set(count));
 }
@@ -1775,7 +1768,6 @@ static PROCESS_CEILING_FOR_TEST: parking_lot::Mutex<Option<usize>> = parking_lot
 /// Test seam: fix the inherited process ceiling for a later activation, and
 /// for an already active runtime.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)] // Keep the process ceiling control available to focused accounting tests.
 pub(crate) fn set_process_ceiling_for_test(ceiling: Option<usize>) {
     *PROCESS_CEILING_FOR_TEST.lock() = ceiling;
     let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
@@ -1801,7 +1793,6 @@ pub(crate) fn effective_process_ceiling() -> usize {
 /// Test seam: record a domain ceiling as a resident insertion runtime's
 /// activation would, without activating one.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn record_domain_ceiling_for_test(ceiling: Option<usize>) {
     PROCESS_WRITER_BUDGET_DOMAIN.write().ceiling = ceiling;
 }
@@ -2341,10 +2332,6 @@ impl WriterBudget {
             vector_accountant,
         })
     }
-    #[allow(
-        dead_code,
-        reason = "native delivery code is staged ahead of its first non-test caller"
-    )]
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -4399,29 +4386,6 @@ impl OwnedMemoryReservation {
         })?;
         self.accountant().release(bytes);
         self.bytes = remaining;
-        Ok(())
-    }
-
-    /// Transfer an existing charge to a store owner. The shared accountant
-    /// total is deliberately unchanged; only this request stops owning it.
-    #[allow(dead_code)] // Keep the explicit transfer operation beside reservation release.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn try_transfer_to_store(&mut self, bytes: usize) -> contextdb_core::Result<()> {
-        self.bytes = self.bytes.checked_sub(bytes).ok_or_else(|| {
-            contextdb_core::Error::MemoryBudgetExceeded {
-                subsystem: ("bounded_read".to_string()).into(),
-                operation: ("transfer_vector_load_reservation".to_string()).into(),
-                requested_bytes: bytes,
-                available_bytes: self.bytes,
-                budget_limit_bytes: self.bytes,
-                hint: ("The vector load cannot transfer more memory than its request reserved."
-                    .to_string())
-                .into(),
-            }
-        })?;
         Ok(())
     }
 }
@@ -7265,7 +7229,6 @@ mod tests {
 /// report actual capacities, including overlapping resize copies. Naming a
 /// charge does not itself supply a structural allocator residency bound.
 #[derive(Debug)]
-#[allow(dead_code)] // Admission seam awaiting the fork allocator capacity oracle.
 pub(crate) struct RedbAllocatorStateCharge {
     reservation: OwnedMemoryReservation,
     pub(crate) resident_bytes: usize,
@@ -7273,7 +7236,6 @@ pub(crate) struct RedbAllocatorStateCharge {
     pub(crate) region_bookkeeping_bytes: usize,
 }
 
-#[allow(dead_code)] // Consumed by the separately owned fork integration.
 impl RedbAllocatorStateCharge {
     pub(crate) fn new(accountant: AccountantHandle) -> Self {
         Self {
@@ -7355,19 +7317,11 @@ mod redb_allocator_state_tests {
 
 /// A fixed native provider pins the actual original writer, not a current role.
 /// It has no payload/root/invoice back-reference, so retained sources are acyclic.
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
 struct NativeSourceProvider {
     accountant: Option<AccountantHandle>,
     writer: Option<WriterUse>,
     control: Option<ControlCredit>,
 }
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
 impl NativeSourceProvider {
     #[expect(
         clippy::result_large_err,
@@ -8420,20 +8374,6 @@ pub(crate) fn preparation_row_map_bytes(members: usize) -> contextdb_core::Resul
 )]
 pub(crate) fn preparation_native_map_bytes<K, V>(members: usize) -> contextdb_core::Result<usize> {
     source_native_map_bytes::<K, V>(members)
-}
-
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(crate) fn preparation_check_row_capacity(
-    row: &contextdb_core::VersionedRow,
-) -> contextdb_core::Result<()> {
-    source_check_row_capacity(row)
 }
 
 #[expect(
@@ -11826,23 +11766,6 @@ pub(crate) fn new_owned_native_vec<T>(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(crate) fn copy_owned_native_slice<T: Copy>(
-    original: &OwnedMemoryReservation,
-    source: &[T],
-) -> contextdb_core::Result<(Vec<T>, OwnedMemoryReservation)> {
-    let (mut values, memory) = new_owned_native_vec(original, source.len())?;
-    values.extend_from_slice(source);
-    if let Err(error) = validate_native_vec_capacity(&values, source.len()) {
-        drop(values);
-        return Err(error);
-    }
-    Ok((values, memory))
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
 fn copy_prepaid_native_string(source: &str) -> contextdb_core::Result<String> {
     let value = source.to_owned();
     if value.capacity() != source.len() {
@@ -12211,16 +12134,6 @@ pub(crate) fn clone_persistence_original_writer(
 // Legacy kernels above remain byte-identical. Only the refusal representation
 // is static; no owned Error is constructed and subsequently mapped.
 impl MemoryAccountant {
-    #[allow(
-        dead_code,
-        reason = "native delivery code is staged ahead of its first non-test caller"
-    )]
-    pub(crate) fn try_allocate_native(
-        &self,
-        bytes: usize,
-    ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
-        self.try_allocate_with_provenance_native(bytes, None)
-    }
     pub(crate) fn try_allocate_for_native(
         &self,
         bytes: usize,
@@ -12610,30 +12523,7 @@ impl StoreAccountantHandle {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
 impl OwnedMemoryReservation {
-    /// A genuine new grant from the originating reservation, retaining its
-    /// existing writer epoch rather than discovering a later registration.
-    pub(crate) fn reserve_copy_native(
-        &self,
-        bytes: usize,
-        subsystem: &'static str,
-        operation: &'static str,
-        hint: &'static str,
-    ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
-        let mut copy = Self {
-            accountant: Some(self.accountant().clone()),
-            bytes: 0,
-            _writer_use: self._writer_use.clone(),
-            own_control: None,
-        };
-        copy.try_grow_for_native(bytes, subsystem, operation, hint)?;
-        Ok(copy)
-    }
-
     pub(crate) fn try_new_for_native(
         accountant: AccountantHandle,
         bytes: usize,

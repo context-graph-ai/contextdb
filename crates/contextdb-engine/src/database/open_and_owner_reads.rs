@@ -184,14 +184,6 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn open_configured(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
-        Self::open_configured_carrying(path, options, None)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn open_configured_carrying(
         path: &Path,
         options: DatabaseOpenOptions,

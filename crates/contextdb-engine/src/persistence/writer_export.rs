@@ -3,45 +3,7 @@ use super::writer_source::SourceWindowOwner;
 use super::*;
 use std::ops::Bound;
 
-impl WriterSnapshot {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn copy_config_into(
-        self: &Arc<Self>,
-        owner: SourceWindowOwner,
-        artifact: &RedbPersistence,
-    ) -> Result<()> {
-        WriterSnapshotHandle::from(self.clone()).copy_config_into(owner, artifact)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn copy_authored_into(
-        self: &Arc<Self>,
-        owner: SourceWindowOwner,
-        artifact: &RedbPersistence,
-        through: Lsn,
-    ) -> Result<()> {
-        WriterSnapshotHandle::from(self.clone()).copy_authored_into(owner, artifact, through)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn copy_ddl_into(
-        self: &Arc<Self>,
-        owner: SourceWindowOwner,
-        artifact: &RedbPersistence,
-        through: Lsn,
-    ) -> Result<()> {
-        WriterSnapshotHandle::from(self.clone()).copy_ddl_into(owner, artifact, through)
-    }
-}
+impl WriterSnapshot {}
 
 impl WriterSnapshotHandle {
     #[expect(

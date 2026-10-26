@@ -335,17 +335,6 @@ impl ReaderGateHold<'_> {
         }
         Ok(())
     }
-
-    /// Keep the shared data lock on the descriptor past this guard; the
-    /// caller now owns giving it back. The reader hold is released here.
-    pub(crate) fn keep_data_release_hold(mut self) -> io::Result<()> {
-        self.data = false;
-        if self.reader_hold {
-            release_byte(self.file, READER_HOLD_OFFSET)?;
-            self.reader_hold = false;
-        }
-        Ok(())
-    }
 }
 
 impl Drop for ReaderGateHold<'_> {
@@ -548,12 +537,6 @@ pub(crate) struct WriterWait<'a> {
 }
 
 impl WriterWait<'_> {
-    pub(crate) const UNTIL_HANDED_OVER: WriterWait<'static> = WriterWait {
-        payer: None,
-        stop: None,
-        deadline: None,
-    };
-
     fn is_plain(&self) -> bool {
         self.stop.is_none() && self.deadline.is_none()
     }

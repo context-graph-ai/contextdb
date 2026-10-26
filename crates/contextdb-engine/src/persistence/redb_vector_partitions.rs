@@ -144,46 +144,6 @@ impl RedbPersistence {
         })
     }
 
-    /// Policy-hold indexing enumerates keys without decoding unrelated values;
-    /// the caller saves its cursor alongside each indexed record before advancing.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn next_config_key(
-        &self,
-        prefix: &str,
-        after: Option<&str>,
-        memory: &crate::read_image_memory::ImageMemoryHandle,
-    ) -> Result<Option<String>> {
-        self.with_db(|db| {
-            let txn = db.begin_read().map_err(Self::storage_error)?;
-            let table = match txn.open_table(CONFIG_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            for entry in table
-                .range(after.unwrap_or(prefix)..)
-                .map_err(Self::storage_error)?
-            {
-                let (key, _) = entry.map_err(Self::storage_error)?;
-                let key = key.value();
-                if !key.starts_with(prefix) {
-                    break;
-                }
-                if after.is_some_and(|after| key <= after) {
-                    continue;
-                }
-                #[cfg(any(test, feature = "test-seams"))]
-                crate::writer_query_test_seams::note_config_enumeration(key);
-                memory.reserve(key.len())?;
-                return Ok(Some(key.to_owned()));
-            }
-            Ok(None)
-        })
-    }
-
     /// The borrowed encoded value is admitted before the decoder can allocate.
     /// The caller retains the lease for as long as it keeps the decoded record.
     #[expect(
@@ -431,230 +391,6 @@ impl RedbPersistence {
         Ok(row)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn relational_row_by_id_in_read(
-        database_path: &Path,
-        root_kind: &str,
-        read: &redb::ReadTransaction,
-        table: &str,
-        meta: &TableMeta,
-        row_id: RowId,
-        snapshot: SnapshotId,
-    ) -> Result<Option<VersionedRow>> {
-        #[cfg(any(test, feature = "test-seams"))]
-        crate::writer_query_test_seams::note_physical_source(
-            crate::writer_query_test_seams::PhysicalFamily::Row,
-            read,
-        );
-        let name = Self::rel_table_name(table);
-        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-        let relation = match read.open_table(definition) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(crate::funded_error::corruption_display(
-                    crate::read_image_memory::active_owner()
-                        .and_then(|owner| owner.diagnostic_budget()),
-                    database_path.display(),
-                    format_args!("relational table {table} is absent from the {root_kind} root"),
-                ));
-            }
-            Err(error) => return Err(Self::relational_table_error(table, error)),
-        };
-        let (lower, upper) = Self::rel_row_key_range(row_id);
-        let mut versions = {
-            #[cfg(any(test, feature = "test-seams"))]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
-                table,
-            );
-            relation
-                .range(lower.as_slice()..upper.as_slice())
-                .map_err(|error| Self::relational_storage_error(table, error))?
-        };
-        while let Some(entry) = {
-            #[cfg(any(test, feature = "test-seams"))]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
-                table,
-            );
-            versions.next_back()
-        } {
-            let (key, value) =
-                entry.map_err(|error| Self::relational_storage_error(table, error))?;
-            #[cfg(any(test, feature = "test-seams"))]
-            crate::writer_query_test_seams::note_target_entry(table);
-            let row = Self::decode_relational_source_row(table, meta, value.value())?;
-            if Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn) != key.value() {
-                return Err(crate::funded_error::corruption_display(
-                    crate::read_image_memory::active_owner()
-                        .and_then(|owner| owner.diagnostic_budget()),
-                    database_path.display(),
-                    format_args!(
-                        "relational table {table} row body disagrees with its saved version key"
-                    ),
-                ));
-            }
-            if row.created_tx.0 <= snapshot.0
-                && row.deleted_tx.is_none_or(|deleted| deleted.0 > snapshot.0)
-            {
-                return Ok(Some(row));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Resolve the one durable relational version named by a vector
-    /// membership without walking any other row identity. The relation key
-    /// carries the LSN, so unrelated versions can be rejected before their
-    /// bodies are decoded.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn relational_row_by_id_lsn_in_read(
-        database_path: &Path,
-        root_kind: &str,
-        read: &redb::ReadTransaction,
-        table: &str,
-        meta: &TableMeta,
-        row_id: RowId,
-        lsn: Lsn,
-    ) -> Result<Option<VersionedRow>> {
-        let name = Self::rel_table_name(table);
-        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-        let relation = match read.open_table(definition) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(crate::funded_error::corruption_display(
-                    crate::read_image_memory::active_owner()
-                        .and_then(|owner| owner.diagnostic_budget()),
-                    database_path.display(),
-                    format_args!("relational table {table} is absent from the {root_kind} root"),
-                ));
-            }
-            Err(error) => return Err(Self::relational_table_error(table, error)),
-        };
-        let (lower, upper) = Self::rel_row_key_range(row_id);
-        let versions = {
-            #[cfg(any(test, feature = "test-seams"))]
-            let _target_reads = crate::writer_query_test_seams::physical_operation(
-                crate::writer_query_test_seams::PhysicalFamily::Row,
-                table,
-            );
-            relation
-                .range(lower.as_slice()..upper.as_slice())
-                .map_err(|error| Self::relational_storage_error(table, error))?
-        };
-        #[cfg(any(test, feature = "test-seams"))]
-        let versions = {
-            let mut versions = versions;
-            std::iter::from_fn(move || {
-                let _target_reads = crate::writer_query_test_seams::physical_operation(
-                    crate::writer_query_test_seams::PhysicalFamily::Row,
-                    table,
-                );
-                versions.next()
-            })
-        };
-        for entry in versions {
-            let (key, value) =
-                entry.map_err(|error| Self::relational_storage_error(table, error))?;
-            let encoded_key = key.value();
-            if encoded_key.len() != 24 {
-                return Err(crate::funded_error::corruption_display(
-                    crate::read_image_memory::active_owner()
-                        .and_then(|owner| owner.diagnostic_budget()),
-                    database_path.display(),
-                    format_args!("relational table {table} contains a malformed row key"),
-                ));
-            }
-            let key_lsn = u64::from_be_bytes(
-                encoded_key[16..24]
-                    .try_into()
-                    .expect("validated relational key width"),
-            );
-            if key_lsn != lsn.0 {
-                continue;
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            crate::writer_query_test_seams::note_target_entry(table);
-            let row = Self::decode_relational_source_row(table, meta, value.value())?;
-            if row.row_id != row_id
-                || row.lsn != lsn
-                || Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn) != encoded_key
-            {
-                return Err(crate::funded_error::corruption_display(
-                    crate::read_image_memory::active_owner()
-                        .and_then(|owner| owner.diagnostic_budget()),
-                    database_path.display(),
-                    format_args!(
-                        "relational table {table} row body disagrees with its point identity"
-                    ),
-                ));
-            }
-            return Ok(Some(row));
-        }
-        Ok(None)
-    }
-
-    /// Decode one durable row version through the writable store's ordinary
-    /// read transaction. This is the point-read half of writable row paging:
-    /// callers supply the MVCC snapshot, and later commits remain invisible.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn load_relational_row_by_id_at(
-        &self,
-        table: &str,
-        meta: &TableMeta,
-        row_id: RowId,
-        snapshot: SnapshotId,
-    ) -> Result<Option<VersionedRow>> {
-        #[cfg(any(test, feature = "test-seams"))]
-        crate::read_work_probe::note_row_version_range_read();
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            Self::relational_row_by_id_in_read(
-                self.path(),
-                "durable",
-                &read,
-                table,
-                meta,
-                row_id,
-                snapshot,
-            )
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn load_relational_row_by_id_lsn(
-        &self,
-        table: &str,
-        meta: &TableMeta,
-        row_id: RowId,
-        lsn: Lsn,
-    ) -> Result<Option<VersionedRow>> {
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            Self::relational_row_by_id_lsn_in_read(
-                self.path(),
-                "durable",
-                &read,
-                table,
-                meta,
-                row_id,
-                lsn,
-            )
-        })
-    }
-
     /// The stored byte length of each named row version, keyed as it was
     /// asked for. A key the store does not hold is absent from the answer.
     ///
@@ -834,21 +570,6 @@ impl RedbPersistence {
             found_format_marker: format!("{name} uses an unrecognized relational key layout"),
             expected_release: CURRENT_FORMAT_VERSION.to_owned(),
         }
-    }
-
-    /// Decode a table one row at a time.  Writable open uses this path so a
-    /// database larger than RAM never exists as a temporary `Vec` before its
-    /// lightweight row and index directories are built.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn visit_relational_table(
-        &self,
-        name: &str,
-        visit: impl FnMut(VersionedRow) -> Result<()>,
-    ) -> Result<()> {
-        self.visit_relational_table_impl(name, &self.require_decode_accountant()?, visit)
     }
 
     /// Charge one persisted row's decoded allocations before each allocation
@@ -5013,27 +4734,6 @@ impl RedbPersistence {
         Self::vector_partition_route_heap_bytes(&catalog.index, &catalog.partition_key)
     }
 
-    pub(super) fn vector_partition_membership_heap_bytes(
-        membership: &VectorPartitionMembershipRecord,
-    ) -> usize {
-        Self::vector_partition_route_heap_bytes(&membership.index, &membership.partition_key)
-    }
-
-    pub(super) fn vector_partition_journal_record_heap_bytes(
-        record: &VectorPartitionJournalRecord,
-    ) -> usize {
-        let change_bytes = match &record.change {
-            VectorPartitionJournalChange::Upsert(membership) => {
-                Self::vector_partition_membership_heap_bytes(membership)
-            }
-            VectorPartitionJournalChange::Tombstone(tombstone) => {
-                Self::vector_partition_membership_heap_bytes(&tombstone.membership)
-            }
-        };
-        Self::vector_partition_route_heap_bytes(&record.index, &record.partition_key)
-            .saturating_add(change_bytes)
-    }
-
     /// Upper-bound heap retained by one decoded vector persistence record.
     /// Route inspection runs before owned decoding and proves the complete
     /// stored component count exists, removing serde's hostile length-hint
@@ -5064,53 +4764,6 @@ impl RedbPersistence {
             .saturating_add(partition_key.estimated_bytes())
             .saturating_add(24)
             .saturating_add(suffix_bytes)
-    }
-
-    pub(super) fn vector_partition_journal_key_matches(
-        prefix: &[u8],
-        key: &[u8],
-        record: &VectorPartitionJournalRecord,
-    ) -> bool {
-        let lsn_end = prefix.len().saturating_add(8);
-        let ordinal_end = lsn_end.saturating_add(8);
-        let lsn = record.lsn.0.to_be_bytes();
-        let ordinal = record.ordinal.to_be_bytes();
-        key.len() == ordinal_end
-            && key.starts_with(prefix)
-            && key.get(prefix.len()..lsn_end) == Some(lsn.as_slice())
-            && key.get(lsn_end..ordinal_end) == Some(ordinal.as_slice())
-    }
-
-    pub(super) fn boxed_vector_key_collection_bytes(capacity: usize, keys: &[Box<[u8]>]) -> usize {
-        capacity
-            .saturating_mul(std::mem::size_of::<Box<[u8]>>())
-            .saturating_add(
-                keys.iter()
-                    .fold(0usize, |bytes, key| bytes.saturating_add(key.len())),
-            )
-    }
-
-    pub(super) fn vector_key_collection_bytes(capacity: usize, keys: &[Vec<u8>]) -> usize {
-        capacity
-            .saturating_mul(std::mem::size_of::<Vec<u8>>())
-            .saturating_add(
-                keys.iter()
-                    .fold(0usize, |bytes, key| bytes.saturating_add(key.capacity())),
-            )
-    }
-
-    pub(super) fn vector_cleanup_collection_bound(key_count: usize, key_bytes: usize) -> usize {
-        // A one-element Vec may start with four pointer slots. Larger
-        // collections stay below twice their requested capacity. Once
-        // allocated, the reservation shrinks to the reported capacity.
-        let slot_bound = if key_count == 0 {
-            0
-        } else {
-            key_count.saturating_mul(2).max(4)
-        };
-        slot_bound
-            .saturating_mul(std::mem::size_of::<Box<[u8]>>())
-            .saturating_add(key_bytes)
     }
 
     #[expect(
@@ -5260,7 +4913,6 @@ impl RedbPersistence {
         removed: &mut usize,
     ) -> Result<bool> {
         const OPERATION: &str = "truncate_vector_partition_journal";
-        const CHECKPOINT_RECORD_INTERVAL: usize = 64;
         checkpoint()?;
         let catalog_owned = Self::vector_partition_catalog_heap_bytes(expected_catalog);
         let physical_key_bound = Self::vector_partition_physical_key_bound(

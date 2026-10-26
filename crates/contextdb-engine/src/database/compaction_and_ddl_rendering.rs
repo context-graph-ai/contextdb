@@ -696,20 +696,6 @@ pub(super) fn export_edge_at_snapshot(entry: &AdjEntry, watermark: TxId) -> Opti
     Some(entry)
 }
 
-pub(super) fn export_vector_at_snapshot(
-    entry: &VectorEntry,
-    watermark: TxId,
-) -> Option<VectorEntry> {
-    if entry.created_tx.0 > watermark.0 {
-        return None;
-    }
-    let mut entry = entry.clone();
-    if entry.deleted_tx.is_some_and(|tx| tx.0 > watermark.0) {
-        entry.deleted_tx = None;
-    }
-    Some(entry)
-}
-
 // Source windows are preparation work owned by this retention request. Keep
 // their actual requested/headroom figures while preserving the public refusal
 // identity; all source receipts are dropped by the failed preparation itself.
@@ -3224,102 +3210,6 @@ pub(super) fn retain_clause_from_meta(meta: &TableMeta, ttl_seconds: u64) -> Str
         clause.push_str(" SYNC SAFE");
     }
     clause
-}
-
-pub(crate) fn retain_and_propagate_clauses_from_meta(meta: &TableMeta) -> Vec<String> {
-    let mut clauses = Vec::new();
-    // Preserve declared custody policy in schema transport and inspection.
-    if let Some(tables) = &meta.delivery_manifest_tables {
-        clauses.push(format!(
-            "DELIVERY MANIFEST OVER {}",
-            tables
-                .iter()
-                .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if let Some(mode) = meta.edge_discard {
-        clauses.push(format!(
-            "EDGE DISCARD {}",
-            match mode {
-                contextdb_core::EdgeDiscardMode::Never => "NEVER",
-                contextdb_core::EdgeDiscardMode::AfterOutcome => "AFTER OUTCOME",
-                contextdb_core::EdgeDiscardMode::Always => "ALWAYS",
-            }
-        ));
-    }
-
-    if let Some(ttl_seconds) = meta.default_ttl_seconds {
-        clauses.push(retain_clause_from_meta(meta, ttl_seconds));
-    }
-
-    // Rendered only when it was DECLARED, so `.schema` gives the declaration
-    // back as it was written, right after RETAIN and before the sync
-    // clauses: row-lifetime -> history-depth -> travel -> arbitration.
-    if let Some(policy) = meta.history_policy {
-        clauses.push(policy.declared_clause().to_string());
-    }
-
-    // Rendered only when it was DECLARED, so `.schema` gives the declaration
-    // back as it was written and an undeclared table shows no restriction for
-    // an operator to puzzle over.
-    if let Some(direction) = meta.sync_direction {
-        clauses.push(direction.sql().to_string());
-    }
-
-    // The conflict policy renders the same way: back verbatim when declared, and
-    // nothing at all for the non-overwriting default.
-    if let Some(clause) = meta
-        .conflict_policy
-        .and_then(|policy| policy.declared_clause())
-    {
-        clauses.push(clause.to_string());
-    }
-
-    // Silence is the default here too: a table that declared no MAINTAIN
-    // COUNT renders exactly as it did before this vocabulary existed.
-    if let Some(declared) = meta.maintained_counts.as_ref() {
-        clauses.push(declared.declared_clause());
-    }
-
-    let mut propagate = Vec::new();
-    for rule in &meta.propagation_rules {
-        match rule {
-            PropagationRule::Edge {
-                edge_type,
-                direction,
-                trigger_state,
-                target_state,
-                max_depth,
-                abort_on_failure,
-            } => {
-                let dir = match direction {
-                    Direction::Incoming => "INCOMING",
-                    Direction::Outgoing => "OUTGOING",
-                    Direction::Both => "BOTH",
-                };
-                let mut clause = format!(
-                    "PROPAGATE ON EDGE {edge_type} {dir} STATE {trigger_state} SET {target_state}"
-                );
-                if *max_depth != 10 {
-                    clause.push_str(&format!(" MAX DEPTH {max_depth}"));
-                }
-                if *abort_on_failure {
-                    clause.push_str(" ABORT ON FAILURE");
-                }
-                propagate.push(clause);
-            }
-            PropagationRule::VectorExclusion { trigger_state } => {
-                propagate.push(format!("PROPAGATE ON STATE {trigger_state} EXCLUDE VECTOR"));
-            }
-            PropagationRule::ForeignKey { .. } => {}
-        }
-    }
-    propagate.sort();
-    clauses.extend(propagate);
-
-    clauses
 }
 
 pub(super) fn ttl_seconds_to_sql(seconds: u64) -> String {

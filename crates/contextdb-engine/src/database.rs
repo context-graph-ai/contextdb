@@ -499,21 +499,6 @@ struct ReceivedSchemaPersistencePayload {
     config_max_u64_keys: Vec<String>,
 }
 
-/// Already encoded non-schema writes that must share a received-schema
-/// transaction.  Keeping the fields distinct prevents a later consumer from
-/// accidentally treating a receipt or applied-push watermark as an optional
-/// post-commit cache update.
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-struct ReceivedSchemaAuxiliaryWrites {
-    lineage_values: Vec<(String, Vec<u8>)>,
-    accepted_author_values: Vec<(String, Vec<u8>)>,
-    source_state_values: Vec<(String, Vec<u8>)>,
-    receipt_values: Vec<(String, Vec<u8>)>,
-    applied_push_watermark_values: Vec<(String, Vec<u8>)>,
-    terminal_values: Vec<(String, Vec<u8>)>,
-}
-
 /// Owned entries for the received unit's affected keys. Publication merges
 /// history and replaces only the affected tables' mutable mirrors under the
 /// existing schema gate, leaving unrelated committed state borrowed throughout
@@ -1698,7 +1683,6 @@ const TABLE_SIZE_RUN_ROWS: usize = 1024;
 /// What one row costs that run: its identity key, the stored length beside it,
 /// and the map entry the two live in.
 const TABLE_SIZE_RUN_ROW_BYTES: usize = 128;
-const EXPORT_NODE_BATCH_SIZE: usize = 256;
 /// Sentinel `sync_source_lsn` sidecar value meaning "this row's arrival is
 /// exactly its own commit LSN on the accepting node" -- written for a
 /// STAMPLESS incoming row (one whose sender never had an established

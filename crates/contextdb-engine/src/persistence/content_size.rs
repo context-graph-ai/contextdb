@@ -492,36 +492,6 @@ impl ContentTable<'_> {
         Ok(())
     }
 
-    /// Write one encoded row body whose caller holds no decoded row: its
-    /// index keys are projected from the indexed columns' bytes only.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn insert_body(
-        &mut self,
-        batch: &mut historical_index_commitment::CommitmentBatch,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<()> {
-        let keys = VersionLife::keys_of_body(&self.indexes, value)?;
-        let (created, deleted) = if self.indexes.is_empty() {
-            (TxId(0), None)
-        } else {
-            content_identity::version_manifest::body_lifetime(value)?
-        };
-        self.insert_version(
-            batch,
-            key,
-            value,
-            &VersionLife {
-                keys: &keys,
-                created,
-                deleted,
-            },
-        )
-    }
-
     /// Remove one stored row version, with its index keys; nothing when no
     /// version is stored under `key`.
     #[expect(

@@ -1476,25 +1476,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         BoundedExecutionError,
     >;
 
-    /// Predicate resolution and value coercion are part of what a source
-    /// answers: an index probe and a graph filter must be read against the
-    /// same column types and the same snapshot that produced the rows.
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn resolve_graph_filter_at_snapshot(
-        &self,
-        expr: &Expr,
-        params: &HashMap<String, Value>,
-        tx: Option<TxId>,
-        snapshot: SnapshotId,
-        ctes: &[Cte],
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<Expr>;
-
     /// The in-process store, when this target is one. A subquery has to be
     /// PLANNED against a real store before it can be read, and planning is the
     /// half both doors share; a target that is not a store never carries a
@@ -1502,26 +1483,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn as_database_for_subquery_plan(&self) -> Option<&Database> {
         None
     }
-
-    /// The start vertices a filter names, resolved against the store the way
-    /// the executor resolves them. A start named by anything other than its id
-    /// is still a pinned start; a door that cannot resolve one walks every edge
-    /// in the store to answer a probe.
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn resolve_graph_start_nodes_from_filter(
-        &self,
-        filter: &Expr,
-        params: &HashMap<String, Value>,
-        tx: Option<TxId>,
-        snapshot: SnapshotId,
-        start_alias: &str,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<GraphStartResolution>;
 
     #[allow(clippy::too_many_arguments)]
     #[expect(
@@ -3040,52 +3001,8 @@ impl ReadExecutionTarget for Database {
         )
     }
 
-    fn resolve_graph_filter_at_snapshot(
-        &self,
-        expr: &Expr,
-        params: &HashMap<String, Value>,
-        tx: Option<TxId>,
-        snapshot: SnapshotId,
-        ctes: &[Cte],
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<Expr> {
-        resolve_graph_filter_at_snapshot(
-            self,
-            expr,
-            params,
-            tx,
-            snapshot,
-            ctes,
-            vector_copy_owner,
-            read_memory.clone(),
-        )
-    }
-
     fn as_database_for_subquery_plan(&self) -> Option<&Database> {
         Some(self)
-    }
-
-    fn resolve_graph_start_nodes_from_filter(
-        &self,
-        filter: &Expr,
-        params: &HashMap<String, Value>,
-        tx: Option<TxId>,
-        snapshot: SnapshotId,
-        start_alias: &str,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<GraphStartResolution> {
-        resolve_graph_start_nodes_from_filter(
-            self,
-            filter,
-            params,
-            tx,
-            snapshot,
-            start_alias,
-            vector_copy_owner,
-            read_memory.clone(),
-        )
     }
 
     fn graph_filter_matches_bindings_with_work(
@@ -3497,41 +3414,6 @@ pub(crate) fn execute_bounded(
         cancellation,
         #[cfg(any(test, feature = "test-seams"))]
         probe,
-    )
-}
-
-/// Run one bounded read against a target that is not the writable database --
-/// a released committed image, say -- and answer in the engine's own words.
-///
-/// This is the same kernel entrance as [`execute_bounded`] with its answer
-/// left un-flattened. A route that must report the same fault the same way
-/// whichever way it reached the store needs the typed answer, and the direct
-/// reader's own doors deliberately cannot carry one.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(crate) fn execute_bounded_on_target(
-    db: &dyn ReadExecutionTarget,
-    sql: &str,
-    params: &HashMap<String, Value>,
-    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    limits: ReadLimits,
-    clock: Arc<dyn DeadlineClock>,
-    cancellation: OwnerReadCancellation,
-    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
-) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
-    execute_bounded_on_target_with_native_trace_refund(
-        db,
-        sql,
-        params,
-        read_memory,
-        limits,
-        clock,
-        cancellation,
-        #[cfg(any(test, feature = "test-seams"))]
-        probe,
-        None,
     )
 }
 
@@ -17930,85 +17812,6 @@ fn graph_query_trace(
     }
 }
 
-/// Resolve start nodes for a graph traversal from a WHERE filter like
-/// `a.name = 'entity-0'`. Uses a matching relational index when one exists and
-/// otherwise reports the full row scan needed to resolve the start vertices.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(crate) fn resolve_graph_start_nodes_from_filter(
-    db: &Database,
-    filter: &Expr,
-    params: &HashMap<String, Value>,
-    tx: Option<TxId>,
-    snapshot: contextdb_core::SnapshotId,
-    start_alias: &str,
-    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-) -> Result<GraphStartResolution> {
-    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-    let mut graph_materialized_columns = expression_columns(std::iter::once(filter));
-    if !graph_materialized_columns
-        .iter()
-        .any(|column| column == "id")
-    {
-        graph_materialized_columns.push("id".to_string());
-    }
-    // The eager door reads the candidate rows the eager way: whole result sets,
-    // no ceiling, which is what it promises its callers.
-    let mut read = |table: &str, pick: Option<&IndexPick>| -> Result<(Vec<uuid::Uuid>, u64)> {
-        let (rows, scanned) = match pick {
-            Some(pick) => execute_index_scan(
-                db,
-                table,
-                pick,
-                snapshot,
-                tx,
-                IndexScanAccessMode::Select,
-                Some(&graph_materialized_columns),
-                None,
-                params,
-                vector_copy_owner,
-                read_memory.clone(),
-            )?,
-            None => {
-                let rows = scan_rows_for_select(
-                    db,
-                    table,
-                    snapshot,
-                    tx,
-                    vector_copy_owner,
-                    read_memory.clone(),
-                )?;
-                let scanned = rows.len() as u64;
-                (rows, scanned)
-            }
-        };
-        db.__bump_rows_examined(scanned);
-        Ok((
-            rows.into_iter()
-                .filter_map(|row| match row.values.get("id") {
-                    Some(Value::Uuid(id)) => Some(*id),
-                    _ => None,
-                })
-                .collect(),
-            scanned,
-        ))
-    };
-    resolve_graph_start_nodes_with_reader(
-        db,
-        filter,
-        params,
-        tx,
-        snapshot,
-        start_alias,
-        &mut read,
-        read_memory.clone(),
-    )
-}
-
 /// The shape of start resolution both doors share: which filter names a start,
 /// which tables can describe one, which predicates were pushed, and the final
 /// per-candidate confirmation. What differs is how the candidate ROWS are read,
@@ -18140,41 +17943,6 @@ where
         pinned: true,
         examined,
     })
-}
-
-#[allow(dead_code)] // Retain the plan-based graph resolver for bounded read fallbacks.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn resolve_graph_start_nodes_from_plan(
-    db: &Database,
-    plan: &PhysicalPlan,
-    params: &HashMap<String, Value>,
-    tx: Option<TxId>,
-    snapshot: contextdb_core::SnapshotId,
-    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-) -> Result<Vec<uuid::Uuid>> {
-    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-    let result = db.with_snapshot_override(snapshot, || {
-        execute_plan(db, plan, params, tx, vector_copy_owner, read_memory.clone())
-    })?;
-    result
-        .result
-        .rows
-        .into_iter()
-        .filter_map(|row| row.into_iter().next())
-        .map(|value| match value {
-            Value::Uuid(id) => Ok(id),
-            Value::Text(text) => uuid::Uuid::parse_str(&text)
-                .map_err(|_| Error::PlanError(format!("invalid UUID in graph start plan: {text}"))),
-            other => Err(Error::PlanError(format!(
-                "invalid graph start identifier from plan: {other:?}"
-            ))),
-        })
-        .collect()
 }
 
 #[expect(
@@ -21550,18 +21318,6 @@ pub(crate) fn auto_indexes_for_table_meta(meta: &TableMeta) -> Vec<contextdb_cor
     });
     indexes
 }
-pub(crate) fn append_composite_fk_auto_indexes(meta: &mut TableMeta) {
-    append_auto_phase(meta, |p| matches!(p, AutoPhase::CompositeForeign));
-}
-fn append_auto_phase(meta: &mut TableMeta, include: impl Fn(AutoPhase) -> bool) {
-    let mut indexes = std::mem::take(&mut meta.indexes);
-    visit_auto_indexes(meta, |phase, columns, name| {
-        if include(phase) {
-            append_auto_candidate(&mut indexes, phase, columns, name);
-        }
-    });
-    meta.indexes = indexes;
-}
 
 /// Checked, allocation-free bound from the same candidate stream as generation.
 /// Includes the complete destination, the temporary auto vector during transfer,
@@ -24419,50 +24175,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         )
     }
 
-    fn resolve_graph_filter_at_snapshot(
-        &self,
-        expr: &Expr,
-        params: &HashMap<String, Value>,
-        tx: Option<TxId>,
-        snapshot: SnapshotId,
-        ctes: &[Cte],
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<Expr> {
-        self.store.resolve_graph_filter_at_snapshot(
-            expr,
-            params,
-            tx,
-            snapshot,
-            ctes,
-            vector_copy_owner,
-            read_memory.clone(),
-        )
-    }
-
     fn as_database_for_subquery_plan(&self) -> Option<&Database> {
         self.store.as_database_for_subquery_plan()
-    }
-
-    fn resolve_graph_start_nodes_from_filter(
-        &self,
-        filter: &Expr,
-        params: &HashMap<String, Value>,
-        tx: Option<TxId>,
-        snapshot: SnapshotId,
-        start_alias: &str,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<GraphStartResolution> {
-        self.store.resolve_graph_start_nodes_from_filter(
-            filter,
-            params,
-            tx,
-            snapshot,
-            start_alias,
-            vector_copy_owner,
-            read_memory.clone(),
-        )
     }
 
     fn graph_filter_matches_bindings_with_work(

@@ -732,9 +732,6 @@ pub(crate) struct WorkingGraphOccurrence {
     origin: WorkingGraphOrigin,
 }
 impl WorkingGraphOccurrence {
-    pub(crate) fn ordinal(&self) -> u64 {
-        self.ordinal
-    }
     pub(crate) fn origin(&self) -> WorkingGraphOrigin {
         self.origin
     }
@@ -907,45 +904,6 @@ impl ReceivedWorkingWrite {
             body,
             _owner: frame.into_reservation(),
         }))
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn visit_graph_types_original(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        mut visit: impl FnMut(&str) -> Result<()>,
-    ) -> Result<()> {
-        self.require_original(original)?;
-        let mut after = None::<GraphPosition>;
-        loop {
-            let lower = after
-                .as_ref()
-                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) =
-                self.next_graph_record(original, WORKING_GRAPH_TYPES, lower, Bound::Unbounded)?
-            else {
-                break;
-            };
-            let kind = std::str::from_utf8(&record.key).map_err(|_| Error::StoreCorrupted {
-                path: "received working graph selection".into(),
-                reason: "invalid exact type bytes".into(),
-            })?;
-            if !record.body.is_empty() {
-                return Err(Error::StoreCorrupted {
-                    path: "received working graph selection".into(),
-                    reason: "invalid selection marker".into(),
-                });
-            }
-            visit(kind)?; // All native guards closed; only this name is resident.
-            let next = OriginalPersistenceFrame::new(original)?;
-            after = Some(GraphPosition {
-                key: next.copy_bytes(&record.key)?,
-                _owner: next.into_reservation(),
-            });
-        }
-        Ok(())
     }
     #[expect(
         clippy::result_large_err,
@@ -1225,47 +1183,7 @@ impl ReceivedWorkingWrite {
     }
 }
 
-impl ReceivedWorkingWrite {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn visit_graph_coordinates_original(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        deletion: bool,
-        mut visit: impl FnMut(&[u8], WorkingGraphCoordinate) -> Result<()>,
-    ) -> Result<()> {
-        self.require_original(original)?;
-        let captured = self.capture_graph(original)?;
-        let definition = if deletion {
-            WORKING_GRAPH_DELETIONS
-        } else {
-            WORKING_GRAPH_CREATIONS
-        };
-        let mut after = None::<GraphPosition>;
-        loop {
-            let lower = after
-                .as_ref()
-                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) =
-                self.next_graph_record(original, definition, lower, Bound::Unbounded)?
-            else {
-                break;
-            };
-            let frame = OriginalPersistenceFrame::new(original)?;
-            let coordinate = self.decode_graph_coordinate(original, &frame, &record.body)?;
-            visit(&record.key, coordinate)?;
-            self.check_graph_capture(original, &captured)?;
-            let next = OriginalPersistenceFrame::new(original)?;
-            after = Some(GraphPosition {
-                key: next.copy_bytes(&record.key)?,
-                _owner: next.into_reservation(),
-            });
-        }
-        Ok(())
-    }
-}
+impl ReceivedWorkingWrite {}
 
 // Bodies of accepted occurrences live in native scratch, before the pending
 // logical-identity overlay can replace or delete them. They are never a second

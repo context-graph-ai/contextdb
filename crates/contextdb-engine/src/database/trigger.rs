@@ -823,22 +823,6 @@ impl Database {
         Ok(())
     }
 
-    /// Validate and encode a received trigger projection using the projected
-    /// table state supplied by the source-order schema planner.  This performs
-    /// every fallible parse/definition check before durable publication.
-    #[allow(dead_code)] // consumed when received-schema publication joins the staged Redb transaction
-    pub(super) fn prepare_received_trigger_publication(
-        &self,
-        ddl: &[DdlChange],
-        projected_tables: &HashMap<String, TableMeta>,
-    ) -> Result<PreparedTriggerPublication> {
-        let mut declarations = self.trigger.declarations.lock().clone();
-        for change in ddl {
-            self.apply_sync_trigger_ddl_to_projection(&mut declarations, change, projected_tables)?;
-        }
-        self.prepare_received_trigger_publication_from_projection(declarations)
-    }
-
     pub(super) fn received_trigger_projection_bytes(&self) -> Result<usize> {
         let declarations = self.trigger.declarations.lock();
         let encoded = bincode::serde::encode_into_std_write(
@@ -3771,64 +3755,7 @@ impl Database {
     }
 }
 
-// The native table-drop route prepares this event component before its durable
-// trigger/table/graph write, then publishes at the original event-definition
-// position. The unchanged Legacy table-drop helper remains selected today.
-pub(super) struct OwnedTableDropEventCompanion {
-    definitions: Option<event_bus::OwnedDefinitionPublication>,
-    events: event_bus::OwnedPreparedSinkEvents,
-}
-impl Database {
-    pub(super) fn prepare_owned_table_drop_event_companion(
-        &self,
-        events: &event_bus::OwnedEventBusHandle,
-        table: &str,
-    ) -> Result<OwnedTableDropEventCompanion> {
-        match &self.tx_mgr {
-            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
-                crate::memory_accounting::validate_owned_original(
-                    &events.data().original,
-                    &self.finalization.accountant,
-                    &host.funder,
-                )
-            })?,
-            DatabaseTransactionHost::Legacy(_) => {
-                return Err(Error::Other(
-                    "owning table drop requires its actual native database host".into(),
-                ));
-            }
-        }
-        let definitions = events.prepare_owned_event_bus_without_table(table)?;
-        let prepared_events = events.prepare_owned_sink_events(&[])?;
-        Ok(OwnedTableDropEventCompanion {
-            definitions,
-            events: prepared_events,
-        })
-    }
-    pub(super) fn with_owned_table_drop_event_config<R>(
-        &self,
-        stage: &OwnedTableDropEventCompanion,
-        flush: impl for<'e> FnOnce(Option<&'e [(String, Vec<u8>)]>) -> Result<R>,
-    ) -> Result<R> {
-        flush(
-            stage
-                .definitions
-                .as_ref()
-                .map(|definitions| definitions.config.values.as_slice()),
-        )
-    }
-    pub(super) fn publish_owned_table_drop_event_companion(
-        &self,
-        events: &event_bus::OwnedEventBusHandle,
-        stage: OwnedTableDropEventCompanion,
-    ) {
-        if let Some(definitions) = stage.definitions {
-            events.publish_owned_definition_publication(definitions, stage.events);
-        } else {
-            events.publish_owned_sink_events_to_memory(stage.events);
-        }
-    }
-}
+impl Database {}
 
 #[cfg(test)]
 mod sync_effect_tests {

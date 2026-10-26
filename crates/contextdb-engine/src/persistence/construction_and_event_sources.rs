@@ -935,19 +935,6 @@ impl OwnedColdEventSource<'_> {
             error
         })
     }
-    pub(crate) fn extent_funded(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        sink: &str,
-    ) -> crate::funded_error::OriginalResult<(u64, u64, redb::StorageSnapshotIdentity)> {
-        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        self.extent_in(
-            original,
-            sink,
-            |error| diagnostic.storage(original, error),
-            |error| diagnostic.error(error),
-        )
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -968,25 +955,6 @@ impl OwnedColdEventSource<'_> {
             visit,
             RedbPersistence::storage_error,
             |error| error,
-        )
-    }
-    pub(crate) fn visit_range_funded(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        sink: &str,
-        after: Option<u64>,
-        upper: u64,
-        visit: impl for<'e> FnMut(u64, &'e [u8]) -> crate::funded_error::OriginalResult<bool>,
-    ) -> crate::funded_error::OriginalResult<bool> {
-        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        self.visit_range_in(
-            original,
-            sink,
-            after,
-            upper,
-            visit,
-            |error| diagnostic.storage(original, error),
-            |error| diagnostic.error(error),
         )
     }
 
@@ -1245,33 +1213,6 @@ impl OwnedEncodedEventSource<'_> {
         }
         Ok(())
     }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn visit_sinks(
-        &self,
-        mut visit: impl for<'e> FnMut(&'e str) -> Result<()>,
-    ) -> Result<()> {
-        if let Some(loaded) = self.loaded {
-            for name in loaded.keys() {
-                visit(name)?;
-            }
-        }
-        for handle in self
-            .read
-            .list_tables()
-            .map_err(RedbPersistence::storage_error)?
-        {
-            if let Some(name) = handle.name().strip_prefix("__sink_queue_")
-                && !self.loaded.is_some_and(|loaded| loaded.contains_key(name))
-            {
-                visit(name)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl RedbPersistence {
@@ -1343,29 +1284,6 @@ impl RedbPersistence {
         )
     }
 
-    pub(crate) fn with_owned_encoded_event_source_funded<R>(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        f: impl for<'s> FnOnce(
-            &'s OwnedEncodedEventSource<'s>,
-        ) -> crate::funded_error::OriginalResult<R>,
-    ) -> crate::funded_error::OriginalResult<R> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        self.with_db_original_funded(original, |db| {
-            let read = db
-                .begin_read()
-                .map_err(|error| diagnostic.storage(original, error))?;
-            f(&OwnedEncodedEventSource {
-                read: &read,
-                loaded: None,
-                read_memory: &read_memory,
-            })
-        })
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -1389,30 +1307,7 @@ impl RedbPersistence {
     }
 }
 
-impl RetainedReadSource {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn with_owned_encoded_image_source<R>(
-        &self,
-        loaded: &BTreeMap<String, Vec<(u64, Vec<u8>)>>,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        f: impl for<'s> FnOnce(&'s OwnedEncodedEventSource<'s>) -> Result<R>,
-    ) -> Result<R> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        // begin_read verifies this transaction against the registered image
-        // snapshot; unloaded queues never reopen the latest writer root.
-        let read = self.begin_read()?;
-        let source = OwnedEncodedEventSource {
-            read: &read,
-            loaded: Some(loaded),
-            read_memory: &read_memory,
-        };
-        f(&source)
-    }
-}
+impl RetainedReadSource {}
 impl std::io::Write for OwnedEventEncodedLength {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0 = self

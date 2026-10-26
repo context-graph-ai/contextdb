@@ -935,46 +935,6 @@ pub(super) fn operation_read_for_retained(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(crate) fn retained_partition_row_at_lsn(
-    source: &RetainedReadSource,
-    table: &str,
-    meta: &TableMeta,
-    row: RowId,
-    lsn: Lsn,
-    memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-) -> Result<Option<VersionedRow>> {
-    let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
-
-    operation_checkpoint()?;
-    let read = match operation_read_for_retained(source) {
-        Some(read) => read,
-        None => Arc::new(source.begin_read()?),
-    };
-    if read.storage_snapshot_identity() != source.storage_identity() {
-        return Err(damage("partition row lookup escaped its retained capture"));
-    }
-    let mut last = None;
-    source.reconcile_relational_group::<Error>(
-        &read,
-        table,
-        meta,
-        row,
-        source.logical_frontier,
-        Some(lsn),
-        memory,
-        &mut || operation_checkpoint(),
-        None,
-        &mut |admission: crate::read_image_memory::RowReadAdmission<'_>| {
-            admission.retain_into_image(crate::read_image_memory::active_owner()?.as_ref())
-        },
-        &mut last,
-    )
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
 pub(super) fn authenticate_retained_historical_body(
     source: &RetainedReadSource,
     read: &redb::ReadTransaction,

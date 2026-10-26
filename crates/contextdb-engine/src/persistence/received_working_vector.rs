@@ -778,42 +778,6 @@ impl ReceivedWorkingWrite {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn visit_vector_bodies_original(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        mut visit: impl FnMut(&VectorEntry, &[u8], &[u8]) -> Result<()>,
-    ) -> Result<()> {
-        self.require_original(original)?;
-        if !self.vectors_prepared()? {
-            return Err(Error::Other(
-                "received vectors have no completed private image".into(),
-            ));
-        }
-        let mut after = None::<VectorPosition>;
-        loop {
-            let lower = after
-                .as_ref()
-                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(body) = self
-                .with_write(|write| next_body_in_write(original, write, lower, Bound::Unbounded))?
-            else {
-                break;
-            };
-            let frame = OriginalPersistenceFrame::new(original)?;
-            let key = frame.copy_bytes(body.position())?;
-            after = Some(VectorPosition {
-                key,
-                _owner: frame.into_reservation(),
-            });
-            visit(body.value(), body.position(), body.encoded())?;
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn visit_vector_memberships_original(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,

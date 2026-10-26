@@ -1728,36 +1728,6 @@ impl AnswerCharge {
         }
     }
 
-    /// Consume the answer's existing credit. The shared credit allocation is
-    /// admitted before allocation and remains owned by every answer clone.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn holding_reader(
-        mut credit: contextdb_core::read_memory::ReadCredit,
-    ) -> Result<Self> {
-        use contextdb_core::read_memory::ReadShared;
-        let control_bytes = ReadShared::<contextdb_core::read_memory::ReadCredit>::layout().size();
-        credit.try_grow_for(
-            control_bytes,
-            "bounded_read",
-            "retain_answer_credit",
-            "Reduce the statement's output or raise the declared reader memory limit.",
-        )?;
-        // Split the newly admitted control from the same original debit. The
-        // payload credit may refund during destruction; the native cell's
-        // separate invoice settles only after its actual physical free.
-        let invoice = credit.try_split_off(control_bytes)?;
-        Ok(Self {
-            image: None,
-            reader: Some(
-                ReadShared::try_from_prepaid_native(credit, invoice)
-                    .map_err(Error::NativeEngineOther)?,
-            ),
-        })
-    }
-
     pub(crate) fn held(&self) -> usize {
         self.image.as_ref().map_or(0, |charge| charge.held())
             + self.reader.as_ref().map_or(0, |charge| {

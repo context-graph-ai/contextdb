@@ -1452,42 +1452,6 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn record_ddl_generation_sidecars(
-        &self,
-        lsn: Lsn,
-        ddl: &[DdlChange],
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let start = self
-            .ddl_log
-            .read()
-            .iter()
-            .filter(|(existing_lsn, _)| *existing_lsn == lsn)
-            .count() as u32;
-        let values = self.ddl_generation_sidecar_values(lsn, ddl, start, read_memory.clone())?;
-        if let Some(persistence) = &self.persistence {
-            self.publish_direct_metadata(|| {
-                persistence.flush_encoded_config_values(
-                    values
-                        .iter()
-                        .map(|(key, value)| (key.as_str(), value.clone()))
-                        .collect(),
-                )
-            })?;
-        } else {
-            let sidecars = self.ddl_generation_sidecars(ddl, read_memory)?;
-            let prepared = self.prepare_memory_schema_history(lsn, start, &[], &sidecars)?;
-            self.publish_memory_schema_history(prepared);
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn durable_lineage_record(
         &self,
         table: &str,
@@ -3660,34 +3624,6 @@ impl Database {
                     .map(|history| history.source.database_path())
             })
             .unwrap_or_else(|| std::path::Path::new(""))
-    }
-
-    pub(super) fn committed_image_path(&self) -> String {
-        self.retained_relational_source
-            .as_ref()
-            .map(|source| source.database_path().display().to_string())
-            .or_else(|| {
-                self.image_history
-                    .as_ref()
-                    .map(|history| history.source.database_path().display().to_string())
-            })
-            .unwrap_or_default()
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn append_durable_pending_delete_changes(
-        &self,
-        since_lsn: Lsn,
-        changes: ChangeSet,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<ChangeSet> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let pending = self.durable_pending_deletes_since(since_lsn, read_memory)?;
-        Ok(Self::reconcile_durable_pending_deletes(changes, pending))
     }
 
     sync_test_seam! {

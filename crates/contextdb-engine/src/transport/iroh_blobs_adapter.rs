@@ -2051,16 +2051,6 @@ impl BlobStoreHandle {
             .map_err(|_| Error::Other("media adapter: store task dropped".into()))?
     }
 
-    /// Retained as the single-source servable-set predicate (mirrors the
-    /// inline check in `serve_stream`); a future caller (e.g. an operator
-    /// `has()` surface) can reuse it instead of re-deriving the check.
-    #[allow(dead_code)]
-    fn is_servable(&self, hash: &Hash) -> bool {
-        self.repository
-            .has_tag_role(hash.as_bytes(), BlobTagRole::Servable)
-            .unwrap_or(false)
-    }
-
     /// Content-address `bytes` into the store, tag them servable, return the
     /// BLAKE3 name. Idempotent: identical bytes converge on one blob.
     #[expect(

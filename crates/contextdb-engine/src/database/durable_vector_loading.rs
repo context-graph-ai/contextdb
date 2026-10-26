@@ -52,17 +52,6 @@ impl SnapshotFloorRegistry {
             .is_some_and(|pass| snapshot.0 <= pass.watermark.0)
     }
 
-    /// Cheap, racy peek at whether anything is registered right now, without
-    /// beginning a removal pass. A registration can land the instant after
-    /// this reads, so a caller may use `true` only to decide whether
-    /// beginning a pass is worth attempting this cycle -- never as a
-    /// correctness gate. The pass's own `begin_removal_pass_inner` samples
-    /// the authoritative set atomically under the lock regardless of what
-    /// this returned.
-    pub(super) fn no_snapshots_currently_registered(&self) -> bool {
-        self.state.lock().active.is_empty()
-    }
-
     /// Racy peek like the one above, ignoring construction floors (see
     /// `begin_vector_removal_pass`).
     pub(super) fn no_snapshots_besides_construction_floors(&self) -> bool {

@@ -4956,63 +4956,6 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
-    /// Decode only the requested page. The extra key is inspected solely to
-    /// report a continuation; its value is never copied or decoded.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn load_config_page_with_prefix<T: serde::de::DeserializeOwned>(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-        accountant: crate::memory_accounting::AccountantHandle,
-    ) -> Result<(Vec<(String, T)>, bool)> {
-        self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let config_table = match read_txn.open_table(CONFIG_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), false)),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let memory = crate::read_image_memory::ImageMemory::charging_for(
-                accountant,
-                "sync_policy",
-                "read_refused_outcome_page",
-                "Reduce the page size or raise MEMORY_LIMIT before reading refusal outcomes.",
-            );
-            let mut page = Vec::new();
-            let mut more = false;
-            for entry in config_table
-                .range(cursor.unwrap_or(prefix)..)
-                .map_err(Self::storage_error)?
-            {
-                let (key, value) = entry.map_err(Self::storage_error)?;
-                let key = key.value();
-                if !key.starts_with(prefix) {
-                    break;
-                }
-                if cursor.is_some_and(|cursor| key <= cursor) {
-                    continue;
-                }
-                if page.len() == limit {
-                    more = true;
-                    break;
-                }
-                #[cfg(any(test, feature = "test-seams"))]
-                crate::writer_query_test_seams::note_config_enumeration(key);
-                let bytes = value.value();
-                memory.reserve(key.len().saturating_add(bytes.len()))?;
-                #[cfg(any(test, feature = "test-seams"))]
-                crate::writer_query_test_seams::note_config_decode(key);
-                let decoded = memory.scope(|| Self::decode(bytes))?;
-                page.push((key.to_owned(), decoded));
-            }
-            Ok((page, more))
-        })
-    }
-
     /// Inspect a peer-scoped run one value at a time and retain only the next
     /// source-order candidate. The digest suffix on durable keys has no source
     /// ordering, so selecting one candidate requires a scan of that peer's run.

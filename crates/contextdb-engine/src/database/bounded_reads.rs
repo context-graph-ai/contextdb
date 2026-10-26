@@ -67,20 +67,6 @@ impl Database {
 
     #[expect(
         clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn execute_at_snapshot_with_read_memory(
-        &self,
-        sql: &str,
-        params: &HashMap<String, Value>,
-        snapshot: SnapshotId,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<OwnedQueryResult> {
-        self.execute_at_snapshot_with_native_trace_refund(sql, params, snapshot, read_memory, None)
-    }
-
-    #[expect(
-        clippy::result_large_err,
         reason = "The existing inline native refusal is preserved without allocating an error."
     )]
     pub(crate) fn execute_at_snapshot_with_native_trace_refund(
@@ -1882,7 +1868,6 @@ impl Database {
         Ok(row)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn bounded_index_next<E>(
         &self,
         table: &str,

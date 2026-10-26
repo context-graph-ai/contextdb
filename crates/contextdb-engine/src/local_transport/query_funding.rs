@@ -23,30 +23,6 @@ impl<T> Funded<T> {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn allocate(
-        owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
-        bytes: usize,
-        make: impl FnOnce() -> T,
-    ) -> contextdb_core::Result<Self> {
-        let credit = owner
-            .map(|owner| {
-                ReadCredit::try_new(
-                    owner,
-                    bytes,
-                    "reader",
-                    "query_buffer",
-                    "Reduce simultaneous query working memory or raise the declared reader limit.",
-                )
-            })
-            .transpose()?;
-        let value = make();
-        Ok(Self { value, credit })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn allocate_owned(
         owner: Option<ReadMemoryOwner>,
         bytes: usize,
@@ -386,22 +362,6 @@ impl QueryBudget {
             .checkpoint
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(QueryCheckpoint::Owner(budget));
-    }
-    pub(crate) fn bind_client(
-        &self,
-        clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
-        deadline_ms: u64,
-        cancellation: Option<contextdb_core::read_contract::OwnerReadCancellation>,
-    ) {
-        *self
-            .control
-            .checkpoint
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(QueryCheckpoint::Client {
-            clock,
-            deadline_ms,
-            cancellation,
-        });
     }
     /// A final refusal still owes its bytes after cancellation. Keep the
     /// original checkpoint/token, and fund only its terminal carrier under

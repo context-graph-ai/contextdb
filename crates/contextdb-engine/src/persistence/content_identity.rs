@@ -493,7 +493,6 @@ fn observe_read_proof_memory(bytes: usize) {
 /// Since the last call: the peak chunk bodies a mutation transaction held,
 /// the chunk record it kept for its flush, and the peak a read walk charged.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 pub(crate) fn take_proof_memory_peak_for_test() -> (usize, usize, usize) {
     PROOF_MEMORY_PEAK.with(|peak| peak.replace((0, 0, 0)))
 }
@@ -510,7 +509,6 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 #[must_use = "keep the watch alive while observing referenced-key copies"]
 pub(crate) struct ResolvedKeyCopyWatchForTest(std::marker::PhantomData<std::rc::Rc<()>>);
 
@@ -523,7 +521,6 @@ impl Drop for ResolvedKeyCopyWatchForTest {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 pub(crate) fn watch_resolved_key_copies_for_test() -> ResolvedKeyCopyWatchForTest {
     RESOLVED_KEY_WATCH_ENABLED.with(|enabled| {
         assert!(!enabled.get(), "referenced-key watches must not overlap");
@@ -534,7 +531,6 @@ pub(crate) fn watch_resolved_key_copies_for_test() -> ResolvedKeyCopyWatchForTes
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)] // Read by the proof-memory contracts beside this module.
 pub(crate) fn take_resolved_key_copy_observations_for_test() -> Vec<(&'static str, usize)> {
     RESOLVED_KEY_EVENTS.with(|obs| std::mem::take(&mut *obs.borrow_mut()))
 }
@@ -2234,59 +2230,6 @@ fn parse_posting_tree_key(key: &[u8]) -> Result<PostingTreeKeyParts<'_>> {
         ));
     }
     Ok((table, index, bound, &key[cursor..]))
-}
-
-/// Ordering for one decoded index-key component.
-///
-/// The proof boundary compares bytes read back from disk, so it validates
-/// before it orders. `RelationalIndexPosition`'s derived ordering is the SQL
-/// ordering for keys this engine itself wrote: it panics on mismatched `Value`
-/// variants and returns `Equal` for an Asc/Desc mismatch. A panic is not a
-/// diagnosis and a tie silently breaks the strict-order invariant the tree
-/// rests on, so stored bytes are refused with the identity corruption error
-/// instead.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn validated_directed_order(left: (bool, Value), right: (bool, Value)) -> Result<Ordering> {
-    let (left_descending, left_value) = left;
-    let (right_descending, right_value) = right;
-    if left_descending != right_descending {
-        return Err(Error::Other(
-            "logical identity posting keys disagree about their sort direction".into(),
-        ));
-    }
-    for value in [&left_value, &right_value] {
-        if !matches!(
-            value,
-            Value::Null
-                | Value::Bool(_)
-                | Value::Int64(_)
-                | Value::Float64(_)
-                | Value::Text(_)
-                | Value::Uuid(_)
-                | Value::Timestamp(_)
-                | Value::TxId(_)
-        ) {
-            return Err(Error::Other(
-                "logical identity posting key holds a value no index may order".into(),
-            ));
-        }
-    }
-    if !left_value.is_null()
-        && !right_value.is_null()
-        && std::mem::discriminant(&left_value) != std::mem::discriminant(&right_value)
-    {
-        return Err(Error::Other(
-            "logical identity posting keys compare unlike value types".into(),
-        ));
-    }
-    Ok(if left_descending {
-        contextdb_core::TotalOrdDesc(left_value).cmp(&contextdb_core::TotalOrdDesc(right_value))
-    } else {
-        contextdb_core::TotalOrdAsc(left_value).cmp(&contextdb_core::TotalOrdAsc(right_value))
-    })
 }
 
 #[expect(
@@ -4629,45 +4572,6 @@ fn resolving_entry_search(
     Ok(Err(left))
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn entry_search(entries: &[PageEntry], key: &[u8]) -> Result<std::result::Result<usize, usize>> {
-    let mut left = 0;
-    let mut right = entries.len();
-    while left < right {
-        let mid = (left + right) / 2;
-        match identity_key_cmp(&entries[mid].key, key)? {
-            Ordering::Less => left = mid + 1,
-            Ordering::Greater => right = mid,
-            Ordering::Equal => return Ok(Ok(mid)),
-        }
-    }
-    Ok(Err(left))
-}
-
-/// Sort by canonical key order without a panic on a key that cannot be
-/// ordered: the first refusal is kept and returned.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn sort_canonical(edits: &mut EntryEdits) -> Result<()> {
-    let mut failure = None;
-    edits.sort_by(|left, right| match identity_key_cmp(&left.0, &right.0) {
-        Ok(ordering) => ordering,
-        Err(error) => {
-            failure.get_or_insert(error);
-            Ordering::Equal
-        }
-    });
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
 /// Coalescing yields distinct encoded keys in raw-byte order. The raw-byte
 /// tiebreak therefore reproduces stable canonical sorting when distinct
 /// accepted encodings compare semantically equal, with no auxiliary allocation.
@@ -5688,11 +5592,6 @@ impl ProofMemory {
     /// The admission this walk charges its own allocations to.
     fn admission(&self) -> std::cell::RefMut<'_, ProofAdmission> {
         self.admission.borrow_mut()
-    }
-
-    /// What this walk has admitted from the accountant right now.
-    pub(super) fn admitted_bytes(&self) -> usize {
-        self.admission.borrow().held()
     }
 
     /// For callers that hold no reservation of their own, such as the
@@ -9043,15 +8942,6 @@ impl RedbPersistence {
         }
         Ok(digest_from_roots(root_hashes))
     }
-
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn validate_family_tag(tag: u8) -> Result<LogicalFamily> {
-        LogicalFamily::from_tag(tag)
-    }
 }
 
 /// Raw proof fixtures retain the exact writer descriptor supplying disposable
@@ -10177,12 +10067,6 @@ pub(crate) mod original_writer {
         pub(crate) fn held(&self) -> usize {
             self.held
         }
-        pub(crate) fn peak(&self) -> usize {
-            self.peak.get()
-        }
-        fn is_accounted(&self) -> bool {
-            true
-        }
         #[expect(
             clippy::result_large_err,
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -10221,35 +10105,6 @@ pub(crate) mod original_writer {
                 .unwrap_or(0),
             budget_limit_bytes: usage.and_then(|usage| usage.limit).unwrap_or(usize::MAX),
             hint: "Proof allocation capacity overflowed.".into(),
-        }
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn resolve_key_charged_checkpoint<'a>(
-        table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-        family: LogicalFamily,
-        key: &'a [u8],
-        admission: &mut ProofAdmission,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<(std::borrow::Cow<'a, [u8]>, usize)> {
-        if key.first() != Some(&KEY_REFERENCE_TAG) {
-            checkpoint()?;
-            return Ok((key.into(), 0));
-        }
-        if key.len() != KEY_REFERENCE_BYTES {
-            return Err(Error::Other("invalid authenticated key reference".into()));
-        }
-        let charge = u32::from_be_bytes(key[1..5].try_into().expect("length")) as usize;
-        admission.admit(charge)?;
-        match resolve_key_checkpoint(table, family, key, checkpoint) {
-            Ok(key) => Ok((key, charge)),
-            Err(error) => {
-                admission.release(charge);
-                Err(error)
-            }
         }
     }
 
@@ -10366,68 +10221,6 @@ pub(crate) mod original_writer {
         })
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn resolving_key_cmp(
-        table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-        family: LogicalFamily,
-        left: &[u8],
-        right: &[u8],
-        admission: &mut ProofAdmission,
-    ) -> Result<Ordering> {
-        let left_reference = left.first() == Some(&KEY_REFERENCE_TAG);
-        let right_reference = right.first() == Some(&KEY_REFERENCE_TAG);
-        if !left_reference && !right_reference {
-            return identity_key_cmp(left, right);
-        }
-        // Equal keys hash equally, and a key reference carries that hash, so the
-        // common case of an edit landing exactly on a separator costs no read.
-        if key_hash(left) == key_hash(right) {
-            return Ok(Ordering::Equal);
-        }
-        // Both keys are live at once for this one comparison, so both are charged
-        // before either is copied and both are given back before the next.
-        let (left, left_charge) = resolve_key_charged(table, family, left, admission)?;
-        let (right, right_charge) = match resolve_key_charged(table, family, right, admission) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                admission.release(left_charge);
-                return Err(error);
-            }
-        };
-        let ordering = identity_key_cmp(&left, &right);
-        drop(left);
-        drop(right);
-        admission.release(left_charge);
-        admission.release(right_charge);
-        ordering
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn resolving_entry_search(
-        table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-        family: LogicalFamily,
-        entries: &[PageEntry],
-        key: &[u8],
-        admission: &mut ProofAdmission,
-    ) -> Result<std::result::Result<usize, usize>> {
-        let mut left = 0;
-        let mut right = entries.len();
-        while left < right {
-            let mid = (left + right) / 2;
-            match resolving_key_cmp(table, family, &entries[mid].key, key, admission)? {
-                Ordering::Less => left = mid + 1,
-                Ordering::Greater => right = mid,
-                Ordering::Equal => return Ok(Ok(mid)),
-            }
-        }
-        Ok(Err(left))
-    }
     struct MutationKeyNode {
         first: usize,
         last: usize,
@@ -13926,37 +13719,6 @@ mod original_ddl_occurrences {
             clippy::result_large_err,
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
-        pub(crate) fn owned_validate_ddl_occurrence_ordinal(ordinal: u32) -> Result<()> {
-            validate_ordinal(ordinal)
-        }
-
-        #[expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )]
-        pub(crate) fn owned_ddl_config_occurrence_coordinate(key: &str) -> Result<(Lsn, u32)> {
-            config_occurrence(key)?
-                .ok_or_else(|| damage("invalid occurrence configuration namespace"))
-        }
-
-        #[expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )]
-        pub(super) fn owned_initialize_ddl_selectors_in_write(
-            write: &redb::WriteTransaction,
-        ) -> Result<()> {
-            write.delete_table(SELECTORS).map_err(Self::storage_error)?;
-            write.delete_table(COUNTS).map_err(Self::storage_error)?;
-            write.open_table(SELECTORS).map_err(Self::storage_error)?;
-            write.open_table(COUNTS).map_err(Self::storage_error)?;
-            Ok(())
-        }
-
-        #[expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )]
         pub(super) fn owned_ddl_selector_fingerprints_in_write(
             write: &redb::WriteTransaction,
         ) -> Result<[[u8; 32]; 2]> {
@@ -14219,164 +13981,6 @@ mod original_ddl_occurrences {
                 return Err(damage("declaration selector root binding mismatch"));
             }
             Ok(())
-        }
-
-        #[expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )]
-        pub(super) fn owned_validate_ddl_selectors_in_read(
-            read: &redb::ReadTransaction,
-        ) -> Result<()> {
-            match read.open_table(SELECTORS) {
-                Ok(_) => {}
-                Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Err(damage("missing mandatory declaration selector table"));
-                }
-                Err(error) => return Err(Self::storage_error(error)),
-            }
-            match read.open_table(COUNTS) {
-                Ok(_) => {}
-                Err(redb::TableError::TableDoesNotExist(_)) => {
-                    return Err(damage("missing mandatory declaration count table"));
-                }
-                Err(error) => return Err(Self::storage_error(error)),
-            }
-            let actual = [
-                read.table_root_fingerprint(SELECTORS)
-                    .map_err(Self::storage_error)?
-                    .unwrap_or([0; 32]),
-                read.table_root_fingerprint(COUNTS)
-                    .map_err(Self::storage_error)?
-                    .unwrap_or([0; 32]),
-            ];
-            if actual != content_identity::ddl_selector_roots_in_read(read)? {
-                return Err(damage("declaration selector root binding mismatch"));
-            }
-            Ok(())
-        }
-
-        #[expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )]
-        pub(crate) fn owned_first_eligible_ddl_occurrence(
-            root: &WriterSnapshotHandle,
-            owner: writer_source::SourceWindowOwner,
-            change: &DdlChange,
-            after: Option<(Lsn, u32)>,
-        ) -> Result<Option<(Lsn, u32)>> {
-            if let Some((_, ordinal)) = after {
-                validate_ordinal(ordinal)?;
-            }
-            // The borrowed declaration is already owned by the received vector.
-            // Only key/control allocations are new; streaming serialization retains no body copy.
-            let name = match change {
-                DdlChange::CreateTable { name, .. }
-                | DdlChange::DropTable { name }
-                | DdlChange::AlterTable { name, .. }
-                | DdlChange::CreateIndex { name, .. }
-                | DdlChange::DropIndex { name, .. }
-                | DdlChange::CreateTrigger { name, .. }
-                | DdlChange::DropTrigger { name }
-                | DdlChange::CreateEventType { name, .. }
-                | DdlChange::CreateSink { name, .. }
-                | DdlChange::CreateRoute { name, .. }
-                | DdlChange::DropRoute { name, .. }
-                | DdlChange::CreateTriggerIncludingSync { name, .. } => name,
-            };
-            let _charge =
-                root.adapter_control(&owner, name.len().saturating_mul(8).saturating_add(2048))?;
-            let prefix = prefix(change)?;
-            let mut lower = prefix.clone();
-            lower.extend_from_slice(&suffix(after.unwrap_or((Lsn(0), 0))));
-            let mut upper = prefix.clone();
-            upper.extend_from_slice(&[255; 12]);
-            let read = root.owner_read()?;
-            Self::owned_validate_ddl_selectors_in_read(&read)?;
-            let selectors = read.open_table(SELECTORS).map_err(Self::storage_error)?;
-            let entry = selectors
-                .range::<&[u8]>((
-                    if after.is_some() {
-                        Bound::Excluded(lower.as_slice())
-                    } else {
-                        Bound::Included(lower.as_slice())
-                    },
-                    Bound::Included(upper.as_slice()),
-                ))
-                .map_err(Self::storage_error)?
-                .next()
-                .transpose()
-                .map_err(Self::storage_error)?;
-            let Some((key, value)) = entry else {
-                return Ok(None);
-            };
-            if key.value().len() != prefix.len() + 12 || !key.value().starts_with(&prefix) {
-                return Err(damage("invalid declaration selector key"));
-            }
-            let key_bytes = &key.value()[prefix.len()..];
-            let at = (
-                Lsn(u64::from_be_bytes(key_bytes[..8].try_into().unwrap())),
-                u32::from_be_bytes(key_bytes[8..].try_into().unwrap()),
-            );
-            let primary = std::str::from_utf8(value.value())
-                .map_err(|_| damage("invalid declaration primary key"))?;
-            if coordinate(primary)? != at {
-                return Err(damage("selector coordinate does not bind primary key"));
-            }
-            let state = selectors
-                .get(state_key(at).as_slice())
-                .map_err(Self::storage_error)?
-                .ok_or_else(|| damage("selector occurrence state is absent"))?;
-            let state: State = Self::decode_config_value_exact(state.value())
-                .map_err(|_| damage("invalid selector occurrence state"))?;
-            if !state.eligible
-                || !state.unmarked
-                || state.selector != key.value()
-                || state.primary.as_bytes() != value.value()
-            {
-                return Err(damage("selector disagrees with exact occurrence state"));
-            }
-            let mut cursor = root.cursor(
-                owner,
-                "ddl_log",
-                writer_source::WriterCursorFamily::Text,
-                Bound::Included(primary.as_bytes()),
-                Bound::Included(primary.as_bytes()),
-                false,
-            )?;
-            let local = cursor
-                .next(|_, bytes| {
-                    crate::read_image_memory::reserve(
-                        bytes.len().saturating_mul(64).saturating_add(4096),
-                    )?;
-                    Self::decode_config_value_exact::<DdlChange>(bytes)
-                        .map_err(|_| damage("invalid exact declaration primary encoding"))
-                })?
-                .ok_or_else(|| damage("selector primary is absent"))?;
-            if &local.value != change {
-                return Err(damage("exact declaration selector disagrees with primary"));
-            }
-            Ok(Some(at))
-        }
-
-        #[expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )]
-        pub(crate) fn owned_unmarked_ddl_occurrences(
-            root: &WriterSnapshot,
-            owner: writer_source::SourceWindowOwner,
-            lsn: Lsn,
-        ) -> Result<u64> {
-            let _charge = root.adapter_control(&owner, 256)?;
-            let read = root.owner_read()?;
-            Self::owned_validate_ddl_selectors_in_read(&read)?;
-            let counts = read.open_table(COUNTS).map_err(Self::storage_error)?;
-            Ok(counts
-                .get(lsn.0)
-                .map_err(Self::storage_error)?
-                .map_or(0, |value| value.value()))
         }
     }
 }
@@ -15414,17 +15018,6 @@ pub(crate) mod original_producers {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn remove_commit_index_mutation(
-        frame: &OriginalPersistenceFrame<'_>,
-        lsn: Lsn,
-    ) -> Result<ContentIdentityMutation> {
-        frame.reserve(ORDERED_HISTORY_MAGIC.len() + 1 + 8)?;
-        Ok(super::remove_commit_index_mutation(lsn))
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn sync_source_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         table: &str,
@@ -15643,118 +15236,6 @@ pub(crate) mod original_version_manifest {
         })
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn parse_manifest_with_checkpoint<'a>(
-        coordinate: &'a [u8],
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<VersionManifest<'a>> {
-        if coordinate.len() < FIXED_KEY_BYTES - 2 || coordinate[0] != FORMAT {
-            return Err(bad("invalid format or truncated key"));
-        }
-        let length = u32::from_be_bytes(coordinate[1..5].try_into().expect("length")) as usize;
-        if length.checked_add(FIXED_KEY_BYTES - 2) != Some(coordinate.len()) {
-            return Err(bad("invalid table length or trailing fields"));
-        }
-        let raw = &coordinate[5..5 + length];
-        let mut at = 0;
-        while at < raw.len() {
-            checkpoint()?;
-            let mut end = raw.len().min(at.saturating_add(64 * 1024));
-            if end < raw.len() {
-                while end > at && raw[end] & 0xc0 == 0x80 {
-                    end -= 1;
-                }
-            }
-            if end == at {
-                return Err(bad("table is not UTF-8"));
-            }
-            std::str::from_utf8(&raw[at..end]).map_err(|_| bad("table is not UTF-8"))?;
-            at = end;
-        }
-        // Every span was validated above; avoid a second whole-table scan.
-        // SAFETY: the entire slice is the concatenation of the valid UTF-8
-        // windows checked above, each ending before a complete character.
-        let table = unsafe { std::str::from_utf8_unchecked(raw) };
-        let p = 5 + length;
-        let identity = coordinate[p..p + 24].try_into().expect("identity");
-        let closure = u64::from_be_bytes(coordinate[p + 25..p + 33].try_into().expect("closure"));
-        let deleted_tx = match coordinate[p + 24] {
-            0 if closure == 0 => None,
-            1 => Some(TxId(closure)),
-            _ => return Err(bad("invalid closure marker")),
-        };
-        Ok(VersionManifest {
-            table,
-            identity,
-            deleted_tx,
-            digest: coordinate[p + 33..].try_into().expect("digest"),
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn prefix_with_checkpoint(
-        table: &str,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Vec<u8>> {
-        let len = u32::try_from(table.len()).map_err(|_| bad("table length overflow"))?;
-        let capacity = (FIXED_KEY_BYTES - 2)
-            .checked_add(table.len())
-            .ok_or_else(|| bad("key length overflow"))?;
-        let mut key = Vec::with_capacity(capacity);
-        key.push(FORMAT);
-        key.extend_from_slice(&len.to_be_bytes());
-        for window in table.as_bytes().chunks(64 * 1024) {
-            checkpoint()?;
-            key.extend_from_slice(window);
-        }
-        Ok(key)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn copy_with_checkpoint(
-        bytes: &[u8],
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Vec<u8>> {
-        let mut copy = Vec::with_capacity(bytes.len());
-        for window in bytes.chunks(64 * 1024) {
-            checkpoint()?;
-            copy.extend_from_slice(window);
-        }
-        Ok(copy)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn starts_with_checkpoint(
-        bytes: &[u8],
-        prefix: &[u8],
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<bool> {
-        if bytes.len() < prefix.len() {
-            return Ok(false);
-        }
-        Ok(bytes_cmp_checkpoint(&bytes[..prefix.len()], prefix, checkpoint)? == Ordering::Equal)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn equal_with_checkpoint(
-        left: &[u8],
-        right: &[u8],
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<bool> {
-        Ok(bytes_cmp_checkpoint(left, right, checkpoint)? == Ordering::Equal)
-    }
-
     /// Four offsets per named value; no decoded map or canonical body copy.
     #[derive(Clone, Copy)]
     struct Span {
@@ -15944,157 +15425,6 @@ pub(crate) mod original_version_manifest {
             }
             Ok(())
         }
-    }
-
-    /// Build only the declared scalar posting key, borrowing every payload from
-    /// the authenticated body. Quantized vector index keys retain their existing
-    /// admitted decoding path; ordinary wide scalar keys need just one buffer.
-    pub(crate) struct PrunedScalarPosting {
-        pub(crate) key: Vec<u8>,
-        pub(crate) suffix: usize,
-        pub(crate) row_id: RowId,
-        pub(crate) created: TxId,
-        pub(crate) deleted: Option<TxId>,
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn has_indexed_vector(body: &[u8], declarations: &[IndexDecl]) -> Result<bool> {
-        let mut checkpoint = || Ok(());
-        let mut input = Encoded {
-            bytes: body,
-            position: 0,
-            checkpoint: &mut checkpoint,
-        };
-        input.integer()?;
-        let count = input.length()?;
-        let mut found = false;
-        for _ in 0..count {
-            let (name, name_end) = input.text()?;
-            let start = input.position;
-            input.value()?;
-            if body[start] != 0
-                && declarations.iter().any(|declaration| {
-                    declaration
-                        .columns
-                        .iter()
-                        .any(|(column, _)| column.as_bytes() == &body[name..name_end])
-                })
-            {
-                found = true;
-            }
-        }
-        Ok(found)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn scalar_posting_for_body(
-        body: &[u8],
-        declaration: &IndexDecl,
-    ) -> Result<Option<PrunedScalarPosting>> {
-        let controls = declaration
-            .columns
-            .len()
-            .checked_mul(std::mem::size_of::<Option<&[u8]>>())
-            .and_then(|n| n.checked_add(256))
-            .ok_or_else(|| bad("posting descriptor overflow"))?;
-        crate::read_image_memory::reserve(controls)?;
-        let mut values = vec![None; declaration.columns.len()];
-        let mut checkpoint = || Ok(());
-        let mut input = Encoded {
-            bytes: body,
-            position: 0,
-            checkpoint: &mut checkpoint,
-        };
-        let row_id = RowId(input.integer()?);
-        let count = input.length()?;
-        let mut vector_key = false;
-        for _ in 0..count {
-            let (name, name_end) = input.text()?;
-            let start = input.position;
-            input.value()?;
-            for (position, (column, _)) in declaration.columns.iter().enumerate() {
-                if column.as_bytes() == &body[name..name_end] {
-                    if values[position].is_some() {
-                        return Err(bad("duplicate indexed value"));
-                    }
-                    if body[start] != 0 {
-                        vector_key = true;
-                    }
-                    values[position] = Some(&body[start + 1..input.position]);
-                }
-            }
-        }
-        let created = TxId(input.integer()?);
-        let deleted = input.option_integer()?.map(TxId);
-        input.integer()?; // lsn, authenticated by the manifest mutation
-        input.option_integer()?;
-        if input.position != body.len() {
-            return Err(bad("trailing body fields"));
-        }
-        if vector_key {
-            return Ok(None);
-        }
-        let capacity = values.iter().try_fold(32usize, |n, value| {
-            n.checked_add(1 + value.map_or(1, <[u8]>::len))
-                .ok_or_else(|| bad("posting key overflow"))
-        })?;
-        crate::read_image_memory::reserve(capacity)?;
-        let mut key = Vec::with_capacity(capacity);
-        bincode::serde::encode_into_std_write(
-            declaration.columns.len() as u64,
-            &mut key,
-            bincode::config::standard(),
-        )
-        .map_err(|e| bad(&format!("posting length: {e}")))?;
-        for ((_, direction), value) in declaration.columns.iter().zip(values) {
-            key.push(u8::from(*direction == contextdb_core::SortDirection::Desc));
-            key.extend_from_slice(value.unwrap_or(&[0])); // Value::Null
-        }
-        let suffix = key.len();
-        bincode::serde::encode_into_std_write(
-            (row_id, created),
-            &mut key,
-            bincode::config::standard(),
-        )
-        .map_err(|e| bad(&format!("posting identity: {e}")))?;
-        Ok(Some(PrunedScalarPosting {
-            key,
-            suffix,
-            row_id,
-            created,
-            deleted,
-        }))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn scalar_posting_identity(key: &[u8]) -> Result<(usize, RowId, TxId)> {
-        let mut checkpoint = || Ok(());
-        let mut input = Encoded {
-            bytes: key,
-            position: 0,
-            checkpoint: &mut checkpoint,
-        };
-        let count = input.length()?;
-        for _ in 0..count {
-            if input.byte()? > 1 {
-                return Err(bad("invalid index direction"));
-            }
-            input.scalar_value()?;
-        }
-        let suffix = input.position;
-        let row = RowId(input.integer()?);
-        let created = TxId(input.integer()?);
-        if input.position != key.len() {
-            return Err(bad("trailing posting fields"));
-        }
-        Ok((suffix, row, created))
     }
 
     /// Parse and hash the exact persisted representation before schema projection.

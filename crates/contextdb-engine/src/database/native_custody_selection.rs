@@ -247,46 +247,6 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn custody_records_native(
-        &self,
-        selectors: &[&str],
-        operation: &NativeReadRequest,
-        context: &NativeReadOpenContext,
-    ) -> Selected<NativeCustodySelection> {
-        if selectors.iter().any(|selector| selector.starts_with('@')) {
-            self.read_native_custody_root(operation, context)?
-                .require_native_custody_groups()?;
-        }
-        let owner = operation.owner();
-        let mut admitted = NativeSelectionHold::try_new(&owner, selectors.len())?;
-        for s in selectors {
-            admitted.retain(match s.strip_prefix('@') {
-                Some(g) => Selector::Group(g),
-                None => Selector::Prefix(s),
-            })?;
-        }
-        self.native_custody_selection_on(operation, context, admitted.as_slice())
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn custody_submission_native(
-        &self,
-        submission: uuid::Uuid,
-        operation: &NativeReadRequest,
-        context: &NativeReadOpenContext,
-    ) -> Selected<NativeCustodySelection> {
-        self.read_native_custody_root(operation, context)?
-            .require_native_custody_groups()?;
-        let group =
-            NativeBuffer::format(&operation.owner(), format_args!("submission:{submission}"))?;
-        self.native_custody_selection_on(operation, context, &[Selector::Group(group.text()?)])
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn custody_authority_native(
         &self,
         operation: &NativeReadRequest,

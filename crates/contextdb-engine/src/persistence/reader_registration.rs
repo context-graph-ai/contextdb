@@ -1950,20 +1950,6 @@ impl LoadReadImageError {
         }
     }
 
-    pub(crate) fn requires_writer_cause(&self) -> Option<ReadImageRequiresWriterCause> {
-        match self.kind() {
-            LoadReadImageErrorKind::RequiresWriter(cause) => Some(cause),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn corruption_cause(&self) -> Option<ReadImageCorruptionCause> {
-        match self.kind() {
-            LoadReadImageErrorKind::Corrupt(cause) => Some(cause),
-            _ => None,
-        }
-    }
-
     /// The reader-facing answer to a refused hydration.
     ///
     /// Persistence owns the damage vocabulary, so it also owns the single
@@ -4217,15 +4203,6 @@ impl ReadSnapshotRegistrationGuard {
             reader_hold_held: false,
             record_write_started: false,
         }
-    }
-
-    #[cfg(unix)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn open(database_path: &Path) -> std::result::Result<Self, LoadReadImageError> {
-        Self::open_descriptor(database_path, true)
     }
 
     /// A direct reader's registration, published PROVISIONALLY -- transaction

@@ -1246,15 +1246,6 @@ impl RedbPersistence {
         Ok(())
     }
 
-    /// The constant per-stripe lock controls inside the native cache index.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn writer_cache_stripe_control_bytes(&self) -> Result<usize> {
-        self.with_db(|db| Ok(db.cache_stripe_control_bytes()))
-    }
-
     pub(crate) fn cache_stripe_residue_bytes(&self) -> usize {
         self.cache_stripe_residue.get().copied().unwrap_or(0)
     }

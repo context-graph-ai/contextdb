@@ -364,14 +364,6 @@ fn open_existing(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn create(
-    runtime_root: &Path,
-    identity: (u64, u64),
-    database_identity: DatabaseIdentity,
-) -> std::io::Result<Fence> {
-    create_with_admission_mode(runtime_root, identity, database_identity, false)
-}
-
 fn create_with_admission_mode(
     runtime_root: &Path,
     identity: (u64, u64),

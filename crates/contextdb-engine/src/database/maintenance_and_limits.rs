@@ -5520,29 +5520,6 @@ impl Database {
         )
     }
 
-    #[allow(dead_code)]
-    pub(super) fn find_edge(
-        &self,
-        source: &NodeId,
-        target: &NodeId,
-        edge_type: &str,
-    ) -> Option<AdjEntry> {
-        self.graph_store
-            .forward_adj
-            .read()
-            .get(source)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| {
-                        entry.row_owner.is_none()
-                            && entry.target == *target
-                            && entry.edge_type == edge_type
-                    })
-                    .map(|entry| entry.entry.clone())
-            })
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

@@ -150,18 +150,6 @@ impl OriginalDiscardHistory {
     ) -> Result<()> {
         self.write.retain_original_owner(events)
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn commit_lsn(&self, tx: TxId) -> Result<Option<Lsn>> {
-        self.write
-            .open_table(COMMITS)
-            .map_err(RedbPersistence::storage_error)?
-            .get(tx.0)
-            .map_err(RedbPersistence::storage_error)
-            .map(|value| value.map(|v| Lsn(v.value())))
-    }
     pub(crate) fn write(&self) -> &redb::WriteTransaction {
         &self.write
     }
@@ -238,17 +226,6 @@ impl OriginalDiscardHistory {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn push_config(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        key: &str,
-    ) -> Result<()> {
-        self.push(original, CONFIGS, &key)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn contains_config(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -261,114 +238,6 @@ impl OriginalDiscardHistory {
             Ok(())
         })?;
         Ok(found)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn push_edge(
-        &self,
-        store: &RedbPersistence,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        edge: &AdjEntry,
-    ) -> Result<()> {
-        self.mutable(original)?;
-        self.write.require_store(store)?;
-        self.root.require_working_store(store)?;
-        let window = OriginalPersistenceFrame::new(original)?;
-        let _image = store.original_graph_window(&window)?;
-        window.record(edge)?;
-        window.reserve(edge.edge_type.len().saturating_add(49))?;
-        let physical = RedbPersistence::graph_fwd_key(edge);
-        // A decoded adjacency is a request, never authority. Re-read the exact
-        // predecessor in this same write and authenticate it at the pinned root.
-        let forward = self
-            .write
-            .open_table(GRAPH_FWD_TABLE)
-            .map_err(RedbPersistence::storage_error)?;
-        let body = forward
-            .get(physical.as_slice())
-            .map_err(RedbPersistence::storage_error)?
-            .ok_or_else(invalid)?;
-        let actual: AdjEntry = window.decode(body.value())?;
-        if actual != *edge {
-            return Err(invalid());
-        }
-        let owner = writer_source::SourceWindowOwner::Read(
-            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?,
-        );
-        self.root
-            .verify_graph_edge_at_root(&physical, body.value(), edge, false, &owner)?;
-        let receipt_key = graph_history_record::lifecycle_key(&physical)?;
-        let receipts = self
-            .write
-            .open_table(graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE)
-            .map_err(RedbPersistence::storage_error)?;
-        let deletion_count = if let Some(receipt) = receipts
-            .get(receipt_key.as_slice())
-            .map_err(RedbPersistence::storage_error)?
-        {
-            let bytes = receipt.value();
-            if bytes.len() != 18
-                || bytes[0] != 1
-                || bytes[17] != 0
-                || edge.deleted_tx
-                    != Some(TxId(u64::from_be_bytes(bytes[1..9].try_into().unwrap())))
-            {
-                return Err(invalid());
-            }
-            let count = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
-            if count == 0 {
-                return Err(invalid());
-            }
-            count
-        } else {
-            0
-        };
-        if self
-            .write
-            .open_table(EDGE_KEYS)
-            .map_err(RedbPersistence::storage_error)?
-            .insert(physical.as_slice(), 0)
-            .map_err(RedbPersistence::storage_error)?
-            .is_some()
-        {
-            return Err(Error::SyncError(
-                "authoritative purge edge-row witness has no exact forward adjacency".into(),
-            ));
-        }
-        self.push(original, EDGES, edge)?;
-        // Creation records have no private deletion witness: preserve their
-        // existing one-per-adjacency matching. Deletions use a disjoint key
-        // space and the complete authenticated private predecessor instead.
-        let creation =
-            window.encode(&(0u8, edge.source, edge.target, &edge.edge_type, edge.lsn))?;
-        let deletion = window.encode(&(2u8, physical.as_slice()))?;
-        let mut occurrences = self
-            .write
-            .open_table(OCCURRENCES)
-            .map_err(RedbPersistence::storage_error)?;
-        let count = occurrences
-            .get(creation.as_slice())
-            .map_err(RedbPersistence::storage_error)?
-            .map(|value| window.decode::<u64>(value.value()))
-            .transpose()?
-            .unwrap_or(0);
-        let count = window.encode(&count.checked_add(1).ok_or_else(invalid)?)?;
-        occurrences
-            .insert(creation.as_slice(), count.as_slice())
-            .map_err(RedbPersistence::storage_error)?;
-        if deletion_count != 0 {
-            let count = window.encode(&deletion_count)?;
-            if occurrences
-                .insert(deletion.as_slice(), count.as_slice())
-                .map_err(RedbPersistence::storage_error)?
-                .is_some()
-            {
-                return Err(invalid());
-            }
-        }
-        Ok(())
     }
     #[expect(
         clippy::result_large_err,

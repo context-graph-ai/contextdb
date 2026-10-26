@@ -370,41 +370,6 @@ impl EngineDatabaseTransactions {
         })
     }
 
-    // Restricted prepared mutations are the only writable preparation door.
-    // Callers must migrate their entire payload/delivery bodies before using
-    // these forwards; the immutable ordinary image is never a mutable adapter.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn commit_terminal(
-        &self,
-        tx: TxId,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        requires_commit: impl FnOnce() -> Result<bool>,
-        active_prepare: impl FnOnce(Lsn, TxId) -> Result<()>,
-        prepare: impl for<'g, 'h, 'p> FnOnce(
-            &'g mut contextdb_tx::manager::EngineGuard<'h>,
-            &'p mut OwnedTerminalMetadata,
-        ) -> Result<()>,
-        after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
-    ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        self.transactions.with_transactions(|lower| {
-            lower.commit_owned_active_prepare_and_applied_with_peer(
-                tx,
-                read_memory,
-                requires_commit,
-                active_prepare,
-                prepare,
-                after_apply,
-                |identity| self.metadata.validate_terminal(identity),
-                ValidatedMetadataTerminal::consume_nonfallible,
-            )
-        })
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -503,57 +468,6 @@ impl EngineDatabaseTransactions {
 }
 
 impl EngineDatabaseTransactions {
-    #[allow(
-        clippy::result_large_err,
-        reason = "the error is contextdb_tx::manager::EngineTerminalFailure, a public type of another crate; boxing it would change that crate's API"
-    )]
-    pub(super) fn commit_terminal_scoped(
-        &self,
-        database: &Database,
-        tx: TxId,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        requires_commit: impl FnOnce() -> Result<bool>,
-        active_prepare: impl FnOnce(
-            &DatabaseCommitScope<'_, '_, '_>,
-            Lsn,
-            TxId,
-        ) -> PreparationResult<()>,
-        prepare: impl for<'g, 'h, 'p> FnOnce(
-            &'g mut contextdb_tx::manager::EngineGuard<'h>,
-            &'p mut OwnedTerminalMetadata,
-            contextdb_tx::manager::EngineTerminalIdentity,
-        ) -> Result<()>,
-        after_apply: impl for<'w> FnOnce(Lsn, &'w WriteSet),
-    ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        // Lend the actual immutable original before any commit/state/peer
-        // guard. The coordinator orders source pruning and independently
-        // funded config stamping before its final validation and hooks.
-        let borrowed = self.events.with_owned_persistence_original(|_original| {
-            if database.tx_mgr.identity() != self.transactions.identity() {
-                return Err(EngineMetadataJournal::identity_error());
-            }
-            Ok(self.commit_interval_terminal_scoped(
-                tx,
-                1,
-                read_memory,
-                requires_commit,
-                |scope, _start, end, visibility_tx| active_prepare(scope, end, visibility_tx),
-                |guard, peer, identity| {
-                    // The owning coordinator orders received-source pruning
-                    // before creation/outcome stamping on this same original.
-                    prepare(guard, peer, identity)
-                },
-                after_apply,
-            ))
-        });
-        match borrowed {
-            Ok(result) => result,
-            Err(error) => Err(OwnedDatabaseTerminalFailure::from_error(error)),
-        }
-    }
-
     #[allow(clippy::result_large_err)]
     pub(super) fn commit_interval_terminal_scoped(
         &self,
@@ -653,59 +567,6 @@ impl EngineDatabaseTransactions {
         });
         result
             .map(|result| result.map(|(lsn, pair)| (lsn, pair.map_peer(unwrap_temporary_peer))))
-            .map_err(|failure| failure.map_peer(unwrap_temporary_peer))
-    }
-
-    #[allow(
-        clippy::result_large_err,
-        reason = "the error is contextdb_tx::manager::EngineTerminalFailure, a public type of another crate; boxing it would change that crate's API"
-    )]
-    pub(super) fn commit_reserved_terminal_scoped(
-        &self,
-        tx: TxId,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        before_commit: impl FnOnce(&DatabaseCommitScope<'_, '_, '_>, Lsn) -> PreparationResult<()>,
-        prepare: impl for<'g, 'h, 'p> FnOnce(
-            &'g mut contextdb_tx::manager::EngineGuard<'h>,
-            &'p mut OwnedTerminalMetadata,
-        ) -> Result<()>,
-    ) -> std::result::Result<(Lsn, OwnedDatabaseTerminal), OwnedDatabaseTerminalFailure> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let result = self.with_terminal_apply_scope(|| {
-            self.transactions.with_transactions(|lower| {
-                lower.commit_owned_with_reserved_lsn_callback_with_peer_scoped(
-                    tx,
-                    read_memory,
-                    |scope, lsn| {
-                        before_commit(
-                            &DatabaseCommitScope {
-                                host: self,
-                                lower: scope,
-                            },
-                            lsn,
-                        )
-                    },
-                    |guard, peer: &mut OwnedTemporaryMetadata| {
-                        self.bind_terminal_apply(guard, peer.identity)?;
-                        prepare(guard, &mut peer.original)
-                    },
-                    |identity| {
-                        let terminal = self.metadata.validate_terminal(identity);
-                        let original_present =
-                            EngineMetadataJournal::record(&terminal.records, identity.original_tx)
-                                .is_some();
-                        ValidatedTemporaryMetadata {
-                            terminal,
-                            original_present,
-                        }
-                    },
-                    consume_temporary_nonfallible,
-                )
-            })
-        });
-        result
-            .map(|(lsn, pair)| (lsn, pair.map_peer(unwrap_temporary_peer)))
             .map_err(|failure| failure.map_peer(unwrap_temporary_peer))
     }
 }
@@ -1579,40 +1440,6 @@ impl DatabaseCommitScope<'_, '_, '_> {
             |error| error,
         )
     }
-    pub(super) fn prepare_received_schema_stage_funded(
-        &self,
-        database: &Database,
-        events: &event_bus::OwnedEventBusHandle,
-        local_lsn: Lsn,
-        coordinates: Option<&ConnectedCoordinates>,
-        changes: &ChangeSet,
-        received: Option<&crate::protocol::ReceivedDdlContext>,
-        validated_lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
-        inputs: ReceivedSchemaAdjudicationInputs<'_>,
-        delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> crate::funded_error::OriginalResult<ReceivedSchemaStage> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let diagnostic =
-            crate::funded_error::OriginalError::prepare_route(&events.data().original)?;
-        self.prepare_received_schema_stage_in(
-            database,
-            events,
-            local_lsn,
-            coordinates,
-            changes,
-            received,
-            validated_lineages,
-            inputs,
-            delivery_prepare,
-            vector_copy_owner,
-            read_memory,
-            crate::persistence::received_working::ReceivedWorkingWrite::begin_funded,
-            |error| diagnostic.error(error),
-        )
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2335,29 +2162,6 @@ impl EngineMetadataJournal {
         record.undo_len = prepared.next_undo_len;
         record.existed = true;
         record.revision = prepared.next_revision;
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn take_settled_metadata(
-        &self,
-        tx: TxId,
-        generation: u64,
-    ) -> Result<Option<MetadataNode<EngineMetadataRecord>>> {
-        let mut records = self.records.lock();
-        if let Some(record) = Self::record(&records, tx) {
-            if record.generation != generation {
-                drop(records);
-                return Err(Self::identity_error());
-            }
-            assert!(
-                record.depth == 0 && record.frames.is_none() && record.undo.is_none(),
-                "terminal metadata custody requires consumed coupled checkpoints"
-            );
-        }
-        Ok(Self::take_record(&mut records, tx))
     }
 
     pub(super) fn validate_checkpoint(

@@ -53,48 +53,6 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn relational_manifest_has_successor_in_write_original(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        write: &redb::WriteTransaction,
-        table: &str,
-        physical: &[u8],
-    ) -> Result<bool> {
-        if physical.len() != 24 {
-            return Err(self.relational_manifest_damage("invalid physical version identity"));
-        }
-        let mut admission = content_identity::original_writer::ProofAdmission::new(
-            original,
-            self.proof_scratch_owner(),
-        )?;
-        admission.admit(
-            table
-                .len()
-                .checked_add(72)
-                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
-        )?;
-        let mut prefix = manifest::manifest_prefix(table)?;
-        prefix.extend_from_slice(physical);
-        let coordinate = manifest::writer_manifest_next(write, &prefix, false, &mut admission)
-            .map_err(|e| self.relational_manifest_error(e))?
-            .filter(|key| key.starts_with(&prefix))
-            .ok_or_else(|| self.relational_manifest_damage("physical version member is missing"))?;
-        let next = manifest::writer_manifest_next(write, &coordinate, true, &mut admission)
-            .map_err(|e| self.relational_manifest_error(e))?;
-        let Some(next) = next else {
-            return Ok(false);
-        };
-        if next.starts_with(&prefix) {
-            return Err(self.relational_manifest_damage("duplicate physical version member"));
-        }
-        let witness =
-            manifest::parse_manifest(&next).map_err(|e| self.relational_manifest_error(e))?;
-        Ok(witness.table == table && witness.identity[..8] == physical[..8])
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn replace_relational_manifest_in_write_original(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,

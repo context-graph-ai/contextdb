@@ -1773,30 +1773,6 @@ impl Database {
         )
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn insert_row_prepaid(
-        &self,
-        tx: TxId,
-        table: &str,
-        values: HashMap<ColName, Value>,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<RowId> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        self.insert_row_with_admission(
-            tx,
-            table,
-            values,
-            None,
-            vector_copy_owner,
-            read_memory.clone(),
-        )
-    }
-
     /// Carry the SQL producer's original reservation into the row caller.
     /// Host selection preserves the Legacy caller and routes Owned through
     /// the paired original producer before any native factory is enabled.

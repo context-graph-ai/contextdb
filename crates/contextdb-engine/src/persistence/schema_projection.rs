@@ -858,43 +858,6 @@ impl ReceivedLatestRecords {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn consider_original(
-        &self,
-        original: &OriginalPersistenceFrame<'_>,
-        write: &redb::WriteTransaction,
-        key: &[u8],
-        lsn: Lsn,
-        tx: TxId,
-        index: usize,
-    ) -> Result<()> {
-        let window = OriginalPersistenceFrame::new(original.original)?;
-        window.reserve(key.len().saturating_mul(4).saturating_add(512))?;
-        let mut table = write
-            .open_table(RECEIVED_LATEST_RECORDS)
-            .map_err(RedbPersistence::storage_error)?;
-        let previous = table
-            .get(key)
-            .map_err(RedbPersistence::storage_error)?
-            .map(|value| Self::decode(value.value()))
-            .transpose()?;
-        if previous.is_some_and(|(seen_lsn, seen_tx, _)| (seen_lsn, seen_tx) >= (lsn.0, tx.0)) {
-            return Ok(());
-        }
-        let index = u64::try_from(index)
-            .map_err(|_| Error::Other("schema record ordinal overflow".into()))?;
-        let mut value = [0u8; 24];
-        value[..8].copy_from_slice(&lsn.0.to_be_bytes());
-        value[8..16].copy_from_slice(&tx.0.to_be_bytes());
-        value[16..].copy_from_slice(&index.to_be_bytes());
-        table
-            .insert(key, value.as_slice())
-            .map_err(RedbPersistence::storage_error)?;
-        Ok(())
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     fn decode(value: &[u8]) -> Result<(u64, u64, u64)> {
         if value.len() != 24 {
             return Err(Error::Other(
@@ -941,60 +904,6 @@ impl ReceivedLatestRecords {
                             coordinate_bytes = required;
                         }
                         window.admit(key.value().len().saturating_add(256))?;
-                        let (_, _, index) = Self::decode(value.value())?;
-                        let index = usize::try_from(index).map_err(|_| {
-                            Error::Other("schema record ordinal exceeds address space".into())
-                        })?;
-                        Ok::<_, Error>((key.value().to_vec(), index))
-                    })
-                    .transpose()?
-            };
-            let Some((key, index)) = selected else {
-                break;
-            };
-            // End all native handles before the callback opens proof tables.
-            visitor(index)?;
-            after = Some(key);
-        }
-        write
-            .delete_table(RECEIVED_LATEST_RECORDS)
-            .map_err(RedbPersistence::storage_error)?;
-        Ok(())
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn visit_original(
-        self,
-        original: &OriginalPersistenceFrame<'_>,
-        write: &redb::WriteTransaction,
-        mut visitor: impl FnMut(usize) -> Result<()>,
-    ) -> Result<()> {
-        let coordinate_credit = OriginalPersistenceFrame::new(original.original)?;
-        let mut coordinate_bytes = 0usize;
-        let mut after: Option<Vec<u8>> = None;
-        loop {
-            let window = OriginalPersistenceFrame::new(original.original)?;
-            let selected = {
-                let table = write
-                    .open_table(RECEIVED_LATEST_RECORDS)
-                    .map_err(RedbPersistence::storage_error)?;
-                let lower = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
-                let mut cursor = table
-                    .range::<&[u8]>((lower, Bound::Unbounded))
-                    .map_err(RedbPersistence::storage_error)?;
-                cursor
-                    .next()
-                    .transpose()
-                    .map_err(RedbPersistence::storage_error)?
-                    .map(|(key, value)| {
-                        let required = key.value().len().saturating_mul(2).saturating_add(128);
-                        if required > coordinate_bytes {
-                            coordinate_credit.reserve(required - coordinate_bytes)?;
-                            coordinate_bytes = required;
-                        }
-                        window.reserve(key.value().len().saturating_add(256))?;
                         let (_, _, index) = Self::decode(value.value())?;
                         let index = usize::try_from(index).map_err(|_| {
                             Error::Other("schema record ordinal exceeds address space".into())
@@ -2952,66 +2861,7 @@ impl<'o> OriginalProjectedIndexes<'o> {
         Ok(())
     }
 }
-impl RedbPersistence {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn rebuild_received_indexes_paged_original(
-        &self,
-        frame: &OriginalPersistenceFrame<'_>,
-        write: &redb::WriteTransaction,
-        table: &str,
-        meta: &TableMeta,
-        supplied_rows: Option<&[VersionedRow]>,
-        commitments: &mut historical_index_commitment::CommitmentBatch,
-    ) -> Result<()> {
-        let mut indexes =
-            OriginalProjectedIndexes::prepare(self, frame, write, table, meta, commitments)?;
-        // A standalone rebuild does not insert rows, so derive their coverage
-        // here exactly once, separately from the posting producer.
-        let mut rebuild_row = |row: &VersionedRow| -> Result<()> {
-            let window = OriginalPersistenceFrame::new(frame.original)?;
-            window.reserve(row.estimated_bytes().saturating_mul(8).saturating_add(1024))?;
-            for declaration in &indexes.declarations {
-                let key =
-                    contextdb_relational::index_key_for_row(&declaration.columns, &row.values);
-                commitments.fold_interval(
-                    write,
-                    table,
-                    declaration,
-                    historical_index_commitment::Side::Versions,
-                    &historical_index_commitment::key_row(&key, row.row_id)?,
-                    row.created_tx,
-                    row.deleted_tx,
-                    true,
-                )?;
-            }
-            indexes.push(self, write, table, meta, row, commitments)
-        };
-        if let Some(rows) = supplied_rows {
-            if rows.windows(2).any(|pair| {
-                (pair[0].row_id, pair[0].created_tx, pair[0].lsn)
-                    > (pair[1].row_id, pair[1].created_tx, pair[1].lsn)
-            }) {
-                return Err(Error::Other(
-                    "received index input is not in prepared durable order".into(),
-                ));
-            }
-            for row in rows {
-                rebuild_row(row)?;
-            }
-        } else {
-            self.visit_relational_rows_in_write_original(frame, write, table, |row, _window| {
-                #[cfg(any(test, feature = "test-seams"))]
-                RELATIONAL_INDEX_REBUILD_ROWS_DECODED
-                    .with(|count| count.set(count.get().saturating_add(1)));
-                rebuild_row(row)
-            })?;
-        }
-        indexes.finish(self, write, table, meta)
-    }
-}
+impl RedbPersistence {}
 
 // The native received kernel stages its derived placement image inside the
 // same unpublished Redb transaction. These relations never cross commit.

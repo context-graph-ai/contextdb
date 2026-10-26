@@ -8559,15 +8559,6 @@ struct OriginalMutationVector<'f, 'o> {
 
 struct OriginalWindowMemory(std::cell::RefCell<crate::memory_accounting::OwnedMemoryReservation>);
 
-/// Actual startup queue decoding over the already captured encoded root.
-/// Count and decode never open a second reader transaction. Raw action ids,
-/// attempts and row identities are preserved for the companion's sanitization
-/// and next-id recovery at the original startup publication positions.
-pub(crate) struct OriginalLoadedSinkQueue {
-    pub(crate) entries: Vec<(u64, SinkQueueEntry)>,
-    _allocation: crate::memory_accounting::OwnedMemoryReservation,
-}
-
 mod original_relational_manifest;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

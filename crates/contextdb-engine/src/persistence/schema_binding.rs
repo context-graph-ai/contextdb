@@ -603,20 +603,7 @@ impl RedbPersistence {
     }
 }
 
-impl WriterSnapshot {
-    /// Preserve the schema owner's identity counters from the checkpoint's root.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn copy_schema_into(
-        self: &Arc<Self>,
-        owner: writer_source::SourceWindowOwner,
-        artifact: &RedbPersistence,
-    ) -> Result<()> {
-        WriterSnapshotHandle::from(self.clone()).copy_schema_into(owner, artifact)
-    }
-}
+impl WriterSnapshot {}
 
 impl WriterSnapshotHandle {
     #[expect(

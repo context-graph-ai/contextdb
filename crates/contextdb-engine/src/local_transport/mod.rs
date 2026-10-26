@@ -417,10 +417,6 @@ impl LocalTransportError {
             other => Err(other),
         }
     }
-    #[allow(dead_code)]
-    pub(crate) const fn unimplemented() -> Self {
-        Self::Unimplemented
-    }
 }
 
 pub(crate) fn refusal(kind: ReadFailureKind) -> LocalTransportError {

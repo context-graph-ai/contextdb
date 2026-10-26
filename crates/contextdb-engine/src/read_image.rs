@@ -3304,41 +3304,6 @@ fn funded_paging(
     })
 }
 
-/// One page of an inventory, cut by the shared pager.
-fn paged(
-    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    vocabulary: MetadataPageVocabulary,
-    items: Vec<contextdb_core::read_contract::MetadataItem>,
-    continuation: Option<&str>,
-    page_bytes: u64,
-    key: fn(&contextdb_core::read_contract::MetadataItem) -> String,
-) -> std::result::Result<contextdb_core::read_contract::MetadataPage, DirectFileReaderError> {
-    let diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared::<
-        crate::read_contract::ReadEncodingError,
-    >(
-        read_memory,
-        "reader",
-        "metadata_page",
-        "Raise the reader memory limit to encode this page.",
-    )
-    .map_err(history_answer_error)?;
-    crate::metadata_page::continuation_page(vocabulary, items, continuation, page_bytes, key)
-        .map_err(|error| match error {
-            // A misused continuation and a page that cannot fit are both
-            // typed refusals a caller can act on -- the same ones the owner
-            // gives for the same store -- not engine prose.
-            crate::metadata_page::MetadataPagingError::Continuation(failure)
-            | crate::metadata_page::MetadataPagingError::Oversized(failure) => {
-                DirectFileReaderError::ReadFailure(failure)
-            }
-            crate::metadata_page::MetadataPagingError::Encoding(encoding) => {
-                DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(
-                    diagnostic.publish(encoding),
-                ))
-            }
-        })
-}
-
 /// Refuse a complete answer that does not fit the byte ceiling in force.
 ///
 /// The owner refuses this before it puts the answer on the wire. Reading the

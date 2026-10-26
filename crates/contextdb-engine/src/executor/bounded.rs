@@ -381,16 +381,6 @@ pub(super) struct TraceMemoryOwner {
 impl TraceMemoryOwner {
     #[expect(
         clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn try_new(
-        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<ControlArc<Self>> {
-        Self::try_new_with_native_refund(owner, None)
-    }
-
-    #[expect(
-        clippy::result_large_err,
         reason = "The existing inline native refusal is preserved without allocating an error."
     )]
     pub(super) fn try_new_with_native_refund(
@@ -18690,105 +18680,6 @@ fn planned_values_clone_bytes(
     Ok(bytes)
 }
 
-#[allow(dead_code)]
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn planned_query_clone_bytes(
-    result: &QueryResultData,
-) -> std::result::Result<usize, BoundedExecutionError> {
-    let mut bytes = std::mem::size_of::<CanonicalQueryResult>();
-    bytes = checked_size_add(
-        bytes,
-        checked_size_mul(
-            result.columns.len(),
-            std::mem::size_of::<String>(),
-            "canonical columns",
-        )?,
-        "canonical columns",
-    )?;
-    for column in &result.columns {
-        bytes = checked_size_add(bytes, column.len(), "canonical column")?;
-    }
-    bytes = checked_size_add(
-        bytes,
-        checked_size_mul(
-            result.rows.len(),
-            std::mem::size_of::<Vec<Value>>(),
-            "canonical rows",
-        )?,
-        "canonical rows",
-    )?;
-    for row in &result.rows {
-        bytes = checked_size_add(bytes, planned_values_clone_bytes(row)?, "canonical row")?;
-    }
-    bytes = checked_size_add(bytes, result.trace.physical_plan.len(), "canonical trace")?;
-    if let Some(index) = result.trace.index_used.as_ref() {
-        bytes = checked_size_add(bytes, index.len(), "canonical trace index")?;
-    }
-    bytes = checked_size_add(
-        bytes,
-        checked_size_mul(
-            result.trace.predicates_pushed.len(),
-            std::mem::size_of::<String>(),
-            "canonical trace predicates",
-        )?,
-        "canonical trace",
-    )?;
-    for predicate in &result.trace.predicates_pushed {
-        bytes = checked_size_add(bytes, predicate.len(), "canonical trace predicate")?;
-    }
-    bytes = checked_size_add(
-        bytes,
-        checked_size_mul(
-            result.trace.indexes_considered.len(),
-            std::mem::size_of::<crate::read_contract::CanonicalIndexCandidate>(),
-            "canonical considered indexes",
-        )?,
-        "canonical trace",
-    )?;
-    for index in &result.trace.indexes_considered {
-        bytes = checked_size_add(bytes, index.name.len(), "canonical considered index")?;
-        bytes = checked_size_add(
-            bytes,
-            index.rejected_reason.len(),
-            "canonical considered-index reason",
-        )?;
-    }
-    bytes = checked_size_add(
-        bytes,
-        checked_size_mul(
-            result.trace.groups.len(),
-            std::mem::size_of::<crate::database::GroupDisclosure>(),
-            "canonical group slots",
-        )?,
-        "canonical trace",
-    )?;
-    for group in &result.trace.groups {
-        bytes = checked_size_add(bytes, group.partition_key.len(), "canonical group key")?;
-    }
-    if let Some(source) = result.trace.query_vector_source.as_ref() {
-        bytes = checked_size_add(bytes, source.table.len(), "canonical vector source")?;
-        bytes = checked_size_add(bytes, source.column.len(), "canonical vector source")?;
-    }
-    if let Some(cascade) = result.cascade.as_ref() {
-        bytes = checked_size_add(
-            bytes,
-            checked_size_mul(
-                cascade.dropped_indexes.len(),
-                std::mem::size_of::<String>(),
-                "canonical cascade",
-            )?,
-            "canonical cascade",
-        )?;
-        for index in &cascade.dropped_indexes {
-            bytes = checked_size_add(bytes, index.len(), "canonical cascade")?;
-        }
-    }
-    Ok(bytes)
-}
-
 /// Native page buffers, excluding its separately admitted immutable root.
 #[expect(
     clippy::result_large_err,
@@ -18969,18 +18860,6 @@ fn encoded_page_size(
     })
 }
 
-#[allow(dead_code)]
-fn strip_internal_row_id(columns: &mut Vec<String>, rows: &mut [Vec<Value>]) {
-    if let Some(position) = columns.iter().position(|column| column == "row_id") {
-        columns.remove(position);
-        for row in rows {
-            if position < row.len() {
-                row.remove(position);
-            }
-        }
-    }
-}
-
 fn bounded_error_text(error: &BoundedExecutionError) -> String {
     match error {
         BoundedExecutionError::Engine(error) => error.to_string(),
@@ -19136,41 +19015,6 @@ impl Drop for StatementProofReuse<'_> {
             None => self.db.release_statement_proof_reuse(),
         }
     }
-}
-
-/// Drain a plan the CALLER already chose, with no ceilings.
-///
-/// This is the established embedding door's half of the shared kernel: the
-/// statement was planned by the caller, so nothing is planned again here, and
-/// the answer is drained once from the same sources a bounded read draws from.
-/// One planning, one drain -- which is what stops a public read from being
-/// answered twice, once for the rows and once for the trace.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(crate) fn drain_chosen_plan(
-    db: &dyn ReadExecutionTarget,
-    plan: &PhysicalPlan,
-    params: &HashMap<String, Value>,
-    tx: Option<TxId>,
-    snapshot: SnapshotId,
-    clock: Arc<dyn DeadlineClock>,
-    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
-    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-) -> std::result::Result<crate::database::OwnedQueryResult, BoundedExecutionError> {
-    drain_chosen_plan_with_native_trace_refund(
-        db,
-        plan,
-        params,
-        tx,
-        snapshot,
-        clock,
-        #[cfg(any(test, feature = "test-seams"))]
-        probe,
-        read_memory,
-        None,
-    )
 }
 
 #[expect(
@@ -22544,165 +22388,6 @@ struct NativeControlCell<T> {
 // borrowed T is protected by a logical strong; T handles its own shared mutation.
 unsafe impl<T: Send + Sync> Sync for NativeControlCell<T> {}
 
-struct NativeControlStrong<T> {
-    cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
-}
-
-struct NativeControlWeak<T> {
-    cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
-}
-
-#[expect(
-    dead_code,
-    reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it."
-)]
-impl<T> NativeControlStrong<T> {
-    /// Native companion of `try_new_with` for an infallible producer: both
-    /// layouts are admitted with native forms before either allocation, and a
-    /// refusal carries no owned diagnostic.
-    fn try_new_with_native(
-        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        make: impl FnOnce() -> T,
-    ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
-        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
-
-        use contextdb_core::read_memory::{NativeProduce, OwnedReadBox, ReadShared};
-        let control_invoice = ReadCredit::try_new_owned_native(
-            owner.clone(),
-            ReadShared::<NativeControlCell<T>>::layout().size(),
-            "reader",
-            "native_control_cell",
-            "release retained request controls",
-        )?;
-        let payload_invoice = ReadCredit::try_new_owned_native(
-            owner,
-            std::alloc::Layout::new::<T>().size(),
-            "reader",
-            "native_control_payload",
-            "release retained request payloads",
-        )?;
-        let refused = |failure: NativeProduce<std::convert::Infallible>| match failure {
-            NativeProduce::Refused(refusal) => refusal,
-            NativeProduce::Producer(never) => match never {},
-        };
-        let cell = ReadShared::try_from_prepaid_with_native(control_invoice, || {
-            Ok(NativeControlCell {
-                strong: std::sync::atomic::AtomicUsize::new(0),
-                payload: std::cell::UnsafeCell::new(None),
-            })
-        })
-        .map_err(refused)?;
-        let payload = OwnedReadBox::try_from_prepaid_with_native(payload_invoice, || Ok(make()))
-            .map_err(refused)?;
-        // SAFETY: as in `try_new_cyclic_with`; no weak alias exists yet.
-        unsafe { *cell.payload.get() = Some(payload) };
-        cell.strong.store(1, std::sync::atomic::Ordering::Release);
-        Ok(Self { cell })
-    }
-
-    fn downgrade(&self) -> NativeControlWeak<T> {
-        // The borrowed strong prevents logical final Drop; cloning the physical
-        // count alone gives the weak identity its independent storage lifetime.
-        NativeControlWeak {
-            cell: self.cell.clone(),
-        }
-    }
-}
-
-impl<T> Clone for NativeControlStrong<T> {
-    fn clone(&self) -> Self {
-        use std::sync::atomic::Ordering;
-        // Acquire a physical owner first. The borrowed source strong already
-        // protects T throughout logical registration, so Relaxed is sufficient.
-        let cell = self.cell.clone();
-        let retained = cell
-            .strong
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                if count != 0 && count < isize::MAX as usize {
-                    Some(count + 1)
-                } else {
-                    None
-                }
-            });
-        if retained.is_err() {
-            // Match the existing shared-count exhaustion contract. Never wrap,
-            // unwind with an unregistered logical owner, or resurrect zero.
-            std::process::abort();
-        }
-        Self { cell }
-    }
-}
-
-impl<T> std::ops::Deref for NativeControlStrong<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // SAFETY: this borrow retains one logical strong for the entire result
-        // lifetime. Therefore final Drop cannot take or destroy this Some(T).
-        unsafe { (&*self.cell.payload.get()).as_ref() }
-            .expect("live native control must retain its payload")
-            .as_ref()
-    }
-}
-
-impl<T> Drop for NativeControlStrong<T> {
-    fn drop(&mut self) {
-        use std::sync::atomic::{Ordering, fence};
-        if self.cell.strong.fetch_sub(1, Ordering::Release) != 1 {
-            return;
-        }
-        // This zero is permanent. A CAS either won a logical strong before it
-        // or cannot upgrade; Acquire observes earlier owners' completed uses.
-        fence(Ordering::Acquire);
-        // SAFETY: zero excludes all strong borrows and all future upgrades.
-        // Take leaves None BEFORE user Drop. Our physical cell field remains
-        // alive through payload destruction and its invoice, including unwind.
-        let payload = unsafe { (&mut *self.cell.payload.get()).take() };
-        drop(payload);
-        // Automatic field cleanup now releases our physical count. Existing
-        // ReadShared frees final control storage before its external invoice.
-    }
-}
-
-impl<T> Clone for NativeControlWeak<T> {
-    fn clone(&self) -> Self {
-        Self {
-            cell: self.cell.clone(),
-        }
-    }
-}
-
-impl<T> NativeControlWeak<T> {
-    #[expect(
-        dead_code,
-        reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it."
-    )]
-    fn upgrade(&self) -> Option<NativeControlStrong<T>> {
-        use std::sync::atomic::Ordering;
-        // The borrowed weak and this new physical owner keep the cell alive
-        // independently of payload expiry; neither is a logical strong yet.
-        let cell = self.cell.clone();
-        let mut count = cell.strong.load(Ordering::Relaxed);
-        loop {
-            if count == 0 {
-                return None;
-            }
-            if count >= isize::MAX as usize {
-                std::process::abort();
-            }
-            match cell.strong.compare_exchange_weak(
-                count,
-                count + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(NativeControlStrong { cell }),
-                Err(observed) => count = observed,
-            }
-        }
-    }
-}
-
 /// The actual Native invocation owns the same bounded RequestContext used by
 /// vector adapters, decoder scopes, page admissions and ordinary checkpoints.
 /// Its observers retain only paired weak aliases of that context.
@@ -22795,22 +22480,6 @@ impl NativeReadOpenContext {
             .as_ref()
             .expect("Native entry retains original operation")
             .owner())
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn touch_row(&self) -> Result<()> {
-        let context = self.request()?;
-        self.checkpoint()?;
-        let mut state = context.state();
-        if state.telemetry.work_units >= context.limits.work {
-            return Err(ReadOpenContext::engine_error(
-                RequestContext::limit_failure(ReadFailureLimit::Work, context.limits.work),
-            ));
-        }
-        state.telemetry.work_units += 1;
-        Ok(())
     }
 }
 

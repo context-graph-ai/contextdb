@@ -2765,27 +2765,6 @@ impl Database {
         Ok(rows)
     }
 
-    pub(super) fn authoritative_purge_all_memory_source_provenance(
-        &self,
-    ) -> Vec<(String, RowId, Lsn, u8)> {
-        self.relational_store
-            .sync_source_sidecars_snapshot()
-            .into_iter()
-            .map(|((table, row_id), (lsn, kind))| {
-                (
-                    table,
-                    row_id,
-                    lsn,
-                    match kind {
-                        contextdb_relational::store::SyncSourceKind::Pulled => 0,
-                        contextdb_relational::store::SyncSourceKind::AcceptedLocal => 1,
-                        contextdb_relational::store::SyncSourceKind::AcceptedLocalPending => 2,
-                    },
-                )
-            })
-            .collect()
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

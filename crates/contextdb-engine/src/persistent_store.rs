@@ -983,39 +983,7 @@ pub(crate) fn with_owned_metadata_publication_scope<R>(store: usize, f: impl FnO
     result
 }
 
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
 impl OwnedPersistentCompositeStore {
-    /// The private host keeps this control owner outside the Any Box across
-    /// the existing metadata publication gate, including failure and unwind.
-    pub(crate) fn with_owned_metadata_publication<R>(&self, f: impl FnOnce() -> R) -> R {
-        with_owned_metadata_publication_scope(self as *const Self as usize, f)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn apply_owned_with_vector_reclamation(
-        &self,
-        ws: &WriteSet,
-        reclaimable_partitions: HashSet<VectorPartitionRef>,
-        registered_snapshots: Option<&[SnapshotId]>,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let identity = self.owned_terminal_apply_identity(ws)?;
-        self.apply_owned_with_vector_reclamation_for_terminal(
-            ws,
-            identity,
-            reclaimable_partitions,
-            registered_snapshots,
-            read_memory,
-        )
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

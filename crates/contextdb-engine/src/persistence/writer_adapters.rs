@@ -145,18 +145,6 @@ impl WriterRelationalSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn exact_historical_row(
-        &self,
-        table: &str,
-        position: &[u8; 24],
-    ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
-        self.exact_historical_row_with_checkpoint(table, position, &mut || Ok(()))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn exact_historical_row_with_checkpoint(
         &self,
         table: &str,
@@ -1250,16 +1238,6 @@ impl WriterGraphSnapshot {
         let read: contextdb_core::read_memory::ReadMemoryOwner = read.into();
 
         Self::new_owned(root, SourceWindowOwner::Read(read))
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn new_for_write(
-        root: WriterSnapshotHandle,
-        writer: crate::memory_accounting::AccountantHandle,
-    ) -> Result<Self> {
-        Self::new_owned(root, SourceWindowOwner::writer(writer))
     }
     #[expect(
         clippy::result_large_err,

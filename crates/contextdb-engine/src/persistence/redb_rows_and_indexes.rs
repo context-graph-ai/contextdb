@@ -3330,38 +3330,6 @@ impl RedbPersistence {
         Some((table, row_id))
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn remove_retention_expiries_for_table(
-        write_txn: &redb::WriteTransaction,
-        table: &str,
-    ) -> Result<()> {
-        let prefix = format!(
-            "{}{}:{table}:",
-            crate::composite_store::RETENTION_EXPIRY_PREFIX,
-            table.len()
-        );
-        let mut config = write_txn
-            .open_table(CONFIG_TABLE)
-            .map_err(Self::storage_error)?;
-        let keys = config
-            .range(prefix.as_str()..)
-            .map_err(Self::storage_error)?
-            .map(|entry| {
-                entry
-                    .map(|(key, _)| key.value().to_owned())
-                    .map_err(Self::storage_error)
-            })
-            .take_while(|entry| entry.as_ref().map_or(true, |key| key.starts_with(&prefix)))
-            .collect::<Result<Vec<_>>>()?;
-        for key in keys {
-            config.remove(key.as_str()).map_err(Self::storage_error)?;
-        }
-        Ok(())
-    }
-
     /// Retire one table's source metadata without a source-sized key list.
     /// The two physical sidecars and their logical identity leave together.
     #[expect(
@@ -3634,37 +3602,6 @@ impl RedbPersistence {
                 )?;
             }
             after = Some(key);
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn remove_sync_source_provenance_for_table(
-        write_txn: &redb::WriteTransaction,
-        table: &str,
-    ) -> Result<()> {
-        let mut source_lsn_table = write_txn
-            .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
-            .map_err(Self::storage_error)?;
-        let lsn_keys_to_remove =
-            Self::sync_source_lsn_keys_for_table(&source_lsn_table, table, |_| true)?;
-        let mut source_kind_table = write_txn
-            .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
-            .map_err(Self::storage_error)?;
-        let kind_keys_to_remove =
-            Self::sync_source_kind_keys_for_table(&source_kind_table, table, |_| true)?;
-        for key in lsn_keys_to_remove {
-            source_lsn_table
-                .remove(key.as_slice())
-                .map_err(Self::storage_error)?;
-        }
-        for key in kind_keys_to_remove {
-            source_kind_table
-                .remove(key.as_slice())
-                .map_err(Self::storage_error)?;
         }
         Ok(())
     }

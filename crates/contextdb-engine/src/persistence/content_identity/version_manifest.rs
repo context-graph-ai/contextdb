@@ -2173,12 +2173,6 @@ pub(in super::super) mod commit_row_work {
         RETENTION_CLOCK_STEPS.with(|count| count.replace(0))
     }
 
-    /// One declared table the commit path looked at to maintain row-count
-    /// bookkeeping: its declaration, its directory header or its saved count.
-    pub(in super::super::super) fn count_declared_table_visit() {
-        DECLARED_TABLE_VISITS.with(|count| count.set(count.get().saturating_add(1)));
-    }
-
     pub(in super::super::super) fn take_declared_table_visits() -> u64 {
         DECLARED_TABLE_VISITS.with(|count| count.replace(0))
     }

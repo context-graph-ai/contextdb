@@ -649,31 +649,6 @@ impl StorageAdmissionScope {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn writer_unqualified(
-        original: &OwnedMemoryReservation,
-        expected: &AccountantHandle,
-        funder: &SourceFunder,
-    ) -> Result<Self> {
-        validate_owned_original(original, expected, funder)?;
-        Self::new_unqualified(StorageFunding::Writer {
-            original_use: clone_persistence_original_writer(original)?,
-            original_handle: persistence_original_projection(original)?,
-            genuine_funder: funder.clone(),
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn reader_unqualified(
-        receipt: crate::vector_read_memory::NativeReadChildReceipt,
-    ) -> Result<Self> {
-        Self::new_unqualified(StorageFunding::Read(receipt.into_owner()))
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn reader_operation(
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Self, NativeStorageFailure> {
@@ -788,41 +763,7 @@ pub(super) struct ColdMetadataOwner {
 }
 unsafe impl Send for ColdMetadataOwner {}
 unsafe impl Sync for ColdMetadataOwner {}
-impl ColdMetadataOwner {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn new_unqualified(
-        accountant: &AccountantHandle,
-        metadata: ColdSnapshotMetadata,
-    ) -> Result<Self> {
-        let original_untagged = StoreAccountantHandle::from_original_nonwriter(accountant);
-        let layout = Layout::new::<ColdMetadataBlock>();
-        let invoice = ControlCredit::admit_from_handle(
-            &original_untagged,
-            layout.size(),
-            "redb",
-            "cold_snapshot_metadata",
-            "Raise the store memory limit for this snapshot descriptor.",
-        )?;
-        let raw = unsafe { alloc(layout) }.cast::<ColdMetadataBlock>();
-        let Some(pointer) = NonNull::new(raw) else {
-            handle_alloc_error(layout)
-        };
-        unsafe {
-            pointer.as_ptr().write(ColdMetadataBlock {
-                owners: AtomicUsize::new(1),
-                metadata,
-                invoice: ManuallyDrop::new(invoice),
-            });
-        }
-        Ok(Self { pointer })
-    }
-    pub(super) fn get(&self) -> ColdSnapshotMetadata {
-        unsafe { self.pointer.as_ref() }.metadata
-    }
-}
+impl ColdMetadataOwner {}
 impl Clone for ColdMetadataOwner {
     fn clone(&self) -> Self {
         retain(&unsafe { self.pointer.as_ref() }.owners);
@@ -852,82 +793,7 @@ impl Drop for ColdMetadataOwner {
     }
 }
 
-/// Stack-held physical name with exact backing and external invoice.
-struct StorageName {
-    bytes: ManuallyDrop<Vec<u8>>,
-    invoice: Option<NativeStorageCredit>,
-}
-impl Drop for StorageName {
-    fn drop(&mut self) {
-        let invoice = self.invoice.take();
-        unsafe { ManuallyDrop::drop(&mut self.bytes) };
-        drop(invoice);
-    }
-}
-impl StorageAdmissionScope {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn with_rel_name<R>(
-        &self,
-        logical: &str,
-        operation: impl FnOnce(&str) -> Result<std::result::Result<R, redb::NativeColdReadError>>,
-    ) -> Result<std::result::Result<R, redb::NativeColdReadError>> {
-        let Some(len) = logical.len().checked_add(4) else {
-            return Ok(Err(redb::NativeColdReadError::Corrupt(
-                redb::NativeColdFault {
-                    reason: "physical table name length overflow",
-                    page: [0; 8],
-                    offset: 0,
-                    expected: 0,
-                    actual: 0,
-                },
-            )));
-        };
-        let Ok(layout) = Layout::array::<u8>(len) else {
-            return Ok(Err(redb::NativeColdReadError::Corrupt(
-                redb::NativeColdFault {
-                    reason: "physical table name layout overflow",
-                    page: [0; 8],
-                    offset: 0,
-                    expected: 0,
-                    actual: 0,
-                },
-            )));
-        };
-        // The native admission marker is recovered as its original scalar by
-        // run_native before the lower result is inspected. A sticky refusal
-        // also prevents a later physical-name allocation in this scope.
-        let invoice = match unsafe { admit_scope(self.pointer.cast(), layout) } {
-            Ok(invoice) => invoice,
-            Err(_) => {
-                return Ok(Err(redb::NativeColdReadError::AdmissionRefusedAt(
-                    self.retain_admission(),
-                )));
-            }
-        };
-        let raw = unsafe { alloc(layout) };
-        let Some(pointer) = NonNull::new(raw) else {
-            return Ok(Err(redb::NativeColdReadError::AllocatorFailed {
-                site: "physical relation name",
-                layout,
-            }));
-        };
-        // No fallible callback between alloc and initialized owner construction.
-        unsafe {
-            std::ptr::copy_nonoverlapping(b"rel_".as_ptr(), pointer.as_ptr(), 4);
-            std::ptr::copy_nonoverlapping(logical.as_ptr(), pointer.as_ptr().add(4), logical.len());
-        }
-        let name = StorageName {
-            bytes: ManuallyDrop::new(unsafe { Vec::from_raw_parts(pointer.as_ptr(), len, len) }),
-            invoice: Some(invoice),
-        };
-        let name_str =
-            std::str::from_utf8(&name.bytes).expect("prefix and logical table are UTF-8");
-        operation(name_str)
-    }
-}
+impl StorageAdmissionScope {}
 
 // Native failures retain only scalar/static data. Inherited allocating Errors
 // keep their original owner; this conversion does not certify their provenance.

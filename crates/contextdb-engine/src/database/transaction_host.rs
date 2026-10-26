@@ -2910,13 +2910,6 @@ impl PluginBinding {
         Self::Supplied(plugin)
     }
 
-    pub(super) fn as_plugin(&self) -> &dyn DatabasePlugin {
-        match self {
-            Self::Builtin(plugin) => plugin.as_ref(),
-            Self::Supplied(plugin) => plugin.as_ref(),
-        }
-    }
-
     pub(super) fn erased(&self) -> Arc<dyn DatabasePlugin> {
         match self {
             Self::Builtin(plugin) => plugin.clone(),

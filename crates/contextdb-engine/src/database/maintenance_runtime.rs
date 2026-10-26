@@ -920,11 +920,6 @@ impl MaintenanceContext {
         Ok(outcome)
     }
 
-    /// The serving cache size this store declares, as the loaders read it.
-    pub(super) fn declared_serving_cache_bytes(&self) -> Option<usize> {
-        declared_serving_cache_bytes(self.vector_serving_cache_bytes.load(Ordering::SeqCst))
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

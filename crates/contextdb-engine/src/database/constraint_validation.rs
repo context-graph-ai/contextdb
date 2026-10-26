@@ -24,20 +24,6 @@ impl Database {
             .map_err(ImageHistoryError::into_engine_error)
     }
 
-    /// [`Self::ensure_image_history`] for a request that owns a cancellation
-    /// and an active-time budget: `checkpoint` is called as the walk advances
-    /// and its refusal ends the walk, leaving nothing loaded or charged.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn ensure_image_history_within(
-        &self,
-        checkpoint: &dyn Fn() -> Result<()>,
-    ) -> std::result::Result<(), ImageHistoryError> {
-        self.ensure_image_history_with_read_memory(checkpoint, self.declared_reader_memory()?)
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

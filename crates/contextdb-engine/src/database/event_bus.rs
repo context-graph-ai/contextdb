@@ -184,10 +184,6 @@ impl SinkQueue {
         }
     }
 
-    pub(crate) fn resident(&self) -> &VecDeque<SinkQueueEntry> {
-        &self.entries
-    }
-
     /// Decoded bytes the resident window holds.
     pub(crate) fn resident_bytes(&self) -> usize {
         self.credits.iter().sum()
@@ -195,10 +191,6 @@ impl SinkQueue {
 
     fn all_resident(&self) -> bool {
         !self.bounded || self.depth == self.entries.len() as u64
-    }
-
-    fn contains(&self, id: u64) -> bool {
-        self.entries.iter().any(|entry| entry.id == id)
     }
 
     /// Publish one committed append. A bounded queue counts it and leaves it
@@ -1234,31 +1226,6 @@ impl EventBusState {
 }
 
 impl Database {
-    /// Project every event-bus declaration against the caller's complete
-    /// post-DDL table view, and encode all durable values before publication.
-    /// Source-order coordination belongs to `ReceivedSchemaStage`; this helper
-    /// deliberately does not append category-local DDL to the log.
-    #[allow(dead_code)] // consumed when received-schema publication joins the staged Redb transaction
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn prepare_received_event_bus_publication(
-        &self,
-        ddl: &[DdlChange],
-        projected_tables: &HashMap<String, TableMeta>,
-    ) -> Result<PreparedEventBusPublication> {
-        let mut definitions = self.received_event_bus_projection();
-        for change in ddl {
-            self.apply_received_event_bus_ddl_to_projection(
-                &mut definitions,
-                change,
-                projected_tables,
-            )?;
-        }
-        self.prepare_received_event_bus_publication_from_projection(definitions)
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -4675,74 +4642,7 @@ mod quiescent_queue_tests {
     }
 }
 
-impl Database {
-    /// Append the original next-action config body only after its actual writer
-    /// has admitted the key and encoded value. The guarded splice retains that
-    /// same reservation through publication and original source retirement.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn stage_next_action_id_in_prepared_write_set(
-        &self,
-        guard: &mut contextdb_tx::manager::EngineGuard<'_>,
-        next_action_id: u64,
-    ) -> Result<()> {
-        struct ByteCount(usize);
-        impl std::io::Write for ByteCount {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self
-                    .0
-                    .checked_add(bytes.len())
-                    .ok_or_else(|| std::io::Error::other("next action config size overflow"))?;
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut count = ByteCount(0);
-        bincode::serde::encode_into_std_write(
-            next_action_id,
-            &mut count,
-            bincode::config::standard(),
-        )
-        .map_err(|error| Error::Other((format!("bincode encode error: {error}")).into()))?;
-        let bytes = NEXT_ACTION_ID_CONFIG_KEY
-            .len()
-            .checked_add(count.0)
-            .ok_or_else(|| Error::Other("next action config size overflow".into()))?;
-        let mut admission = self.reserve_owned_preparation(bytes)?;
-        // Exact capacity prevents an encoder growth allocation outside the
-        // original admission. Neither key nor value exists before admission.
-        let mut encoded = Vec::with_capacity(count.0);
-        bincode::serde::encode_into_std_write(
-            next_action_id,
-            &mut encoded,
-            bincode::config::standard(),
-        )
-        .map_err(|error| Error::Other((format!("bincode encode error: {error}")).into()))?;
-        let body = contextdb_tx::staged_source::AuxBody::ConfigWrite((
-            NEXT_ACTION_ID_CONFIG_KEY.to_owned(),
-            encoded,
-        ));
-        let at = guard.read().config_writes.len();
-        match &self.tx_mgr {
-            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
-                // The original body is moved immediately with its invoice;
-                // there is no fallible operation while they are separate.
-                let invoice = admission.into_source_aux_invoice_for(&host.funder)?;
-                let batch = guard.prepare_owned_aux(body, invoice)?;
-                let prepared = guard.prepare_aux_splice(at, &[], batch)?;
-                guard.publish_tx(prepared);
-                Ok(())
-            }),
-            DatabaseTransactionHost::Legacy(_) => Err(DatabaseTransactionHost::producer_gap(
-                "stage_next_action_id_in_prepared_write_set",
-            )),
-        }
-    }
-}
+impl Database {}
 
 /// Assembly helper for the approved immutable companion seed loan. Frozen
 /// companion storage supplies its authentic stable original field outside
@@ -5225,13 +5125,6 @@ impl OwnedPreparedSinkEvents {
         }
         Ok(owner)
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn empty(original: &OwnedMemoryReservation) -> Result<Self> {
-        Self::try_copy(original, &[])
-    }
 }
 // Field order is deliberate: payload arrays, row/gate invoices, array invoices,
 // then escrow cancellation and mutation lease. No Clone of this aggregate.
@@ -5486,46 +5379,6 @@ impl OwnedEventBusHandle {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn with_owned_queue_entries<R>(
-        &self,
-        sink: &str,
-        f: impl for<'q> FnOnce(Option<&'q VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>>) -> Result<R>,
-    ) -> Result<R> {
-        loop {
-            let maximum = {
-                let queues = self.data().queues.lock();
-                queues
-                    .values
-                    .get(sink)
-                    .filter(|q| q.present)
-                    .map_or(0, |q| q.entries.len().saturating_sub(q.retiring))
-            };
-            let (body, credit) = new_owned_native_ring(&self.data().original, maximum)?;
-            let mut snapshot: OwnedEventBody<VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, _> =
-                OwnedEventBody { body, credit };
-            let present;
-            {
-                let queues = self.data().queues.lock();
-                let queue = queues.values.get(sink).filter(|q| q.present);
-                if queue.is_some_and(|q| {
-                    q.entries.len().saturating_sub(q.retiring) > snapshot.body.capacity()
-                }) {
-                    continue;
-                }
-                present = queue.is_some();
-                if let Some(queue) = queue {
-                    for entry in queue.entries.iter().skip(queue.retiring) {
-                        snapshot.body.push_back(entry.clone());
-                    }
-                }
-            }
-            return f(present.then_some(&snapshot.body));
-        }
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn stage_owned_commit_events(
         &self,
         lsn: Lsn,
@@ -5648,23 +5501,6 @@ impl OwnedEventBusHandle {
                     .map(|schema| schema.config.values.as_slice()),
             }
         }))
-    }
-    pub(super) fn take_owned_commit_events(
-        &self,
-        lsn: Lsn,
-        identity: EngineTerminalIdentity,
-    ) -> Option<OwnedEventShared<OwnedCommitEventStage>> {
-        let mut stages = self.data().stages.lock();
-        if !stages
-            .values
-            .get(&lsn)
-            .is_some_and(|stage| stage.get().identity == identity)
-        {
-            return None;
-        }
-        let taken = stages.values.remove(&lsn);
-        drop(stages);
-        taken
     }
 }
 pub(crate) struct OwnedEventStageRegistration {
@@ -6890,16 +6726,6 @@ impl OwnedEncodedEventBusConfig {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn try_new(
-        original: &OwnedMemoryReservation,
-        definitions: &EventBusDefinitions,
-    ) -> Result<Self> {
-        Self::try_new_capacity(original, definitions, 0)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     fn try_empty(original: &OwnedMemoryReservation) -> Result<Self> {
         let (body, credit) = new_owned_native_vec(original, 0)?;
         let values = OwnedEventBody { body, credit };
@@ -7080,16 +6906,6 @@ impl OwnedEventBusHandle {
             retirement,
         })
     }
-    pub(super) fn publish_owned_definition_publication(
-        &self,
-        publication: OwnedDefinitionPublication,
-        events: OwnedPreparedSinkEvents,
-    ) {
-        // The event owner, even empty, retains a genuine normal lease while
-        // definition-only publication releases its own reservation.
-        self.publish_owned_definition_only(publication);
-        self.publish_owned_sink_events_to_memory(events);
-    }
     pub(super) fn publish_owned_definition_only(
         &self,
         mut publication: OwnedDefinitionPublication,
@@ -7198,43 +7014,6 @@ impl OwnedEventBusHandle {
         drop(publication.slots);
         drop(publication.retirement);
         self.data().common.waiters.notify_all();
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn prepare_owned_event_bus_without_table(
-        &self,
-        table: &str,
-    ) -> Result<Option<OwnedDefinitionPublication>> {
-        let projection = {
-            let definitions = self.data().common.definitions.lock();
-            if !definitions
-                .event_types
-                .values()
-                .any(|def| def.table == table)
-            {
-                return Ok(None);
-            }
-            OwnedDefinitionsProjection::try_copy_filtered(
-                &self.data().original,
-                &definitions,
-                Some(table),
-            )?
-        };
-        let lease = self.data().common.begin_queue_mutation();
-        self.prepare_owned_definition_publication(projection, OwnedDefinitionMode::Additive, lease)
-            .map(Some)
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn export_owned_event_bus_config_values(
-        &self,
-    ) -> Result<OwnedEncodedEventBusConfig> {
-        let definitions = self.data().common.definitions.lock();
-        OwnedEncodedEventBusConfig::try_new(&self.data().original, &definitions)
     }
 }
 impl Drop for OwnedEventBusStorage {
@@ -10054,27 +9833,6 @@ fn decode_owned_startup_definitions<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn decode_owned_startup_definitions_funded<T: serde::de::DeserializeOwned>(
-    source: &crate::persistence::OwnedEncodedEventSource<'_>,
-    original: &OwnedMemoryReservation,
-    key: &str,
-) -> OriginalResult<crate::persistence::OriginalDecoded<Vec<T>>> {
-    match source.decode_owned_config_funded(original, key)? {
-        Some(decoded) => Ok(decoded),
-        None => Ok(crate::persistence::OriginalDecoded {
-            value: Vec::new(),
-            allocation: crate::memory_accounting::reserve_preparation_original_native(
-                original,
-                0,
-                "relational",
-                "statement_overlay",
-                "Reduce prepared event bodies or raise MEMORY_LIMIT.",
-            )
-            .map_err(OriginalError::native)?,
-        }),
-    }
-}
-
 impl OwnedDefinitionsProjection {
     #[expect(
         clippy::result_large_err,
@@ -10109,38 +9867,6 @@ impl OwnedDefinitionsProjection {
                 ))
             },
             |error| error,
-        )
-    }
-    fn decode_persistent_startup_funded(
-        source: &crate::persistence::OwnedEncodedEventSource<'_>,
-        original: &OwnedMemoryReservation,
-        live_tables: &HashMap<String, TableMeta>,
-    ) -> OriginalResult<Self> {
-        let diagnostic = OriginalError::prepare_route(original)?;
-        Self::decode_persistent_startup_in(
-            source,
-            original,
-            live_tables,
-            |source, original| {
-                Ok((
-                    decode_owned_startup_definitions_funded::<EventTypeDef>(
-                        source,
-                        original,
-                        EVENT_TYPES_CONFIG_KEY,
-                    )?,
-                    decode_owned_startup_definitions_funded::<SinkDef>(
-                        source,
-                        original,
-                        SINKS_CONFIG_KEY,
-                    )?,
-                    decode_owned_startup_definitions_funded::<RouteDef>(
-                        source,
-                        original,
-                        ROUTES_CONFIG_KEY,
-                    )?,
-                ))
-            },
-            |error| diagnostic.error(error),
         )
     }
     fn decode_persistent_startup_in<E>(
@@ -10252,49 +9978,6 @@ impl OwnedDefinitionsProjection {
 }
 
 impl OwnedEventBusHandle {
-    fn load_owned_persistent_startup_funded(
-        &self,
-        persistence: &RedbPersistence,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        live_tables: &HashMap<String, TableMeta>,
-    ) -> OriginalResult<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        persistence.with_owned_encoded_event_source_funded(
-            &self.data().original,
-            read_memory,
-            |source| self.install_owned_persistent_startup_funded(source, live_tables),
-        )
-    }
-
-    fn install_owned_persistent_startup_funded(
-        &self,
-        encoded: &crate::persistence::OwnedEncodedEventSource<'_>,
-        live_tables: &HashMap<String, TableMeta>,
-    ) -> OriginalResult<()> {
-        let original = &self.data().original;
-        let diagnostic = OriginalError::prepare_route(original)?;
-        let definitions = OwnedDefinitionsProjection::decode_persistent_startup_funded(
-            encoded,
-            original,
-            live_tables,
-        )?;
-        let source = OwnedPersistentEventStartupSource { encoded, original };
-        let image = self.prepare_owned_event_bus_image_funded(
-            &source,
-            &OwnedPersistentEventEntryDecoder,
-            definitions,
-            true,
-        )?;
-        self.install_owned_event_bus_image(image)
-            .map_err(|error| diagnostic.error(error))?;
-        self.data()
-            .common
-            .durable_windows
-            .store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -10356,26 +10039,6 @@ impl OwnedEventBusHandle {
             |original, bytes| decoder.decode(original, bytes),
             |cold, name| self.read_owned_cold_window(cold, name, None, None),
             |error| error,
-        )
-    }
-    fn prepare_owned_event_bus_image_funded<
-        S: OwnedEncodedEventSource<OriginalError>,
-        D: OwnedEventEntryDecoder,
-    >(
-        &self,
-        source: &S,
-        decoder: &D,
-        definitions: OwnedDefinitionsProjection,
-        writable: bool,
-    ) -> OriginalResult<OwnedEventStartupImage> {
-        let diagnostic = OriginalError::prepare_route(&self.data().original)?;
-        self.prepare_owned_event_bus_image_in(
-            source,
-            definitions,
-            writable,
-            |original, bytes| decoder.decode_funded(original, bytes),
-            |cold, name| self.read_owned_cold_window_funded(cold, name, None, None),
-            |error| diagnostic.error(error),
         )
     }
     fn prepare_owned_event_bus_image_in<E, S: OwnedEncodedEventSource<E>>(
@@ -11357,91 +11020,6 @@ impl Database {
             }),
         ))
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn commit_owned_event_bus_ddl_changes<P: OwnedEventDdlPersistence>(
-        &self,
-        events: &OwnedEventBusHandle,
-        ddl: &[DdlChange],
-        persistence: &P,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        if !matches!(&self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
-            return Err(Error::Other(
-                "owning event DDL requires its native database host".into(),
-            ));
-        }
-        let initial = events.prepare_owned_definition_projection_with_ddl(ddl, |table| {
-            self.table_meta(table).is_some()
-        })?;
-        if initial.definitions == *events.data().common.definitions.lock() {
-            return Ok(());
-        }
-        drop(initial);
-        // Same original LSN allocator and commit boundary as direct Legacy DDL.
-        self.allocate_ddl_lsn(|lsn| {
-            let (_, stage) =
-                self.stage_owned_event_bus_ddl_for_commit(events, lsn, ddl, read_memory.clone())?;
-            let Some(stage) = stage else {
-                return Ok(());
-            };
-            let log = persistence.prepare_log(&events.data().original, lsn, &stage.persistence)?;
-            let empty_events = events.prepare_owned_sink_events(&[])?;
-            persistence.flush(lsn, &stage.persistence)?;
-            let OwnedStagedEventBusDdlCommit {
-                memory_history,
-                persistence: bodies,
-                persistence_credit,
-                publication,
-                buffers,
-                ddl_array,
-                sidecar_array,
-            } = stage;
-            let bodies = OwnedEventDdlLogBodies {
-                persistence: bodies,
-                persistence_credit,
-                buffers,
-                ddl_array,
-                sidecar_array,
-            };
-            events.publish_owned_definition_publication(publication, empty_events);
-            // The native log adapter moves already-paid DDL/sidecars at the
-            // original definitions-then-log position, with no new admission.
-            self.publish_memory_schema_history(memory_history);
-            persistence.publish_log(log, lsn, bodies);
-            Ok(())
-        })
-    }
-}
-pub(super) struct OwnedEventDdlLogBodies {
-    pub(super) persistence: EventBusPersistenceCommit,
-    pub(super) persistence_credit: OwnedEncodedEventBusConfig,
-    pub(super) buffers: OwnedMemoryReservation,
-    pub(super) ddl_array: OwnedMemoryReservation,
-    pub(super) sidecar_array: OwnedMemoryReservation,
-}
-pub(super) trait OwnedEventDdlPersistence {
-    type Log;
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn prepare_log(
-        &self,
-        original: &OwnedMemoryReservation,
-        lsn: Lsn,
-        commit: &EventBusPersistenceCommit,
-    ) -> Result<Self::Log>;
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn flush(&self, lsn: Lsn, commit: &EventBusPersistenceCommit) -> Result<()>;
-    fn publish_log(&self, log: Self::Log, lsn: Lsn, bodies: OwnedEventDdlLogBodies);
 }
 
 // A restricted producer supplies the already-pinned committed predecessor and
@@ -11590,59 +11168,7 @@ impl OwnedEventBusHandle {
         Ok((out, next))
     }
 }
-pub(super) struct OwnedDeleteReleaseBytes {
-    bytes: DeleteReleaseBytes,
-    relational_array: OwnedMemoryReservation,
-    vector_array: OwnedMemoryReservation,
-}
-impl OwnedDeleteReleaseBytes {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn try_copy(
-        original: &OwnedMemoryReservation,
-        relational: &[usize],
-        vectors: &[usize],
-    ) -> Result<Self> {
-        let (body, credit) =
-            crate::memory_accounting::copy_owned_native_slice(original, relational)?;
-        let relational = OwnedEventBody { body, credit };
-        let (body, credit) = crate::memory_accounting::copy_owned_native_slice(original, vectors)?;
-        Ok(Self {
-            bytes: DeleteReleaseBytes {
-                relational: relational.body,
-                vectors: body,
-            },
-            relational_array: relational.credit,
-            vector_array: credit,
-        })
-    }
-}
-impl Database {
-    pub(super) fn settle_owned_delete_release_bytes(&self, bytes: OwnedDeleteReleaseBytes) {
-        self.release_delete_allocations_from_bytes(&bytes.bytes);
-        // Consuming custody makes successful settlement exactly once. Abort
-        // simply destroys these arrays; it never calls this settlement door.
-        drop(bytes);
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn apply_owned_event_bus_ddl_from_user<P: OwnedEventDdlPersistence>(
-        &self,
-        events: &OwnedEventBusHandle,
-        ddl: &[DdlChange],
-        persistence: &P,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        self.require_admin_event_bus_ddl()?;
-        self.commit_owned_event_bus_ddl_changes(events, ddl, persistence, read_memory)
-    }
-}
+impl Database {}
 
 #[derive(Clone, Copy)]
 pub(super) enum OwnedRowEventKind {
@@ -11727,279 +11253,11 @@ impl OwnedPreparedEventGate {
         }
         Ok(owner)
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn try_from_projection(
-        original: &OwnedMemoryReservation,
-        meta: Option<&TableMeta>,
-        values: &HashMap<String, Value>,
-        projected_tables: &HashMap<String, TableMeta>,
-        projected_rows: &HashMap<String, Vec<VersionedRow>>,
-    ) -> Result<Self> {
-        let base = Self::try_from_meta(original, meta)?;
-        let Some(column) =
-            meta.and_then(|meta| meta.columns.iter().find(|column| column.acl_ref.is_some()))
-        else {
-            return Ok(base);
-        };
-        let acl = column.acl_ref.as_ref().expect("selected acl ref");
-        let acl_id = match values.get(&column.name) {
-            Some(Value::Uuid(id)) => Some(*id),
-            _ => None,
-        };
-        let matches = |row: &&VersionedRow| {
-            row.deleted_tx.is_none()
-                && acl_id
-                    .is_some_and(|id| row.values.get(&acl.ref_column) == Some(&Value::Uuid(id)))
-        };
-        let count = projected_rows
-            .get(&acl.ref_table)
-            .map_or(0, |rows| rows.iter().filter(matches).count());
-        let metadata_bytes = owned_event_add(
-            owned_event_add(
-                owned_event_add(column.name.len(), acl.ref_table.len())?,
-                acl.ref_column.len(),
-            )?,
-            owned_event_add(
-                std::mem::size_of::<EventGateSnapshot>(),
-                owned_event_array::<HashMap<String, Value>>(count)?,
-            )?,
-        )?;
-        let metadata = reserve_owned_event_bytes(original, metadata_bytes)?;
-        let (body, credit) = new_owned_native_vec(original, count)?;
-        let rows = OwnedEventBody { body, credit };
-        let (body, credit) = new_owned_native_vec(original, 2)?;
-        let children = OwnedEventBody { body, credit };
-        let mut owner = Self {
-            body: base.body,
-            credit: OwnedEventGateCredits {
-                rows: rows.body,
-                row_array: rows.credit,
-                children: children.body,
-                child_array: children.credit,
-                metadata,
-            },
-        };
-        owner.credit.children.push(base.credit);
-        let grant_gate = Self::try_from_meta(original, projected_tables.get(&acl.ref_table))?;
-        let mut grants = Vec::with_capacity(count);
-        if grants.capacity() != count {
-            return Err(Error::Other(
-                "event projected grant capacity mismatch".into(),
-            ));
-        }
-        if let Some(source) = projected_rows.get(&acl.ref_table) {
-            for row in source.iter().filter(matches) {
-                let (body, credit) = copy_owned_event_values(original, &row.values)?;
-                let copy = OwnedEventBody { body, credit };
-                grants.push(copy.body);
-                owner.credit.rows.push(copy.credit);
-            }
-        }
-        owner.body.acl = Some(EventAclGate {
-            column: copy_owned_prepaid_text(&column.name)?,
-            ref_table: copy_owned_prepaid_text(&acl.ref_table)?,
-            ref_column: copy_owned_prepaid_text(&acl.ref_column)?,
-            grant_gate: Box::new(grant_gate.body),
-            grant_rows: EventGrantRows::Legacy(grants),
-        });
-        owner.credit.children.push(grant_gate.credit);
-        Ok(owner)
-    }
 }
-struct OwnedReceivedEventCandidates<'a> {
-    deleted: HashMap<(&'a str, RowId), &'a VersionedRow>,
-    deleted_memory: OwnedMemoryReservation,
-    ws: &'a contextdb_tx::WriteSet,
-    tables: &'a HashMap<String, TableMeta>,
-    rows: &'a HashMap<String, Vec<VersionedRow>>,
-    original: &'a OwnedMemoryReservation,
-}
-impl OwnedEventCandidateSource for OwnedReceivedEventCandidates<'_> {
-    fn visit(
-        &self,
-        mut visit: impl for<'r> FnMut(
-            OwnedRowEventCandidateRef<'r>,
-            &'r OwnedPreparedEventGate,
-        ) -> Result<()>,
-    ) -> Result<()> {
-        let (body, credit) = new_owned_native_set(self.original, self.deleted.len())?;
-        let mut consumed = OwnedEventBody { body, credit };
-        for (table, row) in &self.ws.relational_inserts {
-            let same_row = (table.as_str(), row.row_id);
-            let same_identity = self.deleted.iter().find_map(|((old_table, old_id), old)| {
-                (*old_table == table.as_str()
-                    && old.values.contains_key("id")
-                    && old.values.get("id") == row.values.get("id"))
-                .then_some((*old_table, *old_id))
-            });
-            let key = self
-                .deleted
-                .contains_key(&same_row)
-                .then_some(same_row)
-                .or(same_identity);
-            let kind = if let Some(key) = key {
-                consumed.body.insert(key);
-                OwnedRowEventKind::Update
-            } else {
-                OwnedRowEventKind::Insert
-            };
-            let gate = OwnedPreparedEventGate::try_from_projection(
-                self.original,
-                self.tables.get(table),
-                &row.values,
-                self.tables,
-                self.rows,
-            )?;
-            visit(
-                OwnedRowEventCandidateRef {
-                    kind,
-                    table,
-                    row_id: row.row_id,
-                    values: &row.values,
-                },
-                &gate,
-            )?;
-        }
-        for ((table, row_id), row) in &self.deleted {
-            if !consumed.body.contains(&(*table, *row_id)) {
-                let gate = OwnedPreparedEventGate::try_from_projection(
-                    self.original,
-                    self.tables.get(*table),
-                    &row.values,
-                    self.tables,
-                    self.rows,
-                )?;
-                visit(
-                    OwnedRowEventCandidateRef {
-                        kind: OwnedRowEventKind::Delete,
-                        table,
-                        row_id: *row_id,
-                        values: &row.values,
-                    },
-                    &gate,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-impl Database {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn prepare_received_owned_sink_events_from_projection(
-        &self,
-        events: &OwnedEventBusHandle,
-        host: &EngineDatabaseTransactions,
-        ws: &contextdb_tx::WriteSet,
-        definitions: &EventBusDefinitions,
-        projected_rows: &HashMap<String, Vec<VersionedRow>>,
-        projected_tables: &HashMap<String, TableMeta>,
-    ) -> Result<(OwnedPreparedSinkEvents, u64)> {
-        self.validate_owned_event_host(events, host)?;
-        let next = events.data().common.next_action_id();
-        let Some(lsn) = ws.commit_lsn else {
-            return Ok((events.prepare_owned_sink_events(&[])?, next));
-        };
-        if definitions.event_types.is_empty() || definitions.routes.is_empty() {
-            return Ok((events.prepare_owned_sink_events(&[])?, next));
-        }
-        let (deleted, deleted_memory) =
-            new_owned_native_map(&events.data().original, ws.relational_deletes.len())?;
-        let mut source = OwnedReceivedEventCandidates {
-            deleted,
-            deleted_memory,
-            ws,
-            tables: projected_tables,
-            rows: projected_rows,
-            original: &events.data().original,
-        };
-        for (table, row_id, _) in &ws.relational_deletes {
-            if let Some(row) = projected_rows
-                .get(table)
-                .and_then(|rows| rows.iter().rev().find(|row| row.row_id == *row_id))
-            {
-                source.deleted.insert((table.as_str(), *row_id), row);
-            }
-        }
-        events.prepare_owned_candidate_events(&source, definitions, lsn, Some(next))
-    }
-}
+impl Database {}
 
-impl OwnedEventBusHandle {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn suspend_owned_registered_append_for_discard(
-        &self,
-        registration: &OwnedEventStageRegistration,
-    ) -> Result<OwnedDiscardAppendHandle> {
-        let handle = registration.append.as_ref().ok_or_else(|| {
-            Error::Other("registered stage has no append transfer control".into())
-        })?;
-        let mut token = handle
-            .control
-            .get()
-            .token
-            .lock()
-            .take()
-            .ok_or_else(|| Error::Other("registered append was already consumed".into()))?;
-        if !token.storage.matches(self) || token.state != OwnedEscrowState::Active {
-            *handle.control.get().token.lock() = Some(token);
-            return Err(Error::Other(
-                "registered discard requires its active original escrow".into(),
-            ));
-        }
-        let mut queues = self.data().queues.lock();
-        cancel_owned_slots_locked(&mut queues, &mut token.slots);
-        token.state = OwnedEscrowState::Suspended;
-        drop(queues);
-        for slot in &mut token.slots {
-            drop(slot.retired.take());
-        }
-        drop(token.lease.take());
-        *handle.control.get().token.lock() = Some(token);
-        // The actual paid control was installed before stage registration and
-        // durability. The exact terminal registration is the source of this
-        // capability, never a lookup in a replacement same-LSN slot.
-        Ok(handle.clone())
-    }
-}
-impl Database {
-    pub(super) fn publish_owned_staged_event_bus_ddl_commit<P: OwnedEventDdlPersistence>(
-        &self,
-        events: &OwnedEventBusHandle,
-        lsn: Lsn,
-        stage: OwnedStagedEventBusDdlCommit,
-        log: P::Log,
-        persistence: &P,
-    ) {
-        let OwnedStagedEventBusDdlCommit {
-            memory_history,
-            persistence: bodies,
-            persistence_credit,
-            publication,
-            buffers,
-            ddl_array,
-            sidecar_array,
-        } = stage;
-        let bodies = OwnedEventDdlLogBodies {
-            persistence: bodies,
-            persistence_credit,
-            buffers,
-            ddl_array,
-            sidecar_array,
-        };
-        events.publish_owned_definition_only(publication);
-        self.publish_memory_schema_history(memory_history);
-        persistence.publish_log(log, lsn, bodies);
-    }
-}
+impl OwnedEventBusHandle {}
+impl Database {}
 
 struct OwnedEventNames {
     names: Vec<String>,
@@ -12020,26 +11278,6 @@ struct OwnedEventCopiedSet<K> {
     buckets: OwnedMemoryReservation,
 }
 impl OwnedEventBusHandle {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn with_owned_registered_stage_identity<R>(
-        &self,
-        registration: &OwnedEventStageRegistration,
-        f: impl FnOnce(Lsn, EngineTerminalIdentity) -> Result<R>,
-    ) -> Result<R> {
-        let pin = self
-            .pin_owned_registered_stage(registration)
-            .ok_or_else(|| {
-                Error::Other("native event apply registered stage identity mismatch".into())
-            })?;
-        // The supplied registration, never the looked-up stage, provides the
-        // identity. The exact pin check only authenticates its installation.
-        let result = f(registration.lsn, registration.identity);
-        drop(pin);
-        result
-    }
     fn take_owned_registered_stage(
         &self,
         registration: &OwnedEventStageRegistration,
@@ -12098,12 +11336,6 @@ impl OwnedEventBusHandle {
     }
 }
 impl OwnedDefinitionsProjection {
-    pub(super) fn with_definitions<R>(
-        &self,
-        f: impl for<'d> FnOnce(&'d EventBusDefinitions) -> R,
-    ) -> R {
-        f(&self.definitions)
-    }
     pub(super) fn sanitize(&mut self, live_tables: &HashMap<String, TableMeta>) {
         self.definitions
             .event_types
@@ -12585,176 +11817,7 @@ impl OwnedEventBusHandle {
     }
 }
 
-impl Database {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn validate_owned_cron_store(
-        &self,
-        events: &OwnedEventBusHandle,
-        host: &EngineDatabaseTransactions,
-        store: &crate::persistent_store::OwnedPersistentCompositeStore,
-    ) -> Result<()> {
-        self.validate_owned_event_host(events, host)?;
-        if !Arc::ptr_eq(&events.data().common, &self.event_bus) {
-            return Err(Error::Other(
-                "native cron requires this database's event companion".into(),
-            ));
-        }
-        host.transactions.with_transactions(|lower| {
-            let installed: &dyn contextdb_tx::WriteSetApplicator = lower.store().as_ref();
-            if installed as *const dyn contextdb_tx::WriteSetApplicator as *const ()
-                != store as *const _ as *const ()
-            {
-                return Err(Error::Other(
-                    "native cron requires its host's installed store".into(),
-                ));
-            }
-            Ok(())
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn prepare_owned_delete_release_bytes_in_prepared_write_set(
-        &self,
-        events: &OwnedEventBusHandle,
-        host: &EngineDatabaseTransactions,
-        guard: &contextdb_tx::manager::EngineGuard<'_>,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<OwnedDeleteReleaseBytes> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        self.validate_owned_event_host(events, host)?;
-        events.with_owned_persistence_original(|original| {
-            guard.with_legacy(|ws| {
-                let mut relational_count = 0;
-                let mut vector_count = 0;
-                self.visit_owned_delete_release_bytes(
-                    original,
-                    ws,
-                    vector_copy_owner,
-                    read_memory.clone(),
-                    |vector, _| {
-                        let count = if vector {
-                            &mut vector_count
-                        } else {
-                            &mut relational_count
-                        };
-                        *count = owned_event_add(*count, 1)?;
-                        Ok(())
-                    },
-                )?;
-                // Both arrays receive their original preparation invoices BEFORE allocation.
-                let (body, credit) = new_owned_native_vec(original, relational_count)?;
-                let relational = OwnedEventBody { body, credit };
-                let (body, credit) = new_owned_native_vec(original, vector_count)?;
-                let mut release = OwnedDeleteReleaseBytes {
-                    bytes: DeleteReleaseBytes {
-                        relational: relational.body,
-                        vectors: body,
-                    },
-                    relational_array: relational.credit,
-                    vector_array: credit,
-                };
-                self.visit_owned_delete_release_bytes(
-                    original,
-                    ws,
-                    vector_copy_owner,
-                    read_memory,
-                    |vector, bytes| {
-                        let (array, count) = if vector {
-                            (&mut release.bytes.vectors, vector_count)
-                        } else {
-                            (&mut release.bytes.relational, relational_count)
-                        };
-                        if array.len() == count {
-                            return Err(Error::Other(
-                                "native delete release source changed".into(),
-                            ));
-                        }
-                        array.push(bytes);
-                        Ok(())
-                    },
-                )?;
-                if release.bytes.relational.len() != relational_count
-                    || release.bytes.vectors.len() != vector_count
-                {
-                    return Err(Error::Other("native delete release source changed".into()));
-                }
-                Ok(release)
-            })
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn visit_owned_delete_release_bytes(
-        &self,
-        original: &OwnedMemoryReservation,
-        ws: &contextdb_tx::WriteSet,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        mut visit: impl FnMut(bool, usize) -> Result<()>,
-    ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let snapshot = SnapshotId::from_raw_wire(u64::MAX);
-        for (table, row_id, _) in &ws.relational_deletes {
-            self.with_owned_event_meta_pair(table, |meta, _| {
-                // The same resident indexed selection as row_by_id, borrowing
-                // the row instead of making an unadmitted payload copy.
-                let lookup_memory = reserve_owned_event_bytes(original, table.len())?;
-                let tables = self.relational_store.tables.read();
-                let row = tables.get(table).and_then(|rows| {
-                    self.relational_store
-                        .visible_version_position(table, rows, *row_id, snapshot)
-                        .and_then(|position| rows.get(position))
-                });
-                drop(lookup_memory);
-                if let Some(row) = row {
-                    visit(
-                        false,
-                        retained_row_bytes_with_optional_meta(table, row, meta),
-                    )?;
-                }
-                Ok(())
-            })?;
-        }
-        // State-owned vector bodies retain their charge until physical removal.
-        // Adjacency likewise remains charged; this commit settles neither.
-        for (index, row_id, _) in &ws.vector_deletes {
-            if self
-                .vector_store
-                .raw_entry_charge_owned_by_state(index, *row_id)
-            {
-                continue;
-            }
-            if let Some(vector) = self.find_vector_by_index_and_row(
-                index,
-                *row_id,
-                vector_copy_owner,
-                read_memory.clone(),
-            )? {
-                visit(
-                    true,
-                    self.vector_insert_accounted_bytes(
-                        index,
-                        vector.vector.len(),
-                        vector_copy_owner,
-                    )?,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
+impl Database {}
 
 #[cfg(test)]
 #[path = "sink_window_tests.rs"]

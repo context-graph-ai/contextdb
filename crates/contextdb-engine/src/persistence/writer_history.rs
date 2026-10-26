@@ -154,18 +154,6 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn remove_change_log_selectors_in_write(
-        write: &redb::WriteTransaction,
-        textual_key: &str,
-    ) -> Result<()> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-        Self::detach_change_log_selectors_in_write(write, textual_key, false)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn detach_change_log_selectors_in_write(
         write: &redb::WriteTransaction,
         textual_key: &str,
@@ -240,32 +228,7 @@ impl RedbPersistence {
     }
 }
 
-impl super::writer_source::WriterSnapshot {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn ddl_history_cursor(
-        self: &Arc<Self>,
-        owner: SourceWindowOwner,
-        since: Lsn,
-    ) -> Result<super::writer_source::WriterReadCursor> {
-        WriterSnapshotHandle::from(self.clone()).ddl_history_cursor(owner, since)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn ddl_history_cursor_ordered(
-        self: &Arc<Self>,
-        owner: SourceWindowOwner,
-        since: Lsn,
-        reverse: bool,
-    ) -> Result<super::writer_source::WriterReadCursor> {
-        WriterSnapshotHandle::from(self.clone()).ddl_history_cursor_ordered(owner, since, reverse)
-    }
-}
+impl super::writer_source::WriterSnapshot {}
 
 impl WriterSnapshotHandle {
     #[expect(

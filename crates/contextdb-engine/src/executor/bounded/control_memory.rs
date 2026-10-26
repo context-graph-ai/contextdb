@@ -121,19 +121,6 @@ impl<T> ControlArc<T> {
         let value = Arc::new(value);
         Ok(Self { value, invoice })
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn try_new_cyclic(
-        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        make: impl FnOnce(&ControlWeak<T>) -> T,
-    ) -> Result<Self> {
-        let owner = owner.into();
-
-        let invoice = Self::admit(owner)?;
-        Ok(Self::cyclic_from_prepaid(invoice, make))
-    }
     pub(super) fn cyclic_from_prepaid(
         invoice: ReadShared<ReadCredit>,
         make: impl FnOnce(&ControlWeak<T>) -> T,

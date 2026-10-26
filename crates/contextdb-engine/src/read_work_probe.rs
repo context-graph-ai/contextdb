@@ -477,14 +477,6 @@ pub(crate) fn note_decoded_row() {
     });
 }
 
-pub(crate) fn note_row_version_range_read() {
-    with_active(|counters| {
-        counters
-            .row_version_range_reads
-            .fetch_add(1, Ordering::Relaxed);
-    });
-}
-
 pub(crate) fn note_row_version_point_read() {
     with_active(|counters| {
         counters

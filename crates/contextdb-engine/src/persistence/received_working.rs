@@ -50,23 +50,6 @@ impl ReceivedWorkingWrite {
         storage_scope
             .run_original_unqualified(|| store.with_db(|db| Self::begin_in(store, db, original)))
     }
-    pub(crate) fn begin_funded(
-        store: &RedbPersistence,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-    ) -> crate::funded_error::OriginalResult<Self> {
-        let scope = super::native_storage_admission::StorageAdmissionScope::writer_original_native(
-            original,
-        )
-        .map_err(crate::funded_error::OriginalError::native)?;
-        scope.run_original(
-            crate::funded_error::OriginalStoragePhase::ReceivedOuter,
-            || {
-                store.with_db_original_funded(original, |db| {
-                    Self::begin_in_funded(store, db, original)
-                })
-            },
-        )
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -87,29 +70,6 @@ impl ReceivedWorkingWrite {
                 scope.run_original_unqualified(|| RedbPersistence::begin_history_write(db))
             },
             |error| error,
-        )
-    }
-    pub(super) fn begin_in_funded(
-        store: &RedbPersistence,
-        db: &redb::Database,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-    ) -> crate::funded_error::OriginalResult<Self> {
-        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        Self::begin_in_route(
-            store,
-            original,
-            || {
-                let scope =
-                    super::native_storage_admission::StorageAdmissionScope::writer_original_native(
-                        original,
-                    )
-                    .map_err(crate::funded_error::OriginalError::native)?;
-                scope.run_original(
-                    crate::funded_error::OriginalStoragePhase::ReceivedBegin,
-                    || RedbPersistence::begin_history_write_funded(original, db),
-                )
-            },
-            |error| diagnostic.error(error),
         )
     }
     fn begin_in_route<E>(
@@ -385,125 +345,7 @@ impl ReceivedWorkingWrite {
     }
 }
 
-pub(crate) struct WorkingPosting {
-    posting: contextdb_relational::source::RelationalPosting,
-    key: Vec<u8>,
-    _owner: crate::memory_accounting::OwnedMemoryReservation,
-}
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn index_bound(
-    frame: &OriginalPersistenceFrame<'_>,
-    bound: std::ops::Bound<&[u8]>,
-) -> Result<std::ops::Bound<DurableRelationalIndexKey>> {
-    match bound {
-        std::ops::Bound::Included(key) => Ok(std::ops::Bound::Included(DurableRelationalIndexKey(
-            frame.copy_bytes(key)?,
-        ))),
-        std::ops::Bound::Excluded(key) => Ok(std::ops::Bound::Excluded(DurableRelationalIndexKey(
-            frame.copy_bytes(key)?,
-        ))),
-        std::ops::Bound::Unbounded => Ok(std::ops::Bound::Unbounded),
-    }
-}
 impl ReceivedWorkingWrite {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn next_posting(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        table: &str,
-        index: &str,
-        current: bool,
-        lower: std::ops::Bound<&[u8]>,
-        upper: std::ops::Bound<&[u8]>,
-        reverse: bool,
-    ) -> Result<Option<WorkingPosting>> {
-        self.require_original(original)?;
-        let frame = OriginalPersistenceFrame::new(original)?;
-        let image = crate::memory_accounting::image_memory_for_original_record(&frame)?;
-        let _image_scope = image.enter();
-        frame.reserve(table.len().saturating_add(index.len()).saturating_add(128))?;
-        let name = working_index_name(table, index, current);
-        let definition = TableDefinition::<DurableRelationalIndexKey, &[u8]>::new(name.as_str());
-        if !self
-            .transaction()
-            .table_exists(definition)
-            .map_err(RedbPersistence::storage_error)?
-        {
-            return Err(Error::IndexNotFound {
-                table: table.to_owned(),
-                index: index.to_owned(),
-            });
-        }
-        let lower = index_bound(&frame, lower)?;
-        let upper = index_bound(&frame, upper)?;
-        let source = self
-            .transaction()
-            .open_table(definition)
-            .map_err(RedbPersistence::storage_error)?;
-        let mut range = source
-            .range::<&DurableRelationalIndexKey>((lower.as_ref(), upper.as_ref()))
-            .map_err(RedbPersistence::storage_error)?;
-        let decoded = {
-            let entry = if reverse {
-                range.next_back()
-            } else {
-                range.next()
-            };
-            let entry = entry.transpose().map_err(RedbPersistence::storage_error)?;
-            if current {
-                if let Some((key, value)) = entry {
-                    frame.reserve(key.retained_page_bytes())?;
-                    let key = key.value();
-                    let encoded: EncodedRelationalIndexPosition = frame.decode(&key.0)?;
-                    let _json_scratch =
-                        frame.json_scratch(encoded.key.iter().map(|(_, value)| value))?;
-                    if frame.encode(&encoded)? != key.0 || encoded.created_tx != TxId(0) {
-                        return Err(crate::funded_error::corruption_text(
-                            crate::funded_error::original_budget(original),
-                            table,
-                            "noncanonical working current index key".into(),
-                        ));
-                    }
-                    frame.array::<DirectedValue>(encoded.key.len())?;
-                    let mut position: RelationalIndexPosition = encoded.into();
-                    position.created_tx = frame.decode::<TxId>(value.value())?;
-                    Some((key.0, position, None))
-                } else {
-                    None
-                }
-            } else {
-                decode_relational_index_entry_original(
-                    &frame,
-                    Path::new("received_working"),
-                    entry,
-                )?
-            }
-        };
-        drop(range);
-        drop(source);
-        let Some((key, position, deleted_tx)) = decoded else {
-            return Ok(None);
-        };
-        let posting = contextdb_relational::source::RelationalPosting {
-            key: position.key,
-            entry: contextdb_relational::store::IndexEntry {
-                row_id: position.row_id,
-                created_tx: position.created_tx,
-                deleted_tx,
-            },
-        };
-        Ok(Some(WorkingPosting {
-            posting,
-            key,
-            _owner: frame.into_reservation(),
-        }))
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -1075,17 +917,6 @@ impl WorkingRow {
 impl Drop for WorkingRow {
     fn drop(&mut self) {}
 }
-impl WorkingPosting {
-    pub(crate) fn value(&self) -> &contextdb_relational::source::RelationalPosting {
-        &self.posting
-    }
-    pub(crate) fn position(&self) -> &[u8] {
-        &self.key
-    }
-}
-impl Drop for WorkingPosting {
-    fn drop(&mut self) {}
-}
 
 impl ReceivedWorkingWrite {
     #[expect(
@@ -1099,17 +930,6 @@ impl ReceivedWorkingWrite {
         stage: &ReceivedSchemaPersistenceProjection,
     ) -> Result<Self> {
         Self::take_or_begin_in(store, db, original, stage, Self::begin_in, |error| error)
-    }
-    pub(super) fn take_or_begin_funded(
-        store: &RedbPersistence,
-        db: &redb::Database,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        stage: &ReceivedSchemaPersistenceProjection,
-    ) -> crate::funded_error::OriginalResult<Self> {
-        let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        Self::take_or_begin_in(store, db, original, stage, Self::begin_in_funded, |error| {
-            diagnostic.error(error)
-        })
     }
     pub(super) fn take_or_begin_in<E>(
         store: &RedbPersistence,

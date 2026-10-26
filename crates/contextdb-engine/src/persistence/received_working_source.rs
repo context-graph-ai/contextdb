@@ -1607,17 +1607,6 @@ impl WorkingReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn vector_partition_count(
-        &self,
-        captured: &WorkingVectorCapture,
-        index_prefix: &[u8],
-    ) -> Result<usize> {
-        Ok(self.vector_partition_counts(captured, index_prefix)?[0])
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn vector_partition_counts(
         &self,
         captured: &WorkingVectorCapture,
@@ -1915,64 +1904,6 @@ impl WorkingReadSource {
     }
 }
 
-/// Retains the same scoped source, never a resident directory of graph types.
-/// Escaping the source loan makes every operation fail through context().
-pub(crate) struct WorkingGraphSelection {
-    source: WorkingReadSource,
-    captured: super::received_working_graph::WorkingGraphCapture,
-}
-impl WorkingGraphSelection {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn contains_original(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        kind: &str,
-    ) -> Result<bool> {
-        self.source.context(|context| {
-            context.write.require_original(original)?;
-            context
-                .write
-                .check_graph_capture(context.original, &self.captured)?;
-            let found = context
-                .write
-                .graph_type_contains_original(context.original, kind)?;
-            context
-                .write
-                .check_graph_capture(context.original, &self.captured)?;
-            Ok(found)
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn visit_original(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        mut visit: impl FnMut(&str) -> Result<()>,
-    ) -> Result<()> {
-        self.source.context(|context| {
-            context.write.require_original(original)?;
-            context
-                .write
-                .check_graph_capture(context.original, &self.captured)?;
-            context
-                .write
-                .visit_graph_types_original(context.original, |kind| {
-                    visit(kind)?;
-                    context
-                        .write
-                        .check_graph_capture(context.original, &self.captured)
-                })?;
-            context
-                .write
-                .check_graph_capture(context.original, &self.captured)
-        })
-    }
-}
 impl WorkingReadSource {
     #[expect(
         clippy::result_large_err,
@@ -1980,60 +1911,6 @@ impl WorkingReadSource {
     )]
     pub(crate) fn select_private_graph_type(&self, kind: &str) -> Result<()> {
         self.context(|context| context.write.select_graph_type(context.original, kind))
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn allocate_private_graph_occurrence(
-        &self,
-        origin: super::received_working_graph::WorkingGraphOrigin,
-    ) -> Result<super::received_working_graph::WorkingGraphOccurrence> {
-        self.context(|context| {
-            context
-                .write
-                .allocate_graph_occurrence(context.original, origin)
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn record_private_graph_coordinate(
-        &self,
-        edge: &AdjEntry,
-        deletion: bool,
-        coordinate: super::received_working_graph::WorkingGraphCoordinate,
-    ) -> Result<()> {
-        self.context(|context| {
-            context
-                .write
-                .record_graph_coordinate(context.original, edge, deletion, coordinate)
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn private_graph_coordinate(
-        &self,
-        edge: &AdjEntry,
-        deletion: bool,
-    ) -> Result<Option<super::received_working_graph::WorkingGraphCoordinate>> {
-        self.context(|context| {
-            context
-                .write
-                .graph_coordinate_original(context.original, edge, deletion)
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn capture_private_graph(
-        &self,
-    ) -> Result<super::received_working_graph::WorkingGraphCapture> {
-        self.context(|context| context.write.capture_graph(context.original))
     }
     #[expect(
         clippy::result_large_err,
@@ -2049,38 +1926,8 @@ impl WorkingReadSource {
                 .check_graph_capture(context.original, captured)
         })
     }
-    /// Call only after restamp and complete validation. Terminal consumers must
-    /// keep this source loan live; no graph publication is activated here.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn freeze_private_graph_selection(&self) -> Result<WorkingGraphSelection> {
-        self.context(|context| {
-            Ok(WorkingGraphSelection {
-                source: self.clone(),
-                captured: context.write.freeze_graph_selection(context.original)?,
-            })
-        })
-    }
 }
-impl WorkingReadSource {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn visit_private_graph_coordinates(
-        &self,
-        deletion: bool,
-        visit: impl FnMut(&[u8], super::received_working_graph::WorkingGraphCoordinate) -> Result<()>,
-    ) -> Result<()> {
-        self.context(|context| {
-            context
-                .write
-                .visit_graph_coordinates_original(context.original, deletion, visit)
-        })
-    }
-}
+impl WorkingReadSource {}
 
 impl WorkingReadSource {
     #[expect(
@@ -2177,24 +2024,7 @@ impl WorkingReadSource {
     }
 }
 
-impl WorkingReadSource {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn retire_private_graph_occurrences(
-        &self,
-        source: NodeId,
-        kind: &str,
-        target: NodeId,
-    ) -> Result<()> {
-        self.context(|context| {
-            context
-                .write
-                .retire_graph_occurrences(context.original, source, kind, target)
-        })
-    }
-}
+impl WorkingReadSource {}
 
 pub(crate) struct OriginalGraphDeclarations {
     pub(crate) types: Vec<String>,

@@ -8707,10 +8707,6 @@ impl Database {
         Ok(snapshot)
     }
 
-    pub(super) fn snapshot_before_lsn(&self, lsn: Lsn) -> SnapshotId {
-        self.snapshot_at(Lsn(lsn.0.saturating_sub(1)))
-    }
-
     /// A row version for a change, its copy admitted first under a bounded
     /// projection.
     #[expect(

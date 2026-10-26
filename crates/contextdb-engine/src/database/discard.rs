@@ -1076,30 +1076,7 @@ impl Database {
     }
 }
 
-impl StartupState<'_> {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn with_owned_encoded_event_source<R>(
-        &self,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        f: impl for<'s> FnOnce(&'s crate::persistence::OwnedEncodedEventSource<'s>) -> Result<R>,
-    ) -> Result<R> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        match self {
-            Self::Durable(persistence) => {
-                persistence.with_owned_encoded_event_source(read_memory, f)
-            }
-            Self::Image(image) => image.config_source.with_owned_encoded_image_source(
-                &image.sink_queues,
-                read_memory,
-                f,
-            ),
-        }
-    }
-}
+impl StartupState<'_> {}
 
 /// Private terminal/discard custody, without a second queue or stage map.
 /// The companion publication retains its native frozen append transfer and
@@ -2036,42 +2013,6 @@ impl From<Error> for OriginalDiscardRowVisit {
     fn from(error: Error) -> Self {
         Self::Error(error)
     }
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn discard_key_pairs_copy_bytes(key: &NaturalKey) -> Result<usize> {
-    discard_key_copy_bytes(key)?
-        .checked_add(std::mem::size_of::<(String, Value)>())
-        .ok_or_else(EngineMetadataJournal::identity_error)
-}
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn discard_copy_key_pairs(key: &NaturalKey) -> Result<Vec<(String, Value)>> {
-    let count = key
-        .rest
-        .len()
-        .checked_add(1)
-        .ok_or_else(EngineMetadataJournal::identity_error)?;
-    let mut pairs = Vec::with_capacity(count);
-    if pairs.capacity() != count {
-        return Err(EngineMetadataJournal::identity_error());
-    }
-    pairs.push((
-        crate::memory_accounting::preparation_copy_string(&key.column)?,
-        crate::memory_accounting::preparation_copy_value(&key.value),
-    ));
-    for (name, value) in &key.rest {
-        pairs.push((
-            crate::memory_accounting::preparation_copy_string(name)?,
-            crate::memory_accounting::preparation_copy_value(value),
-        ));
-    }
-    Ok(pairs)
 }
 
 // Only the exact scoped terminal may move its already prepared write into

@@ -982,18 +982,6 @@ impl RowChange {
             .saturating_add(self.natural_key.held_bytes())
             .saturating_add(held::values(&self.values))
     }
-
-    /// What one copy of this row change costs a projected answer -- the
-    /// table name, the natural key and one copy of the values, the same
-    /// per-value measurement `estimate_row_value_bytes` uses for a store's
-    /// own retention, without the retention multiple: a read holds exactly
-    /// one copy of what it projects.
-    pub(crate) fn estimated_bytes(&self) -> usize {
-        96 + self.table.len()
-            + self.natural_key.estimated_bytes()
-            + contextdb_core::estimate_row_value_bytes(&self.values)
-            + self.created_at.map(|_| 8).unwrap_or(0)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1509,16 +1497,6 @@ impl NaturalKey {
             value,
             rest: pairs,
         })
-    }
-
-    pub(crate) fn estimated_bytes(&self) -> usize {
-        32 + self.column.len()
-            + self.value.estimated_bytes()
-            + self
-                .rest
-                .iter()
-                .map(|(column, value)| 16 + column.len() + value.estimated_bytes())
-                .sum::<usize>()
     }
 
     /// The identity's column names in declared order (leading first).

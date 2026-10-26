@@ -1345,14 +1345,6 @@ impl Database {
             _same_thread: std::marker::PhantomData,
         })
     }
-    pub(crate) fn graph_predicate_memory(
-        &self,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> contextdb_core::read_memory::ReadCredit {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        contextdb_core::read_memory::ReadCredit::new(read_memory.clone())
-    }
 
     /// Visit only owners already held by this operation's captured root.
     #[cfg_attr(
@@ -3333,38 +3325,6 @@ pub(super) fn visit_graph_versions_for_nodes(
     Ok(())
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn visit_graph_versions(
-    store: &GraphStore,
-    root: Option<WriterSnapshotHandle>,
-    mut visit: impl FnMut(&AdjEntry) -> Result<()>,
-    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-) -> Result<()> {
-    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-    if let Some(root) = root {
-        // All-version enumeration is historical even at frontier equality.
-        let graph = crate::persistence::graph_read::EngineGraphReadRoot::Writer(root);
-        let mut cursor = graph.cursor(
-            false,
-            std::ops::Bound::Unbounded,
-            std::ops::Bound::Unbounded,
-            read_memory.clone(),
-        )?;
-        while let Some(window) = cursor.next_edge_with(&|| Ok(()))? {
-            visit(window.edge())?;
-        }
-    } else {
-        for edge in store.forward_adj.read().values().flatten() {
-            visit(edge)?;
-        }
-    }
-    Ok(())
-}
-
 impl Database {
     /// A durable store, writer or retained reader, keeps every relational
     /// posting, automatic or declared, in one ordered family, so a bounded
@@ -3863,37 +3823,7 @@ impl Database {
 }
 
 #[cfg(feature = "sync-orchestration")]
-impl Database {
-    /// Independently capture the committed publication for THIS raw prefix call.
-    /// The returned cursor pins that exact root while using the original request.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn read_native_committed_config_prefix(
-        &self,
-        prefix: &str,
-        operation: &crate::owner_read::NativeReadRequest,
-        context: &crate::executor::bounded::NativeReadOpenContext,
-    ) -> std::result::Result<
-        contextdb_core::read_memory::ReadShared<
-            std::sync::Mutex<crate::persistence::writer_source::NativeRawConfigCursor>,
-        >,
-        crate::persistence::writer_source::NativeConfigFailure,
-    > {
-        use crate::persistence::native_storage_admission::NativeStorageFailure;
-        use crate::persistence::writer_source::NativeConfigFailure;
-        let published = self.tx_mgr.capture_published_read();
-        let root = durable_root(published.handle)
-            .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
-            .ok_or_else(|| {
-                NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(Error::Other(
-                    "writer publication has no durable root".into(),
-                )))
-            })?;
-        root.native_raw_config_prefix(operation, context, prefix)
-    }
-}
+impl Database {}
 
 #[cfg(feature = "sync-orchestration")]
 impl Database {

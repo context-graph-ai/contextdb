@@ -244,57 +244,6 @@ impl Database {
         }
     }
 
-    /// Stage one delivery-owned configuration body through the paired
-    /// transaction host after the original source reservation is admitted.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn stage_owned_delivery_aux(
-        &self,
-        guard: &mut contextdb_tx::manager::EngineGuard<'_>,
-        bytes: usize,
-        produce: impl FnOnce() -> Result<contextdb_tx::staged_source::AuxBody>,
-    ) -> Result<()> {
-        let mut admission = self.reserve_original_preparation_for(
-            bytes,
-            "delivery",
-            "prepare_owned_config",
-            "Reduce delivery metadata or raise MEMORY_LIMIT.",
-        )?;
-        let body = produce()?;
-        if !matches!(
-            body,
-            contextdb_tx::staged_source::AuxBody::ConfigWrite(_)
-                | contextdb_tx::staged_source::AuxBody::ConfigDelete(_)
-        ) {
-            return Err(Error::Other(
-                "owned delivery accepts config mutations only".into(),
-            ));
-        }
-        let at = match &body {
-            contextdb_tx::staged_source::AuxBody::ConfigWrite(_) => {
-                guard.read().config_writes.len()
-            }
-            contextdb_tx::staged_source::AuxBody::ConfigDelete(_) => {
-                guard.read().config_deletes.len()
-            }
-            _ => unreachable!("body was checked above"),
-        };
-        match &self.tx_mgr {
-            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
-                let invoice = admission.into_source_aux_invoice_for(&host.funder)?;
-                let batch = guard.prepare_owned_aux(body, invoice)?;
-                let prepared = guard.prepare_aux_splice(at, &[], batch)?;
-                guard.publish_tx(prepared);
-                Ok(())
-            }),
-            DatabaseTransactionHost::Legacy(_) => Err(DatabaseTransactionHost::producer_gap(
-                "stage_owned_delivery_aux",
-            )),
-        }
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
