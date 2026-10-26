@@ -120,7 +120,7 @@ mod writer_recovery;
 mod writer_row_heads;
 pub(crate) mod writer_source;
 use writer_file::{LockedWriterFile, OpenedWriterDatabase};
-pub(crate) use writer_recovery::{WriterOpenBounds, WriterRecoveryBounds};
+pub(crate) use writer_recovery::WriterRecoveryBounds;
 pub(crate) use writer_source::{WriterSnapshot, WriterSnapshotHandle, WriterSnapshotWeak};
 
 use crate::blob_repository::{

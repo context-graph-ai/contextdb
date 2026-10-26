@@ -6,10 +6,6 @@
 //! The earlier zero-owner decode/JSON bootstrap and typed seeds are excluded.
 //! They are not production entry points and cannot certify native storage.
 use super::*;
-use crate::memory_accounting::{
-     reserve_preparation_from_original, validate_owned_original,
-    writer_adapter_type_layout,
-};
 
 /// Private identity captured from the retained view. It cannot mint a root,
 /// a publication capability or a durable commit outcome.

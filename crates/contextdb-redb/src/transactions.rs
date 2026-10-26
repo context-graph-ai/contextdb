@@ -3792,6 +3792,8 @@ impl Drop for WriteTransaction {
             if let Err(error) = self.abort_inner() {
                 #[cfg(feature = "logging")]
                 warn!("Failure automatically aborting transaction: {error}");
+                #[cfg(not(feature = "logging"))]
+                let _ = error;
             }
         } else if !self.completed && self.mem.storage_failure() {
             self.tables

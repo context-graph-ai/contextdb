@@ -4219,8 +4219,8 @@ async fn serve_sync_connection(
                                 Ok(LargeResponseControlReply::Chunk(chunk))
                             } else {
                                 Err(TransportError::Other(
-                                    ("too many unfinished oversized response transfers"
-                                        .to_string()),
+                                    "too many unfinished oversized response transfers"
+                                        .to_string(),
                                 ))
                             }
                         })
@@ -4257,8 +4257,8 @@ async fn serve_sync_connection(
                                 ) =>
                             {
                                 Err(TransportError::Other(
-                                    ("too many unfinished oversized response transfers"
-                                        .to_string()),
+                                    "too many unfinished oversized response transfers"
+                                        .to_string(),
                                 ))
                             }
                             Ok(()) => tokio::task::spawn_blocking(move || {

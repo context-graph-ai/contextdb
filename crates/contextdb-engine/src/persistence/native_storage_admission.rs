@@ -3,8 +3,8 @@
 //! Joined Original callbacks move private diagnostic custody; legacy callbacks
 //! and lower producers retain their explicit unqualified coverage.
 use crate::memory_accounting::{
-    AccountantHandle, ControlCredit, OwnedMemoryReservation, StoreAccountantHandle, WriterUse,
-    clone_persistence_original_writer, persistence_original_projection, validate_owned_original,
+    ControlCredit, OwnedMemoryReservation, StoreAccountantHandle, WriterUse,
+    clone_persistence_original_writer, persistence_original_projection,
 };
 use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_core::read_memory::{NativeRefusal, ReadCredit, ReadMemoryOwner};

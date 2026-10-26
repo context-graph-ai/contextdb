@@ -3049,7 +3049,7 @@ impl Database {
         &self,
         tx: TxId,
         table: &str,
-        row: RowId,
+        _row: RowId,
         trigger_name: &str,
         lsn: Lsn,
     ) -> Result<()> {

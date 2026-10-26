@@ -28,7 +28,7 @@ use crate::executor::ReadExecutionTarget;
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::ReadPersistenceImageParts;
 use contextdb_core::read_contract::{
-    DeadlineClock, MetadataPageVocabulary, ReadFailure, ReadLimits,
+    DeadlineClock, ReadFailure, ReadLimits,
 };
 use contextdb_core::{
     ColumnType, ContextId, Direction, Error, HistoryPolicy, IndexKind, Lsn, Principal,

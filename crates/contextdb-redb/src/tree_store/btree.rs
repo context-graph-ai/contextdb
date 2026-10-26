@@ -7,7 +7,7 @@ use crate::tree_store::btree_iters::BtreeExtractIf;
 use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory};
 use crate::tree_store::{
-    AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
+    AccessGuardMutInPlace, BtreeRangeIter, PageHint, PageNumber,
     PageTrackerPolicy,
 };
 use crate::types::{Key, MutInPlaceValue, Value};

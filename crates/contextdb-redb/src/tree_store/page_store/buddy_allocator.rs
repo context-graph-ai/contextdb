@@ -278,6 +278,8 @@ impl BuddyAllocator {
 
     #[cfg_attr(not(test), expect(clippy::unused_self))]
     pub(crate) fn check_allocated_pages(&self, region: u32, allocated_pages: &[PageNumber]) {
+        #[cfg(not(test))]
+        let _ = (region, allocated_pages);
         #[cfg(test)]
         // Check the result against the free index to be sure it matches
         {

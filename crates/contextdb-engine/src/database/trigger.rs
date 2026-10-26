@@ -4776,7 +4776,7 @@ impl Database {
         let retired = {
             let mut declarations = self.trigger.declarations.lock();
             let mut callbacks = self.trigger.callbacks.write();
-            let mut names = self.trigger.active_trigger_names.lock();
+            let _names = self.trigger.active_trigger_names.lock();
             let mut original = self.trigger.native_publication_memory.lock();
             let mut callback_original = self.trigger.native_callback_map_memory.lock();
             self.trigger

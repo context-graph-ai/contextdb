@@ -13575,7 +13575,7 @@ pub(crate) mod original_writer {
 mod original_ddl_occurrences {
     //! Exact declaration selectors reconciled at authenticated publication.
     use crate::persistence::*;
-    use std::ops::Bound;
+    
 
     const SELECTORS: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("ddl_eligible_occurrences");
@@ -15186,7 +15186,7 @@ pub(crate) mod original_version_manifest {
     //! A private ordered witness for each retained physical relational version.
     use super::original_writer::{ProofAdmission, read_node_charged, resolve_key_charged};
     use super::*;
-    use contextdb_core::IndexDecl;
+    
 
     const FORMAT: u8 = 1;
     const FIXED_KEY_BYTES: usize = 72;
@@ -15235,7 +15235,7 @@ pub(crate) mod original_version_manifest {
         let p = 5 + length;
         let identity = coordinate[p..p + 24].try_into().expect("identity");
         let closure = u64::from_be_bytes(coordinate[p + 25..p + 33].try_into().expect("closure"));
-        let deleted_tx = match coordinate[p + 24] {
+        let _deleted_tx = match coordinate[p + 24] {
             0 if closure == 0 => None,
             1 => Some(TxId(closure)),
             _ => return Err(bad("invalid closure marker")),

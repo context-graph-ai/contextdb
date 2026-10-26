@@ -8722,7 +8722,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,54 +3773,22 @@
+@@ -2037,57 +3773,27 @@
          })
      }
  
@@ -8787,7 +8787,12 @@
              if let Err(error) = self.abort_inner() {
                  #[cfg(feature = "logging")]
                  warn!("Failure automatically aborting transaction: {error}");
-@@ -2107,20 +3811,150 @@
++                #[cfg(not(feature = "logging"))]
++                let _ = error;
+             }
+         } else if !self.completed && self.mem.storage_failure() {
+             self.tables
+@@ -2107,20 +3813,150 @@
      tree: TableTree,
  }
  
@@ -8939,7 +8944,7 @@
      /// Open the given table
      pub fn open_table<K: Key + 'static, V: Value + 'static>(
          &self,
-@@ -2135,7 +3969,7 @@
+@@ -2135,7 +3971,7 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -8948,7 +8953,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2143,6 +3977,63 @@
+@@ -2143,6 +3979,63 @@
          }
      }
  
@@ -9012,7 +9017,7 @@
      /// Open the given table without a type
      pub fn open_untyped_table(
          &self,
-@@ -2161,7 +4052,7 @@
+@@ -2161,7 +4054,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -9021,7 +9026,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +4080,7 @@
+@@ -2189,7 +4082,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -9030,7 +9035,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +4108,7 @@
+@@ -2217,7 +4110,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -9039,7 +9044,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +4154,15 @@
+@@ -2263,7 +4156,15 @@
  
  #[cfg(test)]
  mod test {
@@ -9056,7 +9061,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4183,1144 @@
+@@ -2284,4 +4185,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -12321,6 +12326,15 @@
 +}
 --- a/src/tree_store/btree.rs
 +++ b/src/tree_store/btree.rs
+@@ -7,7 +7,7 @@
+ use crate::tree_store::btree_mutator::MutateHelper;
+ use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory};
+ use crate::tree_store::{
+-    AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
++    AccessGuardMutInPlace, BtreeRangeIter, PageHint, PageNumber,
+     PageTrackerPolicy,
+ };
+ use crate::types::{Key, MutInPlaceValue, Value};
 @@ -21,6 +21,125 @@
  use std::ops::RangeBounds;
  use std::sync::{Arc, Mutex};
@@ -16184,7 +16198,7 @@
      pub(crate) fn trailing_free_pages(&self) -> u32 {
          let mut free_pages = 0;
          let mut next_page = self.len() - 1;
-@@ -191,9 +276,7 @@
+@@ -191,10 +276,10 @@
          free_pages
      }
  
@@ -16192,9 +16206,12 @@
      #[cfg_attr(not(test), expect(clippy::unused_self))]
 -    #[cfg_attr(not(test), expect(unused_variables))]
      pub(crate) fn check_allocated_pages(&self, region: u32, allocated_pages: &[PageNumber]) {
++        #[cfg(not(test))]
++        let _ = (region, allocated_pages);
          #[cfg(test)]
          // Check the result against the free index to be sure it matches
-@@ -218,6 +301,9 @@
+         {
+@@ -218,6 +303,9 @@
      }
  
      pub(crate) fn resize(&mut self, new_size: u32) {
@@ -16204,7 +16221,7 @@
          self.debug_check_consistency();
          if new_size > self.len() {
              let mut processed_pages = self.len();
-@@ -285,8 +371,10 @@
+@@ -285,8 +373,10 @@
          self.debug_check_consistency();
      }
  
@@ -16216,7 +16233,7 @@
          // Don't enable when fuzzing, because this is kind of expensive
          #[cfg(all(debug_assertions, not(fuzzing)))]
          {
-@@ -318,7 +406,7 @@
+@@ -318,7 +408,7 @@
                          let buddy = buddy_page(page);
                          if buddy < allocator.len() {
                              let buddy_allocated = allocator.get(buddy);
@@ -16225,7 +16242,7 @@
                          }
                      }
                  }
-@@ -328,16 +416,57 @@
+@@ -328,16 +418,57 @@
  
      // Allocates a page of the given order at the lowest index possible. Will split a higher order page,
      // to get one of lower index
@@ -16287,7 +16304,7 @@
                  let index_at_order = index * multiplier;
                  if index_at_order < best_index_at_order {
                      self.free_inner(best.0, best.1);
-@@ -349,19 +478,12 @@
+@@ -349,19 +480,12 @@
              }
              multiplier *= 2;
          }
@@ -16308,7 +16325,7 @@
          Some(best.0)
      }
  
-@@ -370,6 +492,9 @@
+@@ -370,6 +494,9 @@
      }
  
      pub(crate) fn alloc_inner(&mut self, order: u8) -> Option<u32> {
@@ -16318,7 +16335,7 @@
          if order > self.max_order {
              return None;
          }
-@@ -397,8 +522,14 @@
+@@ -397,8 +524,14 @@
      }
  
      pub(crate) fn record_alloc_inner(&mut self, page_number: u32, order: u8) {
@@ -16335,7 +16352,7 @@
              // Need to split parent page
              let upper_page = next_higher_order(page_number);
              self.record_alloc_inner(upper_page, order + 1);
-@@ -412,7 +543,7 @@
+@@ -412,7 +545,7 @@
                  allocator.clear(free1);
              }
          } else {
@@ -16344,7 +16361,7 @@
          }
      }
  
-@@ -425,6 +556,9 @@
+@@ -425,6 +558,9 @@
      }
  
      pub(crate) fn free_inner(&mut self, page_number: u32, order: u8) {
@@ -16354,7 +16371,7 @@
          if order == self.max_order {
              let allocator = self.get_order_free_mut(order);
              allocator.clear(page_number);
-@@ -453,7 +587,61 @@
+@@ -453,7 +589,61 @@
  
  #[cfg(test)]
  mod test {

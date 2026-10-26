@@ -1246,7 +1246,7 @@ impl RedbPersistence {
                 path: "writer_recovery".into(),
                 reason: "missing writer recovery bounds".into(),
             })?;
-        let (count, commit_first, commit_last) =
+        let (count, _commit_first, commit_last) =
             Self::read_commit_directory_bounds_in_read(read, stored)?;
         let mut bounds = WriterOpenBounds {
             max_row_id: RowId(stored.external_row_id_floor),
