@@ -7,6 +7,8 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
     }
 }
 
+#[path = "sql_surface/a_dag_table_keeps_one_copy_of_a_duplicate_edge.rs"]
+mod a_dag_table_keeps_one_copy_of_a_duplicate_edge;
 #[path = "sql_surface/an_edge_keeps_the_identity_its_table_declares.rs"]
 mod an_edge_keeps_the_identity_its_table_declares;
 #[cfg(not(feature = "test-seams"))]
