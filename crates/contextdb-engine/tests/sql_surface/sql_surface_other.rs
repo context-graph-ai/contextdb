@@ -9711,14 +9711,14 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
     let f = prv_seed_rank_policy_docs(&db, 1024);
     // The query's explain reports the actual route per partition. The first
     // maintained graph for a column is built only by a maintenance cycle
-    // (`docs/query-language.md` INDEXED section); before
-    // one runs, AUTO's exact fallback is truthfully labelled exact rather than HNSW. Drive one
-    // cycle so this fixture's 1,024-row partition has a maintained graph before asserting the
-    // HNSW label.
+    // (`docs/query-language.md` INDEXED section), so drive one before asserting the HNSW label.
+    // AUTO may still truthfully compare a small three-dimensional layout exactly when that is
+    // cheaper than a graph walk, so the large queries ask for the maintained route with
+    // `USE VECTOR INDEXED`, placed after the vector ordering and before `USE RANK`.
     db.run_maintenance_cycle().unwrap();
     let literal = db
         .execute(
-            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 3",
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE VECTOR INDEXED USE RANK weighted LIMIT 3",
             &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
         )
         .unwrap();
@@ -9729,7 +9729,7 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
     );
     let persisted = prv_expect_query_ok(
         db.execute(
-            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 3",
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE VECTOR INDEXED USE RANK weighted LIMIT 3",
             &params(vec![("query_id", Value::Uuid(f.source))]),
         ),
         "USE RANK persisted row vector query",
