@@ -181,6 +181,11 @@ path = "tests/read_cache_share_session.rs"
 required-features = ["test-seams"]
 
 [[test]]
+name = "setting_refusals"
+path = "tests/setting_refusals.rs"
+required-features = ["test-seams"]
+
+[[test]]
 name = "reader_release"
 path = "tests/reader_release.rs"
 required-features = ["test-seams"]

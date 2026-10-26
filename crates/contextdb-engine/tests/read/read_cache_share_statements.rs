@@ -11,8 +11,10 @@
 //! `SET READ_CACHE_SHARE = DEFAULT` returns to the cache derived from the
 //! budget. `SHOW READ_CACHE_SHARE` reports the declared value (`default` when
 //! none is declared) beside the effective cache size in bytes and as a percent
-//! (`Float64`), and the session's last refused declaration (`last_refusal`,
-//! `Null` when there has been none). A declaration takes effect immediately,
+//! (`Float64`), the session's last refused declaration (`last_refusal`,
+//! `Null` when there has been none), and how much of the last statement's
+//! pages are resident in the cache (`last_query_resident_percent`, a `Float64`
+//! percent, `Null` before any statement; advisory). A declaration takes effect immediately,
 //! in both directions: every statement after it reads under the new share. It
 //! is not persisted and is not seen by any other session. Shrinking the share
 //! while a cursor is open
@@ -103,6 +105,7 @@ struct Share {
     effective_bytes: i64,
     effective_percent: f64,
     last_refusal: Value,
+    last_query_resident_percent: Value,
 }
 
 fn show(reader: &ReadSession) -> Share {
@@ -136,6 +139,17 @@ fn show(reader: &ReadSession) -> Share {
         effective_bytes,
         effective_percent,
         last_refusal: row[column("last_refusal")].clone(),
+        last_query_resident_percent: row[column("last_query_resident_percent")].clone(),
+    }
+}
+
+/// The residency `SHOW READ_CACHE_SHARE` reports for the last statement.
+fn last_query_resident_percent(reader: &ReadSession) -> f64 {
+    match show(reader).last_query_resident_percent {
+        Value::Float64(percent) => percent,
+        other => panic!(
+            "after a statement, last_query_resident_percent is a Float64 percent, got {other:?}"
+        ),
     }
 }
 
@@ -201,24 +215,33 @@ fn a_declared_read_cache_share_is_inspected_as_declared_and_effective() {
         (
             undeclared.declared,
             undeclared.effective_bytes,
-            undeclared.last_refusal
+            undeclared.last_refusal,
+            undeclared.last_query_resident_percent
         ),
         (
             Value::Text("default".to_owned()),
             derived_default(),
+            Value::Null,
             Value::Null
         ),
-        "an undeclared session reports the default share, the derived cache size and no refusal"
+        "a session that has run no statement reports the default share, the derived cache \
+         size, no refusal and no query residency"
     );
     set(&reader, "40").expect("a session declares a 40% read cache share");
+    let declared = show(&reader);
     assert_eq!(
-        show(&reader),
-        Share {
-            declared: Value::Int64(40),
-            effective_bytes: declared_bytes(40) as i64,
-            effective_percent: 40.0,
-            last_refusal: Value::Null,
-        },
+        (
+            declared.declared,
+            declared.effective_bytes,
+            declared.effective_percent,
+            declared.last_refusal
+        ),
+        (
+            Value::Int64(40),
+            declared_bytes(40) as i64,
+            40.0,
+            Value::Null
+        ),
         "a declared share is reported with the cache size it gives under this budget"
     );
     set(&reader, "DEFAULT").expect("a session returns to the default share");
@@ -338,9 +361,11 @@ fn a_read_cache_share_declared_mid_session_is_honoured_by_the_statements_after_i
     set(&reader, "2").expect("a session declares a 2% read cache share");
     round(&reader, ROWS);
     let small = round(&reader, ROWS);
+    let small_residency = last_query_resident_percent(&reader);
     set(&reader, "40").expect("a session declares a 40% read cache share");
     let primed = round(&reader, ROWS);
     let large = round(&reader, ROWS);
+    let large_residency = last_query_resident_percent(&reader);
     set(&reader, "2").expect("a session declares a 2% read cache share again");
     round(&reader, ROWS);
     let shrunk = round(&reader, ROWS);
@@ -361,6 +386,15 @@ fn a_read_cache_share_declared_mid_session_is_honoured_by_the_statements_after_i
     assert_eq!(
         large, 0,
         "at a 40% share a repeated round reads nothing from the file (2% read {small})"
+    );
+    assert_eq!(
+        large_residency, 100.0,
+        "at a 40% share every page the repeated statement touched is resident"
+    );
+    assert!(
+        small_residency < 100.0,
+        "at a 2% share the last statement's pages exceed the cache, so not all of them are \
+         resident ({small_residency}%)"
     );
     assert!(
         shrunk as usize >= ROWS * PAYLOAD_BYTES / 2,
