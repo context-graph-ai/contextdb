@@ -1927,36 +1927,6 @@ enum NativeEagerVectorPayload {
 }
 
 impl NativeEagerVector {
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn prepare_scalar(
-        row: crate::statement_rows::NativeEagerRow,
-        column: &str,
-        values: &[f32],
-        funder: &crate::staged_source::SourceFunder,
-    ) -> Result<Option<Self>> {
-        if !matches!(row.row().values.get(column),
-            Some(Value::Vector(have)) if have.as_slice() == values)
-        {
-            return Ok(None);
-        }
-        let control =
-            crate::staged_source::FundedArc::<NativeEagerVectorBody>::prepare(funder.clone())?;
-        let column = crate::staged_source::SourceName::new(column, funder)?;
-        Ok(Some(Self(crate::staged_source::FundedArc::from_prepared(
-            NativeEagerVectorBody {
-                row_id: row.row().row_id,
-                column,
-                payload: NativeEagerVectorPayload::Scalar(row),
-            },
-            control,
-        ))))
-    }
-
     /// `original` is the separately prepared eager vector copy, paired with
     /// its own actual invoice before entry. It is never a canonical-original
     /// invoice or the ordinary WriteSet vector's invoice.
@@ -2012,31 +1982,6 @@ impl NativeEagerVector {
             }
             NativeEagerVectorPayload::Owned(owner) => &owner.entry.vector,
         }
-    }
-
-    /// A move preserves the payload and its distinct original invoice. Only
-    /// the new capability header needs admission; the native name is shared.
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn prepare_move(
-        &self,
-        to: RowId,
-        funder: &crate::staged_source::SourceFunder,
-    ) -> Result<Self> {
-        let control =
-            crate::staged_source::FundedArc::<NativeEagerVectorBody>::prepare(funder.clone())?;
-        Ok(Self(crate::staged_source::FundedArc::from_prepared(
-            NativeEagerVectorBody {
-                row_id: to,
-                column: self.0.column.clone(),
-                payload: self.0.payload.clone(),
-            },
-            control,
-        )))
     }
 }
 
@@ -3097,35 +3042,6 @@ impl OrderedStagedRows {
             original_copy: None,
         })
     }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn prepare_native_moved_vector(
-        &self,
-        index: &contextdb_core::VectorIndexRef,
-        from: RowId,
-        to: RowId,
-        funder: &crate::staged_source::SourceFunder,
-    ) -> Result<Option<PreparedNativeChange>> {
-        self.native_preparation_state()?;
-        if from == to {
-            return Ok(Some(self.unchanged_native()));
-        }
-        let Some(root) = self.native_root() else {
-            return Ok(None);
-        };
-        let Some(source) = root
-            .vector_index(index)
-            .and_then(|index| crate::staged_source::get_by(&index.rows, |id| from.cmp(id)))
-        else {
-            return Ok(None);
-        };
-        let vector = source.prepare_move(to, funder)?;
-        self.prepare_native_vector(index, vector, funder).map(Some)
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -3246,17 +3162,6 @@ impl OrderedStagedRows {
         if let NativeSuccessor::Replace(directory) = prepared.successor {
             self.vectors = directory;
         }
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn publish_native_change(&mut self, prepared: PreparedNativeChange) -> Result<()> {
-        let validated = self.validate_native_change(prepared)?;
-        self.publish_validated_native_change(validated);
-        Ok(())
     }
     #[expect(
         clippy::result_large_err,
@@ -3746,23 +3651,6 @@ impl NativeEagerVector {
             _charge: Arc::new(TerminalVectorControl(self.clone())),
         })
     }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn reserve_private_original_copy(
-        &self,
-        bytes: usize,
-    ) -> Result<crate::staged_source::OriginalCopyGrant> {
-        match &self.0.payload {
-            NativeEagerVectorPayload::Scalar(row) => row.reserve_private_original_copy(bytes),
-            NativeEagerVectorPayload::Owned(payload) => {
-                payload.original_copy.reserve_private_original_copy(bytes)
-            }
-        }
-    }
 }
 
 pub(crate) struct ValidatedNativeChange {
@@ -4136,27 +4024,6 @@ impl NativeOrderedRoot {
     }
 }
 impl OrderedStagedRows {
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn eager_statement(
-        &self,
-        table: &str,
-    ) -> Option<crate::statement_rows::NativeStatementBorrow<'_>> {
-        Some(crate::statement_rows::NativeStatementBorrow::new(
-            self.native_root()?.table(table)?.statement.get(),
-        ))
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn eager_vector(
-        &self,
-        index: &contextdb_core::VectorIndexRef,
-        row: RowId,
-    ) -> Option<&NativeEagerVector> {
-        crate::staged_source::get_by(&self.native_root()?.vector_index(index)?.rows, |id| {
-            row.cmp(id)
-        })
-    }
     pub(crate) fn native_retained_bytes(&self) -> Option<usize> {
         let body = self.vectors.native_body()?;
         crate::staged_source::retained_union_bytes(|visit| {
@@ -4175,111 +4042,8 @@ impl OrderedStagedRows {
     }
 }
 
-/// Engine semantic capture retains only private native custody.
-// activated by bounded-storage S3/S4; remove allow at activation
-#[allow(dead_code)]
-pub(crate) struct NativeOrderedCapture {
-    image: crate::statement_rows::NativeImage<NativeOrderedRoot>,
-}
-// activated by bounded-storage S3/S4; remove allow at activation
-#[allow(dead_code)]
-impl NativeOrderedCapture {
-    pub(crate) fn eager_statement(
-        &self,
-        table: &str,
-    ) -> Option<crate::statement_rows::NativeStatementBorrow<'_>> {
-        Some(crate::statement_rows::NativeStatementBorrow::new(
-            self.image.get().table(table)?.statement.get(),
-        ))
-    }
-    pub(crate) fn eager_vector(
-        &self,
-        index: &contextdb_core::VectorIndexRef,
-        row: RowId,
-    ) -> Option<&NativeEagerVector> {
-        crate::staged_source::get_by(&self.image.get().vector_index(index)?.rows, |id| {
-            row.cmp(id)
-        })
-    }
-    pub(crate) fn visit_retained_debits<'a>(
-        &'a self,
-        visit: &mut dyn FnMut(crate::staged_source::RetainedDebit<'a>),
-    ) {
-        self.image.visit_control_debits(visit);
-        self.image.get().visit_retained_debits(visit);
-    }
-}
-impl NativeOrderedCheckpoint {
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn visit_retained_debits<'a>(
-        &'a self,
-        visit: &mut dyn FnMut(crate::staged_source::RetainedDebit<'a>),
-    ) {
-        if let Some(body) = self.0.native_body() {
-            body.credit.visit_retained_debits(visit);
-            match &body.image {
-                NativeDirectoryImage::Active(image) => {
-                    image.visit_control_debits(visit);
-                    image.get().visit_retained_debits(visit);
-                }
-                NativeDirectoryImage::Restore(pin) => {
-                    pin.visit_control_debits(visit);
-                    pin.get().visit_retained_debits(visit);
-                }
-            }
-        }
-    }
-}
-impl OrderedStagedRows {
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn capture_native(&self) -> Option<NativeOrderedCapture> {
-        self.native_image().map(|image| NativeOrderedCapture {
-            image: image.clone(),
-        })
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn visit_native_debits<'a>(
-        &'a self,
-        visit: &mut dyn FnMut(crate::staged_source::RetainedDebit<'a>),
-    ) {
-        if let Some(body) = self.vectors.native_body() {
-            body.credit.visit_retained_debits(visit);
-            match &body.image {
-                NativeDirectoryImage::Active(image) => {
-                    image.visit_control_debits(visit);
-                    image.get().visit_retained_debits(visit);
-                }
-                NativeDirectoryImage::Restore(pin) => {
-                    pin.visit_control_debits(visit);
-                    pin.get().visit_retained_debits(visit);
-                }
-            }
-        }
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn native_retained_union(
-        &self,
-        captures: &[NativeOrderedCapture],
-        restores: &[NativeOrderedCheckpoint],
-    ) -> Option<usize> {
-        // The manager supplies its actual retained captures/journal pins. This
-        // method makes no claim about owners omitted from that inventory.
-        self.native_image()?;
-        crate::staged_source::retained_union_bytes(|visit| {
-            self.visit_native_debits(visit);
-            for capture in captures {
-                capture.visit_retained_debits(visit);
-            }
-            for restore in restores {
-                restore.visit_retained_debits(visit);
-            }
-        })
-    }
-}
+impl NativeOrderedCheckpoint {}
+impl OrderedStagedRows {}
 
 impl OrderedStagedRows {
     #[expect(
@@ -4313,16 +4077,6 @@ impl OrderedStagedRows {
     pub(crate) fn native_semantic_holders(&self) -> Option<usize> {
         self.native_image()
             .map(crate::statement_rows::NativeImage::semantic_holders)
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn native_statement_semantic_holders(&self, name: &str) -> Option<usize> {
-        Some(
-            self.native_root()?
-                .table(name)?
-                .statement
-                .semantic_holders(),
-        )
     }
 }
 

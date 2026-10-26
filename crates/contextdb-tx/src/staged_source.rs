@@ -766,16 +766,6 @@ pub(crate) fn visit_link_debits<'a, K, V>(
         visit_link_debits(&node.right, visit);
     }
 }
-/// Borrow entries without copying keys, values, or allocating traversal storage.
-// retained for the native route; remove when a caller lands
-#[allow(dead_code)]
-pub(crate) fn for_each_entry<'a, K, V>(root: &'a Link<K, V>, visit: &mut impl FnMut(&'a K, &'a V)) {
-    if let Some(node) = root {
-        for_each_entry(&node.left, visit);
-        visit(&node.entry.key, &node.entry.value);
-        for_each_entry(&node.right, visit);
-    }
-}
 fn height<K, V>(root: &Link<K, V>) -> u16 {
     root.as_ref().map_or(0, |n| n.height)
 }
@@ -1062,11 +1052,6 @@ impl<T> SourceBuffer<T> {
     }
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
-    }
-    // retained for the native route; remove when a caller lands
-    #[allow(dead_code)]
-    pub(crate) fn clear(&mut self) {
-        self.values.clear();
     }
     pub(crate) fn insert(&mut self, position: usize, value: T) {
         assert!(
@@ -3418,18 +3403,6 @@ impl AdmittedEagerSourceRow {
                 .bytes(),
         )
     }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn reserve_original_copy(
-        &self,
-        bytes: usize,
-    ) -> Result<Arc<dyn crate::StagedPostingCharge>> {
-        self.original_copy.reserve_original_copy(bytes)
-    }
 }
 /// Genuine original-backed owned vector. Field order frees the payload first.
 #[doc(hidden)]
@@ -3517,31 +3490,6 @@ impl AdmittedEagerSourceVector {
     }
     pub(crate) fn entry(&self) -> &contextdb_core::VectorEntry {
         &self.entry
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn reserve_private_original_copy(&self, bytes: usize) -> Result<OriginalCopyGrant> {
-        self.copy_private_original_grant(bytes)
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn copy_private_original_grant(&self, bytes: usize) -> Result<OriginalCopyGrant> {
-        self.original_copy.reserve_private_original_copy(bytes)
-    }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.invoice
-            .retained_bytes()
-            .saturating_add(self.original_copy.retained_bytes())
     }
     pub(crate) fn visit_retained_debits<'a>(&'a self, visit: &mut dyn FnMut(RetainedDebit<'a>)) {
         self.invoice.visit_retained_debits(visit);

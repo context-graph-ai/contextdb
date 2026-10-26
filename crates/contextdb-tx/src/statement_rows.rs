@@ -1496,45 +1496,6 @@ impl NativeStatementRoot {
                 .map(|_| index.schema.clone())
         })
     }
-    // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
-    fn structural_bytes(&self) -> usize {
-        let mut bytes = crate::staged_source::retained_link_bytes(&self.by_id)
-            .saturating_add(crate::staged_source::retained_link_bytes(&self.by_sequence))
-            .saturating_add(crate::staged_source::retained_link_bytes(&self.indexes));
-        let mut after_name: Option<&str> = None;
-        while let Some((name, index)) =
-            crate::staged_source::seek_by(&self.indexes, false, |name| {
-                if after_name.is_some_and(|after| name.as_str() <= after) {
-                    Ordering::Less
-                } else {
-                    Ordering::Equal
-                }
-            })
-        {
-            bytes = bytes
-                .saturating_add(name.retained_bytes())
-                .saturating_add(index.retained_bytes())
-                .saturating_add(crate::staged_source::retained_link_bytes(&index.postings));
-            let mut after_key = None;
-            while let Some((key, _)) =
-                crate::staged_source::seek_by(&index.postings, false, |key| {
-                    if after_key.is_some_and(|after: &NativeStatementKey| key <= after) {
-                        Ordering::Less
-                    } else {
-                        Ordering::Equal
-                    }
-                })
-            {
-                bytes = bytes
-                    .saturating_add(key.0.retained_bytes())
-                    .saturating_add(key.0._charge.bytes());
-                after_key = Some(key);
-            }
-            after_name = Some(name.as_str());
-        }
-        bytes
-    }
 }
 
 pub(crate) struct NativeImageValidation<T> {
@@ -2165,50 +2126,6 @@ impl TerminalStatementAlias {
     }
 }
 
-/// A private borrowed view never creates or retains a public std shell.
-// activated by bounded-storage S3/S4; remove allow at activation
-#[allow(dead_code)]
-pub(crate) struct NativeStatementBorrow<'a> {
-    root: &'a NativeStatementRoot,
-}
-// activated by bounded-storage S3/S4; remove allow at activation
-#[allow(dead_code)]
-impl<'a> NativeStatementBorrow<'a> {
-    pub(crate) fn new(root: &'a NativeStatementRoot) -> Self {
-        Self { root }
-    }
-    pub(crate) fn row(&self, id: RowId) -> Option<&'a VersionedRow> {
-        self.root.row(id).map(NativeEagerRow::row)
-    }
-    pub(crate) fn len(&self) -> usize {
-        self.root.len()
-    }
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    pub(crate) fn contains(&self, id: &RowId) -> bool {
-        self.root.row(*id).is_some()
-    }
-    pub(crate) fn next_unordered(&self, after: Option<usize>) -> Option<(usize, &'a VersionedRow)> {
-        self.root.next_unordered(after)
-    }
-    pub(crate) fn has_index_for(&self, name: &str, meta: &contextdb_core::TableMeta) -> bool {
-        self.root.has_index_for(name, meta)
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn next_ordered_in_run(
-        &self,
-        name: &str,
-        reverse: bool,
-        after: Option<&(IndexKey, RowId)>,
-        start: &Bound<IndexKey>,
-        end: &Bound<IndexKey>,
-        prefix_len: usize,
-    ) -> Option<(&'a (IndexKey, RowId), &'a VersionedRow)> {
-        self.root
-            .next_ordered_in_run(name, reverse, after, start, end, prefix_len)
-    }
-}
 impl<T> NativeImage<T> {
     pub(crate) fn semantic_holders(&self) -> usize {
         self.data
@@ -2216,33 +2133,6 @@ impl<T> NativeImage<T> {
             .expect("live native image")
             .holders
             .load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-// activated by bounded-storage S3/S4; remove allow at activation
-#[allow(dead_code)]
-impl NativeStatementBorrow<'_> {
-    pub(crate) fn rows(&self) -> impl Iterator<Item = &VersionedRow> {
-        let mut after = None;
-        std::iter::from_fn(move || {
-            let (sequence, row) = self.next_unordered(after)?;
-            after = Some(sequence);
-            Some(row)
-        })
-    }
-    pub(crate) fn next_ordered(
-        &self,
-        name: &str,
-        reverse: bool,
-        after: Option<&(IndexKey, RowId)>,
-    ) -> Option<(&(IndexKey, RowId), &VersionedRow)> {
-        self.next_ordered_in_run(
-            name,
-            reverse,
-            after,
-            &Bound::Unbounded,
-            &Bound::Unbounded,
-            0,
-        )
     }
 }
 
