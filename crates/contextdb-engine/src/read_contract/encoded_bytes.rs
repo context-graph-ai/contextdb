@@ -44,6 +44,16 @@ impl EncodedReadBytes {
         Ok(Self { bytes })
     }
 
+    /// Actual retained buffer and shared-control invoices, without allocating.
+    pub(crate) fn credit_bytes(&self) -> usize {
+        let payload: &Funded<Vec<u8>> = &self.bytes;
+        payload
+            .credit
+            .as_ref()
+            .map_or(0, ReadCredit::bytes)
+            .saturating_add(self.bytes.credit().bytes())
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes.value
     }

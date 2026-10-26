@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-fn public_cache_setting_error(error: Error) -> Error {
+pub(crate) fn public_cache_setting_error(error: Error) -> Error {
     match error {
         Error::NativeEngineOther(
             contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
@@ -906,6 +906,57 @@ impl SessionExpiry {
 }
 
 impl RouteResources {
+    fn note_cache_percent_refusal(&self, percent: Option<u8>) {
+        match percent {
+            None => self.note_cache_refusal("DEFAULT"),
+            Some(value) => {
+                // Admission has already failed: formatting must not allocate.
+                let digits = [
+                    b'0' + value / 100,
+                    b'0' + value / 10 % 10,
+                    b'0' + value % 10,
+                ];
+                let start = if value >= 100 {
+                    0
+                } else if value >= 10 {
+                    1
+                } else {
+                    2
+                };
+                self.note_cache_refusal(
+                    std::str::from_utf8(&digits[start..]).expect("ASCII percent"),
+                );
+            }
+        }
+    }
+
+    fn note_cache_refusal(&self, value: &str) {
+        let mut text = [0_u8; 64];
+        let mut length = value.len().min(text.len());
+        while !value.is_char_boundary(length) {
+            length -= 1;
+        }
+        text[..length].copy_from_slice(&value.as_bytes()[..length]);
+        *self
+            .last_cache_refusal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(text);
+    }
+
+    fn note_cursor_cache_refusal(&self, share: Option<u8>, capacity: usize) {
+        use std::io::Write;
+        let mut bytes = [0_u8; 64];
+        let mut text = std::io::Cursor::new(bytes.as_mut_slice());
+        write!(&mut text, "cursor kept {capacity} bytes (").expect("bounded cursor cache refusal");
+        match share {
+            Some(percent) => write!(&mut text, "{percent})"),
+            None => write!(&mut text, "DEFAULT)"),
+        }
+        .expect("bounded cursor cache refusal");
+        let length = usize::try_from(text.position()).expect("inline text length");
+        self.note_cache_refusal(std::str::from_utf8(&bytes[..length]).expect("ASCII refusal"));
+    }
+
     fn current_read_cache_share(&self) -> Option<u8> {
         self.read_cache_share
             .load(std::sync::atomic::Ordering::Acquire)
@@ -3406,7 +3457,7 @@ impl ReadSession {
     pub fn set_read_cache_share(&self, percent: Option<u8>) -> Result<()> {
         if percent.is_some_and(|percent| percent > 100) {
             let value = percent.expect("invalid declared percent").to_string();
-            self.note_cache_refusal(&value);
+            self.resources.note_cache_refusal(&value);
             return Err(Error::InvalidSetting {
                 name: "READ_CACHE_SHARE",
                 value,
@@ -3426,50 +3477,12 @@ impl ReadSession {
             if let Err(error) =
                 reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)
             {
-                self.note_cache_percent_refusal(percent);
+                self.resources.note_cache_percent_refusal(percent);
                 return Err(public_cache_setting_error(error));
             }
         }
         self.resources.publish_read_cache_share(percent);
         Ok(())
-    }
-
-    fn note_cache_percent_refusal(&self, percent: Option<u8>) {
-        match percent {
-            None => self.note_cache_refusal("DEFAULT"),
-            Some(value) => {
-                // Admission has already failed: formatting must not allocate.
-                let digits = [
-                    b'0' + value / 100,
-                    b'0' + value / 10 % 10,
-                    b'0' + value % 10,
-                ];
-                let start = if value >= 100 {
-                    0
-                } else if value >= 10 {
-                    1
-                } else {
-                    2
-                };
-                self.note_cache_refusal(
-                    std::str::from_utf8(&digits[start..]).expect("ASCII percent"),
-                );
-            }
-        }
-    }
-
-    fn note_cache_refusal(&self, value: &str) {
-        let mut text = [0_u8; 64];
-        let mut length = value.len().min(text.len());
-        while !value.is_char_boundary(length) {
-            length -= 1;
-        }
-        text[..length].copy_from_slice(&value.as_bytes()[..length]);
-        *self
-            .resources
-            .last_cache_refusal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(text);
     }
 
     #[expect(
@@ -3488,7 +3501,7 @@ impl ReadSession {
                     Some(value) => match value.parse::<u8>() {
                         Ok(percent) if percent <= 100 => Some(percent),
                         _ => {
-                            self.note_cache_refusal(value);
+                            self.resources.note_cache_refusal(value);
                             return Err(Error::InvalidSetting {
                                 name: "READ_CACHE_SHARE",
                                 value: value.to_owned(),
@@ -4261,6 +4274,7 @@ impl ReadSession {
                                 self.options.principal.clone(),
                             );
                             config.memory_limit = self.options.memory_limit;
+                            config.read_cache_share = self.resources.current_read_cache_share();
                             config.runtime_dir = Some(owner.runtime_dir.clone());
                             let retained_bytes =
                                 crate::executor::bounded::cursor_statement_bytes(sql, params)
@@ -6088,6 +6102,29 @@ impl Drop for OwnerCursorContinuation {
 impl OwnerCursorContinuation {
     #[expect(
         clippy::result_large_err,
+        reason = "Cache operations retain typed diagnostics."
+    )]
+    fn refresh_cache_share(&mut self, resources: &RouteResources) -> Result<()> {
+        if let Some(cursor) = self.cursor.as_ref() {
+            let share = resources.current_read_cache_share();
+            let budget = self.config.memory_limit.unwrap_or_else(|| {
+                usize::try_from(self.config.limits.memory).unwrap_or(usize::MAX)
+            });
+            let capacity = crate::persistence::redb_reader_cache_bytes(budget, share);
+            let (kept, _working) = cursor
+                .select_cache_capacity_for_page(capacity)
+                .map_err(public_cache_setting_error)?;
+            if kept < capacity {
+                resources.note_cursor_cache_refusal(share, kept);
+            } else {
+                self.config.read_cache_share = share;
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn fetch(
@@ -6109,19 +6146,7 @@ impl OwnerCursorContinuation {
                 ),
             ));
         }
-        if let Some(cursor) = self.cursor.as_ref() {
-            let share = resources.current_read_cache_share();
-            if self.config.read_cache_share != share {
-                let budget = self.config.memory_limit.unwrap_or_else(|| {
-                    usize::try_from(self.config.limits.memory).unwrap_or(usize::MAX)
-                });
-                let capacity = crate::persistence::redb_reader_cache_bytes(budget, share);
-                cursor
-                    .select_cache_capacity(capacity)
-                    .map_err(public_cache_setting_error)?;
-                self.config.read_cache_share = share;
-            }
-        }
+        self.refresh_cache_share(resources)?;
         if self.cursor.is_none() {
             let registration = self
                 .registration
@@ -6129,15 +6154,21 @@ impl OwnerCursorContinuation {
                 .ok_or_else(|| Error::ReadFailure(owner_disconnected()))?
                 .retain_owner_snapshot();
             let mut config = self.config.clone();
-            // The cursor may have opened before the session changed its share.
-            // Resolve the live declaration at open and again on later fetches.
-            config.read_cache_share = resources.current_read_cache_share();
+            // Start with the policy this cursor already had. A new shrink can
+            // apply immediately; growth waits for this reader's first real page
+            // measurement, so even its initial encoding keeps its room.
+            let requested_share = resources.current_read_cache_share();
             let available = usize::try_from(self.declared_memory)
                 .unwrap_or(usize::MAX)
                 .min(config.memory_limit.unwrap_or(usize::MAX))
                 .saturating_sub(self.retained_memory.held());
             config.memory_limit = Some(config.memory_limit.unwrap_or(available).min(available));
             config.limits.memory = available as u64;
+            if crate::persistence::redb_reader_cache_bytes(available, requested_share)
+                < crate::persistence::redb_reader_cache_bytes(available, config.read_cache_share)
+            {
+                config.read_cache_share = requested_share;
+            }
             config.limits.cursor_page_rows = config
                 .limits
                 .cursor_page_rows
@@ -6189,6 +6220,7 @@ impl OwnerCursorContinuation {
             self.config.limits.memory = admitted_memory;
             self.config.memory_limit = Some(usize::try_from(admitted_memory).unwrap_or(usize::MAX));
             self.cursor = Some(opened.cursor);
+            self.refresh_cache_share(resources)?;
             if self.delivered == 0 {
                 return Ok(first_page);
             }

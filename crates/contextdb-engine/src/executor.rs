@@ -1686,6 +1686,7 @@ fn published_page(
     observation: CursorObservation,
     snapshot: crate::direct_file_reader::DirectSnapshot,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    page_peak_bytes: u64,
 ) -> std::result::Result<
     crate::direct_file_reader::DirectCursorPage,
     crate::direct_file_reader::DirectFileReaderError,
@@ -1742,11 +1743,19 @@ fn published_page(
             "invalid funded cursor output".into(),
         ),
     })?;
+    let working_bytes = usize::try_from(page_peak_bytes)
+        .unwrap_or(usize::MAX)
+        .max(page.credit_bytes())
+        .saturating_add(canonical_bytes.credit_bytes())
+        .saturating_add(
+            contextdb_core::read_memory::ReadShared::<bincode::error::EncodeError>::layout().size(),
+        );
     Ok(crate::direct_file_reader::DirectCursorPage {
         page,
         observation,
         canonical_bytes,
         snapshot,
+        working_bytes,
     })
 }
 
@@ -1770,6 +1779,7 @@ fn drained_page(
         published.observation.clone(),
         published.snapshot,
         read_memory,
+        0,
     )
     .map(Some)
 }
@@ -3229,6 +3239,7 @@ impl ReadExecutionTarget for Database {
                 opened.observation,
                 snapshot,
                 read_memory.clone(),
+                opened.telemetry.peak_temporary_bytes,
             )?;
             let drained = drained_page(&published, read_memory.clone())?;
             Ok((published, drained))
@@ -3751,8 +3762,8 @@ pub(crate) enum BoundedSourceTouch {
     AccessRow,
 }
 
-/// Test-feature observability names upstream work and memory so enforcing only
-/// final result size cannot satisfy the bounded-read contract.
+/// Production measurements of work and admitted temporary memory. Cursor cache
+/// policy also uses the measured page peak to preserve its encoding room.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BoundedExecutionTelemetry {
     pub(crate) work_units: u64,
@@ -3833,7 +3844,6 @@ pub(crate) struct BoundedCursorOpen {
     pub(crate) observation: CursorObservation,
     pub(crate) storage_snapshot: Option<redb::StorageSnapshotIdentity>,
     pub(crate) publication: ReadPublicationScope,
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub(crate) telemetry: BoundedExecutionTelemetry,
 }
 
@@ -24574,7 +24584,9 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             crate::read_probe::CANCELLATION_CURSOR_FETCH,
             cancellation,
         );
+        let mut standing_bytes = 0;
         let fetched = self.with_cursor(|cursor| {
+            standing_bytes = cursor.retained_read_bytes();
             fetch_bounded_cursor(
                 cursor,
                 rows,
@@ -24609,6 +24621,10 @@ impl ReadExecutionTarget for BoundedCursorTarget {
                 fetched.observation,
                 self.snapshot,
                 self.read_memory.clone(),
+                fetched
+                    .telemetry
+                    .peak_temporary_bytes
+                    .saturating_sub(u64::try_from(standing_bytes).unwrap_or(u64::MAX)),
             )?;
             let drained = drained_page(&published, self.read_memory.clone())?;
             Ok((published, drained))

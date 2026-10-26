@@ -333,11 +333,20 @@ On the owner route, inspection reports the session's formula values for its file
 cache policy, with `prepaid_index_bytes` and `held_page_bytes` both `None`; it does
 not report or resize the writer's shared cache. The owner route can retain a 100%
 declaration without allocating a file cache; a later file open must still pass
-total admission. Lazy owner-cursor continuations and newly selected file readers
-resolve the session's current declaration when they open. A continuing cursor on its
-own file reader also applies a changed declaration before its next fetch, using that
-reader's admitted memory budget. It resizes the existing retained source, preserving
-the exact registered root and delivered-row position; growth still requires admission.
+total admission. Newly selected file readers resolve the current declaration when they open.
+An owner cursor retains the policy it opened under for its first continuation page;
+a current shrink applies immediately, while growth waits for that reader's first real page
+measurement. Later fetches also resolve the current declaration, using that reader's
+admitted memory budget. It resizes the existing retained source, preserving
+the exact registered root and delivered-row position. Cache growth leaves room for the running
+cursor's measured page work: production kernel memory telemetry, actual row credits, encoded
+buffer/control credits and the encoder diagnostic Layout supply the measurement. The maximum
+observed page need is retained in the cursor's existing memory-control object. The encoder's
+original payer admits a temporary stack credit for that room while real cache admission finds
+the largest byte capacity that still fits. No new backing or parallel budget is created.
+If the continuation cannot follow a declaration fully, it keeps that bounded capacity and
+continues fetching; the session's declared share remains unchanged. `last_refusal` names the
+cursor and the capacity it kept. Each fetch rechecks its room, and shrink applies immediately.
 
 The SQL session surface is `SET READ_CACHE_SHARE = <percent> | DEFAULT` and
 `SHOW READ_CACHE_SHARE`. It uses the same live mutation path as the Rust API and

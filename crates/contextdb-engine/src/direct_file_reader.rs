@@ -552,6 +552,7 @@ pub struct DirectCursorPage {
     pub(crate) observation: crate::executor::CursorObservation,
     pub canonical_bytes: crate::read_contract::EncodedReadBytes,
     pub snapshot: DirectSnapshot,
+    pub(crate) working_bytes: usize,
 }
 
 impl DirectCursorPage {
@@ -570,6 +571,7 @@ impl DirectCursorPage {
             observation: self.observation.clone(),
             canonical_bytes: self.canonical_bytes.clone(),
             snapshot: self.snapshot,
+            working_bytes: self.working_bytes,
         })
     }
 }
@@ -635,6 +637,9 @@ impl DirectCursorPage {
             u64::MAX,
         )
         .expect("retain the fixture's original encoding invoices");
+        let working_bytes = page
+            .credit_bytes()
+            .saturating_add(canonical_bytes.credit_bytes());
         Self {
             page,
             observation: crate::executor::CursorObservation {
@@ -645,6 +650,7 @@ impl DirectCursorPage {
             },
             canonical_bytes,
             snapshot,
+            working_bytes,
         }
     }
 }
@@ -672,7 +678,7 @@ struct DirectCursorSnapshotRetention {
 }
 
 struct DirectCursorMemoryReservation {
-    _retained_bytes: usize,
+    page_working_bytes: std::sync::atomic::AtomicUsize,
 }
 
 /// Dropping these releases the cursor's image and memory charge.
@@ -1297,7 +1303,9 @@ fn open_cursor_on_backend_neutral_target(
                                     _retained_source: reader.retained_source.clone(),
                                 }),
                                 _memory: Arc::new(DirectCursorMemoryReservation {
-                                    _retained_bytes: constructed.1.canonical_bytes.len(),
+                                    page_working_bytes: std::sync::atomic::AtomicUsize::new(
+                                        constructed.1.working_bytes,
+                                    ),
                                 }),
                             },
                             load: constructed.0,
@@ -1368,6 +1376,16 @@ fn fetch_backend_neutral_cursor(
             return Err(error);
         }
     };
+    if let DirectCursorState::Active {
+        _resources: resources,
+        ..
+    } = &cursor.state
+    {
+        resources
+            ._memory
+            .page_working_bytes
+            .fetch_max(published.working_bytes, std::sync::atomic::Ordering::AcqRel);
+    }
     cursor.publication_scope = constructed.2;
     cursor.note_activity();
     if let Some(request) = constructed.1 {
@@ -1744,19 +1762,73 @@ impl DirectFileReader {
 impl DirectCursor {
     #[expect(
         clippy::result_large_err,
-        reason = "Cache admission retains its inline refusal diagnostics."
+        reason = "Cache refusals keep typed diagnostics."
     )]
-    pub(crate) fn select_cache_capacity(&self, capacity: usize) -> contextdb_core::Result<()> {
-        match &self.state {
-            DirectCursorState::Active {
-                _resources: resources,
-                ..
-            } => resources
-                ._snapshot
-                ._retained_source
-                .select_cache_capacity(capacity),
-            DirectCursorState::Exhausted { .. } | DirectCursorState::Closed => Ok(()),
+    pub(crate) fn select_cache_capacity_for_page(
+        &self,
+        requested: usize,
+    ) -> contextdb_core::Result<(usize, usize)> {
+        use contextdb_core::read_memory::ReadCredit;
+        let DirectCursorState::Active {
+            _resources: resources,
+            ..
+        } = &self.state
+        else {
+            return Ok((requested, 0));
+        };
+        let source = &resources._snapshot._retained_source;
+        let working = resources
+            ._memory
+            .page_working_bytes
+            .load(std::sync::atomic::Ordering::Acquire);
+        let current = source.cache_capacity();
+        if requested < current {
+            source.select_cache_capacity(requested)?;
         }
+        // The encoder's existing payer admits this measured page obligation.
+        // A stack credit holds its room while selecting cache capacity.
+        let reserve = || {
+            ReadCredit::try_new_owned(
+                self.read_memory.clone(),
+                working,
+                "reader_cache",
+                "cursor_page_working_room",
+                "Keep room for this cursor's measured page construction and encoding.",
+            )
+            .map_err(crate::read_session::public_cache_setting_error)
+        };
+        let room = match reserve() {
+            Ok(room) => room,
+            Err(contextdb_core::Error::MemoryBudgetExceeded { .. }) => {
+                source.select_cache_capacity(0)?;
+                match reserve() {
+                    Ok(room) => room,
+                    Err(contextdb_core::Error::MemoryBudgetExceeded { .. }) => {
+                        return Ok((0, working));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        let mut low = source.cache_capacity();
+        let mut high = requested;
+        // The actual admission boundary is monotone in selected bytes. A failed
+        // probe restores the previous admitted lower bound in RetainedReadSource.
+        while low < high {
+            let distance = high - low;
+            let candidate = low + distance / 2 + distance % 2;
+            match source
+                .select_cache_capacity(candidate)
+                .map_err(crate::read_session::public_cache_setting_error)
+            {
+                Ok(()) => low = candidate,
+                Err(contextdb_core::Error::MemoryBudgetExceeded { .. }) => high = candidate - 1,
+                Err(error) => return Err(error),
+            }
+        }
+        drop(room);
+        Ok((low, working))
     }
 
     pub(crate) fn work_observation(

@@ -442,7 +442,10 @@ and leaves no room for the prepaid index and decoded state, so it returns the ty
 reservations), `last_refusal` (the last refused value as text, possibly shortened; initially
 Null), `last_query_resident_percent` (Float64 percent; initially Null), `budget_bytes`,
 `fixed_reservation_bytes`, `prepaid_index_bytes`, `held_page_bytes`, and `default_percent`.
-Settings and their inspection do not replace the last data statement's residency observation.
+Settings and their inspection do not replace the last data statement's residency observation. A running cursor can keep a smaller cache when
+following a growth would leave too little room to build its pages. Its rows and snapshot continue;
+the session's declared share stays what the user set. `last_refusal` identifies the cursor and the
+capacity it kept. A later shrink still applies on its next fetch.
 On the owner route the policy describes a future file reader; physical cache fields and query
 residency are Null because this session does not own the writer's shared cache.
 

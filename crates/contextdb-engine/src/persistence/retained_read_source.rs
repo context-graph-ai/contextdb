@@ -2526,6 +2526,14 @@ impl RetainedReadSource {
         self.database.read_cache_held_bytes()
     }
 
+    pub(crate) fn cache_capacity(&self) -> usize {
+        self._source_memory
+            .cache_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .selected
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Cache admission retains original inline refusal diagnostics."
