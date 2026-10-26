@@ -1506,58 +1506,6 @@ fn current_nonmonotonic_transaction_ids_refuse_reopen() {
 
 fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
     use redb::{ReadableDatabase, ReadableTable};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct PersistedVersionedRow {
-        row_id: contextdb_core::RowId,
-        values: HashMap<String, PersistedValue>,
-        created_tx: contextdb_core::TxId,
-        deleted_tx: Option<contextdb_core::TxId>,
-        lsn: contextdb_core::Lsn,
-        created_at: Option<contextdb_core::Wallclock>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    enum PersistedValue {
-        Plain(Value),
-        Vector(PersistedVector),
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    enum PersistedVector {
-        F32(Vec<f32>),
-        SQ8 {
-            min: f32,
-            max: f32,
-            len: u32,
-            payload: Vec<u8>,
-        },
-        SQ4 {
-            min: f32,
-            max: f32,
-            len: u32,
-            payload: Vec<u8>,
-        },
-    }
-
-    fn encode<T: Serialize>(value: &T) -> Vec<u8> {
-        bincode::serde::encode_to_vec(value, bincode::config::standard()).unwrap()
-    }
-
-    fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .unwrap()
-            .0
-    }
-
-    fn row_key(row: &PersistedVersionedRow) -> Vec<u8> {
-        let mut key = Vec::with_capacity(24);
-        key.extend_from_slice(&row.row_id.0.to_be_bytes());
-        key.extend_from_slice(&row.created_tx.0.to_be_bytes());
-        key.extend_from_slice(&row.lsn.0.to_be_bytes());
-        key
-    }
 
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("current-commit-index-integrity.db");
@@ -1685,57 +1633,6 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
         "the healthy-store update must remain durable after a second reopen"
     );
     reopened.close().unwrap();
-    let redb_db = redb::Database::open(&path).unwrap();
-    let write_txn = redb_db.begin_write().unwrap();
-    if disorder_ids {
-        let rel_items: redb::TableDefinition<&[u8], &[u8]> =
-            redb::TableDefinition::new("rel_items");
-        let mut rows = Vec::new();
-        {
-            let table = write_txn.open_table(rel_items).unwrap();
-            for entry in table.iter().unwrap() {
-                let (_, value) = entry.unwrap();
-                let mut row: PersistedVersionedRow = decode(value.value());
-                match row.values.get("label") {
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "first" => {
-                        row.created_tx = contextdb_core::TxId(2);
-                    }
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "second" => {
-                        row.created_tx = contextdb_core::TxId(1);
-                    }
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "before" => {
-                        row.created_tx = contextdb_core::TxId(4);
-                        row.deleted_tx = Some(contextdb_core::TxId(3));
-                    }
-                    Some(PersistedValue::Plain(Value::Text(label))) if label == "after" => {
-                        row.created_tx = contextdb_core::TxId(3);
-                    }
-                    _ => {}
-                }
-                rows.push(row);
-            }
-        }
-        write_txn.delete_table(rel_items).unwrap();
-        {
-            let mut table = write_txn.open_table(rel_items).unwrap();
-            for row in &rows {
-                table
-                    .insert(row_key(row).as_slice(), encode(row).as_slice())
-                    .unwrap();
-            }
-        }
-    }
-    let commit_index: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("commit_index");
-    let mut index = write_txn.open_table(commit_index).unwrap();
-    for lsn in [first_lsn, second_lsn, before_lsn, after_lsn] {
-        assert!(
-            index.remove(lsn.0).unwrap().is_some(),
-            "fixture must remove the current commit-index entry at {lsn:?}"
-        );
-    }
-    drop(index);
-    write_txn.commit().unwrap();
-    drop(redb_db);
 
     // A refused open must not rewrite commit history, row identities or the
     // recovery records that authenticate the directory.
@@ -1784,15 +1681,85 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
             recovery,
         }
     }
-    let damaged = durable_state(&path);
+
+    // The damage is planted strictly inside the commit directory: its first and
+    // last entries, which open authenticates separately, stay as committed, and
+    // no row or recovery record is touched, so the only disagreement open can
+    // find is the directory differing from its committed root.
+    let intact = durable_state(&path);
+    let entry = |lsn: contextdb_core::Lsn| {
+        *intact
+            .commits
+            .iter()
+            .find(|(key, _)| *key == lsn.0)
+            .unwrap_or_else(|| panic!("the intact directory records {lsn:?}"))
+    };
+    let (interior_early, interior_late) = (entry(second_lsn), entry(before_lsn));
+    let (directory_first, directory_last) = (
+        *intact
+            .commits
+            .first()
+            .expect("an intact directory has a first entry"),
+        *intact
+            .commits
+            .last()
+            .expect("an intact directory has a last entry"),
+    );
     assert!(
-        damaged.commits.iter().all(|(lsn, _)| ![
-            first_lsn.0,
-            second_lsn.0,
-            before_lsn.0,
-            after_lsn.0
-        ]
-        .contains(lsn))
+        directory_first.0 < interior_early.0
+            && interior_late.0 < directory_last.0
+            && interior_early.1 < interior_late.1,
+        "the planted entries are interior and committed in order: first {directory_first:?}, \
+         planted {interior_early:?} and {interior_late:?}, last {directory_last:?}"
+    );
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write_txn = redb_db.begin_write().unwrap();
+    {
+        let commit_index: redb::TableDefinition<u64, u64> =
+            redb::TableDefinition::new("commit_index");
+        let mut index = write_txn.open_table(commit_index).unwrap();
+        if disorder_ids {
+            // The later commit now names the earlier transaction and the
+            // earlier commit the later one.
+            index.insert(interior_early.0, interior_late.1).unwrap();
+            index.insert(interior_late.0, interior_early.1).unwrap();
+        } else {
+            for (lsn, _) in [interior_early, interior_late] {
+                assert!(
+                    index.remove(lsn).unwrap().is_some(),
+                    "fixture must remove the interior commit-index entry at LSN {lsn}"
+                );
+            }
+        }
+    }
+    write_txn.commit().unwrap();
+    drop(redb_db);
+
+    let damaged = durable_state(&path);
+    let expected_commits: Vec<(u64, u64)> = intact
+        .commits
+        .iter()
+        .filter_map(|&(lsn, tx)| {
+            if lsn == interior_early.0 {
+                disorder_ids.then_some((lsn, interior_late.1))
+            } else if lsn == interior_late.0 {
+                disorder_ids.then_some((lsn, interior_early.1))
+            } else {
+                Some((lsn, tx))
+            }
+        })
+        .collect();
+    assert_eq!(
+        damaged.commits, expected_commits,
+        "only the two interior entries are damaged; the first and last entries are as committed"
+    );
+    assert_eq!(
+        damaged.rows, intact.rows,
+        "the fixture leaves every row record exactly as committed"
+    );
+    assert_eq!(
+        damaged.recovery, intact.recovery,
+        "the fixture leaves every recovery record exactly as committed"
     );
     for _ in 0..2 {
         let error = match Database::open(&path) {
