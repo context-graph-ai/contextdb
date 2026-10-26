@@ -225,12 +225,17 @@ const BARE_CLOCK_RATCHET: &[(&str, usize, &str)] = &[(
      not general test debt",
 )];
 
-/// Unit-test modules living inside `src/` files (everything from the first
-/// `#[cfg(test)]`-attributed MODULE to end-of-file — an attribute on a lone
-/// item, e.g. a test-only accessor, does not open the region) are audited with
-/// the same needles. Production code above the marker is exempt — it may
-/// legitimately sleep (e.g. `sleep_with_shutdown`) and read real clocks.
+/// In-line test module bodies and the whole contents of test-gated out-of-line
+/// modules are audited with the same needles. Out-of-line modules inherit test
+/// status through nested declarations, including `cfg(all(test, ...))` gates.
+/// Production items outside those modules remain exempt.
 const SRC_TEST_SLEEP_RATCHET: &[(&str, usize, &str)] = &[
+    (
+        "crates/contextdb-engine/src/persistence/proof_allocation_oracle_tests.rs",
+        1,
+        "existing allocation-attribution fixture newly visible through out-of-line module auditing; \
+         replace its neighbour-thread sleep with a deterministic allocation barrier",
+    ),
     ("crates/contextdb-cli/src/auto_sync.rs", 4, RSN_SYNC_BARRIER),
     (
         "crates/contextdb-engine/src/database.rs",
@@ -334,8 +339,20 @@ fn test_module_regions(content: &str) -> Vec<&str> {
 }
 
 /// The parts of the `src` file at `rel` this audit reads as unit-test code.
-fn src_test_regions<'a>(_rel: &str, content: &'a str) -> Vec<&'a str> {
-    test_module_regions(content)
+fn src_test_regions<'a>(rel: &str, content: &'a str) -> Vec<&'a str> {
+    static MODULES: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    let modules = MODULES.get_or_init(|| {
+        out_of_line_test_modules(&workspace_root())
+            .into_iter()
+            .map(|(_, module)| module)
+            .collect()
+    });
+    if modules.contains(rel) {
+        vec![content]
+    } else {
+        test_module_regions(content)
+    }
 }
 
 /// Every baseline entry must carry a non-empty reason: an entry with an empty
@@ -400,14 +417,13 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
             Err(_) => continue,
         };
 
-        // In-src unit-test modules: audit the region from the first
-        // `#[cfg(test)]` marker to end-of-file.
+        // In-src unit-test modules: in-line bodies or whole out-of-line files.
         if is_src_file(&rel) {
             let Ok(content) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
-            // Audit each cfg(test) MODULE body, not the suffix after the first
-            // one. Production items can follow an earlier test module.
+            // Production items can follow an earlier in-line test module;
+            // out-of-line test modules are test code from their first byte.
             for test_region in src_test_regions(&rel, &content) {
                 let sleeps = count_occurrences(test_region, SLEEP_NEEDLES);
                 let allowed = src_sleep_ratchet.get(rel.as_str()).copied().unwrap_or(0);
