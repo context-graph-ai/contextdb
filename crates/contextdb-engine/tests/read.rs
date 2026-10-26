@@ -188,32 +188,36 @@ mod writer_ordered_rows_use_exact_versions;
 mod writing_handle_bounded_read_transaction_boundaries;
 
 #[cfg(unix)]
+#[path = "read/a_small_read_limit_under_a_larger_session_ceiling_still_opens.rs"]
+mod a_small_read_limit_under_a_larger_session_ceiling_still_opens;
+#[cfg(unix)]
 #[path = "read/reader_continuity_contract.rs"]
 mod reader_continuity_contract;
 #[cfg(unix)]
 #[path = "read/reader_operation_expiry_contract.rs"]
 mod reader_operation_expiry_contract;
 #[cfg(unix)]
+#[path = "read/reader_page_cache_follows_the_declared_budget.rs"]
+mod reader_page_cache_follows_the_declared_budget;
+#[cfg(unix)]
 #[path = "read/reader_proof_support.rs"]
 mod reader_proof_support;
 #[cfg(unix)]
-#[path = "read/a_small_read_limit_under_a_larger_session_ceiling_still_opens.rs"]
-mod a_small_read_limit_under_a_larger_session_ceiling_still_opens;
-#[cfg(unix)]
 #[path = "read/working_set_bounded_contract.rs"]
 mod working_set_bounded_contract;
-#[cfg(unix)]
-#[path = "read/reader_page_cache_follows_the_declared_budget.rs"]
-mod reader_page_cache_follows_the_declared_budget;
 
 #[path = "read/content_size_independent_contract.rs"]
 mod content_size_independent_contract;
 
-#[path = "read/read_cache_share_inspection.rs"]
-mod read_cache_share_inspection;
 #[cfg(target_os = "linux")]
 #[path = "read/a_reselected_reader_keeps_its_deadline_driver.rs"]
 mod a_reselected_reader_keeps_its_deadline_driver;
+#[path = "read/read_cache_share_inspection.rs"]
+mod read_cache_share_inspection;
 
 #[path = "read/a_file_session_observes_a_writer_that_already_closed.rs"]
 mod a_file_session_observes_a_writer_that_already_closed;
+
+#[cfg(unix)]
+#[path = "read/a_companionless_reader_adopts_an_unchanged_first_writer.rs"]
+mod a_companionless_reader_adopts_an_unchanged_first_writer;

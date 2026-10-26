@@ -2515,6 +2515,7 @@ impl OwnerReadService {
         let usage = self.spec.database.accountant().usage();
         Ok(LocalOwnerStatusResponse {
             status: self.status(),
+            committed_lsn: self.spec.database.published_read_lsn(),
             effective_limits: LocalEffectiveLimits::from_owner_limits(
                 self.spec.config.limits,
                 self.spec.configuration_source,

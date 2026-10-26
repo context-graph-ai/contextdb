@@ -2397,15 +2397,35 @@ impl ReadSession {
         if cancellation.is_cancelled() {
             return Err(Error::ReadCancelled);
         }
+        let snapshot_floor = match previous.as_ref() {
+            ReadSessionState::DirectFile(reader) => Some(reader.snapshot_lsn()),
+            _ => None,
+        };
         let (state, snapshot_at) = match selected {
             SelectedRoute::Owner(selected) => {
                 if identity.is_some_and(|identity| selected.identity != identity) {
+                    return Err(mismatch());
+                }
+                // A companionless copy has no identity to compare. Its first
+                // authenticated writer must still preserve the committed image
+                // the session already read, rather than adopting an older copy.
+                if snapshot_floor.is_some_and(|floor| {
+                    selected
+                        .client
+                        .lock()
+                        .expect("owner client")
+                        .accepted_lsn()
+                        .is_none_or(|lsn| lsn < floor)
+                }) {
                     return Err(mismatch());
                 }
                 (ReadSessionState::OwnerChannel(selected), None)
             }
             SelectedRoute::File(reader) => {
                 if identity.is_some() && reader.database_identity() != identity {
+                    return Err(mismatch());
+                }
+                if snapshot_floor.is_some_and(|floor| reader.snapshot_lsn() < floor) {
                     return Err(mismatch());
                 }
                 (

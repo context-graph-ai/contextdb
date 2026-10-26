@@ -430,6 +430,8 @@ fn configured_value(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalOwnerStatusResponse {
     pub status: OwnerReadStatus,
+    /// The writer's published committed frontier when it accepted this reader.
+    pub committed_lsn: contextdb_core::Lsn,
     pub effective_limits: LocalEffectiveLimits,
     pub timeouts: LocalOwnerTimeouts,
     pub admission: OwnerAdmissionCounters,
@@ -3531,6 +3533,7 @@ impl<'a> WirePreflight<'a> {
                 _ => unreachable!("bounded owner-reason discriminant"),
             }
         }
+        self.u64()?; // published committed LSN
         for _ in 0..10 {
             self.configured_value()?;
         }

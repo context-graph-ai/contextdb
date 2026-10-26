@@ -156,7 +156,7 @@ pub const LOCAL_PROTOCOL_MARKER: [u8; 20] = *b"contextdb-local-read";
 /// bytes that are not the shape it expected.
 ///
 /// The golden byte fixtures are what make such a change impossible to miss.
-pub const LOCAL_PROTOCOL_VERSION: u16 = 4;
+pub const LOCAL_PROTOCOL_VERSION: u16 = 5;
 /// A complete local payload may be no larger than four mebibytes.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 

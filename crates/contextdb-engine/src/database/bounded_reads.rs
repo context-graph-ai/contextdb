@@ -1,6 +1,11 @@
 use super::*;
 
 impl Database {
+    /// The frontier of the committed root a newly admitted read will capture.
+    pub(crate) fn published_read_lsn(&self) -> contextdb_core::Lsn {
+        self.tx_mgr.published_read_snapshot().1
+    }
+
     /// Whether `table` has an index whose leading key covers `column`. A
     /// declared `PRIMARY KEY`/`UNIQUE` column is auto-indexed at
     /// `CREATE`/`ALTER` time and always answers `true`; a bare `id`-named

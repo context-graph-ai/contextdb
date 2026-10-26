@@ -34,6 +34,7 @@ pub struct OwnerClient {
     cancellations: Arc<CancelCoordination>,
     /// What the owner said about itself when it accepted this reader.
     accepted_status: Option<contextdb_core::read_contract::OwnerReadStatus>,
+    accepted_lsn: Option<contextdb_core::Lsn>,
     /// A draining owner sends this terminal refusal before ending an idle
     /// connection. Remember it so every later operation on the same selected
     /// route receives the owner's typed answer instead of reclassifying the
@@ -103,6 +104,7 @@ impl OwnerClient {
             requests_sent: 0,
             cancellations: Arc::new(CancelCoordination::default()),
             accepted_status: None,
+            accepted_lsn: None,
             terminal_refusal: None,
             #[cfg(any(test, feature = "test-seams"))]
             response_frames: None,
@@ -142,6 +144,7 @@ impl OwnerClient {
                 // connection has to know whether this owner is actually
                 // serving, and this answer is the owner's own word for it.
                 LocalResponse::OwnerStatus { status } => {
+                    self.accepted_lsn = Some(status.committed_lsn);
                     self.accepted_status = Some(status.status);
                     return Ok(());
                 }
@@ -185,6 +188,11 @@ impl OwnerClient {
     /// word here rather than finding out at its first read.
     pub fn accepted_status(&self) -> Option<contextdb_core::read_contract::OwnerReadStatus> {
         self.accepted_status.clone()
+    }
+
+    /// The committed frontier the authenticated owner published at acceptance.
+    pub(crate) fn accepted_lsn(&self) -> Option<contextdb_core::Lsn> {
+        self.accepted_lsn
     }
 
     /// Watch this connection's reply frames arrive, one call per frame, with
