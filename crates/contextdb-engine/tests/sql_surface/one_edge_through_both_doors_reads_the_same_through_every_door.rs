@@ -193,3 +193,6 @@ fn a_wider_key_sibling_of_an_edge_written_through_both_doors_stays_a_second_bind
         "a sibling that differs only by a wider-key column is a second binding"
     );
 }
+
+#[path = "mixed_edge_updates_duplicates_and_gated_views.rs"]
+mod mixed_edge_updates_duplicates_and_gated_views;
