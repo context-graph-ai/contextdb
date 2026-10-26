@@ -986,10 +986,25 @@ fn own_bytes(request: &[u8], reply: &[u8]) -> u64 {
 /// ten pending outcomes after the cursor encode to the same number of bytes.
 const PADDED_POSITION: u64 = 1 << 16;
 
-async fn cursor_scaling(prior: usize) -> Scaling {
+/// The first position of the MessagePack u16 class, which ends at 65,536.
+/// Both worlds of the bounded form start here and must stay inside it.
+const U16_PADDED_POSITION: u64 = 1 << 8;
+
+/// The MessagePack width a position encodes at.
+fn position_class(position: u64) -> u8 {
+    match position {
+        0..=127 => 0,
+        128..=255 => 1,
+        256..=65_535 => 2,
+        65_536..=4_294_967_295 => 4,
+        _ => 8,
+    }
+}
+
+async fn cursor_scaling(prior: usize, padded: u64) -> Scaling {
     eprintln!("S4_SCALE prior={prior} world");
     let world = World::new();
-    world.pad_positions(PADDED_POSITION);
+    world.pad_positions(padded);
     eprintln!(
         "S4_SCALE prior={prior} padded hub_lsn={} edge_lsn={}",
         world.hub_db.current_lsn().0,
@@ -1013,6 +1028,14 @@ async fn cursor_scaling(prior: usize) -> Scaling {
     world.seed_outcomes(10).await;
     hub.stop().await;
     eprintln!("S4_SCALE prior={prior} seeded; driving native");
+    for db in [&world.hub_db, &world.edge_db] {
+        assert_eq!(
+            position_class(db.current_lsn().0),
+            position_class(padded),
+            "both worlds stay in the padded position class: {}",
+            db.current_lsn().0
+        );
+    }
     let request = world.request_bytes(3, Some(cursor));
 
     let measured =
@@ -1089,10 +1112,28 @@ fn describe(pages: &[Page]) -> String {
 // 10 or 10,010 precede it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_request_examines_only_the_orders_after_it() {
-    let small = cursor_scaling(10).await;
-    let large = cursor_scaling(10_010).await;
+    cursor_request_examines_only_the_orders_after_it(PADDED_POSITION, 10_010).await;
+}
+
+// The same contract two full pages deep, from the first position of the
+// MessagePack u16 class: a selector that scans history examines every prior
+// order at any depth beyond one page, and two full pages give the
+// full-page peak comparison its two samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_request_examines_only_the_orders_after_it_two_full_pages_deep() {
+    let page = crate::DatabaseOpenOptions::default()
+        .owner_reads
+        .limits
+        .limits
+        .cursor_page_rows as usize;
+    cursor_request_examines_only_the_orders_after_it(U16_PADDED_POSITION, 2 * page + 10).await;
+}
+
+async fn cursor_request_examines_only_the_orders_after_it(padded: u64, deep: usize) {
+    let small = cursor_scaling(10, padded).await;
+    let large = cursor_scaling(deep, padded).await;
     println!(
-        "S4_STEP7 prior=10 examined(count,collect)={:?} outcomes={} request_len={} reply_len={} native_peak={} transient={} own_bytes={} legacy_peak={} | prior=10010 examined(count,collect)={:?} outcomes={} request_len={} reply_len={} native_peak={} transient={} own_bytes={} legacy_peak={} | legacy_growth={}",
+        "S4_STEP7 prior=10 examined(count,collect)={:?} outcomes={} request_len={} reply_len={} native_peak={} transient={} own_bytes={} legacy_peak={} | prior={deep} examined(count,collect)={:?} outcomes={} request_len={} reply_len={} native_peak={} transient={} own_bytes={} legacy_peak={} | legacy_growth={}",
         small.examined,
         small.outcomes,
         small.request_len,
@@ -1112,7 +1153,7 @@ async fn a_cursor_request_examines_only_the_orders_after_it() {
         large.legacy_peak as i128 - small.legacy_peak as i128,
     );
     println!("S4_PAGED prior=10 {}", describe(&small.catch_up));
-    println!("S4_PAGED prior=10010 {}", describe(&large.catch_up));
+    println!("S4_PAGED prior={deep} {}", describe(&large.catch_up));
     assert_eq!(small.outcomes, 10);
     assert_eq!(large.outcomes, 10);
     assert_eq!(small.examined, (10, 10));
@@ -1138,7 +1179,7 @@ async fn a_cursor_request_examines_only_the_orders_after_it() {
         .limits
         .limits
         .cursor_page_rows as usize;
-    for (prior, pages) in [(10, &small.catch_up), (10_010, &large.catch_up)] {
+    for (prior, pages) in [(10, &small.catch_up), (deep, &large.catch_up)] {
         assert_eq!(pages.iter().map(|p| p.outcomes).sum::<usize>(), prior);
         assert_eq!(pages.len(), prior.div_ceil(page));
         assert!(
