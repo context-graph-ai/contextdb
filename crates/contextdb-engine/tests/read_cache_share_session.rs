@@ -551,3 +551,104 @@ fn after_its_writer_closes_a_session_whose_first_call_declares_a_share_applies_i
         "the status reports the file reader the share applies to: {status:?}"
     );
 }
+
+/// One `SHOW READ_CACHE_SHARE` column of the session.
+fn shown(session: &ReadSession, column: &str) -> Value {
+    let result = session
+        .execute("SHOW READ_CACHE_SHARE", &HashMap::new())
+        .expect("the session inspects its read cache share");
+    let index = result
+        .columns()
+        .iter()
+        .position(|name| name == column)
+        .unwrap_or_else(|| panic!("SHOW READ_CACHE_SHARE has a {column} column"));
+    result.rows()[0][index].clone()
+}
+
+/// A cursor continuing on its own file reader under a tight declared budget
+/// keeps returning its rows when its session declares a share that reader
+/// cannot admit: the fetch never fails for it, the session reports the
+/// refusal, and a later shrink applies without needing any admission.
+#[test]
+fn a_continuing_cursor_keeps_its_rows_when_a_declared_share_cannot_be_admitted() {
+    const TIGHT_BUDGET: usize = 32 * MIB;
+    let seeded = tempfile::tempdir().unwrap();
+    seeded_store(seeded.path(), CURSOR_ROWS);
+    let directory = tempfile::tempdir().unwrap();
+    copy_store(seeded.path(), directory.path());
+    let path = directory.path().join("owner-cursor.db");
+    let writer = Database::open(&path).unwrap();
+    let session = ReadSession::open_with_observations_for_test(
+        &path,
+        ReadSessionOptions {
+            memory_limit: Some(TIGHT_BUDGET),
+            read_cache_share: Some(10),
+            limits: ReadLimits {
+                memory: TIGHT_BUDGET as u64,
+                cursor_page_rows: CURSOR_PAGE_ROWS,
+                cursor_page_bytes: 4 * MIB as u64,
+                ..fixture::limits()
+            },
+            ..Default::default()
+        },
+        Arc::new(ManualDeadlineClock::at(10_000)),
+        None,
+        None,
+    )
+    .expect("a session opens beside the writer under a 32 MiB budget");
+    assert_eq!(session.route(), ReadRoute::Owner);
+    let mut cursor = session
+        .open_cursor(SELECT_ALL, &HashMap::new())
+        .expect("an owner cursor opens beside the writer");
+    let mut rows: Vec<Vec<Value>> = cursor.first_page().rows().to_vec();
+    writer.close().unwrap();
+    let first = cursor
+        .fetch(None)
+        .expect("the cursor continues through its own file reader");
+    rows.extend(first.rows().iter().cloned());
+    assert!(first.has_more());
+
+    session
+        .execute("SET READ_CACHE_SHARE = 95", &HashMap::new())
+        .expect("the session declares a 95% share");
+    let after_growth = cursor.fetch(None).expect(
+        "a share the cursor's own file reader cannot admit never turns its next fetch into a \
+         refusal",
+    );
+    rows.extend(after_growth.rows().iter().cloned());
+    assert!(
+        matches!(shown(&session, "last_refusal"), Value::Text(_)),
+        "the session reports the share the cursor's file reader could not admit: {:?}",
+        shown(&session, "last_refusal")
+    );
+
+    session
+        .execute("SET READ_CACHE_SHARE = 2", &HashMap::new())
+        .expect("a shrink needs no admission");
+    let fixed = contextdb_engine::persistence::read_source_cache_reservation_for_limit_for_test(
+        Some(TIGHT_BUDGET),
+    )
+    .1;
+    assert_eq!(
+        shown(&session, "effective_bytes"),
+        Value::Int64(((TIGHT_BUDGET - fixed) * 2 / 100) as i64),
+        "the shrink applies to the session's cache"
+    );
+    if after_growth.has_more() {
+        loop {
+            let page = cursor
+                .fetch(None)
+                .expect("the cursor keeps reading after the session shrinks its share");
+            rows.extend(page.rows().iter().cloned());
+            if !page.has_more() {
+                break;
+            }
+        }
+    }
+    drop(cursor);
+    assert_eq!(
+        rows,
+        all_rows(CURSOR_ROWS),
+        "the cursor returns every row once, through the refused growth and the shrink"
+    );
+}
