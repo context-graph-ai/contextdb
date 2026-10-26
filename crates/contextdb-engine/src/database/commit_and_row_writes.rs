@@ -1750,6 +1750,7 @@ impl Database {
 
         let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
+        crate::executor::apply_missing_column_defaults(self, table, &mut values, Some(tx))?;
         self.complete_insert_access_values(table, &mut values)?;
         let meta = self
             .table_meta(table)

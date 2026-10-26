@@ -19858,7 +19858,7 @@ fn parse_text_vector_literal(text: &str) -> Result<Vec<f32>> {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn apply_missing_column_defaults(
+pub(crate) fn apply_missing_column_defaults(
     db: &Database,
     table: &str,
     values: &mut HashMap<String, Value>,
