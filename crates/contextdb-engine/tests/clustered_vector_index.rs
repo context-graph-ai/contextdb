@@ -66,3 +66,11 @@ mod training_seed;
 mod with_carrier;
 #[path = "clustered_vector_index/write_buffer.rs"]
 mod write_buffer;
+
+#[path = "clustered_vector_index/engine_stage.rs"]
+mod engine_stage;
+#[path = "clustered_vector_index/native_candidate_port.rs"]
+mod native_candidate_port;
+
+#[path = "clustered_vector_index/native_seal.rs"]
+mod native_seal;

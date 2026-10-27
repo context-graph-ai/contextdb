@@ -1244,3 +1244,521 @@ pub fn inspected_search_settings(
 ) -> Vec<DepthSetting> {
     unimplemented!("{UNBOUND}: the inspected per-depth search settings")
 }
+
+/// Work from a real ReadSession file query, forwarded from its production
+/// vector work record and actual native page callbacks (including workers).
+pub fn observe_file_search<T>(
+    _reader: &contextdb_engine::ReadSession,
+    _operation: impl FnOnce() -> T,
+) -> (T, SearchWork) {
+    unimplemented!("{UNBOUND}: file-reader clustered query work")
+}
+
+/// Fixed projection of the durable descriptor accessor. Inspection neither
+/// warms a query cache nor emits normal-query load events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeServingDescriptor {
+    pub bytes: [u8; 200],
+    pub generation: u64,
+}
+pub fn native_ivf_serving_descriptor_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+) -> contextdb_core::Result<Option<NativeServingDescriptor>> {
+    unimplemented!("{UNBOUND}: actual durable compact serving descriptor")
+}
+/// Projection of ServingDescriptorLoaded, QueryManifestSelected and
+/// RootControlLoaded plus the existing generic generation counter. Copies
+/// only fixed descriptor bytes; never supplies the query's manifest.
+#[derive(Clone, Debug, Default)]
+pub struct NativeDescriptorWork {
+    pub descriptor_loads: u64,
+    pub descriptor_bytes: u64,
+    pub loaded: Option<[u8; 200]>,
+    pub selected: Option<[u8; 200]>,
+    pub selected_generation: Option<u64>,
+    pub saved_generation_loads: u64,
+    pub saved_generation_bytes: u64,
+    pub root_control_loads: u64,
+    pub root_control_bytes: u64,
+    pub index_builds: u64,
+    pub index_repairs: u64,
+    pub quarantined: bool,
+    pub route: Option<SearchRoute>,
+    pub capture_complete: bool,
+    pub overflow: bool,
+}
+pub fn observe_native_ivf_descriptor<T>(
+    _db: &Database,
+    _operation: impl FnOnce() -> T,
+) -> (T, NativeDescriptorWork) {
+    unimplemented!("{UNBOUND}: native descriptor normal-query source and separate control work")
+}
+pub fn corrupt_native_ivf_serving_descriptor_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+    _byte_offset: usize,
+    _xor_mask: u8,
+) -> contextdb_core::Result<()> {
+    unimplemented!(
+        "{UNBOUND}: corrupt the persisted serving descriptor leaving its authority unchanged"
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeRowIdentity {
+    pub row: u64,
+    pub commit_lsn: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeJournalIdentity {
+    pub initialized: bool,
+    pub identity: Option<NativeRowIdentity>,
+    pub deleted: bool,
+    pub copies: u64,
+}
+/// The real authoritative row id/version selected by the SQL primary key;
+/// no assumption equates the primary key, canonical slot and internal RowId.
+pub fn native_ivf_source_identity_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _primary_key: i64,
+) -> contextdb_core::Result<NativeRowIdentity> {
+    unimplemented!("{UNBOUND}: selected authoritative SQL row identity and actual row LSN")
+}
+pub fn native_ivf_journal_identity_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+    _row: contextdb_core::RowId,
+) -> contextdb_core::Result<NativeJournalIdentity> {
+    unimplemented!("{UNBOUND}: initialized live/deleted native journal record")
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeBuildCursor {
+    pub canonical: [u8; 32],
+    pub membership: [u8; 24],
+    pub ingested_vectors: u64,
+    pub canonical_complete: bool,
+}
+pub fn native_ivf_build_progress_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+) -> contextdb_core::Result<NativeBuildCursor> {
+    unimplemented!("{UNBOUND}: persisted partial native source cursor")
+}
+/// SourceRowIngested identities delivered by the actual first bounded cycle.
+/// The fixed recorder cannot silently drop events or grow with population.
+#[derive(Clone, Debug)]
+pub struct NativeIngestionWork {
+    pub identities: [Option<NativeRowIdentity>; 16],
+    pub count: usize,
+    pub capture_complete: bool,
+    pub overflow: bool,
+}
+pub fn observe_native_ivf_ingestion<T>(
+    _db: &Database,
+    _operation: impl FnOnce() -> T,
+) -> (T, NativeIngestionWork) {
+    unimplemented!("{UNBOUND}: actual source identities ingested in a bounded maintenance cycle")
+}
+#[derive(Clone, Copy, Debug)]
+pub enum NativeConditionalMutation<'a> {
+    Update(&'a [f32]),
+    Delete,
+}
+/// Invokes the real adapter compare-existing mutation under an aborting outer
+/// transaction with exactly this expected identity. Never retries, initializes
+/// an initialized record, substitutes an expected version or commits a fake row.
+pub fn try_native_ivf_conditional_mutation_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+    _expected: NativeRowIdentity,
+    _mutation: NativeConditionalMutation<'_>,
+) -> contextdb_core::Result<()> {
+    unimplemented!("{UNBOUND}: native compare-existing stale RowIdentity refusal")
+}
+/// Installs the actual AfterAuthoritativeAndJournalStaged before-commit fault
+/// once for the chosen row; records that it fired after both writes staged.
+pub fn with_native_ivf_after_staged_failure_for_test<T>(
+    _row: contextdb_core::RowId,
+    _operation: impl FnOnce() -> T,
+) -> (T, bool) {
+    unimplemented!("{UNBOUND}: fail after actual authoritative and journal staging")
+}
+
+/// Fixed projections of the producer-owned exported allocation records. Each
+/// Layout below comes directly from the shared producer calculation consumed
+/// by its real constructor; support must not copy a private size formula.
+#[derive(Clone, Copy, Debug)]
+pub struct ProducerCodebookLayouts {
+    pub control: std::alloc::Layout,
+    pub values: std::alloc::Layout,
+    pub counts: std::alloc::Layout,
+    pub charged_bytes: usize,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ProducerWorkspaceLayouts {
+    pub controls: std::alloc::Layout,
+    pub buffer: std::alloc::Layout,
+    pub raw: std::alloc::Layout,
+    pub values: std::alloc::Layout,
+    pub encoded: std::alloc::Layout,
+    pub order: std::alloc::Layout,
+    pub combined: std::alloc::Layout,
+    pub page_scratch: std::alloc::Layout,
+    pub catalog: std::alloc::Layout,
+    pub buffer_record_bytes: usize,
+    pub charged_bytes: usize,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct NativePolicyInputs {
+    pub dimensions: usize,
+    pub lists: u32,
+    pub probes: u32,
+    pub rerank: usize,
+    pub buffer_bytes: usize,
+    pub extend_to_k: bool,
+    pub training_iterations: u32,
+    pub training_samples: u64,
+    pub training_seed: u64,
+    pub ingest_batch_keys: usize,
+    pub phase_batch_entries: usize,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct NativeResolvedPolicy {
+    pub inputs: NativePolicyInputs,
+    pub active_lists: u32,
+    pub population: u64,
+    pub expected_vectors: u64,
+    pub build_budget_bytes: u64,
+    pub codebook_budget_bytes: u64,
+    /// Actual independent remaining whole-workspace allowance after the
+    /// codebook/output/other-owner reservations, before choosing the buffer.
+    pub workspace_budget_bytes: usize,
+    pub codebook: ProducerCodebookLayouts,
+    pub workspace: ProducerWorkspaceLayouts,
+}
+pub fn native_ivf_resolved_policy_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+) -> contextdb_core::Result<NativeResolvedPolicy> {
+    unimplemented!("{UNBOUND}: DEFAULT resolved policy and independent actual budget inputs")
+}
+pub fn codebook_allocation_layout(
+    _dimensions: usize,
+    _active_lists: u32,
+    _training_counts: bool,
+) -> contextdb_core::Result<ProducerCodebookLayouts> {
+    unimplemented!("{UNBOUND}: producer-owned checked codebook allocation layout")
+}
+pub fn workspace_allocation_layout(
+    _inputs: NativePolicyInputs,
+) -> contextdb_core::Result<ProducerWorkspaceLayouts> {
+    unimplemented!("{UNBOUND}: producer-owned checked writer workspace allocation layout")
+}
+#[derive(Clone, Copy, Debug)]
+pub enum ConstructorAllocation {
+    Codebook { training_counts: bool },
+    WriterWorkspace,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum ConstructorEvent {
+    Debited(usize),
+    Allocated,
+    PhysicallyFreed,
+    Released(usize),
+}
+#[derive(Debug)]
+pub struct ConstructorAttempt {
+    pub outcome: contextdb_core::Result<()>,
+    pub events: [Option<ConstructorEvent>; 16],
+    pub event_count: usize,
+    pub retained_after_drop: usize,
+    pub overflow: bool,
+}
+/// Drives the real producer constructor through its existing native
+/// read/build or WriteScope::with_clustered_writer loan. Its original target
+/// owner has exactly available bytes; independently invoiced source frames
+/// remain with their real owners. This is not a trial allocation in DEFAULT
+/// resolution. Observe actual debit/allocation/physical-free/release boundaries
+/// and IvfConstructorObserverForTest; do not construct a fixture object.
+pub fn native_ivf_constructor_attempt_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+    _allocation: ConstructorAllocation,
+    _available: usize,
+) -> ConstructorAttempt {
+    unimplemented!("{UNBOUND}: real producer constructor debits and exact-boundary refusal")
+}
+
+/// Borrowed projections of NativeIvfSealEvent. Outer identity combines the
+/// admitted write-session identity with its actual outer-write object; an
+/// operation number alone is never treated as globally unique.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeSealOperation {
+    pub session: u64,
+    pub outer: usize,
+    pub operation: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeSealPage {
+    pub storage: u64,
+    pub partition: u64,
+    pub generation: u64,
+    pub kind: u8,
+    pub list: u32,
+    pub ordinal: u64,
+    pub run: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct NativeSealWindow {
+    pub offset: usize,
+    pub layout: std::alloc::Layout,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeSealObjectKind {
+    Scope,
+    SealWorkspace,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum NativeSealEvent<'a> {
+    CaptureBegan {
+        capture: u64,
+        attempted: u64,
+        delivered: u64,
+        producers_open: u64,
+        overflow: bool,
+        reentry: bool,
+    },
+    CaptureEnded {
+        capture: u64,
+        attempted: u64,
+        delivered: u64,
+        producers_open: u64,
+        overflow: bool,
+        reentry: bool,
+    },
+    MarkerInserted {
+        operation: NativeSealOperation,
+        key: NativeSealPage,
+        newly_inserted: bool,
+    },
+    MarkerRemoved {
+        operation: NativeSealOperation,
+        key: NativeSealPage,
+    },
+    PayloadWritten {
+        operation: NativeSealOperation,
+        key: NativeSealPage,
+    },
+    HeaderSealed {
+        operation: NativeSealOperation,
+        key: NativeSealPage,
+        header: &'a [u8; 192],
+        payload: &'a [u8; 3904],
+    },
+    PageOpened {
+        key: NativeSealPage,
+        header: &'a [u8; 192],
+        payload: &'a [u8; 3904],
+    },
+    OperationPrefixChecked {
+        operation: NativeSealOperation,
+        after_drain: bool,
+        empty: bool,
+    },
+    GlobalPendingChecked {
+        before_final_binding: bool,
+        empty: bool,
+    },
+    KindHandlesClosed {
+        operation: NativeSealOperation,
+        kind: u8,
+    },
+    FamilyFingerprintCaptured {
+        operation: NativeSealOperation,
+        kind: u8,
+        root: [u8; 32],
+    },
+    ScopeWritten {
+        operation: NativeSealOperation,
+        present: u16,
+        expected_roots: &'a [[u8; 32]; 16],
+    },
+    ConfigurationBound,
+    OuterCommitted {
+        actual_commit_lsn: u64,
+    },
+    OuterAborted,
+    ObjectAdmitted {
+        instance: u64,
+        kind: NativeSealObjectKind,
+        layout: std::alloc::Layout,
+        original_owner: usize,
+        adapter_owner: usize,
+        windows: Option<&'a [NativeSealWindow; 3]>,
+    },
+    ObjectReleased {
+        instance: u64,
+        kind: NativeSealObjectKind,
+        layout: std::alloc::Layout,
+        original_owner: usize,
+        adapter_owner: usize,
+    },
+    /// Every otherwise unselected producer event still counts as delivered;
+    /// a projection must not silently drop it from capture completeness.
+    Other,
+}
+/// Direct forwarding of the intended scoped NativeIvfSealObserver, including
+/// callbacks from actual executing threads. No producer log or page is retained.
+pub fn with_native_ivf_seal_observer_for_test<T>(
+    _observer: Arc<dyn for<'a> Fn(NativeSealEvent<'a>) + Send + Sync>,
+    _operation: impl FnOnce() -> T,
+) -> T {
+    unimplemented!("{UNBOUND}: borrowed native seal events and complete capture framing")
+}
+pub fn native_ivf_original_owner_for_test(_db: &Database) -> usize {
+    unimplemented!("{UNBOUND}: actual retained original native memory payer identity")
+}
+/// Control-only cases invoke the real always-aborting WriteScope driver with
+/// explicit checkpoint/distance callbacks and actual PageStore::begin,
+/// put_page/stage_build/publish_manifest, then WritePages::commit. The enclosing
+/// authoritative write ALWAYS aborts. Cases describe actual controls/payloads,
+/// never expected header values, counts, roots or a fixture sealer. The supplied
+/// cancellation is passed through the real checkpoint and distance callbacks;
+/// neither callback may be replaced by an always-successful function.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeSemanticCase {
+    CanonicalCrossing,
+    CanonicalContinuation,
+    NonconsecutiveListRecords,
+    SlotMetadataCrossing,
+    DirectoryBoundary,
+    DirectoryPresenceExtent,
+    VisibilityBoundary,
+    CodebookCoordinates,
+    AccumulatorBoundary,
+    ReservoirBoundary,
+    CatalogHeaderAndRun,
+    RetainedTail,
+    ListUsedBoundary,
+    ListLinksBoundary,
+    AllocatorBoundary,
+    SparseRowVersions,
+    SparseRowCopies,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeSemanticSetup {
+    pub dimensions: usize,
+    pub slots: u64,
+    pub lists: u32,
+    pub active_lists: u32,
+    pub samples: u64,
+    pub tail_head: u64,
+    pub tail_end: u64,
+    pub allocated_list_pages: u64,
+    pub retained_run: u64,
+    pub sparse_records: [Option<(u64, u64, u8)>; 3],
+}
+#[derive(Clone, Copy, Debug)]
+pub struct NativeSemanticDriveResult {
+    /// Actual final control-change operation and actual target page identities;
+    /// no expected counts/header bytes are supplied by the implementation.
+    pub final_operation: NativeSealOperation,
+    pub targets: [Option<NativeSealPage>; 3],
+}
+pub fn drive_aborting_native_ivf_semantic_case_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+    _case: NativeSemanticCase,
+    _setup: NativeSemanticSetup,
+    _cancellation: &contextdb_core::read_contract::OwnerReadCancellation,
+) -> contextdb_core::Result<NativeSemanticDriveResult> {
+    unimplemented!("{UNBOUND}: real abort-only native control/payload semantic boundary drive")
+}
+#[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Mirror the native fallible before-commit boundary names."
+)]
+pub enum NativeSealFailurePoint {
+    BeforeMarkerWrite,
+    BeforePayloadWrite,
+    BeforeHeaderSeal,
+    BeforeKindFingerprint,
+    BeforeScopeWrite,
+    BeforeConfigurationBind,
+    BeforeOuterCommit,
+}
+/// Returns whether the selected actual fallible before-boundary was reached.
+/// A successful commit is never changed into an error by a passive callback.
+pub fn with_native_ivf_seal_failure_for_test<T>(
+    _point: NativeSealFailurePoint,
+    _operation: impl FnOnce() -> T,
+) -> (T, bool) {
+    unimplemented!("{UNBOUND}: deterministic native precommit seal failure")
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeScopeRoots {
+    pub index_digest: [u8; 32],
+    pub tuple_digest: [u8; 32],
+    pub snapshot_lsn: u64,
+    pub table_generation: u64,
+    pub column_incarnation: u64,
+    pub frozen_frontier: u64,
+    pub frozen_source_identity: [u8; 32],
+    pub current_frontier: u64,
+    pub current_digest: [u8; 32],
+    pub current_entries: u64,
+    pub current_live_entries: u64,
+    pub expected_roots: [[u8; 32]; 16],
+    pub actual_roots: [[u8; 32]; 16],
+    pub present: u16,
+}
+/// Borrows the actual stored scope/control through the retained native read
+/// at the requested snapshot, with actual captured table fingerprints. Never
+/// reconstructs roots from historical write events or opens latest instead.
+pub fn native_ivf_scope_roots_at_snapshot_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+    _snapshot: contextdb_core::SnapshotId,
+) -> contextdb_core::Result<NativeScopeRoots> {
+    unimplemented!("{UNBOUND}: actual captured stored scope and native table-root inspection")
+}
+pub struct NativeSourceRecord<'a> {
+    pub key: &'a [u8],
+    pub encoded: &'a [u8],
+    pub live: bool,
+}
+/// Visits the real authenticated selected source at the SAME captured view;
+/// bytes are actual native keys/records, not re-encoded IVF/source summaries.
+pub fn visit_native_ivf_selected_source_for_test(
+    _db: &Database,
+    _index: &contextdb_core::VectorIndexRef,
+    _tuple: &contextdb_core::VectorPartitionKey,
+    _snapshot: contextdb_core::SnapshotId,
+    _visit: &mut dyn FnMut(NativeSourceRecord<'_>),
+) -> contextdb_core::Result<()> {
+    unimplemented!("{UNBOUND}: borrowed selected authoritative membership keys and encoded records")
+}
+
+/// Maps to FlipHeaderByte/FlipPayloadByte with the exact actual
+/// storage+kind+complete PageKey target. Expected authority stays unchanged.
+pub fn corrupt_native_ivf_page_for_test(
+    _db: &Database,
+    _target: NativeSealPage,
+    _payload: bool,
+    _offset: usize,
+    _xor_mask: u8,
+) -> contextdb_core::Result<()> {
+    unimplemented!("{UNBOUND}: exact native page identity/content corruption target")
+}
