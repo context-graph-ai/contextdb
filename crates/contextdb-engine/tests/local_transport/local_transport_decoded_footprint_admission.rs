@@ -287,37 +287,64 @@ fn a_cursor_page_whose_decoded_rows_exceed_the_memory_ceiling_is_refused() {
 
 #[test]
 fn a_response_frame_carrying_that_cursor_page_is_refused_before_the_page_is_decoded() {
-    let page_bytes = crafted_cursor_page_bytes(CRAFTED_ROWS, CRAFTED_COLUMNS);
-    let payload_length = page_bytes.len();
-    let frame = encode_message(&LocalResponse::CursorPage {
-        page: CursorPageResponse {
-            payload: owner_cursor_test_support::with_empty_observation(page_bytes),
-        },
-    })
-    .expect("the channel encodes a cursor-page response");
-    assert!(
-        frame.len() <= MAX_FRAME_BYTES,
-        "the crafted response must sit inside the wire ceiling to prove admission, observed {} bytes",
-        frame.len()
-    );
-
-    let decoded_footprint = u64::try_from(CRAFTED_ROWS * CRAFTED_COLUMNS * size_of::<Value>())
-        .expect("a decoded footprint fits an unsigned word");
-    let outcome = decode_message_exact::<LocalResponse>(&frame);
-    let error = match outcome {
-        Ok(_) => panic!(
-            "a {} byte response frame carrying a {payload_length} byte cursor page was admitted; \
-             the page decodes into at least {decoded_footprint} bytes of live values, past the \
-             {} byte memory ceiling",
-            frame.len(),
-            ReadLimits::SHIPPED_MEMORY
-        ),
-        Err(error) => error,
+    use contextdb_engine::local_transport::{
+        FrameBufferAllocator, FrameReader, FrameViolation, LocalInboundKind, LocalProtocolBoundary,
+        LocalResponseExpectation, PayloadViolation,
     };
+    use contextdb_engine::vector_read_memory::{
+        take_reader_budget_ledger_for_test, watch_reader_budget_ledger_for_test,
+    };
+    struct Reader(std::io::Cursor<Vec<u8>>);
+    impl FrameReader for Reader {
+        fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), LocalTransportError> {
+            std::io::Read::read_exact(&mut self.0, bytes)
+                .map_err(|_| LocalTransportError::Frame(FrameViolation::TruncatedPayload))
+        }
+    }
+    struct Allocator;
+    impl FrameBufferAllocator for Allocator {
+        fn allocate(&mut self, length: usize) -> Result<Vec<u8>, LocalTransportError> {
+            Ok(vec![0; length])
+        }
+    }
+    // Leave room for the real observation envelope inside the page-byte limit.
+    let columns = CRAFTED_COLUMNS - 64;
+    let page_bytes = crafted_cursor_page_bytes(CRAFTED_ROWS, columns);
+    let decoded_footprint = (CRAFTED_ROWS * columns * size_of::<Value>()) as u64;
+    assert!(decoded_footprint > ReadLimits::SHIPPED_MEMORY);
+    let payload = owner_cursor_test_support::with_empty_observation(page_bytes);
+    assert!(payload.len() as u64 <= ReadLimits::SHIPPED_CURSOR_PAGE_BYTES);
+    let response = encode_message(&LocalResponse::CursorPage {
+        page: CursorPageResponse { payload },
+    })
+    .expect("encode the valid oversized page response");
+    assert!(response.len() <= MAX_FRAME_BYTES);
+    let frame = super::wire_fixture_test_support::encode_payload_frame(&response)
+        .expect("frame the page response");
+    let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits::default());
+    let mut reader = Reader(std::io::Cursor::new(frame));
+    watch_reader_budget_ledger_for_test();
+    let outcome = boundary.receive_frame(
+        LocalInboundKind::Response(LocalResponseExpectation::CursorFetch),
+        &mut reader,
+        &mut Allocator,
+    );
+    let admissions = take_reader_budget_ledger_for_test();
     assert!(
-        refusal_is_typed(&error),
-        "a response frame carrying an oversized cursor page must be refused with a typed \
-         transport error, observed {error:?}"
+        matches!(
+            outcome,
+            Err(LocalTransportError::Payload(
+                PayloadViolation::MemoryCeilingExceeded {
+                    ceiling: ReadLimits::SHIPPED_MEMORY,
+                    required: None,
+                }
+            ))
+        ),
+        "oversized native rows must refuse at the production receive boundary: {outcome:?}"
+    );
+    super::wire_fixture_test_support::assert_native_refusal_within_ceiling(
+        &admissions,
+        ReadLimits::SHIPPED_MEMORY,
     );
 }
 

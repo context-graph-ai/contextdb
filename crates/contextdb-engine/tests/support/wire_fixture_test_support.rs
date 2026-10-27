@@ -227,3 +227,36 @@ pub fn engine_failure(
     )
     .expect("prepay the exact error document input")
 }
+
+// Parent ledger entries include every live child and original control debit.
+// Child entries describe the same forwarded charge and must not be added again.
+#[cfg(feature = "test-seams")]
+fn native_receive_peak(
+    admissions: &[contextdb_engine::memory_accounting::BudgetLedgerEntry],
+) -> u64 {
+    admissions
+        .iter()
+        .filter(|entry| entry.owner_identity == entry.parent_identity && entry.what != "release")
+        .map(|entry| entry.used_after as u64)
+        .max()
+        .filter(|bytes| *bytes > 0)
+        .expect("the real native decoder must admit original-parent working memory")
+}
+
+#[cfg(feature = "test-seams")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: used by local transport admission fixtures"
+)]
+pub fn assert_native_refusal_within_ceiling(
+    admissions: &[contextdb_engine::memory_accounting::BudgetLedgerEntry],
+    ceiling: u64,
+) {
+    // The caller asserts the exact typed refusal. Here every successful debit
+    // before that refusal, including its original controls, must fit the limit.
+    let peak = native_receive_peak(admissions);
+    assert!(
+        peak <= ceiling,
+        "native admission must refuse before crossing the declared ceiling: {peak} > {ceiling}"
+    );
+}
