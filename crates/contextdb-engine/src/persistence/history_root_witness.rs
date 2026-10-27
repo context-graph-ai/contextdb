@@ -1204,6 +1204,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::bool_assert_comparison,
+        reason = "The canonical-root assertion retains the explicit expected boolean value."
+    )]
     fn canonical_valid_root_mismatch_stays_disclosed_false() {
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
