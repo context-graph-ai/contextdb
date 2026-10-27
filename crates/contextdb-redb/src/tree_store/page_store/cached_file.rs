@@ -1355,6 +1355,22 @@ impl PagedCachedFile {
             // and copying (or has already been successfully flushed). Locals
             // retain the old payer and roll back the new payment on Err/unwind.
             let mut page = PageAllocation::zeroed_for_write(len, admitted_page_bytes(len))?;
+            #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+            crate::read_admission::record_dirty_page_allocation_for_test(
+                PageAllocation::layout(len)
+                    .expect("validated page layout")
+                    .0
+                    .size(),
+                page.is_native(),
+            );
+            #[cfg(all(feature = "test-seams", not(feature = "contextdb-internal")))]
+            crate::read_admission::record_dirty_page_allocation_for_test(
+                PageAllocation::layout(len)
+                    .expect("validated page layout")
+                    .0
+                    .size(),
+                false,
+            );
             if let Some(source) = &existing {
                 PageAllocation::get_mut(&mut page)
                     .unwrap()

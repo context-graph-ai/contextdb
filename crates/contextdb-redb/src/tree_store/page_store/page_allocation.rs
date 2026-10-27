@@ -351,6 +351,8 @@ impl PageAllocation {
         })?;
         // The unique, unpublished allocation was paid by the native producer.
         unsafe { page.block.as_mut() }.len_and_origin |= !(isize::MAX as usize);
+        #[cfg(feature = "test-seams")]
+        crate::read_admission::record_native_page_allocation_for_test(layout.size());
         Ok(page)
     }
     #[cfg(feature = "contextdb-internal")]

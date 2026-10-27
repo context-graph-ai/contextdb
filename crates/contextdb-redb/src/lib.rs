@@ -225,3 +225,7 @@ pub use native_storage_admission::observe_pending_names_for_test;
 
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 pub use tree_store::CachePressureFixtureForTest;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use read_admission::{PageAllocationWorkForTest, observe_page_allocations_for_test};

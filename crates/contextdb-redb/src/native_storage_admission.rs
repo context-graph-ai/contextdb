@@ -1291,3 +1291,18 @@ impl NativeStorageCredit {
         self.receipt.as_ptr() as usize
     }
 }
+
+/// Borrow the current original source's concrete receipt layout without admission.
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub(crate) fn receipt_overhead_for_test() -> usize {
+    NATIVE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|scope| {
+                scope
+                    .allocation_funding
+                    .and_then(|inspect| unsafe { inspect(scope.owner.receipt) })
+            })
+            .map_or(0, |(_, bytes)| bytes)
+    })
+}

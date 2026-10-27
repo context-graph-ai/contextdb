@@ -1189,3 +1189,14 @@ keep their original payment until actual physical destruction; retirement does
 not assume those pages were freed. The next allocation remains admitted by its
 real native source. Ordinary data writes retain their existing independent
 dirty funding and do not evict disjoint clean serving pages.
+
+The independent test-seams physical-construction observation is imported from
+b503c4ae/2479b9bb for accepted RED30. `read_admission.rs` records fresh dirty and
+native cache-read constructions independently of admission callbacks, using the
+actual backing layout and the original source inspector's receipt overhead.
+`cached_file.rs` records only new dirty constructions; `page_allocation.rs`
+records actual native construction after allocation. `native_storage_admission.rs`
+borrows the original receipt layout, and `lib.rs` exposes the scoped observation
+only with test-seams. Reuse and duplicate admissions cannot increment the count.
+The source hooks retain the accepted observer logic while using the maintained
+writer's `zeroed_for_write` construction point.

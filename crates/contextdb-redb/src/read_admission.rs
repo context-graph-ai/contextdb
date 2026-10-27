@@ -698,3 +698,98 @@ impl Drop for ReadCacheRequest {
 pub(crate) fn cache_request() -> u64 {
     CACHE_REQUEST.with(std::cell::Cell::get)
 }
+
+/// Physical page work observed independently of admission callbacks.
+/// Original-source native totals include their dirty pages and are priced once.
+#[cfg(feature = "test-seams")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageAllocationWorkForTest {
+    pub fresh_dirty_pages: u64,
+    pub fresh_dirty_page_bytes: usize,
+    pub native_pages: u64,
+    pub native_page_bytes: usize,
+    pub other_native_pages: u64,
+    pub other_native_page_bytes: usize,
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static PAGE_ALLOCATION_WORK: std::cell::Cell<Option<PageAllocationWorkForTest>> = const { std::cell::Cell::new(None) };
+}
+
+/// Observe successful physical page constructions on this operation's thread.
+/// Reusing backing and admitting memory do not increment this observation.
+#[cfg(feature = "test-seams")]
+pub fn observe_page_allocations_for_test<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, PageAllocationWorkForTest) {
+    struct Restore(Option<PageAllocationWorkForTest>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAGE_ALLOCATION_WORK.with(|slot| {
+                let nested = slot.get().unwrap_or_default();
+                slot.set(self.0.map(|parent| PageAllocationWorkForTest {
+                    fresh_dirty_pages: parent.fresh_dirty_pages + nested.fresh_dirty_pages,
+                    fresh_dirty_page_bytes: parent.fresh_dirty_page_bytes
+                        + nested.fresh_dirty_page_bytes,
+                    native_pages: parent.native_pages + nested.native_pages,
+                    native_page_bytes: parent.native_page_bytes + nested.native_page_bytes,
+                    other_native_pages: parent.other_native_pages + nested.other_native_pages,
+                    other_native_page_bytes: parent.other_native_page_bytes
+                        + nested.other_native_page_bytes,
+                }));
+            });
+        }
+    }
+    let restore = Restore(
+        PAGE_ALLOCATION_WORK.with(|slot| slot.replace(Some(PageAllocationWorkForTest::default()))),
+    );
+    let answer = operation();
+    let count = PAGE_ALLOCATION_WORK.with(|slot| slot.get().unwrap());
+    drop(restore);
+    (answer, count)
+}
+
+#[cfg(feature = "test-seams")]
+fn page_invoice_bytes_for_test(backing_bytes: usize) -> usize {
+    #[cfg(feature = "contextdb-internal")]
+    let receipt_bytes = crate::native_storage_admission::receipt_overhead_for_test();
+    #[cfg(not(feature = "contextdb-internal"))]
+    let receipt_bytes = 0;
+    backing_bytes + receipt_bytes
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn record_dirty_page_allocation_for_test(backing_bytes: usize, native: bool) {
+    PAGE_ALLOCATION_WORK.with(|slot| {
+        if let Some(mut work) = slot.get() {
+            work.fresh_dirty_pages += 1;
+            work.fresh_dirty_page_bytes += if native {
+                page_invoice_bytes_for_test(backing_bytes)
+            } else {
+                backing_bytes
+            };
+            slot.set(Some(work));
+        }
+    });
+}
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub(crate) fn record_native_page_allocation_for_test(backing_bytes: usize) {
+    PAGE_ALLOCATION_WORK.with(|slot| {
+        if let Some(mut work) = slot.get() {
+            let invoice_bytes = page_invoice_bytes_for_test(backing_bytes);
+            if invoice_bytes > backing_bytes {
+                // Only the installed original source can name its concrete
+                // separately allocated receipt. Other reader pages remain
+                // covered by their existing reader/work observations.
+                work.native_pages += 1;
+                work.native_page_bytes += invoice_bytes;
+            } else {
+                work.other_native_pages += 1;
+                work.other_native_page_bytes += backing_bytes;
+            }
+            slot.set(Some(work));
+        }
+    });
+}
