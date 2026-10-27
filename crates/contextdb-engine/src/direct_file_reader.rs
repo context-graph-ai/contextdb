@@ -579,7 +579,7 @@ impl std::ops::Deref for DirectMetadataResponse {
 
 #[derive(Debug)]
 pub struct DirectCursorPage {
-    pub page: CursorPage,
+    pub(crate) page: CursorPage,
     pub(crate) observation: crate::executor::CursorObservation,
     pub canonical_bytes: crate::read_contract::EncodedReadBytes,
     pub snapshot: DirectSnapshot,
