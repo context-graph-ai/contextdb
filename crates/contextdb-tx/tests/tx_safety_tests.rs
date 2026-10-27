@@ -222,6 +222,10 @@ fn tx_04_failed_apply_rewinds_lsn_allocator() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn tx_05_commit_removes_active_transaction_before_apply() {
     let store = BlockingStore {
         next_row_id: AtomicU64::new(1),
@@ -258,6 +262,10 @@ fn tx_05_commit_removes_active_transaction_before_apply() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn tx_06_failed_ddl_lsn_allocation_does_not_advance_current_lsn() {
     let store = FailingStore {
         next_row_id: AtomicU64::new(1),
@@ -283,6 +291,10 @@ fn tx_06_failed_ddl_lsn_allocation_does_not_advance_current_lsn() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn tx_07_prepare_runs_after_transaction_is_frozen() {
     let store = FailingStore {
         next_row_id: AtomicU64::new(1),
@@ -341,6 +353,10 @@ fn tx_07_prepare_runs_after_transaction_is_frozen() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn tx_08_prepare_apply_and_return_see_canonical_final_rows() {
     let store = FailingStore {
         next_row_id: AtomicU64::new(1),
@@ -401,6 +417,10 @@ fn tx_08_prepare_apply_and_return_see_canonical_final_rows() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn tx_09_after_apply_publication_precedes_commit_visibility() {
     let store = FailingStore {
         next_row_id: AtomicU64::new(1),

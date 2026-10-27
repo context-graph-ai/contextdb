@@ -158,6 +158,10 @@ fn counts(read: EngineRead<'_>) -> WriteSetCounts {
     }
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn conditional_removal_funds_seven_inverses_and_rolls_back_at_every_byte_limit() {
     for mode in [EnginePreparation::Ordinary, EnginePreparation::Eager] {
         let funding = Arc::new(Funding::new());
@@ -338,6 +342,10 @@ fn custody_row(tx: TxId, text: &str) -> contextdb_core::VersionedRow {
         )]),
     }
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn publish_custody_row(
     guard: &mut contextdb_tx::manager::EngineGuard<'_>,
     funding: &Arc<Funding>,
@@ -358,6 +366,10 @@ fn publish_custody_row(
     guard.publish(prepared);
     Ok(())
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_custody_body(rows: &CanonicalStatementRows, text: &str) {
     rows.with_row(RowId(7), |row| {
         assert_eq!(
@@ -370,6 +382,10 @@ fn assert_custody_body(rows: &CanonicalStatementRows, text: &str) {
 }
 // Captured rows must keep their real original invoice through terminal rollback.
 // A dropped-root mutant passes the pre-existing Aux-only rollback test.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sealed_custody_survives_mutation(operation: &str, directory_first: bool) {
     let funding = Arc::new(Funding::new());
     let reader = Arc::new(Funding::new());
@@ -494,6 +510,10 @@ fn sealed_directory_outlives_table_descriptors() {
     sealed_custody_survives_mutation("replace", false);
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sealed_capture_admission_refusal_preserves_canonical_source_and_payers() {
     let funding = Arc::new(Funding::new());
     let reader = Arc::new(Funding::new());
@@ -540,6 +560,10 @@ fn sealed_capture_admission_refusal_preserves_canonical_source_and_payers() {
 
 // Directory/table capture metadata must stay fixed as selected row bodies grow.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sealed_directory_descriptor_charge_is_fixed_across_row_doublings() {
     let mut charges = Vec::new();
     for n in [1usize, 2, 4] {
