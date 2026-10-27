@@ -200,6 +200,10 @@ fn each_owner_keeps_its_own_visibility_interval() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_exact_row_lookup_visits_only_that_owners_copy() {
     let triad = triad();
     let store = GraphStore::new();
@@ -252,6 +256,10 @@ fn an_exact_row_lookup_visits_only_that_owners_copy() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_full_edge_visit_reports_the_owner_of_every_copy() {
     let triad = triad();
     let store = GraphStore::new();
@@ -492,6 +500,10 @@ impl contextdb_graph::GraphCursor for WitnessCursor {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_owned_traversal_row(route: TraversalRoute) {
     use contextdb_core::read_memory::ReadCredit;
     use contextdb_core::{Error, SnapshotId};
@@ -730,6 +742,10 @@ fn staged_owner_authorization_precedes_logical_or_physical_single_hop_binding() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn committed_owner_entrypoint_and_legacy_callback_keep_the_selected_binding_mode() {
     use contextdb_core::{Error, SnapshotId};
     let triad = triad();
@@ -1014,6 +1030,10 @@ fn encoded_owner_key(owner: &RowEdgeOwner) -> Vec<u8> {
 // The private durable key is the ordering authority. A lexical table-name
 // comparator puts aa before z and selects different neighbor properties.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn different_length_owner_names_have_one_durable_order_in_memory_and_source() {
     use contextdb_core::SnapshotId;
     let triad = triad();
@@ -1115,6 +1135,10 @@ fn different_length_owner_names_have_one_durable_order_in_memory_and_source() {
 // Committed and staged witnesses must be merged before last-triad coalescing;
 // separately sorted A,B then A,B must not report the two triads twice.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn mixed_committed_and_staged_streams_coalesce_only_after_canonical_merge() {
     use contextdb_core::read_memory::ReadCredit;
     use contextdb_core::{Error, SnapshotId};
@@ -1331,6 +1355,10 @@ fn mixed_committed_and_staged_streams_coalesce_only_after_canonical_merge() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn mixed_lane_lookaheads_release_on_refusal_and_cursor_drop() {
     use contextdb_core::read_memory::ReadCredit;
     use contextdb_core::{Error, SnapshotId};
