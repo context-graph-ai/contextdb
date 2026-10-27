@@ -54,7 +54,10 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
     }
 }
 
-#[allow(unused_parens)] // Preserve the existing root checks exactly as authored.
+#[expect(
+    unused_parens,
+    reason = "KEEP-GUARD: Preserve explicit grouping of paired transaction and physical-root comparisons in reader assertions."
+)]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
