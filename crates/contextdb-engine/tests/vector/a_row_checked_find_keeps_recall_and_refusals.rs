@@ -428,6 +428,10 @@ fn assert_one_exact_partition(result: &QueryResult, label: &str, reason: &str) {
 /// insertion order. EXACT's receipt is `exact_requested`. AUTO's receipt
 /// `statement_exhaustive_cheaper_than_walk` records its actual cost decision.
 #[test]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "The test pins build-profile constants with explicit runtime assertions."
+)]
 fn indexed_flat_row_check_exhaustion_before_later_matches_is_refused() {
     assert!(EXHAUSTION_ALLOWANCE >= 1);
     assert!(EXHAUSTION_NONMATCHES + EXHAUSTION_MATCHES > EXHAUSTION_ALLOWANCE);

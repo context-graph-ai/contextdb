@@ -4,6 +4,10 @@
 //! .cargo/config.toml or CARGO_PROFILE_TEST_* overrides; debug_assertions is the
 //! only compiled-in check. Artifact receipts and the timed journey bind the build.
 #[test]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "The test pins build-profile constants with explicit runtime assertions."
+)]
 fn storage_journeys_keep_the_measured_test_profile() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest: toml::Value = toml::from_str(
