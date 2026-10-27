@@ -3438,6 +3438,10 @@ impl ReaderSnapshotRegistryLock {
         runtime_root: &Path,
         identity: (u64, u64),
     ) -> std::io::Result<Self> {
+        #[cfg(any(test, feature = "test-seams"))]
+        read_persistence_test_scaffold::count_registration_attempt_for_test(identity, |counts| {
+            counts.opens += 1;
+        });
         let (file, path) = Self::create_descriptor(runtime_root, identity)?;
         #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
@@ -3461,6 +3465,10 @@ impl ReaderSnapshotRegistryLock {
             locked: false,
         };
         lock.try_lock_exclusive()?;
+        #[cfg(any(test, feature = "test-seams"))]
+        read_persistence_test_scaffold::count_registration_attempt_for_test(identity, |counts| {
+            counts.l0_takes += 1;
+        });
         Ok(lock)
     }
 
