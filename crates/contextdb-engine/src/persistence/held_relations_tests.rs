@@ -632,12 +632,33 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
         if step == HoldStep::Reserve {
             faults.push(HoldFault::GlobalAllocation);
         }
-        for fault in faults {
-            for &skip in &skips {
+        for &skip in &skips {
+            #[cfg(feature = "test-seams")]
+            let ordinary_remaining = {
+                // Release the error control before a successful retry changes
+                // its retained state; the matrix below still verifies retry.
+                let (_root, control, control_tx, _) = many_table_commit(COMMIT_TABLES);
+                let accounting = control.__accountant_handle_for_test();
+                let release = control.last_handle_release_for_test();
+                inject_hold_fault(step, HoldFault::Error, skip);
+                assert!(
+                    control.commit(control_tx).is_err(),
+                    "ordinary control refuses"
+                );
+                assert!(!clear_hold_fault(), "ordinary control injection fired");
+                drop(control);
+                release
+                    .wait_for_release_for_test()
+                    .expect("ordinary control release");
+                accounting.usage().used
+            };
+            for &fault in &faults {
                 let label = format!("{step:?} {fault:?} arrival {}", skip + 1);
                 let (_root, db, tx, tables) = many_table_commit(COMMIT_TABLES);
                 let accountant = db.__accountant_handle_for_test();
                 let before = accountant.usage().used;
+                #[cfg(feature = "test-seams")]
+                let release = db.last_handle_release_for_test();
                 staging_witness::arm(0);
                 inject_hold_fault(step, fault, skip);
                 let outcome =
@@ -653,16 +674,33 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
                     0,
                     "{label}: no unfunded registry growth"
                 );
+                #[cfg(not(feature = "test-seams"))]
                 assert!(
                     accountant.usage().used <= before,
                     "{label}: the failed commit holds nothing more than before it ran"
                 );
                 match (fault, outcome) {
                     (HoldFault::Panic, Err(_)) => {
-                        // A panic inside commit may leave the database's own
-                        // locks poisoned; this test only proves the holder
-                        // gave back what it took.
-                        drop(accountant);
+                        // Cached source invoices live until the physical store
+                        // is released. Compare with the same ordinary failure,
+                        // rather than demanding an empty cache during unwind.
+                        #[cfg(feature = "test-seams")]
+                        {
+                            drop(db);
+                            release
+                                .wait_for_release_for_test()
+                                .expect("physical store release");
+                            let remaining = accountant.usage().used;
+                            assert_eq!(
+                                remaining, ordinary_remaining,
+                                "{label}: panic leaves no excess over ordinary failure after release"
+                            );
+                            assert!(
+                                remaining <= before,
+                                "{label}: no residual excess after release"
+                            );
+                        }
+                        #[cfg(not(feature = "test-seams"))]
                         std::mem::forget(db);
                         continue;
                     }
@@ -693,8 +731,19 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
                     &std::collections::HashMap::new(),
                 )
                 .unwrap_or_else(|error| panic!("{label}: the store keeps committing: {error}"));
-                drop(accountant);
                 db.close().expect("close");
+                #[cfg(feature = "test-seams")]
+                {
+                    release
+                        .wait_for_release_for_test()
+                        .expect("physical store release");
+                    let remaining = accountant.usage().used;
+                    assert!(
+                        remaining <= before,
+                        "{label}: no residual excess after release"
+                    );
+                }
+                drop(accountant);
             }
         }
     }
