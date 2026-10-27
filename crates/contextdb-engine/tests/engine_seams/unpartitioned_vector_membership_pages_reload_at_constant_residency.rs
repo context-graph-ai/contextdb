@@ -92,6 +92,10 @@ fn membership_parent_equation(reader: &statement::Observation, inline: u64, pare
     assert_eq!(reader.parent_funding_mismatches, 0);
 }
 
+#[expect(
+    clippy::manual_contains,
+    reason = "The bounded membership assertion spells out the equality check for each child."
+)]
 fn membership_retained_and_final_free(
     db: &contextdb_engine::Database,
     window: Window,
@@ -565,6 +569,10 @@ fn displace_membership_pages(db: &contextdb_engine::Database) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn unpartitioned_vector_membership_pages_reload_at_constant_residency() {
     if isolated_test(
         module_path!(),

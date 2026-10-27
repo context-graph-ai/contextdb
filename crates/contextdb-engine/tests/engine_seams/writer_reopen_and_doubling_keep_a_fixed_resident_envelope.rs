@@ -755,6 +755,10 @@ fn measure_writer_copy<T>(
 }
 #[test]
 #[allow(clippy::int_plus_one)] // Preserve the existing test expression and its assertion contract.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_copy_operations_keep_fixed_work_with_wide_unrelated_schemas() {
     if let Ok(width) = std::env::var(COPY_SCHEMA_WIDTH) {
         let width: usize = width.parse().unwrap();

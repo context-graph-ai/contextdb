@@ -7,6 +7,10 @@ use contextdb_vector::auto_planning_test_seams::observe;
 use std::collections::HashMap;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for total in [63_i64, 64, 65] {

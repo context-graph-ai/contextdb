@@ -49,6 +49,10 @@ fn survivors(db: &contextdb_engine::Database, old: contextdb_core::SnapshotId, i
     );
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn version_pruning_and_compaction_resume_finite_safe_batches() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();

@@ -32,6 +32,10 @@ impl HnswBuildObserver for BuildCounter {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     if let Some(path) = std::env::var_os(CHILD_PATH) {

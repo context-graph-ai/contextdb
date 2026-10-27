@@ -16,6 +16,10 @@ use std::{
 use uuid::Uuid;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writable_open_never_touches_history_families() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let mut measurements = Vec::new();

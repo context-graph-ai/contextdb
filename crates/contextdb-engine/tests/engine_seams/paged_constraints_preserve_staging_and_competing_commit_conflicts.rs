@@ -8,6 +8,10 @@ use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::collections::HashMap;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let params = HashMap::new();

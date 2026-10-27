@@ -17,6 +17,10 @@ const CHILD_PATH: &str = "CONTEXTDB_ATOMIC_CRASH_CHILD_PATH";
 const CHILD_POINT: &str = "CONTEXTDB_ATOMIC_CRASH_CHILD_POINT";
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let params = HashMap::new();

@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn graph_delete_seeks_only_its_edge_identity() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let source = Uuid::from_u128(1);

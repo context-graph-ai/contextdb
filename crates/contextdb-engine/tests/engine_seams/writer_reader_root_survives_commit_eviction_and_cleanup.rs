@@ -55,6 +55,10 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
 }
 
 #[allow(unused_parens)] // Preserve the existing root checks exactly as authored.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reader_at_boundary(boundary: CommitBoundary) {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let directory = tempfile::tempdir().unwrap();

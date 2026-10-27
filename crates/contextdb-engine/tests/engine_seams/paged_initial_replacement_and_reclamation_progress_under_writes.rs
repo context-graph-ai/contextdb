@@ -19,6 +19,10 @@ fn all_searches(db: &contextdb_engine::Database, ids: impl IntoIterator<Item = u
         );
     }
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded_cycle(
     db: &contextdb_engine::Database,
     workspace: usize,
@@ -56,6 +60,10 @@ fn bounded_cycle(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     if maintenance_crash_child() {
         return;
@@ -519,6 +527,10 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
 
 const MAINTENANCE_CHILD_PATH: &str = "CONTEXTDB_CURRENT_MAINTENANCE_CRASH_PATH";
 const MAINTENANCE_CHILD_CUT: &str = "CONTEXTDB_CURRENT_MAINTENANCE_CRASH_CUT";
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn maintenance_crash_child() -> bool {
     use std::io::{Read, Write};
     let Some(path) = std::env::var_os(MAINTENANCE_CHILD_PATH) else {
@@ -587,6 +599,10 @@ fn maintenance_crash_child() -> bool {
     true
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn current_only_maintenance_crash_cuts() {
     use std::{
         io::BufRead,
