@@ -314,10 +314,9 @@ fn an_answer_outside_the_read_surface_arrives_named_rather_than_lost() {
     );
 }
 
-/// An engine answer is admitted by its length against the ceiling the caller
-/// declared, before the buffer that would hold it exists. A caller that asked
-/// to be kept inside a small budget is not handed an unbounded decode because
-/// the thing being decoded happens to be an error.
+/// An engine answer's encoded input coexists with its decoded document and
+/// native decoder controls. The declared ceiling covers that complete working
+/// set; errors do not bypass receive admission.
 #[test]
 fn an_engine_answer_is_admitted_against_the_ceiling_the_caller_declared() {
     let long = Error::Other("w".repeat(4_096).into());
@@ -329,30 +328,47 @@ fn an_engine_answer_is_admitted_against_the_ceiling_the_caller_declared() {
         .to_vec();
     framed.extend_from_slice(&bytes);
 
-    let roomy = boundary();
-    let mut reader = LiteralFrameReader::new(&bytes);
-    let mut allocator = PlainAllocator;
-    roomy
-        .receive_frame(
-            LocalInboundKind::Response(LocalResponseExpectation::Custom),
-            &mut reader,
-            &mut allocator,
-        )
-        .expect("a declared ceiling with room for the answer admits it");
+    let receive = |memory| {
+        let roomy = LocalProtocolBoundary::with_effective_limits(ReadLimits {
+            memory,
+            ..fixture_limits()
+        });
+        let mut reader = LiteralFrameReader::new(&bytes);
+        roomy
+            .receive_frame(
+                LocalInboundKind::Response(LocalResponseExpectation::Custom),
+                &mut reader,
+                &mut PlainAllocator,
+            )
+            .expect("the complete admitted receive footprint fits its declared ceiling");
+    };
+    let memory = super::wire_fixture_test_support::measured_receive_memory(&receive);
+    receive(memory);
+    assert!(
+        memory > bytes.len() as u64,
+        "encoded input alone is not the native decoder's full working set"
+    );
 
     let mut narrow = fixture_limits();
     narrow.memory = 64;
     let cramped = LocalProtocolBoundary::with_effective_limits(narrow);
     let mut reader = LiteralFrameReader::new(&bytes);
     let mut allocator = PlainAllocator;
+    let outcome = cramped.receive_frame(
+        LocalInboundKind::Response(LocalResponseExpectation::Custom),
+        &mut reader,
+        &mut allocator,
+    );
     assert!(
-        cramped
-            .receive_frame(
-                LocalInboundKind::Response(LocalResponseExpectation::Custom),
-                &mut reader,
-                &mut allocator,
-            )
-            .is_err(),
-        "an answer larger than the declared ceiling is refused before it is held",
+        matches!(
+            outcome,
+            Err(LocalTransportError::Payload(
+                contextdb_engine::local_transport::PayloadViolation::MemoryCeilingExceeded {
+                    ceiling: 64,
+                    required: None,
+                }
+            ))
+        ),
+        "an over-budget engine answer keeps its typed refusal: {outcome:?}"
     );
 }
