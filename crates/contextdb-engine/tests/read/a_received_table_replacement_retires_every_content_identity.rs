@@ -86,6 +86,10 @@ fn insert_link(database: &Database, id: u128, source: u128, target: u128) {
 
 /// Derive the wire provenance the authoring store attaches to a schema-only
 /// unit and install it through the authenticated received-schema door.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn received(author: &Database, changes: &ChangeSet) -> Vec<WireDdlProvenance> {
     static AUTHOR: std::sync::OnceLock<contextdb_engine::identity::FabricIdentity> =
         std::sync::OnceLock::new();
@@ -106,6 +110,10 @@ fn received(author: &Database, changes: &ChangeSet) -> Vec<WireDdlProvenance> {
     .expect("the authoring store produces canonical DDL provenance for this schema unit")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply_received(
     receiver: &Database,
     changes: ChangeSet,

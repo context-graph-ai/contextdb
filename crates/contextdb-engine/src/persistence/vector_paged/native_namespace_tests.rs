@@ -27,6 +27,13 @@ fn fixture() -> (
     };
     (root, persistence, partition, declaration)
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn set_next(persistence: &RedbPersistence, next: u64) {
     persistence
         .with_db(|db| {
@@ -40,6 +47,13 @@ fn set_next(persistence: &RedbPersistence, next: u64) {
         })
         .unwrap();
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn next(persistence: &RedbPersistence) -> u64 {
     persistence
         .with_db(|db| {
@@ -217,6 +231,13 @@ fn resident_export_cannot_cross_native_namespace_or_sql_integer_range() {
     assert_eq!(next(&persistence), 3);
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn corrupt_catalog(persistence: &RedbPersistence, partition: &VectorPartitionRef) {
     let key = RedbPersistence::vector_partition_catalog_key_from_parts(
         &partition.index,

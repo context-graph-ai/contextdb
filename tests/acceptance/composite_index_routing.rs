@@ -247,6 +247,10 @@ fn acceptance_first_composite_index_explain_walkthrough() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn acceptance_degenerate_in_queries_graceful() {
     let db = Database::open_memory();
     db.execute(

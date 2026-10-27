@@ -179,6 +179,10 @@ fn drive_maintenance(db: &Database, until: impl Fn(&Database) -> bool, what: &st
 /// Every Context saved as a base, a sealed change on top of it, and then a
 /// live tail committed after the change. `extra_tail` more rows go into the
 /// last seen Context's tail, enough that maintenance has work there.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn seed(db: &Database, extra_tail: usize) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
@@ -334,6 +338,10 @@ fn every_context() -> Vec<usize> {
 
 /// Ask one route every question and record what does not hold, so a failure
 /// shows every cell at once.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn check_route(
     route: &str,
     store: &VectorStore,
@@ -492,6 +500,10 @@ fn check_route(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn one_search_opens_every_layer_of_every_context_on_the_owner_route() {
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
     let owner =
@@ -521,6 +533,10 @@ fn one_search_opens_every_layer_of_every_context_on_the_owner_route() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn one_search_opens_every_layer_of_every_context_on_the_file_route() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -586,6 +602,10 @@ fn one_search_opens_every_layer_of_every_context_on_the_file_route() {
 /// comparison gave before any of it, from one search, with nothing committed
 /// after its snapshot.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_generation_published_after_a_read_pinned_its_snapshot_changes_nothing_it_answers() {
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
     let owner = Arc::new(

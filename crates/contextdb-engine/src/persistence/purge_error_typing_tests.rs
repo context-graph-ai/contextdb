@@ -20,6 +20,13 @@ fn writer() -> (tempfile::TempDir, RedbPersistence) {
     (directory, persistence)
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn write_marker(persistence: &RedbPersistence, bytes: &[u8]) {
     persistence
         .with_db(|db| {
@@ -38,6 +45,13 @@ fn write_marker(persistence: &RedbPersistence, bytes: &[u8]) {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn malformed_retention_deferred_edge_count_reports_typed_store_corruption() {
     let (_directory, persistence) = writer();
     let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(

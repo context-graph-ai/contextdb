@@ -3725,6 +3725,10 @@ mod admitted_reader_tests {
             limit,
         })
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reader(budget: &Arc<Counted>) -> Result<ImageMemoryHandle> {
         ImageMemory::admitted_reader_for(
             crate::memory_accounting::AccountantHandle::standalone(None, true)?,

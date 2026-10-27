@@ -140,6 +140,13 @@ fn assert_query_breadth(db: &Database, name: &str, breadth: usize) {
 }
 // Root equality detects even a delete/reinsert of identical logical values.
 // All selected families are established names in the frozen storage source.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn physical_roots(db: &Database) -> BTreeMap<String, Option<Option<[u8; 32]>>> {
     let Some(persistence) = &db.persistence else {
         return BTreeMap::new();
@@ -183,6 +190,13 @@ fn assert_binding_unchanged(
 // Address every immutable authored row occurrence through the same source
 // lookup the production history exporter uses. Scalar values remain comparable
 // across F32/SQ8 physical representations; identities are compared on one store.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn authored_rows(db: &Database) -> Vec<(u64, u64, u64, serde_json::Value)> {
     let memory = db.declared_reader_memory().unwrap();
     let decode = crate::read_image_memory::ImageMemory::operation_reader(
@@ -218,6 +232,13 @@ fn authored_rows(db: &Database) -> Vec<(u64, u64, u64, serde_json::Value)> {
         })
         .collect()
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn declared_identity(db: &Database) -> Option<crate::direct_file_reader::DirectTypedImageDigest> {
     db.persistence.as_ref().map(|p| {
         p.with_db(|store| {
@@ -228,6 +249,13 @@ fn declared_identity(db: &Database) -> Option<crate::direct_file_reader::DirectT
         .unwrap()
     })
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_frontier(db: &Database) {
     if let Some(p) = &db.persistence {
         p.with_db(|store| {
@@ -937,6 +965,13 @@ async fn authenticated_pull_preserves_the_same_authored_history_through_ef_searc
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_private_vector_and_history_images_start_no_worker_on_prepare_rollback_or_commit() {
     for file in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -1052,6 +1087,13 @@ fn maintenance_start_probe_counts_only_the_calling_thread() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_history_policy_alter_starts_no_worker_and_preserves_rows_on_rollback() {
     for file in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -1216,6 +1258,13 @@ impl AuthenticatedPull {
 }
 
 #[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn archived_body_count(db: &Database) -> u64 {
     let Some(persistence) = &db.persistence else {
         return 0;
@@ -1348,6 +1397,13 @@ async fn received_metadata_only_alters_archive_and_rewrite_no_row_population() {
 // Every authored row occurrence of `table`, addressed through the history
 // exporter's own lookup: (row id, creating transaction, LSN, scalar values).
 #[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn authored_images(
     db: &Database,
     table_name: &str,

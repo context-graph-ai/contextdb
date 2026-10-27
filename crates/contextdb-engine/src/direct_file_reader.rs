@@ -649,6 +649,13 @@ impl DirectCursorPage {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn try_clone_page_for_test(
         &self,
         owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -668,6 +675,13 @@ impl DirectCursorPage {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn into_public_page_for_test(
         self,
     ) -> contextdb_core::Result<contextdb_core::read_contract::CursorPage> {
@@ -682,6 +696,13 @@ impl DirectCursorPage {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub fn encode_page_for_test(
@@ -2526,6 +2547,13 @@ pub mod test_seams {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn hold_reader_memory_leaving_for_test(
         reader: &DirectFileReader,
         room: usize,
@@ -2702,6 +2730,13 @@ pub mod test_seams {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub fn owned_image_for_test(

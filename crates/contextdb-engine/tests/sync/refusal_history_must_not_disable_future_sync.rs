@@ -180,6 +180,10 @@ impl ClientTransport for RefusalHistoryTransport {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn current_authored_unit(db: &Database, identity: &FabricIdentity) -> (Lsn, [u8; 32]) {
     let history = db
         .changes_since(Lsn(0))

@@ -160,6 +160,10 @@ fn create_scoped_replace_targets(db: &Database) {
     .expect("create scoped replace_markers");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_target_in_tx(
     db: &Database,
     tx: contextdb_core::types::TxId,
@@ -182,6 +186,10 @@ fn insert_target_in_tx(
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_scoped_target_in_tx(
     db: &Database,
     tx: contextdb_core::types::TxId,
@@ -274,6 +282,10 @@ fn trigger_replace_round_logged(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn replace_round_inner(
     db: &Database,
     group: Uuid,
@@ -1205,6 +1217,10 @@ fn sr_09_reopen_after_race_winner_survives() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sr_10_trigger_callback_writes_during_race() {
     // REGRESSION GUARD: callback-initiated replacements obey the same no-NotFound contract.
     let (_dir, _path, db, group, bystander) = setup_standard_file("sr_10.db");

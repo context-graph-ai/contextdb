@@ -1781,6 +1781,13 @@ impl Database {
     /// and global generation/page counts, including orphaned and hashed pages.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __durable_vector_storage_inventory_for_test(
         &self,
         partition: &VectorPartitionRef,

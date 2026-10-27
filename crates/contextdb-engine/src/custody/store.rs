@@ -610,6 +610,13 @@ pub(crate) fn admission_probe(_held: usize) {
 /// Measurement only: one transient durable probe of `bytes` stored at `key`
 /// under `memory`. Answers the outcome; the probe is dropped before return.
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn probe_for_test(
     memory: &crate::read_image_memory::ImageMemoryHandle,
     key: &str,
@@ -1312,6 +1319,13 @@ impl Store {
     /// Measurement only: visit `group`'s members at the captured root,
     /// funding a long group head from `memory`.
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn visit_group_for_test(
         &mut self,
         group: &str,
@@ -2331,6 +2345,13 @@ mod durable {
     }
 
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn probe_for_test(
         memory: &crate::read_image_memory::ImageMemoryHandle,
         key: &str,

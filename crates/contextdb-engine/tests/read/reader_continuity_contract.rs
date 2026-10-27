@@ -123,6 +123,10 @@ fn writer(path: &Path, runtime: &Path) -> Database {
     db
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn initialize_replay_callbacks(db: &Database) {
     let registered = db.registered_trigger_callbacks();
     for trigger in db.list_triggers() {
@@ -149,6 +153,10 @@ fn schema_author() -> &'static contextdb_engine::identity::FabricIdentity {
     AUTHOR.get_or_init(contextdb_engine::identity::FabricIdentity::generate)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn schema_replay_unit(author: &Database, changes: ChangeSet) -> SchemaReplayUnit {
     let ddl_provenance = {
         let seam_read_memory = author
@@ -499,6 +507,10 @@ impl ReadKernelTestObserver for Park {
     fn cancellation_observed(&self, _: ReadKernelCancellationEvent, _: OwnerReadCancellation) {}
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
     if run_with_platform_runtime("a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store")
     {
@@ -598,6 +610,10 @@ fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn lazy_generation_load_beside_a_writer_keeps_serving() {
     if run_with_platform_runtime("lazy_generation_load_beside_a_writer_keeps_serving") {
         return;
@@ -917,6 +933,10 @@ fn a_dead_reader_process_does_not_prevent_later_write_maintenance_and_restart() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("owner-overlap.db");

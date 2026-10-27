@@ -25,6 +25,10 @@ fn txid_value(row: &VersionedRow, column: &str) -> TxId {
 /// RED — t27_01
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_01_schedule_fires_inside_tx_and_commits_callback_writes() {
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -84,6 +88,10 @@ fn t27_01_schedule_fires_inside_tx_and_commits_callback_writes() {
 /// RED — t27_02
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_02_only_due_schedules_dispatch() {
     let db = Arc::new(Database::open_memory());
     db.execute("CREATE TABLE soon_log (id UUID PRIMARY KEY)", &empty())
@@ -142,6 +150,10 @@ fn t27_02_only_due_schedules_dispatch() {
 /// RED — t27_03
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_03_skip_and_audit_records_missed_ticks() {
     use tempfile::TempDir;
     let tmp = TempDir::new().unwrap();
@@ -214,6 +226,10 @@ fn t27_03_skip_and_audit_records_missed_ticks() {
 /// RED — t27_04
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_04_catch_up_within_window_dispatches_all_missed() {
     let db = Arc::new(Database::open_memory());
     db.execute("CREATE TABLE log (id UUID PRIMARY KEY)", &empty())
@@ -311,6 +327,10 @@ fn t27_04_catch_up_within_window_dispatches_all_missed() {
 /// REGRESSION GUARD — t27_05
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_05_drop_schedule_stops_dispatch() {
     let db = Arc::new(Database::open_memory());
     db.execute("CREATE TABLE log (id UUID PRIMARY KEY)", &empty())
@@ -345,6 +365,10 @@ fn t27_05_drop_schedule_stops_dispatch() {
 
 /// RED — t27_06
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_06_callback_runs_inside_tx_with_single_lsn() {
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -427,6 +451,10 @@ fn t27_06_callback_runs_inside_tx_with_single_lsn() {
 /// RED — t27_07: schedule + audit log persist across engine restart.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_07_schedule_persists_across_engine_restart() {
     use tempfile::TempDir;
     let tmp = TempDir::new().unwrap();
@@ -509,6 +537,10 @@ CREATE SCHEDULE persistent EVERY '500 MILLISECONDS' TX (cb) MISSED_TICK_POLICY '
 /// RED — t27_08: fail-loud policy returns typed error on missed window.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_08_fail_loud_missed_tick_returns_error() {
     use contextdb_core::Error;
     use tempfile::TempDir;
@@ -581,6 +613,10 @@ fn t27_08_fail_loud_missed_tick_returns_error() {
 /// RED — t27_09: tickler shuts down on Database drop.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_09_tickler_shuts_down_on_drop() {
     use std::sync::atomic::AtomicU64;
     let counter = Arc::new(AtomicU64::new(0));
@@ -632,6 +668,10 @@ fn t27_09_tickler_shuts_down_on_drop() {
 /// REGRESSION GUARD — t27_10: DROP SCHEDULE persists across engine restart.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_10_drop_schedule_persists_across_reopen() {
     use tempfile::TempDir;
     let tmp = TempDir::new().unwrap();
@@ -689,6 +729,10 @@ DROP SCHEDULE doomed;
 /// RED — t27_11: a persisted schedule whose callback is not registered audits the miss.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_11_missing_registered_callback_records_failed_audit_without_panic() {
     use tempfile::TempDir;
     let tmp = TempDir::new().unwrap();
@@ -770,6 +814,10 @@ fn t27_11_missing_registered_callback_records_failed_audit_without_panic() {
 /// RED — t27_12: a failing registered callback rolls back partial writes and audits.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_12_registered_callback_error_rolls_back_partial_writes_and_audits() {
     use tempfile::TempDir;
     let tmp = TempDir::new().unwrap();
@@ -867,6 +915,10 @@ fn t27_12_registered_callback_error_rolls_back_partial_writes_and_audits() {
 
 /// REGRESSION GUARD — schedule DDL is engine-admin only, not scoped-handle mutable.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_13_scoped_handle_cannot_create_or_drop_schedule() {
     use tempfile::TempDir;
     let tmp = TempDir::new().unwrap();
@@ -903,6 +955,10 @@ fn t27_13_scoped_handle_cannot_create_or_drop_schedule() {
 /// REGRESSION GUARD — callback transaction cannot re-enter DDL or tx control.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_14_callback_rejects_nested_ddl_and_transaction_control() {
     let db = Arc::new(Database::open_memory());
     let captured_db = Arc::new(Database::open_memory());
@@ -1026,6 +1082,10 @@ fn t27_15_scoped_open_does_not_start_persisted_tickler() {
 /// REGRESSION GUARD — cron tx binding is confined to the callback owner thread.
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t27_16_callback_rejects_cross_thread_handle_use() {
     let db = Arc::new(Database::open_memory());
     db.execute(

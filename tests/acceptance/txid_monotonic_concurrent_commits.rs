@@ -244,6 +244,10 @@ fn t18_04_caller_supplied_txid_above_watermark_rejected() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t18_05_cron_callback_stamped_txid_matches_commit_event_lsn_resolution() {
     use std::sync::Mutex;
     let (_dir, db) = open_db();

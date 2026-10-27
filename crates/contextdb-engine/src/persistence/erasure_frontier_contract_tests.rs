@@ -30,6 +30,13 @@ fn seed(path: &Path) -> Database {
     db
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn frontier(persistence: &RedbPersistence, key: &[u8]) -> Option<Lsn> {
     persistence
         .with_db(|db| {
@@ -55,6 +62,13 @@ enum Damage {
     ReplacedTable,
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn damaged_control_refuses(damage: Damage, attempt_write: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("damage.db");
@@ -152,6 +166,13 @@ fn a_replaced_erasure_table_cannot_authorize_a_fresh_read() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn lineage_projection_repair_preserves_a_discard_only_frontier() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("repair.db");
@@ -356,6 +377,13 @@ fn scope(
     scope.read_memory = Some(memory.into());
     scope
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn measured_authorization(db: &Database, names: &[&str]) -> usize {
     let memory = Meter::new(usize::MAX);
     let scope = scope(db, names, memory.clone());
@@ -672,6 +700,13 @@ fn an_export_carries_a_canonical_frontier_without_reconstructible_lineage() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn replaying_displaced_purged_history_never_lowers_named_or_global_maxima() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("monotone.db");
@@ -716,6 +751,13 @@ fn replaying_displaced_purged_history_never_lowers_named_or_global_maxima() {
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn authorization_funds_each_native_control_before_allocation_and_until_free() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -763,6 +805,13 @@ fn authorization_funds_each_native_control_before_allocation_and_until_free() {
 // through the returned reason's physical free, not only its construction.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn an_erasure_reason_keeps_its_reader_credit_until_the_reason_is_freed() {
     use super::content_identity::proof_allocation_oracle_tests as oracle;
     let directory = tempfile::tempdir().unwrap();
@@ -811,6 +860,13 @@ fn native_read_scope(owner: ReadMemoryOwner) -> native_storage_admission::Storag
         .expect("the executing request owner admits its native storage scope")
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn begin_native_read(
     raw: &redb::Database,
     scope: &native_storage_admission::StorageAdmissionScope,
@@ -826,6 +882,13 @@ fn begin_native_read(
 // Real native views retain the same committed root independently. This is a
 // row of the existing lifecycle helper: the decisive mutant refunds the first
 // payer when a shared registration grows or another reader becomes last.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_reader_lifecycle(first_finishes_first: bool, grow: bool) {
     use super::content_identity::proof_allocation_oracle_tests as oracle;
     let directory = tempfile::tempdir().unwrap();
@@ -988,6 +1051,13 @@ fn registry_growth_preserves_the_floor_when_the_first_reader_finishes_last() {
 // deterministic schedule proof; continuous tracker->page locking remains a
 // source-review obligation.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn concurrent_native_capture_keeps_each_returned_root_stable_across_commits() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -1043,6 +1113,13 @@ fn concurrent_native_capture_keeps_each_returned_root_stable_across_commits() {
         .unwrap();
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn cloned_erasure_reason_funding(clone_finishes_last: bool, wildcard: bool) {
     use super::content_identity::proof_allocation_oracle_tests as oracle;
     use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureKind};
@@ -1200,6 +1277,13 @@ impl ReadMemoryBudget for RefusingAdmission {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn native_guard_admission_refusal_rolls_back_count_and_floor_without_stranding_funding() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -1353,6 +1437,13 @@ fn native_guard_admission_refusal_rolls_back_count_and_floor_without_stranding_f
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn configuration_u8_records_and_summary_fingerprints_authorize_the_same_committed_root() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -1413,6 +1504,13 @@ fn configuration_u8_records_and_summary_fingerprints_authorize_the_same_committe
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn missing_and_malformed_configuration_bindings_refuse_before_scope_probes() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -1474,6 +1572,13 @@ fn missing_and_malformed_configuration_bindings_refuse_before_scope_probes() {
 // the decisive mutant reads the lineage-configuration root here and therefore
 // accepts a changed content-size root before probing the requested scope.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_changed_configuration_content_size_root_is_precise_corruption_before_scope_probes() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

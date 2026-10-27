@@ -37,6 +37,10 @@ pub fn vector(ordinal: usize) -> Value {
     dead_code,
     reason = "KEEP-SHARED: shared test helper used by custody_schema_replay_is_proportional_to_affected_tables, read"
 )]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn prepare_existing_rows_and_vectors(db: &Database) -> Calls {
     let calls = Arc::new(Mutex::new(Vec::new()));
     db.register_trigger_callback("schema_099_insert_trigger", {

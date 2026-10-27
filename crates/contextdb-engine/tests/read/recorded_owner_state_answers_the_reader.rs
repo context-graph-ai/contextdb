@@ -72,6 +72,10 @@ fn writer_that_will_not_serve(directory: &Path, runtime_root: PathBuf) -> (Datab
 /// The reader is refused by name, with the reason its writer recorded, and
 /// never reaches the committed file.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_reader_is_told_the_recorded_owner_state_instead_of_the_file_s_complaint() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-state directory");
     let runtime_root = secure_runtime_root(directory.path(), "unserved-runtime");
@@ -123,6 +127,10 @@ fn a_reader_is_told_the_recorded_owner_state_instead_of_the_file_s_complaint() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_status_returns_a_live_disabled_writer_s_recorded_state_instead_of_absence() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-state directory");
     let runtime_root = secure_runtime_root(directory.path(), "disabled-status-runtime");
@@ -145,6 +153,10 @@ fn owner_status_returns_a_live_disabled_writer_s_recorded_state_instead_of_absen
 /// The control: a store nobody owns is not an unserved owner. It reads from
 /// the committed file exactly as it does today.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_store_nobody_owns_still_reads_from_the_committed_file() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-state directory");
     let runtime_root = secure_runtime_root(directory.path(), "unowned-runtime");

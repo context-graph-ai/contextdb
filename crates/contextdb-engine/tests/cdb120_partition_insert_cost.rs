@@ -49,6 +49,10 @@ fn create(db: &Database, cap: u32, history: &str) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sql_insert(
     db: &Database,
     tx: Option<contextdb_core::TxId>,
@@ -80,6 +84,10 @@ fn sql_delete(db: &Database, tx: Option<contextdb_core::TxId>, row: u64) {
     .expect("delete one row");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sql_move(db: &Database, row: u64, scope: &str) -> contextdb_core::Result<()> {
     db.execute(
         "UPDATE items SET scope = $scope WHERE id = $id",

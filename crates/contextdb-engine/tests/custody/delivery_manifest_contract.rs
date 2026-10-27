@@ -179,6 +179,10 @@ fn seed_committed_manifest(
 
 /// Write one root row and its member rows, and register the unit's membership,
 /// all inside one transaction — the only shape the contract admits.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn commit_unit(
     db: &Database,
     root_id: Uuid,
@@ -222,6 +226,10 @@ fn commit_unit(
 }
 
 // Commit only source rows; canonical metadata is arranged explicitly by the caller.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_fixture_rows(
     db: &Database,
     root_id: Uuid,

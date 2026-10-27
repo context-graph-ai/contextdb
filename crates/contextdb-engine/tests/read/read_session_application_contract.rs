@@ -213,6 +213,10 @@ fn session_payloads(database: &Database) -> BTreeSet<String> {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn under_limit_application_query_runs_cross_thread_on_the_derived_owner_view() {
     let fixture = application_fixture();
     let constrained = fixture.admin.scoped_with_constraints(
@@ -347,6 +351,10 @@ impl ExecutionConvergenceObserver {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn database_execute_plans_once_and_drains_the_shared_pull_kernel_once_without_a_cap() {
     let database = Database::open_memory();
     let row_count = over_limit_row_count();
@@ -408,6 +416,10 @@ fn database_execute_plans_once_and_drains_the_shared_pull_kernel_once_without_a_
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_parse_error_before_planning_or_pull() {
     let database = Database::open_memory();
     let observer = Arc::new(ExecutionConvergenceObserver::default());
@@ -431,6 +443,10 @@ fn legacy_execute_preserves_the_exact_parse_error_before_planning_or_pull() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_static_planning_error_without_entering_pull() {
     let database = Database::open_memory();
     let table = format!("planning_error_rows_{}", under_limit_row_count());
@@ -469,6 +485,10 @@ fn legacy_execute_preserves_the_exact_static_planning_error_without_entering_pul
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_execution_error_in_one_pull_execution() {
     let database = Database::open_memory();
     let table = format!("execution_error_rows_{}", under_limit_row_count());
@@ -540,6 +560,10 @@ impl DatabasePlugin for RejectingQueryPlugin {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_execute_preserves_the_exact_plugin_error_before_planning_or_pull() {
     let limits = ReadLimits::default();
     let hook = format!("query-{}", limits.work);

@@ -41,6 +41,10 @@ pub fn owner_for_serialized<T: Serialize>(value: &T, framing_bytes: usize) -> Re
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_message<T: Serialize>(
     value: &T,
 ) -> Result<Vec<u8>, contextdb_engine::local_transport::LocalTransportError> {
@@ -48,6 +52,10 @@ pub fn encode_message<T: Serialize>(
         .map(|bytes| bytes.to_vec())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_payload_frame(
     payload: &[u8],
 ) -> Result<Vec<u8>, contextdb_engine::local_transport::LocalTransportError> {
@@ -83,6 +91,10 @@ impl QueryFixture {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_query_result(input: &QueryFixture) -> Result<Vec<u8>, ReadEncodingError> {
     let input = input.clone(); // A copy of caller-created fixture data, before publication.
     let wire_size = bincode::serde::encode_to_vec(
@@ -152,6 +164,10 @@ pub fn cursor_page(
     .expect("prepay the immutable page input carrier")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_cursor_page(
     page: &contextdb_engine::CursorPage,
 ) -> Result<Vec<u8>, ReadEncodingError> {
@@ -168,6 +184,10 @@ pub fn encode_cursor_page(
     reason = "KEEP-SHARED: shared test helper used by local_transport"
 )]
 pub trait FixtureFrame {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn encode_fixture_frame(
         &self,
         message: contextdb_engine::local_transport::LocalOutboundMessage<'_>,
@@ -205,6 +225,10 @@ impl FixtureFrame for contextdb_engine::local_transport::LocalProtocolBoundary {
 #[allow(
     dead_code,
     reason = "KEEP-SHARED: shared test helper used by local_transport"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub fn encode_metadata_page(
     page: &contextdb_core::read_contract::MetadataPage,

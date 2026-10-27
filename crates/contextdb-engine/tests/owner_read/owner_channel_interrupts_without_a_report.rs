@@ -133,6 +133,10 @@ fn one_row_page_options() -> ReadSessionOptions {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_active_readers(path: &Path, runtime_root: &Path) -> u64 {
     let report = ReadSession::with_runtime_directory_for_test(runtime_root, || {
         ReadSession::owner_report(path, ReadSessionOptions::default())
@@ -239,6 +243,10 @@ impl ReadKernelTestObserver for FetchCancellationGate {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_statement_cancelled_before_it_is_sent_is_refused_without_reaching_the_owner() {
     let directory = tempfile::TempDir::new().expect("task-scoped directory");
     let path = directory.path().join("pre-cancelled.db");
@@ -325,6 +333,10 @@ fn a_statement_cancelled_before_it_is_sent_is_refused_without_reaching_the_owner
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_cursor_fetch_that_walks_the_store_reports_and_can_be_stopped_from_inside_the_observer() {
     let directory = tempfile::TempDir::new().expect("task-scoped directory");
     let path = directory.path().join("fetch-cancel.db");

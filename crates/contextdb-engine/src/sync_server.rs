@@ -494,6 +494,13 @@ impl SyncServer {
     /// owns its transport and reads ordinary arbitration from declarations.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_for_test(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,
@@ -510,6 +517,13 @@ impl SyncServer {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_for_test_with_read_budget_provider(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,
@@ -525,6 +539,13 @@ impl SyncServer {
     }
 
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn with_authenticated_transport_for_test_with_read_budget_provider_handle(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,
@@ -546,6 +567,13 @@ impl SyncServer {
     /// advertised by the injected transport.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_and_identity_for_test(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,
@@ -566,6 +594,13 @@ impl SyncServer {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_and_identity_for_test_with_read_budget_provider(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,
@@ -585,6 +620,13 @@ impl SyncServer {
     }
 
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(
         db: Arc<Database>,
         transport: Arc<dyn crate::transport::ServerTransport>,

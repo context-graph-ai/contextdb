@@ -228,6 +228,10 @@ fn p95_ms(values: &mut [f64]) -> f64 {
             fifteen minutes in a debug build) and prints one row per held-out query. Every \
             number it prints is an observation; the budget itself is proven by \
             a_declared_breadth_gets_exactly_its_approved_budget."]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn what_the_approved_budget_does_to_one_large_context() {
     use std::os::unix::fs::PermissionsExt;
 

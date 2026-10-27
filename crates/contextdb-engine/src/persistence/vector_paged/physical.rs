@@ -45,6 +45,13 @@ impl<'a> BorrowedMeta<'a> {
         dead_code,
         reason = "HNSW: goes with the HNSW index when it is replaced"
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn decode(bytes: &'a [u8]) -> Result<Self> {
         let (meta, consumed): (Self, usize) =
             bincode::serde::borrow_decode_from_slice(bytes, bincode::config::standard())
@@ -69,6 +76,13 @@ impl<'a> BorrowedMeta<'a> {
 #[allow(
     dead_code,
     reason = "HNSW: goes with the HNSW index when it is replaced"
+)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
 )]
 pub(crate) fn borrowed_change_backing<'a>(
     storage: u64,
@@ -133,6 +147,13 @@ pub(crate) struct PhysicalOwner {
     dead_code,
     reason = "HNSW: goes with the HNSW index when it is replaced"
 )]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn point_origin(encoded: &[u8], expected: PointId) -> Result<usize> {
     let header = encoded
         .get(..13)
@@ -149,6 +170,13 @@ pub(crate) fn point_origin(encoded: &[u8], expected: PointId) -> Result<usize> {
 #[allow(
     dead_code,
     reason = "HNSW: goes with the HNSW index when it is replaced"
+)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
 )]
 pub(crate) fn owner_from_identity(key: &[u8], frame: &[u8]) -> Result<PhysicalOwner> {
     let Some(PhysicalPagedIdentity::Identity {

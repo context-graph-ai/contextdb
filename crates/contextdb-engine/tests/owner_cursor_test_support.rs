@@ -34,6 +34,10 @@ impl OwnerPageFixture {
     pub fn has_more(&self) -> bool {
         self.has_more
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate(&self) -> Result<(), ReadEncodingError> {
         if self.rows.iter().any(|row| row.len() != self.columns.len()) {
             return Err(ReadEncodingError::InvalidPayload);
@@ -48,6 +52,10 @@ struct ObservedPage {
     trace: CanonicalQueryTrace,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode(bytes: &[u8]) -> Result<ObservedPage, ReadEncodingError> {
     let (observed, consumed): (ObservedPage, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
@@ -62,11 +70,19 @@ fn decode(bytes: &[u8]) -> Result<ObservedPage, ReadEncodingError> {
     Ok(observed)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_owner_cursor_page(bytes: &[u8]) -> Result<OwnerPageFixture, ReadEncodingError> {
     Ok(decode(bytes)?.page)
 }
 
 #[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn replace_owner_cursor_page(
     bytes: &[u8],
     page: &OwnerPageFixture,

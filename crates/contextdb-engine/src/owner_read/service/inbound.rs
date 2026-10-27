@@ -537,6 +537,13 @@ mod completed_query_refusal_tests {
         changed
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn typed(bytes: &[u8]) -> Result<(), LocalTransportError> {
         let memory = query_funding::QueryMemory::new(ReadLimits::SHIPPED_MEMORY)
             .expect("real native query owner");
@@ -712,6 +719,13 @@ mod completed_query_refusal_tests {
         }
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn receive_bytes(
         bytes: &[u8],
         database: &Database,

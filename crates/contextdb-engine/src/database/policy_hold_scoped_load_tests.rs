@@ -52,6 +52,13 @@ fn one_small_delivery() -> ChangeSet {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn split_one(db: &Database) -> Result<(ChangeSet, Vec<Conflict>)> {
     db.split_data_held_behind_refused_units(
         one_small_delivery(),
@@ -64,6 +71,13 @@ fn split_one(db: &Database) -> Result<(ChangeSet, Vec<Conflict>)> {
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn unrelated_tenants_held_history_does_not_expand_one_deliverys_decode_or_retained_peak() {
     let root = tempfile::tempdir().expect("task-scoped durable store");
     let db =
@@ -141,6 +155,13 @@ fn unrelated_tenants_held_history_does_not_expand_one_deliverys_decode_or_retain
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn oversized_relevant_hold_refuses_before_decode_and_returns_every_charge() {
     let root = tempfile::tempdir().expect("task-scoped durable store");
     let db = Database::open(root.path().join("large-policy-hold.db")).expect("open durable store");
@@ -283,6 +304,13 @@ fn selected_holds_keep_their_memory_charge_until_the_collection_is_dropped() {
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn unrelated_absent_table_holds_do_not_expand_a_small_delivery() {
     let root = tempfile::tempdir().unwrap();
     let db = Database::open(root.path().join("absent-budget.db")).unwrap();

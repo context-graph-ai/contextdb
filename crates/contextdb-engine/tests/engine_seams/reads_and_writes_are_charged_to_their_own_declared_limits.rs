@@ -47,6 +47,10 @@ fn insert_point(db: &Database, id: i64) {
 
 /// Fired triggers for audit history, and a built vector route with one
 /// pending row so a search reads both its graph and its suffix.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn store(path: &std::path::Path, writer: usize, reader: u64) -> Database {
     let db = open(path, writer, reader);
     db.execute(

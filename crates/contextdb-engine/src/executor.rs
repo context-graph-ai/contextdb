@@ -388,6 +388,13 @@ fn content_size_result(
 
 pub(crate) trait ReadExecutionTarget: Send + Sync {
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn resident_history_database_for_test(&self) -> Result<&Database> {
         Err(Error::PlanError(
             "this execution target has no installed history database".into(),
@@ -3780,6 +3787,13 @@ impl BoundedCursorHandle {
     /// What an open cursor is holding, part by part. A cursor that has
     /// already ended holds nothing, and says so with an all-zero breakdown
     /// rather than refusing the question.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn continuation_bytes(
         &self,
     ) -> std::result::Result<bounded::ContinuationBytes, BoundedExecutionError> {
@@ -12906,6 +12920,13 @@ pub fn finite_planner_shared_equality_for_test(left: &Value, right: &Value) -> b
 /// the bounded pull kernel.
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub fn execute_eager_for_test(
     db: &Database,
     sql: &str,
@@ -23135,6 +23156,10 @@ fn declared_conflict_policy_to_string(p: contextdb_core::ConflictPolicy) -> Stri
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn project_graph_frontier_rows(
     frontier: Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)>,
     start_alias: &str,

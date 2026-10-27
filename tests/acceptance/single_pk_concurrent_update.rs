@@ -42,6 +42,10 @@ fn setup_decision(db: &Database) -> Uuid {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t25_01_six_parallel_pk_updates_keep_one_visible_row() {
     let (_dir, db) = open_db();
     let db = &db;

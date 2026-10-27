@@ -1275,6 +1275,10 @@ pub(super) fn take_hold_arrivals() -> [usize; 16] {
 /// Look up `order`'s tables through one pass's holder, handing each lookup's
 /// handle to `check`; returns how many relations the pass opened.
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn hold_in_order_for_test(
     write: &redb::WriteTransaction,
     order: &[String],

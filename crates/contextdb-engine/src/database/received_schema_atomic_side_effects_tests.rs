@@ -511,6 +511,13 @@ fn assert_received_incomplete_acl_refs_are_denied(db: &Database, phase: &str) {
     );
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn seed_preexisting_side_projection(db: &Database) {
     for statement in [
         "CREATE TABLE retained_notes (id INTEGER PRIMARY KEY)",
@@ -726,6 +733,13 @@ fn durable_queue_identity(db: &Database, sink: &str) -> Vec<(u64, SinkEvent)> {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_schema_publish_does_not_resurrect_a_worker_acknowledged_queue_entry() {
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("received-schema-queue-ack-race.redb");

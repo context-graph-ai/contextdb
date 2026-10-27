@@ -6481,6 +6481,13 @@ pub mod read_persistence_test_scaffold {
         .map_err(|e| text(&e))
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn load_vector_version_at_snapshot_for_test(
         path: &Path,
         index: &super::VectorIndexRef,

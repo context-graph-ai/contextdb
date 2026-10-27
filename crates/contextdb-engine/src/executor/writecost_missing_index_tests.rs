@@ -58,6 +58,13 @@ fn fixture() -> Database {
     db
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn eager(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Result<usize, Error> {
     let statement = contextdb_parser::parse(sql)?;
     let plan = contextdb_planner::plan(&statement)?;

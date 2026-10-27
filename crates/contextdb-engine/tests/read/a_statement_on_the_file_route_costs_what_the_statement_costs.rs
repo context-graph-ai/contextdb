@@ -150,6 +150,10 @@ impl ReadKernelTestObserver for AdvanceOnce {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_statement_past_its_active_time_is_refused_in_the_typed_words_without_waiting_for_anything() {
     let directory = tempfile::TempDir::new().expect("task-scoped active-time directory");
     let path = directory.path().join("expiring-show.db");
@@ -233,6 +237,10 @@ impl ReadKernelTestObserver for ParkOnFirstTouch {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_blocked_read_still_stops_when_another_thread_withdraws_it() {
     let directory = tempfile::TempDir::new().expect("task-scoped withdrawal directory");
     let path = directory.path().join("withdrawn-show.db");

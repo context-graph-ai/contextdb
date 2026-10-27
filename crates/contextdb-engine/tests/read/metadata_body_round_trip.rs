@@ -29,6 +29,10 @@ use std::collections::BTreeMap;
 
 /// Read one body back and require it to be the body that was written, in both
 /// directions: the same value, and the same bytes.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn encode_metadata_body(
     body: &MetadataBody,
 ) -> Result<Vec<u8>, contextdb_engine::read_contract::ReadEncodingError> {

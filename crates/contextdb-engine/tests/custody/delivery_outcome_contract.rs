@@ -541,6 +541,10 @@ impl OutcomeContractView for Option<DeliveryOutcome> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_unit_on(
     db: &Database,
     root_table: &str,
@@ -577,6 +581,10 @@ fn stage_unit_on(
     Ok(tx)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_unit(
     db: &Database,
     root_id: Uuid,

@@ -1210,6 +1210,13 @@ impl MaintenanceContext {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn stamp_expired_rows(&self, now: Wallclock) -> Result<()> {
         self.stamp_expired_rows_for(now, RetentionPreparation::Expiry)
     }
@@ -1976,6 +1983,13 @@ impl MaintenanceContext {
     /// zero change to production behavior. Also never compacts -- see
     /// `run_currency`'s own doc comment.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn run_currency_for_tables(
         &self,
         tables: &[&str],

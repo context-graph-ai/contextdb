@@ -16,6 +16,10 @@ impl DeadlineClock for UnexpiringClock {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_already_serving_owner_is_selected_before_its_writable_open_returns() {
     struct OwnerReady {
         reached: mpsc::Sender<()>,

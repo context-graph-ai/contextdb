@@ -72,6 +72,13 @@ fn seed(db: &Database) {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn raw_vector_records(db: &Database, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     db.persistence
         .as_ref()

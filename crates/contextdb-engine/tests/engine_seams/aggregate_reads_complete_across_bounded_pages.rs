@@ -234,6 +234,10 @@ fn one_aggregate_row(what: &str, answer: &QueryResult) -> Value {
 /// executor, an in-process bounded view of the live store, or a direct read of
 /// the closed file.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sum_of_a_byte_column_agrees_on_every_route() {
     let directory = tempfile::TempDir::new().expect("task-scoped chunk directory");
     let path = directory.path().join("chunk-totals.db");

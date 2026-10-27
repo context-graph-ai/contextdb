@@ -357,6 +357,13 @@ impl Database {
     /// production snapshot API.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __with_snapshot_override_for_test<T>(
         &self,
         snapshot: SnapshotId,
@@ -829,6 +836,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn bounded_read_snapshot_registration(
         &self,
         budget: &ReadRegistrationBudget,
@@ -846,6 +860,13 @@ impl Database {
             }))
     }
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn bounded_cursor_snapshot_registration(
         &self,
         clock: Arc<dyn DeadlineClock>,
@@ -2064,6 +2085,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __damage_first_saved_row_for_test(&self, table: &str, swap_body: bool) -> Result<()> {
         let persistence = self.persistence.as_ref().ok_or_else(|| {
             Error::Other(("saved-row damage requires a writer".to_owned()).into())

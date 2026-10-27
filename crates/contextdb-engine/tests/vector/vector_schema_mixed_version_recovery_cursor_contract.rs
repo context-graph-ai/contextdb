@@ -329,6 +329,10 @@ impl ClientTransport for ObservePullPages {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_authored_table_history(source: &Database, pages: &[RecordedPullPage], table: &str) {
     let original = source
         .changes_since(Lsn(0))
@@ -1267,6 +1271,10 @@ async fn held_recovery_pages_purge_before_later_shape_work_and_keeps_erased_vect
 }
 
 #[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn held_recovery_bootstraps_trigger_ddl_before_later_rows() {
     let broker = InProcessBroker::new();
     let source = Arc::new(Database::open_memory());

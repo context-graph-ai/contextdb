@@ -247,6 +247,10 @@ fn fresh_reader(fixture: &Fixture) -> ReadSession {
 /// A fresh reader over the fixture's committed file whose memory limit is
 /// `memory` bytes.
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn fresh_reader_within(fixture: &Fixture, memory: usize) -> ReadSession {
     let reader = ReadSession::with_runtime_directory_for_test(&fixture.runtime, || {
         ReadSession::open_with_options(

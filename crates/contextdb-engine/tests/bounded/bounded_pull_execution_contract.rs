@@ -1448,6 +1448,10 @@ impl contextdb_vector::hnsw::HnswCandidateObserver for HnswCandidatePathProbe {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);

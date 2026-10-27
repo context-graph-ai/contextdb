@@ -1062,6 +1062,10 @@ fn schema_author() -> &'static contextdb_engine::identity::FabricIdentity {
     AUTHOR.get_or_init(contextdb_engine::identity::FabricIdentity::generate)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn signed_by_the_author(
     sender: &Database,
     unit: &contextdb_engine::sync_types::ChangeSet,
@@ -1100,6 +1104,10 @@ fn source_unit(
     (unit, provenance)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn take_delivery(
     hub: &Database,
     fixture_node: &str,

@@ -117,6 +117,10 @@ fn declare_host_sync_keep_latest(db: &Database) {
 }
 
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn setup_ready_host_write_trigger(db: &Database) {
     db.execute(
         "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
@@ -133,6 +137,10 @@ fn setup_ready_host_write_trigger(db: &Database) {
     db.complete_initialization().unwrap();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn register_audit_callback(db: &Database, fire_count: Arc<AtomicUsize>) {
     db.register_trigger_callback("host_write_trigger", move |db_handle, ctx| {
         if ctx.trigger_name != "host_write_trigger"
@@ -257,6 +265,10 @@ fn rollback_audit_failure(db: &Database, label: &str, needles: &[&str]) -> Optio
 }
 
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reopened_rollback_audit_failure(
     path: &std::path::Path,
     label: &str,
@@ -732,6 +744,10 @@ fn row_group_signatures(db: &Database, changes: ChangeSet) -> Vec<BTreeSet<Strin
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("cold_gate.redb");
@@ -979,6 +995,10 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_sync_apply_requires_complete_initialization_after_callback_registration() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("callback_registered_not_initialized.redb");
@@ -1035,6 +1055,10 @@ fn t3_sync_apply_requires_complete_initialization_after_callback_registration() 
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callbacks() {
     let tmp = TempDir::new().unwrap();
 
@@ -2422,6 +2446,10 @@ fn t3_sync_trigger_ddl_fk_preflight_accepts_child_update_before_parent_delete() 
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_sync_trigger_ddl_fk_preflight_rejects_server_wins_child_update_before_edge_wins_parent_delete()
  {
     let db = Database::open_memory();
@@ -3056,6 +3084,10 @@ fn assert_sequential_vector_source_unit_credit() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_reg_introspection_and_delete_event_rejection() {
     let db = Database::open_memory();
     db.execute(
@@ -4654,6 +4686,10 @@ fn t3_reg_introspection_and_delete_event_rejection() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
     let db = Database::open_memory();
     db.execute(
@@ -5001,6 +5037,10 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_trigger_dispatch_uses_commit_final_write_set() {
     let db = Database::open_memory();
     db.execute(
@@ -5274,6 +5314,10 @@ fn t3_sync_trigger_ddl_replay_respects_sender_lsn_order() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_sibling_callback_cascades_validate_after_all_triggers_stage() {
     let db = Database::open_memory();
     db.execute(
@@ -5553,6 +5597,10 @@ fn t3_atomicity_cascade_rows_share_lsn_and_event() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
     let mut failures = Vec::new();
 
@@ -7634,6 +7682,10 @@ fn t3_freshdisk_pull_replays_server_history_atomic_and_no_refire() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_depth_self_cascade_cap_rolls_back_typed() {
     let tmp = TempDir::new().unwrap();
     let depth_path = tmp.path().join("depth_audit.redb");
@@ -8009,6 +8061,10 @@ fn t3_depth_self_cascade_cap_rolls_back_typed() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
     let db = Arc::new(Database::open_memory());
     setup_host_tables(&db);
@@ -8160,6 +8216,10 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t3_audit_records_panic_rollback_and_engine_survives() {
     let tmp = TempDir::new().unwrap();
     let panic_path = tmp.path().join("panic_audit.redb");
@@ -8517,6 +8577,10 @@ fn received_source_change(id: Uuid, lsn: Lsn) -> ChangeSet {
 }
 
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn register_received_derived_callback(db: &Database) {
     db.register_trigger_callback("received_insert", |handle, ctx| {
         let id = ctx.row_values["id"].as_uuid().copied().unwrap();
@@ -8541,6 +8605,10 @@ fn register_received_derived_callback(db: &Database) {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn including_sync_default_is_silent_and_opt_in_fires_once_on_received_insert() {
     for (including_sync, expected_fires) in [(false, 0), (true, 1)] {
         let db = Database::open_memory();
@@ -8629,6 +8697,10 @@ fn including_sync_delete_received_ddl_is_typed_and_never_persisted() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn including_sync_callback_failure_rolls_back_incoming_and_derived_rows() {
     let db = Database::open_memory();
     setup_received_insert_trigger(&db, true);
@@ -8666,6 +8738,10 @@ fn including_sync_callback_failure_rolls_back_incoming_and_derived_rows() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn including_sync_forbidden_effect_families_are_typed_atomic_and_audited() {
     #[derive(Clone, Copy, Debug)]
     enum Effect {
@@ -8827,6 +8903,10 @@ fn including_sync_forbidden_effect_families_are_typed_atomic_and_audited() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn local_trigger_callback_keeps_graph_mutation_api() {
     let db = Database::open_memory();
     setup_received_insert_trigger(&db, false);
@@ -8859,6 +8939,10 @@ fn local_trigger_callback_keeps_graph_mutation_api() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn including_sync_rewrites_only_callback_txid_placeholders() {
     let db = Database::open_memory();
     let control = Database::open_memory();
@@ -8945,6 +9029,10 @@ fn including_sync_rewrites_only_callback_txid_placeholders() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn including_sync_txid_identity_placeholder_is_typed_while_fixed_and_local_are_allowed() {
     for active_placeholder in [true, false] {
         let db = Database::open_memory();
@@ -9139,6 +9227,10 @@ fn including_sync_declaration_persists_reopens_and_transports_as_typed_ddl() {
 
 #[tokio::test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn including_sync_hub_derivation_reaches_another_edge_without_outbound_echo() {
     let fabric = InProcessBroker::new();
     let tenant_id = "including-sync-lineage";

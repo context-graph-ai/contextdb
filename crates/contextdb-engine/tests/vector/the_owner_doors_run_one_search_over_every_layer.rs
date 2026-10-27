@@ -138,6 +138,10 @@ fn drive_maintenance(db: &Database, until: impl Fn(&Database) -> bool, what: &st
 /// Every Context saved as a base, a sealed change on top of it, and a live
 /// tail committed after the change. The column declares INDEXED, so the door
 /// that cannot name a mode asks for the graph as well.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn seed(db: &Database) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
@@ -273,6 +277,10 @@ fn check_receipts(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn the_owner_doors_run_one_search_over_every_layer_and_answer_what_sql_answers() {
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
     let db = Database::open(directory.path().join("owner-doors.db")).expect("open the fixture");

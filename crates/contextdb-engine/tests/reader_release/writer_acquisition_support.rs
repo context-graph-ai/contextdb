@@ -106,6 +106,10 @@ impl ParkedReader {
 impl ParkedReader {
     /// Like `session`, but hands back whatever the reader ended with,
     /// refusal included.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn outcome(mut self) -> contextdb_core::Result<ReadSession> {
         // A reader stopped at a pause point cannot answer until it is let go.
         self.let_go();
@@ -194,6 +198,10 @@ impl WriterOpen {
         self.thread_id
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn finish(mut self) -> contextdb_core::Result<Database> {
         let answer = self
             .result

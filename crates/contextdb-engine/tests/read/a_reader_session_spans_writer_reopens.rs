@@ -21,6 +21,10 @@ use std::sync::{Arc, Mutex};
 const PAGE_ROWS: usize = 2;
 
 /// Open the writer and return the reader registry its startup captured.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reopen_writer(path: &Path) -> (Database, WriterReaderSnapshotRegistryObservation) {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&observed);
@@ -72,6 +76,10 @@ fn paged_session(path: &Path) -> ReadSession {
     session
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_every_row(session: &ReadSession, sql: &str) -> contextdb_core::Result<Vec<Vec<Value>>> {
     let mut cursor = session.open_cursor(sql, &HashMap::new())?;
     let mut rows = cursor.first_page().rows().to_vec();

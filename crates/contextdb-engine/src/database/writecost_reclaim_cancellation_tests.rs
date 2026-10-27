@@ -107,6 +107,13 @@ fn account(observed: &Observed) {
     observed.checkpoints.fetch_add(1, Ordering::SeqCst);
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn cycle(db: &Database, context: &MaintenanceContext) -> Result<MaintenanceReport> {
     let read_memory = context.read_request_provider.request_budget().unwrap();
     let _ = db;
@@ -139,6 +146,13 @@ fn assert_one_committed_step(store: &Store, before: (usize, usize), observed: &O
 /// Row 2 (worker_stop): a stop requested after exactly one committed step returns the existing
 /// typed error; the step stays durable, the rest is untouched, and a later cycle resumes it.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn worker_stop_after_one_committed_step_leaves_a_resumable_remainder() {
     let store = store_with_backlog();
     let before = backlog(&store.db);
@@ -175,6 +189,13 @@ fn worker_stop_after_one_committed_step_leaves_a_resumable_remainder() {
 
 /// Row 2 (resource_closed): the same stop through the closed-resource flag.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn resource_closed_after_one_committed_step_leaves_a_resumable_remainder() {
     let store = store_with_backlog();
     let before = backlog(&store.db);
@@ -210,6 +231,13 @@ fn resource_closed_after_one_committed_step_leaves_a_resumable_remainder() {
 /// Row 3: a foreground writer commits between the cycle's steps. The cycle still completes within
 /// its bound, nothing is lost, and later cycles drain what the writer added.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn foreground_writes_between_steps_do_not_extend_the_cycle_or_lose_data() {
     let store = store_with_backlog();
     let context = store.db.maintenance_context();
@@ -259,6 +287,13 @@ fn foreground_writes_between_steps_do_not_extend_the_cycle_or_lose_data() {
 /// Row 10: a crash between steps. A child process aborts at the checkpoint after its first
 /// committed step; the parent reopens the durable remainder and finishes it.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_crash_between_steps_leaves_the_remainder_and_reopen_resumes_it() {
     const ROLE: &str = "WRITECOST_ENGINE_CRASH_CHILD";
     if let Ok(path) = std::env::var(ROLE) {

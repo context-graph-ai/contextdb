@@ -28,6 +28,13 @@ fn base(generation_id: u64, graph_len: usize) -> VectorPartitionBaseGenerationRe
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn put(
     persistence: &RedbPersistence,
     definition: TableDefinition<&'static [u8], &'static [u8]>,
@@ -51,6 +58,13 @@ fn put(
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn quarantined_inventory_borrows_retained_graphs_with_graph_size_independent_admission() {
     let (_directory, persistence) = writer();
     let route = base(1, 0);
@@ -123,6 +137,13 @@ fn quarantined_inventory_borrows_retained_graphs_with_graph_size_independent_adm
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn quarantined_inventory_rejects_authenticated_unbounded_route_and_invalid_complete_records() {
     let (_directory, persistence) = writer();
     let original = base(7, 17);

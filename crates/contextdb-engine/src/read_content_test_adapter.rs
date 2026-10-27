@@ -54,6 +54,13 @@ fn logical_key(parts: &[&[u8]]) -> Vec<u8> {
     encoded
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn logical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let value = serde_json::to_value(value)
         .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
@@ -119,6 +126,13 @@ struct IndependentRelationalIndexPosition {
     created_tx: TxId,
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn independently_reconstruct_relational_index_posting_records(
     table_meta: &HashMap<String, TableMeta>,
     rows: &[DirectStoredRow],
@@ -223,6 +237,13 @@ fn independent_prefix_is_constraint_bounded(
             .any(|column| column.name == columns[0].0 && (column.primary_key || column.unique))
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn independently_reconstruct_relational_index_count_records(
     table_meta: &HashMap<String, TableMeta>,
     rows: &[DirectStoredRow],
@@ -314,6 +335,13 @@ fn independently_reconstruct_relational_index_count_records(
     Ok(records)
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn independently_enumerate_auxiliary_records(
     parts: &ReadPersistenceImageParts,
 ) -> Result<Vec<LogicalContentRecordForTest>> {
@@ -526,6 +554,13 @@ enum IndependentStoredVector {
     },
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn independently_reconstruct_version_records(
     bodies: Vec<(String, Vec<u8>)>,
 ) -> Result<Vec<LogicalContentRecordForTest>> {
@@ -586,6 +621,13 @@ fn logical_history_key(kind: u8, position: &[u8]) -> Vec<u8> {
     key
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub fn committed_content_for_test(
     path: &Path,
     operation_read_memory: contextdb_core::read_memory::ReadMemoryOwner,
@@ -735,6 +777,13 @@ pub fn committed_content_for_test(
     Ok(content)
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn project_edges(parts: &ReadPersistenceImageParts) -> Result<Vec<DirectStoredEdge>> {
     // One edge identity can carry several stored occurrences -- a later write
     // that adds properties does not erase the one that introduced the edge --
@@ -833,6 +882,13 @@ fn direct_quantization(quantization: VectorQuantization) -> DirectVectorQuantiza
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn project_test_content(
     database: &Database,
     graph_edges: Vec<DirectStoredEdge>,

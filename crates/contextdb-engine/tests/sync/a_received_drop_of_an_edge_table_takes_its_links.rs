@@ -114,6 +114,10 @@ fn an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links() 
 
     const TENANT: &str = "received-link-table-drop";
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply_received(author: &Database, receiver: &Database, changes: ChangeSet) {
         let identity = {
             static AUTHOR: std::sync::OnceLock<contextdb_engine::identity::FabricIdentity> =

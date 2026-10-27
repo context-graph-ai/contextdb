@@ -1816,6 +1816,13 @@ fn accountant(limit: usize) -> Arc<MemoryAccountant> {
 /// back both.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     vector_identity_directory_refunds_only_after_its_buffer_is_freed();
     vector_row_encoding_has_exact_writer_admission();
@@ -1983,6 +1990,13 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
 /// holding nothing.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
     let root = tempfile::tempdir().unwrap();
     let database = ProofFixtureDatabase::create(root.path().join("reader.db")).unwrap();
@@ -2138,6 +2152,13 @@ fn family_node_count(database: &redb::Database, family: LogicalFamily) -> usize 
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_family_reset_admits_its_batches_and_its_peak_does_not_grow_with_the_store() {
     let mut measurements = Vec::new();
     for nodes in [256_u64, 1024] {
@@ -3756,6 +3777,13 @@ mod row_check_cache_ownership_contract {
     ) {
         run_case_with_mode(db, cap, fail_phase, false)
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn run_case_with_mode(
         db: &Database,
         cap: u64,
@@ -4432,6 +4460,13 @@ mod original_failure_contract {
         }
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn codec_adapter_terminal_refusal_rows() {
         use serde::de::{Error as _, SeqAccess, Visitor};
         static TEXT_VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -5046,6 +5081,13 @@ mod original_failure_contract {
     // diagnosis. Retained scope clones make the actual last release observable.
     #[test]
     #[serial]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn overlapping_storage_failures_keep_original_diagnosis_and_paid_last_release() {
         // The raw codec fixture owns this explicitly declared operation.
         let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

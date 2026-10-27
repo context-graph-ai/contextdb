@@ -1829,6 +1829,13 @@ impl PendingManifestPublication {
 
 #[cfg(feature = "test-seams")]
 impl RedbPersistence {
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn visit_committed_change_and_ddl_members_for_test(
         &self,
         tx: TxId,

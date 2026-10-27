@@ -1399,6 +1399,13 @@ impl FamilyDigest {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
     )
 )]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn typed_digest(
     image: &DirectOwnedImage,
     accountant: &Arc<MemoryAccountant>,
@@ -1582,6 +1589,13 @@ fn typed_digest(
     allow(
         dead_code,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from read_only_open_loads_only_the_working_set.rs"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
 pub(crate) fn typed_digest_for_test(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {

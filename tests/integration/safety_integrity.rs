@@ -222,6 +222,10 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
 // Their graph/vector crash-reopen intent is covered by si_01 and the existing p24/p25 persistence guards.
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn si_09_reopen_preserves_configured_memory_limit() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("memory-limit.db");

@@ -530,6 +530,13 @@ impl PullPolicyPreflight {
 /// One arming fires once, so a test that arms it cannot leak the fault into
 /// the next apply.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn take_received_unit_fault_for_test(point: ReceivedUnitFaultPoint) -> Result<()> {
     let armed = RECEIVED_UNIT_FAULT.with(|fault| match fault.get() {
         Some((armed_point, kind)) if armed_point == point => {

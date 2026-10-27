@@ -82,6 +82,10 @@ fn store_with_history(path: &Path, purged: usize) {
 
 /// Entries enumerated and decoded on this thread by one one-row read of the
 /// unrelated table, and the row it returned.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn work_of_one_read(database: &Database) -> (u64, u64, Vec<Vec<Value>>) {
     let session = database
         .read_session(ReadLimits::default())

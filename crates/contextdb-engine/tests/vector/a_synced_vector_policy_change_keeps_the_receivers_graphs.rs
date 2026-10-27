@@ -50,6 +50,10 @@ fn ids(result: &QueryResult) -> Vec<Uuid> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn indexed_search(
     db: &Database,
     scope: Uuid,

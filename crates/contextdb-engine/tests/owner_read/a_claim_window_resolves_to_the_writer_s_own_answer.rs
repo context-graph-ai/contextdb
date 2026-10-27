@@ -366,6 +366,10 @@ fn reader_breadcrumbs(runtime_root: &Path) -> Vec<PathBuf> {
 /// The writer is handed back STILL OPEN. What the caller was owed is a usable
 /// answer from a live owner, so the journey gets to use it before deciding the
 /// writer is done.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ask_inside_the_claim_window(
     path: &Path,
     runtime_root: &Path,

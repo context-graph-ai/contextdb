@@ -236,6 +236,13 @@ fn assert_graph_addressed_work(
 
 // The supplied history bytes are fetched before Query; full-history answers
 // remain in the original helper after these isolated proof windows finish.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn graph_addressed_observer_row(
     root: &graph_read::GraphReadRoot,
     predecessor: &AdjEntry,
@@ -1219,6 +1226,13 @@ fn graph_distinct_history_fixture(
     (store, predecessor, coordinates)
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_graph_coordinate_witnesses(
     store: &RedbPersistence,
     predecessor: &AdjEntry,
@@ -1295,6 +1309,13 @@ fn assert_graph_coordinate_witnesses(
         .unwrap();
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_graph_coordinate_source_answers(
     root: graph_read::GraphReadRoot,
     predecessor: &AdjEntry,
@@ -1727,6 +1748,13 @@ fn graph_history_fixture(
 // Fixture inspection stays outside operation observation scopes. This is
 // an assertion snapshot, never the engine's survivor classifier or index.
 type GraphPublicationState = (Vec<Vec<(Vec<u8>, Vec<u8>)>>, Vec<Vec<(String, Vec<u8>)>>);
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn graph_publication_state(store: &RedbPersistence) -> GraphPublicationState {
     store
         .with_db(|db| {
@@ -1790,6 +1818,13 @@ fn graph_publication_state(store: &RedbPersistence) -> GraphPublicationState {
         .unwrap()
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_retained_graph_witnesses(
     store: &RedbPersistence,
     predecessor: &AdjEntry,
@@ -1873,6 +1908,13 @@ fn assert_retained_graph_witnesses(
         .unwrap();
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_graph_source_answers(
     root: graph_read::GraphReadRoot,
     predecessor: &AdjEntry,
@@ -1974,6 +2016,13 @@ fn assert_graph_source_answers(
 
 // The callbacks use the installed execution target and its real declared
 // operation child. Residency is a paired observation, never graph work.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_installed_commit_directory_rows(
     file: &ReadSession,
     expected: &[(Lsn, TxId)],
@@ -2193,6 +2242,13 @@ impl contextdb_core::read_contract::DeadlineClock for SuffixProgressClock {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn commit_suffix_fixture(path: &Path, frontier: Option<(Lsn, TxId)>, suffix: &[(u64, u64)]) {
     let store = RedbPersistence::create_with_accountant(
         path,
@@ -2224,6 +2280,13 @@ fn commit_suffix_fixture(path: &Path, frontier: Option<(Lsn, TxId)>, suffix: &[(
         .unwrap();
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_commit_suffix_open_rows(directory: &Path) {
     use contextdb_core::read_contract::{
         OwnerLimitExceededDetail, OwnerReadCancellation, ReadFailure, ReadFailureLimit, ReadLimits,
@@ -2478,6 +2541,13 @@ fn assert_commit_suffix_open_rows(directory: &Path) {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn directory_pinned_view(
     file: &ReadSession,
 ) -> (
@@ -2550,6 +2620,13 @@ fn assert_directory_pinned_publication_row(directory: &Path) {
     );
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_commit_directory_writable_controls(directory: &Path) {
     for versions in [4, 8, 16] {
         let path = directory.join(format!("commit-directory-writable-{versions}.db"));
@@ -2599,6 +2676,13 @@ fn assert_commit_directory_writable_controls(directory: &Path) {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_graph_open_and_maintenance_rows(directory: &Path) {
     assert_commit_directory_writable_controls(directory);
     assert_directory_pinned_publication_row(directory);
@@ -3398,6 +3482,13 @@ type GraphDurabilityState = (
     Vec<(String, Option<Vec<(Vec<u8>, Vec<u8>)>>)>,
 );
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn graph_durability_state(store: &RedbPersistence) -> GraphDurabilityState {
     let supplement = store
         .with_db(|db| {
@@ -3503,6 +3594,13 @@ fn graph_durability_state(store: &RedbPersistence) -> GraphDurabilityState {
 
 // Same mixed row/history/predecessor transaction as the existing semantic
 // row. This helper only removes its fixture's nominated physical version.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn graph_durability_publication(
     store: &RedbPersistence,
     predecessor: &AdjEntry,
@@ -3849,6 +3947,13 @@ type GraphCompactionState = (
     redb::StorageSnapshotIdentity,
 );
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn graph_compaction_state(store: &RedbPersistence) -> GraphCompactionState {
     let cursor = store
         .with_db(|db| {
@@ -3875,6 +3980,13 @@ fn graph_compaction_state(store: &RedbPersistence) -> GraphCompactionState {
     )
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn graph_compaction_fixture(path: &Path) -> (AdjEntry, Vec<ChangeLogEntry>) {
     let (store, predecessor, entries) = graph_history_fixture(path, 4, 4, true);
     // The existing overlap fixture's real page population crosses the
@@ -3912,6 +4024,13 @@ fn graph_compaction_fixture(path: &Path) -> (AdjEntry, Vec<ChangeLogEntry>) {
     (predecessor, entries)
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn graph_compaction_publication(
     store: &RedbPersistence,
 ) -> Result<(redb::CompactionProgress, Option<u64>)> {
@@ -4043,6 +4162,13 @@ fn graph_compaction_interruption_child() -> bool {
     panic!("selected compaction interruption {boundary} was not reached: {result:?}");
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_graph_compaction_pinned_rows(directory: &Path, boundaries: &[u8]) {
     let fixture_path = directory.join("graph-compaction-fixture.db");
     let (predecessor, entries) = graph_compaction_fixture(&fixture_path);
@@ -4911,6 +5037,13 @@ fn relational_and_vector_readiness_cross_matrix_refuses_malformed_before_rows() 
 // short-lived credit. Limits come from the existing child declaration or
 // the actual successful request, rather than a second policy constant.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_graph_admission_rows(directory: &Path) {
     use std::ops::Bound;
     use writer_source::SourceWindowOwner;
@@ -5328,6 +5461,13 @@ impl crate::read_session::ReadKernelTestObserver for GraphDoorCancellationObserv
 // Use stored ACL metadata and actual grant lookup. An allowed target and
 // edge never confer the missing source entitlement on either public route.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_graph_authorization_and_cancellation_rows(directory: &Path) {
     use crate::read_session::{ReadSession, ReadSessionOptions};
     use contextdb_core::Principal;
@@ -5677,6 +5817,13 @@ fn assert_graph_permission_session(
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

@@ -276,6 +276,13 @@ fn sync_apply_state_digest_is_deterministic_and_changes_with_durable_state() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn snapshot_export_preserves_trigger_audit_retention_stamps_exactly() {
     let root = tempfile::tempdir().expect("tempdir");
     let database_path = root.path().join("source.redb");

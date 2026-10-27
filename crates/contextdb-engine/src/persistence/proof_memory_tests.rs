@@ -52,6 +52,13 @@ fn tree_height(database: &redb::Database) -> u32 {
     read_node(&nodes, family, root).unwrap().level
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn scan(
     database: &redb::Database,
     proof: &ProofMemory,
@@ -369,6 +376,13 @@ fn a_damaged_chunk_aborts_the_walk_and_changes_no_stored_byte() {
 /// copy is admitted before it is made and given back afterwards, and a budget
 /// that cannot hold them refuses instead of allocating.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
     let root = tempfile::tempdir().unwrap();
     // Keys far above one chunk, so every page walk resolves stored key blobs

@@ -418,6 +418,10 @@ async fn every_refused_unit_is_read_across_status_pages_before_any_reoffer() {
 
 const LINKS: &str = "CREATE TABLE links (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('HELD') SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn push_edge_payload(
     hub: &Hub,
     identity_path: &Path,

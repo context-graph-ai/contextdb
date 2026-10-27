@@ -8,6 +8,10 @@ use std::io::Write;
 
 const READER_LIMIT: u64 = 64 * 1024 * 1024;
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn factory() -> contextdb_core::Result<(
     contextdb_core::read_memory::ReadMemoryOwner,
     contextdb_engine::vector_read_memory::DeclaredReadRoot,

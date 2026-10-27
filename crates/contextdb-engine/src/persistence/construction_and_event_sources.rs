@@ -215,6 +215,13 @@ pub(crate) fn arm_policy_metadata_fault_for_test(boundary: u8, crash: bool) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn policy_metadata_checkpoint_for_test(boundary: u8) -> Result<()> {
     let crash = POLICY_METADATA_FAULT.with(|armed| {
         let (selected, crash) = armed.get();
@@ -237,6 +244,10 @@ pub(super) fn policy_metadata_checkpoint_for_test(boundary: u8) -> Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn stored_relational_row_bytes_fault_for_test() -> Result<()> {
     if STORED_ROW_BYTES_FAULT.with(|armed| armed.replace(false)) {
         return Err(Error::Other(
@@ -273,6 +284,13 @@ pub(crate) fn arm_currency_reclaim_fault_for_test(boundary: u8, crash: bool) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn currency_reclaim_checkpoint_for_test(boundary: u8) -> Result<()> {
     crate::read_work_probe::note_graph(
         "publication",
@@ -304,6 +322,13 @@ pub(super) fn currency_reclaim_checkpoint_for_test(boundary: u8) -> Result<()> {
 #[cfg(any(test, feature = "test-seams"))]
 impl RedbPersistence {
     /// Count physical durable keys without decoding bodies or building a mirror.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn durable_version_count_for_test(&self, name: &str) -> Result<usize> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -324,6 +349,13 @@ impl RedbPersistence {
 // 27..=31 compaction progress/vector/commit-directory/row-head/final binding;
 // 32..=34 imported scalar bounds/commit-directory/final binding.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn graph_observation_checkpoint(boundary: u8) -> Result<()> {
     retention_reclaim_checkpoint_for_test(boundary);
     currency_reclaim_checkpoint_for_test(boundary)

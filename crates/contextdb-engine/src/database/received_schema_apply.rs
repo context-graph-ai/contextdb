@@ -722,6 +722,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn project_received_schema_source_order(
         &self,
         ddl: &[DdlChange],
@@ -1213,6 +1220,13 @@ impl Database {
     // Preserve the existing private graph-accounting fixture door. Production
     // supplies its authentic working-source arguments to the implementation.
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn detached_received_schema_working_database(
         &self,
         projected_tables: &HashMap<String, TableMeta>,
@@ -6266,6 +6280,13 @@ impl Database {
 
     /// Test helper for the received-schema transaction-manager hand-off.
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn commit_received_schema_stage_for_test(
         &self,
         changes: &ChangeSet,
@@ -6796,6 +6817,13 @@ impl Database {
     /// Test-only received-schema bridge which carries the authenticated
     /// receipt and returns the detached adjudicator's committed outcome.
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn commit_received_schema_stage_with_receipt_for_test(
         &self,
         changes: &ChangeSet,

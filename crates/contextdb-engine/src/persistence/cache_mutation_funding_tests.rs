@@ -105,6 +105,13 @@ fn refused_cache_growth_keeps_the_old_declaration_capacity_and_charge() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn two_readers_share_the_declared_cache_through_capacity_changes() {
     let (_directory, reader) = reader(64 * 1024 * 1024, Some(2));
     let reader = std::sync::Arc::new(reader);

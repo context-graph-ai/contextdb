@@ -406,6 +406,13 @@ impl RedbPersistence {
     /// Production-dead: the growth step the writer's handle applies for a
     /// request of `required` bytes at `usable` bytes.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn growth_step_for_test(&self, usable: u64, required: u64) -> Result<Option<u64>> {
         let database = self.db.read().map_err(Self::storage_error)?;
         Ok(database
@@ -590,6 +597,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn fail_next_close_drain_for_test(&self) -> Result<()> {
         self.with_db(|db| {
             db.fail_next_deferred_free_commit_for_test();
@@ -598,6 +612,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn projected_disk_growth_bytes_for_test(&self) -> Result<u64> {
         let owner = self.writer_file.read().map_err(Self::storage_error)?;
         Ok(owner
@@ -1232,6 +1253,13 @@ impl RedbPersistence {
 
     /// Record what the owning database charged for this store's page cache.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn cache_index_bytes_for_test(&self) -> Result<usize> {
         self.with_db(|db| Ok(db.cache_index_bytes()))
     }

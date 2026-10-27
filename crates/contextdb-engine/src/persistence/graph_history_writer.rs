@@ -2194,6 +2194,10 @@ mod required_table_tests {
     /// This row proves the review's typed, noncreating point-check contract;
     /// the old name-only catalog scan accepts a wrong key/value type.
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn required_graph_tables_are_typed_point_probes_without_writes() {
         let dir = tempfile::tempdir().unwrap();
         let mut defects = Vec::new();

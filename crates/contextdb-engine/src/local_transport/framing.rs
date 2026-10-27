@@ -2604,6 +2604,13 @@ impl OrdinaryResultReceiver {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn preflight_canonical_result_for_test(
         bytes: &[u8],
         memory_ceiling: u64,
@@ -2613,6 +2620,13 @@ impl OrdinaryResultReceiver {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn decode_preflighted_canonical_result_for_test(
         bytes: &[u8],
         memory_ceiling: u64,

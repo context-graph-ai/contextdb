@@ -104,6 +104,10 @@ fn query(query: usize) -> HashMap<String, Value> {
     ])
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn find(db: &Database, ordinal: usize) -> Result<Vec<Uuid>, Error> {
     db.execute(FIND, &query(ordinal)).map(|result| ids(&result))
 }
@@ -166,6 +170,10 @@ fn seed(path: &std::path::Path, declared: &str) -> Vec<Vec<Uuid>> {
 
 /// A fresh file reader over the saved store, under the session memory limit
 /// given, and what it holds charged once open.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reader(path: &std::path::Path, memory_limit: Option<usize>) -> (ReadSession, usize) {
     let runtime = path.with_extension("runtime");
     std::fs::create_dir_all(&runtime).expect("create the reader runtime directory");
@@ -198,6 +206,10 @@ fn charged(session: &ReadSession) -> usize {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_declared_graph_degree_loads_when_its_memory_fits_and_is_refused_when_it_does_not() {
     let mut broken = Vec::new();
     for (label, declared) in [

@@ -103,6 +103,10 @@ fn insert_node(database: &Database, id: Uuid, name: &str) {
 
 /// Run `sql` with the store limited to what it is already holding plus
 /// `headroom`, then lift the limit again.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn under_headroom(
     database: &Database,
     accountant: &MemoryAccountant,

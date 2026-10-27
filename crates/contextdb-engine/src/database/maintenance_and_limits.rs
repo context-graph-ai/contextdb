@@ -324,6 +324,13 @@ impl Database {
     /// single-column index or a composite leading-column match.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __probe_constraint_check(
         &self,
         table: &str,
@@ -552,6 +559,13 @@ impl Database {
     /// interrupted allocator-state save leaves them until a recount.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __distrust_allocator_free_totals_for_test(&self) {
         let persistence = self.persistence.as_ref().expect("file fixture");
         persistence
@@ -639,6 +653,13 @@ impl Database {
     /// pages, trailing free pages)`; `None` while untrusted.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __allocator_free_totals_for_test(&self) -> Result<Option<(u64, u64, u64)>> {
         let persistence = self.persistence.as_ref().expect("file fixture");
         persistence.with_db(|db| Ok(db.allocator_free_totals()))
@@ -648,6 +669,13 @@ impl Database {
     /// free order)`, read from every allocator bitmap. Diagnostics only.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __allocator_regions_for_test(&self) -> Result<Vec<(u32, u32, u32, Option<u8>)>> {
         let persistence = self.persistence.as_ref().expect("file fixture");
         persistence.with_db(|db| Ok(db.region_free_pages_for_test()))
@@ -657,6 +685,13 @@ impl Database {
     /// lazy allocator source, and the last page it occupies.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __allocator_state_placement_for_test(&self) -> Result<(bool, Option<(u32, u32)>)> {
         let persistence = self.persistence.as_ref().expect("file fixture");
         persistence.with_db(|db| {
@@ -670,6 +705,13 @@ impl Database {
     /// recount of every allocator bitmap (which does not count as a rebuild).
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __allocator_free_page_ratios_for_test(&self) -> Result<(Option<f64>, f64)> {
         let persistence = self.persistence.as_ref().expect("file fixture");
         let maintained = persistence.allocator_free_page_ratio()?;
@@ -685,6 +727,13 @@ impl Database {
     /// the full statistics walk a diagnostic caller asks for.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __storage_fragmentation_ratio_for_test(&self) -> Result<Option<f64>> {
         self.persistence
             .as_ref()
@@ -827,6 +876,13 @@ impl Database {
     /// its handle carries (`None`: upstream's growth).
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __growth_step_bytes_for_test(&self, usable: u64, required: u64) -> Result<Option<u64>> {
         match self.persistence.as_ref() {
             Some(persistence) => persistence.growth_step_for_test(usable, required),
@@ -891,6 +947,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __rebuild_relational_indexes_from_durable_rows_for_test(
         &self,
         table: &str,
@@ -909,6 +972,13 @@ impl Database {
     /// file snapshots. This reads redb's deferred-free authority directly.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __external_snapshot_retention_for_test(
         &self,
     ) -> Result<
@@ -922,6 +992,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __external_snapshot_page_allocated_for_test(&self, page: [u8; 8]) -> Result<bool> {
         self.persistence
             .as_ref()
@@ -931,6 +1008,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __deferred_free_backlog_for_test(&self) -> Result<[(usize, usize); 2]> {
         self.persistence
             .as_ref()
@@ -940,6 +1024,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __fail_next_close_drain_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -949,6 +1040,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __fail_next_close_handoff_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -959,6 +1057,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __commit_storage_transaction_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -968,6 +1073,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __projected_disk_growth_bytes_for_test(&self) -> Result<u64> {
         self.persistence
             .as_ref()
@@ -1661,6 +1773,10 @@ impl Database {
     /// re-upload created by [`Database::change_retention_sync_peer`]. The
     /// target is durable and names the destination, so a failed or concurrent
     /// move cannot disable ordinary echo suppression toward another hub.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn destination_reupload_frontier(
         &self,
         tenant_id: &TenantId,
@@ -1726,6 +1842,10 @@ impl Database {
     sync_test_seam! {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn destination_reupload_epoch_identity_for_test(
         &self,
         tenant_id: &TenantId,
@@ -1887,6 +2007,13 @@ impl Database {
     /// ONLY` on (yet) — for example a vector-bearing table.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __compact_currency_versions_for_tables_for_test(
         &self,
         tables: &[&str],
@@ -1919,6 +2046,13 @@ impl Database {
     /// Production-dead: pure read-only observation, no behavior change.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __vector_and_graph_fingerprint_for_test(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -1985,6 +2119,13 @@ impl Database {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from historical_index_commitment.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub(super) fn verify_historical_indexes(
@@ -2059,6 +2200,13 @@ impl Database {
     /// pure read-only observation, no behavior change.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __vector_entry_count_for_test(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -2337,6 +2485,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __hold_engine_owned_vector_maintenance_clock_for_test(
         &self,
     ) -> Result<VectorMaintenanceWorkerClockGuardForTest> {
@@ -4567,6 +4722,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn inspect_captured_vector_suffix_for_test(
         &self,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -6074,6 +6236,13 @@ impl Database {
     /// put an operation under transient memory pressure.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn hold_writer_memory_for_test(&self, bytes: usize) -> Result<WriterMemoryHoldForTest> {
         Ok(WriterMemoryHoldForTest(
             crate::memory_accounting::OwnedMemoryReservation::try_new_for(
@@ -6135,6 +6304,13 @@ impl Database {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __visit_committed_change_and_ddl_members_for_test(
         &self,
         tx: contextdb_core::TxId,
@@ -7864,6 +8040,10 @@ impl Database {
     /// authoritative. The peer lock is shared with destination change, so an
     /// old-hub acknowledgement can land either wholly before the reset or be
     /// refused wholly after it, never restore a stale frontier in between.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_sync_push_watermark_for_hub(
         &self,
         tenant_id: &TenantId,
@@ -7989,6 +8169,10 @@ impl Database {
     /// Hub-bound form of the lost-ack marker writer. Destination change holds
     /// the same peer lock while clearing the old marker and rebinding, so an
     /// old response cannot recreate its reconciliation obligation afterward.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_sync_pending_push_confirmation_for_hub(
         &self,
         tenant_id: &TenantId,

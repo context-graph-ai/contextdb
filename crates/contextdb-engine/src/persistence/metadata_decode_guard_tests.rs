@@ -70,6 +70,13 @@ fn membership(index: VectorIndexRef, key: VectorPartitionKey) -> VectorPartition
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn short_authenticated_metadata_hints_are_rejected_before_the_serde_vec_reservation() {
     let (_directory, persistence) = writer();
     let index = VectorIndexRef::new("items", "v");
@@ -116,6 +123,13 @@ fn short_authenticated_metadata_hints_are_rejected_before_the_serde_vec_reservat
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn journal_inspection_covers_the_repeated_route_in_both_changes() {
     let (_directory, persistence) = writer();
     let index = VectorIndexRef::new("items", "v");
@@ -201,6 +215,13 @@ fn valid_catalog_attribution_borrows_all_route_types_and_rejects_invalid_suffixe
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn valid_metadata_keeps_both_journal_variants_and_unknown_catalog_inventory() {
     let (_directory, persistence) = writer();
     let index = VectorIndexRef::new("unknown-table", "v");
@@ -280,6 +301,13 @@ fn valid_metadata_keeps_both_journal_variants_and_unknown_catalog_inventory() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn malformed_and_misplaced_catalogs_keep_existing_inventory_attribution() {
     let (_directory, persistence) = writer();
     let index = VectorIndexRef::new("items", "v");

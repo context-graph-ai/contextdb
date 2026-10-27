@@ -69,6 +69,10 @@ struct ObservedRead {
     native_scores: u64,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn observed_read(
     session: &ReadSession,
     progress: &CompletedReads,
@@ -166,6 +170,10 @@ fn statement(table: &str, partitions: usize, mode: &str) -> (String, HashMap<Str
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn seed(path: &std::path::Path) {
     let db = Database::open(path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -227,6 +235,10 @@ fn seed(path: &std::path::Path) {
     panic!("maintenance did not publish the eight-pair saved graphs");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn fresh_reader_child(path: &std::path::Path) {
     let builds = Arc::new(BuildCounter(AtomicU64::new(0)));
     let progress = Arc::new(CompletedReads::default());

@@ -67,6 +67,10 @@ fn assert_edges(db: &Database, unrelated: u128, expired: bool) {
     }
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_grow() {
     let _clock = Wallclock::test_clock_guard(|| NOW);
     for expire in [false, true] {
@@ -231,6 +235,10 @@ fn ids(db: &contextdb_engine::Database, table: &str) -> BTreeSet<i64> {
         .collect()
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn retention_reclaims_both_expired_foreign_key_ends_across_finite_windows() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();

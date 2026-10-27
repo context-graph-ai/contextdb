@@ -492,6 +492,10 @@ fn a_cut_off_that_recurs_is_repaired_each_time_without_retuning() {
 /// released search's report is ignored -- the rebuilt graph stays ready. The
 /// same report about the graph that still serves sets it aside.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_report_landing_after_a_rebuild_sets_nothing_aside() {
     let db = Arc::new(Database::open_memory());
     live_fixture(&db);
@@ -593,6 +597,10 @@ fn partitioned_fixture(db: &Database) {
     panic!("maintenance did not publish every partition graph");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn partitioned(db: &Database, mode: &str, unlinked: &[u64]) -> Result<Run, Error> {
     let native = Arc::new(Counter(AtomicU64::new(0)));
     let graph = Arc::new(Counter(AtomicU64::new(0)));

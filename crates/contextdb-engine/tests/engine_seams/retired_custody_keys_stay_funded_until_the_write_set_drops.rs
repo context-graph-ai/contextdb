@@ -28,6 +28,10 @@ fn long_root_keys(edge: &Database) -> Vec<String> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn retire_all(edge: &Database, round: usize) -> Result<(), Error> {
     edge.execute(
         &format!("UPDATE {} SET body = $body", long_table()),

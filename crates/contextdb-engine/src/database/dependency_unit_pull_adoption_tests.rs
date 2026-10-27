@@ -114,6 +114,13 @@ fn identity(root: &tempfile::TempDir, name: &str) -> Arc<FabricIdentity> {
     )
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn lineage_entries(
     db: &Database,
     changes: &ChangeSet,

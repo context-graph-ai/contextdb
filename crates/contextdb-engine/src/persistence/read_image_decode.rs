@@ -3275,6 +3275,13 @@ pub(super) fn decode_read_open_config(
         reason = "KEEP-SEAM: live only under the test-seams feature; used from reader_registration.rs"
     )
 )]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn decode_read_trigger_audit_stamps(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(String, u64)>, LoadReadImageError> {
@@ -3352,6 +3359,13 @@ pub(super) fn decode_read_sink_queue_extents(
     allow(
         dead_code,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from reader_registration.rs"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
 pub(super) fn decode_read_sink_queues(
@@ -3462,6 +3476,13 @@ pub(super) fn read_row_relational_identifier(
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn compatibility_read_vector_projection(
     current_vectors: &HashMap<(VectorIndexRef, RowId), Vec<f32>>,
     table_meta: &HashMap<String, TableMeta>,

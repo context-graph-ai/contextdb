@@ -23,6 +23,13 @@ fn params(id: i64) -> HashMap<String, Value> {
         ("v".to_owned(), Value::Vector(vec![1.0, id as f32 / 100.0])),
     ])
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn insert(db: &Database, id: i64) -> contextdb_core::Result<contextdb_engine::QueryResult> {
     db.execute(
         "INSERT INTO items (id, embedding) VALUES ($id, $v)",
@@ -301,6 +308,13 @@ impl contextdb_core::read_memory::ReadMemoryBudget for ReaderBudget {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn captured_suffix_inspection_uses_actual_reader_and_root_without_resident_tail() {
     use crate::memory_accounting::MemoryAccountant;
     use std::sync::Arc;

@@ -60,6 +60,10 @@ fn vector(id: i64) -> Vec<f32> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn nearest(db: &Database, target: i64, mode: &str) -> Result<Vec<Vec<Value>>, Error> {
     db.execute(
         &format!(

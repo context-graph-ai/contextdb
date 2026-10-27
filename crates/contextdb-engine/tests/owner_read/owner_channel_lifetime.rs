@@ -72,10 +72,18 @@ fn short_route_options() -> ReadSessionOptions {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_against_silent_channel(path: &Path, runtime_root: &Path) -> Result<ReadSession> {
     open_against_silent_channel_after_first_waiter(path, runtime_root, || {})
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_against_silent_channel_after_first_waiter(
     path: &Path,
     runtime_root: &Path,
@@ -192,6 +200,10 @@ fn a_writer_that_stops_serving_takes_its_channel_down() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_startup_never_unlinks_a_live_channel_merely_because_its_name_exists() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "startup-live-channel-runtime");
@@ -298,6 +310,10 @@ fn writer_startup_never_unlinks_a_live_channel_merely_because_its_name_exists() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_owner_is_still_the_route_a_reader_selects() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "live-owner-runtime");
@@ -320,6 +336,10 @@ fn a_live_owner_is_still_the_route_a_reader_selects() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_writer_whose_published_channel_is_missing_is_never_reported_absent_or_read_around() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "missing-live-channel-runtime");
@@ -397,6 +417,10 @@ impl ReadSessionTestObserver for DistrustCompanionAfterOwnerDiscovery {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_published_owner_whose_channel_and_companion_become_unavailable_is_never_read_around() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "missing-indeterminate-runtime");
@@ -446,6 +470,10 @@ fn a_published_owner_whose_channel_and_companion_become_unavailable_is_never_rea
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_that_leaves_mid_session_is_answered_by_that_owner_not_by_the_file() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "mid-session-runtime");
@@ -481,6 +509,10 @@ fn an_owner_that_leaves_mid_session_is_answered_by_that_owner_not_by_the_file() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_reader_finding_nobody_listening_reads_the_idle_file() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "stale-channel-runtime");
@@ -629,6 +661,10 @@ fn a_silent_channel_cannot_route_around_a_live_writer_through_an_alias() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_dangling_symlink_never_routes_through_its_alias_companion() {
     let directory = tempfile::TempDir::new().expect("task-scoped dangling-alias directory");
     let runtime_root = secure_runtime_root(directory.path(), "dangling-alias-runtime");
@@ -678,6 +714,10 @@ fn a_dangling_symlink_never_routes_through_its_alias_companion() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_unlinked_store_name_never_routes_to_the_old_live_owner() {
     let directory = tempfile::TempDir::new().expect("task-scoped unlinked-store directory");
     let runtime_root = secure_runtime_root(directory.path(), "unlinked-store-runtime");
@@ -708,6 +748,10 @@ fn an_unlinked_store_name_never_routes_to_the_old_live_owner() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_untrusted_idle_companion_does_not_hide_an_existing_idle_store() {
     let directory = tempfile::TempDir::new().expect("task-scoped idle-companion directory");
     let runtime_root = secure_runtime_root(directory.path(), "idle-companion-runtime");
@@ -780,6 +824,10 @@ fn an_untrusted_companion_never_licenses_a_file_fallback() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn selecting_a_route_against_a_draining_owner_takes_none_of_its_capacity() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "draining-capacity-runtime");

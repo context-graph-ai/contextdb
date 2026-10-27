@@ -102,6 +102,10 @@ fn assert_first_page_refusal(fixture: &Fixture) {
     assert!(answered, "a statement budget that admits the pages answers");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn statement_reader(fixture: &Fixture, memory: usize) -> contextdb_core::Result<ReadSession> {
     ReadSession::with_runtime_directory_for_test(&fixture.runtime, || {
         ReadSession::open_with_options(
@@ -179,6 +183,10 @@ impl PagedVectorObserver for Fills {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn paged_find(selected: usize) -> (u64, u64, u64, u64) {
     let fixture = fixture();
     let reader = fresh_reader(fixture, paged_limit(fixture));
@@ -295,6 +303,10 @@ fn paged_load_pricing_replaces_per_layer_share_row() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn paged_find_charge_growth_tracks_filled_pages_not_present_pages() {
     let fixture = fixture();
     let limit = paged_limit(fixture);

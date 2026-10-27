@@ -128,6 +128,10 @@ fn answer_ids(answer: &contextdb_engine::QueryResult) -> Vec<i64> {
 /// can run routinely; vector unit guards do not exercise this read path.
 #[test]
 #[ignore = "requires the seeded 1,250-row, 768-dimension store built by an_exact_search_authenticates_pages_not_every_vector; fixture creation takes minutes and hundreds of megabytes"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_find_locks_its_serving_cache_once_per_page() {
     use std::os::unix::fs::PermissionsExt;
 

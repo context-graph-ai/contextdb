@@ -78,6 +78,10 @@ async fn stop_server(
     drop(server);
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

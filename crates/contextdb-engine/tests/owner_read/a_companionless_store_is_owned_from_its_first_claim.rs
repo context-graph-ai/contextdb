@@ -364,6 +364,10 @@ fn a_companionless_store_its_writer_holds_is_never_reported_unowned() {
 /// The same window, resolved: a caller already waiting when the writer
 /// publishes gets the writer's real answer, on the writer's own channel.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_caller_waiting_on_a_companionless_store_gets_the_writer_s_answer() {
     let directory = tempfile::TempDir::new().expect("task-scoped companion-less directory");
     let runtime_root = secure_runtime_root(directory.path(), "companionless-resolve-runtime");

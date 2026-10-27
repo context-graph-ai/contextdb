@@ -323,6 +323,10 @@ fn refusal_kind(result: Result<ReadSession>, context: &str) -> ReadFailureKind {
 /// An existing store, mid-handover. The previous run's record is the only
 /// thing published, and it describes a writer that is gone.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_claimed_store_carrying_a_previous_run_s_record_is_never_reported_unowned() {
     let directory = tempfile::TempDir::new().expect("task-scoped claim directory");
     let runtime_root = secure_runtime_root(directory.path(), "prior-run-runtime");
@@ -353,6 +357,10 @@ fn a_claimed_store_carrying_a_previous_run_s_record_is_never_reported_unowned() 
 /// The same window, resolved rather than expired: a caller that is already
 /// waiting when the writer publishes gets the writer's real answer.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_caller_inside_the_claim_gets_the_writer_s_answer_once_it_publishes() {
     let directory = tempfile::TempDir::new().expect("task-scoped claim directory");
     let runtime_root = secure_runtime_root(directory.path(), "resolves-runtime");
@@ -395,6 +403,10 @@ fn a_caller_inside_the_claim_gets_the_writer_s_answer_once_it_publishes() {
 /// A store being created. Nothing about it has ever been published, and the
 /// writer creating it owns it from its own first claim onwards.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_store_being_created_is_never_reported_unowned_while_its_writer_holds_it() {
     let directory = tempfile::TempDir::new().expect("task-scoped claim directory");
     let runtime_root = secure_runtime_root(directory.path(), "new-store-runtime");

@@ -14,6 +14,10 @@ use contextdb_engine::vector_read_memory::{
 use std::collections::HashMap;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn trigger_audit_history_is_charged_once_to_the_declared_reader() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("audit.db")).unwrap();

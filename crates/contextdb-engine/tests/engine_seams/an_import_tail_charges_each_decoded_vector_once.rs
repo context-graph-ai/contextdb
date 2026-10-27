@@ -786,6 +786,10 @@ fn an_import_interrupted_after_one_cohort_publishes_only_that_cohort_and_resumes
 
 /// Run `persist_import_vector_tails` in a child process that dies at the
 /// first cohort's publication `cut`, then prove what reopen and resume see.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn crash_at_the_first_cohort_publication(test: &str, cut: &str) {
     use contextdb_engine::writer_commit_test_seams::{CommitBoundary, observe};
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);

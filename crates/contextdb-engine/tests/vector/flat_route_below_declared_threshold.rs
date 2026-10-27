@@ -833,6 +833,10 @@ fn explain_predicts_the_flat_route_execution_takes() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_refused_explain_admission_leaves_no_charge_and_no_partial_prediction() {
     // EXPLAIN is charged to the store's declared reader memory, so each step
     // reopens the store with a larger declaration.

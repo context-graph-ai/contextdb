@@ -106,6 +106,13 @@ fn graphs(db: &Database) -> Vec<(Option<u64>, Option<u64>)> {
         })
         .collect()
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn physical_roots(db: &Database) -> BTreeMap<String, Option<Option<[u8; 32]>>> {
     let Some(persistence) = &db.persistence else {
         return BTreeMap::new();
@@ -135,6 +142,13 @@ fn physical_roots(db: &Database) -> BTreeMap<String, Option<Option<[u8; 32]>>> {
         })
         .unwrap()
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn authored_rows(db: &Database) -> Vec<(u64, u64, u64, serde_json::Value)> {
     let memory = db.declared_reader_memory().unwrap();
     let decode = crate::read_image_memory::ImageMemory::operation_reader(
@@ -170,6 +184,13 @@ fn authored_rows(db: &Database) -> Vec<(u64, u64, u64, serde_json::Value)> {
         })
         .collect()
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn declared_identity(db: &Database) -> Option<crate::direct_file_reader::DirectTypedImageDigest> {
     db.persistence.as_ref().map(|p| {
         p.with_db(|store| {
@@ -180,6 +201,13 @@ fn declared_identity(db: &Database) -> Option<crate::direct_file_reader::DirectT
         .unwrap()
     })
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_frontier(db: &Database) {
     if let Some(p) = &db.persistence {
         p.with_db(|store| {

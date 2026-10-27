@@ -2941,6 +2941,13 @@ impl ReadSession {
     /// observation enabled.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2962,6 +2969,13 @@ impl ReadSession {
     /// local-channel deadline with its manual clock.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_clock_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -2986,6 +3000,13 @@ impl ReadSession {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_clock_and_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3013,6 +3034,13 @@ impl ReadSession {
     /// with deterministic route observation enabled.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_owner_only_with_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3040,6 +3068,13 @@ impl ReadSession {
     /// the wait deadlines against it instead of against `Instant::now()`.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_owner_only_with_clock_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3063,6 +3098,13 @@ impl ReadSession {
     /// mismatched identity field to its real authentication boundary.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_owner_handshake_mismatch_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3085,6 +3127,13 @@ impl ReadSession {
     /// that can be called only from the selected backend's bounded kernel.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_kernel_observer_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -3106,6 +3155,13 @@ impl ReadSession {
     /// selection, request semantics or the runtime protocol.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn open_with_observations_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -4936,6 +4992,13 @@ impl ReadSession {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn route_resources_for_test(&self) -> Result<ReadRouteResourceSnapshot> {
         Ok(self.resources.snapshot())
     }
@@ -4951,6 +5014,13 @@ impl ReadSession {
     /// is selected, no channel is dialled, no backend is opened.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn route_resources_for_path_for_test(
         path: impl AsRef<Path>,
     ) -> Result<ReadRouteResourceSnapshot> {
@@ -5197,6 +5267,13 @@ impl ReadSession {
     /// draining listener is distinguishable from an unbound or stale path.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn probe_owner_status_for_test(
         path: impl AsRef<Path>,
         options: ReadSessionOptions,
@@ -7235,6 +7312,13 @@ trait OwnedCursorExecution: Send {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn file_resource_witness_for_test(
         &self,
     ) -> Result<Option<crate::direct_file_reader::DirectCursorResourceWitness>> {
@@ -7499,6 +7583,13 @@ impl ReadCursor {
     /// A remote owner cursor has no locally inspectable file-resource witness.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn file_resource_witness_for_test(
         &self,
     ) -> Result<Option<crate::direct_file_reader::DirectCursorResourceWitness>> {
@@ -7729,6 +7820,13 @@ pub(crate) fn owner_read_not_implemented_status() -> OwnerReadStatus {
 #[cfg(any(test, feature = "test-seams"))]
 impl ReadSession {
     #[cfg(all(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn with_direct_file_physical_context_for_test<T>(
         &self,
         action: impl FnOnce(
@@ -7754,6 +7852,13 @@ impl ReadSession {
     /// Use the Database already installed behind this session's execution
     /// target, preserving its captured root and fallible history capability.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __with_resident_history_for_test<T>(
         &self,
         operation: impl FnOnce(&Database) -> Result<T>,

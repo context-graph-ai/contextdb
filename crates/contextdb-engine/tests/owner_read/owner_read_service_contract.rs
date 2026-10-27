@@ -485,6 +485,10 @@ impl Harness {
         client
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn request(
         &self,
         connection: u8,
@@ -503,6 +507,10 @@ impl Harness {
         )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn request_with_handshake(
         &self,
         presented: LocalHandshake,
@@ -1316,6 +1324,10 @@ fn service_source_keeps_database_lifecycle_storage_and_raw_time_out_of_scope() {
     );
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prove_service_capacity_boundary(mut config: OwnerReadConfig, source: LocalConfigurationSource) {
     let handler = GatedHandler::default();
     config.handler = Some(Arc::new(handler.clone()));
@@ -1442,6 +1454,10 @@ fn shipped_default_four_and_raised_capacity_refuse_n_plus_one_without_queueing()
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn eof_hup_cancels_once_at_bounded_work_discards_publication_and_releases_every_resource() {
     let handler = GatedHandler::default();
     let observer = Arc::new(ProductionObserver::default());
@@ -1559,6 +1575,10 @@ fn eof_hup_cancels_once_at_bounded_work_discards_publication_and_releases_every_
     assert_resources(&harness.service, baseline);
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
     let handler = GatedHandler::default();
     let observer = Arc::new(ProductionObserver::default());
@@ -2919,6 +2939,10 @@ fn observed_cursor_harness(observer: Arc<ProductionObserver>) -> Harness {
     harness
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prove_disconnect_reaches_production_blocker(operation: OwnerBoundedOperation) {
     let observer = Arc::new(ProductionObserver::default());
     let harness = observed_cursor_harness(Arc::clone(&observer));
@@ -3012,6 +3036,10 @@ fn eof_hup_reaches_execute_open_and_fetch_production_blockers() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
     let observer = Arc::new(ProductionObserver::default());
     observer.state.0.lock().unwrap().record_budget = true;
@@ -3632,6 +3660,10 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closing_database() {
     let handler = GatedHandler::default();
     let observer = Arc::new(ProductionObserver::default());

@@ -4259,6 +4259,10 @@ fn typed_error_display_messages_describe_hidden_by_scope_with_actionable_phrasin
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn scoped_anchor_read_with_degenerate_input_returns_error_or_empty_no_panic() {
     let db = Database::open_memory();
     db.execute(
@@ -4288,6 +4292,10 @@ fn scoped_anchor_read_with_degenerate_input_returns_error_or_empty_no_panic() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typed_violation() {
     let db = Database::open_memory();
     db.execute(
@@ -4346,6 +4354,10 @@ fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typ
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
     let db = Database::open_memory();
     db.execute(
@@ -9554,6 +9566,10 @@ impl contextdb_engine::plugin::DatabasePlugin for PrvPluginCounters {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync() {
     let counters = Arc::new(PrvPluginCounters {
         pre_commit: std::sync::atomic::AtomicUsize::new(0),

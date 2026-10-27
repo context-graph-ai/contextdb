@@ -85,6 +85,10 @@ fn open_relay_hub() -> Database {
     hub
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_edge_with_widget_trigger() -> Database {
     let edge = Database::open_memory();
     edge.execute(
@@ -391,6 +395,10 @@ fn relay_hub_still_enforces_ddl_lsn_preflight() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn relay_apply_does_not_fabricate_trigger_cascade_rows() {
     let edge = Database::open_memory();
     edge.execute(
@@ -466,6 +474,10 @@ fn relay_apply_does_not_fabricate_trigger_cascade_rows() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
     let fabric = InProcessBroker::new();
     let tenant_id = "relay-trigger";

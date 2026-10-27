@@ -228,6 +228,13 @@ impl Commit {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn observed_commit(db: &Database, run: impl FnOnce()) -> Commit {
     let events = Arc::new(Mutex::new(BTreeMap::<String, BTreeMap<String, u64>>::new()));
     let keys = Arc::new(Mutex::new(BTreeMap::<(String, String, Vec<u8>), u64>::new()));
@@ -510,6 +517,13 @@ fn a_checkpointed_commit_finalizes_each_pending_root_once() {
 }
 
 /// The state a recovered store must show, read through the ordinary surface.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn fingerprint(db: &Database) -> Vec<String> {
     let mut lines = Vec::new();
     for sql in [

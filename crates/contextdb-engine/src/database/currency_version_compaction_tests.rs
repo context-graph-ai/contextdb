@@ -881,6 +881,13 @@ fn compaction_bounds_versions_and_change_log() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn changes_since_survives_reopen_after_compaction() {
     // Allowed graph history is complete, or extraction returns the original
     // metadata read failure after the preceding node histories were admitted.

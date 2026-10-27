@@ -33,6 +33,13 @@ fn record(
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn fixture(
     history: u64,
 ) -> (
@@ -121,6 +128,13 @@ fn fixed_journal_suffix_selection_does_not_examine_n_or_four_n_covered_records()
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn suffix_seek_includes_all_ordinals_and_excludes_later_cohorts() {
     let (_root, persistence, index, key) = fixture(64);
     let (lower, upper) = RedbPersistence::vector_partition_journal_suffix_bounds(
@@ -168,6 +182,13 @@ fn suffix_seek_includes_all_ordinals_and_excludes_later_cohorts() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn suffix_seek_still_authenticates_each_selected_record() {
     let (_root, persistence, index, key) = fixture(64);
     let physical = RedbPersistence::vector_partition_journal_key(&record(&index, &key, Lsn(65), 0));
@@ -203,6 +224,13 @@ fn suffix_seek_still_authenticates_each_selected_record() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn both_tail_loaders_and_delete_carrier_selection_seek_past_covered_history() {
     let work = [64, 256].map(|history| {
         let (_root, persistence, index, key) = fixture(history);

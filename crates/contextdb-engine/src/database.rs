@@ -1626,6 +1626,10 @@ const CROSS_PROCESS_LOCK_SETTLE_RETRY: Duration = Duration::from_millis(250);
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub trait DatabaseOpenInterceptor: Send + Sync {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn intercept(&self, path: &Path, options: &DatabaseOpenOptions) -> Result<Database>;
 }
 

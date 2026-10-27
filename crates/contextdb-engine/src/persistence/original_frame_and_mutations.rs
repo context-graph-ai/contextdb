@@ -3015,6 +3015,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
             reason = "KEEP-SEAM: live only under the test-seams feature; used from native_commit_paths.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn flush_received_schema_noop_ddl_for_test(
         &self,
         accountant: crate::memory_accounting::AccountantHandle,
@@ -4965,6 +4972,13 @@ impl RetainedReadSource {
 
 #[cfg(all(test, feature = "test-seams"))]
 impl RedbPersistence {
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn recycle_cache_handle_for_test(&self) -> Result<Option<u64>> {
         let mut handle = self.db.write().unwrap();
         self.recycle_database_handle(&mut handle)
@@ -4987,6 +5001,10 @@ impl RedbPersistence {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn install_source_fixture_cache_reserve_for_test(
     database: &redb::Database,
     accountant: &crate::memory_accounting::AccountantHandle,

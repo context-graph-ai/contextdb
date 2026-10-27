@@ -39,6 +39,10 @@ impl RejectingPlugin {
             reason: reason.to_string(),
         }
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reject(&self, at_hook: &str) -> Result<()> {
         if self.hook == at_hook {
             Err(Error::PluginRejected {

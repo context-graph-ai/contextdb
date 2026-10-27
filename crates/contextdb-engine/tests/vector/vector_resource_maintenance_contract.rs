@@ -63,6 +63,10 @@ fn declared_topology_changes_retained_graph_charge() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn in_memory_construction_leaves_same_partition_vector_writes_usable() {
     let db = Arc::new(Database::open_memory());
     seed(&db, 1, 4);
@@ -119,6 +123,10 @@ fn in_memory_construction_leaves_same_partition_vector_writes_usable() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn in_memory_construction_leaves_new_partition_vector_writes_usable() {
     let db = Arc::new(Database::open_memory());
     seed(&db, 1, 4);
@@ -238,6 +246,10 @@ fn in_memory_consolidation_keeps_an_active_old_snapshot_on_its_indexed_route() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn changing_the_poll_interval_returns_while_engine_maintenance_is_active() {
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -454,6 +466,10 @@ fn unlimited_memory_keeps_loaded_graphs_warm_across_search_and_idle_maintenance(
     );
 }
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn durable_build_admits_before_loading_and_reports_completed_work() {
     for phase in [
         VectorMaintenancePreparationPhaseForTest::LoadAuthoritativeRawVectors,
@@ -514,6 +530,10 @@ fn durable_build_admits_before_loading_and_reports_completed_work() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn dropping_a_sampled_vector_column_does_not_abort_cycle_closing() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(dir.path().join("dropped-mid-wake.db")).unwrap());
@@ -575,6 +595,10 @@ fn cell_text(result: &contextdb_engine::QueryResult, row: usize, column: &str) -
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn failed_partition_does_not_starve_actual_work_and_reports_active_progress() {
     for durable in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -736,6 +760,10 @@ fn replacement_refusal_precedes_workspace_and_keeps_the_serving_generation() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn delta_replay_and_generation_compaction_report_actual_work() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(dir.path().join("states.db")).unwrap());
@@ -883,6 +911,10 @@ fn selected_generation_id(status: &contextdb_vector::store::VectorGraphGeneratio
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
     let dir = tempfile::tempdir().unwrap();
     let calibration = Arc::new(Database::open(dir.path().join("calibration.db")).unwrap());

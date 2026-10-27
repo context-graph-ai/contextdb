@@ -69,6 +69,13 @@ impl Database {
     /// from.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn vector_serving_pending_inserts_for_test(
         &self,
         table: &str,
@@ -120,6 +127,13 @@ impl Database {
     /// phase, inserted points and frontier LSN.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn vector_build_progress_for_test(
         &self,
         table: &str,
@@ -152,6 +166,13 @@ impl Database {
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn vector_pending_counters_for_test(
         &self,
         table: &str,
@@ -309,6 +330,13 @@ impl MaintenanceContext {
     }
 
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn observe_import_cohort_load(
         &self,
         site: &'static str,
@@ -1235,6 +1263,13 @@ mod build_record_refusal_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn a_refused_build_record_decode_is_the_typed_refusal_and_leaves_the_build_intact() {
         let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
         let root = tempfile::tempdir().unwrap();

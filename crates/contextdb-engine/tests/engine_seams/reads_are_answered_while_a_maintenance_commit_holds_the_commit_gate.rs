@@ -153,6 +153,10 @@ fn fixture_with(serving: bool) -> Fixture {
 }
 
 /// A session that is answered by the serving owner over its channel.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_session(fixture: &Fixture) -> ReadSession {
     let root = fixture.owner_root.as_ref().expect("an owner fixture");
     let session = ReadSession::with_runtime_directory_for_test(root, || {
@@ -204,6 +208,10 @@ impl Held<'_> {
 
 /// Hold one maintenance commit of a real maintenance cycle at its commit gate,
 /// run `body` against it, then let the commit go.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn while_a_maintenance_commit_is_held<T>(
     database: &Arc<Database>,
     body: impl FnOnce(&Held<'_>) -> T,
@@ -272,6 +280,10 @@ fn rows_of(result: contextdb_core::Result<contextdb_engine::QueryResult>) -> Vec
 /// A relational point read is answered with the exact captured row, with no
 /// recorded commit-gate wait, while the commit is still held.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_point_read_is_answered_while_a_maintenance_commit_holds_the_commit_gate() {
     let fixture = fixture();
     let session = fixture
@@ -295,6 +307,10 @@ fn a_point_read_is_answered_while_a_maintenance_commit_holds_the_commit_gate() {
 /// A graph read is answered with the exact captured edge under the same
 /// conditions.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_graph_read_is_answered_while_a_maintenance_commit_holds_the_commit_gate() {
     let fixture = fixture();
     let session = fixture
@@ -326,6 +342,10 @@ fn a_graph_read_is_answered_while_a_maintenance_commit_holds_the_commit_gate() {
 /// A cursor opened before the commit is held continues, page by page, from its
 /// own captured view while the commit is held.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_cursor_continues_while_a_maintenance_commit_holds_the_commit_gate() {
     let fixture = fixture();
     let session = fixture
@@ -362,6 +382,10 @@ fn a_cursor_continues_while_a_maintenance_commit_holds_the_commit_gate() {
 /// authoritative-erasure failure, never served, and its refusal needs no wait on
 /// the commit gate while the commit is held.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_result_captured_before_a_purge_is_refused_as_erased_while_a_maintenance_commit_is_held() {
     let fixture = fixture();
     let session = fixture
@@ -409,6 +433,10 @@ fn a_result_captured_before_a_purge_is_refused_as_erased_while_a_maintenance_com
 /// write and before its memory publication sees exactly the state before that
 /// commit, and records no wait on the commit gate.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_read_beside_a_writer_held_before_its_memory_publication_sees_the_old_state() {
     let fixture = fixture();
     let session = fixture
@@ -521,6 +549,10 @@ fn a_cursor_never_substitutes_a_newer_state_into_a_later_page() {
 
 /// The same point read, answered by the serving owner over its channel.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_answers_a_point_read_while_a_maintenance_commit_holds_the_commit_gate() {
     let fixture = owner_fixture();
     let session = owner_session(&fixture);
@@ -537,6 +569,10 @@ fn an_owner_answers_a_point_read_while_a_maintenance_commit_holds_the_commit_gat
 
 /// The same graph read, answered by the serving owner.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_answers_a_graph_read_while_a_maintenance_commit_holds_the_commit_gate() {
     let fixture = owner_fixture();
     let session = owner_session(&fixture);
@@ -564,6 +600,10 @@ fn an_owner_answers_a_graph_read_while_a_maintenance_commit_holds_the_commit_gat
 /// the commit is held: it samples the committed log position without waiting
 /// for the gate.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_answers_a_metadata_request_while_a_maintenance_commit_holds_the_commit_gate() {
     let fixture = owner_fixture();
     let session = owner_session(&fixture);
@@ -581,6 +621,10 @@ fn an_owner_answers_a_metadata_request_while_a_maintenance_commit_holds_the_comm
 /// An EXPLAIN is answered by the owner while the commit is held, naming the plan
 /// of the statement without running it.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_answers_an_explain_while_a_maintenance_commit_holds_the_commit_gate() {
     let fixture = owner_fixture();
     let session = owner_session(&fixture);

@@ -10,11 +10,19 @@ use contextdb_server::InProcessBroker;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn try_unit(db: &Database, unit: usize) -> contextdb_core::Result<()> {
     let tx = stage_unit(db, unit)?;
     db.commit(tx)
 }
 /// Rows and registration staged in one transaction, not yet committed.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_unit(db: &Database, unit: usize) -> contextdb_core::Result<contextdb_core::TxId> {
     let tx = db.begin()?;
     db.insert_row(

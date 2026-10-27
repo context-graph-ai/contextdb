@@ -197,6 +197,10 @@ fn describe_miss(id: i64, distance: f64, traces: &[UnionWalkTrace]) -> String {
 
 #[test]
 #[ignore = "diagnostic: run explicitly with --ignored"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn multi_partition_union_recall_beam_diagnostic() {
     let base = env_usize("UNION_RECALL_QUERY_BASE", 10_000_000);
     let queries = env_usize("UNION_RECALL_QUERIES", 100);

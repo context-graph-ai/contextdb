@@ -2110,6 +2110,13 @@ impl BlobStoreHandle {
     /// original Bao proof. A changed final leaf exercises verification after
     /// the complete payload has crossed the transport.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn arm_tamper(&self, claimed: &[u8; 32], bytes: &[u8]) -> Result<()> {
         let hash = to_backend_hash(claimed);
         let len = bytes.len() as u64;

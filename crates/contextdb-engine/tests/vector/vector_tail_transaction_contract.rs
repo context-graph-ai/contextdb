@@ -21,6 +21,10 @@ fn params(id: i64) -> HashMap<String, Value> {
         ("v".to_owned(), Value::Vector(vec![1.0, id as f32 / 100.0])),
     ])
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert(db: &Database, id: i64) -> contextdb_core::Result<contextdb_engine::QueryResult> {
     db.execute(
         "INSERT INTO items (id, embedding) VALUES ($id, $v)",
@@ -248,6 +252,10 @@ fn sync_current_identity_admission_refuses_rows_vectors_and_the_authenticated_re
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn declared_topology_and_search_breadth_reach_captured_suffixes_without_a_resident_tail() {
     let root = TempDir::new().unwrap();
     let path = root.path().join("policy.db");

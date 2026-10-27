@@ -25,6 +25,10 @@ fn bucket() -> std::collections::HashMap<String, Value> {
 
 /// Open a session over a store whose writer is still open, and over the
 /// same population with no writer, and hand both to `read`.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn on_both_backings(read: fn(&ReadSession) -> contextdb_core::Result<()>) -> super::Outcome {
     let live = Store::open();
     let (_dir, closed) = Store::closed();
@@ -36,6 +40,10 @@ fn on_both_backings(read: fn(&ReadSession) -> contextdb_core::Result<()>) -> sup
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn rows() -> Vec<Row> {
     vec![
         Row {

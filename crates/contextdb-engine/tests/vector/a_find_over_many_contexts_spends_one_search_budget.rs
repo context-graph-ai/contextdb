@@ -259,6 +259,10 @@ fn measure(path: &std::path::Path, runtime: &std::path::Path, selected: usize) -
 /// The same read under a caller-declared memory budget, so a proof can say what
 /// a find does when its partitions' graphs do not all fit at once.
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn measure_within(
     path: &std::path::Path,
     runtime: &std::path::Path,
@@ -439,6 +443,10 @@ fn a_warm_find_over_many_contexts_reads_no_graph_twice() {
 /// same number at both scopes, with opening the layers a floor on top.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn expansion_work_does_not_grow_with_context_count() {
     use contextdb_vector::hnsw::with_union_search_receipts;
     use std::os::unix::fs::PermissionsExt;
@@ -538,6 +546,10 @@ fn expansion_work_does_not_grow_with_context_count() {
 /// all 100,000 passages past the time ceiling.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn opening_more_layers_never_shrinks_the_walk() {
     use contextdb_vector::hnsw::with_union_search_receipts;
     use std::os::unix::fs::PermissionsExt;
@@ -623,6 +635,10 @@ fn opening_more_layers_never_shrinks_the_walk() {
 /// silently skipping layers.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_exhausted_budget_refuses_and_never_truncates() {
     use contextdb_vector::hnsw::with_union_search_receipts;
     use std::os::unix::fs::PermissionsExt;
@@ -719,6 +735,10 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
 /// that there is no remaining eligible row before returning a short page.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -817,6 +837,10 @@ fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
 /// breadth, but enough farther points must refill the requested page.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn rejected_neighbours_refill_the_page_on_both_routes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1040,6 +1064,10 @@ fn wait_for_kernel_cancellation(token: &OwnerReadCancellation) {
 /// replacement work, on the selected backend of each public read route.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancellation_after_residual_rejection_restores_memory_on_both_routes() {
     use std::os::unix::fs::PermissionsExt;
 

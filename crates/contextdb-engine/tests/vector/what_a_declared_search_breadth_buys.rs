@@ -164,6 +164,10 @@ fn params(query: &[f32]) -> HashMap<String, Value> {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_reader(path: &std::path::Path, runtime: &std::path::Path) -> ReadSession {
     let reader = ReadSession::with_runtime_directory_for_test(runtime, || {
         ReadSession::open_with_options(
@@ -230,6 +234,10 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
             populations -- about a minute per population and mutating by design. There is no \
             property here to twin: every number it prints is an observation, and nothing about \
             it passes or fails."]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn what_a_declared_search_breadth_buys() {
     use std::os::unix::fs::PermissionsExt;
 

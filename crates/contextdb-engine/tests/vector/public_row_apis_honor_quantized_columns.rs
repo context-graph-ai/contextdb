@@ -217,6 +217,10 @@ fn a_no_op_upsert_leaves_the_store_exactly_as_it_was() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_refused_upsert_leaves_nothing_staged_and_nothing_charged() {
     let directory = tempfile::TempDir::new().expect("task-scoped row-api directory");
     let database = Database::open(directory.path().join("refused.db")).expect("create the store");

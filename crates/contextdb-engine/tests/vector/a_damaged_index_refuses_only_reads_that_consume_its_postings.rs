@@ -136,6 +136,10 @@ fn reader(path: &std::path::Path) -> ReadSession {
     .expect("the reader opens over index damage")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ids(
     result: contextdb_core::Result<contextdb_engine::QueryResult>,
 ) -> contextdb_core::Result<Vec<i64>> {
@@ -153,6 +157,10 @@ fn ids(
 
 /// The find whose candidates are proved by canonical descents only: it names
 /// whole partition pairs and never reads a physical posting.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn whole_pair(reader: &ReadSession, partition: usize) -> contextdb_core::Result<Vec<i64>> {
     ids(reader.execute(
         &format!(
@@ -169,6 +177,10 @@ fn whole_pair(reader: &ReadSession, partition: usize) -> contextdb_core::Result<
 
 /// The find that proves candidates through a window over the index's
 /// physical postings.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn window(
     reader: &ReadSession,
     partition: usize,
@@ -370,6 +382,10 @@ fn reads_that_do_not_consume_the_damaged_postings_answer() {
 /// find included; a write into the damaged index refuses and changes no
 /// witness.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn row_table_damage_and_writes_into_a_damaged_index_still_refuse() {
     let (_root, rows_damaged) = damaged_store("rows.db", |path| {
         damage_relational_row_table_for_test(path, "scoped_rows").expect("damage the row table");

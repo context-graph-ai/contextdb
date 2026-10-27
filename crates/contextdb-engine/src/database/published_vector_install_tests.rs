@@ -33,6 +33,13 @@ pub(super) fn maybe_pause_before_install(accountant: &crate::memory_accounting::
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_journal() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("published-install-refusal.db");

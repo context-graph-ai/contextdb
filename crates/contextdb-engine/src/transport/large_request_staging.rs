@@ -498,6 +498,10 @@ pub(super) fn fragment_count(total_bytes: usize) -> usize {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn accept_descriptor_fragment(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -544,6 +548,10 @@ pub(super) fn accept_descriptor_fragment_admitted(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn accept_fragment(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -564,6 +572,10 @@ pub(super) fn accept_fragment(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn begin_request(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -702,6 +714,13 @@ fn remove_completed_stage_at_root(
 }
 
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn snapshot_stage(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -811,6 +830,13 @@ pub(super) fn snapshot_stage(
 /// endpoint's private staging root. This is test-only observability: it never
 /// exposes a stage path or changes staged media.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn snapshot_all_stages(stage_root: &Path) -> TransportResult<Vec<StageSnapshot>> {
     let mut snapshots = Vec::new();
     let Some(root) = stage_root_dir_optional(stage_root)? else {
@@ -827,6 +853,13 @@ pub(super) fn snapshot_all_stages(stage_root: &Path) -> TransportResult<Vec<Stag
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn snapshot_all_stages_at(
     directory: &StageDir,
     depth: usize,
@@ -2288,6 +2321,13 @@ fn stage_dir_from_root(
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn stage_dir_optional_from_root(
     root: &StageDir,
     root_path: &Path,
@@ -2768,6 +2808,10 @@ impl LargeResponseManifest {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn stage_large_response(
     root: &Path,
     authenticated_node_id: &str,
@@ -2822,6 +2866,10 @@ struct ResponseStageAdmission<'a> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stage_large_response_with_nonce(
     root: &Path,
     authenticated_node_id: &str,
@@ -3230,6 +3278,13 @@ pub(super) fn release_large_response(
 /// Test-seam-only receipt inspection, performed while the response-stage lock
 /// is held by the caller so the observation has no completion race.
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn response_completion_receipt_exists(
     root: &Path,
     manifest: &LargeResponseManifest,
@@ -3533,6 +3588,13 @@ fn reserve_response_stage_budget(
 /// deliberately unavailable in production builds: it must not become a
 /// transport control surface.
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn response_stage_counts(root: &Path) -> TransportResult<(usize, usize)> {
     let Some(root_dir) = stage_root_dir_optional(root)? else {
         return Ok((0, 0));
@@ -3854,6 +3916,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_create_directory_and_chmod_stay_in_the_original_tree() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3921,6 +3987,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_request_response_and_receipt_publication_stay_in_the_original_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");
@@ -4049,6 +4119,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_response_read_uses_the_original_stage_after_a_visible_swap() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");
@@ -4089,6 +4163,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_request_and_response_cleanup_never_delete_the_swapped_outside_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");
@@ -4180,6 +4258,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(safe_fs_pause)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pinned_parent_pressure_eviction_cannot_follow_a_swapped_visible_ancestor() {
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside");

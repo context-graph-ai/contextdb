@@ -36,6 +36,13 @@ fn storage_error(error: impl Into<redb::Error>) -> Error {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn oversized_generation_source_is_refused_before_backend_read_with_exact_error() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -85,6 +92,13 @@ fn oversized_generation_source_is_refused_before_backend_read_with_exact_error()
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn oversized_source_charge_outlives_scope_and_releases_with_last_page_handle() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -109,6 +123,13 @@ fn oversized_source_charge_outlives_scope_and_releases_with_last_page_handle() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn cached_source_hands_charge_to_fixed_cache_and_nested_scope_restores_callback() {
     let (_directory, db) = fixture(16 * 1024);
     let read = db.begin_read().unwrap();
@@ -163,6 +184,13 @@ fn cached_source_hands_charge_to_fixed_cache_and_nested_scope_restores_callback(
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn concurrent_source_reads_share_writer_budget_without_releasing_held_page() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -209,6 +237,13 @@ fn concurrent_source_reads_share_writer_budget_without_releasing_held_page() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn caught_source_refusal_preserves_success_and_unrelated_errors() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -252,6 +287,13 @@ fn caught_source_refusal_preserves_success_and_unrelated_errors() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -329,6 +371,13 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
 
 #[test]
 #[serial_test::serial(vector_journal_cleanup_pause)]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn source_refusal_after_durable_publication_keeps_built_count_and_cleanup_detail() {
     // The existing cleanup pause is process-wide. Isolate this case so a
     // parallel sibling maintenance fixture cannot reach its cut first.
@@ -555,6 +604,13 @@ fn source_refusal_after_durable_publication_keeps_built_count_and_cleanup_detail
 /// image-page refusal after its enclosing visitor returns, so the public
 /// query result observed inside that visitor loses the typed payload.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn foreground_projection_query_preserves_page_refusal_before_the_admission_scope_returns() {
     use crate::{Database, DatabaseOpenOptions, MaintenancePolicy};
     use contextdb_core::Value;
@@ -643,6 +699,13 @@ fn foreground_projection_query_preserves_page_refusal_before_the_admission_scope
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn source_page_callback_returns_original_refusal_in_storage_carrier() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -778,6 +841,13 @@ fn assert_exact_source_fields(error: &Error, refusal: contextdb_core::read_memor
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn tiny_source_budgets_refuse_bootstrap_without_entering_the_payload() {
     for ceiling in [1, 3, 7] {
         let accountant = Arc::new(MemoryAccountant::with_budget(ceiling));
@@ -810,6 +880,13 @@ fn tiny_source_budgets_refuse_bootstrap_without_entering_the_payload() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn funded_source_preparation_preserves_exact_tiny_payload_causes() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -848,6 +925,13 @@ fn funded_source_preparation_preserves_exact_tiny_payload_causes() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn allocator_null_and_backend_causes_are_distinct_from_source_budget_refusal() {
     let layout = std::alloc::Layout::new::<SourceRefusalBlock>();
     let error = storage_error(redb::StorageError::Native(
@@ -890,6 +974,13 @@ pub(super) fn observe_source_charge_allocation(charge: &SourcePageCharge) {
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn source_charge_box_keeps_its_genuine_control_invoice_through_system_free() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     let (_directory, db) = fixture(GRAPH_BYTES);
@@ -939,6 +1030,13 @@ fn source_charge_box_keeps_its_genuine_control_invoice_through_system_free() {
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn prepaid_callback_bootstrap_refusal_reports_the_actual_first_allocation_phase() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     // Warm the inherited TLS stack outside the observed allocation window.
@@ -983,6 +1081,13 @@ fn prepaid_callback_bootstrap_refusal_reports_the_actual_first_allocation_phase(
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn source_bootstrap_allocator_null_rolls_back_its_genuine_prepaid_invoice() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     let accountant = Arc::new(MemoryAccountant::with_budget(PREPARATION_BUDGET));
@@ -1008,6 +1113,13 @@ fn source_bootstrap_allocator_null_rolls_back_its_genuine_prepaid_invoice() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_caught_source_refusal_does_not_replace_a_successful_classification() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -1033,6 +1145,13 @@ fn a_caught_source_refusal_does_not_replace_a_successful_classification() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_caught_source_refusal_does_not_replace_the_original_unrelated_error() {
     let (_directory, db) = fixture(GRAPH_BYTES);
     let read = db.begin_read().unwrap();
@@ -1050,6 +1169,13 @@ fn a_caught_source_refusal_does_not_replace_the_original_unrelated_error() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn source_page_control_refusal_preserves_the_first_cause_after_payload_admission() {
     use contextdb_core::read_memory::NativeRefusal;
     let (_directory, db) = fixture(GRAPH_BYTES);

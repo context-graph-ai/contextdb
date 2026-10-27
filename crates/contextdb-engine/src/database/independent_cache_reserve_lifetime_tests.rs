@@ -73,6 +73,13 @@ fn source_invoice(page: &redb::CachePageForTest) -> usize {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn physical_parent_row(residue: bool, recycle: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("physical-reserve.db");

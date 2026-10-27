@@ -116,6 +116,10 @@ fn reader(path: &std::path::Path, memory: Option<u64>) -> ReadSession {
     ReadSession::open_with_options(path, options).expect("the reader opens over any page damage")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn find(reader: &ReadSession, scope: Uuid, query: Vec<f32>) -> contextdb_core::Result<Vec<Uuid>> {
     reader
         .execute(
@@ -258,6 +262,10 @@ fn a_healthy_route_is_verified_once_per_load_with_its_actual_page_set() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_reader_without_memory_for_the_verification_window_is_refused_before_loading() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("paged-verify-budget.redb");
@@ -291,6 +299,10 @@ fn a_reader_without_memory_for_the_verification_window_is_refused_before_loading
 /// per-route roots. Damage to the schema metadata bound beside it still
 /// refuses every paged route; it is never served as a page-only mismatch.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn schema_metadata_damage_is_not_treated_as_page_damage() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("paged-schema-damage.redb");

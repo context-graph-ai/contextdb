@@ -5994,6 +5994,13 @@ impl ContinuationBytes {
 pub const PENDING_INDEX_RUNS: &str = "pending index runs";
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn continuation_bytes_breakdown(
     node: &PullNode,
 ) -> std::result::Result<ContinuationBytes, BoundedExecutionError> {
@@ -6026,6 +6033,13 @@ fn continuation_bytes_breakdown(
 /// reads the same fields the settlement reads, so a part named here is the
 /// part the settlement counted.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn collect_continuation_parts(
     node: &PullNode,
     pending_runs: &mut usize,
@@ -20101,6 +20115,13 @@ impl CursorState {
     /// What this cursor is holding right now, part by part -- the same walk
     /// the settlement above is computed from.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn continuation_bytes(
         &self,
     ) -> std::result::Result<ContinuationBytes, BoundedExecutionError> {

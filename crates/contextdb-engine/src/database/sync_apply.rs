@@ -327,6 +327,13 @@ impl Database {
     /// by sync before the private received context is created.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn apply_received_schema_for_test(
         &self,
         changes: ChangeSet,
@@ -395,6 +402,10 @@ impl Database {
     /// `ConflictPolicy::LatestWins`.
     /// Engine-internal synced apply primitive. The public sync façade has no
     /// way to supply either policy maps or progress state.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply_synced_changes(
         &self,
         changes: ChangeSet,
@@ -415,6 +426,10 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_synced_changes_with_read_memory(
         &self,
         changes: ChangeSet,
@@ -496,6 +511,13 @@ impl Database {
     /// ordinary apply path.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn apply_authenticated_received_changes_with_lineages(
         &self,
         changes: ChangeSet,
@@ -610,6 +632,10 @@ impl Database {
     sync_test_seam! {
     #[cfg(any(test, feature = "test-seams"))]
     /// Engine-internal authenticated push apply primitive.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply_synced_changes_with_receipt(
         &self,
         changes: ChangeSet,
@@ -632,6 +658,10 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_synced_changes_with_receipt_with_read_memory(
         &self,
         changes: ChangeSet,
@@ -682,6 +712,13 @@ impl Database {
 
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn apply_authenticated_received_changes_with_receipt_and_lineages(
         &self,
         changes: ChangeSet,

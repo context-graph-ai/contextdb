@@ -194,6 +194,10 @@ fn alter_hnsw(db: &Database, members: &str) {
     .expect("declared HNSW policy updates atomically");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn captured_topology(db: &Database) -> u64 {
     db.inspect_captured_vector_suffix_for_test(
         &partition(),

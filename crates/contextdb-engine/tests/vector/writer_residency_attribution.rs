@@ -308,6 +308,10 @@ fn concurrent_deletes_retire_one_staged_admission() {
     );
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOnceOutcome, usize) {
     let db = Arc::new(Database::open_memory());
     db.execute(

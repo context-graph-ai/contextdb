@@ -301,6 +301,13 @@ fn adapted_probe(request: &BoundedReadRequest) -> Option<Arc<dyn BoundedExecutio
 }
 
 /// Run one complete bounded ordinary read through the production kernel seam.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub fn execute(db: &Database, request: &BoundedReadRequest) -> Result<TestResult, TestError> {
     execute_bounded(
         db,
@@ -326,6 +333,13 @@ pub fn execute(db: &Database, request: &BoundedReadRequest) -> Result<TestResult
 }
 
 /// Open a cursor and receive its required first page.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub fn open_cursor(
     db: Arc<Database>,
     request: &BoundedReadRequest,
@@ -363,6 +377,13 @@ pub fn open_cursor(
 
 impl TestCursor {
     /// Fetch a bounded page without rerunning the SQL statement.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,

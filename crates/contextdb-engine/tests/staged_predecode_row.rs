@@ -52,6 +52,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_file_backed_received_migration_refuses_an_oversized_row_before_decoding_it() {
     const ROW_BYTES: usize = 12 * 1024 * 1024;
     const HEADROOM: usize = 1024 * 1024;

@@ -134,6 +134,13 @@ impl OwnerAdmission {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn try_acquire_with_post_reservation_hook_for_test(
         self: &Arc<Self>,
         effective_limits: ReadLimits,

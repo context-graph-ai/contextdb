@@ -68,6 +68,13 @@ fn membership_payload(encoded: &[u8]) -> &[u8] {
 }
 
 // Never opens the maintained byte-total table or calls its pricing helper.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn physical_oracle(database: &Database, names: &[&str]) -> BodyBytes {
     let snapshot = database.snapshot();
     let live_rows = names
@@ -294,6 +301,13 @@ fn file_content_totals_match_persisted_values_through_replacement_delete_and_pru
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn content_size_reads_one_total_per_table_at_fixed_table_count() {
     let mut observations = Vec::new();
     for rows in [32, 64] {
@@ -366,6 +380,13 @@ fn content_size_reads_one_total_per_table_at_fixed_table_count() {
     assert!(observations[1].2.retained_vectors > observations[0].2.retained_vectors);
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_received_disjoint_file_export_restore() {
     use crate::persistence::VectorPartitionMembershipRecord;
     let directory = tempfile::tempdir().expect("file-backed disjoint placement fixture");
@@ -590,6 +611,13 @@ fn assert_received_disjoint_file_export_restore() {
 
 // Compare complete durable images, including retired canonical bodies and closed
 // placement records, rather than reconstructing body identity from live rows.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn canonical_and_membership_image(database: &Database) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
     database
         .persistence

@@ -144,6 +144,13 @@ fn owner_cursor_persistence_guard_contention_refuses_before_lock_release() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn owner_cursor_refresh_contention_refuses_before_refresh_release() {
     if crate::test_process::rerun_alone(
         module_path!(),
@@ -372,6 +379,13 @@ fn owner_cursor_provider_contention_retains_and_admits() {
 // after its native capture ends: the older admitted reader still fences every
 // page the later snapshot can address. Exercise the real registration and
 // owner-admission doors without requiring a probabilistic reader overlap.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn newer_registered_root_is_protected_by_an_older_admitted_reader(native_floor: bool) {
     let (_directory, persistence, runtime) = writer();
     let OwnerCursorStoragePin {
@@ -602,6 +616,13 @@ fn replaced_provider_scan_registry_is_a_terminal_typed_refusal() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn poisoned_owner_cursor_refresh_is_a_terminal_typed_coordination_refusal() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -752,6 +773,13 @@ enum MaintenanceContention {
 // These extend the owner-admission schedules; the real caller
 // must distinguish temporary contention from permission to reclaim pages.
 #[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn maintenance_contention_row(contention: MaintenanceContention, retention: bool) {
     use super::read_persistence_test_scaffold::{
         ReaderRegistrationLockPhase, pause_reader_registration_lock_for_test,

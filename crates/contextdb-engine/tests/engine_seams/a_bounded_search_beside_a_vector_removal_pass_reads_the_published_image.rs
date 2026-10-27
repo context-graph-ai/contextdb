@@ -96,6 +96,10 @@ enum Progress {
     Finished(ReadOutcome),
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_beside_a_removal_pass_held_at(boundary: CommitBoundary) {
     let directory = tempfile::tempdir().expect("scratch directory");
     let database = indexed_store(&directory.path().join("store.db"));

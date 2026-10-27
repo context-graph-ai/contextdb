@@ -182,6 +182,13 @@ fn graph_neighbors(db: &Database, node: Uuid, direction: Direction) -> BTreeSet<
     .collect()
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn row_graph_owner(db: &Database, row_id: RowId) -> Option<contextdb_tx::RowEdgeOwner> {
     let memory = db
         .declared_reader_memory()
@@ -204,6 +211,13 @@ fn row_graph_owner(db: &Database, row_id: RowId) -> Option<contextdb_tx::RowEdge
 
 // Consult the captured physical graph root with the SAVED exact row owner,
 // never look up a deleted owning row and mistake None for absent adjacency.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_saved_row_witnesses(
     db: &Database,
     fixture: &Fixture,
@@ -260,6 +274,13 @@ fn assert_saved_row_witnesses(
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn standalone_copies(
     db: &Database,
     source: Uuid,
@@ -421,6 +442,13 @@ fn assert_owned_copies_equal_after_reopen(before: &OwnedCopies, after: &OwnedCop
     );
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
     let vectors = vector_row_ids(db);
     let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
@@ -606,6 +634,13 @@ fn fixture_seed() -> FixtureSeed {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
     let db = &seed.db;
     let selected = seed.selected;
@@ -1574,6 +1609,13 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
@@ -1816,6 +1858,13 @@ impl contextdb_core::read_contract::DeadlineClock for FrozenPublicationClock {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn adoption_excludes_an_explicit_reader(group: AdoptionGroup) {
     use crate::writer_commit_test_seams::{self, CommitBoundary};
     let directory = tempfile::tempdir().unwrap();

@@ -14,6 +14,13 @@ fn explicit_relocation_progresses_with_live_storage_reads_and_waiting_recordings
     assert_online_compaction(true);
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_online_compaction(explicit: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("overlap.redb");

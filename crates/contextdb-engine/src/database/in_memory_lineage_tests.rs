@@ -100,6 +100,13 @@ fn identity(root: &tempfile::TempDir, name: &str) -> Arc<FabricIdentity> {
     )
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn lineages(
     db: &Database,
     changes: &ChangeSet,
@@ -172,6 +179,13 @@ fn lineage_entries(
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn committed_memory_creation_binds_once_across_retry_and_update() {
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = TenantId::from("memory-lineage");
@@ -387,6 +401,13 @@ fn rolled_back_memory_creation_publishes_no_lineage_state() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = TenantId::from("memory-relay-lineage");
@@ -545,6 +566,13 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_memory_schema_then_row_relay_forwards_creator_generation() {
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = TenantId::from("memory-received-schema-relay");
@@ -1324,6 +1352,13 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() {
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = TenantId::from("received-alter-fresh-creator-delete");
@@ -1477,6 +1512,13 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn fresh_creator_delete_race_errors_without_advancing_its_receipt() {
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = TenantId::from("fresh-creator-delete-commit-race");

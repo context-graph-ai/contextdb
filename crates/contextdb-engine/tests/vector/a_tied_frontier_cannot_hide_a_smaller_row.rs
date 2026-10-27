@@ -22,6 +22,10 @@ fn ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_tied_frontier_cannot_hide_a_smaller_row_on_either_reader_route() {
     use std::os::unix::fs::PermissionsExt;
 

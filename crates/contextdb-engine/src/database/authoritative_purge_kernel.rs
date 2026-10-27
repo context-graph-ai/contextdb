@@ -2120,6 +2120,13 @@ impl Database {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_kernel_tests.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn commit_authoritative_purge_kernel(
         &self,
         selection: &AuthoritativePurgeSelection,
@@ -2578,6 +2585,13 @@ impl Database {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn install_authoritative_purge_complete_blob_fixture_for_test(
         &self,
         hash: &[u8; 32],
@@ -2595,6 +2609,13 @@ impl Database {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub(super) fn install_authoritative_purge_interrupted_blob_fixture_for_test(

@@ -31,6 +31,13 @@ fn config_write(key: &str, lsn: u64) -> WriteSet {
     write_set
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn durable_state(store: &RedbPersistence, key: &str) -> (Option<Vec<u8>>, Vec<(u8, Vec<u8>)>) {
     store
         .with_db(|database| {
@@ -61,6 +68,13 @@ fn durable_state(store: &RedbPersistence, key: &str) -> (Option<Vec<u8>>, Vec<(u
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn callback_refusal_after_real_identity_proof_aborts_durable_state_and_retries() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

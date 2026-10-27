@@ -24,15 +24,36 @@ pub(crate) fn fixture_outcome_batch_subject(t: &TenantId) -> String {
 
 impl Database {
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_record_json_for_test(bytes: &[u8]) -> Result<serde_json::Value> {
         serde_json::to_value(super::records::decode(bytes)?).map_err(|_| invalid())
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_record_bytes_for_test(value: serde_json::Value) -> Result<Vec<u8>> {
         super::records::encode(&serde_json::from_value(value).map_err(|_| invalid())?)
     }
     /// Stage authoritative local source rows without inventing a peer binding.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __stage_local_delivery_manifest_for_test(
         &self,
         tx: contextdb_core::TxId,
@@ -89,6 +110,13 @@ impl Database {
         super::durability::commit_fault_reached()
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_prerequisite_wires_for_test(
         &self,
     ) -> Result<Vec<crate::protocol::WireDeliveryOutcome>> {
@@ -115,10 +143,24 @@ impl Database {
         Ok(wires)
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __verify_delivery_core_for_test(node: &str, bytes: &[u8]) -> Result<()> {
         super::decoder::verify_terminal_signature(node, bytes)
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_metadata_bytes_for_test(&self) -> Result<Vec<Vec<u8>>> {
         self.custody_records(self.declared_reader_memory()?)?
             .iter()
@@ -126,6 +168,13 @@ impl Database {
             .collect()
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __verify_delivery_metadata_bytes_for_test(bytes: &[u8]) -> Result<()> {
         super::records::decode(bytes)?.verify()
     }
@@ -142,6 +191,13 @@ impl Database {
         (full_row_digest(values), content_row_digest(values, exclude))
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_diagnostic_encoding_for_test(
         conflicts: Vec<crate::sync_types::Conflict>,
     ) -> Result<Vec<u8>> {
@@ -169,10 +225,24 @@ impl Database {
         .bytes()
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_diagnostic_resolution_roundtrip_for_test(tag: u8) -> Result<u8> {
         Ok(diagnostic_resolution(decode_diagnostic_resolution(tag)?))
     }
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __seed_tenant_table_policies_for_test(
         &self,
         tenant: TenantId,
@@ -217,6 +287,13 @@ impl Database {
     }
     /// Inspect actual canonical prerequisite records independently of public delivery reads.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_prerequisites_for_test(&self) -> Result<serde_json::Value> {
         let records = self.custody_records(self.declared_reader_memory()?)?;
         for r in records.iter() {
@@ -240,6 +317,13 @@ impl Database {
 #[cfg(feature = "sync-orchestration")]
 pub(crate) use super::delivery::manifested_request;
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn manifest_rows(db: &Database, m: &ManifestRecord) -> Result<Vec<RowChange>> {
     let read_memory = db.declared_reader_memory()?;
     m.rows
@@ -263,6 +347,13 @@ pub(crate) fn manifest_rows(db: &Database, m: &ManifestRecord) -> Result<Vec<Row
 
 // Fixture builder: arrange signed mismatched caller policy without
 // weakening the real bind door, which now rejects that expectation.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn issue_fixture_binding(
     db: &Database,
     tenant: TenantId,

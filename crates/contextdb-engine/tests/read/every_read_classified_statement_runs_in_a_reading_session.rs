@@ -113,6 +113,10 @@ fn the_idle_file_runs_every_read_classified_statement() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_owner_runs_every_read_classified_statement_over_its_channel() {
     let directory = tempfile::TempDir::new().expect("task-scoped store directory");
     let runtime_root = secure_runtime_root(directory.path(), "classified-runtime");
@@ -201,6 +205,10 @@ fn explaining_a_write_answers_its_plan_and_leaves_the_rows_alone() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_owner_explains_a_write_over_its_channel_and_leaves_the_rows_alone() {
     let directory = tempfile::TempDir::new().expect("task-scoped store directory");
     let runtime_root = secure_runtime_root(directory.path(), "explain-write-runtime");

@@ -12,6 +12,13 @@ mod durable_observation {
     }
 
     #[allow(dead_code, reason = "KEEP-SHARED: shared test helper; other test targets or modules use it")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn version_count(db: &Database, table: &str) -> usize {
         let root = root(db);
         let source_fixture_reader_1 = db

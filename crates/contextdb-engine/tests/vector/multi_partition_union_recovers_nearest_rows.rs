@@ -157,6 +157,10 @@ fn digest_page(mut digest: u64, ids: &HashSet<i64>) -> u64 {
     (digest ^ 0xff).wrapping_mul(0x100000001b3)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn check_shared_walk(fixture: Fixture) {
     let db = seeded_store(fixture);
     let scopes = [

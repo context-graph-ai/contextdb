@@ -62,6 +62,10 @@ fn number(answered: &QueryResult, name: &str) -> i64 {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn disk_usage_is_the_same_number_from_the_owner_and_from_the_file() {
     let directory = tempfile::TempDir::new().expect("task-scoped store directory");
     let runtime_root = secure_runtime_root(directory.path(), "disk-usage-runtime");

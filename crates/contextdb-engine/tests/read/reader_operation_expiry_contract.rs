@@ -42,6 +42,10 @@ fn failure<T>(result: contextdb_core::Result<T>) -> ReadFailure {
         Ok(_) => panic!("an operation beyond its configured limit cannot succeed"),
     }
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn exercise(route: ReadRoute, operation: Operation) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("expiry.db");

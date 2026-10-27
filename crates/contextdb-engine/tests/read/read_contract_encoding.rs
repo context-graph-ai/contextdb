@@ -31,10 +31,18 @@ pub(super) fn fixture_encoding_owner() -> contextdb_core::read_memory::ReadMemor
         .child()
         .expect("codec fixture child")
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncodingError> {
     encode_query_result_native(result, result.encoding_owner_for_test())
         .map(|bytes| bytes.as_slice().to_vec())
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn encode_cursor_page(page: &CursorPage) -> Result<Vec<u8>, ReadEncodingError> {
     encode_cursor_page_native(
         page,
@@ -42,6 +50,10 @@ fn encode_cursor_page(page: &CursorPage) -> Result<Vec<u8>, ReadEncodingError> {
     )
     .map(|bytes| bytes.as_slice().to_vec())
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn encode_metadata_page(page: &MetadataPage) -> Result<Vec<u8>, ReadEncodingError> {
     encode_metadata_page_native(page, fixture_encoding_owner())
         .map(|bytes| bytes.as_slice().to_vec())

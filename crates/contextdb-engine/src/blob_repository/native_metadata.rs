@@ -409,6 +409,10 @@ pub(crate) fn codec_projection_contract_rows() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     use std::io::Write;
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_source<R>(
         original: &OwnedMemoryReservation,
         bytes: &[u8],
@@ -431,6 +435,10 @@ pub(crate) fn codec_projection_contract_rows() {
         .unwrap()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn errors<T: crate::persistence::StreamedBlobProjection>(
         original: &OwnedMemoryReservation,
         owner: &crate::memory_accounting::AccountantHandle,

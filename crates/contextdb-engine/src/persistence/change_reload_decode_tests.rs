@@ -115,6 +115,13 @@ fn change_reload_borrows_prior_graph_and_copies_change_at_exact_capacity() {
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn short_authenticated_change_route_and_graph_hints_do_not_allocate_serde_cap() {
     let (base, change) = records(VectorQuantization::F32);
     let base_bytes = RedbPersistence::encode_vector_partition_record(

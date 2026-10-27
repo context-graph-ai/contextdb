@@ -66,6 +66,10 @@ fn assert_renders_exactly_direction(rendered: &str, expected: &str) {
 
 /// A table definition arriving from another machine, applied through the public
 /// sync door exactly as a peer's changeset would deliver it.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn arrive_create_table(
     db: &Database,
     name: &str,
@@ -811,6 +815,10 @@ async fn c1b_an_altered_retention_travels_and_leaves_the_direction_alone() {
 // ---------------------------------------------------------------------------
 
 /// A table definition CHANGE arriving from another machine.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn arrive_alter_table(
     db: &Database,
     name: &str,

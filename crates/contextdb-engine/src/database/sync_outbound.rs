@@ -64,6 +64,10 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     /// Persist the pull cursor's `(source incarnation, lsn)` pair as ONE
     /// record (see [`Self::persisted_sync_pull_cursor`]).
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_sync_pull_cursor(
         &self,
         tenant_id: &TenantId,
@@ -228,6 +232,13 @@ impl Database {
     /// real sync requests and receipts.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn sync_incarnation_for_test(&self, tenant_id: &TenantId) -> Result<Incarnation> {
         self.sync_incarnation_with_read_memory(tenant_id, self.declared_reader_memory()?)
     }
@@ -334,6 +345,10 @@ impl Database {
     /// Seed a durable per-edge receipt only for a test fixture whose schema
     /// was installed outside the sync stream. Production receipt writes stay
     /// coupled to accepted source changes in the ordinary apply path.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_sync_applied_push_watermark_for_node_incarnation(
         &self,
         tenant_id: &TenantId,
@@ -1149,6 +1164,13 @@ impl Database {
     }
 
     #[cfg(all(feature = "test-seams", unix))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn pause_at_persisted_state_schema_frontier_for_test(&self) -> Result<()> {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
@@ -5317,6 +5339,13 @@ impl Database {
     /// budget, for fixtures whose changes hold rows larger than the default.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn changes_since_with_arrivals_with_read_memory_for_test(
         &self,
         since_lsn: Lsn,
@@ -5956,6 +5985,13 @@ impl Database {
     /// durably bound by that push -- never before it.
     #[cfg(all(feature = "test-seams", feature = "sync-orchestration"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn outbound_row_lineages_and_ddl_provenance_for_test(
         &self,
         changes: &ChangeSet,
@@ -5994,6 +6030,13 @@ impl Database {
     /// own key, exactly as a production push does.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn outbound_ddl_provenance_for_test(
         &self,
         changes: &ChangeSet,
@@ -6897,6 +6940,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __mutate_vector_generation_catalog_record_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
@@ -6915,6 +6965,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __corrupt_vector_partition_journal_record_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
@@ -6924,6 +6981,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __corrupt_last_vector_partition_journal_record_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
@@ -6933,6 +6997,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __corrupt_vector_partition_base_record_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
@@ -6942,6 +7013,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __corrupt_vector_partition_change_record_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
@@ -6951,6 +7029,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __corrupt_vector_partition_saved_graph_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
@@ -6960,6 +7045,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __damage_paged_route_pages_for_test(
         path: &Path,
         partition: &VectorPartitionRef,
@@ -6971,6 +7063,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __corrupt_vector_partition_graph_page_for_test(
         path: &Path,
         partition: &VectorPartitionRef,

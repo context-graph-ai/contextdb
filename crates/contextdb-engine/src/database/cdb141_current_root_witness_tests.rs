@@ -1,6 +1,13 @@
 use super::*;
 use redb::ReadableDatabase;
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn test_b_public_current_point_list_and_join_refuse_committed_history_damage() {
     // Public historical point, finite-list and join reads keep complete
     // SQL answers after reopen and refuse corrupted consumed groups.

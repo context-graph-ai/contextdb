@@ -32,6 +32,13 @@ fn cursor(reverse: bool) -> BoundedOrderedRowCursor {
     cursor
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Result<Option<RowId>> {
     let meta = &load.image.table_meta["postings"];
     let declaration = RedbPersistence::relational_index_declarations(meta)
@@ -110,6 +117,13 @@ fn wide_pressure_fixture(path: &Path, rows: i64) {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
     const ROWS: i64 = 160;
     let dir = tempfile::tempdir().unwrap();
@@ -202,6 +216,13 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings() {
     // This raw codec fixture declares its own writer operation; it has no
     // database request whose ambient owner it may borrow.
@@ -732,6 +753,13 @@ fn the_pinned_working_set_does_not_grow_with_the_range() {
         db.close().unwrap();
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn pull_wide(
         load: &ReadPersistenceLoad,
         cursor: &mut BoundedOrderedRowCursor,
@@ -1004,6 +1032,13 @@ fn a_small_window_reserves_what_it_needs_and_is_answered_with_little_left_free()
 /// The only remaining refusal is a genuine one: a budget that cannot hold a
 /// working page and the path to it at all. It stays the existing typed error.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_budget_too_small_for_one_working_page_is_still_the_typed_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("no-room.db");

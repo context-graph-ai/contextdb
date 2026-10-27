@@ -2,6 +2,13 @@ use super::*;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

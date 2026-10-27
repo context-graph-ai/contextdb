@@ -95,6 +95,13 @@ fn busy_cursor_pin_retries_outside_commit_and_recaptures_the_complete_root() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn busy_cursor_pin_cancellation_and_deadline_finish_before_handle_release() {
     for cancelled in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -176,6 +183,13 @@ enum RegistryWaitPhase {
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWaitPhase) {
     use crate::local_transport::{
         LocalHandshake, LocalRequest, LocalRequestEnvelope, LocalResponse,

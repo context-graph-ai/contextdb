@@ -406,6 +406,10 @@ fn verify_payload_readable(path: &Path) {
 /// by prior batches. The recycling batch returns before another recording
 /// is appended: its caller can join any queued gap read before the next
 /// writer commit, making the read's expected committed image deterministic.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn drive_to_recycling_batch(
     db: &Database,
     observer: Arc<dyn Fn(WriterFileRecycleObservation) + Send + Sync>,
@@ -1431,6 +1435,10 @@ enum FailedWriterRelease {
 /// holds a descriptor and refuses separate-process opens; the chosen release
 /// then returns the inode to baseline and frees the lock; a fresh open
 /// recovers every committed recording.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn fault_cycle_releases(dir: &Path, name: &str, release: FailedWriterRelease) {
     let (db, path, identity, baseline) = open_fragmented_writer(dir, name);
     let boundaries: Arc<Mutex<Vec<WriterFileRecycleBoundary>>> = Arc::new(Mutex::new(Vec::new()));

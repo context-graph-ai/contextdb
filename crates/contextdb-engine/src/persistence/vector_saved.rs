@@ -1468,6 +1468,13 @@ impl RedbPersistence {
         dead_code,
         reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn materialize_paged_topology_for_test(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         fn u64_into(bytes: &mut Vec<u8>, value: usize) {
             bytes.extend_from_slice(&(value as u64).to_le_bytes());

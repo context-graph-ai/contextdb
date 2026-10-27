@@ -100,6 +100,13 @@ fn hub_receipt(received: &crate::protocol::ReceivedDdlContext) -> SyncApplyRecei
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn apply_full_history(
     db: &Database,
     changes: &ChangeSet,

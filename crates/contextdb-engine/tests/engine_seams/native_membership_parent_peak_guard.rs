@@ -8,6 +8,10 @@ use contextdb_engine::vector_read_memory::statement_child_proof as statement;
 use std::collections::HashMap;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn public_membership_pages_keep_the_original_parent_within_its_live_limit() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     const DIM: usize = 256;
@@ -127,6 +131,10 @@ fn public_membership_pages_keep_the_original_parent_within_its_live_limit() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn inactive_observation_copies_no_full_receipts_for_public_sql_n_and_2n() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let mut counts = Vec::new();

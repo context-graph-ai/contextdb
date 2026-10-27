@@ -36,6 +36,10 @@ fn secure_runtime_root(directory: &tempfile::TempDir, name: &str) -> std::path::
 // stage that failed instead of consuming the whole test allocation.
 const LIFECYCLE_WATCHDOG: Duration = Duration::from_secs(10);
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_quiescent_direct_reader(path: &std::path::Path, runtime_root: &std::path::Path) {
     let reader =
         ReadSession::with_runtime_directory_for_test(runtime_root, || ReadSession::open(path))
@@ -46,6 +50,10 @@ fn assert_quiescent_direct_reader(path: &std::path::Path, runtime_root: &std::pa
     ));
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_owner_listener_released(path: &std::path::Path, runtime_root: &std::path::Path) {
     assert!(matches!(
         ReadSession::with_runtime_directory_for_test(runtime_root, || {
@@ -552,6 +560,10 @@ fn assert_database_resources_owned(snapshot: ReadRouteResourceSnapshot) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn in_process_requests_bypass_saturated_owner_admission_without_changing_the_live_route() {
     let handler = GatedHandler::default();
     let directory = tempfile::TempDir::new().expect("task-scoped saturation path directory");
@@ -644,6 +656,10 @@ fn in_process_requests_bypass_saturated_owner_admission_without_changing_the_liv
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn drain_timeout_preserves_database_resources_until_a_retry_finishes_close() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -745,6 +761,10 @@ fn drain_timeout_preserves_database_resources_until_a_retry_finishes_close() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cleanup_error_survives_owner_read_timeout_and_retry() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -894,6 +914,10 @@ fn cleanup_error_survives_owner_read_timeout_and_retry() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn handoff_error_survives_owner_read_timeout_and_retry() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1002,6 +1026,10 @@ fn handoff_error_survives_owner_read_timeout_and_retry() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_suspended_cursor_is_cancelled_and_released_when_its_owner_closes() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1106,6 +1134,10 @@ fn a_suspended_cursor_is_cancelled_and_released_when_its_owner_closes() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn active_cursor_fetch_completes_before_graceful_owner_close_releases_it() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1262,6 +1294,10 @@ fn active_cursor_fetch_completes_before_graceful_owner_close_releases_it() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn graceful_close_delivers_a_completed_cursor_page_before_releasing_owner() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1386,6 +1422,10 @@ fn graceful_close_delivers_a_completed_cursor_page_before_releasing_owner() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn accepted_first_cursor_page_publishes_before_owner_drop_releases_it() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1505,6 +1545,10 @@ fn accepted_first_cursor_page_publishes_before_owner_drop_releases_it() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn drop_defers_final_resource_release_until_an_accepted_handler_returns() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1586,6 +1630,10 @@ fn drop_defers_final_resource_release_until_an_accepted_handler_returns() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn authenticated_inflight_owner_reader_close_requires_service_lifecycle_completion() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1677,6 +1725,10 @@ fn authenticated_inflight_owner_reader_close_requires_service_lifecycle_completi
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn authenticated_inflight_owner_reader_drop_does_not_wait_for_operation_or_service_release() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
@@ -1749,6 +1801,10 @@ fn authenticated_inflight_owner_reader_drop_does_not_wait_for_operation_or_servi
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn file_owner_refuses_a_real_second_process_until_that_holder_releases() {
     const HOLDER: &str = "CONTEXTDB_OWNER_READ_TEST_HOLDER";
     const HOLDER_PATH: &str = "CONTEXTDB_OWNER_READ_TEST_PATH";

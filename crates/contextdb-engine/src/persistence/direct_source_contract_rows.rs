@@ -215,6 +215,13 @@ fn seed(path: &Path, limit: usize) {
         .unwrap();
     database.close().unwrap();
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn open(path: &Path, limit: usize) -> contextdb_core::Result<ReadSession> {
     ReadSession::open_with_options(
         path,

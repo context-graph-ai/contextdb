@@ -233,6 +233,10 @@ struct RecordedPushRequest {
 
 /// Decode one outgoing push request envelope and append it to the witness.
 /// Shared by both transport methods a push can travel through.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn record_push_request(
     requests: &Mutex<Vec<RecordedPushRequest>>,
     request_bytes: &[u8],
@@ -482,6 +486,10 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
 }
 
 #[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
     let broker = InProcessBroker::new();
     let edge = Arc::new(Database::open_memory());

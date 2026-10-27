@@ -1652,6 +1652,13 @@ fn history_logical_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn visit_history_logical_key_for_test(
     kind: HistoryKind,
     coordinate: &[u8],
@@ -9440,6 +9447,13 @@ mod read_authentication_batch_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn authenticated_posting_range_is_complete_and_ordered_in_both_directions() {
         let root = tempfile::tempdir().unwrap();
         let database = ProofFixtureDatabase::create(root.path().join("ordered.db")).unwrap();

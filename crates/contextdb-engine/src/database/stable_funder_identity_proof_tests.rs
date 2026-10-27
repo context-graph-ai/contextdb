@@ -405,6 +405,13 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
 // Public embedding ruling: a search uses its operation child, even with no
 // writer headroom. This row belongs to the existing distinct-funder proof;
 // integration tests cannot call the private explicit-owner entry point.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn embedded_graph_reader_scratch_rows() {
     use crate::vector_read_memory::{
         DeclaredReadChildObserver, DeclaredReadMemory, declared_child_observer,

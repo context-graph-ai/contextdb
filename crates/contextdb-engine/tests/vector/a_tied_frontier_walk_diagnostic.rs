@@ -11,6 +11,10 @@ use std::collections::HashMap;
 
 #[test]
 #[ignore = "diagnostic: run explicitly with --ignored"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_tied_frontier_walk_diagnostic() {
     let repeats = std::env::var("TIED_DIAGNOSTIC_REPEATS")
         .ok()

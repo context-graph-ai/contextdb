@@ -487,6 +487,13 @@ mod tests {
             created_at: None,
         }
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn read(
         root: &WriterSnapshot,
         record: &VectorPartitionMembershipRecord,
@@ -729,6 +736,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn current_moves_replay_and_refusals_preserve_exact_owner_and_captured_roots() {
         // The raw codec fixture owns this explicitly declared operation.
         let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -837,6 +851,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn missing_and_mismatched_current_witnesses_refuse_without_reconstruction() {
         // The raw codec fixture owns this explicitly declared operation.
         let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -911,6 +932,13 @@ mod tests {
             assert_eq!(writer.usage().used, 0);
         }
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn durable_records(persistence: &RedbPersistence) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
         persistence
             .with_db(|db| {
@@ -943,6 +971,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn cancelled_current_identity_refuses_before_probes_and_refunds_its_owner() {
         // The raw codec fixture owns this explicitly declared operation.
         let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

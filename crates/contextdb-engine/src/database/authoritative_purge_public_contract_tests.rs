@@ -172,6 +172,13 @@ fn assert_successful_batch_history(db: &Database, survivor_history_before: &[Row
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen() {
     // Extend the registered atomic-erasure proof with long unrelated column
     // names. The frozen schema-width fixture has only short field names and
@@ -661,6 +668,13 @@ fn public_purge_reports_blob_referent_from_a_superseded_selected_work_job_versio
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
     // Delivered erasure either removes the live selected copy or returns a
     // typed failure before its purge metadata and delivery frontier advance.

@@ -126,6 +126,10 @@ fn received(owner: &Database) -> u64 {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_read_that_panics_in_the_owner_is_answered_and_leaves_the_connection_usable() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-panic directory");
     let path = directory.path().join("panicking.db");

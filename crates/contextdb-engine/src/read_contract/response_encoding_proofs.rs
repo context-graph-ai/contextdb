@@ -517,6 +517,13 @@ fn response_size_only_operations_do_not_allocate_output_or_json_scratch() {
 // Error-diagnostic allocations are not confused with the refused output buffer.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn original_budget_refuses_each_response_leaf_before_its_output_allocation() {
     let data = data(32 * 1024);
     let metadata = metadata_page(32 * 1024);
@@ -620,6 +627,13 @@ fn actual_encoded_control_layout(
 // Mutants: leak the payload invoice on failure, or drop it before dropping Vec.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn encoded_carrier_control_refusal_and_null_allocation_roll_back_the_original_budget() {
     for null_allocation in [false, true] {
         let (accountant, owner) = budget();
@@ -695,6 +709,13 @@ fn encoded_carrier_control_refusal_and_null_allocation_roll_back_the_original_bu
 // arbitrary standalone codec a funded consumer boundary.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn funded_output_rolls_back_on_second_pass_serializer_failure_and_unwind() {
     struct FailsOnWrite {
         visits: std::cell::Cell<usize>,
@@ -768,6 +789,13 @@ fn funded_output_rolls_back_on_second_pass_serializer_failure_and_unwind() {
 // with a real host budget; this row does not pin the native child for observation.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn encoded_output_retains_the_original_native_request_without_an_observer_alias() {
     let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(CEILING).unwrap();
     let root_only = parent.retained_bytes_for_test();

@@ -1179,6 +1179,13 @@ impl SyncClient {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __stage_delivery_manifest_for_test(
         &self,
         tx: contextdb_core::TxId,
@@ -1219,6 +1226,13 @@ impl SyncClient {
     /// Preserve the ordinary sibling's actual committed lineage in an adversarial request.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __ordinary_push_request_for_test(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1274,6 +1288,13 @@ impl SyncClient {
     /// Construct ordinary push input from committed prerequisites.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __delivery_push_request_for_test(
         &self,
         table: &str,
@@ -1683,6 +1704,13 @@ impl SyncClient {
     /// remains the source of the client's peer identity.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_for_test(
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
@@ -1699,6 +1727,13 @@ impl SyncClient {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_for_test_with_read_memory(
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
@@ -1723,6 +1758,13 @@ impl SyncClient {
     /// internally from the authenticated transport endpoint.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_and_identity_for_test(
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
@@ -1741,6 +1783,13 @@ impl SyncClient {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_authenticated_transport_and_identity_for_test_with_read_memory(
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
@@ -5291,6 +5340,10 @@ fn classify_push_reply_decode(error: Error) -> PushReplyError {
 
 #[cfg(test)]
 #[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by sync")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResult, PushReplyError> {
     let envelope = decode_for_version(reply, protocol_version)
         .map_err(|e| PushReplyError::Malformed(Error::SyncError((e.to_string()).into())))?;

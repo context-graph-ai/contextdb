@@ -373,6 +373,10 @@ fn measure_upsert_cascade(n: usize) -> CommitMeasurement {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn setup_trigger_case(n: usize) -> (Database, Vec<(Uuid, i64)>) {
     let db = Database::open_memory();
     declare_mixed_schema(&db);

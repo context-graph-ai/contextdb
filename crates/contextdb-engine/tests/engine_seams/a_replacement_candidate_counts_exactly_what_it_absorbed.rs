@@ -92,6 +92,10 @@ fn counters(db: &Database) -> Counters {
 
 /// Run maintenance cycles until `catch_ups` more candidate catch-ups have
 /// committed; return the successor each one committed.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn drive_catch_ups(db: &Database, catch_ups: usize) -> Vec<BuildSuccessor> {
     let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
     for _ in 0..512 {
@@ -247,6 +251,10 @@ fn an_absorbed_insert_deleted_later_is_not_subtracted_twice() {
     );
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn crash_at_the_first_catch_up(test: &str, cut: &str) {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     if let (Ok(path), Ok(out)) = (

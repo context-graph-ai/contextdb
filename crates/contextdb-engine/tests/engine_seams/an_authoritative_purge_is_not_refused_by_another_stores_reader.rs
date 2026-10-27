@@ -35,6 +35,10 @@ fn secure_runtime_directory(parent: &Path) -> PathBuf {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_authoritative_purge_succeeds_while_another_stores_reader_holds_the_shared_runtime_directory()
 {
     let directory = tempfile::tempdir().expect("scratch directory");

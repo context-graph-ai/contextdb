@@ -95,6 +95,10 @@ async fn start_hub(root: &Path, name: &str, tenant: &str) -> Hub {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn declare(db: &Database, table: &str, clauses: &str) -> contextdb_core::Result<()> {
     db.execute(
         &format!("DECLARE TENANT TABLE POLICY {table} {clauses}"),
@@ -190,6 +194,10 @@ struct AdversarialBoundTablePull {
 }
 
 impl AdversarialBoundTablePull {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn alter_received_pull(&self, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
         let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
         // Adapter: the ordinary route may carry dependency-complete

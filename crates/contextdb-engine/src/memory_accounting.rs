@@ -870,6 +870,10 @@ impl Drop for WriterCounterInvoice {
 // Native backing remains funded through its physical allocation lifetime.
 // These rows use the existing allocator and allocation-free observer storage.
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn native_allocation_lifetime_rows_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     fn native() -> (AccountantHandle, [(usize, usize, usize); 3], usize) {
@@ -9828,6 +9832,10 @@ mod general_checkpoint_native_fixture {
             column: "embedding".into(),
         }
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn original_row(
         writer: &WriterBudget,
         funder: &SourceFunder,
@@ -9867,6 +9875,10 @@ mod general_checkpoint_native_fixture {
         source_check_row_capacity(&body)?;
         Ok((body, invoice))
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn original_vector(
         writer: &WriterBudget,
         funder: &SourceFunder,
@@ -9906,6 +9918,10 @@ mod general_checkpoint_native_fixture {
             ..TableMeta::default()
         }
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn stage(
         g: &mut EngineGuard<'_>,
         f: &SourceFunder,
@@ -9931,6 +9947,10 @@ mod general_checkpoint_native_fixture {
         g.publish_tx(p);
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn populate_aux(
         g: &mut EngineGuard<'_>,
         tx: TxId,
@@ -9994,6 +10014,10 @@ mod general_checkpoint_native_fixture {
         }
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn populate(
         g: &mut EngineGuard<'_>,
         f: &SourceFunder,
@@ -10026,6 +10050,10 @@ mod general_checkpoint_native_fixture {
         g.publish_tx(p);
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn mutate(
         g: &mut EngineGuard<'_>,
         f: &SourceFunder,
@@ -10102,6 +10130,10 @@ mod general_checkpoint_native_fixture {
         );
         result
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn assert_canonical(source: &CanonicalStatementRows, tx: TxId, value: u64) {
         assert_eq!(source.len(), 3);
         assert!(source.has_index_for("by_rank", &meta()));
@@ -10183,6 +10215,10 @@ mod general_checkpoint_native_fixture {
             other => panic!("expected actual typed original/caller refusal, got {other:?}"),
         }
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn removal_admission_cuts(
         t: &Transactions,
         tx: TxId,
@@ -10261,6 +10297,10 @@ mod general_checkpoint_native_fixture {
             assert_eq!(snapshot(t, tx), *expected);
         }
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn run_frames(
         owner: &AccountantHandle,
         writer: &WriterBudget,

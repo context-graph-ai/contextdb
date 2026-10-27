@@ -66,6 +66,10 @@ type SignedUnit = (ChangeSet, Vec<WireDdlProvenance>);
 const INCARNATION: Incarnation = Incarnation(311);
 const SOURCE: &str = "metadata-peak-author";
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn author_unit(
     author: &Database,
     sql: &str,
@@ -94,6 +98,10 @@ fn author_unit(
     (changes, provenance)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn receive(receiver: &Database, unit: SignedUnit, tenant: &TenantId) -> contextdb_core::Result<()> {
     {
         let seam_read_memory = receiver
@@ -115,6 +123,10 @@ fn receive(receiver: &Database, unit: SignedUnit, tenant: &TenantId) -> contextd
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn one_table_migration_peak_ignores_unrelated_catalog_and_provenance() {
     const UNRELATED: usize = 96;
     // The fixed slack permits small bookkeeping variation from the second target ALTER.

@@ -2399,6 +2399,10 @@ fn restricted_inspection_keeps_adaptive_partition_populations_private() {
 
 #[cfg(all(feature = "test-seams", unix))]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
     use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits, ReadRoute};
     use contextdb_engine::{DatabaseOpenOptions, OwnerReadConfig, ReadSession, ReadSessionOptions};

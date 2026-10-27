@@ -176,6 +176,13 @@ fn durable_cursor_registers_before_releasing_its_captured_root() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn durable_admission_rechecks_cancellation_and_deadline_before_registering() {
     for cursor in [false, true] {
         for cancelled in [false, true] {
@@ -338,6 +345,13 @@ fn fresh_snapshot_pin_does_not_borrow_an_older_readers_root() {
 // registration: an internally consistent physical fingerprint cannot substitute
 // for authenticating selected placement companions and their global controls.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
     use redb::ReadableTable as _;
 
@@ -577,6 +591,13 @@ fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn prepared_metadata_publication_keeps_bounded_vector_reads_and_cursors_available() {
     use crate::executor::bounded_read_test_support as bounded;
     use contextdb_core::read_contract::ReadLimits;

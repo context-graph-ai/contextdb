@@ -119,6 +119,10 @@ fn work_inputs_columns() -> Vec<(String, String)> {
     ]
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply_single_ddl(db: &Database, ddl: DdlChange) -> contextdb_core::Result<()> {
     let changes = ChangeSet {
         rows: Vec::new(),

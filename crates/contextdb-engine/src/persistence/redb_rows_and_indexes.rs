@@ -882,6 +882,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn damage_checkpoint_f32_projection_for_test(&self) -> Result<()> {
         self.with_db(|database| {
             read_persistence_test_scaffold::damage_f32_row_projection_for_test(database)
@@ -1211,6 +1218,13 @@ impl RedbPersistence {
     #[allow(
         dead_code,
         reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
     )]
     pub(crate) fn write_corrupt_store_vector_memberships_for_test(
         &self,
@@ -6564,6 +6578,13 @@ impl RedbPersistence {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub(crate) fn vector_pending_counters_for_test(

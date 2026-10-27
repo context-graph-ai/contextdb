@@ -108,6 +108,10 @@ fn status(db: &Database) -> VectorGraphGenerationStatus {
         .expect("the fixture keeps one declared partition state")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn captured_suffix_points(db: &Database) -> usize {
     db.inspect_captured_vector_suffix_for_test(
         &partition_ref(),

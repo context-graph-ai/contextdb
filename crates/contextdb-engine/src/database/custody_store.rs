@@ -252,6 +252,13 @@ impl Database {
     /// Measurement only; no mutation or production API.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_metadata_work_for_test(&self) -> Result<(u64, u64, u64)> {
         self.with_custody_store(|store| {
             Ok((
@@ -280,6 +287,13 @@ impl Database {
     /// the returned value drops.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __hold_custody_root_for_test(&self) -> Result<HeldCustodyRootForTest> {
         Ok(HeldCustodyRootForTest(self.latest_custody_root()?))
     }
@@ -288,6 +302,13 @@ impl Database {
     /// own root when `None`).
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_keys_for_test(
         &self,
         held: Option<&HeldCustodyRootForTest>,
@@ -313,6 +334,13 @@ impl Database {
     /// Measurement only: the committed bytes of one custody CONFIG key.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_record_bytes_for_test(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.persistence
             .as_ref()
@@ -325,6 +353,13 @@ impl Database {
     /// consistent while the journal itself is damaged.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __tamper_custody_record_for_test(
         &self,
         key: &str,
@@ -336,6 +371,13 @@ impl Database {
     /// the ordinary commit path, with its ordinary custody validation.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __commit_custody_record_for_test(
         &self,
         key: &str,
@@ -347,6 +389,13 @@ impl Database {
     /// answers, and how many pending-index entries it examined.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_pending_for_test(&self) -> Result<(Vec<String>, u64)> {
         let before = crate::custody::store::work::pending_examined_total();
         let answer = self.custody_pending_manifests(self.declared_reader_memory()?)?;
@@ -361,6 +410,13 @@ impl Database {
     /// order, in one transaction, with ordinary custody validation.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __commit_custody_records_for_test(
         &self,
         deletes: &[&str],
@@ -408,6 +464,13 @@ impl Database {
         MEASURED_READER_FOR_TEST.with(|reader| reader.borrow().as_ref().map(|memory| memory.held()))
     }
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn raw_custody_commit_for_test(
         &self,
         key: &str,
@@ -463,6 +526,13 @@ impl Database {
     /// Takes effect for roots captured after the next open.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __invalidate_custody_groups_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -472,6 +542,13 @@ impl Database {
     /// Measurement only: the repair rebuild of the custody group index.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __rebuild_custody_index_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -482,6 +559,13 @@ impl Database {
     /// closed and reopened before any other use.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __repair_transaction_order_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -496,6 +580,13 @@ impl Database {
     /// it dropped.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_memo_admission_for_test(
         &self,
         limit: usize,
@@ -569,6 +660,13 @@ impl Database {
     /// the bytes still admitted afterwards.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __visit_custody_group_for_test(
         &self,
         group: &str,
@@ -584,6 +682,13 @@ impl Database {
     /// entries examined, and the bytes still admitted after the answer drops.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_pending_with_limit_for_test(
         &self,
         limit: usize,
@@ -603,6 +708,13 @@ impl Database {
     /// admitted once the operation's memory drops.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __validate_custody_writes_for_test(
         &self,
         writes: &[(String, Vec<u8>)],
@@ -623,6 +735,13 @@ impl Database {
     /// `admission_certificate`).
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_mutated_record_for_test(&self, key: &str, mutation: &str) -> Result<Vec<u8>> {
         let bytes = self
             .__custody_record_bytes_for_test(key)?
@@ -647,6 +766,13 @@ impl Database {
     /// reader memory of `limit` bytes, at the operation's own captured root.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_keys_with_limit_for_test(
         &self,
         selector: &str,
@@ -661,6 +787,13 @@ impl Database {
     /// answer `(its tenant mirror's writer admission, mirrored entries)`.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_tenant_mirror_for_test(&self) -> Result<(usize, usize)> {
         self.with_custody_store(|store| Ok((store.tenant_mirror_charge(), store.records.len())))
     }
@@ -692,6 +825,13 @@ impl Database {
     /// answer dropped.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_caller_with_limit_for_test(
         &self,
         caller: &str,
@@ -739,6 +879,13 @@ impl Database {
     /// decoded size far exceeds its encoding (its signature no longer holds).
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_inflated_terminal_for_test(
         &self,
         key: &str,
@@ -777,6 +924,13 @@ impl Database {
     /// Measurement only: whether the committed custody group index is complete.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_groups_complete_for_test(&self) -> Result<bool> {
         self.persistence
             .as_ref()
@@ -787,6 +941,13 @@ impl Database {
     /// (for example `delivery_root.v1.`), counted without decoding values.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_durable_key_count_for_test(&self, prefix: &str) -> Result<u64> {
         self.persistence
             .as_ref()
@@ -798,6 +959,13 @@ impl Database {
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __custody_selection_parity_for_test(
         &self,
         root_table: &str,

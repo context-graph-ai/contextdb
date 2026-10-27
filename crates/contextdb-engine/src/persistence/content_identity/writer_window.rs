@@ -2501,6 +2501,10 @@ fn replay(
         reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
     )
 )]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn update_family(
     table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     admission: &mut ProofAdmission,
@@ -2581,8 +2585,16 @@ pub(super) fn update_family_consuming_keys(
 
 #[cfg(test)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
     // This private row observes the real owners; stack handles have no heap quote.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_window<R>(
         table: &redb::Table<'_, &'static [u8], &'static [u8]>,
         family: LogicalFamily,

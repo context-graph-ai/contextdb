@@ -217,6 +217,10 @@ where
 /// a callback parked on a barrier pair. The callback waits on `entered.wait()`
 /// to signal it is active, then waits on `done.wait()` to release.
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_trigger_parked_db(entered: Arc<Barrier>, done: Arc<Barrier>) -> Arc<Database> {
     let db = Arc::new(Database::open_memory());
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
@@ -259,6 +263,10 @@ fn build_trigger_parked_with_open_tx(
 /// parked on a barrier pair. Tests explicitly drive the callback with
 /// `cron_run_due_now_for_test()`.
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn build_cron_parked_db(
     entered: Arc<Barrier>,
     done: Arc<Barrier>,
@@ -280,6 +288,10 @@ fn build_cron_parked_db(
 
 /// Spawn a thread that fires the parked trigger by INSERTing into table `t`.
 /// Returns the join handle so callers can confirm the firing tx committed.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn fire_trigger_in_thread(db: Arc<Database>, key: u128) -> thread::JoinHandle<Result<()>> {
     thread::spawn(move || {
         let tx = db.begin()?;
@@ -460,6 +472,10 @@ fn t30_01_sustained_writer_flood_50_threads_commits_under_lens7_baseline() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_02_two_writer_interleave_same_db_thread_b_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -524,6 +540,10 @@ fn t30_02_two_writer_interleave_same_db_thread_b_waits_then_proceeds() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_02_commit_same_db_b2_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -568,6 +588,10 @@ fn t30_02_commit_same_db_b2_waits_then_proceeds() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_02_rollback_same_db_b2_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -610,6 +634,10 @@ fn t30_02_rollback_same_db_b2_waits_then_proceeds() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_02_apply_changes_same_db_b2_waits_then_proceeds() {
     use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
     run_with_timeout(|| {
@@ -699,6 +727,10 @@ fn t30_03_two_writer_interleave_cross_db_dby_no_callback_proceeds_without_engage
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_03b_two_writer_interleave_cross_db_non_owner_probe_proceeds_without_engagement() {
     run_with_timeout(|| {
         let db_y = Arc::new(Database::open_memory());
@@ -924,6 +956,10 @@ fn t30_05_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_cross_db_write_from_inside_callback_returns_callback_reentry_trigger() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -978,6 +1014,10 @@ fn t30_11_cross_db_write_from_inside_callback_returns_callback_reentry_trigger()
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_execute_from_trigger_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1075,6 +1115,10 @@ fn t30_11_execute_from_trigger_callback_against_other_db_returns_callback_reentr
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_execute_in_tx_from_trigger_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1134,6 +1178,10 @@ fn t30_11_execute_in_tx_from_trigger_callback_against_other_db_returns_callback_
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_direct_helpers_from_trigger_callback_against_other_db_return_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1176,6 +1224,10 @@ fn t30_11_direct_helpers_from_trigger_callback_against_other_db_return_callback_
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_execute_from_cron_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1273,6 +1325,10 @@ fn t30_11_execute_from_cron_callback_against_other_db_returns_callback_reentry()
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_execute_in_tx_from_cron_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1329,6 +1385,10 @@ fn t30_11_execute_in_tx_from_cron_callback_against_other_db_returns_callback_ree
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_direct_helpers_from_cron_callback_against_other_db_return_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1369,6 +1429,10 @@ fn t30_11_direct_helpers_from_cron_callback_against_other_db_return_callback_ree
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_12_spawned_detached_thread_from_inside_callback_writes_other_db_succeeds() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1457,6 +1521,10 @@ fn t30_12_spawned_detached_thread_from_inside_callback_writes_other_db_succeeds(
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_12b_captured_trigger_tx_execute_in_tx_read_from_wrong_thread_returns_typed_err() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1505,6 +1573,10 @@ fn t30_12b_captured_trigger_tx_execute_in_tx_read_from_wrong_thread_returns_type
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_13_trigger_inside_cron_callback_tx_nested_same_thread_same_db_atomic() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1633,6 +1705,10 @@ fn t30_14_b1_cron_active_same_db_returns_callback_active_cron_immediately() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_14b_cron_trigger_dispatch_failure_rolls_back_active_tx_while_guard_retained() {
     run_with_timeout(|| {
         let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -1695,6 +1771,10 @@ fn t30_14b_cron_trigger_dispatch_failure_rolls_back_active_tx_while_guard_retain
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_15_schema_agnosticity_relational_graph_vector_cascade_in_callback_n_writers_all_commit() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1807,6 +1887,10 @@ fn t30_15_schema_agnosticity_relational_graph_vector_cascade_in_callback_n_write
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_15b_schema_agnosticity_wait_holds_mid_cascade() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1944,6 +2028,10 @@ fn t30_15b_schema_agnosticity_wait_holds_mid_cascade() {
 /// table `host` (not `t`). Used by t30_15b where the firing table is the
 /// cascade host.
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn fire_trigger_in_thread_into_host(
     db: Arc<Database>,
     key: u128,
@@ -1962,6 +2050,10 @@ fn fire_trigger_in_thread_into_host(
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_16_drop_while_callback_parked_no_panic_close_releases_after_callback_exits() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2016,6 +2108,10 @@ fn t30_16_drop_while_callback_parked_no_panic_close_releases_after_callback_exit
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_16_close_requested_while_begin_waiter_parked_wakes_begin_to_closed() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2076,6 +2172,10 @@ fn t30_16_close_requested_while_begin_waiter_parked_wakes_begin_to_closed() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_16b_close_requested_while_sql_begin_waiter_parked_wakes_begin_to_closed() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2139,6 +2239,10 @@ fn t30_16b_close_requested_while_sql_begin_waiter_parked_wakes_begin_to_closed()
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_16c_close_requested_while_sql_rollback_waiter_parked_wakes_rollback_to_closed() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2204,6 +2308,10 @@ fn t30_16c_close_requested_while_sql_rollback_waiter_parked_wakes_rollback_to_cl
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_16d_sql_autocommit_dml_does_not_rewait_inside_outer_execute_operation() {
     run_with_timeout(|| {
         let plugin = Arc::new(ParkAutocommitOnQueryPlugin::default());
@@ -2282,6 +2390,10 @@ fn t30_16d_sql_autocommit_dml_does_not_rewait_inside_outer_execute_operation() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_17_deadlock_guard_timeout_unhealthy_park_returns_typed_err_plus_one_warn_event() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2399,6 +2511,10 @@ fn t30_17_deadlock_guard_timeout_unhealthy_park_returns_typed_err_plus_one_warn_
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn c8_the_trigger_deadlock_environment_variable_changes_nothing() {
     // A hundredth of the shipped deadline: if the environment could move it,
     // the probe below would give up almost at once.
@@ -2491,6 +2607,10 @@ fn c8_the_trigger_deadlock_environment_variable_changes_nothing() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_17_deadlock_guard_commit() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2575,6 +2695,10 @@ fn t30_17_deadlock_guard_commit() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_17_deadlock_guard_rollback() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2642,6 +2766,10 @@ fn t30_17_deadlock_guard_rollback() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_17_deadlock_guard_apply_changes() {
     use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
     t30_install_global_subscriber();
@@ -2712,6 +2840,10 @@ fn t30_17_deadlock_guard_apply_changes() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_17_deadlock_guard_close() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2925,6 +3057,10 @@ fn t30_18_deadlock_guard_healthy_contention_no_tracing_warn_emitted() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_19_cron_then_trigger_sequential_phases_typed_err_then_wait() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -3281,6 +3417,10 @@ fn t30_05_release_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_22_source_order_priority_b1_unrelated_trigger_unchanged() {
     run_with_timeout(|| {
         // db: cron parks; db_y: trigger parks. Thread C's begin() on db must
@@ -3363,6 +3503,10 @@ fn t30_22_source_order_priority_b1_unrelated_trigger_unchanged() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_25_background_worker_handle_same_db_b2_waits_and_proceeds() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -3441,6 +3585,10 @@ fn t30_25_background_worker_handle_same_db_b2_waits_and_proceeds() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_02_execute_same_db_b2_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -3501,6 +3649,10 @@ fn t30_02_execute_same_db_b2_waits_then_proceeds() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_panicking_callback_wakes_parked_waiter() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -3664,6 +3816,10 @@ fn t30_cron_b1_immediate_typed_err_remains_unparked() {
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_commit_from_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -3706,6 +3862,10 @@ fn t30_11_commit_from_callback_against_other_db_returns_callback_reentry() {
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_rollback_from_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -3749,6 +3909,10 @@ fn t30_11_rollback_from_callback_against_other_db_returns_callback_reentry() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_apply_changes_from_callback_against_other_db_returns_callback_reentry() {
     use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
     run_with_timeout(|| {
@@ -3795,6 +3959,10 @@ fn t30_11_apply_changes_from_callback_against_other_db_returns_callback_reentry(
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_11_close_from_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -4102,6 +4270,10 @@ fn t30_18_release() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_24_cross_db_independence_emits_no_warn() {
     // Relocated from trigger_concurrency_panic_freedom.rs (t37_cross_db, 2026-07-18):
     // its two t37 siblings were begin-surface copies of t30_17/t30_18 and were
@@ -4180,6 +4352,10 @@ fn t30_24_cross_db_independence_emits_no_warn() {
 #[test]
 #[serial]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_28_healthy_same_db_wait_emits_no_warn() {
     t30_install_global_subscriber();
     t37_reset();
@@ -4247,6 +4423,10 @@ fn t30_28_healthy_same_db_wait_emits_no_warn() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t30_26_completed_callbacks_leave_no_stale_owner_entries() {
     // Deterministic state guard for TriggerCallbackThreadGuard::drop's
     // owner-map cleanup (its `*count > 1` match guards). The 32-writer flood

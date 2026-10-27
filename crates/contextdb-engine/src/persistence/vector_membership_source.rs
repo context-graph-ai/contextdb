@@ -1567,6 +1567,13 @@ impl contextdb_vector::store::RawVectorMembershipSelection for SelectedVectorMem
 
 impl SelectedVectorMembership {
     #[cfg(all(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn assert_row_evidence_bindings_for_test(
         &self,
         other: &MembershipOwner,
@@ -4062,6 +4069,13 @@ pub(super) fn membership_partitions_in_read(
 
 impl RedbPersistence {
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn durable_vector_storage_inventory_for_test(
         &self,
         partition: &VectorPartitionRef,
@@ -4588,6 +4602,13 @@ use crate::persistence::writer_source::WriterSnapshotHandle;
 /// count authenticates every placement at its OWN cut, so an invisible newer
 /// malformed placement still correctly rejects there; that is a different cut.
 #[cfg(all(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn count_header_before_future_version_for_test(
     owner: &MembershipOwner,
     table: &str,

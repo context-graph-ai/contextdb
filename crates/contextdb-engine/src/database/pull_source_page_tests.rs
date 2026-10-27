@@ -20,6 +20,13 @@ struct Page {
 
 /// One page from `since`, selected on this thread so its work is observable,
 /// funded by the store's writer budget as a hub serves it.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn page(db: &Database, since: Lsn, page_bytes: usize) -> Result<Page> {
     let memory = db.engine_sync_read_memory()?;
     let mut vector_copy = crate::vector_read_memory::admission(memory.clone());
@@ -51,6 +58,13 @@ fn page(db: &Database, since: Lsn, page_bytes: usize) -> Result<Page> {
 
 /// Every page from the start, as an edge pulls: (pages, rows, ddl, the most
 /// source entries one page visited).
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn pull_all(db: &Database, page_bytes: usize) -> Result<(usize, usize, usize, usize)> {
     let mut since = Lsn(0);
     let (mut pages, mut rows, mut ddl, mut most) = (0, 0, 0, 0);
@@ -247,6 +261,13 @@ fn a_declaration_only_history_pulls_in_pages() {
 // so the same page costs the same behind a doubled count of that row's
 // superseded versions.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_page_reads_one_version_of_a_row_whatever_its_history() {
     let mut visited = Vec::new();
     for versions in [50usize, 100] {

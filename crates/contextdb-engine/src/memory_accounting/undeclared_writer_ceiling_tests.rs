@@ -23,6 +23,13 @@ fn vector_for(id: i64) -> Vec<f32> {
         .collect()
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn insert(db: &Database, first: i64, rows: i64) -> contextdb_core::Result<()> {
     let mut sql = String::from("INSERT INTO points VALUES ");
     let mut params = HashMap::new();

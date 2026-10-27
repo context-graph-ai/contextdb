@@ -481,6 +481,10 @@ impl Default for InProcessBroker {
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn receive_native_read_borrowed(
     operation: &crate::owner_read::NativeReadRequest,
     request: &[u8],
@@ -508,6 +512,10 @@ fn receive_native_read_borrowed(
         dead_code,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from native_delivery_tests.rs"
     )
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(crate) fn begin_native_in_process(
     installation: &super::ReadBoundStreamInstallation,
@@ -590,6 +598,13 @@ pub(crate) mod native_serving {
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn shared<T>(
         owner: ReadMemoryOwner,
         make: impl FnOnce() -> contextdb_core::Result<T>,
@@ -692,6 +707,13 @@ pub(crate) mod native_serving {
         }
     }
     impl Mailbox {
+        #[cfg_attr(
+            any(test, feature = "test-seams"),
+            expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )
+        )]
         pub(super) fn acquire_client(
             mailbox: &ReadShared<Self>,
         ) -> super::super::WireResult<ClientHandle> {
@@ -709,6 +731,13 @@ pub(crate) mod native_serving {
                 completion: mailbox.completion,
             })
         }
+        #[cfg_attr(
+            any(test, feature = "test-seams"),
+            expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )
+        )]
         fn begin(handle: ClientHandle) -> super::super::WireResult<BeginTicket> {
             {
                 let mailbox = handle.mailbox();
@@ -723,6 +752,13 @@ pub(crate) mod native_serving {
             }
             Ok(BeginTicket { handle })
         }
+        #[cfg_attr(
+            any(test, feature = "test-seams"),
+            expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )
+        )]
         fn enqueue(&self, node: ReadShared<RequestNode>) -> super::super::WireResult<()> {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.retired {
@@ -854,6 +890,13 @@ pub(crate) mod native_serving {
     }
     impl Future for ClientWait {
         type Output = super::super::WireResult<super::super::BoundedWireReply>;
+        #[cfg_attr(
+            any(test, feature = "test-seams"),
+            expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )
+        )]
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
             // Synchronous native driver: no host Waker is cloned or stored.
@@ -891,6 +934,13 @@ pub(crate) mod native_serving {
         }
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn request(
         handle: ClientHandle,
         subject: &str,
@@ -1292,6 +1342,13 @@ pub(crate) mod native_serving {
             }
         }
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn serve<'a>(
         inner: &'a Inner,
         installation: super::super::ReadBoundStreamInstallation,

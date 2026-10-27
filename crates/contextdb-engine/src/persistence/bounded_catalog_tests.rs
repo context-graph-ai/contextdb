@@ -85,6 +85,13 @@ fn journal(candidate: &VectorPartitionGenerationCandidate) -> VectorPartitionJou
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn insert_journal(persistence: &RedbPersistence, record: &VectorPartitionJournalRecord) {
     persistence
         .with_db(|db| {
@@ -239,6 +246,13 @@ fn cold_publication_and_cleanup_exclude_unrelated_singleton_extents() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn miskeyed_catalog_attribution_still_authenticates_the_complete_record() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -305,6 +319,13 @@ fn miskeyed_catalog_attribution_still_authenticates_the_complete_record() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

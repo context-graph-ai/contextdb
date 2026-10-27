@@ -82,6 +82,10 @@ fn create_declaring(list: &str) -> DdlChange {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply(db: &Database, changes: ChangeSet) -> contextdb_core::Result<()> {
     db.apply_changes(
         changes,

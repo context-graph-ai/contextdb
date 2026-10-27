@@ -239,6 +239,10 @@ fn t22_04_single_tx_fk_violation_rolls_back_full_writeset() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t22_05_concurrent_child_inserts_against_live_parent_both_commit() {
     // REGRESSION GUARD: validator must not spuriously reject FK validations
     // when the parent is live for both writers.

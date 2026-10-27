@@ -188,6 +188,10 @@ struct Searched {
     receipts: Vec<UnionSearchReceipt>,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn search(db: &Database, mode: &str) -> Searched {
     let counter = Arc::new(Counter(AtomicU64::new(0), AtomicU64::new(0)));
     let (result, receipts) = with_union_search_receipts(|| {

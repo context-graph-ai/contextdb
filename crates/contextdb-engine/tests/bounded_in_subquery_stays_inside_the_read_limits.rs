@@ -230,6 +230,10 @@ fn described(outcome: &Outcome) -> String {
 /// Run the outer statement one way under one tightened ceiling and hold the
 /// result to the two outcomes a ceiling allows.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn arm(
     database: &Database,
     what: &str,
@@ -318,6 +322,10 @@ fn arm(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn run_through_a_cursor(
     open: &dyn Fn(ReadLimits) -> contextdb_core::Result<contextdb_engine::ReadSession>,
     limits: ReadLimits,

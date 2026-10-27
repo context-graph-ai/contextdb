@@ -32,6 +32,10 @@ fn seeded(database: &Database) {
         .expect("create the fixture table");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert(database: &Database, id: i64) -> contextdb_core::Result<()> {
     database
         .execute(

@@ -4,6 +4,13 @@
 use super::*;
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn interleaved_staged_row_owners_and_standalone_edges_share_logical_reachability() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE links (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL, subtype TEXT NOT NULL, UNIQUE(source_id, target_id, edge_type, subtype))", &HashMap::new()).unwrap();
@@ -149,6 +156,13 @@ fn detached_standalone_graph_copies_return_exactly_their_admitted_bytes() {
 // Policy 22: an open captured view cannot prohibit otherwise valid writes.
 // The rows exercise insert, same-owner changed endpoints, and delete separately:
 // otherwise an insert refusal masks the update/delete contract.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn staged_cursor_keeps_old_and_new_views_after_write(operation: &str) {
     let db = Database::open_memory();
     let params = HashMap::new();
@@ -254,6 +268,13 @@ fn an_open_graph_cursor_allows_staged_delete_and_keeps_its_view() {
 
 // Policy 22: insertion may move physical slots but cannot change a captured answer.
 // Thin rows ensure an early failing anchor case does not mask tail truncation.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn memory_edge_cursor_keeps_snapshot(direction: Direction, inserted: u128) {
     let db = Database::open_memory();
     db.execute("CREATE TABLE links (id INTEGER PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)", &HashMap::new()).unwrap();
@@ -363,6 +384,13 @@ fn a_memory_edge_cursor_keeps_its_snapshot_both_after_tail() {
 
 // Captured authorization decisions must use the same revision as staged bodies.
 // A live grant/node/edge lookup mutant passes the endpoint-only frozen rows.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn captured_graph_authorization_survives_mutation(operation: &str) {
     let db = Database::open_memory();
     let p = HashMap::from([

@@ -172,6 +172,10 @@ fn cursor_page_ids(page: &CursorPage) -> Vec<i64> {
         .collect()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn direct_session(observer: Arc<dyn ReadKernelTestObserver>) -> (tempfile::TempDir, ReadSession) {
     let directory = tempfile::TempDir::new().expect("task-scoped direct-route directory");
     let path = directory.path().join("direct-cancellation.db");
@@ -185,6 +189,10 @@ fn direct_session(observer: Arc<dyn ReadKernelTestObserver>) -> (tempfile::TempD
     (directory, session)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_session(
     observer: Arc<dyn ReadKernelTestObserver>,
 ) -> (tempfile::TempDir, Database, ReadSession) {
@@ -247,6 +255,10 @@ fn assert_one_selected_backend_operation(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
     let directory = tempfile::TempDir::new().expect("task-scoped route fixture directory");
     let path = directory.path().join("route-equivalence.db");
@@ -346,6 +358,10 @@ fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn file_and_live_owner_reads_report_the_same_one_byte_memory_limit() {
     let directory = tempfile::TempDir::new().expect("task-scoped route fixture directory");
     let path = directory.path().join("one-byte-memory.db");
@@ -630,6 +646,10 @@ fn spawn_startup_race_owner(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner() {
     if std::env::var_os(STARTUP_RACE_OWNER_CHILD).is_some() {
         let path = std::path::PathBuf::from(
@@ -775,6 +795,10 @@ fn writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn missing_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped missing-store directory");
     let runtime_root = secure_runtime_root(&directory, "missing-store-runtime");
@@ -793,6 +817,10 @@ fn missing_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn missing_store_beneath_a_missing_parent_keeps_the_typed_refusal() {
     let directory = tempfile::TempDir::new().expect("task-scoped missing-parent directory");
     let runtime_root = secure_runtime_root(&directory, "missing-parent-runtime");
@@ -816,6 +844,10 @@ fn missing_store_beneath_a_missing_parent_keeps_the_typed_refusal() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn damaged_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped damaged-store directory");
     let path = directory.path().join("damaged-store.db");
@@ -832,6 +864,10 @@ fn damaged_store_direct_open_failure_is_terminal_without_an_ownership_retry() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn direct_read_requiring_writer_is_terminal_without_an_ownership_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped direct-refusal directory");
     let path = directory.path().join("direct-refusal.db");
@@ -865,6 +901,10 @@ impl OwnerRequestHandler for RejectIfInvokedHandler {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_identity_authentication_failure_is_terminal_without_direct_fallback_or_retry() {
     let directory = tempfile::TempDir::new().expect("task-scoped authentication directory");
     let path = directory.path().join("owner-authentication.db");
@@ -1073,6 +1113,10 @@ impl ReadKernelTestObserver for KernelCancellationGate {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancel_execute_inside_kernel(
     session: ReadSession,
     gate: Arc<KernelCancellationGate>,
@@ -1154,6 +1198,10 @@ fn cancel_execute_inside_kernel(
     gate.assert_kernel_reported_cancellation();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancel_cursor_open_inside_kernel(
     session: ReadSession,
     gate: Arc<KernelCancellationGate>,
@@ -1588,6 +1636,10 @@ impl Drop for OwnerProcess {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_disconnect_after_partial_reply_never_falls_back_within_the_session() {
     if std::env::var_os(ROUTE_OWNER_CHILD).is_some() {
         let path =

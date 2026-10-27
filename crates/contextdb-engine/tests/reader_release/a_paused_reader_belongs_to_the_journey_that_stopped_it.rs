@@ -61,6 +61,10 @@ impl contextdb_core::read_contract::DeadlineClock for PausedTestClock {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_paused_reader(path: &Path, runtime: &Path) -> ReadSession {
     ReadSession::with_runtime_directory_for_test(runtime, || {
         ReadSession::open_with_clock_for_test(

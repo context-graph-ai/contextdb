@@ -888,6 +888,10 @@ fn c8_estimates_are_per_table_and_never_claim_the_whole_file() {
 // C10 — the engine's own unbounded table
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_audited_db(path: &std::path::Path) -> Database {
     let db = Database::open(path).expect("open file-backed db");
     db.execute("CREATE TABLE fire (id INTEGER PRIMARY KEY)", &p())

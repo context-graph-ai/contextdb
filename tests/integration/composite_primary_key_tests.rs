@@ -540,6 +540,10 @@ fn c5d_guard_a_single_column_primary_key_replicates_unchanged() {
 /// keys, or vector keys; composite FOREIGN KEY behavior is separately
 /// pinned in `tests/integration/composite_foreign_key_tests.rs`.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn c5d_guard_a_multi_column_unique_constraint_is_not_an_identity() {
     let db = Database::open_memory();
     db.execute(

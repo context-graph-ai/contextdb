@@ -427,6 +427,10 @@ fn ce06_persisted_config_round_trip_disk_limit() {
 // CE07 — cron schedule round-trip: fires on the artifact. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce07_cron_schedule_round_trip_fires_on_artifact() {
     let (_tmp, src, dest) = new_export_fixture();
 
@@ -486,6 +490,10 @@ fn ce07_cron_schedule_round_trip_fires_on_artifact() {
 // CE08 — trigger declaration round-trip: registers and fires on artifact. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce08_trigger_declaration_round_trip_fires_on_artifact() {
     let (_tmp, src, dest) = new_export_fixture();
 
@@ -970,6 +978,10 @@ fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
 // CE14 — in-memory source round-trip: rows, vectors, edges. RED.
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ce14_in_memory_source_round_trip() {
     let tmp = TempDir::new().unwrap();
     let dest = tmp.path().join("artifact.db");
@@ -1739,6 +1751,10 @@ fn checkpoint_preserves_current_and_historical_vectors_in_every_quantization() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
     let (_tmp, src, dest) = new_export_fixture();
     src.execute(

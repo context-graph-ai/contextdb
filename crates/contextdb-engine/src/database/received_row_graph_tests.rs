@@ -19,6 +19,13 @@ fn insert_siblings(db: &Database, table: &str, keyed: bool) {
     db.execute(&format!("INSERT INTO {table} VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'link', 1), ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'link', 2)"), &HashMap::new()).unwrap();
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn witnesses(db: &Database, direction: Direction) -> Vec<OwnedAdjEntry> {
     let memory = db.declared_reader_memory().unwrap();
     let root = db.graph_snapshot(db.snapshot_for_read(), memory).unwrap();
@@ -47,6 +54,13 @@ fn witnesses(db: &Database, direction: Direction) -> Vec<OwnedAdjEntry> {
     result
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn standalone_witnesses(db: &Database, direction: Direction) -> Vec<AdjEntry> {
     let memory = db.declared_reader_memory().unwrap();
     let root = db.graph_snapshot(db.snapshot_for_read(), memory).unwrap();
@@ -100,6 +114,13 @@ fn assert_witnesses(db: &Database, expected: &[OwnedAdjEntry], expected_standalo
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn receive(db: &Database, ddl: DdlChange, generation: u64, connected: bool) -> Result<()> {
     let received = crate::protocol::ReceivedDdlContext {
         tenant_id: TenantId::from("tenant-a"),
@@ -175,6 +196,13 @@ fn receive(db: &Database, ddl: DdlChange, generation: u64, connected: bool) -> R
     })
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_identity_lifecycle(drop_selected: bool, file: bool, connected: bool) {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let temp = tempfile::TempDir::new().unwrap();

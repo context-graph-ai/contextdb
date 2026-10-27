@@ -349,6 +349,13 @@ fn identity_cursor(reverse: bool) -> contextdb_relational::mem::BoundedOrderedRo
     cursor
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn pull_identity(
     load: &ReadPersistenceLoad,
     cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
@@ -511,6 +518,13 @@ mod transition_observation {
     /// Run `transition` on another thread and sample the accountant at both
     /// observation points from this one. `probe` is the number of bytes only a
     /// limit above `floor` could admit.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn observe_transition(
         database: &Database,
         floor: usize,
@@ -569,6 +583,13 @@ mod transition_observation {
 /// durable write that records it, so a concurrent operation can consume
 /// capacity that never commits.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_widening_transition_never_publishes_capacity_its_durable_write_has_not_committed() {
     use crate::database::memory_limit_transition_seam::TransitionPhase;
     let root = tempfile::tempdir().unwrap();
@@ -613,6 +634,13 @@ fn a_widening_transition_never_publishes_capacity_its_durable_write_has_not_comm
 /// then publishes it, so a concurrent operation keeps allocating under the
 /// larger limit after the smaller one is already the durable truth.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_narrowing_transition_never_leaves_the_old_capacity_published_after_its_durable_write() {
     use crate::database::memory_limit_transition_seam::TransitionPhase;
     let root = tempfile::tempdir().unwrap();

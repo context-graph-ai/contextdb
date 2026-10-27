@@ -1331,6 +1331,13 @@ impl Fence {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn publish<T>(
         &mut self,
         snapshot_lsn: Lsn,
@@ -1875,6 +1882,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn file_publication_wait_has_no_false_timer_refusal_repoll_or_lost_release_wake() {
         let (_runtime, mut reader, writer) = contended_fences();
         let (clock, polled, release) = controlled_clock(20, None, true);
@@ -1907,6 +1918,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn file_publication_wait_wakes_for_cancellation_and_refuses_only_after_elapsed_deadline() {
         let (_runtime, mut reader, writer) = contended_fences();
         let cancellation = OwnerReadCancellation::new();

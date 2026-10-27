@@ -49,6 +49,13 @@ impl Database {
     /// ChangeSet here would release its admissions before its allocations.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn with_checked_changes_page_for_test<T>(
         &self,
         since: Lsn,

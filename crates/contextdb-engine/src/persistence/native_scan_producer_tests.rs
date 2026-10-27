@@ -515,6 +515,13 @@ fn native_scan_nested_helpers_and_every_drop_order_retain_the_original_admission
 // application's payload is outside the native scan interval.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn native_scan_error_and_unwind_restore_scope_and_physically_free_entries() {
     for unwind in [false, true] {
         let reader = Reader::new(1 << 20);

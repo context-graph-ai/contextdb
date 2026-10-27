@@ -112,6 +112,10 @@ impl ReadSessionTestObserver for ClaimWaitReport {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_statement_arriving_while_a_new_writer_is_still_claiming_the_store_waits_for_it_and_is_answered()
  {
     let directory = tempfile::tempdir().expect("scratch directory");

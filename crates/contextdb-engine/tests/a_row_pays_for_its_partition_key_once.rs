@@ -27,6 +27,10 @@ fn fixture(path: &std::path::Path) -> Database {
     db
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert(db: &Database, id: i64, key: &str) -> contextdb_core::Result<()> {
     db.execute(
         "INSERT INTO keyed VALUES ($id, $scope, $v)",

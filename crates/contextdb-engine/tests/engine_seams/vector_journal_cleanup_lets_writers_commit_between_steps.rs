@@ -54,6 +54,10 @@ fn journal_records(db: &Database) -> usize {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_writer_commits_between_two_steps_of_a_covered_journal_cleanup() {
     let root = tempfile::tempdir().unwrap();
     let mut options = DatabaseOpenOptions {

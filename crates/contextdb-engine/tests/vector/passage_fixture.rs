@@ -89,6 +89,10 @@ pub fn seeded(rows: usize) -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn open_reader(
     path: &std::path::Path,
     runtime: &std::path::Path,

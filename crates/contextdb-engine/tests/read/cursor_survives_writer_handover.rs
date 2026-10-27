@@ -645,6 +645,10 @@ impl ReadSessionTestObserver for PauseBeforeRegistration {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_exit_after_open_response_does_not_break_client_registration() {
     if std::env::var_os(ROLE).is_some() {
         return;
@@ -712,6 +716,10 @@ fn owner_exit_after_open_response_does_not_break_client_registration() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn purge_during_handoff_invalidates_affected_continuation_after_owner_exit() {
     if std::env::var_os(ROLE).is_some() {
         return;
@@ -1047,6 +1055,10 @@ fn an_abrupt_owner_exit_preserves_old_rows_through_replacement_rewrites() {
     drop(writer);
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn small_budget_handover(deliver_owner_rows: usize) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bounded-replay.db");
@@ -1303,6 +1315,10 @@ pub(crate) mod append_heap_oracle {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn closing_a_cursor_keeps_the_next_small_append_cleanup_bounded() {
     if std::env::var_os(ROLE).is_some() {
         return;

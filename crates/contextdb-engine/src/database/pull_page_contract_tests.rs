@@ -103,6 +103,13 @@ struct Pulled {
 /// One page from `since`, selected on this thread so its work is observable,
 /// funded by `budget`, exactly as a hub serves it. The page's output is dropped
 /// before the budget is read back.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn page_from(
     db: &Database,
     since: Lsn,
@@ -293,6 +300,13 @@ fn every_occurrence(pages: &[Pulled]) -> Vec<Occurrence> {
 // the peak it holds are the same behind a doubled tail, exactly.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_resident_page_admits_the_same_bytes_as_the_tail_doubles() {
     let mut admitted = Vec::new();
     let mut peaks = Vec::new();
@@ -365,6 +379,13 @@ fn a_resident_page_admits_the_same_bytes_as_the_tail_doubles() {
 // from the same cursor under a sufficient budget succeeds in full.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_refused_resident_page_releases_everything_it_admitted() {
     let db = caller_driven(Database::open_memory());
     synced_notes(&db);
@@ -740,6 +761,13 @@ fn a_dropped_page_changes_nothing_for_the_next_request() {
 // bytes a page admits do not grow with the deletions the later pages will
 // carry, and each deletion arrives exactly once in order.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn pending_deletes_are_selected_a_page_at_a_time() {
     for durable in [false, true] {
         pending_deletes_page_is_flat(durable);
@@ -1184,6 +1212,13 @@ fn old_version_page_is_flat(durable: bool) {
 /// per-entry checkpoint, the way a page in flight lets other work run between
 /// two of its source reads. `during` receives the checkpoint's call number
 /// (0 is the first source entry's).
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn page_with_work_between_reads(
     db: &Database,
     during: impl Fn(usize) -> Result<()>,
@@ -1253,6 +1288,13 @@ fn lsns(changes: &ChangeSet) -> Vec<u64> {
 // still delivers e0, e1 and e2 exactly once, and the same pass run after the
 // page is gone removes all three.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_page_in_flight_defers_the_removal_of_the_group_it_is_reading() {
     let db = one_group_then_supersessions();
     assert_eq!(db.active_pull_history_registrations_for_test(), 0);
@@ -1373,6 +1415,13 @@ fn a_page_in_flight_defers_the_removal_of_the_group_it_is_reading() {
 // A page that is refused or cancelled mid-read lets go of what it protected:
 // the pass that deferred while it was in flight removes the group afterwards.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_cancelled_page_in_flight_releases_its_protection() {
     let db = one_group_then_supersessions();
     let during_page = Cell::new(None);
@@ -1401,6 +1450,13 @@ fn a_cancelled_page_in_flight_releases_its_protection() {
 // succeeds, the page ends at the frontier it captured, and the next page from
 // that frontier carries the new row once.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn commits_during_a_page_proceed_and_are_not_part_of_it() {
     let db = one_group_then_supersessions();
     let frontier = db.current_lsn();

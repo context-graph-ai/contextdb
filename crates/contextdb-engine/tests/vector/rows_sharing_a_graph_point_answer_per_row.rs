@@ -94,6 +94,10 @@ fn search_at(
     search_labelled(db, mode, snapshot, "")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn search_labelled(
     db: &Database,
     mode: &str,
@@ -300,6 +304,10 @@ fn settle_table(db: &Database, table: &str) {
     );
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn answer(
     db: &Database,
     table: &str,
@@ -514,6 +522,10 @@ fn member_reads_stay_within_the_declared_tombstone_share_as_history_grows() {
 /// typed disconnected error, AUTO answers as EXACT does, and every byte the
 /// counting took is given back.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_large_shared_point_beside_a_cut_off_row_is_counted_and_given_back() {
     let query = query();
     let db = Database::open_memory();
@@ -789,6 +801,10 @@ fn a_filtered_walk_over_a_graph_without_shared_points_reads_no_membership() {
 /// work checkpoint of the statement. INDEXED refuses the cut partition, typed,
 /// with nothing left charged, and AUTO answers as EXACT does.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn unsuccessful_member_probes_of_a_reopened_filtered_count_are_each_charged() {
     let query = query();
     let root = TempDir::new().expect("create the durable fixture directory");

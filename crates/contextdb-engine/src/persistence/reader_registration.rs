@@ -1,6 +1,13 @@
 use super::*;
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn observed_graph_storage_key<K: AsRef<[u8]>>(
     family: &str,
     operation: &str,
@@ -1784,6 +1791,13 @@ impl ReadPersistenceImage {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn hydrate_logical_content_for_test(
         &mut self,
         retained_source: &RetainedReadSource,
@@ -1893,6 +1907,13 @@ impl ReadPersistenceReleaseReceipt {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn validate_released(&self) -> std::result::Result<(), LoadReadImageError> {
         if self.source_accesses == 0 {
             return Err(LoadReadImageError::Release(
@@ -2056,6 +2077,13 @@ impl LoadReadImageError {
 /// Test adapters resolve the established session limits and clock here;
 /// production callers must supply their active open context.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn load_read_image(
     path: &Path,
 ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
@@ -2063,6 +2091,13 @@ pub(crate) fn load_read_image(
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn load_read_image_with_memory(
     path: &Path,
     limit: Option<usize>,
@@ -4020,6 +4055,13 @@ impl ReadSnapshotRegistrationGuard {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_cursor_admission_tests.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub(crate) fn owner_handoff_start(

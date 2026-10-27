@@ -53,6 +53,13 @@ fn retained_raw_body_guard_accepts_each_quantization_and_preserves_identity() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_corrupt_sq4_refuses_before_conversion_owner() {
     let membership = membership();
     let corrupt = PersistedVectorEntry {
@@ -92,6 +99,13 @@ fn retained_corrupt_sq4_refuses_before_conversion_owner() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_oversized_body_is_refused_before_persisted_decode() {
     let membership = membership();
     let oversized = PersistedVectorEntry {

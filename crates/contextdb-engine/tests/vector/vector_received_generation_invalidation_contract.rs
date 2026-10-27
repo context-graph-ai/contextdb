@@ -79,6 +79,10 @@ fn exact_search_at_snapshot(
         .unwrap_or_else(|error| panic!("exact vector search at retained snapshot: {error}")))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn indexed_search(db: &Database, scope: Uuid, query: Vec<f32>) -> Result<Vec<Uuid>, Error> {
     db.execute(
         "SELECT id FROM received_vector_items WHERE scope_id = $scope \

@@ -2066,6 +2066,10 @@ fn assert_pre2_family_refusal_for_test(error: Error, family: &'static str) {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn family_refusal_literals_for_test() {
     use crate::memory_accounting::WriterBudget;
     let database = Database::open_memory();

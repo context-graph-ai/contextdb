@@ -1464,6 +1464,13 @@ impl RedbPersistence {
     /// Read only the carry-over identities. Admit their decoded B-tree and
     /// destination hash buckets before decoding, including carry-only retries.
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn load_retention_deferred_edge_nodes_admitted(
         &self,
         workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
@@ -3578,6 +3585,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn external_snapshot_retention_for_test(
         &self,
     ) -> Result<read_persistence_test_scaffold::ExternalSnapshotRetentionObservation> {
@@ -3604,11 +3618,25 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn external_snapshot_page_allocated_for_test(&self, page: [u8; 8]) -> Result<bool> {
         self.with_db(|db| Ok(db.external_snapshot_page_allocated_for_test(page)))
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn deferred_free_backlog_for_test(&self) -> Result<[(usize, usize); 2]> {
         self.with_db(|db| {
             db.deferred_free_backlog_for_test()
@@ -3617,6 +3645,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn commit_storage_transaction_for_test(&self) -> Result<()> {
         self.with_db(|db| {
             db.begin_write()

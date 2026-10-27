@@ -292,6 +292,13 @@ fn snapshot_of(load: &ReadPersistenceLoad) -> SnapshotId {
 /// Walk and authenticate every live row of the fixture table through the
 /// production retained-source route. This is the same `verify()` hot path a
 /// search takes for the rows and row vectors it projects.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn walk_rows(load: &ReadPersistenceLoad) -> Result<usize> {
     let meta = &load.image.table_meta[TABLE];
     let snapshot = snapshot_of(load);
@@ -529,6 +536,13 @@ fn a_read_is_answered_although_a_full_resident_set_is_holding_the_last_declared_
 /// row's own content is hashed and compared against them, so the read is the
 /// existing typed corruption error and no row body is delivered.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_changed_row_body_is_typed_corruption_although_its_proof_chunks_are_resident() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

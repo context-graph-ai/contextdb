@@ -447,6 +447,10 @@ type DeclarationRows = Vec<(String, String, String)>;
 /// Two storage compaction declarations run through the setter on two
 /// threads while the first is paused after its declaration is durable and
 /// before it is live.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn race_declarations(
     first: &'static str,
     second: &'static str,
@@ -525,6 +529,10 @@ fn a_default_racing_a_declaration_leaves_live_show_and_reopen_agreeing() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn the_rust_setter_refuses_what_sql_refuses_and_changes_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("validated.redb");

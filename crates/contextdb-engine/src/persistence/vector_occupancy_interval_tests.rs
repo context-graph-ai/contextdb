@@ -452,6 +452,13 @@ fn a_route_end_equal_to_the_publishing_tx_then_a_new_open_membership_leaves_one_
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn removing_the_only_membership_of_a_route_clears_its_rows() {
     let h = Harness::new();
     h.commit(&[put(1, 10, Some(20))], true);
@@ -840,6 +847,13 @@ fn run_sequence(seed: u64, steps: usize) {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() {
     for seed in 1..=60 {
         run_sequence(seed, 80);
@@ -1085,6 +1099,13 @@ const SCENARIO_ENV: &str = "CDB120_CRASH_WINDOW_SCENARIO";
 const STORE_ENV: &str = "CDB120_CRASH_WINDOW_STORE";
 const MARKER_ENV: &str = "CDB120_CRASH_WINDOW_MARKER";
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn sql(
     db: &crate::Database,
     text: &str,
@@ -1094,6 +1115,13 @@ fn sql(
     db.execute(text, &params).map(|_| ())
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn put_row(db: &crate::Database, row: u128, scope: &str) -> contextdb_core::Result<()> {
     sql(
         db,

@@ -124,6 +124,10 @@ fn fill(db: &Database, shape: Shape, percent: usize, breadth: Option<usize>) {
     panic!("maintenance did not settle");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn find(db: &Database, mode: &str, partitions: usize, query: &[f32]) -> Result<QueryResult, Error> {
     let scope = (0..partitions)
         .map(|partition| format!("'{}'", context(partition)))
@@ -362,6 +366,10 @@ fn insert_passage(db: &Database, context: Uuid, row: usize, searchable: bool, em
     .expect("insert one passage");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn search_one_context(
     db: &Database,
     mode: &str,

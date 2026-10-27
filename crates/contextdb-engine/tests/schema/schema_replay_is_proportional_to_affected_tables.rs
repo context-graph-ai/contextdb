@@ -386,6 +386,10 @@ async fn schema_replay_is_proportional_to_affected_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn affected_schema_closure_keeps_foreign_keys_propagation_and_triggers() {
     let root = tempfile::tempdir().unwrap();
     let receiver = receiver(&root.path().join("hub.db"));
@@ -683,6 +687,10 @@ fn largest_affected_replay_preserves_existing_rows_vectors_and_trigger() {
 /// the detached apply hits) and stages exactly it, never the store's many
 /// unrelated tables.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn including_sync_stage_discovers_a_callback_written_table_beyond_its_declared_affected_set() {
     use contextdb_engine::sync_types::{
         ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,

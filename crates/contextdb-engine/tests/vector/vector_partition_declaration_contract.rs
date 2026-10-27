@@ -327,6 +327,10 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn concurrent_maintenance_poll_interval_setters_keep_live_worker_and_reopen_consistent() {
     let root = tempfile::tempdir().expect("scratch directory");
     let path = root.path().join("concurrent-maintenance-policy.db");

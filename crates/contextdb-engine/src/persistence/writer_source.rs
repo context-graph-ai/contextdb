@@ -56,6 +56,13 @@ pub(crate) struct HistoricalRowProof {
 }
 impl HistoricalRowProof {
     #[cfg(all(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn assert_real_visitor_rejects_other_bindings_for_test(
         &mut self,
         root: &WriterSnapshotHandle,
@@ -3934,6 +3941,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn published_writer_root_stays_old_until_explicit_swap_and_windows_release() {
         let reader = Arc::new(MemoryAccountant::no_limit());
         let directory = tempfile::tempdir().unwrap();

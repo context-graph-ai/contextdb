@@ -169,6 +169,10 @@ fn assert_open_reads_only_bounds(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ssa_open_locality_journey() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("open_locality.redb");

@@ -98,6 +98,10 @@ fn suffix_store(path: &std::path::Path, suffix: i64) {
     db.close().unwrap();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn trigger_store(path: &std::path::Path, fired: i64) {
     let db = open(path);
     db.execute(

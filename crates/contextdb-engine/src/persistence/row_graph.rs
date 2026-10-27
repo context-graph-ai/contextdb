@@ -127,6 +127,13 @@ impl RedbPersistence {
     /// Deliberate fixture damage bypasses producer witnesses; the next graph
     /// operation must refuse rather than select a surviving sibling.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn remove_row_graph_witness_for_test(
         path: &Path,
         table: &str,

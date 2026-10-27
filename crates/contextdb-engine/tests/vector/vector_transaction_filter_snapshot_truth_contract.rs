@@ -381,6 +381,10 @@ fn assert_exact_trace(db: &Database, what: &str) {
 /// This call is the deliberate transaction-entrance compile wall described in
 /// the module documentation. It observes the existing transaction-aware semantic kernel
 /// without choosing a new public Rust transaction interface.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn semantic_in_tx(
     db: &Database,
     tx: contextdb_core::TxId,

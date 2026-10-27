@@ -296,6 +296,10 @@ fn authorized_reader(db: &Database) -> Database {
 /// index identities instead of stored row versions.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_find_decodes_only_the_rows_it_returns() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;
@@ -484,6 +488,10 @@ fn only_the_rows_an_answer_publishes_are_put_through_the_row_gate() {
 /// nothing.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_find_verifies_what_it_walks_not_the_scope_it_searches() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;
@@ -602,6 +610,10 @@ fn a_find_verifies_what_it_walks_not_the_scope_it_searches() {
 /// made where the row is published is the only one that can see it.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;
@@ -697,6 +709,10 @@ fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
 /// asserted, over the same Context.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_moved_index_posting_is_reported_as_damage() {
     use contextdb_core::read_contract::ReadRoute;
     use contextdb_core::types::ContextId;

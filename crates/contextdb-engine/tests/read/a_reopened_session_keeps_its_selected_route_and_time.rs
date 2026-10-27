@@ -233,6 +233,10 @@ impl ReadSessionTestObserver for HoldDirectOpenThenReportClaimWait {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_reselection_wait_inside_the_routing_allowance_never_spends_a_statements_active_time() {
     const ACTIVE_MS: u64 = 500;
     const ROUTING_MS: u64 = 1_000;

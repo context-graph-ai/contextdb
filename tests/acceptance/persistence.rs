@@ -964,6 +964,10 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
 /// I corrupted a 1.0 store's metadata table and got a distinct error — NOT LegacyVectorStoreDetected, so the operator
 /// can tell "missing marker" from "garbled marker".
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().join("corrupt.db");

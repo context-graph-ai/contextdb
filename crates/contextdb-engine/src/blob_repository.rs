@@ -1635,6 +1635,13 @@ impl BlobRepository {
 
     /// Append one bounded, already-associated payload chunk.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn append_staging_payload(
         &self,
         object_id: [u8; 16],
@@ -1789,6 +1796,13 @@ impl BlobRepository {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn append_staging_chunk(
         &self,
         object_id: [u8; 16],
@@ -2540,6 +2554,13 @@ impl BlobRepository {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn install_complete_fixture_for_test(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2550,6 +2571,13 @@ impl BlobRepository {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn install_interrupted_fixture_for_test(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2566,6 +2594,13 @@ impl BlobRepository {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn install_fixture_for_test(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2721,6 +2756,13 @@ impl BlobRepository {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn authoritative_purge_roles_for_test(&self, hash: &[u8; 32]) -> Result<BTreeSet<String>> {
         let _operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -2816,6 +2858,13 @@ impl BlobRepository {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn bounded_payload_for_test(
         self: &Arc<Self>,
         hash: &[u8; 32],
@@ -2884,6 +2933,13 @@ impl BlobRepository {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn next_missing_range_for_test(
         self: &Arc<Self>,
         hash: &[u8; 32],
@@ -3255,6 +3311,13 @@ impl BlobRepository {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn count_tag_role(&self, role: BlobTagRole) -> Result<u64> {
         let _operation = self.begin_operation()?;
         self.store()?.with_db(|db| {
@@ -3967,6 +4030,10 @@ impl BlobExportSnapshot {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_fixture_chunks_in_write(
     write: &redb::WriteTransaction,
     definition: TableDefinition<&[u8], &[u8]>,
@@ -3995,6 +4062,13 @@ fn insert_fixture_chunks_in_write(
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn object_has_chunks_in_read(
     read: &redb::ReadTransaction,
     definition: TableDefinition<&[u8], &[u8]>,

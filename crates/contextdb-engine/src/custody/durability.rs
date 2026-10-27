@@ -50,6 +50,13 @@ pub(crate) fn commit_fault_reached() -> bool {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn take_commit_fault(transaction: &redb::WriteTransaction) -> Result<bool> {
     let mut fault = BEFORE_COMMIT_FAULT.lock().unwrap();
     let Some(fault) = fault.as_mut().filter(|fault| !fault.reached) else {
@@ -83,6 +90,13 @@ fn take_commit_fault(transaction: &redb::WriteTransaction) -> Result<bool> {
 
 // Called only at the actual shared row/outcome commit boundary.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn before_custody_commit(transaction: &redb::WriteTransaction) -> Result<()> {
     if take_commit_fault(transaction)? {
         return Err(contextdb_core::Error::Other(

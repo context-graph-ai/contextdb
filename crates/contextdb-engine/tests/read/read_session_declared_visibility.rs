@@ -307,6 +307,10 @@ fn declaring(
 
 /// Route 3: the store is idle, so the session answers from the committed
 /// image through the direct-file backend.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn direct_session(
     fixture: &DeclaredFixture,
     name: &str,
@@ -342,6 +346,10 @@ fn owner_writer(
 
 /// Route 2: a live writer holds the store, so the session reaches it over the
 /// local owner channel.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_session(
     fixture: &DeclaredFixture,
     runtime_root: &std::path::Path,

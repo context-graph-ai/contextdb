@@ -2036,6 +2036,13 @@ pub(crate) fn commit_terminal(
     })
 }
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn admit_terminal(
     db: &Database,
     tenant: &TenantId,
@@ -2151,6 +2158,13 @@ pub(crate) fn admit_terminals(
 /// transaction. Shared subjects must carry identical authenticated row bytes.
 #[cfg(feature = "test-seams")]
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn commit_terminal_batch(
     db: &Database,
     tenant: TenantId,

@@ -227,6 +227,10 @@ fn assert_required_recall(db: &Database) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn native_tail_publication_answers_exactly_before_the_serving_cache_installs() {
     use contextdb_engine::writer_commit_test_seams::{CommitBoundary, observe};
     use std::sync::{Mutex, mpsc};
@@ -308,6 +312,10 @@ fn native_fixture(path: &std::path::Path) -> Database {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn native_tail_crash_recovers_a_complete_catalog_and_graph_at_both_commit_boundaries() {
     use contextdb_engine::writer_commit_test_seams::{CommitBoundary, observe};
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
@@ -454,6 +462,10 @@ fn saved_change_fixture(path: &std::path::Path) -> Database {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_existing_saved_change_is_adopted_once_before_native_import_suffixes() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     if let Ok(path) = std::env::var("CG_GROWTH_ADOPTION_CRASH_PATH") {

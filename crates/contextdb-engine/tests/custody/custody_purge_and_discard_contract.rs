@@ -756,6 +756,10 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
 
 // Multi-table purge selects and erases as one durable boundary at both hub and edge.
 #[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_is_refused_before_selection_when_illegal()
  {
     let _clock = Wallclock::test_clock_guard(|| T0);
@@ -1122,6 +1126,10 @@ async fn edge_discard_follows_declared_modes_and_one_local_transaction_boundary(
     discard_transaction_writes();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn discard_never() {
     let _clock = Wallclock::test_clock_guard(|| T0);
     let list = "DISCARD FROM records WHERE batch_ref = $batch, \
@@ -1236,6 +1244,10 @@ async fn discard_never() {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn discard_after_outcome() {
     let _clock = Wallclock::test_clock_guard(|| T0);
     let list = "DISCARD FROM records WHERE batch_ref = $batch, \
@@ -1472,6 +1484,10 @@ async fn discard_after_outcome() {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn discard_always() {
     let _clock = Wallclock::test_clock_guard(|| T0);
     let list = "DISCARD FROM records WHERE batch_ref = $batch, \

@@ -67,6 +67,10 @@ fn insert_parent(db: &Database, a: i64, b: i64) {
     .unwrap();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_child(db: &Database, id: i64, c1: &str, c2: &str) -> Result<(), Error> {
     db.execute(
         &format!("INSERT INTO child (id, c1, c2, note) VALUES ({id}, {c1}, {c2}, 'c')"),
@@ -583,6 +587,10 @@ fn cfk_delete_parent_no_children_commits() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cfk_delete_race_serializes_with_barrier() {
     let (_tmp, path, db) = file_db("delete-race.db");
     create_parent_child(&db);
@@ -2130,6 +2138,10 @@ fn protocol_version_bumps_for_structured_constraint_wire() {
     assert_eq!(decoded.version, 7);
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_composite_parent_projection_prices_keys_not_payloads() {
     let mut peaks = HashMap::new();
     for key_bytes in [8usize, 1024] {

@@ -175,6 +175,10 @@ fn served_store(directory: &Path, runtime_root: PathBuf) -> (Database, PathBuf) 
     (database, path)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_session(runtime_root: &Path, path: &Path) -> ReadSession {
     let session = ReadSession::with_runtime_directory_for_test(runtime_root, || {
         ReadSession::open_with_options(path, declared_session())
@@ -184,6 +188,10 @@ fn owner_session(runtime_root: &Path, path: &Path) -> ReadSession {
     session
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn file_session(runtime_root: &Path, path: &Path) -> ReadSession {
     let session = ReadSession::with_runtime_directory_for_test(runtime_root, || {
         ReadSession::open_with_options(path, declared_session())

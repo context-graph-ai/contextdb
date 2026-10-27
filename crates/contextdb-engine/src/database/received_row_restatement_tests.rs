@@ -58,6 +58,13 @@ fn identity(root: &tempfile::TempDir, name: &str) -> Arc<FabricIdentity> {
 /// Sign the outbound lineage for every row in `changes`, exactly as the
 /// authoring node would before handing that row to a hub — mirrors
 /// `in_memory_lineage_tests.rs`'s identical helper.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn lineages(
     db: &Database,
     changes: &ChangeSet,

@@ -169,6 +169,10 @@ fn assert_work_bounds_every_answer(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn tied_index_probes_are_charged_against_the_work_limit_on_every_route() {
     let root = tempfile::tempdir().expect("fixture directory");
     let path = root.path().join("tied.db");

@@ -210,6 +210,13 @@ fn bus_with_window(
     bus
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn prepare(
     bus: &EventBusState,
     rows: &[u64],
@@ -281,6 +288,13 @@ fn a_purge_replacement_funds_the_copied_window_buffers_before_copying() {
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn an_attempt_rewrite_copies_no_part_of_the_entry() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests::measured;
     let mut wide = entry(9);

@@ -144,6 +144,10 @@ fn insert_batch(db: &Database, start: usize) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn first_saved_search_stays_inside_its_primitive_ceiling() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -224,6 +228,10 @@ fn first_saved_search_stays_inside_its_primitive_ceiling() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_admitted_batch_stays_inside_its_primitive_ceiling_on_doubled_history() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let mut completed_writer = None;

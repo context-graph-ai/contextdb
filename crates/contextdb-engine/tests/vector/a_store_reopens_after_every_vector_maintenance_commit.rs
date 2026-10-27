@@ -107,6 +107,10 @@ fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 /// Child half of the crash test: run maintenance to one preparation phase and
 /// abort the process there, leaving exactly what the build had committed.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reopen_crash_child() {
     let (Ok(path), Ok(phase)) = (
         std::env::var(CRASH_CHILD_PATH),

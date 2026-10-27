@@ -862,6 +862,13 @@ fn fixture(file: bool) -> (tempfile::TempDir, Database) {
 fn sql(db: &Database, statement: &str) -> QueryResult {
     db.execute(statement, &HashMap::new()).unwrap()
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn entry(
     db: &Database,
     historical: bool,
@@ -904,6 +911,13 @@ impl ReadExecutionConvergenceObserver for Routes {
 // snapshot ignored, or adapter/keeper refunded before native deallocation.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn ordinary_sql_and_two_snapshots_retain_the_original_native_parent() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
@@ -988,6 +1002,13 @@ fn ordinary_sql_and_two_snapshots_retain_the_original_native_parent() {
 // Decisive mutants: always force pull, lose tx overlay, change rollback/commit.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn ordinary_transactions_preserve_eager_updates_and_private_rows() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
@@ -1082,6 +1103,13 @@ fn borrowed_refusal(
 // owned diagnostic conversion, leaked/double-refunded child, new transport caps.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn ordinary_admission_and_allocator_refusals_preserve_typed_fields_and_cleanup() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
@@ -1210,6 +1238,13 @@ fn ordinary_admission_and_allocator_refusals_preserve_typed_fields_and_cleanup()
 // Decisive mutant: retain a raw forwarding Arc without its external invoice.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn an_escaped_actual_trace_keeps_the_native_child_and_original_invoice_alive() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
@@ -1312,6 +1347,13 @@ impl DatabasePlugin for PanicPlugin {
 // Decisive mutants: only success-path cleanup or refund adapter before Arc free.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn ordinary_producer_callback_unwind_frees_each_original_control_once() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
@@ -1374,6 +1416,13 @@ fn ordinary_producer_callback_unwind_frees_each_original_control_once() {
 // reset, simulated, substituted or admitted by this diagnostic negative control.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn ordinary_native_physical_cut_rejects_missing_duplicate_early_wrong_and_extra_receipts() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
@@ -1430,6 +1479,13 @@ fn ordinary_native_physical_cut_rejects_missing_duplicate_early_wrong_and_extra_
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physical_free() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
@@ -1479,6 +1535,13 @@ fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physica
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     struct Cleanup;
@@ -1767,6 +1830,13 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     for file in [false, true] {
@@ -1986,6 +2056,13 @@ impl contextdb_core::read_contract::DeadlineClock for DirectPhysicalClock {
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn actual_direct_file_public_readers_keep_original_invoices_through_physical_free() {
     use crate::direct_file_reader::{DirectFileReader, DirectReaderConfig};
     use std::num::NonZeroUsize;

@@ -403,6 +403,10 @@ impl Drop for OpenerThread {
 /// waits. It runs on its own thread so the filter never leaks into another proof.
 #[cfg(target_os = "linux")]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_thread_that_may_not_sigkill_gets_the_unsupported_refusal_and_default_opens_still_wait() {
     let directory = tempfile::TempDir::new().expect("task-scoped directory");
     let path = seeded_store(directory.path(), "seccomp.db");

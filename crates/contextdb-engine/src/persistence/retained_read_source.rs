@@ -4518,6 +4518,13 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn change_history_bodies_for_test(&self) -> Result<Vec<(String, Vec<u8>)>> {
         self.with_read(|read| {
             let table = match read.open_table(CHANGE_LOG_TABLE) {
@@ -4542,6 +4549,13 @@ impl RetainedReadSource {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub(crate) fn relational_version_bodies_for_test(
@@ -4569,6 +4583,13 @@ impl RetainedReadSource {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn compatibility_vector_projection_for_test(
         &self,
         table_meta: &HashMap<String, TableMeta>,

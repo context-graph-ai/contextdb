@@ -205,6 +205,13 @@ fn receipt() -> SyncApplyReceipt {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn apply_received(
     db: &Database,
     changes: &ChangeSet,
@@ -289,6 +296,13 @@ fn reopen_if_requested(db: Database, path: &std::path::Path, reopen: bool) -> Da
     Database::open(path).unwrap()
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_structured_received_schema_has_no_pending_ddl(db: &Database) {
     let mut trigger_arrivals = Vec::new();
     db.visit_received_ddl_arrivals(
@@ -590,6 +604,13 @@ fn memory_changed_ddl_with_the_same_marker_identity_refuses_without_mutation() {
 /// authentication; the public authenticated-sync suite owns that separate bar.
 /// Existing retry cases have no row on both sides of a shape-changing ALTER.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
     let parent = "mixed_parents";
     let child = "mixed_children";
@@ -1060,6 +1081,13 @@ fn native_memory_received_graph_prefix_requires_complete_path() {
     assert_native_memory_received_source_prefix(NativeMemoryReplayCase::GraphGuard);
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let parent = "mixed_parents";
@@ -2040,6 +2068,10 @@ mod edge_column_owner_contract {
     // The existing canonical-digest fixture represents transport-validated input;
     // this exercises the real received stage, not signature validation or a policy predicate.
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn received_edge_column_changes_are_atomic_and_keep_source_identity() {
         let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
         for dag in [false, true] {
@@ -2223,6 +2255,10 @@ mod edge_column_owner_contract {
     // unrelated edge table remains untouched. Final-result equality cannot prove
     // route selection: the callback inspects its actual active replay owner.
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn unrelated_received_migration_uses_private_prefix_route_with_untouched_edges() {
         let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
         let db = open_native_received_memory();

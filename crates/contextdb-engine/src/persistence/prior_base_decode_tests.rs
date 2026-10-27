@@ -29,6 +29,13 @@ fn base(graph_len: usize) -> VectorPartitionBaseGenerationRecord {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn put(persistence: &RedbPersistence, key: &[u8], encoded: &[u8]) {
     persistence
         .with_db(|db| {
@@ -307,6 +314,13 @@ fn raw_membership(entry: &PersistedVectorEntry) -> VectorPartitionMembershipReco
 
 // Install the declaration and authenticated placement the current loader captures.
 // The raw write below remains intentional damage injection, after that foundation.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn declare_raw_fixture(
     persistence: &RedbPersistence,
     membership: &VectorPartitionMembershipRecord,
@@ -331,6 +345,13 @@ fn declare_raw_fixture(
     persistence.write_corrupt_store_vector_memberships_for_test(std::slice::from_ref(membership))
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn write_and_load_raw_entry(
     persistence: &RedbPersistence,
     encoded: &[u8],
@@ -388,6 +409,13 @@ fn write_and_load_raw_entry(
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn oversized_raw_dimension_or_route_is_refused_before_body_decode() {
     let (_directory, persistence) = writer();
     let expected = raw_entry(1, VectorQuantization::F32);
@@ -435,6 +463,13 @@ fn oversized_raw_dimension_or_route_is_refused_before_body_decode() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn corrupt_sq4_expansion_is_refused_before_dequantization_allocation() {
     let (_directory, persistence) = writer();
     let mut corrupt = raw_entry(1, VectorQuantization::SQ4);

@@ -160,6 +160,10 @@ fn with_batches<T>(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn one_committed_lsn_larger_than_the_cohort_share_is_absorbed_without_raising_the_limit() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -202,6 +206,10 @@ fn one_committed_lsn_larger_than_the_cohort_share_is_absorbed_without_raising_th
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_older_build_publishes_at_its_own_frontier_before_a_fresh_build_absorbs_the_large_commit() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -410,6 +418,10 @@ fn a_fresh_rebuild_counts_its_inputs_outside_the_commit_lock_at_any_partition_si
 }
 
 /// Run the import in a child that dies at `cut`, then prove reopen and resume.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn crash_inside_the_large_commit(test: &str, cut: &str) {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     const K: usize = 3;

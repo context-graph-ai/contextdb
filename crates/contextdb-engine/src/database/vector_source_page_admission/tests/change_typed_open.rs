@@ -114,6 +114,13 @@ fn change_fixture(
     (directory, persistence, change)
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
     let (_directory, persistence, record) = change_fixture(oversized_base);
     let accountant = Arc::new(MemoryAccountant::with_budget(128 * 1024 * 1024));

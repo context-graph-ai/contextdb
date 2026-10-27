@@ -203,6 +203,10 @@ fn the_idle_file_answers_every_question_a_store_is_asked_about_itself() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn the_owner_answers_the_same_questions_in_the_same_words() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "served-runtime");
@@ -278,6 +282,10 @@ fn the_owner_answers_the_same_questions_in_the_same_words() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn both_routes_describe_the_same_store_the_same_way() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "parity-runtime");
@@ -395,6 +403,10 @@ fn both_routes_describe_the_same_store_the_same_way() {
 /// binding -- so a constrained handle asking why ITS query routes as it does
 /// gets the same bound answer, however it is routed.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn the_owner_route_and_the_file_route_both_explain_a_bound_partition_key_the_way_the_owner_plans_it_locally()
  {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
@@ -517,6 +529,10 @@ fn the_owner_route_and_the_file_route_both_explain_a_bound_partition_key_the_way
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_execution() {
     let directory = tempfile::TempDir::new().expect("task-scoped trace directory");
     let runtime_root = secure_runtime_root(directory.path(), "vector-trace-runtime");
@@ -670,6 +686,10 @@ fn a_continuation_is_refused_by_a_question_that_never_issues_one() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_document_that_does_not_fit_the_caller_s_byte_ceiling_says_what_would_fit_it() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "ceiling-runtime");
@@ -763,6 +783,10 @@ fn paging_options() -> ReadSessionOptions {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_table_inventory_too_big_for_one_answer_pages_the_same_way_on_both_routes() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "paging-runtime");
@@ -822,6 +846,10 @@ fn a_table_inventory_too_big_for_one_answer_pages_the_same_way_on_both_routes() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_continuation_from_one_route_resumes_the_same_place_on_the_other() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "cross-route-runtime");
@@ -909,6 +937,10 @@ fn owner_route_image_state_refusal(
 /// three questions is the control -- without it, a reader that had simply
 /// stopped answering image-state everywhere would satisfy the refusal.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_image_state_question_over_the_owner_route_names_what_it_cannot_answer() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "unsupported-runtime");

@@ -252,6 +252,13 @@ impl JourneyPeer {
 /// Everything `sender` committed after `since`, in the wire form a sync
 /// sender puts on the network: its extraction, each row's signed creator
 /// lineage, and the schema provenance for each DDL occurrence.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn served_by(sender: &JourneyPeer, since: Lsn) -> crate::protocol::WireChangeSet {
     let tenant = TenantId::from(JOURNEY_TENANT);
     let fixture_operation_reader_1 = sender
@@ -979,6 +986,13 @@ fn assert_durable_manifest_matches(
 /// ordinal and canonical digest in exactly the author's order, beside the
 /// altered table and the registered trigger.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_received_create_trigger_alter_unit_installs_in_authored_order_at_the_door() {
     let root = tempfile::TempDir::new().expect("scratch peer directory");
     let author = JourneyPeer::open(root.path(), "order-author");
@@ -1864,6 +1878,13 @@ fn received_ddl_marker_binds_the_stored_occurrence_not_the_outbound_spelling() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn filtered_synthetic_schema_signs_only_its_remaining_authored_order() {
     let root = tempfile::TempDir::new().expect("scratch signing identity");
     let identity = crate::identity::FabricIdentity::load_or_generate(&root.path().join("node.key"))
@@ -3546,6 +3567,13 @@ fn received_single_ddl(ddl: &DdlChange, generation: u64) -> crate::protocol::Rec
 /// transaction as `CreateTrigger ... DropTrigger` still fires and is
 /// audited in author order.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_signed_units_trigger_audit_counts_every_trigger_it_declares() {
     let db = Database::open_memory();
     db.execute(
@@ -3749,6 +3777,13 @@ fn a_signed_units_trigger_audit_counts_every_trigger_it_declares() {
 /// it lazily; the many unrelated tables the receiver also holds are never
 /// staged.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_signed_units_including_sync_rows_copy_only_the_tables_the_callback_touches() {
     let db = Database::open_memory();
     for ordinal in 0..100 {
@@ -3937,6 +3972,13 @@ fn received_schema_create_with_row() -> ReceivedSchemaFixture {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn received_schema_stage_persists_and_publishes_only_after_redb_commit() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("received-schema-stage.redb");
@@ -5188,6 +5230,13 @@ fn a_restored_edge_gets_the_authors_migration_from_a_hub_serving_its_persisted_s
 /// migration, never the moving edge's restatement of it.
 #[cfg(any(test, feature = "test-seams"))]
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_destination_reupload_from_persisted_state_forwards_the_authors_migration() {
     let root = tempfile::TempDir::new().expect("scratch peer directory");
     let tenant = TenantId::from(JOURNEY_TENANT);
@@ -5308,6 +5357,13 @@ fn a_destination_reupload_from_persisted_state_forwards_the_authors_migration() 
 /// restates the received migration under its own name.
 #[cfg(any(test, feature = "test-seams"))]
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_hub_without_the_authors_evidence_refuses_to_serve_received_schema_from_persisted_state() {
     let root = tempfile::TempDir::new().expect("scratch peer directory");
     let author = JourneyPeer::open(root.path(), "evidence-author");
@@ -5749,6 +5805,13 @@ fn custody_cache_holds(db: &Database, key: &str) -> bool {
 /// unpublished in memory (the record still cached) while the durable
 /// image already carries the new state, which a reopen serves whole.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn the_fault_after_the_durable_commit_fires_before_any_publication_component() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("received-schema-before-publication.redb");
@@ -6109,6 +6172,13 @@ fn local_schema_redb_failure_rolls_back_table_trigger_and_frontier() {
 /// registration, catch the unwind, and prove nothing the commit put in a
 /// database-owned stage map outlives it: all three maps are empty and the
 /// accountant is back to exactly what it held before the transaction.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_unwind_after_local_stage_registration_leaves_nothing(
     db: &Database,
     point: LocalCommitStageFaultPoint,

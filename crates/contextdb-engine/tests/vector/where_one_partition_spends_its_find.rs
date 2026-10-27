@@ -236,6 +236,10 @@ fn seed_one_partition(path: &std::path::Path, runtime: &std::path::Path) {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn measure_one_partition(path: &std::path::Path, runtime: &std::path::Path) {
     let open = Instant::now();
     let reader = ReadSession::with_runtime_directory_for_test(runtime, || {

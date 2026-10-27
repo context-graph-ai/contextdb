@@ -134,6 +134,10 @@ fn anchor_uuid(event: usize) -> uuid::Uuid {
 
 /// cg's startup: every declaration in one transaction, then the host's trigger
 /// callbacks, then initialization is complete.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn declare(db: &Database) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let tx = db.begin().expect("begin the startup schema transaction");
@@ -371,6 +375,10 @@ fn observed_work() -> AppendWork {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn committed_change_and_ddl_members(db: &Database, tx: TxId) -> CommittedMembers {
     let mut expected = CommittedMembers::empty();
     db.__visit_committed_change_and_ddl_members_for_test(

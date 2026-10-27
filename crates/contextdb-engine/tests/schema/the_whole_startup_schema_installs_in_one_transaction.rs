@@ -25,6 +25,10 @@ const STARTUP_SCHEMA: &[&str] = &[
     "CREATE ROUTE startup_route EVENT startup_event TO startup_sink",
 ];
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn install(db: &Database) -> contextdb_core::Result<()> {
     let tx = db.begin()?;
     for ddl in STARTUP_SCHEMA {

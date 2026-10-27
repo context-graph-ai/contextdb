@@ -513,6 +513,10 @@ fn observe(path: &Path) -> Observation {
     observe_with_root_comparison(path, true)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn observe_with_root_comparison(path: &Path, compare_typed_root: bool) -> Observation {
     // The independent adapter loads the COMMITTED STORE while idle, not an
     // engine-owned image retained by either production reading session.
@@ -1159,6 +1163,10 @@ fn durable_sink_queue_ack_changes_identity_without_a_row_commit() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn trigger_audit_and_schedule_firing_are_real_durable_identity_mutations() {
     const BASE: u64 = 2_000_000_000_000;
     let wall = Arc::new(std::sync::atomic::AtomicU64::new(BASE));
@@ -1736,6 +1744,10 @@ fn rollback_keeps_rows_all_vectors_edges_and_prepared_events_out_of_the_root() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn crashes_before_commit_and_after_durable_commit_publish_only_complete_roots() {
     use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
@@ -1946,6 +1958,10 @@ fn generation_publication_keeps_the_root_equal_to_the_independent_committed_cont
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn pruning_only_durable_trigger_audit_cannot_leave_a_stale_content_root() {
     const BASE: u64 = 2_000_000_000_000;
     let wall = Arc::new(std::sync::atomic::AtomicU64::new(BASE));

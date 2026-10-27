@@ -18,6 +18,13 @@ enum ColdMetadata {
     GraphLifetimeRepair,
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("metadata-owner.db");
@@ -397,6 +404,13 @@ enum UnknownCatalog {
     Incomplete,
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCatalog) {
     use contextdb_core::VectorPartitionComponent;
     let directory = tempfile::tempdir().unwrap();

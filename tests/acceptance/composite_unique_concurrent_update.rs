@@ -45,6 +45,10 @@ fn setup_acl(db: &Database) -> (Uuid, Uuid) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t24_01_concurrent_updates_on_composite_unique_protected_row_keep_one_visible() {
     let (_dir, db) = open_db();
     let db = &db;

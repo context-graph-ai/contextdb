@@ -2,6 +2,13 @@
 use super::*;
 use redb::{ReadableDatabase, ReadableTable};
 impl RedbPersistence {
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn durable_page_population_for_test(&self) -> Result<(usize, u64)> {
         self.with_db(|db| {
             let snapshot = db
@@ -17,12 +24,26 @@ impl RedbPersistence {
         })
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn create_region_fixture_for_test(path: &Path, region_bytes: u64) -> Result<()> {
         let mut builder = redb::Database::builder();
         builder.set_region_size(region_bytes);
         let db = builder.create(path).map_err(Self::storage_error)?;
         Self::write_format_marker(&db, &mut content_identity::ProofAdmission::unaccounted())
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn durable_ddl_for_test(&self) -> Result<Vec<(String, Vec<u8>)>> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -40,12 +61,26 @@ impl RedbPersistence {
         })
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn native_read_transaction_count_for_test(
         &self,
         transaction_id: u64,
     ) -> Result<u64> {
         self.with_db(|db| Ok(db.native_read_transaction_count_for_test(transaction_id)))
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn durable_sidecars_for_test(&self) -> Result<(usize, Vec<(String, Vec<u8>)>)> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -61,6 +96,13 @@ impl RedbPersistence {
         })
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn physical_snapshot_for_test(&self) -> Result<redb::StorageSnapshotIdentity> {
         self.with_db(|db| {
             Ok(db
@@ -70,11 +112,25 @@ impl RedbPersistence {
         })
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn allocator_metadata_bytes_for_test(&self) -> Result<usize> {
         self.with_db(|db| Ok(db.allocator_metadata_bytes_for_test()))
     }
 
     /// Actual durable relation height, observed only during fixture setup.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn durable_relation_tree_height_for_test(&self, name: &str) -> Result<u32> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -88,6 +144,13 @@ impl RedbPersistence {
     pub(crate) fn resident_storage_cursor_for_test(&self) -> String {
         format!("{:?}", self.storage_compaction.lock().unwrap().0)
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn resident_cache_stats_for_test(&self) -> Result<(u64, u64, u64, usize)> {
         self.with_db(|db| {
             let stats = db.cache_stats();
@@ -99,12 +162,26 @@ impl RedbPersistence {
             ))
         })
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn detach_cached_row_page_for_test(
         &self,
         page: &redb::AccessGuard<'_, &'static [u8]>,
     ) -> Result<(u64, usize, usize, bool)> {
         self.with_db(|db| Ok(db.detach_cached_guard_for_test(page)))
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn hold_row_page_for_test(
         &self,
         table: &str,
@@ -137,6 +214,13 @@ impl RedbPersistence {
                 .ok_or_else(|| Error::Other("fixture body disappeared".into()))
         })
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn damage_membership_envelope_for_test(
         &self,
         partition: &VectorPartitionRef,

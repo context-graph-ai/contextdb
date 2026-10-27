@@ -7,6 +7,10 @@ use std::collections::HashMap;
 const TENANT: &str = "received-column-rename-identity";
 const INCARNATION: Incarnation = Incarnation(1);
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn signed_rename(author: &Database) -> (ChangeSet, Vec<WireDdlProvenance>, String) {
     let before = author.current_lsn();
     author
@@ -40,6 +44,10 @@ fn signed_rename(author: &Database) -> (ChangeSet, Vec<WireDdlProvenance>, Strin
     (changes, provenance, node_id)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn receive(
     receiver: &Database,
     changes: ChangeSet,

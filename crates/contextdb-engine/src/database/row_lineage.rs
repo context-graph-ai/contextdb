@@ -2895,6 +2895,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn reject_dependency_complete_accepted_lineage_replays(
         &self,
         tenant_id: &TenantId,
@@ -3690,6 +3697,13 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn record_durable_delete_acceptance(
         &self,
         rows: &[RowChange],
@@ -3864,6 +3878,10 @@ impl Database {
     /// current-row comparison and the provenance write one ordering boundary:
     /// a later local write has a different row LSN and is never marked as if
     /// the hub had accepted it.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn record_hub_accepted_rows(
         &self,
         rows: &[RowChange],
@@ -3875,6 +3893,10 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn record_hub_accepted_rows_with_read_memory(
         &self,
         rows: &[RowChange],
@@ -3978,6 +4000,10 @@ impl Database {
     /// lands wholly before the move or is refused wholly after it: an old hub
     /// cannot mark rows accepted, retire delete obligations, or leave
     /// reconciliation markers in the new destination's state.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn record_hub_push_reply_effects_for_hub(
         &self,
         tenant_id: &TenantId,
@@ -4000,6 +4026,10 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn record_hub_push_reply_effects_for_hub_with_read_memory(
         &self,
         tenant_id: &TenantId,
@@ -4025,6 +4055,10 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn record_hub_push_reply_effects_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -4309,6 +4343,10 @@ impl Database {
     sync_test_seam! {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn durable_delete_is_pending_for_test(
         &self,
         table: &str,
@@ -4331,6 +4369,10 @@ impl Database {
     sync_test_seam! {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn has_terminal_refusal_markers_for_test(
         &self,
         tenant_id: &TenantId,
@@ -4836,6 +4878,13 @@ impl Database {
     /// here rather than assembling one from counters it watched go by.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn commit_index_for_test(&self) -> Vec<(Lsn, TxId)> {
         let _operation = self.assert_open_operation();
         if self.image_history.is_some() {

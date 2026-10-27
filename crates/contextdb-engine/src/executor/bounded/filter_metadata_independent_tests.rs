@@ -110,6 +110,13 @@ fn wide_fixture() -> (Expr, TableMeta) {
 // refund the invoice before dropping the actual copied owner.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn predicate_metadata_copy_is_preadmitted_and_funded_through_every_native_free() {
     let (filter, meta) = wide_fixture();
     let owner = Arc::new(MemoryAccountant::with_budget(64 << 20));
@@ -355,6 +362,13 @@ fn plain_fixture(path: &std::path::Path, indexed: bool) -> Arc<Database> {
 // Decisive mutants: remove row_filter's charge or settle/refund it at first-page return.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_cleanup() {
     for indexed in [false, true] {
         for ending in ["close", "cancel", "drop"] {
@@ -504,6 +518,13 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
 // it does not claim that the ACL directory route owns row_filter metadata.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_writes() {
     use contextdb_core::{Principal, ScopeLabel};
     use std::collections::BTreeSet;

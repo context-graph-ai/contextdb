@@ -92,6 +92,13 @@ fn fallback_snapshots_do_not_emit_an_old_raw_version_after_its_latest_position_i
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombstoned() {
     // Public historical point, finite-list and join reads keep complete
     // SQL answers after reopen and refuse corrupted consumed groups.

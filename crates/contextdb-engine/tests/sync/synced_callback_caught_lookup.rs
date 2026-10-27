@@ -21,6 +21,10 @@ struct Calls {
     missing: AtomicUsize,
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn register_callback(db: &Database, parent_id: i64, calls: Arc<Calls>) {
     db.register_transactional_trigger_callback("prepare_received", move |handle, context| {
         // A genuinely absent table remains an ordinary error that the callback
@@ -101,6 +105,10 @@ fn unit() -> ChangeSet {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply(db: &Database) -> contextdb_core::Result<contextdb_engine::sync_types::ApplyResult> {
     db.apply_changes(
         unit(),

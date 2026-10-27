@@ -228,6 +228,13 @@ fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compact
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn large_ordered_keys_split_by_bytes_and_rejoin_after_boundary_deletions() {
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("large.db")).unwrap();
@@ -303,6 +310,13 @@ fn large_ordered_keys_split_by_bytes_and_rejoin_after_boundary_deletions() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn wide_separator_reference_corruption_is_rejected_before_a_posting_is_used() {
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("damaged-key.db")).unwrap();
@@ -408,6 +422,13 @@ fn remove_then_put_coalesces_to_the_same_physical_work_as_a_value_update() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identically() {
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("oversized.db")).unwrap();
@@ -491,6 +512,13 @@ fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identic
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("oversized-damage.db")).unwrap();

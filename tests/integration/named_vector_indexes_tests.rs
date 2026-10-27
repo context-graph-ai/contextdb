@@ -1242,6 +1242,10 @@ fn nv05b_vector_order_by_preserves_full_row_projection() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn nv14_snapshot_isolation_across_two_indexes() {
     let db = Arc::new(Database::open_memory());
     db.execute(

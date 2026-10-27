@@ -21,6 +21,10 @@ fn bodies(db: &Database) -> Vec<Vec<Value>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn an_incomplete_custody_index_refuses_without_loading_the_journal() {
     let dir = tempfile::tempdir().unwrap();
     let broker = InProcessBroker::new();

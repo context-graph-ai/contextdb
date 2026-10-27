@@ -107,6 +107,10 @@ fn t15_01_concurrent_single_column_unique_insert_keeps_one_winner() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_02_concurrent_composite_unique_insert_collapses_to_one_row() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -145,6 +149,10 @@ fn t15_02_concurrent_composite_unique_insert_collapses_to_one_row() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_03_concurrent_pk_collision_six_threads_keeps_one_winner() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -221,6 +229,10 @@ fn t15_04_immutable_unique_sequential_duplicate_insert_rejects() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_05_immutable_unique_concurrent_insert_one_winner() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -865,6 +877,10 @@ fn t15_19_commit_time_upsert_rechecks_unique_after_propagation_shifts_inserts() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_09_concurrent_delete_and_insert_same_unique_key_serialize() {
     // REGRESSION GUARD: delete-vs-reinsert may serialize as either "delete
     // wins" or "replacement wins", but it must never leave two live rows for
@@ -1051,6 +1067,10 @@ fn t15_11_rejected_tx_produces_no_subscription_event() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t15_08_non_conflicting_concurrent_inserts_both_commit() {
     // REGRESSION GUARD: the validator must not spuriously reject non-overlapping inserts.
     let (_dir, db) = open_db();

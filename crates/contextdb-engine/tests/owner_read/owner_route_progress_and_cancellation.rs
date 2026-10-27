@@ -550,6 +550,10 @@ fn one_row_page_reader_options() -> ReadSessionOptions {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_active_readers(path: &Path, runtime_root: &Path) -> u64 {
     let report = ReadSession::with_runtime_directory_for_test(runtime_root, || {
         ReadSession::owner_report(path, ReadSessionOptions::default())
@@ -563,6 +567,10 @@ fn owner_active_readers(path: &Path, runtime_root: &Path) -> u64 {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_statement_over_the_owner_channel_reports_progress_before_the_result_returns_and_never_decreases()
  {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-progress directory");
@@ -624,6 +632,10 @@ fn a_statement_over_the_owner_channel_reports_progress_before_the_result_returns
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancelling_a_statement_from_inside_the_owner_channel_observer_frees_the_owner_slot_and_leaves_the_session_usable()
  {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-cancellation directory");
@@ -688,6 +700,10 @@ fn cancelling_a_statement_from_inside_the_owner_channel_observer_frees_the_owner
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_cursor_open() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-cursor-cancel directory");
     let path = directory.path().join("owner-cancel-cursor.db");
@@ -777,6 +793,10 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_replays_the_page() {
     let directory = tempfile::TempDir::new().expect("task-scoped publication directory");
     let path = directory.path().join("owner-publication.db");
@@ -1045,6 +1065,10 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_the_owner_channel() {
     let directory = tempfile::TempDir::new().expect("task-scoped owner-attribution directory");
     let path = directory.path().join("owner-attribution.db");
@@ -1186,6 +1210,10 @@ impl OwnerServicePublicationObserver for WriterContendedPublicationObserver {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationContention) {
     use std::collections::BTreeMap;
     use std::sync::mpsc::sync_channel;

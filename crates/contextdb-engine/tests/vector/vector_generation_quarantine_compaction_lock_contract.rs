@@ -117,6 +117,10 @@ fn assert_complete_authoritative_route(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_search(
     db: &Database,
     scope: Uuid,
@@ -126,6 +130,10 @@ fn vector_search(
     vector_search_limit(db, scope, query, mode, 1)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_search_limit(
     db: &Database,
     scope: Uuid,
@@ -457,6 +465,10 @@ fn malformed_catalog_record_quarantines_only_that_route_without_passive_inspecti
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("journal-route-repair.redb");
@@ -652,6 +664,10 @@ fn corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn corrupt_physical_graph_page_never_falls_back_to_the_complete_generation() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("physical-graph-page-corruption.redb");
@@ -801,6 +817,10 @@ fn repair_preserves_a_dormant_generation_selected_by_a_held_old_snapshot() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn committed_file_reader_registers_the_same_isolated_catalog_quarantine() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("read-only-checksum-quarantine.redb");
@@ -858,6 +878,10 @@ fn committed_file_reader_registers_the_same_isolated_catalog_quarantine() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn embedded_and_bounded_owner_reads_share_quarantine_and_resource_failure_truth() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1081,6 +1105,10 @@ fn newer_catalog_format_quarantines_only_that_route() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("repair-quarantine.redb");
@@ -1371,6 +1399,10 @@ fn engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn later_mutations_publish_a_new_generation_truncate_only_covered_journal_and_replay_the_suffix() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("generation-suffix.redb");
@@ -1663,6 +1695,10 @@ fn pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn preparation_pauses_do_not_block_an_unrelated_commit_or_hot_route_query() {
     for phase in [
         VectorMaintenancePreparationPhaseForTest::LoadAuthoritativeRawVectors,

@@ -41,6 +41,10 @@ fn search(db: &Database, scope: usize, mode: &str) {
 // Shared rows exercise initial construction, replacement and finite reclamation.
 // A single-catalog control establishes that the allowance admits useful work;
 // only the number of unrelated durable catalogs changes in the pressure row.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn maintenance_row(catalogs: usize, cycles: usize) -> Json {
     const WORKSPACE: usize = 256 * 1024;
     let directory = tempfile::tempdir().unwrap();

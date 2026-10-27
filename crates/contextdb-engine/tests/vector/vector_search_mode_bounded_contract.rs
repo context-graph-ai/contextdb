@@ -1220,6 +1220,10 @@ fn exact_memory_admission_uses_selected_authorized_rows_as_unrelated_vectors_gro
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn concurrent_direct_exact_scores_hold_their_charge_through_result_consumption() {
     use contextdb_engine::memory_accounting::MemoryAccountant;
     use contextdb_vector::mem::{ExactScorePhaseForTest, with_exact_score_observer_for_test};

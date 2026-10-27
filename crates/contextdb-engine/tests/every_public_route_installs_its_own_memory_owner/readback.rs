@@ -44,6 +44,10 @@ fn on_fresh_thread<T: Send>(body: impl FnOnce() -> T + Send) -> T {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_checkpoint_export_reopens_with_every_seeded_row() {
     let file = Store::open();
     let memory = memory_store();
@@ -70,6 +74,10 @@ fn a_checkpoint_export_reopens_with_every_seeded_row() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_authenticated_pull_delivers_every_seeded_row() {
     for (name, pair) in [
         ("file-backed", Pair::serve(false)),

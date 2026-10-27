@@ -352,6 +352,10 @@ fn a_registration_whose_fence_departed_registers_again_and_sees_a_purge() {
 /// registers into whatever the leave left, and once it too leaves nothing is
 /// left at all.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_join_waits_for_a_leave_of_the_same_runtime_root() {
     if run_with_platform_runtime("a_join_waits_for_a_leave_of_the_same_runtime_root") {
         return;
@@ -453,6 +457,10 @@ fn a_pending_fence_outlives_its_last_reader_until_writer_recovery() {
 /// once, retryably, and never waits on the writer -- whose commit finishes.
 /// Asked again after the purge, the cursor registers and reads nothing purged.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_owner_cursor_never_waits_on_a_purging_writers_fence() {
     if run_with_platform_runtime("an_owner_cursor_never_waits_on_a_purging_writers_fence") {
         return;

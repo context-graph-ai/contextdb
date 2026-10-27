@@ -35,6 +35,10 @@ extern "C" fn count_the_signal(_: libc::c_int) {
 /// succeeds, the blocking acquisitions stay within one per byte, and the caller's handler runs
 /// once. No earlier test interrupts a blocked lock wait.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_caught_signal_neither_fails_nor_repeats_a_default_writer_wait() {
     // A handler installed WITHOUT SA_RESTART: a blocked lock wait it
     // interrupts would return EINTR.

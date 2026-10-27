@@ -114,6 +114,10 @@ fn assert_indexed(db: &Database, id: usize, revision: usize) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries() {
     const BASE_ROWS: usize = 512;
     const DELTA_ROWS: usize = 64;

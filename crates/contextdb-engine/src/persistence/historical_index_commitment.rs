@@ -1192,6 +1192,13 @@ pub fn skip_next_postings_fold_for_test() {
 /// Production-dead: change one lane of a (table, index)'s stored postings
 /// state, as storage damage would, leaving its publication as it was.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn damage_postings_state_for_test(
     write_txn: &redb::WriteTransaction,
     table: &str,
@@ -1665,6 +1672,13 @@ pub fn skip_next_index_retirement_for_test() {
 /// Production-dead: whether either commitment state of a (table, index) is
 /// stored.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn states_stored_for_test(
     read: &redb::ReadTransaction,
     table: &str,
@@ -1717,6 +1731,10 @@ mod verification_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verification_stops_mid_walk_at_its_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
         let db = history(&directory.path().join("checkpoint.db"));
@@ -1763,6 +1781,10 @@ mod verification_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verification_is_charged_to_its_reader_and_refuses_a_tiny_budget() {
         use crate::memory_accounting::MemoryAccountant;
         let directory = tempfile::tempdir().unwrap();
@@ -1916,6 +1938,10 @@ mod interval_invariant_tests {
     }
 
     /// Run `body` against a fresh posting table and batch, then finish.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_postings(
         body: impl FnOnce(
             &mut HistoricalPostings<'_>,
@@ -1940,6 +1966,10 @@ mod interval_invariant_tests {
     }
 
     /// Fold one row version's lifetime under `tag` into the versions side.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn version(
         batch: &mut CommitmentBatch,
         write: &redb::WriteTransaction,
@@ -1967,6 +1997,10 @@ mod interval_invariant_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn a_coalesced_run_over_its_versions_commits() {
         with_postings(|postings, batch, write| {
             version(batch, write, "a", 1, Some(4))?;
@@ -1977,6 +2011,10 @@ mod interval_invariant_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn overlapping_touching_empty_and_inverted_postings_are_refused_at_write() {
         corrupt(
             with_postings(|postings, batch, write| {
@@ -2021,6 +2059,10 @@ mod interval_invariant_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn a_moved_endpoint_is_refused_at_commit() {
         corrupt(
             with_postings(|postings, batch, write| {
@@ -2039,6 +2081,10 @@ mod interval_invariant_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn a_run_stretched_across_another_keys_versions_is_refused_at_commit() {
         // a for [1,4), b for [4,6), a again for [6,8): two runs of a.
         let versions = |batch: &mut CommitmentBatch, write: &redb::WriteTransaction| {
@@ -2090,6 +2136,10 @@ mod funding_lifetime_tests {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fold_many(
         batch: &mut CommitmentBatch,
         write: &redb::WriteTransaction,
@@ -2190,6 +2240,10 @@ mod funding_lifetime_tests {
     /// checking that the final accountant total returns to zero.
     #[test]
     #[serial]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn a_failed_touched_batch_keeps_its_boxed_states_funded_through_each_free() {
         let directory = tempfile::tempdir().unwrap();
         let database = redb_builder()
@@ -2314,6 +2368,10 @@ mod wide_record_verification_tests {
         db
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn steps(db: &Database) -> u64 {
         let mut steps = 0_u64;
         db.verify_historical_indexes_within(
@@ -2328,6 +2386,10 @@ mod wide_record_verification_tests {
         steps
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cancelled_inside(db: &Database, at: u64) {
         let mut taken = 0_u64;
         let refused = db.verify_historical_indexes_within(
@@ -2395,6 +2457,10 @@ mod wide_record_verification_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn a_wide_key_is_refused_by_its_reader_without_drawing_on_the_writer() {
         let directory = tempfile::tempdir().unwrap();
         let db = one_wide_row(&directory.path().join("reader-key.db"), 1024 * 1024, 8);
@@ -2536,6 +2602,10 @@ mod wide_key_phase_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn every_phase_of_one_wide_key_checks_its_request() {
         let directory = tempfile::tempdir().unwrap();
         let db = wide_group(&directory.path().join("phases.db"));
@@ -2593,6 +2663,10 @@ mod wide_key_phase_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cancellation_and_expiry_stop_the_walk_inside_each_phase() {
         let directory = tempfile::tempdir().unwrap();
         let db = wide_group(&directory.path().join("stops.db"));
@@ -2697,6 +2771,10 @@ mod vector_projection_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn projecting_a_stored_vector_checks_its_request_every_4096_components() {
         for (name, representation) in REPRESENTATIONS {
             let body = stored_body(wide(1 << 18, representation));
@@ -2743,6 +2821,10 @@ mod vector_projection_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn a_malformed_stored_vector_is_refused_before_any_component_work() {
         let dimension = 4096_u32;
         let malformed = [
@@ -2818,6 +2900,10 @@ mod vector_projection_tests {
     /// A stored vector cut short, or carrying a byte more than its header
     /// says, is the same typed corruption as any other malformed vector.
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn a_truncated_or_overlong_stored_vector_is_refused_as_corruption() {
         // Every persisted representation uses the same parser and must keep
         // typed corruption for missing, displaced, and trailing stored bytes.
@@ -2853,6 +2939,10 @@ mod vector_projection_tests {
     /// only the fixed descriptor controls, whatever its dimension and however
     /// many versions are projected with the one admitted scratch.
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn the_hashed_projection_charges_the_same_whatever_the_width_or_count() {
         use crate::persistence::content_identity::version_manifest as manifest;
         for (name, representation) in REPRESENTATIONS {
@@ -2896,6 +2986,10 @@ mod vector_projection_tests {
     /// encoder gives: decode the version, expand each vector with `to_f32`,
     /// build the key from the decoded values, and hash it whole.
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn the_streamed_key_and_its_elements_equal_the_legacy_encoder() {
         use super::{
             OPEN_END, element_checked, element_finish, element_prefix, index_identity, key_row,

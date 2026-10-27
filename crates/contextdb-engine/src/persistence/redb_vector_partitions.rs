@@ -309,6 +309,13 @@ impl RedbPersistence {
     /// caller changes only the existing JSON text bytes, so physical identity,
     /// encoded length, row versions and all lifecycle metadata remain intact.
     #[cfg(all(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn malformed_count_json_for_test(
         &self,
         accountant: crate::memory_accounting::AccountantHandle,
@@ -513,6 +520,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn damage_first_saved_row_for_test(
         &self,
         table: &str,
@@ -1942,6 +1956,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn mutate_vector_generation_catalog_record_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2016,6 +2037,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn corrupt_vector_partition_journal_record_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2025,6 +2053,13 @@ impl RedbPersistence {
 
     /// Damage the route's LAST journal record, the newest uncovered one.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn corrupt_last_vector_partition_journal_record_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2033,6 +2068,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn corrupt_vector_partition_journal_record_at_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2088,6 +2130,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn corrupt_vector_partition_base_record_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2098,6 +2147,13 @@ impl RedbPersistence {
     /// Flip the last byte of a partition's selected change record, leaving its
     /// catalog readable.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn corrupt_vector_partition_change_record_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2110,6 +2166,13 @@ impl RedbPersistence {
     /// Flip one byte in the middle of a partition's selected base record,
     /// which is inside its saved graph: damage no digest was told about.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn corrupt_vector_partition_saved_graph_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2118,6 +2181,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn flip_vector_partition_base_record_byte_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2129,6 +2199,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn flip_vector_partition_generation_record_byte_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2222,6 +2299,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn corrupt_vector_partition_graph_page_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2326,6 +2410,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn paged_storage_of_route_in_write_for_test(
         write: &redb::WriteTransaction,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2375,6 +2466,13 @@ impl RedbPersistence {
     /// Damage one route's committed paged page set; `other` names the route
     /// a cross-route substitution copies from.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn damage_paged_route_pages_for_test(
         path: &Path,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2392,6 +2490,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn debug_vector_partition_journal_for_test(
         &self,
         partition: &contextdb_vector::VectorPartitionRef,
@@ -2867,6 +2972,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn debug_superseded_vector_generation_retention_for_test(
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
@@ -3512,6 +3624,13 @@ impl RedbPersistence {
     #[allow(
         dead_code,
         reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
     )]
     pub(crate) fn load_vector_partition_base_generation_with_expected_graph_bytes(
         &self,
@@ -4330,6 +4449,13 @@ impl RedbPersistence {
         allow(
             dead_code,
             reason = "KEEP-SEAM: live only under the test-seams feature; used from generation_admission_tests.rs"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
     pub(super) fn prepare_vector_partition_graph_pages(

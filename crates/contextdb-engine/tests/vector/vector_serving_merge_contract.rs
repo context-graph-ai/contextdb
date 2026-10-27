@@ -507,6 +507,10 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_paused() {
     use contextdb_core::{VectorIndexRef, VectorPartitionKey};
     use contextdb_engine::VectorMaintenancePreparationPhaseForTest;

@@ -358,6 +358,13 @@ mod cleanup_attribution_tests {
             }
         }
 
+        #[cfg_attr(
+            any(test, feature = "test-seams"),
+            expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )
+        )]
         fn with_admission<T>(
             self,
             accountant: Arc<MemoryAccountant>,
@@ -375,6 +382,13 @@ mod cleanup_attribution_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn cleanup_page_admissions_keep_typed_attribution_and_release_their_source_owner() {
         use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
         const CACHE_BYTES: usize = 8 * 1024 * 1024;

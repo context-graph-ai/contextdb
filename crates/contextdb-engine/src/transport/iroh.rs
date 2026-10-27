@@ -1785,11 +1785,25 @@ impl LargeRequestTestController {
     }
 
     /// Reads the durable response inventory without changing transport state.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn response_stage_counts_for_test(&self) -> TransportResult<LargeResponseStageCounts> {
         let (stages, receipts) = large_response_stage_counts(&self.stage.root)?;
         Ok(LargeResponseStageCounts { stages, receipts })
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn stage_snapshot_for_test(
         &self,
         authenticated_node_id: &str,
@@ -1824,6 +1838,13 @@ impl LargeRequestTestController {
         })
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn stage_snapshots_for_test(&self) -> TransportResult<Vec<LargeRequestStageSnapshot>> {
         snapshot_all_large_request_stages(&self.stage.root).map(|snapshots| {
             snapshots

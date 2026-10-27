@@ -655,6 +655,13 @@ fn open_graph_page<'v>(key: &[u8], value: &'v [u8]) -> Result<&'v [u8]> {
 /// Storage of a paged generation record's graph bytes, or None when the
 /// graph is stored inline.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn paged_storage_of_graph_for_test(
     graph_format_version: u16,
     graph_bytes: &[u8],
@@ -668,6 +675,13 @@ pub(super) fn paged_storage_of_graph_for_test(
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn first_page_in_write(
     pages: &redb::Table<&'static [u8], &'static [u8]>,
     storage: &[u8; 8],
@@ -703,6 +717,13 @@ fn first_page_in_write(
 /// Physical damage to one route's committed page set, made without
 /// rebinding any root.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn damage_route_pages_in_write_for_test(
     write: &redb::WriteTransaction,
     storage_id: u64,
@@ -6269,6 +6290,13 @@ pub(crate) enum PhysicalPagedIdentity<'a> {
     dead_code,
     reason = "HNSW: goes with the HNSW index when it is replaced"
 )]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn physical_identity<'a>(
     key: &[u8],
     stored: &'a [u8],
@@ -6385,6 +6413,13 @@ mod single_authentication_tests {
         }
     }
     #[test]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn point_and_identity_authenticate_once_and_reject_corruption_before_admission() {
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("one-auth.redb")).unwrap();

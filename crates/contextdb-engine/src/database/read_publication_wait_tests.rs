@@ -81,6 +81,13 @@ fn scope(
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn owner_publication_wait_has_no_false_timer_refusal_repoll_or_lost_release_wake() {
     let gate = Arc::new(ReadPublicationGate::default());
     let writer = gate.acquire_write(&BTreeSet::from(["items".to_owned()]));
@@ -104,6 +111,13 @@ fn owner_publication_wait_has_no_false_timer_refusal_repoll_or_lost_release_wake
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn owner_publication_wait_wakes_for_cancellation_and_refuses_only_after_elapsed_deadline() {
     let gate = Arc::new(ReadPublicationGate::default());
     let writer = gate.acquire_write(&BTreeSet::from(["items".to_owned()]));
@@ -255,6 +269,13 @@ impl DeadlineClock for GateWaitClock {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn final_read_publication_wait_refuses_cancellation_and_deadline_before_the_purge_releases_the_gate()
  {
     for expire in [false, true] {

@@ -224,6 +224,10 @@ fn owner_writer(
 
 /// Route 2: a live writer holds the store, so the session reaches it over the
 /// local owner channel.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_session(
     fixture: &PrincipalFixture,
     runtime_root: &std::path::Path,
@@ -239,6 +243,10 @@ fn owner_session(
 
 /// Route 3: the store is idle, so the session answers from the committed image
 /// through the direct-file backend.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn direct_session(
     fixture: &PrincipalFixture,
     name: &str,
@@ -343,6 +351,10 @@ fn both_routes_answer_the_same_declared_principal_the_same_rows() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_declaration_naming_another_principal_than_the_writer_is_refused_at_admission() {
     let fixture = principal_fixture();
     let runtime_root = secure_runtime_root(&fixture.directory, "refusal-runtime");

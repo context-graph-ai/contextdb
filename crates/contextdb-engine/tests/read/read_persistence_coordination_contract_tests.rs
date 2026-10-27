@@ -102,6 +102,10 @@ struct StoreReplacementTask {
 }
 
 impl StoreReplacementTask {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn spawn(path: PathBuf) -> Self {
         Self {
             handle: Some(thread::spawn(move || {
@@ -3313,7 +3317,7 @@ impl SameProcessHydrationRun {
         &mut self,
         path: &Path,
     ) -> contextdb_engine::persistence::read_persistence_test_scaffold::ReadImageHydrationParticipantObservation
-    {
+{
         let path = path.to_path_buf();
         let handle = thread::spawn(move || {
             let _attempt = begin_two_read_image_hydration_attempt_for_test();
@@ -4234,6 +4238,10 @@ impl Drop for StoreReplacementFinished {
 
 #[test]
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reset_retains_one_original_guard_through_every_replacement_boundary() {
     let _serial = serialise_coordination_test();
     let root = tempfile::tempdir().expect("scratch directory");

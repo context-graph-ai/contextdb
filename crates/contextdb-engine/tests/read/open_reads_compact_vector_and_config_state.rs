@@ -397,6 +397,10 @@ fn change_copied_vector_visibility(path: &Path) {
     );
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_match_ids(path: &Path) -> contextdb_core::Result<Vec<Vec<Value>>> {
     ReadSession::open(path)?
         .execute(

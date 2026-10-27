@@ -84,6 +84,13 @@ fn damage_leaf_key(
     write.commit().unwrap();
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn read_failure(database: &redb::Database, records: &[ContentIdentityMutation]) -> Error {
     let read = database.begin_read().unwrap();
     let verifier =

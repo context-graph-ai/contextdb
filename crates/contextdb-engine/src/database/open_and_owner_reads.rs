@@ -44,6 +44,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn reset_content_identity_work_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -54,6 +61,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn take_content_identity_work_for_test(&self) -> Result<(u64, u64, u64)> {
         Ok(self
             .persistence
@@ -64,6 +78,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn take_content_identity_work_bytes_for_test(&self) -> Result<(u64, u64)> {
         Ok(self
             .persistence
@@ -74,6 +95,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn damage_checkpoint_f32_projection_for_test(&self) -> Result<()> {
         self.persistence
             .as_ref()
@@ -199,6 +227,13 @@ impl Database {
 
     /// Unit modules use the real open assembly, including file reopen.
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn open_owned_for_test(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
         Self::open_configured_carrying_with_host(
             path,
@@ -613,6 +648,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn read_session_with_observer_for_test(
         &self,
         limits: ReadLimits,
@@ -632,6 +674,13 @@ impl Database {
     /// the owner route already honours a supplied clock.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn read_session_with_clock_for_test(
         &self,
         limits: ReadLimits,
@@ -649,6 +698,13 @@ impl Database {
     /// executor probe used by this live-state session.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn read_session_with_kernel_observer_for_test(
         &self,
         limits: ReadLimits,
@@ -672,6 +728,13 @@ impl Database {
     /// tell an in-process dispatch from one that went through the channel.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn read_route_resources_for_test(&self) -> Result<ReadRouteResourceSnapshot> {
         let observed = crate::read_probe::observed();
         let owner = self

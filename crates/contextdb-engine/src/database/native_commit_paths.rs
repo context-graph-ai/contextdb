@@ -10,6 +10,10 @@ pub(super) fn r1_database_field_for_test(field: usize) {
     });
 }
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn r1_database_cleanup_rows_for_test() {
     d1_initialized_control_proofs::mapped_rows_for_test();
     initialized_prepaid_controls_for_test();
@@ -79,6 +83,10 @@ pub(crate) fn r1_database_cleanup_rows_for_test() {
 
 // CDB127 private mapped extension; frozen test bodies/fixtures remain untouched.
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn returned_loader_rows_for_test() {
     use std::mem::{align_of, offset_of, size_of};
     struct Pre2RawLoader {
@@ -705,6 +713,10 @@ pub(crate) fn returned_loader_rows_for_test() {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn initialized_prepaid_controls_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests::{
         last_request_for_test, last_request_pointer_for_test, measured,
@@ -4164,6 +4176,13 @@ impl Database {
     /// its DDL-history identity mutations refusing as an exhausted MEMORY_LIMIT
     /// does.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __flush_received_noop_ddl_for_test(&self, refuse_identity_growth: bool) -> Result<()> {
         let persistence = self.persistence.as_ref().expect("file-backed fixture");
         crate::persistence::refuse_identity_growth_at_for_test(
@@ -4269,6 +4288,13 @@ impl Database {
 // memory databases the durable edge-local DISCARD operation.
 #[cfg(test)]
 impl Database {
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn publish_memory_erasure_frontier_for_test(
         &self,
         tables: &BTreeSet<String>,

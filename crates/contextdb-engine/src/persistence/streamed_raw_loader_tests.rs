@@ -51,6 +51,13 @@ fn fixture() -> (
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn streamed_raw_body_finishes_while_close_contends_for_persistence_ownership() {
     let (_directory, persistence, partition, expected) = fixture();
     let (at_body_tx, at_body_rx) = mpsc::channel();
@@ -104,6 +111,13 @@ fn streamed_raw_body_finishes_while_close_contends_for_persistence_ownership() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn streamed_membership_and_body_use_the_same_root_after_concurrent_body_rewrite() {
     let (_directory, persistence, partition, expected) = fixture();
     let mut replacement = expected.clone();

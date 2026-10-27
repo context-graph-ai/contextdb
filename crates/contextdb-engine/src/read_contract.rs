@@ -1636,6 +1636,13 @@ impl<'a> CanonicalReader<'a> {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader.rs"
     )
 )]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn encode_owned_cursor_page_for_test(
     page: &crate::owned_cursor_page::OwnedCursorPage,
 ) -> Result<Vec<u8>, ReadEncodingError> {

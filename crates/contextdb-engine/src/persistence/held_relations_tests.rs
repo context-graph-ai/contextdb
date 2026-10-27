@@ -212,6 +212,13 @@ fn a_relation_that_does_not_fit_the_writer_budget_is_refused_before_it_is_opened
 /// non-empty registry: whatever was admitted comes back, the grown registry
 /// array is freed, and no relation stays open.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_pass_that_fails_at_any_step_returns_everything_and_leaves_nothing_open() {
     const STEPS: [HoldStep; 16] = [
         HoldStep::AdmitName,
@@ -582,6 +589,13 @@ fn a_commit_releases_each_holder_charge_only_after_what_it_funds_is_freed() {
 /// the commit fails, nothing is left charged, nothing went unfunded, nothing
 /// was committed, and (after an error) the store keeps committing.
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_usable() {
     use super::staging_witness;
     const STEPS: [HoldStep; 16] = [
@@ -752,6 +766,13 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
 /// A native write starts before this relation has been opened or staged.
 /// The pending key has its own original invoice after the holder releases
 /// its two shorter name copies, through the write transaction's teardown.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn fresh_native_holder_staging(inject_growth: bool) {
     use super::staging_witness::{self, Event};
     let count = if inject_growth { 5 } else { 1 };

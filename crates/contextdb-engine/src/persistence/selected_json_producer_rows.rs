@@ -632,6 +632,13 @@ impl Root {
         changed.splice(hits[0]..hits[0] + old.len(), new);
         changed
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn decode(
         self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -882,6 +889,13 @@ fn selected_json_native_parity_and_physical_lifetime_rows() {
     target_env = "gnu",
     target_pointer_width = "64"
 ))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn selected_json_first_refusal_and_bootstrap_rows() {
     let writer = MemoryAccountant::writer_no_limit().unwrap();
     let owner = writer.accountant();

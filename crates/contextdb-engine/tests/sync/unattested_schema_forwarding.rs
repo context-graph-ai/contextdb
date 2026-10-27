@@ -29,6 +29,10 @@ fn table_unit(changes: &ChangeSet, table: &str) -> ChangeSet {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn received_then_forwarded() -> (Database, ChangeSet, FabricIdentity, Vec<WireDdlProvenance>) {
     let source = Database::open_memory();
     source
@@ -132,6 +136,10 @@ fn unattested_receiver_still_installs_forwarded_unattested_schema() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn forwarders_own_locally_authored_schema_remains_signed() {
     let (forwarder, _, identity, _) = received_then_forwarded();
     const LOCAL: &str = "forwarder_ledger";

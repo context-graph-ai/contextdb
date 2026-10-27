@@ -223,6 +223,10 @@ fn statement(selected: usize) -> (String, HashMap<String, Value>) {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_reader(
     path: &std::path::Path,
     runtime: &std::path::Path,
@@ -321,6 +325,10 @@ fn check_budget(
 /// breadth it was declared, and never walks past the funded scope total.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_declared_breadth_is_given_its_breadth_times_the_serving_degree() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -368,6 +376,10 @@ fn a_declared_breadth_is_given_its_breadth_times_the_serving_degree() {
 /// it, and the answer is a full page or a typed refusal.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn opening_and_walking_are_charged_against_the_declared_work() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -426,6 +438,10 @@ fn opening_and_walking_are_charged_against_the_declared_work() {
 /// `M = 24` (layer-0 maximum 48) give `EF_SEARCH x 48`, and the `M = 16`
 /// partition alone gives `EF_SEARCH x 32`.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn mixed_serving_degrees_are_given_the_widest_admitted_degree() {
     use std::sync::mpsc;
     use std::time::Duration;

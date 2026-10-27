@@ -26,6 +26,10 @@ pub fn empty() -> HashMap<String, Value> {
     dead_code,
     reason = "KEEP-SHARED: shared test helper used by custody, custody_schema_replay_bounded_contract, custody_schema_replay_identical"
 )]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn initialize_fixture_callbacks(db: &Database) {
     let registered = db.registered_trigger_callbacks();
     for trigger in db.list_triggers() {

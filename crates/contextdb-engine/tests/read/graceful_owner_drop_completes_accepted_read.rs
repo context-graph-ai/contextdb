@@ -36,6 +36,10 @@ impl OwnerRequestHandler for HeldRead {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn graceful_close_publishes_quiescence_before_withdrawing_the_channel() {
     use contextdb_engine::{OwnerReadTestHooks, QuiescentStopPhase};
 
@@ -181,6 +185,10 @@ fn graceful_close_publishes_quiescence_before_withdrawing_the_channel() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn dropped_owner_finishes_an_accepted_request_before_releasing_the_store() {
     let root = tempfile::tempdir().expect("task-scoped store directory");
     let path = root.path().join("owner-drop.db");
@@ -297,6 +305,10 @@ fn callback_close_refuses_its_pending_ack_and_redelivers_after_reopen() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn concurrent_callback_and_ordinary_close_complete_one_shutdown_and_preserve_pending_delivery() {
     use contextdb_core::{Value, read_contract::ReadRoute};
     use contextdb_engine::{OwnerReadTestHooks, QuiescentStopPhase};
@@ -515,6 +527,10 @@ fn ordinary_close_waits_until_callback_dispatcher_releases_writer_resources() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn two_ordinary_close_callers_wait_for_one_complete_shutdown() {
     use contextdb_core::{Value, read_contract::ReadRoute};
     use contextdb_engine::{OwnerReadTestHooks, QuiescentStopPhase};
@@ -662,6 +678,10 @@ fn owner_sockets(runtime: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// reads the committed file.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_draining_owner_keeps_its_exact_channel_until_admitted_work_leaves() {
     use contextdb_engine::OwnerReadTestHooks;
     use std::os::unix::fs::PermissionsExt;

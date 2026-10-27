@@ -16,6 +16,13 @@ enum ColdMetadata {
     Journal,
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("metadata-owner.db");
@@ -310,6 +317,13 @@ fn cold_oversized_membership_extent_refuses_before_fallback_count_decode() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serving() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -541,6 +555,13 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn wide_text_partition_metadata_refuses_before_cold_catalog_lookup() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(

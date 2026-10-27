@@ -56,6 +56,10 @@ fn seed_page_fixture(path: &PathBuf) {
     db.close().expect("close page fixture writer");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn captured_writer_registry(path: &PathBuf) -> (Database, WriterReaderSnapshotRegistryObservation) {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&observed);
@@ -481,6 +485,10 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_scan_after_final_reader_teardown_observes_no_released_registration() {
     let root = tempfile::tempdir().expect("scratch directory");
     let path = root.path().join("scan-after-reader-teardown.redb");

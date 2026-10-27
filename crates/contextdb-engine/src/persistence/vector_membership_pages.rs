@@ -999,6 +999,13 @@ pub(super) fn publish_membership(
 /// Adversarial fixture publication: authenticate records and companions while
 /// deliberately allowing overlapping placement lifetimes.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn publish_corrupt_store_membership_for_test(
     write: &redb::WriteTransaction,
     membership_key: &[u8],

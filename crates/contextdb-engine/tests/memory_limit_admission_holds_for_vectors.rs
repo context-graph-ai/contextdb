@@ -100,6 +100,10 @@ fn used(database: &Database) -> u64 {
     database.accountant().usage().used as u64
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_edge(
     database: &Database,
     tx: contextdb_core::TxId,

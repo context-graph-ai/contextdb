@@ -224,6 +224,10 @@ fn run_owner_process() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_second_process_interrupt_ends_only_the_request_it_names() {
     if std::env::var_os(OWNER_ROLE).is_some() {
         run_owner_process();

@@ -856,6 +856,10 @@ fn grouping_charge_bounds_reject_uncharged_and_repeated_candidate_work() {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn historical_partition_rows(
     db: &Database,
     snapshot: Option<contextdb_core::SnapshotId>,
@@ -877,6 +881,10 @@ fn historical_partition_rows(
         .into()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn historical_deleted_rows(
     db: &Database,
     snapshot: Option<contextdb_core::SnapshotId>,

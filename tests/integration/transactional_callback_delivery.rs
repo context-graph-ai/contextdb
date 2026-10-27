@@ -33,6 +33,10 @@ fn prepare_schema(db: &Database) {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn register_preparation(db: &Database, calls: Arc<AtomicUsize>) {
     db.register_transactional_trigger_callback("prepare_observation", move |db, ctx| {
         calls.fetch_add(1, Ordering::SeqCst);
@@ -67,6 +71,10 @@ fn register_preparation(db: &Database, calls: Arc<AtomicUsize>) {
     db.complete_initialization().unwrap();
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_observation(db: &Database, id: i64) -> contextdb_core::Result<()> {
     db.execute(
         "INSERT INTO observations (id, parent_id) VALUES ($id, $parent)",
@@ -276,6 +284,10 @@ fn local_durable_commit_failure_after_preparation_publishes_nothing_even_after_r
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn final_commit_validation_failure_discards_callback_records_delivery_and_event() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let db = Database::open_memory();
@@ -621,6 +633,10 @@ fn crash_during_external_delivery_recovers_uncertainty_before_retry() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn scheduled_action_identity_survives_drained_queue_and_restart() {
     let now = Arc::new(AtomicU64::new(1_700_000_000_000));
     let clock_now = now.clone();
@@ -777,6 +793,10 @@ fn delivery_panic_retains_uncertain_action_for_restart_and_deduplicated_retry() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn full_sink_queue_refuses_scheduled_row_and_delivery_together() {
     let now = Arc::new(AtomicU64::new(1_700_000_000_000));
     let clock_now = now.clone();

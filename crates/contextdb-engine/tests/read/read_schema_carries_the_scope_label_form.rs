@@ -209,6 +209,10 @@ fn the_schema_answer_carries_each_table_s_declared_scope_label_form() {
 /// the scope form, so the owner route is also pinned to the declared value
 /// before the two answers are compared.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn both_read_routes_answer_the_same_scope_label_form() {
     let directory = tempfile::TempDir::new().expect("task-scoped scope-schema directory");
     let runtime_root = secure_runtime_root(directory.path(), "scope-schema-runtime");

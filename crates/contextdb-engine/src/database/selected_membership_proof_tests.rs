@@ -5,6 +5,13 @@ use contextdb_vector::store::{DormantRawVectorLoader, RawVectorMembershipSource}
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     for rows in [32, 64] {
@@ -273,6 +280,13 @@ fn historical_count_valid_json_uses_existing_decoder() {
 fn count_header_producer_skips_future_authenticated_malformed_json() {
     authenticated_json_count_fixture(true, true);
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn authenticated_json_count_fixture(malformed: bool, future: bool) {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();

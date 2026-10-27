@@ -1099,6 +1099,10 @@ fn cwv_04j_alter_add_unique_collision_rebuilds_moved_auto_index_storage() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cwv_05_trigger_staged_counter_parity() {
     fn child_insert(db: &Database, tx: contextdb_core::TxId, i: i64) {
         db.insert_row(

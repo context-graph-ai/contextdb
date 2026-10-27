@@ -6,6 +6,13 @@ impl RedbPersistence {
     /// Measurement only: drop the custody group index completion marker in
     /// a separate committed transaction, as an unfunded maintenance write does.
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn invalidate_custody_groups_for_test(&self) -> Result<()> {
         self.with_db(|db| {
             let write = Self::begin_history_write(db)?;
@@ -16,6 +23,13 @@ impl RedbPersistence {
     /// Measurement only: the repair rebuild of the custody read mirror and its
     /// group index, in a separate committed transaction.
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn rebuild_custody_index_for_test(&self) -> Result<()> {
         self.with_db(|db| {
             let write = Self::begin_history_write(db)?;
@@ -31,6 +45,13 @@ impl RedbPersistence {
     /// Measurement only: the full transaction-order repair over this store's
     /// committed commit index and tables, in one committed transaction.
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn repair_transaction_order_for_test(&self) -> Result<()> {
         let commit_index = self.load_commit_index()?;
         let tables = self.load_all_table_meta()?;
@@ -39,6 +60,13 @@ impl RedbPersistence {
     /// Measurement only: how many committed CONFIG keys start with `prefix`.
     /// Visits keys; never decodes or copies a value.
     #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn count_config_keys_with_prefix_for_test(&self, prefix: &str) -> Result<u64> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;

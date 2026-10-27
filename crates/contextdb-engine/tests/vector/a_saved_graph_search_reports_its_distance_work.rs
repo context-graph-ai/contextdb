@@ -240,6 +240,10 @@ fn observe(reader: &ReadSession, mode: &str) -> Observed {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_saved_graph_search_reports_its_distance_work() {
     use std::os::unix::fs::PermissionsExt;
 

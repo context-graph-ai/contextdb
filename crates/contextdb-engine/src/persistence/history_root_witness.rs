@@ -479,6 +479,10 @@ mod tests {
         write.commit().unwrap();
         db
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verify(db: &redb::Database) -> Result<()> {
         let _operation = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         RedbPersistence::verify_history_root(&db.begin_read().unwrap(), "rel_fixture")

@@ -88,6 +88,10 @@ fn store(path: &std::path::Path) -> (Database, Vec<Vec<Value>>) {
 /// Commit one staged statement. With `hold`, the commit reports `reached`
 /// from inside itself and waits there until the paired resume sender is
 /// dropped.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn commit_statement(
     database: &Database,
     sql: &str,
@@ -169,6 +173,10 @@ fn note(id: i64) -> HashMap<String, Value> {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_bounded_search_waiting_for_a_commit_is_answered_without_spending_its_active_time() {
     let directory = tempfile::tempdir().expect("scratch directory");
     let (database, expected) = store(&directory.path().join("store.db"));
@@ -244,6 +252,10 @@ impl bounded::ExecutionProbe for Registrations {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_bounded_search_under_back_to_back_committers_never_waits_and_reads_one_committed_snapshot() {
     let directory = tempfile::tempdir().expect("scratch directory");
     let (database, expected) = store(&directory.path().join("store.db"));
@@ -376,6 +388,10 @@ fn uncontended_answer(database: &Database) -> Vec<Vec<Value>> {
 
 /// Moves row 1 so the search's answer changes from `[[1], [2]]` to
 /// `[[2], [1]]`.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn move_row_one(database: &Database) -> contextdb_core::Result<()> {
     let tx = database.begin().expect("begin a write");
     database
@@ -394,6 +410,10 @@ fn move_row_one(database: &Database) -> contextdb_core::Result<()> {
 /// (answer `before`, snapshot published before). Only when `after` is given
 /// may it instead read wholly the state published after the operation
 /// (answer `after`, snapshot published after).
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_beside_an_operation_held_at(
     boundary: CommitBoundary,
     database: &Database,
@@ -462,6 +482,10 @@ fn read_beside_an_operation_held_at(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_beside_a_commit_held_at(boundary: CommitBoundary) {
     let directory = tempfile::tempdir().expect("scratch directory");
     let database = indexed_store(&directory.path().join("store.db"));
@@ -498,6 +522,10 @@ fn a_bounded_search_before_a_durable_commit_is_published_reads_only_the_publishe
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_bounded_search_while_an_index_generation_is_published_reads_one_whole_snapshot() {
     let directory = tempfile::tempdir().expect("scratch directory");
     let database = indexed_store(&directory.path().join("store.db"));

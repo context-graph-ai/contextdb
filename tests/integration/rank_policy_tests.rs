@@ -368,6 +368,10 @@ fn expect_use_rank_requires_vector_order(
     );
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn create_rank_policy_on_text_anchor(
     db: &Database,
 ) -> contextdb_core::Result<contextdb_engine::QueryResult> {
@@ -535,6 +539,10 @@ fn expect_drop_blocked(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn create_bad_policy_table(
     db: &Database,
     column_def: &str,

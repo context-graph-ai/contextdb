@@ -3996,6 +3996,13 @@ impl MaintenanceWorkerClock {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn wake_once(
         &self,
         shutdown: &AtomicBool,
@@ -4032,6 +4039,13 @@ impl MaintenanceWorkerClock {
 
 #[cfg(any(test, feature = "test-seams"))]
 impl VectorMaintenanceWorkerClockGuardForTest {
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn wake_once(&self) -> Result<VectorMaintenanceWorkerCycleForTest> {
         self.clock.wake_once(&self.shutdown)
     }

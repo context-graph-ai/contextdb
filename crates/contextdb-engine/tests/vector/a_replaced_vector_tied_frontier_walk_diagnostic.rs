@@ -25,6 +25,10 @@ fn ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
 #[cfg(unix)]
 #[test]
 #[ignore = "diagnostic: run explicitly with --ignored"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_replaced_vector_tied_frontier_walk_diagnostic() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -78,6 +78,10 @@ fn seed(path: &Path) {
 /// Hold a writer's open at the held data descriptor, open a reader against
 /// it, release the writer once the reader has arrived, and require that the
 /// reader was served the committed rows.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_while_a_writer_holds_the_data_descriptor(path: &Path) {
     // Dropping `resume` (including by a panic below) lets the writer go.
     let (reached, reached_rx) = mpsc::channel::<()>();

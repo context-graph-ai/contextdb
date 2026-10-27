@@ -32,6 +32,13 @@ fn cursor(reverse: bool) -> BoundedOrderedRowCursor {
     cursor
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Result<Option<RowId>> {
     let meta = &load.image.table_meta["postings"];
     let declaration = RedbPersistence::relational_index_declarations(meta)

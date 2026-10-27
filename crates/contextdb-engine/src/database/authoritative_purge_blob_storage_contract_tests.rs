@@ -412,6 +412,13 @@ fn purge_commits_row_blob_roles_and_delivery_together_or_not_at_all() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn purge_refuses_pre_frontier_backup_publication_and_post_purge_backup_restores_absence() {
     let (root, db) = open_ledger();
     let complete_bytes = b"backup-fenced-complete-engine-held-media";

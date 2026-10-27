@@ -378,6 +378,10 @@ fn the_erasure_frontier_works_after_the_store_changes_hands() {
 // distinguish a successful copy from a refusal during copying; the existing
 // commit observer's export-publication event drives this exact race instead.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_discard_after_the_export_copy_refuses_publication_of_the_older_artifact() {
     use contextdb_engine::writer_commit_test_seams::{self, CommitBoundary};
     let directory = tempfile::tempdir().unwrap();

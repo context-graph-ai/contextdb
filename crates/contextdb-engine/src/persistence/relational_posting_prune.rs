@@ -526,6 +526,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn expired_last_indexed_version_stays_absent_from_later_historical_reads() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("expired-posting.db");
@@ -586,6 +590,10 @@ mod tests {
     /// index. Erasing one expired live row whose two indexes share the
     /// counted prefix takes it out of that count once.
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn erasing_a_live_row_leaves_a_count_shared_by_two_indexes_once() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shared-count.db");
@@ -692,6 +700,10 @@ mod tests {
         short_declarations_are_funded_before_native_allocation(128);
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn short_declarations_are_funded_before_native_allocation(declarations: usize) {
         use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
         let directory = tempfile::tempdir().unwrap();
@@ -805,6 +817,10 @@ mod tests {
     /// hold a wide leading value once for every prefix it leads.
     #[test]
     #[serial_test::serial]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn erasing_a_wide_live_row_retains_no_count_key_per_prefix() {
         const WIDTH: usize = 256 * 1024;
         const COLUMNS: usize = 64;
@@ -1002,6 +1018,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reclaimed_intervals_split_postings_reanchor_current_and_preserve_old_roots() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("posting-prune.db");

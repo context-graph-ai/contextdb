@@ -769,6 +769,10 @@ fn assert_open_reads_only_bounds(
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ssh_c3_open_isolated() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("open_isolated.redb");
@@ -840,6 +844,10 @@ fn ssh_c3_open_isolated() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ssh_c3_open_sibling_scaling() {
     // Preserve both original sibling index shapes. Within each shape, only the
     // sibling history doubles; target history and schema stay identical.
@@ -902,6 +910,10 @@ fn ssh_c3_open_sibling_scaling() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ssh_c3_open_empty_sibling() {
     let tmp = setup_file_db_for_open("open_empty_sibling.redb", true, 0);
     let (opened, work) = contextdb_engine::writer_query_test_seams::observe(|| {
@@ -1332,6 +1344,10 @@ fn ssh_c2_sync_applied_commit_contract() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ssh_c2_reentrant_trigger_commit() {
     let (plugin, records) = LifecycleObserverPlugin::new();
     let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();

@@ -198,6 +198,10 @@ fn single_point_between_on_a_desc_indexed_integer_column_returns_the_matching_ro
 /// `nan_real_predicate_tests.rs`'s ASC-index / non-indexed coverage, this
 /// pin is the DESC-index leg of that same promise).
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn nan_bounded_range_query_on_a_desc_indexed_real_column_returns_empty_without_panic() {
     let db = Database::open_memory();
     db.execute(

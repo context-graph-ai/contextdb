@@ -259,6 +259,10 @@ fn fresh_ten_thousand_dense_vectors_publish_and_restart_under_writer_limit() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("retained.db");
@@ -572,6 +576,10 @@ fn multiple_pinned_generations_remain_charged_until_their_final_snapshot_release
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn growing_persistence_transitions_refuse_atomically_for_base_and_change_publication() {
     for publish_change in [false, true] {
         let phase = VectorMaintenancePreparationPhaseForTest::AdmitPersistence;
@@ -745,6 +753,10 @@ fn growing_persistence_transitions_refuse_atomically_for_base_and_change_publica
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn encoding_shrink_transfers_held_workspace_without_additive_headroom() {
     let directory = tempfile::tempdir().unwrap();
     let db = Arc::new(open(&directory.path().join("encoding-shrink.db")));
@@ -810,6 +822,10 @@ fn encoding_shrink_transfers_held_workspace_without_additive_headroom() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn candidate_shrink_transfers_held_workspace_without_additive_headroom() {
     for publish_change in [false, true] {
         let directory = tempfile::tempdir().unwrap();

@@ -197,6 +197,10 @@ fn sealed_fixture(plant: bool) -> Fixture {
 /// A fresh reader over the committed file image, authorized for every
 /// Context: the route a consumer reads through, and the only one that proves
 /// its candidates through authenticated windows.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reader(fixture: &Fixture) -> ReadSession {
     let reader = ReadSession::with_runtime_directory_for_test(&fixture.runtime, || {
         ReadSession::open_with_options(
@@ -308,6 +312,10 @@ fn sorted(mut ids: Vec<i64>) -> Vec<i64> {
 /// whole, a NULL element makes the comparison unknown rather than false, and
 /// the column order of the row value is the caller's, not the index's.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_row_value_list_selects_exactly_the_listed_pairs() {
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
     let path = directory.path().join("row-values.db");

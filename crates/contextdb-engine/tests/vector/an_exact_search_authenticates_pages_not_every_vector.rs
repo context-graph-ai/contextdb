@@ -147,6 +147,10 @@ fn seed_with_rows(path: &std::path::Path, runtime: &std::path::Path, row_count: 
 #[cfg(unix)]
 #[test]
 #[ignore = "large exact-search diagnostic; run explicitly when measuring body and proof work"]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_exact_search_authenticates_pages_not_every_vector() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -276,6 +280,10 @@ fn an_exact_search_authenticates_pages_not_every_vector() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn exact_search_refuses_damaged_missing_and_mismatched_authoritative_bodies() {
     use std::os::unix::fs::PermissionsExt;
 

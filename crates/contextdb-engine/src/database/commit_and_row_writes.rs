@@ -3023,6 +3023,13 @@ impl Database {
 
     /// The former three-lock sequence, reachable only through the test hook.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn delete_relational_row_split_lock_for_test(
         &self,
         tx: TxId,
@@ -3070,6 +3077,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn delete_relational_row_releasing_staged_for_test(
         &self,
         tx: TxId,
@@ -3085,6 +3099,13 @@ impl Database {
     /// Observe the real delete path at the two sides of its write-set lock.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn delete_relational_row_with_race_hook_for_test(
         &self,
         tx: TxId,
@@ -3113,6 +3134,13 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn staged_row_id_for_test(&self, tx: TxId, table: &str) -> Result<Option<RowId>> {
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.relational_inserts
@@ -3609,6 +3637,10 @@ impl Database {
     /// to isolate echo selection from the independently authenticated lineage
     /// contract exercised by the transport journey.
     #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn mark_row_arrived_by_sync_for_test(
         &self,
         table: &str,
@@ -4525,6 +4557,13 @@ impl Database {
     /// dropped but whose next same-name CREATE still depends on their prior
     /// generation.
     #[cfg(test)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(super) fn authoritative_table_generations_for_detached_working(
         &self,
     ) -> Result<HashMap<String, u64>> {

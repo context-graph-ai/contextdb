@@ -42,6 +42,10 @@ fn fixture_schema_author() -> &'static contextdb_engine::identity::FabricIdentit
 }
 
 /// Sign as that author, the way a transport-owned signer does.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn fixture_signer() -> impl Fn(&[u8]) -> contextdb_core::Result<Vec<u8>> {
     |bytes: &[u8]| Ok(fixture_schema_author().sign_for_test(bytes))
 }
@@ -142,6 +146,10 @@ fn measure_thread_peak<T>(action: impl FnOnce() -> T) -> (T, i64) {
 /// dominate this fixture's unrelated definitions; the changed table has no
 /// rows, so a whole-metadata clone cannot hide behind the table-copy cost.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_received_table_alter_does_not_clone_unrelated_event_metadata_before_admission() {
     const ROUTES: usize = 8;
     const FILTER_VALUES: usize = 512;
@@ -3923,6 +3931,10 @@ fn preparations_own_charges_draw_the_units_reservation_and_its_bounded_excess() 
 /// after. Unrelated live data is charged throughout, so a release that is too
 /// large has somewhere to come from and shows up as a number below the start.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was() {
     const ROWS: usize = 250;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -4098,6 +4110,10 @@ fn a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was() {
 /// Cleanup runs when staging unwinds, returning the reservation and lease
 /// without publishing a partial unit.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind() {
     const ROWS: usize = 120;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -4237,6 +4253,10 @@ fn a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind() {
 /// complete state: no stage left behind, no memory left spent on it, no
 /// trace of the arriving unit anywhere.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_panic_immediately_before_the_durable_commit_leaves_no_stage_behind() {
     const ROWS: usize = 120;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -4409,6 +4429,10 @@ fn assert_refuses_service_after_interrupted_publication(db: &Database) {
 /// CAUGHT unwind specifically, since the durable image is what a restart
 /// always re-derives from regardless of what the live process was doing.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_panic_after_the_durable_commit_before_publication_is_recovered_by_restart() {
     const ROWS: usize = 30;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -4519,6 +4543,10 @@ fn a_panic_after_the_durable_commit_before_publication_is_recovered_by_restart()
 /// state from the durable image, never a live patch-up of the half-published
 /// components.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_panic_between_publication_components_is_recovered_by_restart() {
     const ROWS: usize = 30;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -5806,6 +5834,10 @@ fn a_receiver_that_prices_a_unit_as_fitting_but_cannot_copy_it(
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn deliver(
     receiver: &Database,
     door: ReceivedDoor,
@@ -6665,6 +6697,10 @@ impl SchemaPeer {
     /// The provenance this peer would send with `unit`: its own signature when
     /// it authored the schema, and the author's unchanged when it is
     /// forwarding schema it received.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn outbound(&self, unit: &ChangeSet) -> Vec<contextdb_engine::protocol::WireDdlProvenance> {
         {
             let seam_read_memory = self
@@ -6695,6 +6731,10 @@ impl SchemaPeer {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn take(
         &self,
         unit: ChangeSet,

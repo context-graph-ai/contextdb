@@ -361,6 +361,13 @@ pub(crate) fn erasure_first_table_fault_reached_for_test() -> bool {
     ERASURE_FIRST_TABLE_FAULT.with(|state| state.get().1)
 }
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(super) fn erasure_first_table_staged_for_test() -> Result<()> {
     let armed = ERASURE_FIRST_TABLE_FAULT.with(|state| {
         let (armed, reached) = state.get();

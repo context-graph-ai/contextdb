@@ -428,6 +428,13 @@ mod native {
         // refund the body before deallocation, or skip unmap after join.
         #[test]
         #[serial_test::serial]
+        #[cfg_attr(
+            any(test, feature = "test-seams"),
+            expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )
+        )]
         fn fixed_worker_startup_and_physical_release_rows() {
             let control = ReadShared::<Body<fn()>>::layout();
             let before = threads();

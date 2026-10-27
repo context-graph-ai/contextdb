@@ -259,6 +259,10 @@ fn stage_wide_unit(edge: &Database, unit: usize) -> contextdb_core::TxId {
 /// commits of wide units under a sweep of validation limits, measured from
 /// the start of commit validation. What the writer accountant admits meanwhile
 /// (the admitted verifier, the pages validation's reads load) is admitted too.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn companion_planning() {
     let dir = tempfile::tempdir().unwrap();
     let (edge, _hub) = edge_with_units(dir.path(), 1).await;

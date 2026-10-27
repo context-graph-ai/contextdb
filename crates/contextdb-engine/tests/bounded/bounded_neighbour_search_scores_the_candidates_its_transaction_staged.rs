@@ -118,10 +118,18 @@ fn answer(result: &QueryResult) -> String {
     format!("{:?}", result.rows())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn eager(database: &Database) -> contextdb_core::Result<QueryResult> {
     database.execute(NEAREST, &source_params())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded(database: &Database) -> contextdb_core::Result<QueryResult> {
     database
         .read_session(roomy())

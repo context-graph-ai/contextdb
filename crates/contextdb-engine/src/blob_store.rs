@@ -173,6 +173,13 @@ impl PausedProviderGenerationForTest {
         self.payload_bytes_emitted.load(Ordering::SeqCst)
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn resume_from_stale_generation_for_test(&self) -> Result<()> {
         let session = self.repository.open_read(self.hash)?.ok_or_else(|| {
             Error::Other(
@@ -215,6 +222,13 @@ impl PausedWriterGenerationForTest {
         self.guard.lock().expect("writer generation guard").take();
     }
 
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn complete_from_stale_generation_for_test(&self) -> Result<()> {
         let guard = self.repository.begin_write_generation(self.hash)?;
         if guard.generation() != self.generation {
@@ -780,6 +794,13 @@ impl BlobStore {
     /// content-address to it — the consumer's verification is what must
     /// catch the lie.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn serve_wrong_bytes_for_test(&self, claimed: &BlobHash, bytes: &[u8]) -> Result<()> {
         self.store()?.arm_tamper(&claimed.as_bytes(), bytes)
     }
@@ -882,6 +903,13 @@ impl BlobStore {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn pause_authorized_provider_stream_after_shared_hash_guard_for_test(
         &self,
         hash: &BlobHash,
@@ -901,6 +929,13 @@ impl BlobStore {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn pause_partial_blob_writer_after_shared_hash_guard_for_test(
         &self,
         hash: &BlobHash,

@@ -137,6 +137,10 @@ fn seed_store(path: &Path) {
     database.close().expect("the fixture writer closes cleanly");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn find_the_needles(session: &ReadSession) -> Result<contextdb_engine::QueryResult> {
     session.execute(
         "SELECT id FROM progress_rows WHERE marker = $marker",

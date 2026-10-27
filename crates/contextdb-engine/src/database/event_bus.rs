@@ -2058,6 +2058,13 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn __debug_register_sink_with_constraints_for_test<F>(
         &self,
         name: &str,
@@ -2166,6 +2173,13 @@ impl Database {
     /// Test-only view of pending identities before dispatcher registration.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn pending_sink_action_ids_for_test(&self, sink: &str) -> Vec<u64> {
         let _operation = self.assert_open_operation();
         let queues = self.event_bus.queues.lock();
@@ -2382,6 +2396,13 @@ impl Database {
     /// entries as held, and a bounded queue's entries that are only in the
     /// store, decoded from there.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn pending_sink_entries_for_test(&self, sink: &str) -> Vec<SinkQueueEntry> {
         let (mut entries, needs_store) = match self.event_bus.queues.lock().get(sink) {
             Some(queue) => (

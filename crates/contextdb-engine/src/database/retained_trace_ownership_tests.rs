@@ -1107,6 +1107,13 @@ fn fixture() -> (tempfile::TempDir, Database) {
     }
     (directory, db)
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn query(db: &Database) -> Result<QueryResult> {
     struct CheckNativeFrees;
     impl Drop for CheckNativeFrees {
@@ -1164,6 +1171,13 @@ fn retained_free_cut_matches(cut: RetainedFreeCut) -> bool {
         && cut.live >= cut.request.1
         && cut.live.checked_add(cut.residual) == Some(cut.freed.0)
 }
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_trace_row(row: Row) {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let (_directory, db) = fixture();
@@ -1460,6 +1474,13 @@ fn retained_trace_original_owner_arc_stays_paid_through_native_free() {
 // decisive mutant keeps the provider admission after ReadShared returns NULL.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_trace_keeper_native_null_returns_controls_and_keeps_payload_paid_through_free() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let (_directory, db) = fixture();
@@ -1573,6 +1594,13 @@ fn retained_trace_keeper_native_null_returns_controls_and_keeps_payload_paid_thr
 // payload before destroying its buffers when the genuine Box callback refuses.
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_trace_late_box_refusal_frees_payload_before_returning_original_invoice() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let (_directory, db) = fixture();
@@ -1816,6 +1844,13 @@ pub(crate) fn provider_callback_unwind(
 
 #[test]
 #[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn retained_trace_provider_callback_unwind_keeps_pending_payload_paid_through_native_frees() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let (_directory, db) = fixture();

@@ -98,6 +98,10 @@ fn committed_row_change_count(path: &std::path::Path) -> usize {
 /// the database that actually authored it, and apply the resulting unit to
 /// `receiver` through the same authenticated, dependency-complete door a
 /// real sync client uses.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply_received(author: &Database, receiver: &Database, changes: ChangeSet) {
     let identity = {
         static AUTHOR: std::sync::OnceLock<contextdb_engine::identity::FabricIdentity> =

@@ -219,6 +219,13 @@ fn snapshot_paths_for_test(runtime: &Path, identity: (u64, u64)) -> Vec<PathBuf>
 /// when the failure came after the record write began the record is marked failed, retention
 /// ignores it and a PURGE is accepted; when it came before the record write the record is still
 /// provisional with its reader alive and a PURGE is refused, naming the reader.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn assert_a_failure_under_the_data_lock_detaches_without_blocking(
     fault: read_persistence_test_scaffold::RegistrationFault,
     purge_in_the_gap_is_accepted: bool,

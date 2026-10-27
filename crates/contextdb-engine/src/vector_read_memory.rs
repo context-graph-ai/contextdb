@@ -697,6 +697,13 @@ impl DeclaredReadRoot {
         self.native_child_unqualified_observed(|_, _| {})
     }
     #[cfg(all(test, feature = "test-seams"))]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub(crate) fn child_with_physical_counter_for_test(
         &self,
     ) -> Result<(ReadMemoryOwner, (usize, usize))> {

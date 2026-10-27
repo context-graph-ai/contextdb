@@ -628,6 +628,10 @@ impl OwnerServicePublicationObserver for ExpireBeforePublication {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_publication_honors_active_deadline_before_any_purge_durability() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owner-publication-deadline.db");
@@ -713,6 +717,10 @@ fn owner_publication_honors_active_deadline_before_any_purge_durability() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn held_owner_publication_does_not_hold_the_commit_mutex_and_purge_waits() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owner-publication-progress.db");
@@ -793,6 +801,10 @@ fn held_owner_publication_does_not_hold_the_commit_mutex_and_purge_waits() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_cursor_paused_before_carrier_publication_cannot_emit_after_purge() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owner-purge-reader.db");

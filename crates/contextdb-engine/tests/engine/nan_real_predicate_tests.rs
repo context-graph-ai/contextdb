@@ -105,6 +105,10 @@ fn between_query_with_nan_lower_bound_on_a_non_indexed_real_column_returns_empty
 /// non-indexed twin above already does (empty result), or refuse with a
 /// typed error; either is acceptable, but a raw Rust panic is not.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn between_query_with_nan_lower_bound_on_an_indexed_real_column_does_not_panic() {
     let db = Database::open_memory();
     seed(&db, &[1.0, 2.0, 3.0]);

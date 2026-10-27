@@ -49,6 +49,10 @@ fn reporter(events: &Sender<FirstEvent>, event: FirstEvent) -> Arc<dyn Fn() + Se
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_maintenance_step_planted_inside_census_collection_waits_until_the_sample_is_complete() {
     let _clock = Wallclock::test_clock_guard(|| NOW);
     let dir = tempfile::tempdir().unwrap();

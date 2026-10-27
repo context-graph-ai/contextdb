@@ -123,6 +123,13 @@ fn receipt() -> SyncApplyReceipt {
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn apply_received(
     db: &Database,
     changes: &ChangeSet,

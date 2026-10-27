@@ -96,6 +96,10 @@ fn edge_with_own_work() -> Pair {
     pair
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn rows() -> Vec<Row> {
     vec![
         Row {

@@ -346,6 +346,13 @@ pub(crate) fn diagnostic_resolution(policy: crate::sync_types::ConflictPolicy) -
     }
 }
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn decode_diagnostic_resolution(tag: u8) -> Result<crate::sync_types::ConflictPolicy> {
     match tag {
         0 => Ok(crate::sync_types::ConflictPolicy::InsertIfNotExists),

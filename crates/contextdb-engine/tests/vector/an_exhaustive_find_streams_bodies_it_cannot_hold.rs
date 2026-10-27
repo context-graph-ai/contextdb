@@ -181,6 +181,10 @@ fn statement() -> (String, HashMap<String, Value>) {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_reader(path: &std::path::Path, runtime: &std::path::Path, memory: u64) -> ReadSession {
     // This proof is about memory. The time allowance is wide so an unoptimized
     // test build on a loaded machine is not what decides it.

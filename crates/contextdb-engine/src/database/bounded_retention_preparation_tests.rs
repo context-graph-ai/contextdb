@@ -2,6 +2,13 @@ use super::*;
 include!("durable_test_observations.rs");
 use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn durable_edge_count(db: &Database) -> usize {
     use crate::persistence::writer_source::{SourceWindowOwner, WriterCursorFamily};
     use std::ops::Bound;

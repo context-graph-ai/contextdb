@@ -49,6 +49,13 @@ fn placement(route: &str, start: u64, end: Option<u64>) -> VectorPartitionMember
     }
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn decode_catalog(persistence: &RedbPersistence) -> std::result::Result<bool, LoadReadImageError> {
     persistence
         .with_db(|db| {
@@ -85,6 +92,13 @@ fn insert_orphan_body_and_compensate_count(write: &redb::WriteTransaction) {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn disjoint_shared_body_placements_publish_and_open_across_partitions() {
     let (_dir, persistence) = fixture();
     persistence
@@ -125,6 +139,13 @@ fn disjoint_shared_body_placements_publish_and_open_across_partitions() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn shared_body_overlap_is_refused_within_and_across_partitions_atomically() {
     for route in ["first", "second"] {
         let (_dir, persistence) = fixture();
@@ -161,6 +182,13 @@ fn shared_body_overlap_is_refused_within_and_across_partitions_atomically() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn shared_body_coverage_count_is_bound_to_the_committed_vector_projection() {
     let (_dir, persistence) = fixture();
     persistence
@@ -185,6 +213,13 @@ fn shared_body_coverage_count_is_bound_to_the_committed_vector_projection() {
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn damaged_body_root_retains_the_physical_orphan_key_check() {
     let (_dir, persistence) = fixture();
     persistence

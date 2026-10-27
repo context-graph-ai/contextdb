@@ -91,6 +91,10 @@ impl Pair {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn client(&self) -> Result<SyncClient, contextdb_core::Error> {
         let identity = Arc::new(FabricIdentity::generate());
         SyncClient::with_authenticated_transport_and_identity_for_test(
@@ -117,6 +121,10 @@ fn expectation() -> ApplicationTablePolicyExpectation {
         .expect("fixture policy expectation")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn rows() -> Vec<Row> {
     vec![
         Row {
