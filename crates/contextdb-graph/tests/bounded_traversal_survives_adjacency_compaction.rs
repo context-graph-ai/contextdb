@@ -82,6 +82,10 @@ impl Caller {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline native refusal diagnostics so an exhausted budget can return without allocating. "
+    )]
     fn charge(&self) -> std::result::Result<(), Error> {
         match self.remaining.get().checked_sub(1) {
             Some(left) => {
@@ -164,6 +168,10 @@ fn withdraw(
 
 /// One pull of the traversal. The caller's charge runs before every adjacency
 /// inspection, and the access gate answers for the neighbour the entry names.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error retains inline native refusal diagnostics so an exhausted budget can return without allocating. "
+)]
 fn pull(
     exec: &MemGraphExecutor<TestStore>,
     cursor: &mut BoundedBfsCursor,
@@ -235,6 +243,10 @@ fn assert_emitted_exactly_once(emitted: &[NodeId], expected: &[NodeId], journey:
 /// parked point slides down by two, and the two neighbours that land under
 /// the held offset are the ones a numeric resume never reaches.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error retains inline native refusal diagnostics so an exhausted budget can return without allocating. "
+)]
 fn a_parked_traversal_emits_every_visible_neighbour_when_all_the_entries_it_consumed_are_reclaimed()
 {
     let journey = "parked traversal, every consumed adjacency entry reclaimed under it";
@@ -316,6 +328,10 @@ fn a_parked_traversal_emits_every_visible_neighbour_when_all_the_entries_it_cons
 /// point, so resuming strictly after it is always possible; a numeric resume
 /// still skips the two neighbours the reclaim shifted past the held offset.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error retains inline native refusal diagnostics so an exhausted budget can return without allocating. "
+)]
 fn a_parked_traversal_emits_every_visible_neighbour_when_a_consumed_entry_survives_the_reclaim() {
     let journey = "parked traversal, one consumed adjacency entry survives the reclaim";
     let (store, tx_mgr, exec) = setup();
