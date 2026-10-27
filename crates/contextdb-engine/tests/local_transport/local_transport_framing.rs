@@ -179,14 +179,14 @@ async fn a_live_response_decode_keeps_memory_refusals_separate_from_corrupt_byte
     });
     let clock = ManualDeadlineClock::at(0);
 
-    let required_frame_memory =
-        u64::try_from(valid_frame.len() - std::mem::size_of::<u32>()).unwrap();
+    // One byte cannot admit even the native decoder owner. Its typed
+    // refusal has no complete required-byte figure at this boundary.
     for (frame, expected) in [
         (
             valid_frame,
             LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
                 ceiling: 1,
-                required: Some(required_frame_memory),
+                required: None,
             }),
         ),
         (
