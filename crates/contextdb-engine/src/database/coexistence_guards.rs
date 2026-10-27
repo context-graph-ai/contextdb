@@ -358,10 +358,39 @@ fn coordination(case: &str) {
         );
     }
 }
+struct CarrierRetirement(std::sync::mpsc::Sender<()>);
+impl crate::owner_read::OwnerBoundedExecutionObserver for CarrierRetirement {
+    fn before_operation(
+        &self,
+        _operation: crate::owner_read::OwnerBoundedOperation,
+        _limits: contextdb_core::read_contract::ReadLimits,
+        _cancellation: contextdb_core::read_contract::OwnerReadCancellation,
+    ) {
+    }
+    fn before_work(
+        &self,
+        _source: crate::executor::bounded_read_test_support::TestWorkSource,
+        _completed: u64,
+    ) {
+    }
+    fn cancellation_observed(&self, _completed: u64) {}
+    fn carrier_request_retired(&self) {
+        let _ = self.0.send(());
+    }
+}
 fn cache(case: &str) {
     let mut config = options();
     config.memory_limit = Some(128 * 1024 * 1024);
-    let db = Database::open_with_options(path(), config).unwrap();
+    let (db, retired) = if case == "red29_owner_reader_charge" {
+        let (sent, retired) = mpsc::channel();
+        let db = crate::owner_read::OwnerServiceSpec::with_execution_observer_during_start_for_test(
+            Arc::new(CarrierRetirement(sent)),
+            || Database::open_with_options(path(), config).unwrap(),
+        );
+        (db, Some(retired))
+    } else {
+        (Database::open_with_options(path(), config).unwrap(), None)
+    };
     db.execute(
         "CREATE TABLE entries (id INTEGER PRIMARY KEY)",
         &HashMap::new(),
@@ -412,7 +441,18 @@ fn cache(case: &str) {
             crate::ReadSession::open(path())
         })
         .unwrap();
+        let retired = retired
+            .as_ref()
+            .expect("owner charge fixture observes retirement");
+        // Open authenticates with an initial OwnerStatus. A response frame
+        // does not retire the carrier's original request invoices.
+        retired
+            .recv_timeout(WATCHDOG)
+            .expect("open status carrier retired");
         let before = reader.charged_bytes().unwrap();
+        retired
+            .recv_timeout(WATCHDOG)
+            .expect("baseline status carrier retired");
         let declared_before = db.declared_read_charged_bytes();
         let reservation = crate::memory_accounting::OwnedMemoryReservation::try_new_for_native(
             crate::memory_accounting::AccountantHandle::clone(&db.finalization.accountant),
@@ -424,6 +464,9 @@ fn cache(case: &str) {
         .unwrap();
         let declared_after = db.declared_read_charged_bytes();
         let after = reader.charged_bytes().unwrap();
+        retired
+            .recv_timeout(WATCHDOG)
+            .expect("final status carrier retired");
         drop(reservation);
         drop(reader);
         db.close().unwrap();
