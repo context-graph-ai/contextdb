@@ -2255,6 +2255,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture starts with the shipped defaults and changes only the option under test."
+    )]
     fn sync_source_lsn_update_cardinality_counts_each_ordinary_primary_key_insert_at_n_and_two_n() {
         for count in [8, 16] {
             let mut write_set = WriteSet::default();

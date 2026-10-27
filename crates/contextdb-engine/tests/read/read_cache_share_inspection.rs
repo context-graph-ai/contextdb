@@ -27,6 +27,10 @@ fn cache_inspection_keeps_the_declaration_and_the_admitted_session_budget() {
 }
 
 #[test]
+#[expect(
+    clippy::field_reassign_with_default,
+    reason = "The fixture starts with the shipped defaults and changes only the option under test."
+)]
 fn cache_inspection_accounts_for_fixed_reservations_at_both_percent_boundaries() {
     let mut options = ReadSessionOptions::default();
     options.read_cache_share = Some(0);
