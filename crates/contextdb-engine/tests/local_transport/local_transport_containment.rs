@@ -55,6 +55,7 @@ struct StructuralDependencies {
     paths: BTreeSet<Vec<String>>,
     aliases: BTreeMap<String, Vec<String>>,
     modules: BTreeSet<String>,
+    production_only: bool,
 }
 
 fn collect_macro_tokens(
@@ -210,7 +211,80 @@ fn flatten_use_tree(
     }
 }
 
+// Unknown platform/feature predicates stay visible. Only a condition proven
+// false with `test = false` can hide a unit-test item from the production scan.
+fn cfg_without_tests(meta: &syn::Meta) -> Option<bool> {
+    use syn::parse::Parser as _;
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::List(list) => {
+            let items = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())
+                .ok()?;
+            let values: Vec<_> = items.iter().map(cfg_without_tests).collect();
+            if list.path.is_ident("all") {
+                if values.contains(&Some(false)) {
+                    Some(false)
+                } else if values.iter().all(|v| *v == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                if values.contains(&Some(true)) {
+                    Some(true)
+                } else if values.iter().all(|v| *v == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("not") && values.len() == 1 {
+                values[0].map(|value| !value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn test_only_item(item: &syn::Item) -> bool {
+    let attrs = match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => return false,
+    };
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Meta>()
+                .ok()
+                .as_ref()
+                .is_some_and(|meta| cfg_without_tests(meta) == Some(false))
+    })
+}
+
 impl<'ast> Visit<'ast> for StructuralDependencies {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if self.production_only && test_only_item(item) {
+            return;
+        }
+        visit::visit_item(self, item);
+    }
+
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         flatten_use_tree(&item.tree, &mut Vec::new(), self);
         visit::visit_item_use(self, item);
@@ -230,6 +304,13 @@ impl<'ast> Visit<'ast> for StructuralDependencies {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         self.modules.insert(item.ident.to_string());
         visit::visit_item_mod(self, item);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if self.production_only {
+            self.paths.insert(vec![call.method.to_string()]);
+        }
+        visit::visit_expr_method_call(self, call);
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
@@ -256,9 +337,25 @@ fn structural_dependencies_with_aliases(
     source: &Path,
     cargo_aliases: &BTreeMap<String, Vec<String>>,
 ) -> StructuralDependencies {
+    structural_dependencies_in_mode(source, cargo_aliases, false)
+}
+
+fn production_dependencies(
+    source: &Path,
+    cargo_aliases: &BTreeMap<String, Vec<String>>,
+) -> StructuralDependencies {
+    structural_dependencies_in_mode(source, cargo_aliases, true)
+}
+
+fn structural_dependencies_in_mode(
+    source: &Path,
+    cargo_aliases: &BTreeMap<String, Vec<String>>,
+    production_only: bool,
+) -> StructuralDependencies {
     let contents = fs::read_to_string(source).expect("read transport source");
     let mut dependencies = StructuralDependencies {
         aliases: cargo_aliases.clone(),
+        production_only,
         ..StructuralDependencies::default()
     };
     if let Ok(syntax) = syn::parse_file(&contents) {
@@ -556,15 +653,48 @@ fn owner_channel_routes_cannot_bypass_the_typed_protocol_boundary() {
         "receive_framed_ordinary_result",
     ];
     let required_boundary_calls = [
-        "receive_message",
+        "decode_payload",
+        "decode_query_request",
         "receive_response",
         "send_message",
         "write_request",
     ];
+    // A compound test-only gate is excluded; a production-capable branch is
+    // still inspected even when the same expression also mentions `test`.
+    let controls = tempfile::tempdir().expect("source controls");
+    for (index, (source, expected)) in [
+        (
+            "#[cfg(all(test, unix))] mod tests { use crate::local_transport::encode_message; }",
+            false,
+        ),
+        (
+            "#[cfg(any(test, unix))] mod channel { use crate::local_transport::encode_message; }",
+            true,
+        ),
+        (
+            "#[cfg(not(test))] use crate::local_transport::encode_message;",
+            true,
+        ),
+        ("use crate::local_transport::encode_message as raw;", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = controls.path().join(format!("control-{index}.rs"));
+        fs::write(&path, source).expect("write boundary control");
+        let dependencies = production_dependencies(&path, &aliases);
+        let found = dependencies.paths.iter().any(|path| {
+            let resolved = resolve_aliases(path, &dependencies.aliases);
+            resolved
+                .last()
+                .is_some_and(|symbol| bypasses.contains(&symbol.as_str()))
+        });
+        assert_eq!(found, expected, "production boundary control: {source}");
+    }
     let mut observed_boundary_calls = BTreeSet::new();
 
     for source in source_files(&engine_root().join("src/owner_read")) {
-        let dependencies = structural_dependencies_with_aliases(&source, &aliases);
+        let dependencies = production_dependencies(&source, &aliases);
         for path in &dependencies.paths {
             let resolved = resolve_aliases(path, &dependencies.aliases);
             let Some(symbol) = resolved.last().map(String::as_str) else {
