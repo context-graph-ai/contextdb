@@ -714,6 +714,7 @@ fn a_commit_decides_each_tables_retention_clock_once() {
 /// levels only.
 #[test]
 fn a_one_event_append_commits_the_same_work_at_any_stored_history() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let context = Value::Uuid(uuid::Uuid::from_u128(0xc0_00 << 112));
     let mut freed = Vec::new();
     let mut fixed = Vec::new();
@@ -778,6 +779,7 @@ fn a_one_event_append_commits_the_same_work_at_any_stored_history() {
         freed.push(pages.freed_pages);
         db.close().expect("close the database");
     }
+    eprintln!("APPEND_PHYSICAL_WORK fixed={fixed:?} freed={freed:?}");
     assert_eq!(
         fixed[0], fixed[1],
         "versions authenticated, clock steps and protected root events after 16 and 512 \
