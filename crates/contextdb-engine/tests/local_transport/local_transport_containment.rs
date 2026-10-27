@@ -305,6 +305,15 @@ fn forbidden_dependency(path: &[String]) -> bool {
     {
         return false;
     }
+    // The immutable answer carrier crosses the transport custody boundary;
+    // no database constructor or storage operation is permitted here.
+    if path
+        .iter()
+        .map(String::as_str)
+        .eq(["crate", "database", "OwnedQueryResult"])
+    {
+        return false;
+    }
     let forbidden_modules = [
         "companion",
         "companion_lock",
@@ -454,6 +463,12 @@ fn local_channel_source_recursively_excludes_storage_companion_remote_and_async_
         "NaturalKey".into(),
         "single".into(),
     ]));
+    assert!(forbidden_dependency(&[
+        "crate".into(),
+        "database".into(),
+        "OwnedQueryResult".into(),
+        "new".into(),
+    ]));
     let source_root = engine_root().join("src/local_transport");
     let manifest: toml::Value = fs::read_to_string(engine_root().join("Cargo.toml"))
         .expect("read engine manifest")
@@ -492,8 +507,32 @@ fn local_channel_source_recursively_excludes_storage_companion_remote_and_async_
         }
         for path in &dependencies.paths {
             let resolved = resolve_aliases(path, &dependencies.aliases);
+            // The native driver uses OS futex primitives, not an async runtime.
+            // Keep libc forbidden everywhere else and for every other symbol.
+            let native_futex = source == source_root.join("native_driver.rs")
+                && resolved.len() >= 2
+                && resolved[0] == "libc"
+                && (resolved.len() == 2
+                    || (resolved.len() == 3
+                        && resolved[1] == "time_t"
+                        && ["MAX", "try_from"].contains(&resolved[2].as_str())))
+                && [
+                    "EAGAIN",
+                    "EINTR",
+                    "ETIMEDOUT",
+                    "FUTEX_PRIVATE_FLAG",
+                    "FUTEX_WAIT",
+                    "FUTEX_WAKE",
+                    "SYS_futex",
+                    "__errno_location",
+                    "c_long",
+                    "syscall",
+                    "time_t",
+                    "timespec",
+                ]
+                .contains(&resolved[1].as_str());
             assert!(
-                !forbidden_dependency(&resolved),
+                !forbidden_dependency(&resolved) || native_futex,
                 "{} structurally references forbidden path {}",
                 source.display(),
                 resolved.join("::")
