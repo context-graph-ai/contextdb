@@ -172,6 +172,10 @@ struct BlobPair {
     hash: BlobHash,
 }
 
+#[expect(
+    clippy::clone_on_copy,
+    reason = "The fixture keeps an explicit copy at the point where the policy is passed to a new holder."
+)]
 fn blob_pair() -> BlobPair {
     let hub = IrohHub::bind();
     let holder_key = hub.hub.sibling("hub.fabric-identity.key");
