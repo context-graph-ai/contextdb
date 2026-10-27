@@ -419,10 +419,28 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
         .commit(tx)
         .expect_err("the relations do not fit the tight limit");
     match &refusal {
-        contextdb_core::Error::MemoryBudgetExceeded { operation, .. } => assert_eq!(
-            operation, "hold_row_head_relations",
-            "the refusal names what asked for the bytes: {refusal:?}"
-        ),
+        contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        } => {
+            let receipt = crate::persistence::native_storage_admission::StorageAdmissionScope::receipt_layout_for_scan_test();
+            assert_eq!(*subsystem, "redb");
+            assert_eq!(*operation, "pending_directory");
+            assert_eq!(*requested_bytes, receipt.size());
+            assert!(*available_bytes < *requested_bytes);
+            assert_eq!(*budget_limit_bytes, tight);
+            assert_eq!(
+                refusal.to_string(),
+                format!(
+                    "writing this transaction's rows to {HELD_TABLES} tables: the table roots did not fit in the declared memory ({requested_bytes} B requested, {available_bytes} B available of {budget_limit_bytes} B). Hint: Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to."
+                ),
+                "the original numeric refusal must explain the row-write work in user terms"
+            );
+        }
         other => panic!("a typed budget refusal, not {other:?}"),
     }
     db.set_memory_limit(Some(ample)).expect("raise the limit");
