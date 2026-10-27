@@ -10,6 +10,10 @@ const CACHE: usize = 128 * 1024;
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_original_native_writer_refusal_cannot_borrow_unused_clean_cache_room() {
     let writer = MemoryAccountant::writer_budget(LIMIT).expect("GUARD_BLOCKED: writer fixture");
     let owner = writer.accountant();
@@ -130,6 +134,10 @@ fn an_original_native_writer_refusal_cannot_borrow_unused_clean_cache_room() {
 
 #[test]
 #[serial]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn independently_funded_dirty_pages_preserve_a_full_disjoint_clean_working_set() {
     let writer = MemoryAccountant::writer_budget(LIMIT).unwrap();
     let owner = writer.accountant();

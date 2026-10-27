@@ -115,6 +115,18 @@ impl crate::read_session::ReadSessionTestObserver for FinishHolder {
         }
     }
 }
+#[expect(
+    clippy::needless_borrows_for_generic_args,
+    reason = "Keep the explicit runtime-directory borrow at the fixture opener."
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[expect(
+    clippy::unused_unit,
+    reason = "Keep the explicit unit result at the operation observation boundary."
+)]
 fn coordination(case: &str) {
     let clock = Arc::new(ManualDeadlineClock::at(0));
     let owner_clock = Arc::new(ManualDeadlineClock::at(0));
@@ -378,6 +390,14 @@ impl crate::owner_read::OwnerBoundedExecutionObserver for CarrierRetirement {
         let _ = self.0.send(());
     }
 }
+#[expect(
+    clippy::needless_borrows_for_generic_args,
+    reason = "Keep the explicit runtime-directory borrow at the fixture opener."
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cache(case: &str) {
     let mut config = options();
     config.memory_limit = Some(128 * 1024 * 1024);
