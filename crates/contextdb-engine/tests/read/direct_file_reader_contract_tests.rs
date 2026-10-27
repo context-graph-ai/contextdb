@@ -1512,6 +1512,10 @@ fn exact_empty_page(
     )
 }
 
+#[expect(
+    clippy::borrow_deref_ref,
+    reason = "The assertion spells out the borrowed rows it compares without consuming their owner."
+)]
 fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCursorPage> {
     let one = NonZeroUsize::new(1).expect("one row is nonzero");
     let mut opened = reader
@@ -3865,6 +3869,10 @@ fn assert_closed_cursor_aftermath(
 }
 
 #[test]
+#[expect(
+    clippy::borrow_deref_ref,
+    reason = "The assertion spells out the borrowed rows it compares without consuming their owner."
+)]
 fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() {
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
@@ -4201,6 +4209,10 @@ fn manual_clock_idle_expiry_is_terminal_and_releases_owned_resources() {
 }
 
 #[test]
+#[expect(
+    clippy::borrow_deref_ref,
+    reason = "The assertion spells out the borrowed rows it compares without consuming their owner."
+)]
 fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources() {
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
