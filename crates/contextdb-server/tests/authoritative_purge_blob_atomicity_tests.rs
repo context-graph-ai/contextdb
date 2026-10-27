@@ -157,6 +157,10 @@ async fn inbound_purge_removes_last_ref_blob_and_preserves_shared_blob() {
 /// Contract 3: PURGE waits for already-authorized readers and writers of its
 /// selected hash, then makes their retained generations permanently stale.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn purge_waits_for_selected_hash_guards_and_rejects_stale_provider_and_writer() {
     let root = tempfile::tempdir().expect("temporary in-flight fence directory");
     let identity = identity_file(&root);

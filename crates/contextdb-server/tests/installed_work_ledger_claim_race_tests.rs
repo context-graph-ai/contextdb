@@ -135,6 +135,10 @@ async fn drain_push(client: &SyncClient) {
 
 /// An ordinary application table with a trigger on it, declared the way a
 /// product declares its schema: on every node, before any sync.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn declare_application_table_with_trigger(db: &Database) {
     db.execute(
         "CREATE TABLE observations (id TEXT PRIMARY KEY, note TEXT) SYNC TWO WAY",

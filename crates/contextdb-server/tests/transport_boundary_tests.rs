@@ -100,6 +100,10 @@ fn column_index(columns: &[String], name: &str) -> usize {
         .unwrap_or_else(|| panic!("result must project column {name}: {columns:?}"))
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn expect_text_value(db: &Database, table: &str, column: &str, id: Uuid, expected: &str) {
     let mut key = HashMap::new();
     key.insert("id".to_string(), Value::Uuid(id));
@@ -120,6 +124,10 @@ fn expect_text_value(db: &Database, table: &str, column: &str, id: Uuid, expecte
     );
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn uuid_set(db: &Database, table: &str) -> BTreeSet<Uuid> {
     let result = db
         .execute(&format!("SELECT id FROM {table}"), &HashMap::new())

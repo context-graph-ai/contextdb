@@ -141,6 +141,10 @@ impl RecordingPushTransport {
         self.rows.lock().expect("read recorded rows").clone()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn record(&self, bytes: &[u8]) -> TransportResult<()> {
         let envelope = decode(bytes).map_err(|err| TransportError::Other(err.to_string()))?;
         if !matches!(

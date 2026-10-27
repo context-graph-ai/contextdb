@@ -559,6 +559,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn a_bound_ticket_is_published_before_readiness_failure_and_no_server_is_returned() {
         let root = tempfile::tempdir().expect("temporary ticket directory");
         let identity = root.path().join("server.identity");

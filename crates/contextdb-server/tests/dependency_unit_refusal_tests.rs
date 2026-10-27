@@ -204,6 +204,10 @@ impl ObservingTransport {
             .clone()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn observe_push_request(&self, subject: &str, request_bytes: &[u8]) -> TransportResult<()> {
         if subject != contextdb_server::subjects::push_subject(TENANT) {
             return Ok(());

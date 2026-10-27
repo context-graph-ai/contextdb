@@ -1830,6 +1830,10 @@ async fn run_blob_fetch(
 // S6 — the engine's own durable trigger audit stays bounded
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn run_s6_audit(db_path: &Path, firings_per_round: u64, retain_secs: u64) {
     let db = match Database::open(db_path) {
         Ok(db) => db,

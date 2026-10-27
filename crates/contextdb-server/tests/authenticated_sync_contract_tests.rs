@@ -184,6 +184,10 @@ struct TamperPushLineageTransport {
 }
 
 impl TamperPushLineageTransport {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn rewrite(&self, subject: &str, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
         if subject != self.subject {
             return Ok(bytes);

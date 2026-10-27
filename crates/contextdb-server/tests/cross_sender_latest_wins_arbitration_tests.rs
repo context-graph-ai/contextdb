@@ -140,6 +140,10 @@ fn edge_with_ledger(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, S
     (db, client)
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn only_body(db: &Database, id: i64) -> Option<String> {
     let mut params = p();
     params.insert("id".to_string(), Value::Int64(id));
@@ -172,6 +176,10 @@ fn write_key(db: &Database, id: i64, body: &str) {
 
 /// The `work_capabilities.tags` JSON array for `node_id`, as plain strings —
 /// `None` when the hub holds no row for it.
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn capability_tags(db: &Database, node_id: &str) -> Option<Vec<String>> {
     let mut params = p();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));

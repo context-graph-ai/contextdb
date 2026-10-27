@@ -135,6 +135,10 @@ fn insert_row(db: &Database, id: i64, body: &str) {
         .unwrap_or_else(|err| panic!("insert row {id}: {err}"));
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn only_body(db: &Database, id: i64) -> Option<String> {
     let mut params = p();
     params.insert("id".to_string(), Value::Int64(id));

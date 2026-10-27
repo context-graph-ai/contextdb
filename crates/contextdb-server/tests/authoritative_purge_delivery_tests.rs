@@ -57,6 +57,10 @@ fn note_body(db: &Database, id: Uuid) -> Option<String> {
     })
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn note_ids(db: &Database) -> BTreeSet<Uuid> {
     db.execute("SELECT id FROM notes", &HashMap::new())
         .expect("read note keys")

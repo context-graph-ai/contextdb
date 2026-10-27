@@ -167,6 +167,10 @@ impl Hub {
 /// sync, so the child-before-parent ordering defect cannot mask the real
 /// frame-boundary transport path.
 #[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_commits_once() {
     let root = tempfile::tempdir().expect("tempdir");
     let hub = start_hub(root.path()).await;

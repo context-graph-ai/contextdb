@@ -169,6 +169,10 @@ fn assert_absent(db: &Database, id: Uuid, place: &str) {
     );
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn note_keys(db: &Database) -> BTreeSet<Uuid> {
     db.execute("SELECT id FROM notes", &HashMap::new())
         .expect("select exact note keys")
@@ -202,6 +206,10 @@ impl RecordingRowLineageTransport {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn inspect(&self, bytes: &[u8]) -> TransportResult<()> {
         let envelope = decode(bytes).map_err(|err| TransportError::Other(err.to_string()))?;
         if !matches!(
@@ -310,6 +318,10 @@ impl PurgeInjectingPushTransport {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn inject_purge(&self, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
         let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
         if !matches!(
@@ -395,6 +407,10 @@ struct MalformedLineagePushTransport {
 }
 
 impl MalformedLineagePushTransport {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn corrupt_lineage(&self, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
         let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
         if !matches!(
@@ -526,6 +542,10 @@ impl OneFrontierPullTransport {
         self.pages.lock().expect("read recorded pull pages").clone()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn force_one_frontier(&self, bytes: Vec<u8>) -> TransportResult<(Vec<u8>, PullRequest)> {
         let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
         if !matches!(envelope.message_type, MessageType::PullRequest) {
@@ -541,6 +561,10 @@ impl OneFrontierPullTransport {
         Ok((bytes, request))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn record_response(&self, request: PullRequest, bytes: &[u8]) -> TransportResult<()> {
         let envelope = decode(bytes).map_err(|error| TransportError::Other(error.to_string()))?;
         let (ordinary, dependency_units) = match envelope.message_type {
@@ -861,6 +885,10 @@ fn insert_graph_edge(db: &Database, id: Uuid, source: Uuid, target: Uuid) {
     .expect("insert graph edge");
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn graph_targets(db: &Database, source: Uuid) -> BTreeSet<Uuid> {
     let result = db
         .execute(
@@ -952,6 +980,10 @@ fn change_set_contains(
             .any(|vector| vector.row_id == selected_row_id)
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn work_job_ids(db: &Database, job_id: &str) -> Vec<String> {
     db.execute(
         "SELECT job_id FROM work_jobs WHERE job_id = $job_id",
@@ -3445,6 +3477,10 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
 }
 
 #[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn post_purge_backup_preserves_absence() {
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = "post-purge-backup";
