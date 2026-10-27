@@ -2,6 +2,9 @@
 use super::relational_version_manifest::position_tree::{NO_POSITION, PositionTree, Vacancy};
 use super::*;
 
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "detached_staged_row_refund_tests.rs"]
+mod detached_staged_row_refund_tests;
 #[cfg(test)]
 #[path = "held_relations_tests.rs"]
 mod held_relations_tests;
