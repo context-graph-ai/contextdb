@@ -559,14 +559,14 @@ pub(crate) fn enter_read_operation(
 pub(crate) fn operation_checkpoint() -> Result<()> {
     let context = OPERATION.with(|slot| slot.borrow().clone());
     #[cfg(any(test, feature = "test-seams"))]
-    if context.is_some() {
+    if let Some(context) = &context {
         // Observe only a live, genuinely admitted native cell. This reader
         // workspace is not a charge against the store's writer accountant.
         crate::database::resident_history_test_seams::note(|work| {
             work.workspace_peak = work.workspace_peak.max(VectorReadCapture::layout().size());
         });
         crate::vector_read_memory::statement_child_proof::live_workspace(
-            &context.as_ref().unwrap().memory,
+            &context.memory,
             VectorReadCapture::layout().size(),
         );
     }
