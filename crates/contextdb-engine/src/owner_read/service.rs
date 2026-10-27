@@ -154,6 +154,10 @@ pub trait OwnerBoundedExecutionObserver: Send + Sync {
 
     fn request_finished(&self) {}
 
+    /// The carrier returned, its publication future was destroyed and its
+    /// request worker joined. Transferred cursor ownership may remain live.
+    fn carrier_request_retired(&self) {}
+
     /// The returned carrier future and disconnect cleanup have dropped their
     /// storage. Notification only, before the connection is marked completed.
     fn connection_storage_released(&self) {}
@@ -1281,6 +1285,10 @@ impl Drop for CarrierRequestGuard<'_> {
             waiter.wake();
         }
         self.0.stop_workers_if_drained();
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(observer) = &self.0.spec.execution_observer {
+            observer.carrier_request_retired();
+        }
     }
 }
 
