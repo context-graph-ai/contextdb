@@ -661,10 +661,10 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
     );
     drop(workspace);
     drop(owner);
-    assert_eq!(spy.used.load(Ordering::SeqCst), 0);
     assert_eq!(spy.wrong_funder.load(Ordering::SeqCst), 0);
-    spy.assert_payload_lifetime();
-    assert_eq!(parent.retained_bytes_for_test(), child_control);
+    assert_eq!(spy.early_payload_refunds.load(Ordering::SeqCst), 0);
+    // Original page invoices may outlive this operation in the native cache.
+    // The exact zero and physical-free checks belong after persistence drops.
     let after = snapshot();
     for (old, new) in before[..4].iter().zip(&after[..4]) {
         assert_eq!(new.len(), 2);
@@ -678,6 +678,10 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
         "surviving equal lifetimes preserve their canonical interval"
     );
     assert!(after[5].is_empty());
+    drop(persistence);
+    assert_eq!(spy.used.load(Ordering::SeqCst), 0);
+    spy.assert_payload_lifetime();
+    assert_eq!(parent.retained_bytes_for_test(), child_control);
     drop(spy);
     drop(child);
     assert_eq!(
@@ -685,7 +689,6 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
         parent.root_control_bytes() as u64
     );
     parent.assert_final_root_free_for_test();
-    drop(persistence);
     drop(root);
 }
 
