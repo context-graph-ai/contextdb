@@ -111,6 +111,10 @@ fn hub_with_many_edges() -> (Arc<GraphStore>, MemGraphExecutor<TestStore>, NodeI
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_traversal_queue_holding_a_million_entries_is_released_on_a_small_stack() {
     let (_graph, executor, hub) = hub_with_many_edges();
 
