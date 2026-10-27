@@ -7883,14 +7883,24 @@ fn vector_schema_pages_hash(pages: [u8; 32], schema: [u8; 32]) -> [u8; 32] {
 pub(super) fn vector_schema_pages_root_in_write(
     write: &redb::WriteTransaction,
 ) -> Result<[u8; 32]> {
-    let pages = write
-        .table_root_fingerprint(super::vector_paged::PAGES)
-        .map_err(RedbPersistence::storage_error)?
-        .unwrap_or([0; 32]);
     let schema = write
         .table_root_fingerprint(super::META_TABLE)
         .map_err(RedbPersistence::storage_error)?
         .unwrap_or([0; 32]);
+    let scopes = write
+        .table_root_fingerprint(super::vector_ivf::SCOPES)
+        .map_err(RedbPersistence::storage_error)?;
+    let pages = if let Some(scopes) = scopes {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"contextdb-clustered-scope-root-v1");
+        hash.update(&scopes);
+        *hash.finalize().as_bytes()
+    } else {
+        write
+            .table_root_fingerprint(super::vector_paged::PAGES)
+            .map_err(RedbPersistence::storage_error)?
+            .unwrap_or([0; 32])
+    };
     Ok(vector_schema_pages_hash(pages, schema))
 }
 
@@ -7899,14 +7909,23 @@ pub(super) fn vector_schema_pages_root_in_write(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(super) fn vector_schema_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
-    let pages = read
-        .table_root_fingerprint(super::vector_paged::PAGES)
-        .map_err(RedbPersistence::storage_error)?
-        .unwrap_or([0; 32]);
     let schema = read
         .table_root_fingerprint(super::META_TABLE)
         .map_err(RedbPersistence::storage_error)?
         .unwrap_or([0; 32]);
+    let scopes = read
+        .table_root_fingerprint(super::vector_ivf::SCOPES)
+        .map_err(RedbPersistence::storage_error)?;
+    let pages = if let Some(scopes) = scopes {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"contextdb-clustered-scope-root-v1");
+        hash.update(&scopes);
+        *hash.finalize().as_bytes()
+    } else {
+        read.table_root_fingerprint(super::vector_paged::PAGES)
+            .map_err(RedbPersistence::storage_error)?
+            .unwrap_or([0; 32])
+    };
     Ok(vector_schema_pages_hash(pages, schema))
 }
 
@@ -7964,6 +7983,40 @@ pub(super) fn vector_pages_root_in_read(read: &redb::ReadTransaction) -> Result<
         .vector_pages_root
         .ok_or_else(|| Error::Other("committed vector page root is missing".into()))
 }
+/// Check the existing shared authority before an exclusive clustered writer
+/// mutates any family. Later kernel commits use this same admitted session.
+pub(super) fn validate_clustered_scope_root_in_write(write: &redb::WriteTransaction) -> Result<()> {
+    if write
+        .table_root_fingerprint(super::vector_ivf::SCOPES)
+        .map_err(RedbPersistence::storage_error)?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let expected = {
+        let roots = write
+            .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
+            .map_err(RedbPersistence::storage_error)?;
+        let value = roots
+            .get(LogicalFamily::Configuration as u8)
+            .map_err(RedbPersistence::storage_error)?;
+        match value {
+            Some(value) => {
+                decode_published_root(LogicalFamily::Configuration, value.value())?
+                    .vector_pages_root
+            }
+            None => None,
+        }
+    };
+    if expected != Some(vector_schema_pages_root_in_write(write)?) {
+        return Err(Error::StoreCorrupted {
+            path: "clustered vector native pages".into(),
+            reason: "the staged scope directory disagrees with Configuration".into(),
+        });
+    }
+    Ok(())
+}
+
 /// The schema half of the paged binding, kept on its own so a damaged page
 /// table can be told apart from damaged schema metadata.
 pub(super) const VECTOR_SCHEMA_META_ROOT_KEY: &str = "vector_schema_meta_root_v1";

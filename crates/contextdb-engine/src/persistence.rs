@@ -67,6 +67,7 @@ pub(crate) mod vector_current_identity;
 pub(crate) mod vector_identity_range;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
+pub(crate) mod vector_ivf;
 pub(crate) mod vector_paged;
 mod vector_saved;
 #[cfg(unix)]
