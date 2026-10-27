@@ -56,6 +56,21 @@ fn writer_child() {
                 .read_line(&mut input)
                 .expect("writer command");
             match input.trim() {
+                "purge-provisional" => {
+                    let result =
+                        db.execute("PURGE FROM handover_rows WHERE id = 110", &HashMap::new());
+                    assert!(
+                        matches!(result,
+                            Err(contextdb_core::Error::ReaderCoordinationUnavailable { operation, reason, .. })
+                                if operation == "authoritative purge" && reason.contains("is still acquiring its snapshot")
+                        ),
+                        "an acquiring reader must be coordinated before successful purge"
+                    );
+                    println!("PROVISIONAL_PURGE_REFUSED");
+                    std::io::stdout()
+                        .flush()
+                        .expect("flush provisional refusal marker");
+                }
                 "purge" => {
                     db.execute("PURGE FROM handover_rows WHERE id = 110", &HashMap::new())
                         .expect("purge a row in the affected cursor");
@@ -756,14 +771,20 @@ fn purge_during_handoff_invalidates_affected_continuation_after_owner_exit() {
         affected_session.open_cursor("SELECT id FROM handover_rows ORDER BY id", &HashMap::new())
     });
     reached_rx.recv().expect("affected first page received");
-    holder.purge();
-    holder.release();
+    writeln!(
+        holder.child.stdin.as_mut().expect("child stdin"),
+        "purge-provisional"
+    )
+    .expect("request purge while registration is provisional");
+    holder.wait_for("PROVISIONAL_PURGE_REFUSED");
     resume_tx.send(()).expect("finish exact registration");
     let mut affected = opening
         .join()
         .expect("join affected opener")
         .expect("register affected old root");
     assert!(affected.first_page().has_more());
+    holder.purge();
+    holder.release();
     match affected.fetch(None) {
         Err(contextdb_core::Error::ReadFailure(failure)) => {
             assert_eq!(failure.kind(), ReadFailureKind::AuthoritativeErasure);
