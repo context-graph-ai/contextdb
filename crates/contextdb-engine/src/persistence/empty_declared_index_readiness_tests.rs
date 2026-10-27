@@ -2683,6 +2683,10 @@ fn assert_commit_directory_writable_controls(directory: &Path) {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
+#[expect(
+    clippy::needless_borrows_for_generic_args,
+    reason = "The fixture explicitly borrows the path passed to the database opener."
+)]
 fn assert_graph_open_and_maintenance_rows(directory: &Path) {
     assert_commit_directory_writable_controls(directory);
     assert_directory_pinned_publication_row(directory);

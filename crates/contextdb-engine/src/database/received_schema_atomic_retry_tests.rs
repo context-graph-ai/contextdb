@@ -611,6 +611,10 @@ fn memory_changed_ddl_with_the_same_marker_identity_refuses_without_mutation() {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
+#[expect(
+    clippy::needless_borrows_for_generic_args,
+    reason = "The fixture explicitly borrows the path passed to the database opener."
+)]
 fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
     let parent = "mixed_parents";
     let child = "mixed_children";
