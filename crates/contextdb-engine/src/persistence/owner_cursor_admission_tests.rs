@@ -431,6 +431,13 @@ fn newer_registered_root_is_protected_by_an_older_admitted_reader(native_floor: 
 
 #[test]
 fn untrusted_provider_scan_registry_is_a_terminal_typed_refusal() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "untrusted_provider_scan_registry_is_a_terminal_typed_refusal",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
