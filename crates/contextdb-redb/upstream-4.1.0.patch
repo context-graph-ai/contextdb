@@ -644,29 +644,7 @@
  }
  
  pub trait TableHandle: Sealed {
-@@ -126,6 +324,10 @@
-     /// Panics if `name` is empty. When `name` is a non-empty string literal
-     /// this is checked at compile time, but callers that build the name at
-     /// runtime are responsible for ensuring it is non-empty.
-+    #[expect(
-+        clippy::assert_is_empty,
-+        reason = "The constructor remains const on the declared minimum Rust version."
-+    )]
-     pub const fn new(name: &'a str) -> Self {
-         assert!(!name.is_empty());
-         Self {
-@@ -186,6 +388,10 @@
-     /// Panics if `name` is empty. When `name` is a non-empty string literal
-     /// this is checked at compile time, but callers that build the name at
-     /// runtime are responsible for ensuring it is non-empty.
-+    #[expect(
-+        clippy::assert_is_empty,
-+        reason = "The constructor remains const on the declared minimum Rust version."
-+    )]
-     pub const fn new(name: &'a str) -> Self {
-         assert!(!name.is_empty());
-         Self {
-@@ -275,6 +481,10 @@
+@@ -275,6 +473,10 @@
      transaction_tracker: Option<Arc<TransactionTracker>>,
      transaction_id: Option<TransactionId>,
      write_transaction: bool,
@@ -677,7 +655,7 @@
  }
  
  impl TransactionGuard {
-@@ -286,7 +496,44 @@
+@@ -286,7 +488,44 @@
              transaction_tracker: Some(tracker),
              transaction_id: Some(transaction_id),
              write_transaction: false,
@@ -723,7 +701,7 @@
      }
  
      pub(crate) fn new_write(
-@@ -297,6 +544,10 @@
+@@ -297,6 +536,10 @@
              transaction_tracker: Some(tracker),
              transaction_id: Some(transaction_id),
              write_transaction: true,
@@ -734,7 +712,7 @@
          }
      }
  
-@@ -306,6 +557,22 @@
+@@ -306,6 +549,22 @@
              transaction_tracker: None,
              transaction_id: None,
              write_transaction: false,
@@ -757,7 +735,7 @@
          }
      }
  
-@@ -321,6 +588,14 @@
+@@ -321,6 +580,14 @@
  impl Drop for TransactionGuard {
      fn drop(&mut self) {
          if self.transaction_tracker.is_none() {
@@ -772,7 +750,7 @@
              return;
          }
          if let Some(transaction_id) = self.transaction_id {
-@@ -419,9 +694,329 @@
+@@ -419,9 +686,329 @@
  }
  
  impl ReadOnlyDatabase {
@@ -1102,7 +1080,7 @@
      }
  
      fn new(
-@@ -429,6 +1024,17 @@
+@@ -429,6 +1016,17 @@
          page_size: usize,
          region_size: Option<u64>,
          cache_size: usize,
@@ -1120,7 +1098,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -441,21 +1047,26 @@
+@@ -441,21 +1039,26 @@
              region_size,
              cache_size,
              true,
@@ -1160,7 +1138,7 @@
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -463,6 +1074,334 @@
+@@ -463,6 +1066,334 @@
          };
  
          Ok(db)
@@ -1495,7 +1473,7 @@
      }
  }
  
-@@ -502,6 +1441,9 @@
+@@ -502,6 +1433,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -1505,7 +1483,7 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +1460,201 @@
+@@ -518,6 +1452,201 @@
  }
  
  impl Database {
@@ -1707,7 +1685,7 @@
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +1708,17 @@
+@@ -571,9 +1700,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -1726,7 +1704,7 @@
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +1764,7 @@
+@@ -619,6 +1756,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1734,7 +1712,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +1775,7 @@
+@@ -629,6 +1767,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1742,7 +1720,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +1790,7 @@
+@@ -643,6 +1782,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1750,7 +1728,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +1800,7 @@
+@@ -652,6 +1792,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1758,7 +1736,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +1809,7 @@
+@@ -660,6 +1801,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1766,7 +1744,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -678,7 +1828,317 @@
+@@ -678,7 +1820,317 @@
          Ok(compacted)
      }
  
@@ -2085,7 +2063,7 @@
      fn check_repaired_allocated_pages_table(
          system_root: Option<BtreeHeader>,
          mem: Arc<TransactionalMemory>,
-@@ -891,14 +2351,19 @@
+@@ -891,14 +2343,19 @@
          Ok([data_root, system_root])
      }
  
@@ -2106,7 +2084,7 @@
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
          #[cfg(feature = "logging")]
-@@ -910,6 +2375,8 @@
+@@ -910,6 +2367,8 @@
              region_size,
              cache_size,
              false,
@@ -2115,7 +2093,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +2386,12 @@
+@@ -919,7 +2378,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -2129,7 +2107,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,8 +2416,21 @@
+@@ -944,8 +2408,21 @@
  
          let db = Database {
              mem,
@@ -2152,7 +2130,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,16 +2520,35 @@
+@@ -1035,16 +2512,35 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -2188,7 +2166,7 @@
      fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
          // Make a new quick-repair commit to update the allocator state table
          #[cfg(feature = "logging")]
-@@ -1056,16 +2560,183 @@
+@@ -1056,16 +2552,183 @@
  
          Ok(())
      }
@@ -2374,7 +2352,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +2777,8 @@
+@@ -1106,6 +2769,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -2383,7 +2361,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +2798,8 @@
+@@ -1125,6 +2790,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -2392,7 +2370,7 @@
          }
      }
  
-@@ -1157,13 +2832,37 @@
+@@ -1157,13 +2824,37 @@
          self
      }
  
@@ -2431,7 +2409,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +2874,7 @@
+@@ -1175,6 +2866,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -2439,7 +2417,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +2883,75 @@
+@@ -1183,26 +2875,75 @@
              .open(path)?;
  
          Database::new(
@@ -2517,7 +2495,7 @@
          )
      }
  
-@@ -1222,6 +2971,58 @@
+@@ -1222,6 +2963,58 @@
              self.page_size,
              None,
              self.cache_size,
@@ -2576,7 +2554,7 @@
          )
      }
  
-@@ -1236,6 +3037,70 @@
+@@ -1236,6 +3029,70 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2647,7 +2625,7 @@
          )
      }
  
-@@ -1251,6 +3116,9 @@
+@@ -1251,6 +3108,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2657,7 +2635,7 @@
          )
      }
  }
-@@ -1262,16 +3130,214 @@
+@@ -1262,16 +3122,214 @@
  }
  
  #[cfg(test)]
@@ -2874,7 +2852,7 @@
  
      #[derive(Debug)]
      struct FailingBackend {
-@@ -1298,7 +3364,7 @@
+@@ -1298,7 +3356,7 @@
          fn decrement_countdown(&self) -> Result<(), std::io::Error> {
              if self
                  .countdown
@@ -6975,28 +6953,17 @@
              _ => unreachable!(),
          }
      }
-@@ -237,6 +301,9 @@
+@@ -236,6 +300,9 @@
+             }
              Self::TransactionId => {
                  result[0] = 5;
-             }
++            }
 +            Self::FreeTotals => {
 +                result[0] = 6;
-+            }
+             }
              AllocatorStateKey::Deprecated => {
                  result[0] = 0;
-             }
-@@ -263,6 +330,10 @@
- }
- 
- impl<'a, K: Key + 'static, V: Value + 'static> SystemTableDefinition<'a, K, V> {
-+    #[expect(
-+        clippy::assert_is_empty,
-+        reason = "The constructor remains const on the declared minimum Rust version."
-+    )]
-     pub const fn new(name: &'a str) -> Self {
-         assert!(!name.is_empty());
-         Self {
-@@ -562,7 +633,9 @@
+@@ -562,7 +629,9 @@
  }
  
  struct TableNamespace<'db> {
@@ -7007,7 +6974,7 @@
      allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
      table_tree: TableTreeMut<'db>,
-@@ -585,8 +658,10 @@
+@@ -585,8 +654,10 @@
              freed_pages.clone(),
              allocated.clone(),
          );
@@ -7019,7 +6986,7 @@
              table_tree,
              freed_pages,
              allocated_pages: allocated,
-@@ -620,8 +695,9 @@
+@@ -620,8 +691,9 @@
          let root = self
              .table_tree
              .get_or_create_table::<K, V>(name, table_type)?;
@@ -7030,7 +6997,7 @@
  
          Ok(root)
      }
-@@ -748,9 +824,126 @@
+@@ -748,9 +820,126 @@
          table: &BtreeMut<K, V>,
          length: u64,
      ) {
@@ -7157,7 +7124,7 @@
      }
  }
  
-@@ -815,6 +1008,22 @@
+@@ -815,6 +1004,22 @@
          self.invalidated.clear();
      }
  }
@@ -7180,7 +7147,7 @@
  
  /// A read/write transaction
  ///
-@@ -832,9 +1041,253 @@
+@@ -832,9 +1037,253 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
@@ -7434,7 +7401,7 @@
  }
  
  impl WriteTransaction {
-@@ -850,8 +1303,16 @@
+@@ -850,8 +1299,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -7451,7 +7418,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +1325,181 @@
+@@ -864,9 +1321,181 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -7633,7 +7600,7 @@
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1525,31 @@
+@@ -892,6 +1521,31 @@
              return Ok(true);
          }
  
@@ -7665,7 +7632,7 @@
          Ok(false)
      }
  
-@@ -1130,6 +1788,10 @@
+@@ -1130,6 +1784,10 @@
              return Err(SavepointError::InvalidSavepoint);
          }
  
@@ -7676,7 +7643,7 @@
          let (id, transaction_id) = self.allocate_savepoint()?;
          #[cfg(feature = "logging")]
          debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
-@@ -1349,7 +2011,225 @@
+@@ -1349,7 +2007,225 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -7902,7 +7869,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +2253,13 @@
+@@ -1373,6 +2249,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -7916,7 +7883,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +2271,21 @@
+@@ -1384,10 +2267,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -7939,7 +7906,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +2310,29 @@
+@@ -1412,7 +2306,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -7970,7 +7937,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +2378,159 @@
+@@ -1458,9 +2374,159 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -8130,7 +8097,7 @@
      }
  
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +2539,45 @@
+@@ -1469,11 +2535,45 @@
              self.two_phase_commit = true;
          }
  
@@ -8178,7 +8145,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +2588,117 @@
+@@ -1484,6 +2584,117 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -8296,7 +8263,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1609,7 +2824,7 @@
+@@ -1609,7 +2820,7 @@
          debug!("Aborting transaction id={:?}", self.transaction_id);
          self.tables
              .lock()
@@ -8305,7 +8272,7 @@
              .table_tree
              .clear_root_updates_and_close();
          // Release all transaction-local savepoint state. The on-disk mutations
-@@ -1618,7 +2833,7 @@
+@@ -1618,7 +2829,7 @@
          // in-memory TransactionTracker state that rollback cannot see.
          self.savepoint_state
              .lock()
@@ -8314,7 +8281,7 @@
              .apply_on_abort(&self.transaction_tracker);
          self.mem.rollback_uncommitted_writes()?;
          #[cfg(feature = "logging")]
-@@ -1627,18 +2842,41 @@
+@@ -1627,18 +2838,41 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -8361,7 +8328,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2918,17 @@
+@@ -1680,7 +2914,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -8380,7 +8347,7 @@
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2936,11 @@
+@@ -1688,6 +2932,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -8392,7 +8359,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2951,148 @@
+@@ -1698,6 +2947,148 @@
              self.mem.free(page, &mut PageTrackerPolicy::Ignore);
          }
  
@@ -8541,7 +8508,7 @@
          Ok(())
      }
  
-@@ -1766,6 +3161,9 @@
+@@ -1766,6 +3157,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -8551,7 +8518,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +3221,384 @@
+@@ -1823,46 +3217,384 @@
          Ok(progress)
      }
  
@@ -8966,7 +8933,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,57 +3773,27 @@
+@@ -2037,57 +3769,27 @@
          })
      }
  
@@ -9036,7 +9003,7 @@
              }
          } else if !self.completed && self.mem.storage_failure() {
              self.tables
-@@ -2107,18 +3813,148 @@
+@@ -2107,18 +3809,148 @@
      tree: TableTree,
  }
  
@@ -9186,7 +9153,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3971,69 @@
+@@ -2135,12 +3967,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -9257,7 +9224,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +4054,7 @@
+@@ -2161,7 +4050,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -9266,7 +9233,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +4082,7 @@
+@@ -2189,7 +4078,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -9275,7 +9242,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +4110,7 @@
+@@ -2217,7 +4106,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -9284,7 +9251,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +4156,15 @@
+@@ -2263,7 +4152,15 @@
  
  #[cfg(test)]
  mod test {
@@ -9301,7 +9268,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4185,1144 @@
+@@ -2284,4 +4181,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }

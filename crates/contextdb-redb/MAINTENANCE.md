@@ -1074,10 +1074,10 @@ AtomicUsize and AtomicU64 without requiring the renamed API from newer compilers
 Original success/failure ordering and overflow/refusal behavior are preserved.
 Fixed-width byte iteration uses array chunks with the same ignored remainder;
 nonnull pointer conversions preserve the actual allocated Layout alignment.
-Inline typed native errors and const constructors retain narrow documented lint
-exceptions where changing representation or const behavior would change their
-contract. Unused private native-page construction helpers are removed. Test
-modules follow production items, and passive observers require their live guard.
+Inline typed native errors retain narrow documented lint exceptions where
+changing representation would change their contract. Const constructors retain
+their existing assertions without lint expectations for those assertions. Unused
+private native-page construction helpers are removed. Test modules follow production items, and passive observers require their live guard.
 The opaque native byte-key fixture keeps its intentional big-endian lexical order;
 its assertions and test bodies are unchanged.
 
@@ -1200,3 +1200,7 @@ borrows the original receipt layout, and `lib.rs` exposes the scoped observation
 only with test-seams. Reuse and duplicate admissions cannot increment the count.
 The source hooks retain the accepted observer logic while using the maintained
 writer's `zeroed_for_write` construction point.
+
+| Changed source | Reason |
+|---|---|
+| `src/db.rs`, `src/transactions.rs` | Remove three expectations for the unknown `clippy::assert_is_empty` lint. The existing const-constructor assertions need no exception on Rust 1.94.0; constructor behavior and the minimum supported Rust version are unchanged. |

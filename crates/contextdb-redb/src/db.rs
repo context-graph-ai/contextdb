@@ -324,10 +324,6 @@ impl<'a, K: Key + 'static, V: Value + 'static> TableDefinition<'a, K, V> {
     /// Panics if `name` is empty. When `name` is a non-empty string literal
     /// this is checked at compile time, but callers that build the name at
     /// runtime are responsible for ensuring it is non-empty.
-    #[expect(
-        clippy::assert_is_empty,
-        reason = "The constructor remains const on the declared minimum Rust version."
-    )]
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -388,10 +384,6 @@ impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableDefinition<'a, K, V> {
     /// Panics if `name` is empty. When `name` is a non-empty string literal
     /// this is checked at compile time, but callers that build the name at
     /// runtime are responsible for ensuring it is non-empty.
-    #[expect(
-        clippy::assert_is_empty,
-        reason = "The constructor remains const on the declared minimum Rust version."
-    )]
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {

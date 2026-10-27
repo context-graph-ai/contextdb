@@ -330,10 +330,6 @@ pub struct SystemTableDefinition<'a, K: Key + 'static, V: Value + 'static> {
 }
 
 impl<'a, K: Key + 'static, V: Value + 'static> SystemTableDefinition<'a, K, V> {
-    #[expect(
-        clippy::assert_is_empty,
-        reason = "The constructor remains const on the declared minimum Rust version."
-    )]
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
