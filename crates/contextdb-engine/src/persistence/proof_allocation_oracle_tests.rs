@@ -4015,6 +4015,10 @@ mod row_check_cache_ownership_contract {
 
     #[test]
     #[serial]
+    #[expect(
+        clippy::double_ended_iterator_last,
+        reason = "The oracle selects the last matching phase in the recorded forward order."
+    )]
     fn row_check_cache_allocator_null_refuses_each_live_layout_then_retries() {
         let db = fixture();
         let (ok, _, phases, payer) = run_case(&db, roomy_read_limits().memory, 0);
