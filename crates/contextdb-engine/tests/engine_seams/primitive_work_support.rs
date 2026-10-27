@@ -46,6 +46,12 @@ pub(crate) struct Work {
     pub backend_reads: Option<u64>,
     pub backend_bytes: Option<u64>,
     pub stored_vector_decodes: usize,
+    pub fresh_dirty_pages: u64,
+    pub fresh_dirty_page_bytes: usize,
+    pub native_pages: Option<u64>,
+    pub native_page_bytes: usize,
+    pub other_native_pages: u64,
+    pub other_native_page_bytes: usize,
     pub writer_before: usize,
     pub writer_peak: usize,
     pub writer_after: usize,
@@ -82,8 +88,10 @@ pub(crate) fn observe_work<T>(
     watch_native_admissions_for_test();
     watch_budget_ledger_for_test();
     let _cleanup = RecorderCleanup;
-    let (answer, resident) = observe_resident(|| {
-        with_native_vector_score_observer_for_test(scored.clone(), || operation())
+    let ((answer, resident), pages) = redb::observe_page_allocations_for_test(|| {
+        observe_resident(|| {
+            with_native_vector_score_observer_for_test(scored.clone(), || operation())
+        })
     });
     drop(backend);
     let ledger = take_budget_ledger_for_test();
@@ -121,6 +129,12 @@ pub(crate) fn observe_work<T>(
             backend_reads: Some(backend_reads.load(Ordering::SeqCst)),
             backend_bytes: Some(backend_bytes.load(Ordering::SeqCst)),
             stored_vector_decodes: resident.stored_vector_decodes,
+            fresh_dirty_pages: pages.fresh_dirty_pages,
+            fresh_dirty_page_bytes: pages.fresh_dirty_page_bytes,
+            native_pages: Some(pages.native_pages),
+            native_page_bytes: pages.native_page_bytes,
+            other_native_pages: pages.other_native_pages,
+            other_native_page_bytes: pages.other_native_page_bytes,
             writer_before,
             writer_peak,
             writer_after,
@@ -130,12 +144,52 @@ pub(crate) fn observe_work<T>(
 }
 
 impl Work {
+    /// Add the declared cache policy and its native index to the measured
+    /// fixed controls and operation workspace allowances in a byte ceiling.
+    pub fn with_declared_writer_cache(mut self, db: &contextdb_engine::Database) -> Self {
+        let (capacity, _) =
+            contextdb_engine::persistence::read_source_cache_reservation_for_limit_for_test(
+                db.memory_limit(),
+            );
+        let reserve = capacity + db.__writer_cache_index_bytes_for_test().unwrap();
+        self.writer_before += reserve;
+        self.writer_peak += reserve;
+        self.writer_after += reserve;
+        self
+    }
+
+    /// Price the native cache-read and dirty backings with their distinct
+    /// source receipts. Physical work is capped independently of billing.
+    pub fn with_native_page_invoices(
+        self,
+        db: &contextdb_engine::Database,
+        observed: &Self,
+        fresh_page_allowance: u64,
+        cache_read_page_allowance: u64,
+    ) -> Self {
+        let mut ceiling = self.with_declared_writer_cache(db);
+        ceiling.search.writer_budget_charges += 2 * observed
+            .native_pages
+            .expect("the producer observation is present");
+        ceiling.writer_peak += observed.native_page_bytes;
+        ceiling.fresh_dirty_pages = fresh_page_allowance;
+        ceiling.native_pages = Some(cache_read_page_allowance + fresh_page_allowance);
+        ceiling
+    }
+
     pub fn assert_within(&self, label: &str, ceiling: &Self) {
         macro_rules! cap {
             ($observed:expr, $limit:expr, $($field:ident),+ $(,)?) => {$(
                 assert!($observed.$field <= $limit.$field,
                     "{label}: {} grew: observed {:?}, ceiling {:?}", stringify!($field), self, ceiling);
             )+};
+        }
+        cap!(self, ceiling, fresh_dirty_pages);
+        if let Some(limit) = ceiling.native_pages {
+            assert!(
+                self.native_pages.is_some_and(|pages| pages <= limit),
+                "{label}: native physical page work grew: observed {self:?}, ceiling {ceiling:?}"
+            );
         }
         cap!(
             self.search,

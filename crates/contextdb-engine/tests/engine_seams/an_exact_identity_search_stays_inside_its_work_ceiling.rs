@@ -39,15 +39,23 @@ const BILLING_CEILING: BillingWork = BillingWork {
     copy_reservations: 10,
 };
 
+// Byte fields exclude the declared cache capacity and its native index;
+// they retain the measured fixed controls and operation workspace allowances.
 const EXTENDED_CEILING: Work = Work {
     search: CEILING,
     backend_bytes: Some(323_584),
     backend_reads: Some(79),
     reader_peak: Some(1_345),
     stored_vector_decodes: 1_024,
-    writer_after: 4_266_339,
-    writer_before: 4_266_339,
-    writer_peak: 4_266_923,
+    fresh_dirty_pages: 0,
+    fresh_dirty_page_bytes: 0,
+    native_pages: None,
+    native_page_bytes: 0,
+    other_native_pages: 0,
+    other_native_page_bytes: 0,
+    writer_after: 8_495,
+    writer_before: 8_495,
+    writer_peak: 8_495 + 584,
 };
 
 fn measure(db: &contextdb_engine::Database, id: usize) -> (Work, BillingWork) {
@@ -100,8 +108,14 @@ fn an_exact_identity_search_over_a_maintained_partition_stays_inside_its_work_ce
             && first_billing.copy_reservations <= BILLING_CEILING.copy_reservations,
         "billing calls per exact search grew: {first_billing:?}, ceiling {BILLING_CEILING:?}"
     );
-    first.assert_within("maintained exact search", &EXTENDED_CEILING);
-    second.assert_within("maintained exact search", &EXTENDED_CEILING);
+    first.assert_within(
+        "maintained exact search",
+        &EXTENDED_CEILING.with_declared_writer_cache(&db),
+    );
+    second.assert_within(
+        "maintained exact search",
+        &EXTENDED_CEILING.with_declared_writer_cache(&db),
+    );
     let first = first.search;
     let second = second.search;
     eprintln!("exact identity search work: {first:?}");

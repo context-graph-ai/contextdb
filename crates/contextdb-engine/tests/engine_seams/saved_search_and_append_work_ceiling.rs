@@ -28,6 +28,8 @@ const DIM: usize = 8;
 const BATCH: usize = 4;
 
 // Fixed producer counts measured on these fixtures; improvements lower these bounds.
+// Byte fields exclude the declared cache capacity and its native index;
+// they retain the measured fixed controls and operation workspace allowances.
 const SAVED_SEARCH_CEILING: Work = Work {
     search: SearchWork {
         decoded_rows: 32,
@@ -44,9 +46,15 @@ const SAVED_SEARCH_CEILING: Work = Work {
     backend_reads: None,
     reader_peak: Some(880),
     stored_vector_decodes: 32,
-    writer_after: 4_271_578,
-    writer_before: 4_266_324,
-    writer_peak: 4_276_822,
+    fresh_dirty_pages: 0,
+    fresh_dirty_page_bytes: 0,
+    native_pages: None,
+    native_page_bytes: 0,
+    other_native_pages: 0,
+    other_native_page_bytes: 0,
+    writer_after: 8_480 + 5_254,
+    writer_before: 8_480,
+    writer_peak: 8_480 + 10_498,
 };
 
 const APPEND_CEILING: Work = Work {
@@ -64,9 +72,15 @@ const APPEND_CEILING: Work = Work {
     backend_reads: Some(71),
     reader_peak: Some(880),
     stored_vector_decodes: 0,
-    writer_after: 4_276_832,
-    writer_before: 4_266_324,
-    writer_peak: 4_374_409,
+    fresh_dirty_pages: 0,
+    fresh_dirty_page_bytes: 0,
+    native_pages: None,
+    native_page_bytes: 0,
+    other_native_pages: 0,
+    other_native_page_bytes: 0,
+    writer_after: 8_480 + 10_508,
+    writer_before: 8_480,
+    writer_peak: 8_480 + 108_085,
 };
 
 const IMPORT_CEILING: Work = Work {
@@ -84,9 +98,15 @@ const IMPORT_CEILING: Work = Work {
     backend_reads: Some(17),
     reader_peak: None,
     stored_vector_decodes: 4,
-    writer_after: 4_276_832,
-    writer_before: 4_276_832,
-    writer_peak: 4_502_244,
+    fresh_dirty_pages: 0,
+    fresh_dirty_page_bytes: 0,
+    native_pages: None,
+    native_page_bytes: 0,
+    other_native_pages: 0,
+    other_native_page_bytes: 0,
+    writer_after: 8_480 + 10_508,
+    writer_before: 8_480 + 10_508,
+    writer_peak: 8_480 + 10_508 + 225_412,
 };
 
 fn create(db: &Database) {
@@ -191,7 +211,10 @@ fn first_saved_search_stays_inside_its_primitive_ceiling() {
         "PRIMITIVE {}",
         serde_json::json!({"fixture":"saved-first-32x8", "work":work, "saved_graph_loads":query.saved_graph_loads, "saved_graph_bytes":query.saved_graph_bytes})
     );
-    work.assert_within("first saved search", &SAVED_SEARCH_CEILING);
+    work.assert_within(
+        "first saved search",
+        &SAVED_SEARCH_CEILING.with_declared_writer_cache(&db),
+    );
     assert_eq!(query.saved_graph_loads, 1);
     assert!(
         query.saved_graph_bytes <= 239,
@@ -250,8 +273,29 @@ fn an_admitted_batch_stays_inside_its_primitive_ceiling_on_doubled_history() {
             "PRIMITIVE {}",
             serde_json::json!({"fixture":format!("append-{history}-plus-{BATCH}x8"),"append":append,"import":import,"journal_records":records.load(Ordering::SeqCst),"journal_vectors":vectors.load(Ordering::SeqCst)})
         );
-        append.assert_within("four-row append", &APPEND_CEILING);
-        import.assert_within("four-vector import", &IMPORT_CEILING);
+        let (append_pages, import_pages, append_read_pages, import_read_pages) = match history {
+            32 => (71, 188, 44, 10),
+            64 => (92, 382, 55, 16),
+            _ => unreachable!("the fixture has two measured physical-work rows"),
+        };
+        append.assert_within(
+            "four-row append",
+            &APPEND_CEILING.with_native_page_invoices(
+                &db,
+                &append,
+                append_pages,
+                append_read_pages,
+            ),
+        );
+        import.assert_within(
+            "four-vector import",
+            &IMPORT_CEILING.with_native_page_invoices(
+                &db,
+                &import,
+                import_pages,
+                import_read_pages,
+            ),
+        );
         assert_eq!(
             import.stored_vector_decodes, BATCH,
             "each newly admitted vector is decoded exactly once"
