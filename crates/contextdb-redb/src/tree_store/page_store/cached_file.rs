@@ -1018,6 +1018,10 @@ impl PagedCachedFile {
     fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
         PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
         #[cfg(feature = "contextdb-internal")]
+        if crate::native_storage_admission::control_write_active() {
+            self.retire_control_buffers(&mut self.write_buffer.lock().unwrap())?;
+        }
+        #[cfg(feature = "contextdb-internal")]
         if !crate::read_admission::has_read_memory_admission()
             && crate::native_storage_admission::native_storage_active()
         {
@@ -1251,6 +1255,21 @@ impl PagedCachedFile {
         }
     }
 
+    /// Re-readable clean pages and completed dirty map owners need not overlap
+    /// the next control allocation. Checked-out/external aliases remain paid.
+    #[cfg(feature = "contextdb-internal")]
+    fn retire_control_buffers(&self, lock: &mut MutexGuard<'_, LRUWriteCache>) -> Result {
+        self.evict_from_read_cache(self.read_cache_bytes.load(Ordering::Acquire), lock);
+        while let Some((offset, buffer)) = lock.pop_lowest_priority() {
+            if let Err(error) = self.file.write(offset, &buffer) {
+                lock.insert(offset, buffer);
+                return Err(error);
+            }
+            drop(buffer);
+        }
+        Ok(())
+    }
+
     /// Reserve the complete new backing while any old COW backing remains
     /// independently counted. Failed backend writes leave their map owner intact;
     /// the local payment rolls back this not-yet-allocated replacement.
@@ -1259,8 +1278,20 @@ impl PagedCachedFile {
         bytes: usize,
         lock: &mut MutexGuard<'_, LRUWriteCache>,
     ) -> Result<CachePayment> {
+        #[cfg(feature = "contextdb-internal")]
+        let control_write = crate::native_storage_admission::control_write_active();
+        #[cfg(not(feature = "contextdb-internal"))]
+        let control_write = false;
+        #[cfg(feature = "contextdb-internal")]
+        if control_write {
+            self.retire_control_buffers(lock)?;
+        }
         let (previous, payment) = CachePayment::reserve(&self.write_buffer_bytes, bytes)?;
-        let half = self.max_cache_size.load(Ordering::Acquire) / 2;
+        let half = if control_write {
+            0
+        } else {
+            self.max_cache_size.load(Ordering::Acquire) / 2
+        };
         let write_bytes = previous + bytes;
         if write_bytes > half {
             let excess = write_bytes - half;
@@ -1304,16 +1335,12 @@ impl PagedCachedFile {
         let is_hit = existing.is_some() || overwrite;
         // A dirty source has one local clone plus its map owner. Neither can
         // escape while this write lock is held; only other owners require COW.
-        #[cfg(feature = "contextdb-internal")]
-        let requires_native_source = crate::native_storage_admission::native_storage_active()
-            && existing.as_ref().is_some_and(|page| !page.is_charged());
-        #[cfg(not(feature = "contextdb-internal"))]
-        let requires_native_source = false;
-        let needs_copy = !was_dirty
-            || requires_native_source
-            || existing
-                .as_ref()
-                .is_none_or(|page| PageAllocation::strong_count(page) != 2);
+        // An exclusive clean or dirty backing is already physically paid.
+        // Moving it to the write buffer needs no replacement allocation.
+        // External aliases still require COW and its native admission below.
+        let needs_copy = existing
+            .as_ref()
+            .is_none_or(|page| PageAllocation::strong_count(page) != if was_dirty { 2 } else { 1 });
         let needs_payment = needs_copy
             || existing
                 .as_ref()

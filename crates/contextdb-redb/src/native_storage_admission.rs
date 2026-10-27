@@ -246,6 +246,31 @@ impl Clone for NativeStorageAdmission {
         }
     }
 }
+#[cfg(feature = "contextdb-internal")]
+thread_local! {
+    static CONTROL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Control writes retire re-readable clean pages before funding dirty backing,
+/// and write dirty buffers through rather than accumulating transition debt.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn with_control_write<R>(operation: impl FnOnce() -> R) -> R {
+    struct RestoreControl(bool);
+    impl Drop for RestoreControl {
+        fn drop(&mut self) {
+            CONTROL_WRITE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = RestoreControl(CONTROL_WRITE.with(|slot| slot.replace(true)));
+    operation()
+}
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn control_write_active() -> bool {
+    CONTROL_WRITE.with(std::cell::Cell::get)
+}
+
 thread_local! {
     static NATIVE: RefCell<Option<NativeStorageAdmission>> = const { RefCell::new(None) };
 }

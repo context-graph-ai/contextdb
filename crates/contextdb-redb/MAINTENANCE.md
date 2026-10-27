@@ -30,7 +30,7 @@ Physical occupancy and detached owners remain visible until their real release.
 Provisional custody does not evict healthy clean pages. Flush uses available
 capacity with lowest-priority insertion and does not evict hot pages to promote
 output. Source-to-fixed transfer reserves destination custody before refunding
-the original payer. Cache capacity and dirty flush thresholds are unchanged.
+the original payer. Ordinary write capacity and flush thresholds are unchanged. Control writes use the scoped retirement order described below.
 Independent overbooking, alias, failed-admission and physical-free guards remain
 required before accepting this ownership extension.
 
@@ -1172,3 +1172,20 @@ the allocator carve and the latest completed window IDs through `lru_cache.rs`;
 these controls are compiled only with test seams. They do not choose admission,
 allocation, cache eviction, or production window results. The source-only upstream
 patch includes these changes and their existing dirty-backing funding changes.
+
+Exclusive clean pages (one owner) and dirty pages (map plus local owner) now
+reuse their already funded physical backing. New pages and copies required by
+external aliases still pass through the original native producer before any
+allocation. Moving an existing backing between counters does not create a new
+source invoice.
+
+`with_control_write` in `native_storage_admission.rs`, exported only through the
+internal fork interface, restores its thread-local flag on return or unwind.
+The engine uses it for durable configuration writes/removals. Before a control
+read miss or replacement allocation, `cached_file.rs` evicts re-readable clean
+cache entries and writes completed dirty map entries through to the backend.
+A failed write restores the dirty map owner. Checked-out or external holders
+keep their original payment until actual physical destruction; retirement does
+not assume those pages were freed. The next allocation remains admitted by its
+real native source. Ordinary data writes retain their existing independent
+dirty funding and do not evict disjoint clean serving pages.

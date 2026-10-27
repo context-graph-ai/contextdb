@@ -168,7 +168,7 @@ mod native_storage_admission;
 pub use native_storage_admission::{
     NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
     NativeStorageRefused, PreparedReadError, PreparedTableDefinitionError, native_storage_active,
-    with_native_storage_admission,
+    with_control_write, with_native_storage_admission,
 };
 
 mod atomic_compat;

@@ -3083,7 +3083,7 @@
 +pub use native_storage_admission::{
 +    NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
 +    NativeStorageRefused, PreparedReadError, PreparedTableDefinitionError, native_storage_active,
-+    with_native_storage_admission,
++    with_control_write, with_native_storage_admission,
 +};
 +
 +mod atomic_compat;
@@ -3188,7 +3188,7 @@
      /// Add the given value to the mapping of the key
 --- /dev/null
 +++ b/src/native_storage_admission.rs
-@@ -0,0 +1,1268 @@
+@@ -0,0 +1,1293 @@
 +//! Internal owned admission for exact byte reads; no host or engine dependency.
 +use crate::atomic_compat::AtomicUpdate as _;
 +use std::alloc::{Layout, alloc, dealloc};
@@ -3437,6 +3437,31 @@
 +        }
 +    }
 +}
++#[cfg(feature = "contextdb-internal")]
++thread_local! {
++    static CONTROL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Control writes retire re-readable clean pages before funding dirty backing,
++/// and write dirty buffers through rather than accumulating transition debt.
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub fn with_control_write<R>(operation: impl FnOnce() -> R) -> R {
++    struct RestoreControl(bool);
++    impl Drop for RestoreControl {
++        fn drop(&mut self) {
++            CONTROL_WRITE.with(|slot| slot.set(self.0));
++        }
++    }
++    let _restore = RestoreControl(CONTROL_WRITE.with(|slot| slot.replace(true)));
++    operation()
++}
++
++#[cfg(feature = "contextdb-internal")]
++pub(crate) fn control_write_active() -> bool {
++    CONTROL_WRITE.with(std::cell::Cell::get)
++}
++
 +thread_local! {
 +    static NATIVE: RefCell<Option<NativeStorageAdmission>> = const { RefCell::new(None) };
 +}
@@ -17802,7 +17827,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +1014,28 @@
+@@ -416,18 +1014,32 @@
          Ok(buffer)
      }
  
@@ -17816,6 +17841,10 @@
 +    // Admit the concrete complete allocation before allocation and backend I/O.
 +    fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
 +        PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
++        #[cfg(feature = "contextdb-internal")]
++        if crate::native_storage_admission::control_write_active() {
++            self.retire_control_buffers(&mut self.write_buffer.lock().unwrap())?;
++        }
 +        #[cfg(feature = "contextdb-internal")]
 +        if !crate::read_admission::has_read_memory_admission()
 +            && crate::native_storage_admission::native_storage_active()
@@ -17839,7 +17868,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1046,7 @@
+@@ -438,7 +1050,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17848,7 +17877,7 @@
              }
          }
  
-@@ -449,54 +1057,141 @@
+@@ -449,54 +1061,141 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -18030,7 +18059,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1202,174 @@
+@@ -507,104 +1206,197 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -18095,6 +18124,21 @@
 +        }
 +    }
 +
++    /// Re-readable clean pages and completed dirty map owners need not overlap
++    /// the next control allocation. Checked-out/external aliases remain paid.
++    #[cfg(feature = "contextdb-internal")]
++    fn retire_control_buffers(&self, lock: &mut MutexGuard<'_, LRUWriteCache>) -> Result {
++        self.evict_from_read_cache(self.read_cache_bytes.load(Ordering::Acquire), lock);
++        while let Some((offset, buffer)) = lock.pop_lowest_priority() {
++            if let Err(error) = self.file.write(offset, &buffer) {
++                lock.insert(offset, buffer);
++                return Err(error);
++            }
++            drop(buffer);
++        }
++        Ok(())
++    }
++
 +    /// Reserve the complete new backing while any old COW backing remains
 +    /// independently counted. Failed backend writes leave their map owner intact;
 +    /// the local payment rolls back this not-yet-allocated replacement.
@@ -18103,8 +18147,20 @@
 +        bytes: usize,
 +        lock: &mut MutexGuard<'_, LRUWriteCache>,
 +    ) -> Result<CachePayment> {
++        #[cfg(feature = "contextdb-internal")]
++        let control_write = crate::native_storage_admission::control_write_active();
++        #[cfg(not(feature = "contextdb-internal"))]
++        let control_write = false;
++        #[cfg(feature = "contextdb-internal")]
++        if control_write {
++            self.retire_control_buffers(lock)?;
++        }
 +        let (previous, payment) = CachePayment::reserve(&self.write_buffer_bytes, bytes)?;
-+        let half = self.max_cache_size.load(Ordering::Acquire) / 2;
++        let half = if control_write {
++            0
++        } else {
++            self.max_cache_size.load(Ordering::Acquire) / 2
++        };
 +        let write_bytes = previous + bytes;
 +        if write_bytes > half {
 +            let excess = write_bytes - half;
@@ -18165,16 +18221,12 @@
 +        let is_hit = existing.is_some() || overwrite;
 +        // A dirty source has one local clone plus its map owner. Neither can
 +        // escape while this write lock is held; only other owners require COW.
-+        #[cfg(feature = "contextdb-internal")]
-+        let requires_native_source = crate::native_storage_admission::native_storage_active()
-+            && existing.as_ref().is_some_and(|page| !page.is_charged());
-+        #[cfg(not(feature = "contextdb-internal"))]
-+        let requires_native_source = false;
-+        let needs_copy = !was_dirty
-+            || requires_native_source
-+            || existing
-+                .as_ref()
-+                .is_none_or(|page| PageAllocation::strong_count(page) != 2);
++        // An exclusive clean or dirty backing is already physically paid.
++        // Moving it to the write buffer needs no replacement allocation.
++        // External aliases still require COW and its native admission below.
++        let needs_copy = existing
++            .as_ref()
++            .is_none_or(|page| PageAllocation::strong_count(page) != if was_dirty { 2 } else { 1 });
 +        let needs_payment = needs_copy
 +            || existing
 +                .as_ref()
@@ -18291,7 +18343,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1379,383 @@
+@@ -614,13 +1406,383 @@
  }
  
  #[cfg(test)]
@@ -18677,7 +18729,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1788,912 @@
+@@ -653,4 +1815,912 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }

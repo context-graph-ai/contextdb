@@ -3653,41 +3653,43 @@ graph_commit_result }.map_err(Self::storage_error)?;
             ));
         }
         self.with_db(|db| {
-            let write_txn = Self::begin_history_write(db)?;
-            #[cfg(any(test, feature = "test-seams"))]
-            let mut graph_publication_attempt =
-                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
-            Self::update_policy_hold_release_index(&write_txn, key, true)?;
-            let encoded;
-            {
-                let mut config_table = write_txn
-                    .open_table(CONFIG_TABLE)
-                    .map_err(Self::storage_error)?;
-                encoded = Self::encode(value)?;
-                config_table
-                    .insert(key, encoded.as_slice())
-                    .map_err(Self::storage_error)?;
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &content_identity::config_mutations(key, Some(&encoded)),
-                &mut self.proof_admission(),
-            )?;
-            Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            {
+            redb::with_control_write(|| {
+                let write_txn = Self::begin_history_write(db)?;
                 #[cfg(any(test, feature = "test-seams"))]
-                graph_observation_checkpoint(10)?;
-                let graph_commit_result = write_txn.commit();
-                #[cfg(any(test, feature = "test-seams"))]
-                if graph_commit_result.is_ok() {
-                    graph_publication_attempt.committed();
-                    graph_observation_checkpoint(11)?;
+                let mut graph_publication_attempt =
+                    crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+                Self::update_policy_hold_release_index(&write_txn, key, true)?;
+                let encoded;
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    encoded = Self::encode(value)?;
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
                 }
-                graph_commit_result
-            }
-            .map_err(Self::storage_error)?;
-            Ok(())
+                Self::apply_content_identity_mutations_in_write(
+                    &write_txn,
+                    &content_identity::config_mutations(key, Some(&encoded)),
+                    &mut self.proof_admission(),
+                )?;
+                Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
+                Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+                {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    graph_observation_checkpoint(10)?;
+                    let graph_commit_result = write_txn.commit();
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if graph_commit_result.is_ok() {
+                        graph_publication_attempt.committed();
+                        graph_observation_checkpoint(11)?;
+                    }
+                    graph_commit_result
+                }
+                .map_err(Self::storage_error)?;
+                Ok(())
+            })
         })
     }
 
@@ -4081,36 +4083,38 @@ graph_commit_result }.map_err(Self::storage_error)?;
             ));
         }
         self.with_db(|db| {
-            let write_txn = Self::begin_history_write(db)?;
-            #[cfg(any(test, feature = "test-seams"))]
-            let mut graph_publication_attempt =
-                crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
-            Self::update_policy_hold_release_index(&write_txn, key, false)?;
-            {
-                let mut config_table = write_txn
-                    .open_table(CONFIG_TABLE)
-                    .map_err(Self::storage_error)?;
-                config_table.remove(key).map_err(Self::storage_error)?;
-            }
-            Self::apply_content_identity_mutations_in_write(
-                &write_txn,
-                &content_identity::config_mutations(key, None),
-                &mut self.proof_admission(),
-            )?;
-            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
-            {
+            redb::with_control_write(|| {
+                let write_txn = Self::begin_history_write(db)?;
                 #[cfg(any(test, feature = "test-seams"))]
-                graph_observation_checkpoint(10)?;
-                let graph_commit_result = write_txn.commit();
-                #[cfg(any(test, feature = "test-seams"))]
-                if graph_commit_result.is_ok() {
-                    graph_publication_attempt.committed();
-                    graph_observation_checkpoint(11)?;
+                let mut graph_publication_attempt =
+                    crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
+                Self::update_policy_hold_release_index(&write_txn, key, false)?;
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    config_table.remove(key).map_err(Self::storage_error)?;
                 }
-                graph_commit_result
-            }
-            .map_err(Self::storage_error)?;
-            Ok(())
+                Self::apply_content_identity_mutations_in_write(
+                    &write_txn,
+                    &content_identity::config_mutations(key, None),
+                    &mut self.proof_admission(),
+                )?;
+                Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+                {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    graph_observation_checkpoint(10)?;
+                    let graph_commit_result = write_txn.commit();
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if graph_commit_result.is_ok() {
+                        graph_publication_attempt.committed();
+                        graph_observation_checkpoint(11)?;
+                    }
+                    graph_commit_result
+                }
+                .map_err(Self::storage_error)?;
+                Ok(())
+            })
         })
     }
 
