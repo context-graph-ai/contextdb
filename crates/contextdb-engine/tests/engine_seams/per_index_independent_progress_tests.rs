@@ -84,6 +84,10 @@ fn seed_reopen_tables(db: &Database) -> (Vec<Uuid>, Vec<Uuid>) {
     (text_ids, face_ids)
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn top_ranked(db: &Database, table: &str, limit: usize) -> Vec<(Uuid, f64)> {
     let ids = db
         .execute(

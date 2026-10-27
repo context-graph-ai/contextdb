@@ -120,6 +120,10 @@ fn reader(path: &std::path::Path, memory: Option<u64>) -> ReadSession {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn find(reader: &ReadSession, scope: Uuid, query: Vec<f32>) -> contextdb_core::Result<Vec<Uuid>> {
     reader
         .execute(

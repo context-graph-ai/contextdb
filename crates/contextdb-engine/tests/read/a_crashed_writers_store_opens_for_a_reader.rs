@@ -201,6 +201,10 @@ enum ReaderSaw {
 /// The reader child: open the store with nobody owning it, under the seams
 /// its role names, and print what it saw and what its admission cost.
 /// Returns false in every process that is not the reader child.
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn reader_child() -> bool {
     let Ok(role) = std::env::var(READER) else {
         return false;
@@ -369,6 +373,10 @@ fn run_reader(test: &str, role: &str, store: &Path) -> ReaderReport {
 }
 
 /// The rows a writer reads after its own open repaired the store.
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn rows_after_repair(store: &Path) -> Vec<i64> {
     let database = Database::open(store).expect("a writer repairs the crashed store");
     let rows = database

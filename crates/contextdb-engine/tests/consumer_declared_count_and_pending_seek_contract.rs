@@ -46,6 +46,10 @@ fn contexts(db: &Database) {
 
 const GROUP_COUNT: &str = "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref";
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn stream_counts(db: &Database, id: u128, expected: &[(&str, &str, i64)]) -> u64 {
     let (answer, work) = contextdb_engine::writer_query_test_seams::observe(|| {
         execute(db, GROUP_COUNT, &params(&[("context_id", context(id))]))

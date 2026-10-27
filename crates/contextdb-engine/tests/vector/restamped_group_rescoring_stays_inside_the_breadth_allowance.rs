@@ -192,6 +192,10 @@ struct Searched {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn search(db: &Database, mode: &str) -> Searched {
     let counter = Arc::new(Counter(AtomicU64::new(0), AtomicU64::new(0)));
     let (result, receipts) = with_union_search_receipts(|| {

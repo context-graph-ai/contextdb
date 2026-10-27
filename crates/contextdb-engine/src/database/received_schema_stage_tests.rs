@@ -4588,6 +4588,10 @@ fn forwarded_copy_holds(receiver: &Database, table: &str, rows: usize) {
 /// incarnation and LSN -- still names the peer that delivered it; that is
 /// asserted too, so a change to it is seen.)
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn a_second_peer_holds_the_authors_signed_identity_not_the_forwarding_hubs() {
     let root = tempfile::TempDir::new().expect("scratch peer directory");
     let author = JourneyPeer::open(root.path(), "forward-author");

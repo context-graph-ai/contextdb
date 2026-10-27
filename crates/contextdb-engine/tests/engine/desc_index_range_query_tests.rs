@@ -51,6 +51,10 @@ fn seed(db: &Database, values: &[i64]) {
     }
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn query_scores(db: &Database, sql: &str, extra: Vec<(&str, Value)>) -> Vec<i64> {
     let result = db
         .execute(sql, &params(extra))

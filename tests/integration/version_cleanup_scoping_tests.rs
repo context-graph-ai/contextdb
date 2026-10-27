@@ -46,6 +46,10 @@ fn advertise(db: &Database, key: &str, node_id: &str, capability_id: &str, adver
     .expect("advertise/re-advertise a capability");
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn capability_ids(db: &Database, key: &str) -> Vec<String> {
     let mut params = HashMap::new();
     params.insert("k".to_string(), Value::Text(key.to_string()));

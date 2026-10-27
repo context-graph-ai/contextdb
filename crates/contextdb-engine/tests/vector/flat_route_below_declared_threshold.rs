@@ -1283,6 +1283,10 @@ fn a_reader_pinned_before_a_rebuild_keeps_its_graph_until_it_finishes() {
     );
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn ids_at(db: &Database, mode: &str, snapshot: contextdb_core::SnapshotId) -> Vec<Value> {
     db.execute_at_snapshot(
         &format!(

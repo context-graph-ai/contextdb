@@ -101,6 +101,10 @@ fn settle(db: &Database) {
     panic!("maintenance did not settle");
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn ids(db: &Database, mode: &str, filter: &str, query: &[f32], label: &str) -> Vec<Value> {
     let sql = format!(
         "SELECT id FROM items {filter} ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 10"

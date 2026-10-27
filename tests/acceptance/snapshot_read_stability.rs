@@ -1099,6 +1099,10 @@ fn sr_07_scoped_handle_replace_race() {
 }
 
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn sr_08_sequential_replacement_convergence() {
     // REGRESSION GUARD: atomic replacement visibility without concurrency.
     let (_dir, _path, db) = open_file_db("sr_08.db");

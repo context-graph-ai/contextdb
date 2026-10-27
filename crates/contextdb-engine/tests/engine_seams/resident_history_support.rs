@@ -105,6 +105,10 @@ pub fn vector_oracle(ids: impl IntoIterator<Item = usize>, dim: usize) -> Vec<Ve
         .map(|id| vec![Value::Int64(id as i64), Value::Vector(vector(id, dim))])
         .collect()
 }
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 pub fn exact_partition_ids(
     db: &Database,
     table: &str,

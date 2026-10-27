@@ -1585,6 +1585,10 @@ fn ce21_export_during_open_transaction_excludes_uncommitted_state() {
 // brute-force-exact search path and the full-recall assertion deterministic.)
 // ---------------------------------------------------------------------------
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn ce22_vector_index_completeness_at_scale() {
     let (_tmp, src, dest) = new_export_fixture();
 

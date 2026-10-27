@@ -23,6 +23,10 @@ fn open_db() -> (tempfile::TempDir, Database) {
 }
 
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn t18_01_concurrent_committers_stamp_distinct_txids() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -81,6 +85,10 @@ fn t18_01_concurrent_committers_stamp_distinct_txids() {
 }
 
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn t18_02_pagination_cursor_after_concurrent_commits_misses_no_rows() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -140,6 +148,10 @@ fn t18_02_pagination_cursor_after_concurrent_commits_misses_no_rows() {
 }
 
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn t18_03_auto_stamped_txid_order_matches_commit_lsn_order() {
     let (_dir, db) = open_db();
     let db = &db;
@@ -244,6 +256,10 @@ fn t18_04_caller_supplied_txid_above_watermark_rejected() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

@@ -175,6 +175,10 @@ fn principal_fixture() -> PrincipalFixture {
     }
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn payloads(result: QueryResult) -> BTreeSet<String> {
     result
         .rows()

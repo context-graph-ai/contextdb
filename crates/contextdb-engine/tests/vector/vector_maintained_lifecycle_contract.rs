@@ -123,6 +123,10 @@ fn seed_file_fixture(path: &std::path::Path) -> Database {
     db
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn nearest_ids(
     db: &Database,
     table: &str,

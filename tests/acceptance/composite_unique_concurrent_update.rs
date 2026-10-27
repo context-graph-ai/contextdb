@@ -166,6 +166,10 @@ fn t24_02_concurrent_updates_yield_one_final_value() {
 }
 
 #[test]
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn t24_03_concurrent_updates_moving_composite_key_columns_one_winner() {
     let (_dir, db) = open_db();
     let db = &db;
