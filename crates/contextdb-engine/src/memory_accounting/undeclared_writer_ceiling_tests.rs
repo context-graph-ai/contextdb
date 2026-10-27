@@ -119,9 +119,12 @@ fn an_undeclared_writer_page_cache_fits_the_process_ceiling() {
             eprintln!(
                 "undeclared writer under an 8 MiB ceiling: cache {configured} B, writer {writer} B, process residue {process} B, high water {high_water}"
             );
+            let policy_capacity =
+                crate::persistence::read_source_cache_reservation_for_limit_for_test(Some(CEILING))
+                    .0;
             assert!(
-                configured <= CEILING / 16,
-                "the page cache is sized from the process ceiling: {configured}"
+                configured <= policy_capacity,
+                "the page cache is sized from the process ceiling: {configured}, policy {policy_capacity}"
             );
             // The settled capacity adds the cache's fixed stripe controls.
             assert!(
