@@ -1785,6 +1785,10 @@ async fn a_differing_restatement_refuses_its_whole_transaction_leaving_no_schema
 // Conditions 2 and 4 through the pull door: many authored transactions in one
 // transport batch.
 #[tokio::test]
+#[expect(
+    clippy::useless_vec,
+    reason = "The expected rows retain their explicit Vec representation in this comparison."
+)]
 async fn a_refused_transaction_in_a_pulled_batch_leaves_its_unrelated_siblings_installing_and_holds_its_tables()
  {
     let _clock = Wallclock::test_clock_guard(|| T0);
