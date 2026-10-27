@@ -827,12 +827,20 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         &HashMap::from([("q".into(),Value::Vector(vec![0.0,1.0,0.0])), ("scope".into(), Value::Text("scope".into()))])).unwrap().rows(),
         vec![vec![Value::Int64(0)]], "the complete serving chain must include the newly published insert");
     let original_limit = db.memory_limit();
-    db.set_memory_limit(Some(db.accountant().usage().used.saturating_add(96 * 1024)))
-        .unwrap();
     run(
         &db,
         "UPDATE recheck_rows SET embedding = '[0,0,1]' WHERE id = 1",
     );
+    // The narrow budget exercises maintenance, after its pending change is prepared.
+    let native_receipt = crate::persistence::native_storage_admission::StorageAdmissionScope::receipt_layout_for_scan_test().size();
+    db.set_memory_limit(Some(
+        db.accountant()
+            .usage()
+            .used
+            .saturating_add(96 * 1024)
+            .saturating_add(native_receipt),
+    ))
+    .unwrap();
     let before_failure = info();
     let retained_changes = (before_failure.pending_inserts, before_failure.tombstones);
     assert!(retained_changes.0 > 0);
