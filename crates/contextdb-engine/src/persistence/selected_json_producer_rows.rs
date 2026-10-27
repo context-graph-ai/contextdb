@@ -700,6 +700,10 @@ impl Root {
 fn qualified(error: &Error) -> bool {
     matches!(error, Error::FundedEngine(source) if source.source_is_qualified())
 }
+#[expect(
+    clippy::err_expect,
+    reason = "The refusal fixture inspects the error without requiring Debug on the successful value."
+)]
 fn native_message(
     root: Root,
     bytes: &[u8],
