@@ -2982,6 +2982,10 @@ pub mod statement_child_proof {
         legacy: bool,
     }
     impl<'a> ChildCall<'a> {
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "The read-copy charge constructor records each existing accounting dimension without changing their ownership."
+        )]
         pub(super) fn new(
             parent: &'a DeclaredReadMemory,
             child: usize,
