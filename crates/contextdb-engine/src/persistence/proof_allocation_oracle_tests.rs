@@ -5439,6 +5439,10 @@ fn inactive_graph_allocator_observation_copies_no_record() {
 }
 
 #[test]
+#[expect(
+    clippy::redundant_closure_call,
+    reason = "The immediately invoked fallible closure models an operation boundary with its local guards."
+)]
 fn graph_allocator_observation_restores_nested_error_and_panic_scopes() {
     use crate::vector_observations::{
         VectorGraphBufferKindForTest as Kind, VectorGraphWorkspaceEventForTest as Event,

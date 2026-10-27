@@ -1877,6 +1877,10 @@ fn recorder_deferred_events_and_history_invalidate_at_the_original_capacity() {
 
 #[test]
 #[serial]
+#[expect(
+    clippy::redundant_closure_call,
+    reason = "The immediately invoked fallible closure models an operation boundary with its local guards."
+)]
 fn recorder_rejects_nested_begin_and_restores_after_error_and_panic() {
     let owner = MemoryAccountant::no_limit();
     let observation = Observation::begin(&owner);
