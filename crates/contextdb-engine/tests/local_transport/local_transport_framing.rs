@@ -979,78 +979,59 @@ fn malformed_assembled_canonical_result_is_discarded_before_actual_decode() {
 }
 
 fn assert_compact_canonical_container_is_preflighted(container: CompactCanonicalContainer) {
+    use contextdb_engine::vector_read_memory::{
+        take_reader_budget_ledger_for_test, watch_reader_budget_ledger_for_test,
+    };
     let (canonical, decoded) = compact_canonical_result(container);
-    assert!(
-        canonical.len() as u64 <= EFFECTIVE_MEMORY_CEILING,
-        "the {label} fixture fits the effective memory ceiling as wire bytes",
-        label = container.label()
-    );
-    assert!(
-        container.minimum_native_allocation(&decoded) > EFFECTIVE_MEMORY_CEILING as usize,
-        "the {label} fixture's nested native container allocation exceeds the effective memory ceiling",
-        label = container.label()
-    );
+    assert!(canonical.len() as u64 <= EFFECTIVE_MEMORY_CEILING);
+    assert!(container.minimum_native_allocation(&decoded) > EFFECTIVE_MEMORY_CEILING as usize);
 
-    let split_at = canonical.len() / 2;
-    let responses = [
-        LocalResponse::ResultChunk {
-            chunk: ResultChunk {
-                bytes: canonical[..split_at].to_vec(),
-            },
-        },
-        LocalResponse::TerminalSuccess {
-            success: TerminalSuccess {
-                final_bytes: canonical[split_at..].to_vec(),
-            },
-        },
-    ];
-    let frames = responses
+    // Keep each envelope small enough that the refusal must come from the
+    // nested canonical containers, after all wire bytes have arrived.
+    let pieces: Vec<_> = canonical.chunks(1_024).collect();
+    let frames: Vec<_> = pieces
         .iter()
-        .map(|response| {
-            let frame = frame_for_ordinary_response(response);
-            assert!(
-                frame.len() - 4 <= MAX_FRAME_BYTES,
-                "the {label} envelope must fit the outer frame ceiling",
-                label = container.label()
-            );
+        .enumerate()
+        .map(|(index, bytes)| {
+            let response = if index + 1 == pieces.len() {
+                LocalResponse::TerminalSuccess {
+                    success: TerminalSuccess {
+                        final_bytes: bytes.to_vec(),
+                    },
+                }
+            } else {
+                LocalResponse::ResultChunk {
+                    chunk: ResultChunk {
+                        bytes: bytes.to_vec(),
+                    },
+                }
+            };
+            let frame = frame_for_ordinary_response(&response);
+            assert!(frame.len() - 4 <= MAX_FRAME_BYTES);
             frame
         })
-        .collect::<Vec<_>>();
+        .collect();
     let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
         result_rows: u64::MAX,
         result_bytes: MAX_FRAME_BYTES as u64,
-        work: 1,
-        active_ms: 1,
         memory: EFFECTIVE_MEMORY_CEILING,
-        cursor_page_rows: 1,
-        cursor_page_bytes: 1,
-        cursor_idle_ms: 1,
-        cursor_lifetime_ms: 1,
+        ..ReadLimits::default()
     });
-    let mut receiver = OrdinaryResultReceiver::new();
     let expected_error = LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
         ceiling: EFFECTIVE_MEMORY_CEILING,
         required: None,
     });
     OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
-    assert!(
-        OrdinaryResultReceiver::preflight_canonical_result_for_test(
-            &canonical,
-            EFFECTIVE_MEMORY_CEILING,
-        )
-        .is_err(),
-        "the real allocation-free canonical preflight must reject the over-memory {label} fixture",
-        label = container.label()
-    );
-    assert_eq!(
-        OrdinaryResultReceiver::canonical_receive_events_for_test(),
-        vec![OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_FAILED]
-    );
+    OrdinaryResultReceiver::preflight_canonical_result_for_test(
+        &canonical,
+        EFFECTIVE_MEMORY_CEILING,
+    )
+    .expect("the valid canonical grammar passes before actual allocation admission");
     assert!(
         OrdinaryResultReceiver::canonical_preflight_matches_for_test(
             &canonical,
             EFFECTIVE_MEMORY_CEILING,
-            false,
+            true,
         )
     );
     assert_eq!(
@@ -1058,18 +1039,20 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
         0
     );
     OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
-
+    let mut receiver = OrdinaryResultReceiver::new();
+    let count = frames.len();
     for (index, frame) in frames.into_iter().enumerate() {
         let mut reader = SliceReader::new(frame);
         let mut allocator = AllocationLimit {
             maximum: MAX_FRAME_BYTES,
             calls: 0,
         };
+        watch_reader_budget_ledger_for_test();
         let received =
             boundary.receive_ordinary_result_frame(&mut receiver, &mut reader, &mut allocator);
+        let admissions = take_reader_budget_ledger_for_test();
         assert_eq!(reader.offset, reader.bytes.len());
-
-        if index == 0 {
+        if index + 1 < count {
             assert_eq!(received, Ok(ResultReceiveOutcome::Pending));
             assert_eq!(receiver.state(), ResultReceiveState::Receiving);
             assert!(OrdinaryResultReceiver::canonical_receive_events_for_test().is_empty());
@@ -1079,16 +1062,14 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
             );
         } else {
             assert_eq!(
-                OrdinaryResultReceiver::canonical_receive_events_for_test(),
-                vec![OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_FAILED],
-                "the over-ceiling {label} fixture must be refused after allocation-free preflight without entering canonical decode, publication, or assembled-result construction",
-                label = container.label()
-            );
-            assert_eq!(
                 received.as_ref(),
                 Err(&expected_error),
-                "the valid assembled {label} result must be rejected before nested serde allocation",
+                "the {label} native containers must refuse before allocation",
                 label = container.label()
+            );
+            super::wire_fixture_test_support::assert_native_refusal_within_ceiling(
+                &admissions,
+                EFFECTIVE_MEMORY_CEILING,
             );
             assert_eq!(receiver.state(), ResultReceiveState::Discarded);
             assert_eq!(receiver.buffered_byte_count(), 0);
@@ -1096,21 +1077,28 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
                 OrdinaryResultReceiver::canonical_preflight_matches_for_test(
                     &canonical,
                     EFFECTIVE_MEMORY_CEILING,
-                    false,
+                    true,
                 )
             );
             assert_eq!(
+                OrdinaryResultReceiver::canonical_receive_events_for_test(),
+                vec![
+                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_PASSED,
+                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_DECODE_AUTHORIZED,
+                ],
+                "admission refusal must precede publication and assembled-result construction"
+            );
+            assert_eq!(
                 OrdinaryResultReceiver::canonical_decode_entries_for_test(),
-                0,
-                "the over-memory {label} fixture must be refused before the actual canonical decoder entrance",
-                label = container.label()
+                1,
+                "the real scoped decoder must attempt and refuse the nested allocation"
             );
         }
     }
 }
 
 #[test]
-fn assembled_canonical_results_preflight_compact_nested_containers_before_deserialization() {
+fn assembled_canonical_results_refuse_compact_nested_containers_before_allocation() {
     for container in [
         CompactCanonicalContainer::ColumnsAndValues,
         CompactCanonicalContainer::Rows,
