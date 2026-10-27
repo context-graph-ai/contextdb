@@ -12,6 +12,10 @@ use std::collections::HashMap;
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[expect(
+    clippy::useless_format,
+    reason = "The query fixture retains its explicit formatted SQL construction."
+)]
 fn public_membership_pages_keep_the_original_parent_within_its_live_limit() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     const DIM: usize = 256;
