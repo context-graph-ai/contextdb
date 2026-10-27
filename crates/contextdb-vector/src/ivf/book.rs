@@ -1,7 +1,7 @@
 use super::storage::DistanceKind;
 use super::{
     codec,
-    memory::{Invoice, bytes, corrupt, overflow},
+    memory::{Invoice, corrupt, overflow},
     storage::{Manifest, PAGE_BYTES, PageKind, ReadPages, WritePages},
     types::cosine,
 };
@@ -12,6 +12,44 @@ struct BookData {
     values: Vec<f32>,
     counts: Vec<u64>,
 }
+/// Complete allocation geometry used by the codebook constructor.
+#[derive(Clone, Copy, Debug)]
+pub struct CodebookAllocationLayouts {
+    pub control: std::alloc::Layout,
+    pub values: std::alloc::Layout,
+    pub counts: std::alloc::Layout,
+    pub charged_bytes: usize,
+}
+
+pub fn codebook_allocation_layout(
+    dimensions: usize,
+    active_lists: u32,
+    training_counts: bool,
+) -> Result<CodebookAllocationLayouts> {
+    let n = dimensions
+        .checked_mul(active_lists as usize)
+        .ok_or_else(overflow)?;
+    let control = std::alloc::Layout::new::<BookData>();
+    let values = std::alloc::Layout::array::<f32>(n).map_err(|_| overflow())?;
+    let counts = std::alloc::Layout::array::<u64>(if training_counts {
+        active_lists as usize
+    } else {
+        0
+    })
+    .map_err(|_| overflow())?;
+    let charged_bytes = values
+        .size()
+        .checked_add(counts.size())
+        .and_then(|n| n.checked_add(control.size()))
+        .ok_or_else(overflow)?;
+    Ok(CodebookAllocationLayouts {
+        control,
+        values,
+        counts,
+        charged_bytes,
+    })
+}
+
 pub(crate) struct Codebook {
     data: Box<BookData>,
     dimensions: usize,
@@ -23,19 +61,14 @@ impl Codebook {
         Self::allocate(owner, manifest, true)
     }
     fn allocate(owner: &MemoryBudgetOwner, manifest: Manifest, counts: bool) -> Result<Self> {
-        let n = manifest
-            .dimensions
-            .checked_mul(manifest.active_lists as usize)
-            .ok_or_else(overflow)?;
-        let charge = bytes::<f32>(n)?
-            .checked_add(bytes::<u64>(if counts {
-                manifest.active_lists as usize
-            } else {
-                0
-            })?)
-            .and_then(|x| x.checked_add(std::mem::size_of::<BookData>()))
-            .ok_or_else(overflow)?;
-        let invoice = Invoice::reserve(owner, charge, "clustered_codebook")?;
+        let layouts =
+            codebook_allocation_layout(manifest.dimensions, manifest.active_lists, counts)?;
+        let n = layouts.values.size() / std::mem::size_of::<f32>();
+        let invoice = Invoice::reserve(owner, layouts.charged_bytes, "clustered_codebook")?;
+        #[cfg(feature = "test-seams")]
+        super::layout_observation::admitted(super::IvfConstructorAllocationForTest::Codebook(
+            layouts,
+        ));
         Ok(Self {
             data: Box::new(BookData {
                 values: vec![0.0; n],

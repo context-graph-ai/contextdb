@@ -22,6 +22,70 @@ pub(crate) fn coalesce_control_pages(m: Manifest) -> Result<usize> {
         .ok_or_else(corrupt)
 }
 
+/// Constructor-owned allocation and scratch geometry. The page scratch and
+/// catalog are the existing allowance, separate from the five heap arrays.
+#[derive(Clone, Copy, Debug)]
+pub struct WriterWorkspaceLayout {
+    pub controls: std::alloc::Layout,
+    pub buffer: std::alloc::Layout,
+    pub raw: std::alloc::Layout,
+    pub values: std::alloc::Layout,
+    pub encoded: std::alloc::Layout,
+    pub order: std::alloc::Layout,
+    pub combined: std::alloc::Layout,
+    pub page_scratch: std::alloc::Layout,
+    pub catalog: std::alloc::Layout,
+    pub buffer_record_bytes: usize,
+    pub charged_bytes: usize,
+}
+
+pub fn workspace_allocation_layout(
+    policy: Policy,
+    _training: TrainingPolicy,
+) -> Result<WriterWorkspaceLayout> {
+    use std::alloc::Layout;
+    let raw_bytes = policy
+        .dimensions
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(overflow)?;
+    let buffer_record_bytes = raw_bytes.checked_add(32).ok_or_else(overflow)?;
+    let records = policy.buffer_cap_bytes / buffer_record_bytes;
+    let controls = Layout::new::<(Policy, TrainingPolicy, BufferState)>();
+    let buffer = Layout::array::<u8>(policy.buffer_cap_bytes).map_err(|_| overflow())?;
+    let raw = Layout::array::<u8>(raw_bytes).map_err(|_| overflow())?;
+    let values = Layout::array::<f32>(policy.dimensions).map_err(|_| overflow())?;
+    let encoded = Layout::array::<u8>(policy.dimensions.checked_add(16).ok_or_else(overflow)?)
+        .map_err(|_| overflow())?;
+    let order = Layout::array::<usize>(records).map_err(|_| overflow())?;
+    let mut combined = controls;
+    for part in [buffer, raw, values, encoded, order] {
+        combined = combined.extend(part).map_err(|_| overflow())?.0;
+    }
+    let combined = combined.pad_to_align();
+    let page_scratch =
+        Layout::array::<u8>(super::storage::PAGE_BYTES * 12).map_err(|_| overflow())?;
+    let catalog = Layout::new::<Catalog>();
+    let charged_bytes = combined
+        .size()
+        .checked_add(page_scratch.size())
+        .and_then(|n| n.checked_add(catalog.size()))
+        .ok_or_else(overflow)?;
+    Ok(WriterWorkspaceLayout {
+        controls,
+        buffer,
+        raw,
+        values,
+        encoded,
+        order,
+        combined,
+        page_scratch,
+        catalog,
+        buffer_record_bytes,
+        charged_bytes,
+    })
+}
+
 /// Bounded writer window over the native committed canonical tail. Search reads
 /// the same native slots, including after this window is evicted/reopened.
 pub struct ClusteredIndex<S> {
@@ -62,32 +126,16 @@ impl<S: PageStore> ClusteredIndex<S> {
                 });
             }
         }
-        let raw_bytes = policy
-            .dimensions
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(8))
-            .ok_or_else(overflow)?;
-        let buffer_record_bytes = raw_bytes.checked_add(32).ok_or_else(overflow)?;
-        let records = policy.buffer_cap_bytes / buffer_record_bytes;
-        let mut layout = std::alloc::Layout::new::<(Policy, TrainingPolicy, BufferState)>();
-        for part in [
-            std::alloc::Layout::array::<u8>(policy.buffer_cap_bytes),
-            std::alloc::Layout::array::<u8>(raw_bytes),
-            std::alloc::Layout::array::<f32>(policy.dimensions),
-            std::alloc::Layout::array::<u8>(policy.dimensions + 16),
-            std::alloc::Layout::array::<usize>(records),
-        ] {
-            layout = layout
-                .extend(part.map_err(|_| overflow())?)
-                .map_err(|_| overflow())?
-                .0;
-        }
-        let total = layout
-            .pad_to_align()
-            .size()
-            .checked_add(super::storage::PAGE_BYTES * 12 + std::mem::size_of::<Catalog>())
-            .ok_or_else(overflow)?;
-        let invoice = Invoice::reserve(&owner, total, "clustered_writer_workspace")?;
+        let layouts = workspace_allocation_layout(policy, training)?;
+        let raw_bytes = layouts.raw.size();
+        let buffer_record_bytes = layouts.buffer_record_bytes;
+        let records = layouts.order.size() / std::mem::size_of::<usize>();
+        let invoice =
+            Invoice::reserve(&owner, layouts.charged_bytes, "clustered_writer_workspace")?;
+        #[cfg(feature = "test-seams")]
+        super::layout_observation::admitted(
+            super::IvfConstructorAllocationForTest::WriterWorkspace(layouts),
+        );
         let mut out = Self {
             store,
             policy,

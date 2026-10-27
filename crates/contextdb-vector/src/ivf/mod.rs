@@ -23,3 +23,13 @@ pub use types::{
     RowIdentity, TrainingPolicy, Vector, Work,
 };
 pub use writer::{ClusteredIndex, RemapProgress};
+
+pub use book::{CodebookAllocationLayouts, codebook_allocation_layout};
+pub use writer::{WriterWorkspaceLayout, workspace_allocation_layout};
+#[cfg(feature = "test-seams")]
+mod layout_observation;
+#[cfg(feature = "test-seams")]
+pub use layout_observation::{
+    IvfConstructorAllocationForTest, IvfConstructorObserverForTest,
+    with_ivf_constructor_observer_for_test,
+};
