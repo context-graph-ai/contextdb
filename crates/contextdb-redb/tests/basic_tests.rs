@@ -432,7 +432,22 @@ fn list_tables() {
 
 #[test]
 // Test that these signatures compile
-fn tuple_type_function_lifetime() {}
+fn tuple_type_function_lifetime() {
+    #[allow(dead_code)]
+    fn insert_inferred_lifetime(table: &mut redb::Table<(&str, u8), u64>) {
+        table
+            .insert(&(String::from("hello").as_str(), 8), &1)
+            .unwrap();
+    }
+
+    #[allow(dead_code)]
+    #[allow(clippy::needless_lifetimes)]
+    fn insert_explicit_lifetime<'a>(table: &mut redb::Table<(&'a str, u8), u64>) {
+        table
+            .insert(&(String::from("hello").as_str(), 8), &1)
+            .unwrap();
+    }
+}
 
 #[test]
 fn tuple_type_lifetime() {
