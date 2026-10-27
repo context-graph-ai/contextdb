@@ -193,6 +193,9 @@ std::thread_local! {
     static OWNER_SERVICE_START_PUBLICATION_OBSERVER: std::cell::RefCell<
         Option<Arc<dyn OwnerServicePublicationObserver>>,
     > = const { std::cell::RefCell::new(None) };
+    static OWNER_SERVICE_START_EXECUTION_OBSERVER: std::cell::RefCell<
+        Option<Arc<dyn OwnerBoundedExecutionObserver>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -213,6 +216,27 @@ impl Drop for OwnerServiceStartPublicationObserverGuard {
         let previous = self.previous.take();
         OWNER_SERVICE_START_PUBLICATION_OBSERVER.with(|slot| {
             let _ = slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under test-seams; scoped owner observer attachment"
+    )
+)]
+struct OwnerServiceStartExecutionObserverGuard {
+    previous: Option<Arc<dyn OwnerBoundedExecutionObserver>>,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for OwnerServiceStartExecutionObserverGuard {
+    fn drop(&mut self) {
+        OWNER_SERVICE_START_EXECUTION_OBSERVER.with(|slot| {
+            let _ = slot.replace(self.previous.take());
         });
     }
 }
@@ -374,11 +398,33 @@ impl OwnerServiceSpec {
             clock,
             cursor_identifiers: Arc::new(SequenceCursorIdentifierAllocator::default()),
             #[cfg(any(test, feature = "test-seams"))]
-            execution_observer: None,
+            execution_observer: OWNER_SERVICE_START_EXECUTION_OBSERVER
+                .with(|slot| slot.borrow().clone()),
             #[cfg(any(test, feature = "test-seams"))]
             publication_observer: OWNER_SERVICE_START_PUBLICATION_OBSERVER
                 .with(|slot| slot.borrow().clone()),
         }
+    }
+
+    /// Attach an execution observer while Database constructs its real owner
+    /// service, restoring the thread-local attachment on return or unwind.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under test-seams; used by coexistence_guards.rs"
+        )
+    )]
+    pub fn with_execution_observer_during_start_for_test<T>(
+        observer: Arc<dyn OwnerBoundedExecutionObserver>,
+        start: impl FnOnce() -> T,
+    ) -> T {
+        let previous =
+            OWNER_SERVICE_START_EXECUTION_OBSERVER.with(|slot| slot.replace(Some(observer)));
+        let _guard = OwnerServiceStartExecutionObserverGuard { previous };
+        start()
     }
 
     /// Attach a publication observer to the owner service synchronously built
