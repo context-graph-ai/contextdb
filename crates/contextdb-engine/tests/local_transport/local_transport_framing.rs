@@ -119,7 +119,8 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
         maximum: MAX_FRAME_BYTES,
         calls: 0,
     };
-    let required_frame_memory = u64::try_from(frame.len() - std::mem::size_of::<u32>()).unwrap();
+    // Native owner admission can refuse before a complete byte requirement
+    // is known; the class and the caller's exact ceiling must survive.
     let budget_error = boundary
         .receive_frame(
             LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
@@ -131,7 +132,7 @@ fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
         budget_error,
         LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
             ceiling: 1,
-            required: Some(required_frame_memory)
+            required: None
         })
     );
 
