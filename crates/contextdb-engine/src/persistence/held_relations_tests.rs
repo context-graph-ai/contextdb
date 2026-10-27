@@ -788,3 +788,43 @@ fn a_real_position_tree_buffer_stays_funded_until_clear_after_growth_cancellatio
         "the actual node buffer frees before its charge"
     );
 }
+
+/// A detached Legacy write set has no active transaction left to clean it up.
+/// Its panic must refund the same staged rows as an ordinary failed apply,
+/// after the real persistence/cache release rather than before cached pages die.
+#[cfg(feature = "test-seams")]
+#[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "The injected commit returns the allocation-free inline public error."
+)]
+fn detached_staged_rows_refund_after_panic_and_physical_store_release() {
+    let mut ordinary_remaining = None;
+    for fault in [HoldFault::Error, HoldFault::Panic] {
+        let (_root, db, tx, _) = many_table_commit(COMMIT_TABLES);
+        let accountant = db.__accountant_handle_for_test();
+        let release = db.last_handle_release_for_test();
+        inject_hold_fault(HoldStep::AdmitName, fault, 0);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.commit(tx)));
+        assert!(!clear_hold_fault(), "the controlled failure fired");
+        match fault {
+            HoldFault::Error => assert!(matches!(outcome, Ok(Err(_)))),
+            HoldFault::Panic => assert!(outcome.is_err()),
+            _ => unreachable!(),
+        }
+        drop(db);
+        release
+            .wait_for_release_for_test()
+            .expect("physical store release");
+        let remaining = accountant.usage().used;
+        eprintln!("HOLDER_PHYSICAL_RELEASE fault={fault:?} remaining={remaining}");
+        if let Some(ordinary) = ordinary_remaining {
+            assert_eq!(
+                remaining, ordinary,
+                "panic retires every detached row invoice"
+            );
+        } else {
+            ordinary_remaining = Some(remaining);
+        }
+    }
+}

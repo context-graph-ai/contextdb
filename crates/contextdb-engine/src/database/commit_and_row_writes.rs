@@ -1,5 +1,21 @@
 use super::*;
 
+/// The legacy manager destroys its detached write set before unwinding back to
+/// this frame. Retire its recorded row invoices only after that destruction;
+/// ordinary returns keep the existing success/failure cleanup as their owner.
+struct DetachedRowUnwindRefund<'a> {
+    accountant: &'a crate::memory_accounting::AccountantHandle,
+    bytes: std::cell::Cell<usize>,
+}
+
+impl Drop for DetachedRowUnwindRefund<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() && self.bytes.get() != 0 {
+            self.accountant.release(self.bytes.get());
+        }
+    }
+}
+
 impl Database {
     pub(super) fn take_local_schema_stage(&self, lsn: Lsn) -> Option<LocalSchemaStage> {
         self.local_schema_stages.lock().remove(&lsn)
@@ -238,6 +254,10 @@ impl Database {
                     } else {
                         false
                     });
+                let detached_row_unwind_refund = DetachedRowUnwindRefund {
+                    accountant: &self.finalization.accountant,
+                    bytes: std::cell::Cell::new(0),
+                };
                 let (lsn, ws) = {
                     match self.tx_mgr.commit_with_lsn_precanonicalized_active_prepare_and_applied_mut(
                 tx,
@@ -666,6 +686,15 @@ impl Database {
                         }
                         detached_capture.set(Some(refused));
                     }
+                    if matches!(&self.tx_mgr, DatabaseTransactionHost::Legacy(_))
+                        && self.persistence.is_some()
+                        && self.relational_store.uses_disk_backed_committed_bodies()
+                    {
+                        let bytes = ws.relational_inserts.iter()
+                            .filter_map(|(table, row)| ws.admitted_bytes_for_staged_row(table, row.row_id))
+                            .sum();
+                        detached_row_unwind_refund.bytes.set(bytes);
+                    }
                     *publication_watch.borrow_mut() = Some(PublicationInterruptionWatch::arm(
                         &self.publication_interrupted,
                     ));
@@ -772,12 +801,14 @@ impl Database {
                 },
             ) {
                 Ok(committed) => {
+                    detached_row_unwind_refund.bytes.set(0);
                     if let Some(watch) = publication_watch.borrow_mut().take() {
                         watch.completed();
                     }
                     committed
                 }
                 Err(mut failure) => {
+                    detached_row_unwind_refund.bytes.set(0);
                     // An ordinary failure: nothing was published, and the
                     // durable apply either did not happen or reported its own
                     // error. The handle keeps serving.
