@@ -166,6 +166,10 @@ impl Charge {
 static PAUSED_LIVE: AtomicIsize = AtomicIsize::new(-1);
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_paused_search_holds_no_page_the_serving_cache_has_let_go() {
     let index = VectorIndexRef::new("items", "embedding");
     let entries = (0..POPULATION)

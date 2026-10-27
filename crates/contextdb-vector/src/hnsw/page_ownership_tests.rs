@@ -356,6 +356,10 @@ impl ReadOnlyVectorGraphPageReader for BytesReader {
 
 // One mapped row helper uses the real coordinate fold and distance arithmetic.
 // Seven-byte source pages force a float carry and an actual partial final page.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn exercise_page_fold_rows() {
     for (mode, held_full, directory_entries, deny_reserve, deny_reconcile) in [
         (ReadMode::Exact, false, 1, false, false),
@@ -584,6 +588,10 @@ pub(super) fn allocating_control(body: PageBody) -> Arc<PageBody> {
     answer
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn exercise_overflow_rows() {
     let paged = PagedHnsw {
         points: Vec::new(),

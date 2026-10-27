@@ -109,6 +109,10 @@ impl MemoryBudget for Budget {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_partition_fixture(
     store: &VectorStore,
     body_owner: &Arc<Budget>,
@@ -128,6 +132,10 @@ fn insert_partition_fixture(
     }
     result
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_inline_fixture(
     store: &VectorStore,
     body_owner: &Arc<Budget>,
@@ -197,6 +205,10 @@ fn entry(index: &VectorIndexRef, row: u64) -> VectorEntry {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn fixed_metadata_can_be_sampled_from_source_and_publication_views() {
     fn require_copy<T: Copy>(_: T) {}
 
@@ -464,6 +476,10 @@ fn renamed_index_rejects_the_old_name_even_when_that_name_is_reused() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn scalar_marking_preserves_historical_only_sources() {
     let declared_column_owner = Arc::new(Budget::default());
     let executing_owner = Arc::new(Budget::default());

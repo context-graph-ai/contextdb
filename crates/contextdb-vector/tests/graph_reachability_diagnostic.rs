@@ -79,6 +79,10 @@ fn policy() -> ResolvedVectorPolicy {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn report(label: &str, vectors: Vec<Vec<f32>>) {
     let dimension = vectors[0].len();
     let entries = entries(vectors);

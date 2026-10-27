@@ -209,6 +209,10 @@ impl Ledger {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn acquire(&self, event: HnswSearchScratchEvent) -> Result<(), Error> {
         let (container, bytes, covering) = match event {
             HnswSearchScratchEvent::Reserve {
@@ -288,6 +292,10 @@ impl Ledger {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_completed_search_keeps_every_live_allocation_charged() {
     let index = VectorIndexRef::new("items", "embedding");
     let entries = (0..POPULATION)

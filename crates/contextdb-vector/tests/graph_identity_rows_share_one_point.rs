@@ -54,6 +54,10 @@ fn policy() -> ResolvedVectorPolicy {
 
 /// Build the family with `workers` and require one point per graph identity
 /// and no unreachable point.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn assert_family(label: &str, vectors: Vec<Vec<f32>>, identities: usize) {
     let dimension = vectors[0].len();
     let entries = entries(vectors);
@@ -84,6 +88,10 @@ fn assert_family(label: &str, vectors: Vec<Vec<f32>>, identities: usize) {
 }
 
 /// Graph points of a build, for families that are not grouped.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn points(vectors: Vec<Vec<f32>>) -> usize {
     let dimension = vectors[0].len();
     HnswIndex::from_vector_entries_with_parallel_progress(

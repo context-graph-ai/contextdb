@@ -89,6 +89,10 @@ impl Budget {
             directories,
         });
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn acquire(&self, event: HnswSearchScratchEvent) -> Result<()> {
         let bytes = match event {
             HnswSearchScratchEvent::Reserve {
@@ -133,6 +137,10 @@ impl ReadOnlyVectorGraphPageReader for Reader {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prepaid_generation_and_search_directory_funders_cover_shared_controls_until_physical_retirement()
 {
     for reverse_drop_order in [false, true] {

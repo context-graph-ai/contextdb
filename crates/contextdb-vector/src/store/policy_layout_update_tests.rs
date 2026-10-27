@@ -296,6 +296,10 @@ fn publish_and_recheck(
 
 /// As [`publish_and_recheck`], returning the recheck's refusal instead of
 /// panicking on it.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn publish_and_try_recheck(
     store: &VectorStore,
     target: VectorIndexLayout,

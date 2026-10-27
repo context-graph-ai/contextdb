@@ -533,6 +533,10 @@ pub struct Plan {
 
 /// One graph search over the fixture's generation, charging its working
 /// memory to `held`. Returns its rows and how many pages it read.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn search(
     fixture: &Fixture,
     query: &[f32],

@@ -66,6 +66,10 @@ fn layout() -> VectorIndexLayout {
     )
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn seeded() -> (VectorStore, Arc<IndexState>, Arc<Budget>) {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
     let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
@@ -205,6 +209,10 @@ fn successful_tail_publication_consumes_prior_admission_without_rebuilding() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn snapshot_counts_and_filtered_eligibility_do_not_walk_excluded_history() {
     let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
     let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());

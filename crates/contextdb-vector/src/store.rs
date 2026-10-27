@@ -2408,6 +2408,10 @@ impl Drop for LoadedRawVectorPartition {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn load_co_created_fixture_carriers(
     entries: &[VectorEntry],
     directory: Option<&[RawVectorDirectoryEntry]>,
@@ -26379,6 +26383,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visible_id_work_skips_obsolete_directory_intervals() {
         for history in [0, 64, 4096_u64] {
             let state = IndexState::new(2, VectorQuantization::F32);
@@ -26663,6 +26671,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn dormant_candidate_scoring_charges_releases_and_cancels_without_bulk_hydration() {
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
@@ -28669,6 +28681,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn sampled_build_accounts_for_the_fresh_tail_and_candidate_separately() {
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
@@ -28837,6 +28853,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn sampled_maintenance_publishes_while_every_build_attempt_overlaps_a_write() {
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
@@ -28914,6 +28934,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn disabled_consolidation_skips_an_interrupted_threshold_retry_but_keeps_required_builds() {
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
@@ -29116,6 +29140,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn refused_sampled_build_restores_the_old_tail_replay_frontier() {
         // A failed captured suffix load rolls back this invocation's new graph
         // slots while preserving the exact contents and credit already present.
@@ -29758,6 +29786,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn maintenance_failure_marks_are_stable_until_successful_publication() {
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());

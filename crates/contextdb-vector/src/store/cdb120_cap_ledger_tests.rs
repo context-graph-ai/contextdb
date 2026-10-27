@@ -91,6 +91,10 @@ impl Fixture {
         VectorCopyAdmission::new(self.executing.clone())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare(
         &self,
         deletes: Vec<PartitionedVectorDelete>,
@@ -115,6 +119,10 @@ impl Fixture {
             .publish_prepared_partitioned_batch(prepared, Lsn(lsn), None);
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn insert(&mut self, k: u64, row: u64, tx: TxId, holds: &[SnapshotId]) -> Result<()> {
         let prepared = self.prepare(
             vec![],
@@ -188,6 +196,10 @@ fn cap_refusal(error: &Error, cap: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cdb120_ledger_equals_a_recount_after_every_kind_of_publication() {
     let mut f = Fixture::new(4);
     for k in 0..4 {

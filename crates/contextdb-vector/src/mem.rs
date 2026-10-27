@@ -9897,6 +9897,10 @@ mod indexed_row_check_empty_merge_tests {
         )
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn grouped(
         executor: &MemVectorExecutor<TestStore>,
         index: &VectorIndexRef,
@@ -9919,6 +9923,10 @@ mod indexed_row_check_empty_merge_tests {
         groups
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn rejected_flat_outcome(
         executor: &MemVectorExecutor<TestStore>,
         index: &VectorIndexRef,
@@ -10055,6 +10063,10 @@ mod indexed_row_check_empty_merge_tests {
         navigation
     }
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn actual_row_check_admission_reclaims_full_base_cache_before_predicate() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
         let payer = Arc::new(NavigationPressureBudget {
@@ -10330,6 +10342,10 @@ mod indexed_row_check_empty_merge_tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn actual_journal_directory_caller_reclaims_full_base_cache_before_copy_admission() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
         let (executor, index, snapshot, mut fixture_owner) = fixture(4);

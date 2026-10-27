@@ -170,6 +170,10 @@ impl paged_builder::PagedVectorGraphSource for UnusedSource {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn durable_expansion_reads_one_point_body_per_distance_plus_required_adjacency() {
     for (bridge, allow_bridges, admitted, wrong_identity, wrong_body, cached_fault) in [
         (false, false, true, false, false, 0),

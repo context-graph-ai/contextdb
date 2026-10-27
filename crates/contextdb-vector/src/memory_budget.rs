@@ -1173,6 +1173,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn resizing_workspace_moves_one_charge_between_ownership_phases() {
         // Additive historical-route ownership rows of the existing workspace host.
         // The flag is crate-private; this module reaches it without a forwarding seam.

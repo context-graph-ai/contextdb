@@ -186,6 +186,10 @@ fn quarantined_cancel_fixture() -> (
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn quarantined_preload_propagates_typed_cancellation_on_both_search_routes() {
     use contextdb_core::VectorSearchMode;
     use contextdb_vector::hnsw::HnswAllowedSearchLimits;
@@ -394,6 +398,10 @@ fn exact_vector(dim: usize, axis: usize) -> Vec<f32> {
     vector
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_fixture_vectors(
     store: &VectorStore,
     entries: Vec<VectorEntry>,
@@ -1050,6 +1058,10 @@ fn a_durable_generation_with_no_live_vectors_loads_as_an_empty_graph() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() {
     use contextdb_core::{VectorPartitionKey, VectorSearchMode};
     use contextdb_vector::hnsw::{HnswAllowedSearchLimits, HnswIndex};
@@ -1651,6 +1663,10 @@ fn concurrent_same_ref_updates_in_order(first_tx: u64) {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
     let r = index();
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -3703,6 +3719,10 @@ fn two_independent_vector_stores_do_not_share_maintenance_locks() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn ordinary_and_bounded_indexed_search_share_snapshot_effort_across_size_band_delete() {
     use contextdb_vector::hnsw::HnswAllowedSearchLimits;
     use contextdb_vector::mem::BoundedHnswOutcome;
