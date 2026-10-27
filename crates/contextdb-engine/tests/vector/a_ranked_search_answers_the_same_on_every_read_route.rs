@@ -3,9 +3,7 @@
 //! that reads the closed store's file directly. The rank policy's joined
 //! weights decide the order on every one of them.
 
-#[path = "../fixtures/retained_query_rows.rs"]
-mod retained_query_rows;
-use retained_query_rows::RetainedRows;
+use super::retained_query_rows::RetainedRows;
 
 use contextdb_core::Value;
 use contextdb_engine::{Database, MaintenancePolicy};

@@ -111,6 +111,8 @@ mod quantized_vector_read_agreement;
 mod restamped_group_rescoring_stays_inside_the_breadth_allowance;
 #[path = "vector/retained_indexed_rows.rs"]
 mod retained_indexed_rows;
+#[path = "fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
 #[path = "vector/row_delete_and_guards_honor_vector_columns.rs"]
 mod row_delete_and_guards_honor_vector_columns;
 #[path = "vector/rows_sharing_a_graph_point_answer_per_row.rs"]

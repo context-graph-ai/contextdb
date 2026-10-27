@@ -5,9 +5,7 @@
 //! threshold the partition walks its graph as before. A scope may mix both;
 //! its answer is the one global top-k either way.
 
-#[path = "../fixtures/retained_query_rows.rs"]
-mod retained_query_rows;
-use retained_query_rows::RetainedRows;
+use super::retained_query_rows::RetainedRows;
 
 use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
 use contextdb_core::{Error, Value, VectorIndexRef, VectorPolicyDeclarationIssue as Issue};

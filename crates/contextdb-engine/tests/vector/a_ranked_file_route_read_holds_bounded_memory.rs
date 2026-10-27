@@ -4,9 +4,7 @@
 //! joined body at a time however many candidates are ranked. Each case also
 //! answers the same on the writer, the owner route and the file route.
 
-#[path = "../fixtures/retained_query_rows.rs"]
-mod retained_query_rows;
-use retained_query_rows::RetainedRows;
+use super::retained_query_rows::RetainedRows;
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;

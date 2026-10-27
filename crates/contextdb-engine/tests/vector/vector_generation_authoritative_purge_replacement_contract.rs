@@ -3,9 +3,7 @@
 //! maintained indexed route; permanently forgetting one row cannot make every
 //! surviving row unavailable until a later maintenance call.
 
-#[path = "../fixtures/retained_query_rows.rs"]
-mod retained_query_rows;
-use retained_query_rows::RetainedRows;
+use super::retained_query_rows::RetainedRows;
 
 use contextdb_core::{Error, TenantId, Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;

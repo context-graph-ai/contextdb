@@ -8,9 +8,7 @@
 //! total charged work, examined rows, the per-source work split, the source
 //! items actually reached, and the answer itself.
 
-#[path = "../fixtures/retained_query_rows.rs"]
-mod retained_query_rows;
-use retained_query_rows::RetainedRows;
+use super::retained_query_rows::RetainedRows;
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{Value, VectorIndexRef};

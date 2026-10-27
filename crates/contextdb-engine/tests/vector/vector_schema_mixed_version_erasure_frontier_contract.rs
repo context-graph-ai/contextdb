@@ -7,9 +7,7 @@
 //! lands after a schema-only outbound snapshot. Every public bookmark must
 //! describe only history delivered to the current store.
 
-#[path = "../fixtures/retained_query_rows.rs"]
-mod retained_query_rows;
-use retained_query_rows::RetainedRows;
+use super::retained_query_rows::RetainedRows;
 
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::sync_types::{SchemaSyncCapability, SchemaSyncHoldback};

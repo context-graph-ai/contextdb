@@ -1,6 +1,4 @@
-#[path = "../fixtures/retained_query_rows.rs"]
-mod retained_query_rows;
-use retained_query_rows::RetainedRows;
+use super::retained_query_rows::RetainedRows;
 
 use super::maintained_search;
 use contextdb_core::read_contract::{
