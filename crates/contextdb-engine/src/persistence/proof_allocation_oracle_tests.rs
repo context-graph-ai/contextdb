@@ -3788,6 +3788,10 @@ mod row_check_cache_ownership_contract {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "The allocation oracle compares each indexed position with its recorded slot."
+    )]
     fn run_case_with_mode(
         db: &Database,
         cap: u64,
