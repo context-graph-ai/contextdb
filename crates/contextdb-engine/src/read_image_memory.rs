@@ -4004,7 +4004,7 @@ impl MaintenancePhase {
             record.open_residue
         );
         let len = output.position() as usize;
-        drop(output);
+
         if formatted.is_ok() {
             if let Some(mut file) = file.as_ref() {
                 let _ = file.write_all(&buffer[..len]);
