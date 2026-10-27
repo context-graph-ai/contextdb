@@ -537,6 +537,10 @@ fn direct_session_native_sources_prepay_and_keep_original_invoices_until_last_ph
 // retry its original store; never replace the payer with a stand-in meter.
 #[test]
 #[serial_test::serial]
+#[expect(
+    clippy::int_plus_one,
+    reason = "The assertion states that at least one more item was observed after the stored cutpoint."
+)]
 fn direct_session_source_constructor_refusals_and_native_nulls_leave_no_original_charge() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let directory = tempfile::tempdir().unwrap();
