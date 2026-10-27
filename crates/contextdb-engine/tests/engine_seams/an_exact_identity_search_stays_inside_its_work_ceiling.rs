@@ -72,6 +72,10 @@ fn measure(db: &contextdb_engine::Database, id: usize) -> (Work, BillingWork) {
 }
 
 #[test]
+#[expect(
+    clippy::absurd_extreme_comparisons,
+    reason = "The work-ceiling assertion compares every measured dimension directly, including zero ceilings."
+)]
 fn an_exact_identity_search_over_a_maintained_partition_stays_inside_its_work_ceiling() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();
