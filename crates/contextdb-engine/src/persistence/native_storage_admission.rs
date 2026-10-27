@@ -757,7 +757,30 @@ impl Drop for StorageAdmissionScope {
     }
 }
 
-/// Scalar descriptor only; does not replace WriterSnapshot or adopt its schema.
+/// Keep the actual native operation and numeric refusal intact for traces.
+// Only the row-writing boundary supplies the user-facing table-root phase.
+pub(super) fn transaction_row_root_refusal(mut error: Error, ws: &contextdb_tx::WriteSet) -> Error {
+    if let Error::MemoryBudgetExceeded {
+        subsystem,
+        operation,
+        hint,
+        ..
+    } = &mut error
+        && subsystem.as_ref() == "redb"
+        && operation.as_ref() == "pending_directory"
+    {
+        // The existing admission sidecar already has one key per inserted
+        // table. Mixed/delete-only writes retain the truthful phase without
+        // inventing a table count or allocating another directory on refusal.
+        let tables = (ws.relational_deletes.is_empty() && !ws.relational_inserts.is_empty())
+            .then_some(ws.relational_insert_admitted_bytes.len())
+            .filter(|count| *count != 0);
+        *hint = contextdb_core::error::DiagnosticLabel::transaction_row_roots_hint(tables);
+    }
+    error
+}
+
+// Scalar descriptor only; does not replace WriterSnapshot or adopt its schema.
 #[derive(Clone, Copy)]
 pub(crate) struct ColdSnapshotMetadata {
     pub(crate) identity: redb::StorageSnapshotIdentity,

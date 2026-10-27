@@ -231,8 +231,11 @@ impl RedbPersistence {
         options: FlushDataOptions<'_>,
         prepare_publication: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        let _decode_scope = self.writer_decode_scope()?;
-        self.prepare_proof_owner()?;
+        let _decode_scope = self
+            .writer_decode_scope()
+            .map_err(|error| native_storage_admission::transaction_row_root_refusal(error, ws))?;
+        self.prepare_proof_owner()
+            .map_err(|error| native_storage_admission::transaction_row_root_refusal(error, ws))?;
         let deleted_rows_snapshot = options.snapshots.deleted_rows;
         let sink_events = options.sink_events;
         let trigger_audits = options.trigger_audits;
@@ -1392,7 +1395,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 observe_append_stage(AppendStage::Commit, &mut stage_started);
             }
             Ok(())
-        })
+        }).map_err(|error| native_storage_admission::transaction_row_root_refusal(error, ws))
     }
 
     /// Commit a complete received-schema projection in the transaction that

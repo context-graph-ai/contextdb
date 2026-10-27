@@ -420,6 +420,9 @@ impl std::fmt::Debug for DiagnosticText {
 pub struct DiagnosticLabel(DiagnosticLabelStorage);
 enum DiagnosticLabelStorage {
     Text(Cow<'static, str>),
+    TransactionRowRoots {
+        tables: Option<usize>,
+    },
     Native {
         pointer: std::ptr::NonNull<()>,
         text: unsafe fn(std::ptr::NonNull<()>) -> *const str,
@@ -430,6 +433,12 @@ enum DiagnosticLabelStorage {
 unsafe impl Send for DiagnosticLabel {}
 unsafe impl Sync for DiagnosticLabel {}
 impl DiagnosticLabel {
+    /// Inline context for a real table-root refusal while writing rows.
+    /// Formatting this context requires no diagnostic allocation.
+    #[doc(hidden)]
+    pub fn transaction_row_roots_hint(tables: Option<usize>) -> Self {
+        Self(DiagnosticLabelStorage::TransactionRowRoots { tables })
+    }
     #[doc(hidden)]
     pub fn from_shared<I: Send + Sync + 'static>(
         value: crate::read_memory::ReadShared<String, I>,
@@ -520,6 +529,7 @@ impl DiagnosticLabel {
     pub fn static_text(&self) -> Option<&'static str> {
         match &self.0 {
             DiagnosticLabelStorage::Text(Cow::Borrowed(text)) => Some(*text),
+            DiagnosticLabelStorage::TransactionRowRoots { .. } => Some(TRANSACTION_ROW_ROOTS_HINT),
             _ => None,
         }
     }
@@ -532,6 +542,9 @@ impl DiagnosticLabel {
             }
             DiagnosticLabelStorage::Native { pointer, text, .. } => {
                 unsafe { &*text(*pointer) }.to_owned()
+            }
+            DiagnosticLabelStorage::TransactionRowRoots { .. } => {
+                TRANSACTION_ROW_ROOTS_HINT.to_owned()
             }
         }
     }
@@ -565,6 +578,7 @@ impl AsRef<str> for DiagnosticLabel {
     fn as_ref(&self) -> &str {
         match &self.0 {
             DiagnosticLabelStorage::Text(text) => text,
+            DiagnosticLabelStorage::TransactionRowRoots { .. } => TRANSACTION_ROW_ROOTS_HINT,
             // SAFETY: this handle retains the immutable native cell and its
             // original invoice for the entire returned borrow.
             DiagnosticLabelStorage::Native { pointer, text, .. } => unsafe { &*text(*pointer) },
@@ -624,6 +638,61 @@ impl std::fmt::Display for ReaderWaitHelperExit {
             f,
             "the writer's acquisition helper ended without the store: {self:?}"
         )
+    }
+}
+
+const TRANSACTION_ROW_ROOTS_HINT: &str =
+    "Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to.";
+
+struct MemoryBudgetDisplay<'a> {
+    subsystem: &'a DiagnosticLabel,
+    operation: &'a DiagnosticLabel,
+    requested: &'a usize,
+    available: &'a usize,
+    limit: &'a usize,
+    hint: &'a DiagnosticLabel,
+}
+impl std::fmt::Display for MemoryBudgetDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let DiagnosticLabelStorage::TransactionRowRoots { tables } = &self.hint.0 {
+            f.write_str("writing this transaction's rows")?;
+            if let Some(tables) = tables {
+                write!(f, " to {tables} tables")?;
+            }
+            write!(
+                f,
+                ": the table roots did not fit in the declared memory ({} B requested, {} B available of {} B). Hint: {}",
+                self.requested, self.available, self.limit, self.hint
+            )
+        } else {
+            write!(
+                f,
+                "memory budget exceeded: {}/{} requested {} bytes, {} available of {} budget. Hint: {}",
+                self.subsystem,
+                self.operation,
+                self.requested,
+                self.available,
+                self.limit,
+                self.hint
+            )
+        }
+    }
+}
+fn memory_budget_display<'a>(
+    subsystem: &'a DiagnosticLabel,
+    operation: &'a DiagnosticLabel,
+    requested: &'a usize,
+    available: &'a usize,
+    limit: &'a usize,
+    hint: &'a DiagnosticLabel,
+) -> MemoryBudgetDisplay<'a> {
+    MemoryBudgetDisplay {
+        subsystem,
+        operation,
+        requested,
+        available,
+        limit,
+        hint,
     }
 }
 
@@ -1266,7 +1335,15 @@ pub enum Error {
     #[error("plugin rejected at {hook}: {reason}")]
     PluginRejected { hook: String, reason: String },
     #[error(
-        "memory budget exceeded: {subsystem}/{operation} requested {requested_bytes} bytes, {available_bytes} available of {budget_limit_bytes} budget. Hint: {hint}"
+        "{}",
+        memory_budget_display(
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint
+        )
     )]
     MemoryBudgetExceeded {
         subsystem: DiagnosticLabel,
