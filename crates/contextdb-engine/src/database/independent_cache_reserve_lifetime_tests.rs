@@ -25,8 +25,8 @@ fn actual_funding(accountant: &crate::memory_accounting::AccountantHandle, resid
 }
 
 // Every pointer must name its own actual current payer; a plausible aggregate
-// alone cannot qualify the overlap. SourceCounted is deliberately NOT blessed
-// by cache capacity: that branch needs a separate authentic source-invoice proof.
+// alone cannot qualify the overlap. Source-counted dirty pages retain their
+// genuine source invoice until a paid cache handoff or physical free.
 fn paid_pages(pages: &[&redb::CachePageForTest], controls: &redb::CacheReserveOwner) {
     let counters = controls.observation_for_test();
     let mut expected = [0usize; 2];
@@ -36,9 +36,9 @@ fn paid_pages(pages: &[&redb::CachePageForTest], controls: &redb::CacheReserveOw
             assert_ne!(allocation.0, other.allocation().0);
         }
         let payment = page.payment();
-        assert_eq!(
-            payment.0, "cache",
-            "non-cache payer needs its authentic source invoice proof: {allocation:?} {payment:?}"
+        assert!(
+            matches!(payment.0, "cache" | "source_counted"),
+            "every page retains its real cache or source-counted payer: {allocation:?} {payment:?}"
         );
         let payer = counters
             .iter()
@@ -61,6 +61,15 @@ fn paid_pages(pages: &[&redb::CachePageForTest], controls: &redb::CacheReserveOw
         eprintln!(
             "CACHE_CURRENT_PAYMENT allocation={allocation:?} payment={payment:?} counters={counters:?}"
         );
+    }
+}
+
+fn source_invoice(page: &redb::CachePageForTest) -> usize {
+    if page.payment().0 == "source_counted" {
+        page.allocation().1
+            + crate::persistence::native_storage_admission::StorageAdmissionScope::receipt_layout_for_scan_test().size()
+    } else {
+        0
     }
 }
 
@@ -126,6 +135,7 @@ fn physical_parent_row(residue: bool, recycle: bool) {
     let mut next_generation = None;
     if recycle {
         let before = actual_funding(&accountant, residue);
+        let source_before = source_invoice(&dirty);
         assert!(
             persistence
                 .recycle_cache_handle_for_test()
@@ -141,8 +151,8 @@ fn physical_parent_row(residue: bool, recycle: bool) {
         assert_eq!(persistence.cache_funded_bytes(), Some(fixed));
         assert_eq!(
             actual_funding(&accountant, residue),
-            before,
-            "preparation overlap refunds; no second fixed reserve is charged"
+            before - source_before + source_invoice(&dirty),
+            "preparation refunds and a paid destination may retire the original dirty source invoice; no second fixed reserve is charged"
         );
         paid_pages(&[&cached, &dirty], &controls);
         let (fresh, fresh_dirty, fresh_control) = persistence
@@ -221,6 +231,7 @@ fn physical_parent_row(residue: bool, recycle: bool) {
         occupied - old_cached.1
     );
 
+    let dirty_source_invoice = source_invoice(&dirty);
     oracle::watch_exact_free_for_test(old_dirty, counter);
     drop(dirty);
     drop(dirty_clone);
@@ -235,6 +246,11 @@ fn physical_parent_row(residue: bool, recycle: bool) {
         oracle::source_free_for_test(1)[0],
         (funded, funded, 1),
         "dirty/map/control teardown must precede fixed reserve refund"
+    );
+    assert_eq!(
+        actual_funding(&accountant, residue),
+        funded - dirty_source_invoice,
+        "the actual original source refunds exactly its backing and receipt after physical dirty free"
     );
     assert_eq!(controls.observation_for_test().map(|v| v.1), [0, 0]);
     assert!(
