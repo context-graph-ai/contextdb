@@ -1734,6 +1734,10 @@ fn live_body(db: &Database, id: i64) -> Vec<Vec<Value>> {
 // The six historical page tests reopen the same store file. None reopen an
 // `export_snapshot` artifact, and none place the fresh life in that stream.
 #[test]
+#[expect(
+    clippy::single_match,
+    reason = "The cursor fixture spells out both advancing and exhausted states while asserting progression."
+)]
 fn an_exported_snapshot_after_recreation_replays_authored_body_schema_and_a_distinct_fresh_occurrence()
  {
     let dir = tempfile::tempdir().expect("historical export directory");
