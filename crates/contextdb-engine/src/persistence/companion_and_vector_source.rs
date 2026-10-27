@@ -247,19 +247,13 @@ pub(crate) fn redb_cache_bytes_for_limit(limit: Option<usize>) -> usize {
     redb_reader_cache_bytes(budget, None)
 }
 
-/// Internal writer subdivision of the unchanged memory budget: for limit L,
-/// `max(min(64 MiB, L / 16), min(256 KiB, L / 16))`; without a limit,
-/// 64 MiB. The capped floor preserves small-limit transitions. Reader sizing
-/// remains independent, and the existing page-cache owner charges this share.
+/// The writer's serving cache uses the reader default over its declared budget.
+/// Dirty source pages keep their separate original writer payer.
 pub(crate) fn redb_writer_cache_bytes_for_limit(limit: Option<usize>) -> usize {
-    const WRITER_CACHE_BYTES: usize = 64 * 1024 * 1024;
-    // A writer that declares no limit sizes its cache from the process
-    // ceiling it is bounded by, exactly as a declared limit of that size.
-    let limit = limit.unwrap_or_else(crate::memory_accounting::effective_process_ceiling);
-    let share = limit / 16;
-    share
-        .min(WRITER_CACHE_BYTES)
-        .max(share.min(REDB_CACHE_FLOOR_BYTES))
+    redb_reader_cache_bytes(
+        limit.unwrap_or_else(crate::memory_accounting::effective_process_ceiling),
+        None,
+    )
 }
 
 /// Read-only test seam exposing the writer's page-cache reserve for a

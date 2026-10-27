@@ -185,6 +185,14 @@ impl std::fmt::Display for NativeRefusal {
 
 #[doc(hidden)]
 pub trait ReadMemoryBudget: Debug + Send + Sync {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    fn coordination_counter_for_test(
+        &self,
+    ) -> Option<crate::coordination_test_observation::FundingCounter<'_>> {
+        None
+    }
+
     /// Identity of the actual accountant charged by this provider, if known.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
@@ -341,6 +349,9 @@ type NativeReserve = unsafe fn(
 
 struct NativeVtable {
     #[cfg(feature = "test-seams")]
+    coordination_counter:
+        unsafe fn(NonNull<()>) -> Option<crate::coordination_test_observation::CounterAddress>,
+    #[cfg(feature = "test-seams")]
     funding_accountant: unsafe fn(NonNull<()>) -> Option<usize>,
     native_reserve_supported: unsafe fn(NonNull<()>) -> bool,
     constrain_operation_memory: unsafe fn(NonNull<()>, usize),
@@ -402,6 +413,8 @@ impl<I> Drop for NativeFreeGuard<I> {
 impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T, I> {
     const VTABLE: NativeVtable = NativeVtable {
         #[cfg(feature = "test-seams")]
+        coordination_counter: Self::coordination_counter,
+        #[cfg(feature = "test-seams")]
         funding_accountant: Self::funding_accountant,
         native_reserve_supported: Self::native_reserve_supported,
         constrain_operation_memory: Self::constrain_operation_memory,
@@ -413,6 +426,20 @@ impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T,
         clone_owner: Self::clone_owner,
         drop_owner: Self::drop_owner,
     };
+    #[cfg(feature = "test-seams")]
+    unsafe fn coordination_counter(
+        block: NonNull<()>,
+    ) -> Option<crate::coordination_test_observation::CounterAddress> {
+        // SAFETY: the real strong owner pins this monomorphized original provider.
+        unsafe {
+            block
+                .cast::<Self>()
+                .as_ref()
+                .payload
+                .coordination_counter_for_test()
+        }
+        .map(crate::coordination_test_observation::FundingCounter::address)
+    }
     #[cfg(feature = "test-seams")]
     unsafe fn funding_accountant(block: NonNull<()>) -> Option<usize> {
         // The same monomorphized strong owner pins this exact provider.
@@ -832,6 +859,22 @@ impl AsRef<dyn ReadMemoryBudget> for ReadMemoryOwner {
     }
 }
 impl ReadMemoryBudget for ReadMemoryOwner {
+    #[cfg(feature = "test-seams")]
+    fn coordination_counter_for_test(
+        &self,
+    ) -> Option<crate::coordination_test_observation::FundingCounter<'_>> {
+        match &self.0 {
+            OwnerKind::Legacy(owner, _) => owner.coordination_counter_for_test(),
+            OwnerKind::Native(owner) => {
+                // SAFETY: this borrowed strong owner pins the actual typed provider atomics.
+                unsafe {
+                    (owner.vtable.coordination_counter)(owner.block)
+                        .map(|counter| counter.borrowed())
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "test-seams")]
     fn funding_accountant_identity_for_test(&self) -> Option<usize> {
         match &self.0 {

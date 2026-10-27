@@ -417,7 +417,7 @@
 +}
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -20,13 +20,32 @@
+@@ -20,12 +20,31 @@
  use crate::sealed::Sealed;
  use crate::transactions::{
      ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, DATA_ALLOCATED_TABLE,
@@ -429,7 +429,7 @@
  use crate::tree_store::file_backend::FileBackend;
  #[cfg(feature = "logging")]
  use log::{debug, info, warn};
- 
++
 +#[cfg(feature = "test-seams")]
 +pub(crate) mod allocator_metadata_test_seams;
 +
@@ -448,27 +448,28 @@
 +    /// Fail the save after the free totals are encoded, before publication.
 +    FailAfterEncode,
 +}
-+
+ 
  #[allow(clippy::len_without_is_empty)]
  /// Implements persistent storage for a database.
- pub trait StorageBackend: 'static + Debug + Send + Sync {
-@@ -49,6 +68,12 @@
+@@ -48,6 +67,12 @@
+ 
      /// Writes the specified array to the storage.
      fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
- 
++
 +    /// Create non-durable allocator scratch storage beside this backend's file.
 +    /// Backends without a file may retain the in-memory allocator instead.
 +    fn scratch_backend(&self) -> std::result::Result<Option<Box<dyn ScratchBackend>>, io::Error> {
 +        Ok(None)
 +    }
-+
+ 
      /// Release any resources held by the backend
      ///
-     /// Note: redb will not access the backend after calling this method and will call it exactly
-@@ -58,6 +83,179 @@
+@@ -56,6 +81,179 @@
+     fn close(&self) -> std::result::Result<(), io::Error> {
+         Ok(())
      }
- }
- 
++}
++
 +/// Original construction capability. Legacy or wrapped backends never acquire it implicitly.
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
@@ -640,11 +641,9 @@
 +    Ok(Box::new(TemporaryScratch(std::sync::Mutex::new(
 +        tempfile::tempfile_in(directory)?,
 +    ))))
-+}
-+
+ }
+ 
  pub trait TableHandle: Sealed {
-     // Returns the name of the table
-     fn name(&self) -> &str;
 @@ -126,6 +324,10 @@
      /// Panics if `name` is empty. When `name` is a non-empty string literal
      /// this is checked at compile time, but callers that build the name at
@@ -678,17 +677,18 @@
  }
  
  impl TransactionGuard {
-@@ -286,9 +496,46 @@
+@@ -286,7 +496,44 @@
              transaction_tracker: Some(tracker),
              transaction_id: Some(transaction_id),
              write_transaction: false,
+-        }
 +            #[cfg(feature = "contextdb-internal")]
 +            prepared: false,
 +            #[cfg(feature = "contextdb-internal")]
 +            prepared_active: None,
-         }
-     }
- 
++        }
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn new_prepared(
 +        transaction_id: TransactionId,
@@ -720,11 +720,9 @@
 +            .as_ref()
 +            .expect("prepared guard")
 +            .clone()
-+    }
-+
+     }
+ 
      pub(crate) fn new_write(
-         transaction_id: TransactionId,
-         tracker: Arc<TransactionTracker>,
 @@ -297,6 +544,10 @@
              transaction_tracker: Some(tracker),
              transaction_id: Some(transaction_id),
@@ -759,22 +757,22 @@
          }
      }
  
-@@ -323,6 +590,14 @@
+@@ -321,6 +588,14 @@
+ impl Drop for TransactionGuard {
+     fn drop(&mut self) {
          if self.transaction_tracker.is_none() {
-             return;
-         }
++            return;
++        }
 +        #[cfg(feature = "contextdb-internal")]
 +        if self.prepared {
 +            self.transaction_tracker
 +                .as_ref()
 +                .unwrap()
 +                .remove_prepared_pin(self.id());
-+            return;
-+        }
+             return;
+         }
          if let Some(transaction_id) = self.transaction_id {
-             if self.write_transaction {
-                 self.transaction_tracker
-@@ -419,17 +694,348 @@
+@@ -419,9 +694,329 @@
  }
  
  impl ReadOnlyDatabase {
@@ -918,8 +916,8 @@
      /// Opens an existing redb database.
      pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
          Builder::new().open_read_only(path)
-     }
- 
++    }
++
 +    /// Whether this handle's header says a writer died mid-run. Such a store
 +    /// is read at its last verified commit through
 +    /// [`ReadOnlyDatabase::crashed_snapshot_for_registration`].
@@ -1101,14 +1099,14 @@
 +        snapshot: crate::StorageSnapshotIdentity,
 +    ) -> Result<ReadTransaction, TransactionError> {
 +        ReadTransaction::new_external(self.mem.clone(), snapshot)
-+    }
-+
+     }
+ 
      fn new(
-         file: Box<dyn StorageBackend>,
+@@ -429,6 +1024,17 @@
          page_size: usize,
          region_size: Option<u64>,
          cache_size: usize,
-     ) -> Result<Self, DatabaseError> {
++    ) -> Result<Self, DatabaseError> {
 +        Self::new_inner(file, page_size, region_size, cache_size, false, false)
 +    }
 +
@@ -1119,10 +1117,9 @@
 +        cache_size: usize,
 +        external_read: bool,
 +        allocator_free: bool,
-+    ) -> Result<Self, DatabaseError> {
+     ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-         #[cfg(feature = "logging")]
 @@ -441,21 +1047,26 @@
              region_size,
              cache_size,
@@ -1142,6 +1139,8 @@
 -                &file_path
 -            );
 -            return Err(DatabaseError::RepairAborted);
+-        }
+-
 +        // External readers use a registered user root. Allocator state may
 +        // belong to a concurrently committing writer and is never consulted.
 +        // A reader never allocates, so an allocator-free handle loads none.
@@ -1156,16 +1155,18 @@
 +                );
 +                return Err(DatabaseError::RepairAborted);
 +            }
-         }
--
++        }
 +        // This handle owns only its local read-transaction tracking.
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -466,6 +1077,303 @@
-     }
- }
+@@ -463,6 +1074,334 @@
+         };
  
+         Ok(db)
++    }
++}
++
 +/// The most base pages a registered reader's root capture may read, header
 +/// included: one header page, at most 4 system-tree pages (6 fixed system
 +/// tables), at most 33 allocator-state branches at 2 requests each (a prefix
@@ -1463,10 +1464,38 @@
 +    Ok(recorded == mem.get_last_committed_transaction_id()?.raw_id())
 +}
 +
- /// Opened redb database file
- ///
- /// Use [`Self::begin_read`] to get a [`ReadTransaction`] object that can be used to read from the database
-@@ -502,6 +1410,9 @@
++/// An observation lease on the actual serving page cache. Cloning the existing
++/// memory owner allocates no control block. Callers release database handle
++/// locks before execution; page windows observe only this cache's identities.
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub struct ReadCacheObservation {
++    memory: Arc<TransactionalMemory>,
++}
++#[cfg(feature = "contextdb-internal")]
++impl ReadCacheObservation {
++    pub fn installed_capacity(&self) -> usize {
++        self.memory.installed_cache_capacity()
++    }
++    pub fn index_bytes(&self) -> usize {
++        self.memory.cache_index_bytes()
++    }
++    pub fn held_page_bytes(&self) -> usize {
++        self.memory.read_cache_held_bytes()
++    }
++    pub fn with_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, Option<f64>) {
++        let (result, window) = self.memory.with_page_window(operation);
++        let mut resident = 0.0;
++        let mut count = 0.0;
++        let measured = window.visit(|id| {
++            resident += self.memory.read_cache_resident_fraction(&[id]);
++            count += 1.0;
++        });
++        (result, (measured && count > 0.0).then(|| resident / count))
+     }
+ }
+ 
+@@ -502,6 +1441,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -1476,10 +1505,46 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +1429,165 @@
+@@ -518,6 +1460,201 @@
  }
  
  impl Database {
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn installed_cache_capacity_for_test(&self) -> usize {
++        self.mem.installed_cache_capacity_for_test()
++    }
++
++    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++    #[doc(hidden)]
++    pub fn with_read_cache_page_window_for_test<R>(
++        &self,
++        operation: impl FnOnce() -> R,
++    ) -> (R, Option<f64>) {
++        let (result, window) = self.mem.with_page_window(operation);
++        let mut resident = 0.0;
++        let mut count = 0.0;
++        let measured = window.visit_latest_for_test(|id| {
++            resident += self.read_cache_resident_fraction(&[id]);
++            count += 1.0;
++        });
++        (result, (measured && count > 0.0).then(|| resident / count))
++    }
++
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn cached_header_for_test(&self) -> Result<crate::CachePageForTest> {
++        self.mem.cached_header_for_test()
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn read_cache_observation(&self) -> ReadCacheObservation {
++        ReadCacheObservation {
++            memory: self.mem.clone(),
++        }
++    }
++
 +    /// Exact live reader-registry backing plus its receipt, for one payer.
 +    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +    #[doc(hidden)]
@@ -1642,7 +1707,7 @@
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +1641,17 @@
+@@ -571,9 +1708,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -1661,7 +1726,7 @@
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +1697,7 @@
+@@ -619,6 +1764,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1669,7 +1734,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +1708,7 @@
+@@ -629,6 +1775,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1677,7 +1742,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +1723,7 @@
+@@ -643,6 +1790,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1685,7 +1750,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +1733,7 @@
+@@ -652,6 +1800,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1693,7 +1758,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +1742,7 @@
+@@ -660,6 +1809,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1701,7 +1766,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -678,7 +1761,317 @@
+@@ -678,7 +1828,317 @@
          Ok(compacted)
      }
  
@@ -2020,7 +2085,7 @@
      fn check_repaired_allocated_pages_table(
          system_root: Option<BtreeHeader>,
          mem: Arc<TransactionalMemory>,
-@@ -891,14 +2284,19 @@
+@@ -891,14 +2351,19 @@
          Ok([data_root, system_root])
      }
  
@@ -2041,7 +2106,7 @@
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
          #[cfg(feature = "logging")]
-@@ -910,6 +2308,8 @@
+@@ -910,6 +2375,8 @@
              region_size,
              cache_size,
              false,
@@ -2050,7 +2115,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +2319,12 @@
+@@ -919,7 +2386,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -2064,7 +2129,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,9 +2349,22 @@
+@@ -944,8 +2416,21 @@
  
          let db = Database {
              mem,
@@ -2079,16 +2144,15 @@
 +            #[cfg(feature = "test-seams")]
 +            deferred_free_commit_io_fault: std::sync::atomic::AtomicBool::new(false),
          };
- 
++
 +        // Repair reconstructs current and deferred allocation state without
 +        // reusing pages. Authenticate every external root before the first
 +        // housekeeping transaction can reclaim or allocate anything.
 +        db.transaction_tracker.refresh_external_snapshots(&db.mem)?;
-+
+ 
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-         if let Some(next_id) = txn.next_persistent_savepoint_id()? {
-@@ -1035,16 +2453,35 @@
+@@ -1035,16 +2520,35 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -2124,7 +2188,7 @@
      fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
          // Make a new quick-repair commit to update the allocator state table
          #[cfg(feature = "logging")]
-@@ -1056,16 +2493,183 @@
+@@ -1056,16 +2560,183 @@
  
          Ok(())
      }
@@ -2310,7 +2374,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +2710,8 @@
+@@ -1106,6 +2777,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -2319,7 +2383,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +2731,8 @@
+@@ -1125,6 +2798,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -2328,7 +2392,7 @@
          }
      }
  
-@@ -1157,13 +2765,37 @@
+@@ -1157,13 +2832,37 @@
          self
      }
  
@@ -2367,7 +2431,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +2807,7 @@
+@@ -1175,6 +2874,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -2375,7 +2439,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +2816,75 @@
+@@ -1183,26 +2883,75 @@
              .open(path)?;
  
          Database::new(
@@ -2400,11 +2464,11 @@
          Database::new(
 -            Box::new(FileBackend::new(file)?),
 +            Box::new(FileBackend::new_with_path(file, path)?),
-+            false,
-+            self.page_size,
-+            None,
-+            self.cache_size,
-+            &self.repair_callback,
+             false,
+             self.page_size,
+             None,
+             self.cache_size,
+             &self.repair_callback,
 +            None,
 +            self.deferred_free_budget,
 +            self.keep_pace_reclaim,
@@ -2442,21 +2506,24 @@
 +    ) -> Result<Database, DatabaseError> {
 +        Database::new(
 +            Box::new(backend),
-             false,
-             self.page_size,
-             None,
-             self.cache_size,
-             &self.repair_callback,
++            false,
++            self.page_size,
++            None,
++            self.cache_size,
++            &self.repair_callback,
 +            Some(provider),
 +            self.deferred_free_budget,
 +            self.keep_pace_reclaim,
          )
      }
  
-@@ -1225,6 +2907,58 @@
-         )
-     }
- 
+@@ -1222,6 +2971,58 @@
+             self.page_size,
+             None,
+             self.cache_size,
++        )
++    }
++
 +    /// Opens an existing read-only database through a caller-owned backend.
 +    ///
 +    /// The caller must provide any required coordination and keep the backend's
@@ -2506,13 +2573,10 @@
 +            self.cache_size,
 +            false,
 +            true,
-+        )
-+    }
-+
-     /// Open an existing or create a new database in the given `file`.
-     ///
-     /// The file must be empty or contain a valid database.
-@@ -1236,6 +2970,70 @@
+         )
+     }
+ 
+@@ -1236,6 +3037,70 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2583,7 +2647,7 @@
          )
      }
  
-@@ -1251,6 +3049,9 @@
+@@ -1251,6 +3116,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2593,7 +2657,7 @@
          )
      }
  }
-@@ -1262,17 +3063,215 @@
+@@ -1262,16 +3130,214 @@
  }
  
  #[cfg(test)]
@@ -2614,7 +2678,7 @@
      use std::io::{ErrorKind, Read, Seek, SeekFrom};
      use std::sync::Arc;
      use std::sync::atomic::{AtomicU64, Ordering};
- 
++
 +    #[cfg(feature = "contextdb-internal")]
 +    #[test]
 +    fn nonblocking_external_read_refuses_before_refresh_release() {
@@ -2807,11 +2871,10 @@
 +        assert_eq!(table.get(1).unwrap().unwrap().value(), b"original");
 +        assert!(table.get(2).unwrap().is_none());
 +    }
-+
+ 
      #[derive(Debug)]
      struct FailingBackend {
-         inner: FileBackend,
-@@ -1298,7 +3297,7 @@
+@@ -1298,7 +3364,7 @@
          fn decrement_countdown(&self) -> Result<(), std::io::Error> {
              if self
                  .countdown
@@ -2947,7 +3010,7 @@
  };
  pub use error::{
      CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
-@@ -79,19 +92,58 @@
+@@ -79,19 +92,61 @@
      ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
      Table, TableStats,
  };
@@ -2979,6 +3042,9 @@
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
 +pub use db::NativeStorageBackend;
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub use db::ReadCacheObservation;
 +#[doc(hidden)]
 +pub use native_storage_admission::{NativeBackendError, NativeIoCause};
  mod error;
@@ -3006,7 +3072,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +158,64 @@
+@@ -106,3 +161,67 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -3071,6 +3137,9 @@
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
 +pub use native_storage_admission::observe_pending_names_for_test;
++
++#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++pub use tree_store::CachePressureFixtureForTest;
 --- a/src/multimap_table.rs
 +++ b/src/multimap_table.rs
 @@ -212,12 +212,12 @@
@@ -3105,21 +3174,21 @@
                  }
              }
          }
-@@ -1018,11 +1020,6 @@
+@@ -1016,11 +1018,6 @@
+             mem,
+             _value_type: Default::default(),
          }
-     }
- 
+-    }
+-
 -    #[allow(dead_code)]
 -    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
 -        self.tree.print_debug(include_values)
--    }
--
+     }
+ 
      /// Add the given value to the mapping of the key
-     ///
-     /// Returns `true` if the key-value pair was present
 --- /dev/null
 +++ b/src/native_storage_admission.rs
-@@ -0,0 +1,1262 @@
+@@ -0,0 +1,1268 @@
 +//! Internal owned admission for exact byte reads; no host or engine dependency.
 +use crate::atomic_compat::AtomicUpdate as _;
 +use std::alloc::{Layout, alloc, dealloc};
@@ -3154,6 +3223,12 @@
 +unsafe impl Send for NativePageCharge {}
 +#[cfg(feature = "contextdb-internal")]
 +unsafe impl Sync for NativePageCharge {}
++#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
++impl NativePageCharge {
++    pub(crate) fn identity_for_test(&self) -> usize {
++        self.receipt.as_ptr() as usize
++    }
++}
 +#[cfg(feature = "contextdb-internal")]
 +impl Drop for NativePageCharge {
 +    fn drop(&mut self) {
@@ -5211,18 +5286,18 @@
              transaction,
              tree: BtreeMut::new(
                  table_root,
-@@ -93,11 +93,6 @@
+@@ -91,11 +91,6 @@
+                 allocated_pages,
+             ),
          }
-     }
- 
+-    }
+-
 -    #[allow(dead_code)]
 -    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
 -        self.tree.print_debug(include_values)
--    }
--
+     }
+ 
      /// Returns an accessor, which allows mutation, to the value corresponding to the given key
-     pub fn get_mut<'k>(
-         &mut self,
 @@ -215,7 +210,23 @@
          if value_len + key_len > MAX_PAIR_LENGTH {
              return Err(StorageError::ValueTooLarge(value_len + key_len));
@@ -6816,7 +6891,7 @@
  
          Ok(root)
      }
-@@ -748,10 +824,127 @@
+@@ -748,9 +824,126 @@
          table: &BtreeMut<K, V>,
          length: u64,
      ) {
@@ -6824,7 +6899,7 @@
          self.open_tables.remove(name).unwrap();
          self.table_tree
              .stage_update_table_root(name, table.get_root(), length);
-     }
++    }
 +
 +    /// The exact layout a reserve of `additional` open tables would allocate,
 +    /// learned by refusing it: the registry keeps its entries and allocation.
@@ -6940,14 +7015,14 @@
 +        let freed = previous.allocation_size();
 +        drop(previous);
 +        Ok(freed)
-+    }
- }
- 
- // Transaction-local savepoint lifecycle state.
-@@ -816,6 +1009,22 @@
      }
  }
  
+@@ -815,6 +1008,22 @@
+         self.invalidated.clear();
+     }
+ }
++
 +/// Transaction-local normal-table root lifecycle. Policy and witness storage belong to callers.
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
@@ -6963,10 +7038,9 @@
 +
 +#[cfg(feature = "contextdb-internal")]
 +type TableRootHook = fn(&WriteTransaction, &str, TableRootEvent) -> Result<(), StorageError>;
-+
+ 
  /// A read/write transaction
  ///
- /// Only a single [`WriteTransaction`] may exist at a time
 @@ -832,9 +1041,253 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
@@ -7238,7 +7312,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,11 +1325,183 @@
+@@ -864,9 +1325,181 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -7250,8 +7324,8 @@
 +            table_root_hook: None,
 +            table_root_hook_error: Mutex::new(None),
          })
-     }
- 
++    }
++
 +    /// Install fixed transaction-local lifecycle policy; no inventory is retained.
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
@@ -7417,15 +7491,16 @@
 +    // Explicit whole-file compaction retains its upstream full-drain semantics.
 +    pub(crate) fn reclaim_all_deferred_pages(&mut self) {
 +        self.deferred_free_budget = (usize::MAX, usize::MAX);
-+    }
-+
-     pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-         self.shrink_policy = shrink_policy;
-     }
-@@ -895,6 +1528,31 @@
-         Ok(false)
      }
  
+     pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
+@@ -892,6 +1525,31 @@
+             return Ok(true);
+         }
+ 
++        Ok(false)
++    }
++
 +    /// Inspect only the oldest entry in each free tree using the same fence
 +    /// as `durable_commit`. A live reader protects newer entries, not every
 +    /// deferred allocation in the file.
@@ -7448,12 +7523,9 @@
 +                return Ok(true);
 +            }
 +        }
-+        Ok(false)
-+    }
-+
-     #[cfg(debug_assertions)]
-     pub fn print_allocated_page_debug(&self) {
-         let mut all_allocated: HashSet<PageNumber> =
+         Ok(false)
+     }
+ 
 @@ -1130,6 +1788,10 @@
              return Err(SavepointError::InvalidSavepoint);
          }
@@ -7465,15 +7537,15 @@
          let (id, transaction_id) = self.allocate_savepoint()?;
          #[cfg(feature = "logging")]
          debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
-@@ -1349,9 +2011,227 @@
+@@ -1349,7 +2011,225 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
 +        #[cfg(feature = "contextdb-internal")]
 +        self.call_table_root_hook(definition.name(), TableRootEvent::BeforeOpen)?;
          self.tables.lock().unwrap().open_table(self, definition)
-     }
- 
++    }
++
 +    /// Check a user family's directory entry without finalizing dirty payload pages.
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
@@ -7688,11 +7760,9 @@
 +        })();
 +        self.poison_failed_capture(&result);
 +        result
-+    }
-+
+     }
+ 
      /// Open the given table
-     ///
-     /// The table will be created if it does not exist
 @@ -1373,6 +2253,13 @@
          length: u64,
      ) {
@@ -7761,7 +7831,7 @@
      }
  
      /// Delete the given table
-@@ -1458,22 +2378,206 @@
+@@ -1458,9 +2378,159 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -7771,8 +7841,8 @@
          // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
          self.completed = true;
          self.commit_inner()
-     }
- 
++    }
++
 +    /// Bind a stack marker to this database instance and actual write id.
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
@@ -7918,11 +7988,10 @@
 +        // Match consuming commit: no abort of possibly published pages on drop.
 +        self.completed = true;
 +        self.commit_inner_publishing(marker)
-+    }
-+
+     }
+ 
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-         // Quick-repair requires 2-phase commit
-         if self.quick_repair {
+@@ -1469,11 +2539,45 @@
              self.two_phase_commit = true;
          }
  
@@ -7970,10 +8039,11 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1485,6 +2589,117 @@
+@@ -1484,6 +2588,117 @@
+             InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
- 
++
 +        #[cfg(feature = "test-seams")]
 +        crate::commit_work::set_tag(restore_tag);
 +
@@ -8084,10 +8154,9 @@
 +
 +        #[cfg(feature = "test-seams")]
 +        crate::commit_work::set_tag(restore_tag);
-+
+ 
          self.savepoint_state
              .lock()
-             .unwrap()
 @@ -1609,7 +2824,7 @@
          debug!("Aborting transaction id={:?}", self.transaction_id);
          self.tables
@@ -8157,6 +8226,7 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
+-
 +        #[cfg(feature = "test-seams")]
 +        {
 +            crate::commit_work::observe_commit_span(
@@ -8165,7 +8235,7 @@
 +            );
 +            span_started = std::time::Instant::now();
 +        }
- 
++
 +        #[cfg(all(feature = "test-seams", unix))]
 +        self.pause_reclaim_step_before_durable_publication_from_env()?;
          self.mem.commit(
@@ -8183,10 +8253,13 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1701,6 +2954,148 @@
-         Ok(())
-     }
+@@ -1698,6 +2951,148 @@
+             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
+         }
  
++        Ok(())
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    fn durable_commit_publishing(
 +        &mut self,
@@ -8326,12 +8399,9 @@
 +        stream.send(MARKER)?;
 +        let mut release = [0];
 +        stream.recv(&mut release)?;
-+        Ok(())
-+    }
-+
-     // Commit without a durability guarantee
-     pub(crate) fn non_durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
-         let mut free_until_transaction = self
+         Ok(())
+     }
+ 
 @@ -1766,6 +3161,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
@@ -8542,6 +8612,8 @@
      fn process_freed_pages(&mut self, free_until: TransactionId) -> Result {
 -        // We assume below that PageNumber is length 8
 -        assert_eq!(PageNumber::serialized_size(), 8);
+-
+-        // Handle the data freed tree
 +        let (pages, entries) = self.deferred_free_budget;
 +        // Give each tree half the shared cap. The odd unit follows the oldest
 +        // durable pending key, so a one-unit budget cannot starve either tree
@@ -8609,8 +8681,7 @@
 +        }
 +        Ok(())
 +    }
- 
--        // Handle the data freed tree
++
 +    fn process_freed_pages_bounded(
 +        &self,
 +        free_until: TransactionId,
@@ -8630,7 +8701,6 @@
 -                for i in 0..page_list.value().len() {
 -                    self.mem
 -                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
--                }
 +        let mut freed = system_tables.open_system_table(self, definition)?;
 +        while pages_remaining > 0 && entries_remaining > 0 {
 +            let next = freed.tree.first()?.map(|(key, _)| key.value());
@@ -8661,23 +8731,11 @@
 +            drop(entry);
 +            if empty {
 +                freed.remove(&key)?;
-             }
-         }
++            }
++        }
 +        Ok((pages_remaining, entries_remaining))
 +    }
- 
--        // Handle the system freed tree
--        {
--            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
--            let key = TransactionIdWithPagination {
--                transaction_id: free_until.raw_id(),
--                pagination_id: 0,
--            };
--            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
--                let (_, page_list) = entry?;
--                for i in 0..page_list.value().len() {
--                    self.mem
--                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
++
 +    /// Inspect the exact root-page intersection with the deferred-free table
 +    /// on demand. The transaction floor may also defer unrelated pages; this
 +    /// diagnostic deliberately does not inventory them on writer admission.
@@ -8702,6 +8760,19 @@
                  }
              }
          }
+-
+-        // Handle the system freed tree
+-        {
+-            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
+-            let key = TransactionIdWithPagination {
+-                transaction_id: free_until.raw_id(),
+-                pagination_id: 0,
+-            };
+-            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
+-                let (_, page_list) = entry?;
+-                for i in 0..page_list.value().len() {
+-                    self.mem
+-                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
 +        let page_size = u32::try_from(self.mem.get_page_size())
 +            .expect("redb page size is represented by a 32-bit header field");
 +        let reachable_bytes = protected
@@ -8728,8 +8799,7 @@
 +            retained_bytes,
 +        })
 +    }
- 
--        Ok(())
++
 +    #[cfg(any(test, feature = "test-seams"))]
 +    #[doc(hidden)]
 +    pub fn external_snapshot_retained_pages_for_test(&self) -> Result<Vec<[u8; 8]>> {
@@ -8748,9 +8818,11 @@
 +                let page = pages.value().get(index);
 +                if protected.contains(&page) {
 +                    retained.insert(page);
-+                }
-+            }
-+        }
+                 }
+             }
+         }
+-
+-        Ok(())
 +        Ok(retained.into_iter().map(PageNumber::to_le_bytes).collect())
      }
  
@@ -8825,7 +8897,7 @@
              }
          } else if !self.completed && self.mem.storage_failure() {
              self.tables
-@@ -2107,20 +3813,150 @@
+@@ -2107,18 +3813,148 @@
      tree: TableTree,
  }
  
@@ -8959,8 +9031,8 @@
 +            tree: TableTree::new(root, PageHint::Verified, guard, mem)
                  .map_err(TransactionError::Storage)?,
          })
-     }
- 
++    }
++
 +    /// Name the exact committed user-tree root this transaction reads.
 +    #[doc(hidden)]
 +    pub fn storage_snapshot_identity(&self) -> StorageSnapshotIdentity {
@@ -8972,12 +9044,10 @@
 +                length: root.length,
 +            }),
 +        }
-+    }
-+
+     }
+ 
      /// Open the given table
-     pub fn open_table<K: Key + 'static, V: Value + 'static>(
-         &self,
-@@ -2135,7 +3971,7 @@
+@@ -2135,12 +3971,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -8986,10 +9056,10 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2143,6 +3979,63 @@
+             InternalTableDefinition::Multimap { .. } => unreachable!(),
          }
-     }
- 
++    }
++
 +    /// Open a byte table for reject-only bounded inspection. Selected records
 +    /// still use ordinary complete-page admission and checksum verification.
 +    #[cfg(feature = "contextdb-internal")]
@@ -9045,11 +9115,9 @@
 +                }
 +                InternalTableDefinition::Multimap { .. } => unreachable!(),
 +            }))
-+    }
-+
+     }
+ 
      /// Open the given table without a type
-     pub fn open_untyped_table(
-         &self,
 @@ -2161,7 +4054,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
@@ -9098,6 +9166,7 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
+-}
 +
 +    #[test]
 +    fn external_roots_retain_only_reachable_allocation_versions_and_release_them_for_reuse() {
@@ -10238,7 +10307,7 @@
 +        self.tree
 +            .next_native_u64_bytes_range(name, lower, exclusive, before)
 +    }
- }
++}
 --- /dev/null
 +++ b/src/tree_store/bounded_bytes.rs
 @@ -0,0 +1,2115 @@
@@ -12620,21 +12689,21 @@
      fn visit_pages_helper<F>(&self, path: PagePath, visitor: &mut F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -126,6 +344,14 @@
-     }
- }
+@@ -124,6 +342,14 @@
  
+         Ok(())
+     }
++}
++
 +struct PageBatch<'a> {
 +    resume: &'a [usize],
 +    maximum: usize,
 +    pages: Vec<PagePath>,
 +    next: Option<Vec<usize>>,
 +    examined: usize,
-+}
-+
+ }
+ 
  pub(crate) struct UntypedBtreeMut {
-     mem: Arc<TransactionalMemory>,
-     root: Option<BtreeHeader>,
 @@ -179,6 +405,13 @@
      fn finalize_dirty_checksums_helper(&mut self, page_number: PageNumber) -> Result<Checksum> {
          assert!(self.mem.uncommitted(page_number));
@@ -12688,10 +12757,12 @@
      transaction_guard: Arc<TransactionGuard>,
      root: Option<BtreeHeader>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-@@ -364,21 +600,6 @@
+@@ -362,21 +598,6 @@
+         );
+         self.root = tree.finalize_dirty_checksums()?;
          Ok(self.root)
-     }
- 
+-    }
+-
 -    #[allow(dead_code)]
 -    pub(crate) fn all_pages_iter(&self) -> Result<Option<AllPageNumbersBtreeIter>> {
 -        if let Some(root) = self.root.map(|x| x.root) {
@@ -12705,11 +12776,9 @@
 -        } else {
 -            Ok(None)
 -        }
--    }
--
+     }
+ 
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-     where
-         F: FnMut(&PagePath) -> Result,
 @@ -454,7 +675,10 @@
              fake_allocated_pages,
          );
@@ -12722,18 +12791,18 @@
          Ok(())
      }
  
-@@ -472,11 +696,6 @@
+@@ -470,11 +694,6 @@
+         );
+         let result = operation.delete(key)?;
          Ok(result)
-     }
- 
+-    }
+-
 -    #[allow(dead_code)]
 -    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
 -        self.read_tree()?.print_debug(include_values)
--    }
--
+     }
+ 
      pub(crate) fn stats(&self) -> Result<BtreeStats> {
-         btree_stats(
-             self.get_root().map(|x| x.root),
 @@ -522,6 +741,8 @@
                  new_page.memory_mut().copy_from_slice(old_page.memory());
                  drop(old_page);
@@ -12790,10 +12859,12 @@
  pub(crate) struct RawBtree {
      mem: Arc<TransactionalMemory>,
      root: Option<BtreeHeader>,
-@@ -762,6 +1009,22 @@
+@@ -760,6 +1007,22 @@
+         } else {
+             Ok(true)
          }
-     }
- 
++    }
++
 +    /// Authenticate only the saved root page during external admission.
 +    /// Its descendants remain protected by the transaction floor and are
 +    /// checked when the retained reader actually visits them.
@@ -12808,11 +12879,9 @@
 +            _ => return Ok(false),
 +        };
 +        Ok(computed.is_ok_and(|computed| computed == header.checksum))
-+    }
-+
+     }
+ 
      fn verify_checksum_helper(
-         &self,
-         page_number: PageNumber,
 @@ -804,12 +1067,12 @@
  }
  
@@ -12871,10 +12940,12 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -860,6 +1150,17 @@
+@@ -858,6 +1148,17 @@
+             self.hint,
+         )
          .verify_checksum()
-     }
- 
++    }
++
 +    pub(crate) fn verify_root_checksum(&self) -> Result<bool> {
 +        RawBtree::new(
 +            self.get_root(),
@@ -12884,11 +12955,9 @@
 +            self.hint,
 +        )
 +        .verify_root_checksum()
-+    }
-+
+     }
+ 
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-     where
-         F: FnMut(&PagePath) -> Result,
 @@ -877,6 +1178,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
@@ -12961,7 +13030,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,14 +1297,37 @@
+@@ -975,12 +1297,35 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -12984,8 +13053,8 @@
              self.mem.clone(),
              self.hint,
          )
-     }
- 
++    }
++
 +    fn verify_path_page(&self, page: &PageImpl, expected: Checksum) -> Result<()> {
 +        if self.hint.verifies_path()
 +            && page_checksum(page, K::fixed_width(), V::fixed_width())? != expected
@@ -12996,15 +13065,14 @@
 +            )));
 +        }
 +        Ok(())
-+    }
-+
-     pub(crate) fn len(&self) -> Result<u64> {
-         Ok(self.root.map_or(0, |x| x.length))
      }
-@@ -996,42 +1341,6 @@
+ 
+     pub(crate) fn len(&self) -> Result<u64> {
+@@ -995,42 +1340,6 @@
+             V::fixed_width(),
              self.hint,
          )
-     }
+-    }
 -
 -    #[allow(dead_code)]
 -    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
@@ -13040,10 +13108,9 @@
 -        }
 -
 -        Ok(())
--    }
+     }
  }
  
- impl<K: Key, V: Value> Drop for Btree<K, V> {
 @@ -1118,3 +1427,521 @@
          _ => unreachable!(),
      }
@@ -13671,10 +13738,13 @@
  impl<V: Value + 'static> Drop for AccessGuardMut<'_, V> {
      fn drop(&mut self) {
          // no-op. This Drop impl is only here to ensure that self is dropped before the transaction
-@@ -445,17 +487,6 @@
-         }
-     }
- 
+@@ -442,17 +484,6 @@
+             fixed_key_size,
+             fixed_value_size,
+             num_pairs,
+-        }
+-    }
+-
 -    pub(super) fn print_node<K: Key, V: Value>(&self, include_value: bool) {
 -        let mut i = 0;
 -        while let Some(entry) = self.entry(i) {
@@ -13683,12 +13753,9 @@
 -                eprint!(" value_{i}={:?}", V::from_bytes(entry.value()));
 -            }
 -            i += 1;
--        }
--    }
--
-     pub(crate) fn position<K: Key>(&self, query: &[u8]) -> (usize, bool) {
-         // inclusive
-         let mut min_entry = 0;
+         }
+     }
+ 
 @@ -618,8 +649,32 @@
      }
  }
@@ -13851,10 +13918,12 @@
  
          // Right shift the trailing key data & preceding value data
          let start = shift_key_start;
-@@ -1274,22 +1341,6 @@
+@@ -1272,22 +1339,6 @@
+             fixed_key_size,
+             _page_lifetime: Default::default(),
          }
-     }
- 
+-    }
+-
 -    pub(super) fn print_node<K: Key>(&self) {
 -        eprint!(
 -            "Internal[ (page={:?}), child_0={:?}",
@@ -13869,11 +13938,9 @@
 -            }
 -        }
 -        eprint!("]");
--    }
--
+     }
+ 
      pub(crate) fn total_length(&self) -> usize {
-         // Keys are stored at the end
-         self.key_end(self.num_keys() - 1).unwrap()
 --- a/src/tree_store/btree_iters.rs
 +++ b/src/tree_store/btree_iters.rs
 @@ -1,10 +1,12 @@
@@ -14678,7 +14745,7 @@
  mod table_tree;
  mod table_tree_base;
  
-@@ -22,4 +30,22 @@
+@@ -22,4 +30,25 @@
  };
  pub use page_store::{InMemoryBackend, Savepoint, file_backend};
  pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut};
@@ -14702,6 +14769,9 @@
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +#[doc(hidden)]
 +pub use page_store::CheckedWriterBackendForTest;
++
++#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++pub use page_store::CachePressureFixtureForTest;
 --- /dev/null
 +++ b/src/tree_store/page_store/allocator_pager.rs
 @@ -0,0 +1,733 @@
@@ -15457,18 +15527,18 @@
  
  pub(crate) const MAX_VALUE_LENGTH: usize = 3 * 1024 * 1024 * 1024;
  pub(crate) const MAX_PAIR_LENGTH: usize = 3 * 1024 * 1024 * 1024 + 768 * 1024 * 1024;
-@@ -106,6 +105,11 @@
+@@ -104,6 +103,11 @@
+             page_index: index,
+             page_order: order,
          }
-     }
- 
++    }
++
 +    pub(crate) fn validated_from_le_bytes(bytes: [u8; 8]) -> Option<Self> {
 +        let page = Self::from_le_bytes(bytes);
 +        (page.page_order <= MAX_MAX_PAGE_ORDER).then_some(page)
-+    }
-+
+     }
+ 
      #[cfg(test)]
-     pub(crate) fn to_order0(self) -> Vec<PageNumber> {
-         let mut pages = vec![self];
 @@ -177,14 +181,19 @@
  }
  
@@ -15514,6 +15584,10 @@
      fn drop(&mut self) {
          #[cfg(debug_assertions)]
 -        assert!(self.open_pages.lock().unwrap().remove(&self.page_number));
+-    }
+-}
+-
+-#[derive(Copy, Clone)]
 +        {
 +            let mut open_pages = self.open_pages.lock().unwrap();
 +            assert!(open_pages.remove(&self.page_number));
@@ -15521,10 +15595,9 @@
 +                *open_pages = HashSet::new();
 +            }
 +        }
-     }
- }
- 
--#[derive(Copy, Clone)]
++    }
++}
++
 +#[derive(Copy, Clone, PartialEq, Eq)]
  pub(crate) enum PageHint {
      None,
@@ -16082,20 +16155,20 @@
  
  const MAX_ORDER_OFFSET: usize = 0;
  const PADDING: usize = 3;
-@@ -24,6 +26,13 @@
-     page_number ^ 1
- }
+@@ -22,6 +24,13 @@
  
+ fn buddy_page(page_number: u32) -> u32 {
+     page_number ^ 1
++}
++
 +#[cfg(test)]
 +thread_local! {
 +    /// Blocks `alloc_lowest` allocated at a higher order only to compare
 +    /// positions, for the work-count test.
 +    pub(super) static TENTATIVE_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-+}
-+
+ }
+ 
  // Handles allocation of dynamically sized pages, supports pages of up to page_size * 2^max_order bytes
- //
- // Pages are marked free at only a single order, and it must always be the largest order
 @@ -34,6 +43,64 @@
  }
  
@@ -16168,15 +16241,21 @@
 +    #[cfg(test)]
      pub(crate) fn to_vec(&self) -> Vec<u8> {
 -        let serialized: Vec<Vec<u8>> = self.free.iter().map(BtreeBitmap::to_vec).collect();
+-
 +        let mut result = vec![0; self.encoded_len()];
 +        self.encode_into(&mut result);
 +        result
 +    }
- 
++
 +    pub(crate) fn encoded_len(&self) -> usize {
          let header_bytes = 1 + 3 + size_of::<u32>();
          let offsets_bytes = (self.max_order as usize + 1) * size_of::<u32>();
 -        let data_bytes: usize = serialized.iter().map(Vec::len).sum();
+-
+-        let mut result = Vec::with_capacity(header_bytes + offsets_bytes + data_bytes);
+-        result.push(self.max_order);
+-        result.extend([0u8; 3]);
+-        result.extend(self.len.to_le_bytes());
 +        header_bytes
 +            + offsets_bytes
 +            + self
@@ -16185,11 +16264,7 @@
 +                .map(BtreeBitmap::encoded_len)
 +                .sum::<usize>()
 +    }
- 
--        let mut result = Vec::with_capacity(header_bytes + offsets_bytes + data_bytes);
--        result.push(self.max_order);
--        result.extend([0u8; 3]);
--        result.extend(self.len.to_le_bytes());
++
 +    pub(crate) fn encode_into(&self, out: &mut [u8]) {
 +        assert!(out.len() >= self.encoded_len());
 +        let header_bytes = 1 + 3 + size_of::<u32>();
@@ -16206,15 +16281,16 @@
 -        }
 -        for bitmap in &serialized {
 -            result.extend_from_slice(bitmap);
+-        }
+-
+-        result
 +        for (order, bitmap) in self.free.iter().enumerate() {
 +            let end = data_offset + bitmap.encoded_len();
 +            let field = header_bytes + order * size_of::<u32>();
 +            out[field..field + 4].copy_from_slice(&u32::try_from(end).unwrap().to_le_bytes());
 +            bitmap.encode_into(&mut out[data_offset..end]);
 +            data_offset = end;
-         }
--
--        result
++        }
      }
  
      pub(crate) fn from_bytes(data: &[u8]) -> Self {
@@ -16801,13 +16877,14 @@
  use std::sync::atomic::AtomicU64;
  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 -use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-+use std::sync::{Mutex, MutexGuard, RwLock};
- 
+-
 -// Allocates an `Arc<[u8]>` in one step. `Arc::<[u8]>::from(vec![0; len])` would
 -// allocate the Vec and then allocate a new Arc and memcpy into it.
 -fn zero_filled_arc(len: usize) -> Arc<[u8]> {
 -    // This is documented to do a single allocation: https://doc.rust-lang.org/std/sync/struct.Arc.html#iterators-of-known-length
 -    std::iter::repeat_n(0u8, len).collect()
++use std::sync::{Mutex, MutexGuard, RwLock};
++
 +use super::page_allocation::{CacheCounter, CachePayment, PageAllocation};
 +
 +/// Every alias retains the same complete physical backing and its payer.
@@ -17028,10 +17105,11 @@
          let result = self.file.read(offset, out);
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
+-        }
+-        result.map_err(StorageError::from)
 +        } else {
 +            crate::read_admission::record_backend_read(out.len());
-         }
--        result.map_err(StorageError::from)
++        }
 +        result
      }
  
@@ -17109,7 +17187,7 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,27 +375,168 @@
+@@ -233,27 +375,183 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
@@ -17147,6 +17225,16 @@
 +            PageMemory::Native(_) => panic!("expected real legacy cache allocation"),
 +        }
 +    }
++    pub fn native_source_receipt_for_test(&self) -> Option<usize> {
++        match &self.0 {
++            PageMemory::Cached(page) | PageMemory::Plain(page) | PageMemory::Charged(page) => {
++                page.native_source_receipt_for_test()
++            }
++            #[cfg(feature = "contextdb-internal")]
++            PageMemory::Native(page) => page.native_source_receipt_for_test(),
++        }
++    }
++
 +    pub fn allocation(&self) -> (usize, usize, usize) {
 +        let page = match &self.0 {
 +            PageMemory::Cached(p) | PageMemory::Plain(p) | PageMemory::Charged(p) => p,
@@ -17186,6 +17274,11 @@
  }
  
  impl PagedCachedFile {
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn installed_cache_capacity_for_test(&self) -> usize {
++        self.max_cache_size.load(Ordering::Acquire)
++    }
++
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) fn write_control_for_test(&self) -> CacheWriteControlForTest {
 +        CacheWriteControlForTest(self.write_buffer.clone())
@@ -17287,13 +17380,13 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -266,10 +549,132 @@
+@@ -266,8 +564,130 @@
              #[cfg(feature = "cache_metrics")]
              evictions: Default::default(),
              read_cache,
 -            write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
 +            write_buffer: CacheShared::new_prepaid(Mutex::new(LRUWriteCache::new()))?,
-+        })
+         })
 +    }
 +
 +    #[cfg(feature = "contextdb-internal")]
@@ -17367,9 +17460,9 @@
 +            .next_power_of_two();
 +        cache_array_prepaid(usize::try_from(Self::lock_stripes()).unwrap(), |_| {
 +            LRUCache::try_new(arena.clone(), heads).map(RwLock::new)
-         })
-     }
- 
++        })
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn begin_page_window(&self) -> ReadCachePageWindow {
 +        let arena = self.read_cache[0].read().unwrap().page_window_arena();
@@ -17416,12 +17509,10 @@
 +            .unwrap()
 +            .peek(offset)
 +            .is_some_and(|page| page.len() == len)
-+    }
-+
+     }
+ 
      #[allow(clippy::unused_self)]
-     pub(crate) fn cache_stats(&self) -> CacheStats {
-         #[cfg(not(feature = "cache_metrics"))]
-@@ -303,6 +708,110 @@
+@@ -303,6 +723,115 @@
          }
      }
  
@@ -17451,6 +17542,7 @@
 +        let mut retire = self
 +            .read_cache_bytes
 +            .load(Ordering::Acquire)
++            .saturating_add(self.write_buffer_bytes.fixed_bytes())
 +            .saturating_sub(bytes);
 +        let stripes = self.read_cache.len();
 +        let start = self.next_eviction_stripe.load(Ordering::Relaxed) % stripes;
@@ -17473,6 +17565,11 @@
 +        // No insertion can publish a tentative occupancy while the producer
 +        // settles funding. Concurrent physical releases may only lower it.
 +        Ok(settle())
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn installed_cache_capacity(&self) -> usize {
++        self.max_cache_size.load(Ordering::Acquire)
 +    }
 +
 +    #[cfg(feature = "contextdb-internal")]
@@ -17524,15 +17621,14 @@
 +        drop(locks);
 +        drop(write);
 +        Ok(bytes.max(
-+            self.read_cache_bytes.load(Ordering::Acquire)
-+                + self.write_buffer_bytes.load(Ordering::Acquire),
++            self.read_cache_bytes.load(Ordering::Acquire) + self.write_buffer_bytes.fixed_bytes(),
 +        ) + self.index_bytes())
 +    }
 +
      pub(crate) fn close(&self) -> Result {
          self.file.close()
      }
-@@ -329,28 +838,44 @@
+@@ -329,28 +858,44 @@
          bytes_needed: usize,
          _write_lock: &MutexGuard<'_, LRUWriteCache>,
      ) {
@@ -17581,8 +17677,15 @@
      }
  
      fn flush_write_buffer(&self) -> Result {
-@@ -364,25 +889,49 @@
-         // drained, so the total check only considers the read cache size.
+@@ -359,30 +904,51 @@
+         for (offset, buffer) in write_buffer.cache.iter() {
+             self.file.write(*offset, buffer.as_ref().unwrap())?;
+         }
+-        // Transfer flushed pages into the read cache so they are available
+-        // for subsequent reads without a file I/O.  The write buffer is being
+-        // drained, so the total check only considers the read cache size.
++        // Completed dirty pages may use genuinely available clean capacity,
++        // but flush never evicts a hot clean page merely to promote its output.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
 -            let cache_size = self
@@ -17590,60 +17693,64 @@
 -                .fetch_add(buffer.len(), Ordering::AcqRel);
 -
 -            if cache_size + buffer.len() <= self.max_cache_size {
+-                let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+-                let mut lock = self.read_cache[cache_slot].write().unwrap();
+-                if let Some(replaced) = lock.insert(*offset, buffer) {
+-                    // A race could cause us to replace an existing buffer
+-                    self.read_cache_bytes
+-                        .fetch_sub(replaced.len(), Ordering::AcqRel);
 +            let page_bytes = cached_page_bytes(buffer.len());
 +            let Ok((cache_size, payment)) =
 +                CachePayment::reserve(&self.read_cache_bytes, page_bytes)
 +            else {
 +                break;
 +            };
-+            if cache_size.saturating_add(page_bytes) <= self.max_cache_size.load(Ordering::Acquire)
-+            {
-                 let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
-                 let mut lock = self.read_cache[cache_slot].write().unwrap();
--                if let Some(replaced) = lock.insert(*offset, buffer) {
--                    // A race could cause us to replace an existing buffer
--                    self.read_cache_bytes
--                        .fetch_sub(replaced.len(), Ordering::AcqRel);
-+                debug_assert!(
-+                    buffer.len() >= usize::try_from(self.page_size).unwrap()
-+                        || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
-+                );
-+                // Reserve before replacing the original write/source payer.
-+                // A dirty Plain alias follows this same physical owner.
-+                match lock.try_insert(*offset, buffer.clone()) {
-+                    Ok(displaced) => {
-+                        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
-+                        let leaving_write = if buffer.counted_by(&self.write_buffer_bytes) {
-+                            page_bytes
-+                        } else {
-+                            0
-+                        };
-+                        let fixed_room = cache_size
-+                            .saturating_add(page_bytes)
-+                            .saturating_add(write_bytes.saturating_sub(leaving_write))
-+                            <= self.max_cache_size.load(Ordering::Acquire);
-+                        buffer.transfer_counted(payment, fixed_room);
-+                        drop(displaced);
-+                    }
-+                    Err(rejected) => {
-+                        drop(rejected);
-+                        drop(payment);
-+                    }
++            let leaving_write = if buffer.fixed_counted_by(&self.write_buffer_bytes) {
++                page_bytes
++            } else {
++                0
++            };
++            let fixed_room = cache_size.saturating_add(page_bytes).saturating_add(
++                self.write_buffer_bytes
++                    .fixed_bytes()
++                    .saturating_sub(leaving_write),
++            ) <= self.max_cache_size.load(Ordering::Acquire);
++            if !fixed_room {
++                drop(payment);
++                break;
++            }
++            let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
++            let mut lock = self.read_cache[cache_slot].write().unwrap();
++            debug_assert!(
++                buffer.len() >= usize::try_from(self.page_size).unwrap()
++                    || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
++            );
++            match lock.try_insert_lowest_priority(*offset, buffer.clone()) {
++                Ok(displaced) => {
++                    // Destination custody precedes releasing the genuine source
++                    // payer, including every alias of this physical backing.
++                    buffer.transfer_counted(payment, true);
++                    drop(displaced);
                  }
-             } else {
+-            } else {
 -                self.read_cache_bytes
 -                    .fetch_sub(buffer.len(), Ordering::AcqRel);
-+                drop(payment);
-                 break;
-             }
-         }
+-                break;
+-            }
+-        }
 -        self.write_buffer_bytes.store(0, Ordering::Release);
++                Err(rejected) => {
++                    drop(rejected);
++                    drop(payment);
++                }
++            }
++        }
 +        // Clearing drops map owners only. Detached dirty aliases retain their
 +        // original payment until their actual backing is physically freed.
          write_buffer.clear();
  
          Ok(())
-@@ -390,12 +939,30 @@
+@@ -390,10 +956,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -17655,8 +17762,8 @@
 +        self.invalidate_cache_beyond(len);
  
          self.file.set_len(len)
-     }
- 
++    }
++
 +    fn invalidate_cache_beyond(&self, len: u64) {
 +        for stripe in &self.read_cache {
 +            let mut lock = stripe.write().unwrap();
@@ -17671,12 +17778,10 @@
 +                drop(lock.remove(offset));
 +            }
 +        }
-+    }
-+
-     pub(super) fn flush(&self) -> Result {
-         self.flush_write_buffer()?;
+     }
  
-@@ -409,6 +976,20 @@
+     pub(super) fn flush(&self) -> Result {
+@@ -409,6 +993,20 @@
          self.flush_write_buffer()
      }
  
@@ -17697,7 +17802,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +997,28 @@
+@@ -416,18 +1014,28 @@
          Ok(buffer)
      }
  
@@ -17734,7 +17839,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1029,7 @@
+@@ -438,7 +1046,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17743,17 +17848,20 @@
              }
          }
  
-@@ -449,54 +1040,141 @@
+@@ -449,54 +1057,141 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
 -                return Ok(cached.clone());
-+                return Ok(PageMemory::Cached(cached.clone()));
-             }
-         }
- 
+-            }
+-        }
+-
 -        let buffer = self.read_direct_into_arc(offset, len)?;
 -        let cache_size = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
++                return Ok(PageMemory::Cached(cached.clone()));
++            }
++        }
++
 +        let buffer = self.read_direct_into_page(offset, len)?;
 +        let scan_replace = crate::read_admission::scan_reads_active()
 +            && !crate::read_admission::declared_scan_reads_active()
@@ -17781,7 +17889,7 @@
 +                return Ok(Self::uncached(buffer));
 +            }
 +        } else {
-+            let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
++            let write_bytes = self.write_buffer_bytes.fixed_bytes();
 +            let cache_size = self.read_cache_bytes.load(Ordering::Acquire);
 +            if cache_size
 +                .saturating_add(page_bytes)
@@ -17801,7 +17909,7 @@
 +        else {
 +            return Ok(Self::uncached(buffer));
 +        };
-+        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
++        let write_bytes = self.write_buffer_bytes.fixed_bytes();
 +        if previous
 +            .saturating_add(page_bytes)
 +            .saturating_add(write_bytes)
@@ -17825,6 +17933,31 @@
 -            cache_size
 +            write_lock.try_insert(offset, buffer.clone())
          };
+-
+-        // Rule 3: evict from this read-cache slot if the total exceeds the
+-        // budget.  We evict exactly `len` bytes (one page) per miss to avoid
+-        // over-eviction spikes.
+-        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+-        let over_total = cache_size + len + write_bytes > self.max_cache_size;
+-        let mut removed = 0;
+-        if over_total {
+-            while removed < len {
+-                if let Some((_, v)) = write_lock.pop_lowest_priority() {
+-                    #[cfg(feature = "cache_metrics")]
+-                    {
+-                        self.evictions.fetch_add(1, Ordering::Relaxed);
+-                    }
+-                    removed += v.len();
+-                } else {
+-                    break;
+-                }
+-            }
+-        }
+-        if removed > 0 {
+-            self.read_cache_bytes.fetch_sub(removed, Ordering::AcqRel);
+-        }
+-
+-        Ok(buffer)
 +        match inserted {
 +            Ok(displaced) => {
 +                // All new holders retain this same source payer until transfer.
@@ -17844,24 +17977,7 @@
 +            }
 +        }
 +    }
- 
--        // Rule 3: evict from this read-cache slot if the total exceeds the
--        // budget.  We evict exactly `len` bytes (one page) per miss to avoid
--        // over-eviction spikes.
--        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
--        let over_total = cache_size + len + write_bytes > self.max_cache_size;
--        let mut removed = 0;
--        if over_total {
--            while removed < len {
--                if let Some((_, v)) = write_lock.pop_lowest_priority() {
--                    #[cfg(feature = "cache_metrics")]
--                    {
--                        self.evictions.fetch_add(1, Ordering::Relaxed);
--                    }
--                    removed += v.len();
--                } else {
--                    break;
--                }
++
 +    // A reject-only window never enters the full-page cache. Its admission
 +    // remains owned until the window is released, including cached sources.
 +    pub(super) fn read_window(
@@ -17887,10 +18003,8 @@
 +            if let Some(source) = lock.get(offset) {
 +                output.copy_from_slice(&source[range.clone()]);
 +                copied = true;
-             }
-         }
--        if removed > 0 {
--            self.read_cache_bytes.fetch_sub(removed, Ordering::AcqRel);
++            }
++        }
 +        if !copied {
 +            let slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
 +            let lock = self.read_cache[slot].read().unwrap();
@@ -17898,9 +18012,7 @@
 +                output.copy_from_slice(&source[range.clone()]);
 +                copied = true;
 +            }
-         }
--
--        Ok(buffer)
++        }
 +        if !copied {
 +            self.file.read(offset + range.start as u64, output)?;
 +        }
@@ -17918,15 +18030,16 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1185,172 @@
+@@ -507,104 +1202,174 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
 -            self.read_cache_bytes
 -                .fetch_sub(removed.len(), Ordering::AcqRel);
-         }
-     }
- 
+-        }
++        }
++    }
++
 +    /// Detach only the map entry whose physical allocation the guard retains.
 +    /// The coordinate comes from the real cache map, never a SQL row ordinal.
 +    #[cfg(feature = "test-seams")]
@@ -17964,14 +18077,20 @@
 +            "exact held identity must be absent after invalidation"
 +        );
 +        (offset, len, identity, absent)
-+    }
-+
+     }
+ 
      pub(super) fn invalidate_cache_all(&self) {
          for cache_slot in 0..self.read_cache.len() {
              let mut lock = self.read_cache[cache_slot].write().unwrap();
 -            while let Some((_, removed)) = lock.pop_lowest_priority() {
 -                self.read_cache_bytes
 -                    .fetch_sub(removed.len(), Ordering::AcqRel);
+-            }
+-        }
+-    }
+-
+-    // If overwrite is true, the page is initialized to zero
+-    // cache_policy takes the existing data as an argument and returns the priority. The priority should be stable and not change after WritablePage is dropped
 +            while lock.pop_lowest_priority().is_some() {}
 +        }
 +    }
@@ -17986,7 +18105,7 @@
 +    ) -> Result<CachePayment> {
 +        let (previous, payment) = CachePayment::reserve(&self.write_buffer_bytes, bytes)?;
 +        let half = self.max_cache_size.load(Ordering::Acquire) / 2;
-+        let mut write_bytes = previous + bytes;
++        let write_bytes = previous + bytes;
 +        if write_bytes > half {
 +            let excess = write_bytes - half;
 +            let mut flushed = 0;
@@ -18003,24 +18122,13 @@
 +                #[cfg(feature = "cache_metrics")]
 +                self.evictions.fetch_add(1, Ordering::Relaxed);
 +                flushed += removed_bytes;
-             }
-+            // A detached dirty reader can keep flushed backing paid. Use the
-+            // real counter, not the sum of entries removed from the map.
-+            write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
++            }
 +        }
-+        let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
-+        if write_bytes.saturating_add(read_bytes) > self.max_cache_size.load(Ordering::Acquire) {
-+            self.evict_from_read_cache(
-+                write_bytes.saturating_add(read_bytes)
-+                    - self.max_cache_size.load(Ordering::Acquire),
-+                lock,
-+            );
-         }
++        // The new backing has no classified payer yet. In particular a full
++        // healthy clean cache cannot be evicted by this tentative reservation.
 +        Ok(payment)
-     }
- 
--    // If overwrite is true, the page is initialized to zero
--    // cache_policy takes the existing data as an argument and returns the priority. The priority should be stable and not change after WritablePage is dropped
++    }
++
 +    // If overwrite is true, the page is initialized to zero.
      pub(super) fn write(&self, offset: u64, len: usize, overwrite: bool) -> Result<WritablePage> {
          assert_eq!(0, offset % self.page_size);
@@ -18045,12 +18153,6 @@
 -            } else {
 -                None
 -            }
--        };
--
--        let data = if let Some(removed) = lock.take_value(offset) {
--            #[cfg(feature = "cache_metrics")]
--            self.writes_hits.fetch_add(1, Ordering::AcqRel);
--            removed
 +        let existing_read = self.read_cache[cache_slot].write().unwrap().remove(offset);
 +        if let Some(page) = &existing_read {
 +            assert_eq!(len, page.len(), "cache inconsistency for offset {offset}");
@@ -18063,15 +18165,44 @@
 +        let is_hit = existing.is_some() || overwrite;
 +        // A dirty source has one local clone plus its map owner. Neither can
 +        // escape while this write lock is held; only other owners require COW.
-+        let needs_copy = existing
-+            .as_ref()
-+            .is_none_or(|page| PageAllocation::strong_count(page) != if was_dirty { 2 } else { 1 });
++        #[cfg(feature = "contextdb-internal")]
++        let requires_native_source = crate::native_storage_admission::native_storage_active()
++            && existing.as_ref().is_some_and(|page| !page.is_charged());
++        #[cfg(not(feature = "contextdb-internal"))]
++        let requires_native_source = false;
++        let needs_copy = !was_dirty
++            || requires_native_source
++            || existing
++                .as_ref()
++                .is_none_or(|page| PageAllocation::strong_count(page) != 2);
 +        let needs_payment = needs_copy
 +            || existing
 +                .as_ref()
 +                .is_none_or(|page| !page.counted_by(&self.write_buffer_bytes));
 +        let payment = if needs_payment {
 +            Some(self.reserve_write_backing(cached_page_bytes(len), &mut lock)?)
++        } else {
++            None
+         };
+-
+-        let data = if let Some(removed) = lock.take_value(offset) {
+-            #[cfg(feature = "cache_metrics")]
+-            self.writes_hits.fetch_add(1, Ordering::AcqRel);
+-            removed
++        let data = if needs_copy {
++            // The old dirty entry stays in the map across fallible admission
++            // and copying (or has already been successfully flushed). Locals
++            // retain the old payer and roll back the new payment on Err/unwind.
++            let mut page = PageAllocation::zeroed_for_write(len, admitted_page_bytes(len))?;
++            if let Some(source) = &existing {
++                PageAllocation::get_mut(&mut page)
++                    .unwrap()
++                    .copy_from_slice(source);
++            } else if !overwrite {
++                self.file
++                    .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
++            }
++            page
          } else {
 -            let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
 -            let mut write_bytes = previous + len;
@@ -18109,25 +18240,36 @@
 -            let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
 -            if write_bytes + read_bytes > self.max_cache_size {
 -                self.evict_from_read_cache(write_bytes + read_bytes - self.max_cache_size, &lock);
-+            None
-+        };
-+        let data = if needs_copy {
-+            // The old dirty entry stays in the map across fallible admission
-+            // and copying (or has already been successfully flushed). Locals
-+            // retain the old payer and roll back the new payment on Err/unwind.
-+            let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
-+            let mut page = PageAllocation::zeroed(len, charge)?;
-+            if let Some(source) = &existing {
-+                PageAllocation::get_mut(&mut page)
-+                    .unwrap()
-+                    .copy_from_slice(source);
-+            } else if !overwrite {
-+                self.file
-+                    .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
-             }
+-            }
 -            let result = if let Some(data) = existing {
 -                #[cfg(feature = "cache_metrics")]
--                self.writes_hits.fetch_add(1, Ordering::AcqRel);
++            existing.unwrap()
++        };
++        if let Some(payment) = payment {
++            // A real source invoice remains with dirty backing. Unscoped pages
++            // retain their fixed payment and continue to constrain clean growth.
++            data.transfer_counted(payment, false);
++            let used = self
++                .read_cache_bytes
++                .load(Ordering::Acquire)
++                .saturating_add(self.write_buffer_bytes.fixed_bytes());
++            self.evict_from_read_cache(
++                used.saturating_sub(self.max_cache_size.load(Ordering::Acquire)),
++                &lock,
++            );
++        }
++        // On COW the old alias stays counted until its physical free. No byte
++        // alias is detached from the payment when returning writable ownership.
++        // No fallible operation remains after removing the old dirty entry.
++        // If reserve_write_backing already flushed it, remove is simply empty.
++        drop(lock.remove(offset));
++        lock.insert(offset, data);
++        let mut data = lock.take_value(offset).unwrap();
++        PageAllocation::get_mut(&mut data).expect("writable backing is exclusive");
++        #[cfg(feature = "cache_metrics")]
++        {
++            if is_hit {
+                 self.writes_hits.fetch_add(1, Ordering::AcqRel);
 -                data
 -            } else if overwrite {
 -                #[cfg(feature = "cache_metrics")]
@@ -18138,31 +18280,9 @@
 -            };
 -            lock.insert(offset, result);
 -            lock.take_value(offset).unwrap()
-+            page
-+        } else {
-+            existing.unwrap()
-         };
-+        if let Some(payment) = payment {
-+            let fixed_room = self
-+                .read_cache_bytes
-+                .load(Ordering::Acquire)
-+                .saturating_add(self.write_buffer_bytes.load(Ordering::Acquire))
-+                <= self.max_cache_size.load(Ordering::Acquire);
-+            data.transfer_counted(payment, fixed_room);
-+        }
-+        // On COW the old alias stays counted until its physical free. No byte
-+        // alias is detached from the payment when returning writable ownership.
-+        // No fallible operation remains after removing the old dirty entry.
-+        // If reserve_write_backing already flushed it, remove is simply empty.
-+        drop(lock.remove(offset));
-+        lock.insert(offset, data);
-+        let mut data = lock.take_value(offset).unwrap();
-+        PageAllocation::get_mut(&mut data).expect("writable backing is exclusive");
-         #[cfg(feature = "cache_metrics")]
+-        };
+-        #[cfg(feature = "cache_metrics")]
 -        self.writes_total.fetch_add(1, Ordering::AcqRel);
-+        {
-+            if is_hit {
-+                self.writes_hits.fetch_add(1, Ordering::AcqRel);
 +            }
 +            self.writes_total.fetch_add(1, Ordering::AcqRel);
 +        }
@@ -18171,7 +18291,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1360,383 @@
+@@ -614,13 +1379,383 @@
  }
  
  #[cfg(test)]
@@ -18557,10 +18677,11 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1769,840 @@
+@@ -653,4 +1788,912 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
+-}
 +    #[test]
 +    fn immutable_byte_checksum_owners_are_charged_and_release_at_final_holder() {
 +        struct Charge(Arc<std::sync::atomic::AtomicUsize>, usize);
@@ -19397,7 +19518,79 @@
 +            }
 +        }
 +    }
- }
++}
++
++/// Independent cache-pressure fixture using the production cache and native admission.
++/// Methods expose scalar observations; they never override cache allocation or eviction.
++#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++pub struct CachePressureFixtureForTest {
++    file: PagedCachedFile,
++    pages: usize,
++    capacity: usize,
++}
++#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++impl CachePressureFixtureForTest {
++    pub fn new() -> std::result::Result<Self, DatabaseError> {
++        let backend = crate::backends::InMemoryBackend::new();
++        crate::StorageBackend::set_len(&backend, 64 * 4096)?;
++        let capacity = 8 * cached_page_bytes(4096);
++        let file = PagedCachedFile::new(Box::new(backend), 4096, capacity)?;
++        Ok(Self {
++            file,
++            pages: 8,
++            capacity,
++        })
++    }
++    pub fn capacity_and_index(&self) -> (usize, usize) {
++        (self.capacity, self.file.index_bytes())
++    }
++    pub fn retain_reserve(&self, reserve: crate::NativeStorageCredit) -> crate::CacheReserveOwner {
++        self.file.retain_cache_reserve(reserve)
++    }
++    pub fn warm(&self) -> Result<()> {
++        for index in 0..self.pages {
++            drop(self.file.read(index as u64 * 4096, 4096, PageHint::Clean)?);
++        }
++        Ok(())
++    }
++    pub fn clean_resident(&self) -> usize {
++        (0..self.pages)
++            .filter(|index| {
++                let offset = *index as u64 * 4096;
++                let stripe = usize::try_from(offset % PagedCachedFile::lock_stripes()).unwrap();
++                self.file.read_cache[stripe]
++                    .read()
++                    .unwrap()
++                    .get(offset)
++                    .is_some()
++            })
++            .count()
++    }
++    pub fn dirty_disjoint(&self) -> Result<()> {
++        for index in self.pages..self.pages + 4 {
++            let mut page = self.file.write(index as u64 * 4096, 4096, true)?;
++            page[0] = 42;
++            drop(page);
++        }
++        Ok(())
++    }
++    pub fn flush(&self) -> Result<()> {
++        self.file.flush_write_buffer()
++    }
++    pub fn held(&self) -> (usize, usize) {
++        (
++            self.file.read_cache_bytes.load(Ordering::Acquire),
++            self.file.write_buffer_bytes.load(Ordering::Acquire),
++        )
++    }
++}
++
++#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++impl ReadCachePageWindow {
++    pub(crate) fn visit_latest_for_test(&self, visit: impl FnMut([u8; 8])) -> bool {
++        self.arena.visit_latest_page_window_for_test(visit)
++    }
++}
 --- a/src/tree_store/page_store/file_backend/fallback.rs
 +++ b/src/tree_store/page_store/file_backend/fallback.rs
 @@ -1,13 +1,15 @@
@@ -19642,6 +19835,8 @@
  use crate::tree_store::page_store::fast_hash::FastHashMapU64;
 -use std::collections::VecDeque;
 -use std::sync::atomic::{AtomicBool, Ordering};
+-
+-#[derive(Default)]
 +use crate::tree_store::page_store::fast_hash::FastHasher64;
 +use std::hash::Hasher;
 +use std::ops::Deref;
@@ -19649,8 +19844,7 @@
 +use std::sync::atomic::AtomicUsize;
 +use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 +use std::sync::{Mutex, RwLock, RwLockReadGuard};
- 
--#[derive(Default)]
++
 +const NONE: u32 = u32::MAX;
 +
 +struct Entry<T> {
@@ -20240,17 +20434,10 @@
          }
      }
  
-@@ -21,83 +597,593 @@
+@@ -21,83 +597,603 @@
          self.cache.len()
      }
  
--    pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
--        let result = self
--            .cache
--            .insert(key, (value, AtomicBool::new(false)))
--            .map(|(x, _)| x);
--        if result.is_none() {
--            self.lru_queue.push_back(key);
 +    fn insert_at(&mut self, key: u64, value: T, lowest: bool) -> Option<T> {
 +        if let Some(entry) = self.cache.get_mut(&key) {
 +            entry.second_chance.store(false, Ordering::Release);
@@ -20274,8 +20461,7 @@
 +            self.cache.get_mut(&previous).unwrap().next = Some(key);
 +        } else {
 +            self.first = Some(key);
-         }
--        result
++        }
 +        if let Some(next) = next {
 +            self.cache.get_mut(&next).unwrap().previous = Some(key);
 +        } else {
@@ -20284,7 +20470,15 @@
 +        None
 +    }
 +
-+    pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
+     pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
+-        let result = self
+-            .cache
+-            .insert(key, (value, AtomicBool::new(false)))
+-            .map(|(x, _)| x);
+-        if result.is_none() {
+-            self.lru_queue.push_back(key);
+-        }
+-        result
 +        self.insert_at(key, value, false)
      }
  
@@ -20298,10 +20492,6 @@
 -                    {
 -                        second_chance.store(false, Ordering::Release);
 -                        self.lru_queue.push_back(removed_key);
--                    }
--                }
--            }
--            Some(value)
 +        let entry = self.cache.remove(&key)?;
 +        if let Some(previous) = entry.previous {
 +            self.cache.get_mut(&previous).unwrap().next = entry.next;
@@ -20310,8 +20500,7 @@
 +        }
 +        if let Some(next) = entry.next {
 +            self.cache.get_mut(&next).unwrap().previous = entry.previous;
-         } else {
--            None
++        } else {
 +            self.last = entry.previous;
 +        }
 +        // Geometric reclamation keeps metadata proportional to live cache entries
@@ -20320,58 +20509,33 @@
 +            self.cache = Default::default();
 +        } else if self.cache.capacity() > self.cache.len().saturating_mul(4) {
 +            self.cache.shrink_to_fit();
-         }
++        }
 +        Some(entry.value)
-     }
- 
-     pub(crate) fn get(&self, key: u64) -> Option<&T> {
--        if let Some((value, second_chance)) = self.cache.get(&key) {
--            second_chance.store(true, Ordering::Release);
--            Some(value)
--        } else {
--            None
--        }
++    }
++
++    pub(crate) fn get(&self, key: u64) -> Option<&T> {
 +        let entry = self.cache.get(&key)?;
 +        entry.second_chance.store(true, Ordering::Release);
 +        Some(&entry.value)
-     }
- 
-     pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
--        if let Some((value, second_chance)) = self.cache.get_mut(&key) {
--            second_chance.store(true, Ordering::Release);
--            Some(value)
--        } else {
--            None
--        }
++    }
++
++    pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
 +        let entry = self.cache.get_mut(&key)?;
 +        entry.second_chance.store(true, Ordering::Release);
 +        Some(&mut entry.value)
-     }
- 
-     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
--        self.cache.iter().map(|(k, (v, _))| (k, v))
++    }
++
++    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
 +        self.cache.iter().map(|(key, entry)| (key, &entry.value))
-     }
- 
-     pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
--        self.cache.iter_mut().map(|(k, (v, _))| (k, v))
++    }
++
++    pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
 +        self.cache
 +            .iter_mut()
 +            .map(|(key, entry)| (key, &mut entry.value))
-     }
- 
-     pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
--        while let Some(key) = self.lru_queue.pop_front() {
--            if let Some((_, second_chance)) = self.cache.get(&key) {
--                if second_chance
--                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
--                    .is_ok()
--                {
--                    self.lru_queue.push_back(key);
--                } else {
--                    let (value, _) = self.cache.remove(&key).unwrap();
--                    return Some((key, value));
--                }
++    }
++
++    pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
 +        self.pop_lowest_priority_where(|_| true)
 +    }
 +
@@ -20397,16 +20561,12 @@
 +                entry.next = None;
 +                self.first = Some(next);
 +                self.last = Some(key);
-             }
-         }
-         None
-     }
- 
-     pub(crate) fn clear(&mut self) {
--        self.cache.shrink_to_fit();
--        self.cache.clear();
--        self.lru_queue.shrink_to_fit();
--        self.lru_queue.clear();
++            }
++        }
++        None
++    }
++
++    pub(crate) fn clear(&mut self) {
 +        *self = Self::new();
 +    }
 +}
@@ -20597,8 +20757,49 @@
 +                for stripe in &mut stripes {
 +                    while let Some((key, value)) = stripe.pop_lowest_priority() {
 +                        assert_eq!(key, value);
-+                    }
-+                }
+                     }
+                 }
+-            }
+-            Some(value)
+-        } else {
+-            None
+-        }
+-    }
+-
+-    pub(crate) fn get(&self, key: u64) -> Option<&T> {
+-        if let Some((value, second_chance)) = self.cache.get(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
+-    }
+-
+-    pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
+-        if let Some((value, second_chance)) = self.cache.get_mut(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
+-    }
+-
+-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
+-        self.cache.iter().map(|(k, (v, _))| (k, v))
+-    }
+-
+-    pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
+-        self.cache.iter_mut().map(|(k, (v, _))| (k, v))
+-    }
+-
+-    pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
+-        while let Some(key) = self.lru_queue.pop_front() {
+-            if let Some((_, second_chance)) = self.cache.get(&key) {
+-                if second_chance
+-                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+-                    .is_ok()
+-                {
+-                    self.lru_queue.push_back(key);
 +                assert!(stripes.iter().all(|s| s.len() == 0));
 +                assert_eq!(
 +                    arena.index_bytes() + stripes.iter().map(|s| s.index_bytes()).sum::<usize>(),
@@ -20720,7 +20921,9 @@
 +                }
 +                let (previous, next) = if lowest {
 +                    (None, self.first)
-+                } else {
+                 } else {
+-                    let (value, _) = self.cache.remove(&key).unwrap();
+-                    return Some((key, value));
 +                    (self.last, None)
 +                };
 +                self.cache.insert(
@@ -20736,7 +20939,19 @@
 +                    self.cache.get_mut(&previous).unwrap().next = Some(key);
 +                } else {
 +                    self.first = Some(key);
-+                }
+                 }
+-            }
+-        }
+-        None
+-    }
+-
+-    pub(crate) fn clear(&mut self) {
+-        self.cache.shrink_to_fit();
+-        self.cache.clear();
+-        self.lru_queue.shrink_to_fit();
+-        self.lru_queue.clear();
+-    }
+-}
 +                if let Some(next) = next {
 +                    self.cache.get_mut(&next).unwrap().previous = Some(key);
 +                } else {
@@ -20883,8 +21098,18 @@
 +        assert!(cache.peek(3).is_none());
 +        assert_eq!(cache.pop_lowest_priority(), Some((1, 10)));
 +        assert_eq!(cache.pop_lowest_priority(), Some((2, 20)));
-     }
- }
++    }
++}
++
++// Quiescent single-query fixtures can compare the actual latest recorded set
++// even when the operation installed its own nested production window.
++#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++impl<T> EntryArena<T> {
++    pub(crate) fn visit_latest_page_window_for_test(&self, visit: impl FnMut([u8; 8])) -> bool {
++        let epoch = self.query_epoch.load(Ordering::Acquire);
++        self.visit_page_window(epoch, visit)
++    }
++}
 --- a/src/tree_store/page_store/mod.rs
 +++ b/src/tree_store/page_store/mod.rs
 @@ -1,3 +1,4 @@
@@ -20915,7 +21140,7 @@
  pub(crate) use header::PAGE_SIZE;
  pub(crate) use page_manager::{
      FILE_FORMAT_VERSION3, ShrinkPolicy, TransactionalMemory, xxh3_checksum,
-@@ -28,3 +33,17 @@
+@@ -28,3 +33,20 @@
  
  pub(super) use base::{PageImpl, PageMut};
  pub(super) use xxh3::hash128_with_seed;
@@ -20933,9 +21158,12 @@
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +#[doc(hidden)]
 +pub use cached_file::CheckedWriterBackendForTest;
++
++#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++pub use cached_file::CachePressureFixtureForTest;
 --- /dev/null
 +++ b/src/tree_store/page_store/page_allocation.rs
-@@ -0,0 +1,800 @@
+@@ -0,0 +1,877 @@
 +//! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 +//! escape independently of the payer. Native copies retain their separate owner.
 +use crate::atomic_compat::AtomicUpdate as _;
@@ -20976,6 +21204,8 @@
 +struct CounterBlock {
 +    owners: AtomicUsize,
 +    value: AtomicUsize,
++    // Occupancy still relying on the original fixed cache reserve.
++    fixed: AtomicUsize,
 +    release_generation: AtomicU64,
 +    dynamic_settlement: AtomicBool,
 +    settlement: Mutex<Option<CacheSettlement>>,
@@ -21007,6 +21237,10 @@
 +    #[cfg(feature = "test-seams")]
 +    pub(super) fn observation_for_test(&self) -> (usize, usize) {
 +        (self.block.as_ptr() as usize, self.load(Ordering::SeqCst))
++    }
++
++    pub(super) fn fixed_bytes(&self) -> usize {
++        unsafe { self.block.as_ref() }.fixed.load(Ordering::Acquire)
 +    }
 +
 +    pub(super) fn release_generation(&self) -> u64 {
@@ -21067,6 +21301,7 @@
 +            block.as_ptr().write(CounterBlock {
 +                owners: AtomicUsize::new(1),
 +                value: AtomicUsize::new(0),
++                fixed: AtomicUsize::new(0),
 +                release_generation: AtomicU64::new(1),
 +                dynamic_settlement: AtomicBool::new(false),
 +                settlement: Mutex::new(None),
@@ -21134,6 +21369,7 @@
 +pub(super) struct CachePayment {
 +    counter: CacheCounter,
 +    bytes: usize,
++    fixed: bool,
 +}
 +impl CachePayment {
 +    /// Caller reserves the complete Layout under the existing cache locks.
@@ -21146,11 +21382,25 @@
 +                used.checked_add(bytes)
 +            })
 +            .map_err(|_| StorageError::ValueTooLarge(bytes))?;
++        // Tentative custody starts fixed-paid. Only retaining a genuine source
++        // charge below may remove this fixed claim; no capacity refusal or
++        // clean eviction occurs while the new backing is still provisional.
++        if unsafe { counter.block.as_ref() }
++            .fixed
++            .fetch_update_compat(Ordering::AcqRel, Ordering::Acquire, |used| {
++                used.checked_add(bytes)
++            })
++            .is_err()
++        {
++            counter.fetch_sub(bytes, Ordering::AcqRel);
++            return Err(StorageError::ValueTooLarge(bytes));
++        }
 +        Ok((
 +            previous,
 +            Self {
 +                counter: owner,
 +                bytes,
++                fixed: true,
 +            },
 +        ))
 +    }
@@ -21160,9 +21410,23 @@
 +    fn has_fixed_reserve(&self) -> bool {
 +        self.counter.has_fixed_reserve()
 +    }
++    // Called only while the same PagePayer retains its real source invoice.
++    fn retain_source(&mut self) {
++        if self.fixed {
++            self.fixed = false;
++            unsafe { self.counter.block.as_ref() }
++                .fixed
++                .fetch_sub(self.bytes, Ordering::AcqRel);
++        }
++    }
 +}
 +impl Drop for CachePayment {
 +    fn drop(&mut self) {
++        if self.fixed {
++            unsafe { self.counter.block.as_ref() }
++                .fixed
++                .fetch_sub(self.bytes, Ordering::AcqRel);
++        }
 +        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
 +        self.counter.settle_after_free();
 +    }
@@ -21171,8 +21435,8 @@
 +enum PagePayer {
 +    // Field is owned for its destructor, never inspected or substituted.
 +    Source(ReadMemoryCharge),
-+    // Beyond the fixed reserve, the actual source receipt pays for this whole
-+    // write backing. Occupancy remains visible and blocks further cache growth;
++    // The actual source receipt pays for this whole backing independently of
++    // the fixed reserve. Physical occupancy remains visible;
 +    // it is not a second invoice against the fixed reserve.
 +    SourceCounted {
 +        // Owned for its destructor; never downcast, substituted or re-invoiced.
@@ -21303,6 +21567,25 @@
 +            None => ("missing", 0, 0),
 +        }
 +    }
++    /// Copy only the actual native source receipt under its payment lock.
++    /// Occupancy identity alone does not authenticate source funding.
++    #[cfg(feature = "test-seams")]
++    pub(super) fn native_source_receipt_for_test(&self) -> Option<usize> {
++        let slot = unsafe { self.block.as_ref() }
++            .payer
++            .lock()
++            .unwrap_or_else(|error| error.into_inner());
++        match &*slot {
++            #[cfg(feature = "contextdb-internal")]
++            Some(PagePayer::Source(ReadMemoryCharge::Native(charge)))
++            | Some(PagePayer::SourceCounted {
++                charge: ReadMemoryCharge::Native(charge),
++                ..
++            }) => Some(charge.identity_for_test()),
++            _ => None,
++        }
++    }
++
 +    #[cfg(any(test, feature = "contextdb-internal"))]
 +    pub(super) fn checksum(&self) -> &Mutex<Option<u128>> {
 +        &unsafe { self.block.as_ref() }.checksum
@@ -21331,10 +21614,30 @@
 +            _ => false,
 +        }
 +    }
++    pub(super) fn fixed_counted_by(&self, counter: &CacheCounter) -> bool {
++        match &*unsafe { self.block.as_ref() }
++            .payer
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++        {
++            Some(PagePayer::Cache(payment)) => payment.fixed && payment.counter_is(counter),
++            _ => false,
++        }
++    }
++    /// Writes use the original native producer when installed. The legacy TLS
++    /// slot may be empty even while native writer admission is active.
++    pub(super) fn zeroed_for_write(len: usize, legacy_admitted_bytes: usize) -> Result<Self> {
++        #[cfg(feature = "contextdb-internal")]
++        if crate::native_storage_admission::native_storage_active() {
++            return Self::zeroed_native(len).map_err(StorageError::Native);
++        }
++        let charge = admit_read_memory(legacy_admitted_bytes)?;
++        Self::zeroed(len, charge)
++    }
 +    /// Only backing that fits the fixed reserve relinquishes its genuine
 +    /// source receipt. Overlap/oversized backing keeps that original receipt
 +    /// and a physical occupancy tally until free, including across flush.
-+    pub(super) fn transfer_counted(&self, payment: CachePayment, fixed_room: bool) {
++    pub(super) fn transfer_counted(&self, mut payment: CachePayment, fixed_room: bool) {
 +        // Capacity is not a receipt. Before the actual engine parent is
 +        // installed (or on an unqualified standalone backend), keep the true
 +        // source charge instead of refunding it into an unowned cache reserve.
@@ -21346,6 +21649,7 @@
 +        let previous = slot.take();
 +        let refund = match previous {
 +            Some(PagePayer::Source(charge)) if !fixed_room => {
++                payment.retain_source();
 +                *slot = Some(PagePayer::SourceCounted {
 +                    charge,
 +                    occupancy: payment,
@@ -21353,6 +21657,7 @@
 +                None
 +            }
 +            Some(PagePayer::SourceCounted { charge, occupancy }) if !fixed_room => {
++                payment.retain_source();
 +                *slot = Some(PagePayer::SourceCounted {
 +                    charge,
 +                    occupancy: payment,
@@ -21926,13 +22231,17 @@
  struct InMemoryState {
      header: DatabaseHeader,
      // TODO: we should make this an Option because it is only valid after the Database initializes it
-@@ -82,17 +232,27 @@
+@@ -82,22 +232,95 @@
  }
  
  impl InMemoryState {
 -    fn new(header: DatabaseHeader) -> Self {
 -        let allocators = Allocators::new(header.layout());
 -        Self { header, allocators }
+-    }
+-
+-    fn get_region(&self, region: u32) -> &BuddyAllocator {
+-        &self.allocators.region_allocators[region as usize]
 +    fn new(
 +        header: DatabaseHeader,
 +        scratch: Option<Box<dyn ScratchBackend>>,
@@ -21946,10 +22255,8 @@
 +            Allocators::new(header.layout())
 +        };
 +        Ok(Self { header, allocators })
-     }
- 
--    fn get_region(&self, region: u32) -> &BuddyAllocator {
--        &self.allocators.region_allocators[region as usize]
++    }
++
 +    fn get_region(&mut self, region: u32) -> &BuddyAllocator {
 +        self.allocators.get_region(region)
      }
@@ -21960,10 +22267,10 @@
      }
  
      fn get_region_tracker_mut(&mut self) -> &mut RegionTracker {
-@@ -100,6 +260,69 @@
+         &mut self.allocators.region_tracker
      }
- }
- 
++}
++
 +// Armed throughout header publication until that same header is installed.
 +// Drop must remain infallible and independent of every storage mutex.
 +#[cfg(feature = "contextdb-internal")]
@@ -22025,11 +22332,9 @@
 +        ((1075 - shift) << 52) | (mantissa & ((1 << 52) - 1))
 +    };
 +    Some(f64::from_bits(bits))
-+}
-+
+ }
+ 
  pub(crate) struct TransactionalMemory {
-     // Pages allocated since the last commit
-     // TODO: maybe this should be moved to WriteTransaction?
 @@ -108,7 +331,14 @@
      // True if the allocator state was corrupted when the file was opened
      // TODO: maybe we can remove this flag now that CheckedBackend exists?
@@ -22058,8 +22363,8 @@
 +    // The fixed cache invoice also covers allocator windows in state. Free
 +    // that state before storage releases its final genuine reserve owner.
 +    storage: PagedCachedFile,
-+}
-+
+ }
+ 
 +/// One commit slot of a crashed store's header.
 +#[cfg(feature = "contextdb-internal")]
 +#[derive(Debug, Clone, Copy)]
@@ -22113,8 +22418,8 @@
 +    }
 +    file.write_all_at(&header.to_bytes(true), 0)?;
 +    file.sync_all()
- }
- 
++}
++
  impl TransactionalMemory {
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {
@@ -22386,15 +22691,15 @@
              storage,
              state: Mutex::new(state),
              #[cfg(debug_assertions)]
-@@ -277,41 +776,227 @@
+@@ -277,7 +776,150 @@
              page_size: page_size.try_into().unwrap(),
              region_size,
              region_header_with_padding_size: region_header_size,
 +            #[cfg(feature = "contextdb-internal")]
 +            read_budget: Mutex::new(None),
          })
-     }
- 
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn retire_read_cache_request(&self, request: u64) {
 +        self.storage.retire_read_cache_request(request);
@@ -22424,6 +22729,10 @@
 +        self.storage.retain_cache_reserve(reserve)
 +    }
 +
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn installed_cache_capacity_for_test(&self) -> usize {
++        self.storage.installed_cache_capacity_for_test()
++    }
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn set_read_cache_capacity(&self, bytes: usize) -> Result<usize> {
 +        self.storage.set_read_cache_capacity(bytes)
@@ -22436,6 +22745,11 @@
 +        settle: impl FnOnce() -> R,
 +    ) -> Result<R> {
 +        self.storage.with_read_cache_capacity(bytes, settle)
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn installed_cache_capacity(&self) -> usize {
++        self.storage.installed_cache_capacity()
 +    }
 +
 +    #[cfg(feature = "contextdb-internal")]
@@ -22525,10 +22839,10 @@
 +            })
 +            .count();
 +        resident as f64 / page_ids.len() as f64
-+    }
-+
+     }
+ 
      pub(crate) fn cache_stats(&self) -> CacheStats {
-         self.storage.cache_stats()
+@@ -285,7 +927,52 @@
      }
  
      pub(crate) fn check_io_errors(&self) -> Result {
@@ -22543,9 +22857,9 @@
 +            return Err(error);
 +        }
          self.storage.check_io_errors()
-     }
- 
-     #[cfg(debug_assertions)]
++    }
++
++    #[cfg(debug_assertions)]
 +    pub(crate) fn uses_paged_allocator(&self) -> bool {
 +        self.state.lock().unwrap().allocators.pager().is_some()
 +    }
@@ -22578,12 +22892,10 @@
 +            return Err(error);
 +        }
 +        Ok(retired)
-+    }
-+
-+    #[cfg(debug_assertions)]
-     pub(crate) fn mark_debug_allocated_page(&self, page: PageNumber) {
-         assert!(self.allocated_pages.lock().unwrap().insert(page));
      }
+ 
+     #[cfg(debug_assertions)]
+@@ -295,23 +982,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -22620,7 +22932,7 @@
          }
      }
  
-@@ -346,7 +1031,9 @@
+@@ -346,7 +1040,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -22631,7 +22943,7 @@
  
          Ok(was_clean)
      }
-@@ -363,6 +1050,44 @@
+@@ -363,6 +1059,44 @@
          self.state.lock().unwrap().header.two_phase_commit
      }
  
@@ -22676,7 +22988,7 @@
      pub(crate) fn allocator_hash(&self) -> u128 {
          self.state.lock().unwrap().allocators.xxh3_hash()
      }
-@@ -379,7 +1104,8 @@
+@@ -379,7 +1113,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -22686,7 +22998,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,20 +1118,42 @@
+@@ -392,20 +1127,42 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -22730,7 +23042,7 @@
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
          let result = self.storage.flush();
-@@ -419,30 +1167,37 @@
+@@ -419,30 +1176,37 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -22754,6 +23066,12 @@
 -                &AllocatorStateKey::Region(i),
 -                &vec![0; region_bytes_len].as_ref(),
 -            )?;
+-        }
+-
+-        tree.insert(
+-            &AllocatorStateKey::RegionTracker,
+-            &vec![0; region_tracker_len].as_ref(),
+-        )?;
 +            let region_bytes_len = self
 +                .state
 +                .lock()
@@ -22762,12 +23080,8 @@
 +                .get_region(i)
 +                .encoded_len();
 +            drop(tree.insert_zeroed_reserve(&AllocatorStateKey::Region(i), region_bytes_len)?);
-         }
- 
--        tree.insert(
--            &AllocatorStateKey::RegionTracker,
--            &vec![0; region_tracker_len].as_ref(),
--        )?;
++        }
++
 +        drop(tree.insert_zeroed_reserve(&AllocatorStateKey::RegionTracker, region_tracker_len)?);
 +        // Reserved before anything is encoded, so the encode allocates nothing.
 +        #[cfg(feature = "test-seams")]
@@ -22784,7 +23098,7 @@
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +1213,83 @@
+@@ -458,43 +1222,83 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -22815,11 +23129,8 @@
                  return Ok(false);
              }
 -            tree.insert_inplace(&AllocatorStateKey::Region(i), &region_bytes.as_ref())?;
-+            region.encode_into(destination.value_mut());
-+            drop(state);
-+            drop(destination);
-         }
- 
+-        }
+-
 -        let region_tracker_bytes = state.allocators.region_tracker.to_vec();
 -        if tree
 -            .get(&AllocatorStateKey::RegionTracker)?
@@ -22828,6 +23139,11 @@
 -            .len()
 -            < region_tracker_bytes.len()
 -        {
++            region.encode_into(destination.value_mut());
++            drop(state);
++            drop(destination);
++        }
++
 +        let mut destination = tree.get_mut(&AllocatorStateKey::RegionTracker)?.unwrap();
 +        let state = self.state.lock().unwrap();
 +        if destination.value().len() < state.allocators.region_tracker.encoded_len() {
@@ -22838,6 +23154,7 @@
 -            &AllocatorStateKey::RegionTracker,
 -            &region_tracker_bytes.as_ref(),
 -        )?;
+-
 +        state
 +            .allocators
 +            .region_tracker
@@ -22879,7 +23196,7 @@
 +            let len = encoded.len();
 +            destination.value_mut()[..len].copy_from_slice(&encoded);
 +        }
- 
++
 +        let state = self.state.lock().unwrap();
 +        if let Some(error) = state
 +            .allocators
@@ -22891,7 +23208,7 @@
          Ok(true)
      }
  
-@@ -516,15 +1311,216 @@
+@@ -516,15 +1320,216 @@
          Ok(transaction_id == self.get_last_committed_transaction_id()?)
      }
  
@@ -23110,7 +23427,7 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -533,15 +1529,19 @@
+@@ -533,15 +1538,19 @@
                  .value(),
          );
  
@@ -23132,7 +23449,7 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -550,12 +1550,25 @@
+@@ -550,12 +1559,25 @@
          Ok(())
      }
  
@@ -23161,7 +23478,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -586,6 +1599,32 @@
+@@ -586,6 +1608,32 @@
          result
      }
  
@@ -23194,10 +23511,11 @@
      #[allow(clippy::too_many_arguments)]
      fn commit_inner(
          &self,
-@@ -612,13 +1651,112 @@
+@@ -612,7 +1660,13 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
+-
 +        self.check_io_errors()?;
 +
 +        // Every page this commit wrote reaches the file before any header
@@ -23205,51 +23523,13 @@
 +        // below, so a process that dies at any point leaves a header whose
 +        // commit is complete in the file it names. Same writes, same one sync.
 +        self.storage.write_barrier()?;
-+        let old_transaction_id = header.secondary_slot().transaction_id;
-+        let secondary = header.secondary_slot_mut();
-+        secondary.transaction_id = transaction_id;
-+        secondary.user_root = data_root;
-+        secondary.system_root = system_root;
-+
-+        self.write_header(&header)?;
-+
-+        // Use 2-phase commit, if checksums are disabled
-+        if two_phase {
-+            self.storage.flush()?;
-+        }
-+
-+        // Make our new commit the primary, and record whether it was a 2-phase commit.
-+        // These two bits need to be written atomically
-+        header.swap_primary_slot();
-+        header.two_phase_commit = two_phase;
-+
-+        // Write the new header to disk
-+        self.write_header(&header)?;
-+        self.storage.flush()?;
-+
-+        if shrunk {
-+            let result = self.storage.resize(header.layout().len());
-+            if result.is_err() {
-+                // TODO: it would be nice to have a more cohesive approach to setting this.
-+                // we do it in commit() & rollback() on failure, but there are probably other places that need it
-+                self.needs_recovery.store(true, Ordering::Release);
-+                return result;
-+            }
-+        }
-+        let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-+        allocated_since_commit.clear();
-+        allocated_since_commit.shrink_to_fit();
-+        let mut unpersisted = self.unpersisted.lock().unwrap();
-+        unpersisted.clear();
-+        unpersisted.shrink_to_fit();
-+
-+        let mut state = self.state.lock().unwrap();
-+        assert_eq!(
-+            state.header.secondary_slot().transaction_id,
-+            old_transaction_id
-+        );
-+        state.header = header;
-+        self.read_from_secondary.store(false, Ordering::Release);
+         let old_transaction_id = header.secondary_slot().transaction_id;
+         let secondary = header.secondary_slot_mut();
+         secondary.transaction_id = transaction_id;
+@@ -658,6 +1712,101 @@
+         );
+         state.header = header;
+         self.read_from_secondary.store(false, Ordering::Release);
 +        // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
 +        // TODO: maybe we can remove the whole read_from_secondary flag?
 +        drop(state);
@@ -23286,44 +23566,69 @@
 +        let mut header = state.header.clone();
 +        drop(state);
 +        self.check_io_errors()?;
- 
++
 +        // Every page this commit wrote reaches the file before any header
 +        // naming it does: the header leaves the buffer last, in the flush
 +        // below, so a process that dies at any point leaves a header whose
 +        // commit is complete in the file it names. Same writes, same one sync.
 +        self.storage.write_barrier()?;
-         let old_transaction_id = header.secondary_slot().transaction_id;
-         let secondary = header.secondary_slot_mut();
-         secondary.transaction_id = transaction_id;
-         secondary.user_root = data_root;
-         secondary.system_root = system_root;
- 
++        let old_transaction_id = header.secondary_slot().transaction_id;
++        let secondary = header.secondary_slot_mut();
++        secondary.transaction_id = transaction_id;
++        secondary.user_root = data_root;
++        secondary.system_root = system_root;
++
 +        let mut recovery_guard = PublicationRecoveryGuard {
 +            needs_recovery: &self.needs_recovery,
 +            publication_needs_recovery: &self.publication_needs_recovery,
 +            armed: true,
 +        };
 +        marker.header_begun();
-         self.write_header(&header)?;
- 
-         // Use 2-phase commit, if checksums are disabled
-@@ -634,6 +1772,7 @@
-         // Write the new header to disk
-         self.write_header(&header)?;
-         self.storage.flush()?;
++        self.write_header(&header)?;
++
++        // Use 2-phase commit, if checksums are disabled
++        if two_phase {
++            self.storage.flush()?;
++        }
++
++        // Make our new commit the primary, and record whether it was a 2-phase commit.
++        // These two bits need to be written atomically
++        header.swap_primary_slot();
++        header.two_phase_commit = two_phase;
++
++        // Write the new header to disk
++        self.write_header(&header)?;
++        self.storage.flush()?;
 +        marker.durable();
- 
-         if shrunk {
-             let result = self.storage.resize(header.layout().len());
-@@ -658,6 +1797,7 @@
-         );
-         state.header = header;
-         self.read_from_secondary.store(false, Ordering::Release);
++
++        if shrunk {
++            let result = self.storage.resize(header.layout().len());
++            if result.is_err() {
++                // TODO: it would be nice to have a more cohesive approach to setting this.
++                // we do it in commit() & rollback() on failure, but there are probably other places that need it
++                self.needs_recovery.store(true, Ordering::Release);
++                return result;
++            }
++        }
++        let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
++        allocated_since_commit.clear();
++        allocated_since_commit.shrink_to_fit();
++        let mut unpersisted = self.unpersisted.lock().unwrap();
++        unpersisted.clear();
++        unpersisted.shrink_to_fit();
++
++        let mut state = self.state.lock().unwrap();
++        assert_eq!(
++            state.header.secondary_slot().transaction_id,
++            old_transaction_id
++        );
++        state.header = header;
++        self.read_from_secondary.store(false, Ordering::Release);
 +        recovery_guard.armed = false;
          // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
          // TODO: maybe we can remove the whole read_from_secondary flag?
          drop(state);
-@@ -678,6 +1818,7 @@
+@@ -678,6 +1827,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -23331,7 +23636,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -725,8 +1866,11 @@
+@@ -725,8 +1875,11 @@
              state
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
@@ -23344,7 +23649,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -745,12 +1889,18 @@
+@@ -745,12 +1898,18 @@
      }
  
      pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
@@ -23363,7 +23668,7 @@
          let len: usize = (range.end - range.start).try_into().unwrap();
          let mem = self.storage.read(range.start, len, hint)?;
  
-@@ -776,6 +1926,33 @@
+@@ -776,6 +1935,33 @@
          })
      }
  
@@ -23397,7 +23702,7 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -824,6 +2001,44 @@
+@@ -824,6 +2010,44 @@
          }
      }
  
@@ -23442,7 +23747,7 @@
      pub(crate) fn get_data_root(&self) -> Option<BtreeHeader> {
          let state = self.state.lock().unwrap();
          if self.read_from_secondary.load(Ordering::Acquire) {
-@@ -871,7 +2086,9 @@
+@@ -871,7 +2095,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -23453,7 +23758,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -881,6 +2098,7 @@
+@@ -881,6 +2107,7 @@
          state
              .get_region_mut(region_index)
              .free(page.page_index, page.page_order);
@@ -23461,7 +23766,7 @@
          // Ensure that the region is marked as having free space
          state
              .get_region_tracker_mut()
-@@ -953,12 +2171,32 @@
+@@ -953,12 +2180,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -23478,7 +23783,7 @@
 +                StorageError::Corrupted("allocator growth yielded no free page".into())
 +            })?
          };
- 
++
 +        if let Some(error) = state
 +            .allocators
 +            .pager()
@@ -23486,7 +23791,7 @@
 +        {
 +            return Err(error);
 +        }
-+
+ 
          #[cfg(debug_assertions)]
          {
 -            assert!(self.allocated_pages.lock().unwrap().insert(page_number));
@@ -23496,7 +23801,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -987,7 +2225,6 @@
+@@ -987,7 +2234,6 @@
              .try_into()
              .unwrap();
  
@@ -23504,7 +23809,7 @@
          let mut mem = self.storage.write(address_range.start, len, true)?;
          debug_assert!(mem.mem().len() >= allocation_size);
  
-@@ -1024,7 +2261,28 @@
+@@ -1024,7 +2270,28 @@
              } else {
                  region.alloc(required_order)
              };
@@ -23533,7 +23838,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +2319,7 @@
+@@ -1061,7 +2328,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -23542,7 +23847,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1093,27 +2351,52 @@
+@@ -1093,27 +2360,52 @@
                  layout.usable_bytes() + required_growth * 2,
              )
          };
@@ -23607,7 +23912,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1123,7 +2406,12 @@
+@@ -1123,7 +2415,12 @@
          allocation_size: usize,
          allocated: &mut PageTrackerPolicy,
      ) -> Result<PageMut<'txn>> {
@@ -23621,7 +23926,7 @@
          if let Ok(ref page) = result {
              allocated.insert(page.get_page_number());
          }
-@@ -1135,7 +2423,7 @@
+@@ -1135,7 +2432,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -23630,7 +23935,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +2433,7 @@
+@@ -1145,7 +2442,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -23639,7 +23944,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +2446,41 @@
+@@ -1158,8 +2455,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -23682,7 +23987,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +2549,469 @@
+@@ -1228,4 +2558,469 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }
@@ -23785,7 +24090,7 @@
 +            }
 +        }
 +    }
-+}
+ }
 +
 +#[cfg(feature = "contextdb-internal")]
 +impl TransactionalMemory {
@@ -24151,7 +24456,7 @@
 +        );
 +        assert!(state.allocators.has_saved_source());
 +    }
- }
++}
 --- a/src/tree_store/page_store/region.rs
 +++ b/src/tree_store/page_store/region.rs
 @@ -1,10 +1,27 @@
@@ -25577,7 +25882,7 @@
      }
  
      pub(crate) fn flush_and_close(
-@@ -318,64 +520,145 @@
+@@ -318,62 +520,143 @@
      }
  
      fn flush_inner(&mut self) -> Result<Option<BtreeHeader>> {
@@ -25604,23 +25909,6 @@
 -            // Finalize any dirty checksums
 -            match definition {
 -                InternalTableDefinition::Normal {
--                    ref mut table_root,
--                    ref mut table_length,
--                    fixed_key_size,
--                    fixed_value_size,
--                    ..
--                } => {
--                    let mut tree = UntypedBtreeMut::new(
--                        new_root,
--                        self.mem.clone(),
--                        self.freed_pages.clone(),
--                        fixed_key_size,
--                        fixed_value_size,
--                    );
--                    *table_root = tree.finalize_dirty_checksums()?;
--                    *table_length = new_length;
--                }
--                InternalTableDefinition::Multimap {
 -                    ref mut table_root,
 -                    ref mut table_length,
 +    // Finalization changes only the selected table's pending header. Publication
@@ -25668,6 +25956,23 @@
                      fixed_value_size,
 -                    ..
 -                } => {
+-                    let mut tree = UntypedBtreeMut::new(
+-                        new_root,
+-                        self.mem.clone(),
+-                        self.freed_pages.clone(),
+-                        fixed_key_size,
+-                        fixed_value_size,
+-                    );
+-                    *table_root = tree.finalize_dirty_checksums()?;
+-                    *table_length = new_length;
+-                }
+-                InternalTableDefinition::Multimap {
+-                    ref mut table_root,
+-                    ref mut table_length,
+-                    fixed_key_size,
+-                    fixed_value_size,
+-                    ..
+-                } => {
 -                    *table_root = finalize_tree_and_subtree_checksums(
 -                        new_root,
 -                        fixed_key_size,
@@ -25676,10 +25981,11 @@
 -                    )?;
 -                    *table_length = new_length;
 -                }
+-            }
+-            self.tree.insert(&name.as_str(), &definition)?;
 +                );
 +                tree.finalize_dirty_checksums()?
-             }
--            self.tree.insert(&name.as_str(), &definition)?;
++            }
 +            InternalTableDefinition::Multimap {
 +                fixed_key_size,
 +                fixed_value_size,
@@ -25717,8 +26023,8 @@
 +            return Err(error);
          }
          Ok(self)
-     }
- 
++    }
++
 +    fn flush_table_root_updates_inner(&mut self) -> Result {
 +        while !self.pending_table_updates.is_empty() {
 +            // Move one paid key out, retaining it until publication succeeds.
@@ -25766,11 +26072,9 @@
 +            self.pending_table_updates.remove(name.as_str());
 +        }
 +        Ok(())
-+    }
-+
+     }
+ 
      // Opens a table, calls the provided closure to insert entries into it, and then
-     // flushes the table root. The flush is done using insert_inplace(), so it's guaranteed
-     // that no pages will be allocated or freed after the closure returns
 @@ -539,12 +822,28 @@
              if self.get_table_untyped(new_name, table_type)?.is_some() {
                  return Err(TableError::TableExists(new_name.to_string()));
@@ -25842,7 +26146,7 @@
              table
          };
  
-@@ -660,16 +977,15 @@
+@@ -660,21 +977,123 @@
                  definition.set_header(*updated_root, *updated_length);
              }
  
@@ -25862,10 +26166,11 @@
              }
          }
  
-@@ -678,6 +994,109 @@
-         Ok(())
-     }
+         self.tree.relocate(relocation_map)?;
  
++        Ok(())
++    }
++
 +    pub(crate) fn compaction_page_batch(
 +        &self,
 +        cursor: &mut crate::transactions::CompactionCursor,
@@ -25966,12 +26271,9 @@
 +        } else {
 +            self.tree.relocate(relocation_map)?;
 +        }
-+        Ok(())
-+    }
-+
-     pub fn stats(&self) -> Result<DatabaseStats> {
-         let master_tree_stats = self.tree.stats()?;
-         let mut max_subtree_height = 0;
+         Ok(())
+     }
+ 
 @@ -761,6 +1180,193 @@
      }
  }

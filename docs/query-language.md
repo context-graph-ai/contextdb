@@ -442,6 +442,10 @@ and leaves no room for the prepaid index and decoded state, so it returns the ty
 reservations), `last_refusal` (the last refused value as text, possibly shortened; initially
 Null), `last_query_resident_percent` (Float64 percent; initially Null), `budget_bytes`,
 `fixed_reservation_bytes`, `prepaid_index_bytes`, `held_page_bytes`, and `default_percent`.
+On a live owner route, the cache figures describe the owner's shared serving cache and its actual pages.
+The `declared` text states that reader `SET READ_CACHE_SHARE` is not applicable to that shared cache;
+the reader retains its declaration for its next file route. The writer's default serving capacity uses
+its declared budget and the same `(budget - fixed reservations) / 7` derivation.
 Settings and their inspection do not replace the last data statement's residency observation. A running cursor can keep a smaller cache when
 following a growth would leave too little room to build its pages. Its rows and snapshot continue;
 the session's declared share stays what the user set. `last_refusal` identifies the cursor and the

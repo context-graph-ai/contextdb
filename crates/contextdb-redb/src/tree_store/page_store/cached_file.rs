@@ -407,6 +407,16 @@ impl CachePageForTest {
             PageMemory::Native(_) => panic!("expected real legacy cache allocation"),
         }
     }
+    pub fn native_source_receipt_for_test(&self) -> Option<usize> {
+        match &self.0 {
+            PageMemory::Cached(page) | PageMemory::Plain(page) | PageMemory::Charged(page) => {
+                page.native_source_receipt_for_test()
+            }
+            #[cfg(feature = "contextdb-internal")]
+            PageMemory::Native(page) => page.native_source_receipt_for_test(),
+        }
+    }
+
     pub fn allocation(&self) -> (usize, usize, usize) {
         let page = match &self.0 {
             PageMemory::Cached(p) | PageMemory::Plain(p) | PageMemory::Charged(p) => p,
@@ -446,6 +456,11 @@ impl CacheWriteControlForTest {
 }
 
 impl PagedCachedFile {
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn installed_cache_capacity_for_test(&self) -> usize {
+        self.max_cache_size.load(Ordering::Acquire)
+    }
+
     #[cfg(feature = "test-seams")]
     pub(crate) fn write_control_for_test(&self) -> CacheWriteControlForTest {
         CacheWriteControlForTest(self.write_buffer.clone())
@@ -734,6 +749,7 @@ impl PagedCachedFile {
         let mut retire = self
             .read_cache_bytes
             .load(Ordering::Acquire)
+            .saturating_add(self.write_buffer_bytes.fixed_bytes())
             .saturating_sub(bytes);
         let stripes = self.read_cache.len();
         let start = self.next_eviction_stripe.load(Ordering::Relaxed) % stripes;
@@ -756,6 +772,11 @@ impl PagedCachedFile {
         // No insertion can publish a tentative occupancy while the producer
         // settles funding. Concurrent physical releases may only lower it.
         Ok(settle())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn installed_cache_capacity(&self) -> usize {
+        self.max_cache_size.load(Ordering::Acquire)
     }
 
     #[cfg(feature = "contextdb-internal")]
@@ -807,8 +828,7 @@ impl PagedCachedFile {
         drop(locks);
         drop(write);
         Ok(bytes.max(
-            self.read_cache_bytes.load(Ordering::Acquire)
-                + self.write_buffer_bytes.load(Ordering::Acquire),
+            self.read_cache_bytes.load(Ordering::Acquire) + self.write_buffer_bytes.fixed_bytes(),
         ) + self.index_bytes())
     }
 
@@ -884,9 +904,8 @@ impl PagedCachedFile {
         for (offset, buffer) in write_buffer.cache.iter() {
             self.file.write(*offset, buffer.as_ref().unwrap())?;
         }
-        // Transfer flushed pages into the read cache so they are available
-        // for subsequent reads without a file I/O.  The write buffer is being
-        // drained, so the total check only considers the read cache size.
+        // Completed dirty pages may use genuinely available clean capacity,
+        // but flush never evicts a hot clean page merely to promote its output.
         for (offset, buffer) in write_buffer.cache.iter_mut() {
             let buffer = buffer.take().unwrap();
             let page_bytes = cached_page_bytes(buffer.len());
@@ -895,39 +914,37 @@ impl PagedCachedFile {
             else {
                 break;
             };
-            if cache_size.saturating_add(page_bytes) <= self.max_cache_size.load(Ordering::Acquire)
-            {
-                let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
-                let mut lock = self.read_cache[cache_slot].write().unwrap();
-                debug_assert!(
-                    buffer.len() >= usize::try_from(self.page_size).unwrap()
-                        || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
-                );
-                // Reserve before replacing the original write/source payer.
-                // A dirty Plain alias follows this same physical owner.
-                match lock.try_insert(*offset, buffer.clone()) {
-                    Ok(displaced) => {
-                        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
-                        let leaving_write = if buffer.counted_by(&self.write_buffer_bytes) {
-                            page_bytes
-                        } else {
-                            0
-                        };
-                        let fixed_room = cache_size
-                            .saturating_add(page_bytes)
-                            .saturating_add(write_bytes.saturating_sub(leaving_write))
-                            <= self.max_cache_size.load(Ordering::Acquire);
-                        buffer.transfer_counted(payment, fixed_room);
-                        drop(displaced);
-                    }
-                    Err(rejected) => {
-                        drop(rejected);
-                        drop(payment);
-                    }
-                }
+            let leaving_write = if buffer.fixed_counted_by(&self.write_buffer_bytes) {
+                page_bytes
             } else {
+                0
+            };
+            let fixed_room = cache_size.saturating_add(page_bytes).saturating_add(
+                self.write_buffer_bytes
+                    .fixed_bytes()
+                    .saturating_sub(leaving_write),
+            ) <= self.max_cache_size.load(Ordering::Acquire);
+            if !fixed_room {
                 drop(payment);
                 break;
+            }
+            let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+            let mut lock = self.read_cache[cache_slot].write().unwrap();
+            debug_assert!(
+                buffer.len() >= usize::try_from(self.page_size).unwrap()
+                    || (*offset == 0 && buffer.len() == DB_HEADER_SIZE)
+            );
+            match lock.try_insert_lowest_priority(*offset, buffer.clone()) {
+                Ok(displaced) => {
+                    // Destination custody precedes releasing the genuine source
+                    // payer, including every alias of this physical backing.
+                    buffer.transfer_counted(payment, true);
+                    drop(displaced);
+                }
+                Err(rejected) => {
+                    drop(rejected);
+                    drop(payment);
+                }
             }
         }
         // Clearing drops map owners only. Detached dirty aliases retain their
@@ -1071,7 +1088,7 @@ impl PagedCachedFile {
                 return Ok(Self::uncached(buffer));
             }
         } else {
-            let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+            let write_bytes = self.write_buffer_bytes.fixed_bytes();
             let cache_size = self.read_cache_bytes.load(Ordering::Acquire);
             if cache_size
                 .saturating_add(page_bytes)
@@ -1091,7 +1108,7 @@ impl PagedCachedFile {
         else {
             return Ok(Self::uncached(buffer));
         };
-        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+        let write_bytes = self.write_buffer_bytes.fixed_bytes();
         if previous
             .saturating_add(page_bytes)
             .saturating_add(write_bytes)
@@ -1244,7 +1261,7 @@ impl PagedCachedFile {
     ) -> Result<CachePayment> {
         let (previous, payment) = CachePayment::reserve(&self.write_buffer_bytes, bytes)?;
         let half = self.max_cache_size.load(Ordering::Acquire) / 2;
-        let mut write_bytes = previous + bytes;
+        let write_bytes = previous + bytes;
         if write_bytes > half {
             let excess = write_bytes - half;
             let mut flushed = 0;
@@ -1262,18 +1279,9 @@ impl PagedCachedFile {
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 flushed += removed_bytes;
             }
-            // A detached dirty reader can keep flushed backing paid. Use the
-            // real counter, not the sum of entries removed from the map.
-            write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
         }
-        let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
-        if write_bytes.saturating_add(read_bytes) > self.max_cache_size.load(Ordering::Acquire) {
-            self.evict_from_read_cache(
-                write_bytes.saturating_add(read_bytes)
-                    - self.max_cache_size.load(Ordering::Acquire),
-                lock,
-            );
-        }
+        // The new backing has no classified payer yet. In particular a full
+        // healthy clean cache cannot be evicted by this tentative reservation.
         Ok(payment)
     }
 
@@ -1296,9 +1304,16 @@ impl PagedCachedFile {
         let is_hit = existing.is_some() || overwrite;
         // A dirty source has one local clone plus its map owner. Neither can
         // escape while this write lock is held; only other owners require COW.
-        let needs_copy = existing
-            .as_ref()
-            .is_none_or(|page| PageAllocation::strong_count(page) != if was_dirty { 2 } else { 1 });
+        #[cfg(feature = "contextdb-internal")]
+        let requires_native_source = crate::native_storage_admission::native_storage_active()
+            && existing.as_ref().is_some_and(|page| !page.is_charged());
+        #[cfg(not(feature = "contextdb-internal"))]
+        let requires_native_source = false;
+        let needs_copy = !was_dirty
+            || requires_native_source
+            || existing
+                .as_ref()
+                .is_none_or(|page| PageAllocation::strong_count(page) != 2);
         let needs_payment = needs_copy
             || existing
                 .as_ref()
@@ -1312,8 +1327,7 @@ impl PagedCachedFile {
             // The old dirty entry stays in the map across fallible admission
             // and copying (or has already been successfully flushed). Locals
             // retain the old payer and roll back the new payment on Err/unwind.
-            let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
-            let mut page = PageAllocation::zeroed(len, charge)?;
+            let mut page = PageAllocation::zeroed_for_write(len, admitted_page_bytes(len))?;
             if let Some(source) = &existing {
                 PageAllocation::get_mut(&mut page)
                     .unwrap()
@@ -1327,12 +1341,17 @@ impl PagedCachedFile {
             existing.unwrap()
         };
         if let Some(payment) = payment {
-            let fixed_room = self
+            // A real source invoice remains with dirty backing. Unscoped pages
+            // retain their fixed payment and continue to constrain clean growth.
+            data.transfer_counted(payment, false);
+            let used = self
                 .read_cache_bytes
                 .load(Ordering::Acquire)
-                .saturating_add(self.write_buffer_bytes.load(Ordering::Acquire))
-                <= self.max_cache_size.load(Ordering::Acquire);
-            data.transfer_counted(payment, fixed_room);
+                .saturating_add(self.write_buffer_bytes.fixed_bytes());
+            self.evict_from_read_cache(
+                used.saturating_sub(self.max_cache_size.load(Ordering::Acquire)),
+                &lock,
+            );
         }
         // On COW the old alias stays counted until its physical free. No byte
         // alias is detached from the payment when returning writable ownership.
@@ -2604,5 +2623,77 @@ mod test {
                 }
             }
         }
+    }
+}
+
+/// Independent cache-pressure fixture using the production cache and native admission.
+/// Methods expose scalar observations; they never override cache allocation or eviction.
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub struct CachePressureFixtureForTest {
+    file: PagedCachedFile,
+    pages: usize,
+    capacity: usize,
+}
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl CachePressureFixtureForTest {
+    pub fn new() -> std::result::Result<Self, DatabaseError> {
+        let backend = crate::backends::InMemoryBackend::new();
+        crate::StorageBackend::set_len(&backend, 64 * 4096)?;
+        let capacity = 8 * cached_page_bytes(4096);
+        let file = PagedCachedFile::new(Box::new(backend), 4096, capacity)?;
+        Ok(Self {
+            file,
+            pages: 8,
+            capacity,
+        })
+    }
+    pub fn capacity_and_index(&self) -> (usize, usize) {
+        (self.capacity, self.file.index_bytes())
+    }
+    pub fn retain_reserve(&self, reserve: crate::NativeStorageCredit) -> crate::CacheReserveOwner {
+        self.file.retain_cache_reserve(reserve)
+    }
+    pub fn warm(&self) -> Result<()> {
+        for index in 0..self.pages {
+            drop(self.file.read(index as u64 * 4096, 4096, PageHint::Clean)?);
+        }
+        Ok(())
+    }
+    pub fn clean_resident(&self) -> usize {
+        (0..self.pages)
+            .filter(|index| {
+                let offset = *index as u64 * 4096;
+                let stripe = usize::try_from(offset % PagedCachedFile::lock_stripes()).unwrap();
+                self.file.read_cache[stripe]
+                    .read()
+                    .unwrap()
+                    .get(offset)
+                    .is_some()
+            })
+            .count()
+    }
+    pub fn dirty_disjoint(&self) -> Result<()> {
+        for index in self.pages..self.pages + 4 {
+            let mut page = self.file.write(index as u64 * 4096, 4096, true)?;
+            page[0] = 42;
+            drop(page);
+        }
+        Ok(())
+    }
+    pub fn flush(&self) -> Result<()> {
+        self.file.flush_write_buffer()
+    }
+    pub fn held(&self) -> (usize, usize) {
+        (
+            self.file.read_cache_bytes.load(Ordering::Acquire),
+            self.file.write_buffer_bytes.load(Ordering::Acquire),
+        )
+    }
+}
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl ReadCachePageWindow {
+    pub(crate) fn visit_latest_for_test(&self, visit: impl FnMut([u8; 8])) -> bool {
+        self.arena.visit_latest_page_window_for_test(visit)
     }
 }

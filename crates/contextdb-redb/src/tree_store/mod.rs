@@ -49,3 +49,6 @@ pub use page_store::{CachePageForTest, CacheWriteControlForTest, CacheWriteForTe
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 #[doc(hidden)]
 pub use page_store::CheckedWriterBackendForTest;
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub use page_store::CachePressureFixtureForTest;

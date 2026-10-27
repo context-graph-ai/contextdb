@@ -2621,7 +2621,24 @@ impl OwnerReadService {
     )]
     fn status_response(&self) -> OwnerReadScaffoldResult<LocalOwnerStatusResponse> {
         let usage = self.spec.database.accountant().usage();
+        let cache = self
+            .spec
+            .database
+            .read_cache_observation()
+            .map_err(OwnerReadScaffoldError::Database)?;
         Ok(LocalOwnerStatusResponse {
+            serving_cache_capacity_bytes: cache
+                .as_ref()
+                .map(|cache| cache.installed_capacity() as u64),
+            serving_cache_index_bytes: cache.as_ref().map(|cache| cache.index_bytes() as u64),
+            serving_cache_held_page_bytes: cache
+                .as_ref()
+                .map(|cache| cache.held_page_bytes() as u64),
+            serving_cache_budget_bytes: usage
+                .limit
+                .unwrap_or_else(crate::memory_accounting::effective_process_ceiling)
+                as u64,
+            reader_charged_bytes: self.spec.database.declared_read_charged_bytes(),
             status: self.status(),
             committed_lsn: self.spec.database.published_read_lsn(),
             effective_limits: LocalEffectiveLimits::from_owner_limits(
@@ -2681,24 +2698,38 @@ impl OwnerReadService {
                         read_memory.clone(),
                     )
                     .map_err(OwnerReadScaffoldError::Database)?;
-                    let outcome = execute_bounded(
-                        &reading,
-                        &statement,
-                        &params.value,
-                        read_memory.clone(),
-                        connection.effective_limits(),
-                        Arc::clone(&self.spec.clock),
-                        connection.cancellation().clone(),
-                        #[cfg(any(test, feature = "test-seams"))]
-                        self.spec.bounded_probe(
-                            OwnerBoundedOperation::Execute,
+                    let cache = self
+                        .spec
+                        .database
+                        .read_cache_observation()
+                        .map_err(OwnerReadScaffoldError::Database)?;
+                    let execute = || {
+                        execute_bounded(
+                            &reading,
+                            &statement,
+                            &params.value,
+                            read_memory.clone(),
                             connection.effective_limits(),
+                            Arc::clone(&self.spec.clock),
                             connection.cancellation().clone(),
-                        ),
-                    )
-                    .map_err(|error| {
+                            #[cfg(any(test, feature = "test-seams"))]
+                            self.spec.bounded_probe(
+                                OwnerBoundedOperation::Execute,
+                                connection.effective_limits(),
+                                connection.cancellation().clone(),
+                            ),
+                        )
+                    };
+                    let (outcome, resident) = match cache {
+                        Some(cache) => cache.with_page_window(execute),
+                        None => (execute(), None),
+                    };
+                    let mut outcome = outcome.map_err(|error| {
                         self.map_request_bounded_error(connection.connection_id(), error)
                     })?;
+                    if outcome.data_statement {
+                        outcome.result.trace.cache_resident_fraction = resident;
+                    }
                     query_control
                         .as_ref()
                         .expect("query retains its original control")

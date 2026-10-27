@@ -810,6 +810,10 @@ impl TransactionalMemory {
         self.storage.retain_cache_reserve(reserve)
     }
 
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn installed_cache_capacity_for_test(&self) -> usize {
+        self.storage.installed_cache_capacity_for_test()
+    }
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn set_read_cache_capacity(&self, bytes: usize) -> Result<usize> {
         self.storage.set_read_cache_capacity(bytes)
@@ -822,6 +826,11 @@ impl TransactionalMemory {
         settle: impl FnOnce() -> R,
     ) -> Result<R> {
         self.storage.with_read_cache_capacity(bytes, settle)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn installed_cache_capacity(&self) -> usize {
+        self.storage.installed_cache_capacity()
     }
 
     #[cfg(feature = "contextdb-internal")]

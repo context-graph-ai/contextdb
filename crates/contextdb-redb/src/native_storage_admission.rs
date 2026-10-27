@@ -32,6 +32,12 @@ pub(crate) struct NativePageCharge {
 unsafe impl Send for NativePageCharge {}
 #[cfg(feature = "contextdb-internal")]
 unsafe impl Sync for NativePageCharge {}
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+impl NativePageCharge {
+    pub(crate) fn identity_for_test(&self) -> usize {
+        self.receipt.as_ptr() as usize
+    }
+}
 #[cfg(feature = "contextdb-internal")]
 impl Drop for NativePageCharge {
     fn drop(&mut self) {

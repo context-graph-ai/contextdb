@@ -136,6 +136,7 @@ fn rich_parts() -> QueryFixture {
             vector_search: None,
             rows_examined: 9,
             maintained_count: None,
+            cache_resident_fraction: Some(0.5),
             groups: Default::default(),
         };
         query_fixture.cascade = Some(CascadeReport {
@@ -161,6 +162,7 @@ fn sparse_parts() -> QueryFixture {
             vector_search: None,
             rows_examined: 2,
             maintained_count: None,
+            cache_resident_fraction: None,
             groups: Default::default(),
         };
         query_fixture.cascade = None;
@@ -215,6 +217,7 @@ fn expected_result_with_every_value_kind() -> CanonicalQueryResult {
             vector_search: None,
             rows_examined: 9,
             maintained_count: None,
+            cache_resident_fraction: Some(0.5),
             groups: Default::default(),
         },
         cascade: Some(CanonicalCascadeReport {
@@ -238,6 +241,7 @@ fn expected_materially_different_result() -> CanonicalQueryResult {
             vector_search: None,
             rows_examined: 2,
             maintained_count: None,
+            cache_resident_fraction: None,
             groups: Default::default(),
         },
         cascade: None,
@@ -596,6 +600,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
+                    cache_resident_fraction: None,
                     groups: Default::default(),
                 };
                 query_fixture.cascade = None;
@@ -615,6 +620,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
+                    cache_resident_fraction: None,
                     groups: Default::default(),
                 },
                 cascade: None,
@@ -639,6 +645,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
+                    cache_resident_fraction: None,
                     groups: Default::default(),
                 };
                 query_fixture.cascade = None;
@@ -661,6 +668,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     vector_search: None,
                     rows_examined: 1,
                     maintained_count: None,
+                    cache_resident_fraction: None,
                     groups: Default::default(),
                 },
                 cascade: None,

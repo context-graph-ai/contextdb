@@ -177,18 +177,52 @@ impl ReadImageSource {
         // is absent or unavailable. The same descriptor becomes the retained
         // physical capability after registration publication.
         let snapshot_registration = match registration {
-            Some(registration) => registration,
+            Some(mut registration) => {
+                if let Some(transaction) =
+                    open_context.and_then(|context| context.registration_transaction())
+                    && registration
+                        .opening_transaction
+                        .as_ref()
+                        .is_none_or(|existing| existing.identity() != transaction.identity())
+                {
+                    registration.opening_transaction = Some(transaction.clone());
+                }
+                registration
+            }
             #[cfg(unix)]
-            None => ReadSnapshotRegistrationGuard::open_provisional(database_path, runtime_dir)?,
+            None => match open_context {
+                Some(context) => ReadSnapshotRegistrationGuard::open_provisional_for_read(
+                    database_path,
+                    runtime_dir,
+                    context,
+                )?,
+                None => ReadSnapshotRegistrationGuard::open_provisional_with_transaction(
+                    database_path,
+                    runtime_dir,
+                    None,
+                )?,
+            },
             #[cfg(not(unix))]
             None => ReadSnapshotRegistrationGuard::open(database_path)?,
         };
         let breadcrumb = current_reader_breadcrumb().ok();
         // The breadcrumb uses the preferred coordination directory.
         // Publication is best effort; an unverifiable process remains anonymous.
-        let breadcrumb_guard = reader_runtime_directory(runtime_dir).and_then(|runtime| {
-            ReaderBreadcrumbGuard::create_in(database_path, &runtime, breadcrumb.as_ref()).ok()
-        });
+        let breadcrumb_guard = match reader_runtime_directory(runtime_dir) {
+            Some(runtime) => match open_context {
+                Some(context) => ReaderBreadcrumbGuard::create_for_open(
+                    database_path,
+                    &runtime,
+                    breadcrumb.as_ref(),
+                    context,
+                )?,
+                None => {
+                    ReaderBreadcrumbGuard::create_in(database_path, &runtime, breadcrumb.as_ref())
+                        .ok()
+                }
+            },
+            None => None,
+        };
         let snapshot_view = snapshot_registration.view()?;
         #[cfg(test)]
         let native_observation = direct_source_contract_rows::begin(1, &source_memory.memory);

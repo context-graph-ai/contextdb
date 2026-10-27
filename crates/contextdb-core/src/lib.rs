@@ -1,4 +1,7 @@
 pub mod companion;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod coordination_test_observation;
 pub mod error;
 pub mod find_attribution;
 mod json_read_builder;

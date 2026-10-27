@@ -1125,6 +1125,10 @@ pub(crate) fn static_plan_document(plan: &str) -> Value {
 
 fn trace_body(trace: &QueryTrace) -> Map<String, Value> {
     let mut body = Map::new();
+    body.insert(
+        "cache_resident_fraction".to_string(),
+        json!(trace.cache_resident_fraction),
+    );
     body.insert("physical_plan".to_string(), json!(trace.physical_plan));
     body.insert(
         "index_used".to_string(),

@@ -6883,6 +6883,7 @@ fn execute_plan_with_working_state(
                         .cloned()
                         .collect();
                     result.trace = crate::database::QueryTrace {
+                        cache_resident_fraction: None,
                         physical_plan: "IndexScan",
                         index_used: Some(pick.name.clone()),
                         predicates_pushed: pushed,
@@ -6917,6 +6918,7 @@ fn execute_plan_with_working_state(
                     let considered: smallvec::SmallVec<[crate::database::IndexCandidate; 4]> =
                         a.considered.into_iter().collect();
                     result.trace = crate::database::QueryTrace {
+                        cache_resident_fraction: None,
                         physical_plan: "Scan",
                         index_used: None,
                         predicates_pushed: Default::default(),
@@ -14765,6 +14767,7 @@ fn run_index_scan_with_order(
     let mut pushed: smallvec::SmallVec<[Cow<'static, str>; 4]> = smallvec::SmallVec::new();
     pushed.push(Cow::Owned(decl.columns[0].0.clone()));
     result.trace = crate::database::QueryTrace {
+        cache_resident_fraction: None,
         physical_plan: "IndexScan",
         index_used: Some(decl.name.clone()),
         predicates_pushed: pushed,

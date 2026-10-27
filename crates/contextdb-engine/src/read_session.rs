@@ -91,6 +91,8 @@ pub struct ReadSessionOptions {
 /// The declaration and effective file-cache capacity of a read session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReadCacheShareStatus {
+    /// A live owner serves one shared cache; this reader policy applies only to its file route.
+    pub shared_serving_cache: bool,
     pub declared: Option<u8>,
     /// The default's displayed percent; its exact derivation is (B - F) / 7.
     pub default_percent: u8,
@@ -109,7 +111,9 @@ pub struct ReadCacheShareStatus {
 impl ReadCacheShareStatus {
     /// Human-readable declaration source used by policy inspection.
     pub const fn declaration_source(&self) -> &'static str {
-        if self.declared.is_none() {
+        if self.shared_serving_cache {
+            "shared owner cache; reader SET READ_CACHE_SHARE is not applicable"
+        } else if self.declared.is_none() {
             "default (14%)"
         } else {
             "declared"
@@ -125,6 +129,7 @@ impl ReadSessionOptions {
         let fixed = crate::persistence::read_source_fixed_reservation_bytes();
         let cache = crate::persistence::redb_reader_cache_bytes(budget, self.read_cache_share);
         ReadCacheShareStatus {
+            shared_serving_cache: false,
             declared: self.read_cache_share,
             default_percent: 14,
             budget_bytes: budget,
@@ -1693,7 +1698,15 @@ fn attempt_route_once(
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
     let published = published_owner_channel(path);
     if requirement == RouteRequirement::OwnerOrFile && owner_is_quiescent(path) {
-        return open_direct_route(path, options, runtime_dir, resources, attempt, observe);
+        return open_direct_route(
+            path,
+            options,
+            runtime_dir,
+            resources,
+            attempt,
+            handover,
+            observe,
+        );
     }
     let owner_channel = match published {
         Some((identity, writer_run, owner_user, address)) => {
@@ -1806,6 +1819,7 @@ fn attempt_route_once(
                             runtime_dir,
                             resources,
                             attempt,
+                            handover,
                             observe,
                         );
                     }
@@ -1872,6 +1886,7 @@ fn attempt_route_once(
                                     runtime_dir,
                                     resources,
                                     attempt,
+                                    handover,
                                     observe,
                                 );
                             }
@@ -1944,6 +1959,7 @@ fn attempt_route_once(
                             runtime_dir,
                             resources,
                             attempt,
+                            handover,
                             observe,
                         );
                     }
@@ -1972,7 +1988,15 @@ fn attempt_route_once(
     // anyone.
     if let Some(status) = crate::persistence::recorded_unserved_owner(path) {
         if requirement == RouteRequirement::OwnerOrFile && owner_is_quiescent(path) {
-            return open_direct_route(path, options, runtime_dir, resources, attempt, observe);
+            return open_direct_route(
+                path,
+                options,
+                runtime_dir,
+                resources,
+                attempt,
+                handover,
+                observe,
+            );
         }
         return Err(RouteOpenRefusal {
             failure: ReadRouteOpenFailure::OwnerAuthentication,
@@ -1993,7 +2017,15 @@ fn attempt_route_once(
         });
     }
 
-    open_direct_route(path, options, runtime_dir, resources, attempt, observe)
+    open_direct_route(
+        path,
+        options,
+        runtime_dir,
+        resources,
+        attempt,
+        handover,
+        observe,
+    )
 }
 
 fn owner_is_quiescent(path: &Path) -> bool {
@@ -2014,6 +2046,7 @@ fn open_direct_route(
     runtime_dir: Option<&Path>,
     resources: &Arc<RouteResources>,
     attempt: u64,
+    handover: Option<&RouteHandover<'_>>,
     observe: &dyn Fn(ReadSessionEvent),
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
     observe(ReadSessionEvent::BeforeDirectBackendOpen { attempt });
@@ -2039,10 +2072,30 @@ fn open_direct_route(
     config.memory_limit = options.memory_limit;
     config.read_cache_share = resources.current_read_cache_share();
     config.runtime_dir = coordination_runtime;
-    match crate::direct_file_reader::DirectFileReader::open(path, config) {
+    let opened = match handover {
+        Some(handover) => crate::direct_file_reader::DirectFileReader::open_with_route_deadline(
+            path,
+            config,
+            handover.cancellation,
+            handover.deadline_ms,
+        ),
+        None => crate::direct_file_reader::DirectFileReader::open(path, config),
+    };
+    match opened {
         Ok(reader) => {
             observe(ReadSessionEvent::DirectBackendOpen);
             Ok(SelectedRoute::File(Box::new(reader)))
+        }
+        Err(crate::direct_file_reader::DirectFileReaderError::ReadFailure(failure))
+            if handover.is_some()
+                && matches!(failure.detail(),
+                contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
+                    if detail.limit == contextdb_core::read_contract::ReadFailureLimit::ActiveMs) =>
+        {
+            Err(RouteOpenRefusal {
+                failure: ReadRouteOpenFailure::OwnerHeldWithoutDecision,
+                error: Error::ReadFailure(owner_not_serving()),
+            })
         }
         Err(error) => Err(classify_direct_open_failure(path, error)),
     }
@@ -2542,7 +2595,9 @@ impl ReadSession {
                 (
                     owner.path.as_path(),
                     Some(owner.identity),
-                    Some(owner.runtime_dir.as_path()),
+                    // Retain the caller's declaration: a resolved default child
+                    // must not become an operator-supplied directory at turnover.
+                    self.runtime_dir.as_deref(),
                     observed,
                     owner
                         .client
@@ -3525,7 +3580,7 @@ impl ReadSession {
                 for response in responses {
                     match response {
                         crate::local_transport::LocalResponse::OwnerStatus { status } => {
-                            return Ok(status.memory.used_bytes);
+                            return Ok(status.reader_charged_bytes);
                         }
                         crate::local_transport::LocalResponse::Failure { failure } => {
                             return Err(Error::ReadFailure(failure));
@@ -3565,9 +3620,73 @@ impl ReadSession {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut status = self.options().read_cache_share_status();
-        if let ReadSessionState::DirectFile(reader) = self.selected_state().as_ref() {
-            status.prepaid_index_bytes = Some(reader.prepaid_cache_index_bytes());
-            status.held_page_bytes = Some(reader.held_cache_page_bytes());
+        match self.selected_state().as_ref() {
+            ReadSessionState::DirectFile(reader) => {
+                status.prepaid_index_bytes = Some(reader.prepaid_cache_index_bytes());
+                status.held_page_bytes = Some(reader.held_cache_page_bytes());
+            }
+            ReadSessionState::LiveDatabase(database) => {
+                let observation = database.read_cache_observation()?;
+                status.budget_bytes = database
+                    .accountant()
+                    .usage()
+                    .limit
+                    .unwrap_or_else(crate::memory_accounting::effective_process_ceiling);
+                status.shared_serving_cache = true;
+                status.effective_bytes = observation
+                    .as_ref()
+                    .map_or(0, |cache| cache.installed_capacity());
+                status.prepaid_index_bytes = observation.as_ref().map(|cache| cache.index_bytes());
+                status.held_page_bytes = observation.as_ref().map(|cache| cache.held_page_bytes());
+                let available = status
+                    .budget_bytes
+                    .saturating_sub(status.fixed_reservation_bytes);
+                status.effective_percent = if available == 0 {
+                    0.0
+                } else {
+                    status.effective_bytes as f64 * 100.0 / available as f64
+                };
+            }
+            ReadSessionState::OwnerChannel(owner) => {
+                let responses = owner.ask(
+                    self.options.limits,
+                    crate::local_transport::LocalRequest::OwnerStatus,
+                    None,
+                    #[cfg(any(test, feature = "test-seams"))]
+                    self.observer.as_ref(),
+                )?;
+                let observed = responses
+                    .into_iter()
+                    .find_map(|response| match response {
+                        crate::local_transport::LocalResponse::OwnerStatus { status } => {
+                            Some(Ok(status))
+                        }
+                        crate::local_transport::LocalResponse::Failure { failure } => {
+                            Some(Err(Error::ReadFailure(failure)))
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| Error::ReadFailure(owner_disconnected()))??;
+                status.budget_bytes =
+                    usize::try_from(observed.serving_cache_budget_bytes).unwrap_or(usize::MAX);
+                status.effective_bytes =
+                    observed.serving_cache_capacity_bytes.unwrap_or(0) as usize;
+                status.prepaid_index_bytes = observed
+                    .serving_cache_index_bytes
+                    .map(|value| value as usize);
+                status.held_page_bytes = observed
+                    .serving_cache_held_page_bytes
+                    .map(|value| value as usize);
+                status.shared_serving_cache = true;
+                let available = status
+                    .budget_bytes
+                    .saturating_sub(status.fixed_reservation_bytes);
+                status.effective_percent = if available == 0 {
+                    0.0
+                } else {
+                    status.effective_bytes as f64 * 100.0 / available as f64
+                };
+            }
         }
         Ok(status)
     }
@@ -3702,7 +3821,9 @@ impl ReadSession {
         let bytes = COLUMNS.len() * (size_of::<String>() + size_of::<Value>())
             + size_of::<Vec<Value>>()
             + COLUMNS.iter().map(|name| name.len()).sum::<usize>()
-            + if status.declared.is_none() {
+            + if status.shared_serving_cache {
+                status.declaration_source().len()
+            } else if status.declared.is_none() {
                 "default".len()
             } else {
                 0
@@ -3720,10 +3841,14 @@ impl ReadSession {
             let mut result = QueryResultData::empty();
             result.columns = COLUMNS.into_iter().map(str::to_owned).collect();
             result.rows = vec![vec![
-                status.declared.map_or_else(
-                    || Value::Text("default".to_owned()),
-                    |value| Value::Int64(i64::from(value)),
-                ),
+                if status.shared_serving_cache {
+                    Value::Text(status.declaration_source().to_owned())
+                } else {
+                    status.declared.map_or_else(
+                        || Value::Text("default".to_owned()),
+                        |value| Value::Int64(i64::from(value)),
+                    )
+                },
                 Value::Int64(status.effective_bytes as i64),
                 Value::Float64(status.effective_percent),
                 refusal.map_or(Value::Null, |value| Value::Text(value.to_owned())),
@@ -3835,11 +3960,14 @@ impl ReadSession {
     ) -> Result<OwnedQueryResult> {
         match selected {
             ReadSessionState::LiveDatabase(database) => {
-                let child = database.ordinary_read_child()?;
-                crate::executor::bounded::with_native_read_memory(
-                    child,
-                    |read_memory, native_trace_refund| {
-                        let executed =
+                let cache = database.read_cache_observation()?;
+                let mut data_statement = false;
+                let mut execute = || {
+                    let child = database.ordinary_read_child()?;
+                    crate::executor::bounded::with_native_read_memory(
+                        child,
+                        |read_memory, native_trace_refund| {
+                            let executed =
                             crate::executor::execute_bounded_on_target_with_native_trace_refund(
                                 database.as_ref(),
                                 sql,
@@ -3853,13 +3981,33 @@ impl ReadSession {
                                 Some(&native_trace_refund),
                             )
                             .map_err(read_error)?;
-                        database.publish_authoritative_read(
-                            &executed.publication,
-                            |error| error,
-                            || Ok(executed.result),
-                        )
-                    },
-                )
+                            data_statement = executed.data_statement;
+                            database.publish_authoritative_read(
+                                &executed.publication,
+                                |error| error,
+                                || Ok(executed.result),
+                            )
+                        },
+                    )
+                };
+                let (mut result, fraction) = match cache {
+                    Some(cache) => cache.with_page_window(execute),
+                    None => (execute(), None),
+                };
+                if let Ok(answer) = result.as_mut()
+                    && data_statement
+                {
+                    answer.trace.cache_resident_fraction = fraction;
+                }
+                if result.is_ok() && data_statement {
+                    *self
+                        .resources
+                        .last_query_resident_percent
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        fraction.map(|value| value * 100.0);
+                }
+                result
             }
             // The committed file is asked through the target the reader
             // already holds, so the engine answers this route in the same
@@ -3870,7 +4018,7 @@ impl ReadSession {
                     .request_query_read_owner()
                     .map_err(|error| direct_error(Path::new(""), error))?;
                 let mut data_statement = false;
-                let (result, fraction) = reader.with_cache_page_window(|| {
+                let (mut result, fraction) = reader.with_cache_page_window(|| {
                     crate::executor::bounded::with_request_read_memory(
                         request,
                         |error| error,
@@ -3894,6 +4042,11 @@ impl ReadSession {
                         },
                     )
                 });
+                if let Ok(answer) = result.as_mut()
+                    && data_statement
+                {
+                    answer.trace.cache_resident_fraction = fraction;
+                }
                 if result.is_ok() && data_statement {
                     *self
                         .resources
@@ -3921,7 +4074,17 @@ impl ReadSession {
                     #[cfg(any(test, feature = "test-seams"))]
                     self.observer.as_ref(),
                 )?;
-                published_query_result(responses, self.options.limits, receiving_memory)
+                let result =
+                    published_query_result(responses, self.options.limits, receiving_memory)?;
+                *self
+                    .resources
+                    .last_query_resident_percent
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = result
+                    .trace
+                    .cache_resident_fraction
+                    .map(|fraction| fraction * 100.0);
+                Ok(result)
             }
         }
     }
@@ -4283,12 +4446,24 @@ impl ReadSession {
                         ),
                     )?
                     .into_cursor_owner()?;
+                let handoff_ticket = if cfg!(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )) {
+                    Some(
+                        crate::persistence::read_coordination::RegistrationCommitTicket::new(
+                            retained_owner.clone(),
+                        )?,
+                    )
+                } else {
+                    None
+                };
                 let public_carrier = OwnedCursorPage::try_prepare_public(retained_owner.clone())?;
                 let expiry_waker: OwnerExpirySlot =
                     owner_expiry_shared(retained_owner.clone(), Mutex::new(None))?;
                 let operation_deadline = now.saturating_add(self.options.limits.active_ms);
                 let handoff =
-                    crate::persistence::ReadSnapshotRegistrationGuard::owner_handoff_start_within(
+                    crate::persistence::ReadSnapshotRegistrationGuard::owner_handoff_start_with_transaction(
                         &owner.path,
                         owner.identity,
                         Some(&owner.runtime_dir),
@@ -4296,6 +4471,7 @@ impl ReadSession {
                         (Arc::clone(&clock), operation_deadline),
                         self.options.limits.active_ms,
                         retained_memory.clone(),
+                        handoff_ticket.as_ref().map(|ticket| ticket.transaction()),
                     )
                     .map_err(|error| direct_error(&owner.path, error.into_direct_reader_error()))?;
                 #[cfg(any(test, feature = "test-seams"))]
@@ -4507,11 +4683,8 @@ impl ReadSession {
                     );
                     return Err(error);
                 }
-                if !complete {
-                    self.resources
-                        .active_cursors
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
+                let mut construction_count =
+                    CursorConstructionCount::new(&self.resources, !complete);
                 let owner_rows_examined = observation.rows_examined;
                 let (trace, observation) = take_cursor_observation(observation);
                 let cursor = ReadCursor {
@@ -4542,7 +4715,7 @@ impl ReadSession {
                             retained_owner: retained_owner.clone(),
                             continuation: if complete { None } else { continuation },
                             last_used_ms: clock.now_ms(),
-                            clock,
+                            clock: Arc::clone(&clock),
                             created_ms: now,
                             closed: complete,
                             expired: None,
@@ -4557,12 +4730,33 @@ impl ReadSession {
                         kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                     }),
                 };
+                construction_count.transfer_to_cursor();
                 if !complete
                     && let Err(error) =
                         start_owner_cursor_expiry_watch(&cursor.state, retained_owner.clone())
                 {
                     let _ = cursor.close();
                     return Err(error);
+                }
+                // Temporary publication leaves while the transaction is still staging.
+                drop(handoff);
+                let handoff_ticket = if complete {
+                    drop(handoff_ticket);
+                    None
+                } else {
+                    handoff_ticket
+                };
+                if let Err(error) = crate::persistence::read_coordination::check_handoff_authority(
+                    cancellation,
+                    clock.as_ref(),
+                    operation_deadline,
+                    self.options.limits.active_ms,
+                ) {
+                    let _ = cursor.close();
+                    return Err(error);
+                }
+                if let Some(ticket) = handoff_ticket {
+                    ticket.commit();
                 }
                 Ok(cursor)
             }
@@ -5770,6 +5964,18 @@ fn restored_query_trace(
                 .expect("invalid channel data accepts canonical empty detail"),
             )
         })?;
+    if canonical
+        .cache_resident_fraction
+        .is_some_and(|fraction| !fraction.is_finite() || !(0.0..=1.0).contains(&fraction))
+    {
+        return Err(Error::ReadFailure(
+            contextdb_core::read_contract::ReadFailure::new(
+                contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
+                contextdb_core::read_contract::ReadFailureDetail::None,
+            )
+            .expect("invalid channel data accepts empty detail"),
+        ));
+    }
     Ok(crate::database::QueryTrace {
         physical_plan,
         index_used: canonical.index_used,
@@ -5799,6 +6005,7 @@ fn restored_query_trace(
         vector_search: vector_search.map(Box::new),
         rows_examined: canonical.rows_examined,
         groups: canonical.groups.into_boxed_slice(),
+        cache_resident_fraction: canonical.cache_resident_fraction,
         maintained_count: canonical.maintained_count.map(|disclosure| {
             Box::new(crate::read_contract::CanonicalMaintainedCountDisclosure::restored(disclosure))
         }),
@@ -6982,6 +7189,33 @@ type CursorExpiryWatch = (
     u64,
     OwnerExpirySlot,
 );
+
+struct CursorConstructionCount<'a> {
+    resources: &'a RouteResources,
+    owned: bool,
+}
+impl<'a> CursorConstructionCount<'a> {
+    fn new(resources: &'a RouteResources, owned: bool) -> Self {
+        if owned {
+            resources
+                .active_cursors
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self { resources, owned }
+    }
+    fn transfer_to_cursor(&mut self) {
+        self.owned = false;
+    }
+}
+impl Drop for CursorConstructionCount<'_> {
+    fn drop(&mut self) {
+        if self.owned {
+            self.resources
+                .active_cursors
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 trait OwnedCursorExecution: Send {
     #[cfg(any(test, feature = "test-seams"))]

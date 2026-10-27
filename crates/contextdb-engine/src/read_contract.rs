@@ -45,6 +45,7 @@ pub struct CanonicalQueryTrace {
     #[serde(default)]
     pub maintained_count: Option<CanonicalMaintainedCountDisclosure>,
     pub groups: Vec<crate::database::GroupDisclosure>,
+    pub cache_resident_fraction: Option<f64>,
 }
 
 /// `used` is the maintained count serving the answer; `false` with `declared`
@@ -395,6 +396,7 @@ impl CanonicalQueryTrace {
             rows_examined: 0,
             maintained_count: None,
             groups: Vec::new(),
+            cache_resident_fraction: None,
         }
     }
 }
@@ -422,6 +424,7 @@ impl From<&QueryTrace> for CanonicalQueryTrace {
             vector_search: trace.vector_search.as_deref().map(Into::into),
             rows_examined: trace.rows_examined,
             groups: trace.groups.to_vec(),
+            cache_resident_fraction: trace.cache_resident_fraction,
             maintained_count: trace.maintained_count.as_deref().map(|disclosure| {
                 use crate::maintained_counts::MaintainedCountDisclosure;
                 let (used, declared, table, columns, already_declared) = match disclosure {
@@ -692,6 +695,7 @@ struct QueryTraceView<'a> {
     rows_examined: u64,
     maintained_count: Option<QueryCountView<'a>>,
     groups: &'a [crate::database::GroupDisclosure],
+    cache_resident_fraction: Option<f64>,
 }
 #[derive(Serialize)]
 struct QueryCountView<'a> {
@@ -900,6 +904,7 @@ impl<'a> From<&'a QueryTrace> for QueryTraceView<'a> {
             rows_examined: trace.rows_examined,
             maintained_count: trace.maintained_count.as_deref().map(Into::into),
             groups: &trace.groups,
+            cache_resident_fraction: trace.cache_resident_fraction,
         }
     }
 }

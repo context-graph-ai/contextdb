@@ -441,6 +441,12 @@ pub struct LocalOwnerStatusResponse {
     pub timeouts: LocalOwnerTimeouts,
     pub admission: OwnerAdmissionCounters,
     pub memory: OwnerMemoryCounters,
+    /// Actual serving storage; absence means this owner has no file cache.
+    pub serving_cache_capacity_bytes: Option<u64>,
+    pub serving_cache_index_bytes: Option<u64>,
+    pub serving_cache_held_page_bytes: Option<u64>,
+    pub serving_cache_budget_bytes: u64,
+    pub reader_charged_bytes: u64,
 }
 
 /// Everything an owner can answer. Result, page, and metadata payloads are
@@ -2046,6 +2052,9 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             self.u64()?;
             self.u64()?;
             self.enumeration(1)?;
+        }
+        if self.option()? {
+            self.fixed(8)?;
         }
         Ok(())
     }
@@ -3668,6 +3677,13 @@ impl<'a> WirePreflight<'a> {
         if self.option()? {
             self.u64()?;
         }
+        for _ in 0..3 {
+            if self.option()? {
+                self.u64()?;
+            }
+        }
+        self.u64()?; // owner's serving-cache budget
+        self.u64()?; // owner's declared reader charge
         Ok(())
     }
 }

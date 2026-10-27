@@ -828,6 +828,9 @@ pub fn render_query_trace(trace: &QueryTrace, rows_examined: u64) -> String {
         out.push(']');
     }
     out.push_str(&format!(" rows_examined={rows_examined}"));
+    if let Some(fraction) = trace.cache_resident_fraction {
+        out.push_str(&format!(" cache_resident_fraction={fraction:.6}"));
+    }
     if let Some(vector_search) = &trace.vector_search {
         out.push(' ');
         out.push_str(&vector_search.to_string());

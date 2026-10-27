@@ -38,6 +38,8 @@ unsafe impl Sync for CacheSettlement {}
 struct CounterBlock {
     owners: AtomicUsize,
     value: AtomicUsize,
+    // Occupancy still relying on the original fixed cache reserve.
+    fixed: AtomicUsize,
     release_generation: AtomicU64,
     dynamic_settlement: AtomicBool,
     settlement: Mutex<Option<CacheSettlement>>,
@@ -69,6 +71,10 @@ impl CacheCounter {
     #[cfg(feature = "test-seams")]
     pub(super) fn observation_for_test(&self) -> (usize, usize) {
         (self.block.as_ptr() as usize, self.load(Ordering::SeqCst))
+    }
+
+    pub(super) fn fixed_bytes(&self) -> usize {
+        unsafe { self.block.as_ref() }.fixed.load(Ordering::Acquire)
     }
 
     pub(super) fn release_generation(&self) -> u64 {
@@ -129,6 +135,7 @@ impl CacheCounter {
             block.as_ptr().write(CounterBlock {
                 owners: AtomicUsize::new(1),
                 value: AtomicUsize::new(0),
+                fixed: AtomicUsize::new(0),
                 release_generation: AtomicU64::new(1),
                 dynamic_settlement: AtomicBool::new(false),
                 settlement: Mutex::new(None),
@@ -196,6 +203,7 @@ impl Drop for CacheCounter {
 pub(super) struct CachePayment {
     counter: CacheCounter,
     bytes: usize,
+    fixed: bool,
 }
 impl CachePayment {
     /// Caller reserves the complete Layout under the existing cache locks.
@@ -208,11 +216,25 @@ impl CachePayment {
                 used.checked_add(bytes)
             })
             .map_err(|_| StorageError::ValueTooLarge(bytes))?;
+        // Tentative custody starts fixed-paid. Only retaining a genuine source
+        // charge below may remove this fixed claim; no capacity refusal or
+        // clean eviction occurs while the new backing is still provisional.
+        if unsafe { counter.block.as_ref() }
+            .fixed
+            .fetch_update_compat(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+            })
+            .is_err()
+        {
+            counter.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(StorageError::ValueTooLarge(bytes));
+        }
         Ok((
             previous,
             Self {
                 counter: owner,
                 bytes,
+                fixed: true,
             },
         ))
     }
@@ -222,9 +244,23 @@ impl CachePayment {
     fn has_fixed_reserve(&self) -> bool {
         self.counter.has_fixed_reserve()
     }
+    // Called only while the same PagePayer retains its real source invoice.
+    fn retain_source(&mut self) {
+        if self.fixed {
+            self.fixed = false;
+            unsafe { self.counter.block.as_ref() }
+                .fixed
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
 }
 impl Drop for CachePayment {
     fn drop(&mut self) {
+        if self.fixed {
+            unsafe { self.counter.block.as_ref() }
+                .fixed
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
         self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
         self.counter.settle_after_free();
     }
@@ -233,8 +269,8 @@ impl Drop for CachePayment {
 enum PagePayer {
     // Field is owned for its destructor, never inspected or substituted.
     Source(ReadMemoryCharge),
-    // Beyond the fixed reserve, the actual source receipt pays for this whole
-    // write backing. Occupancy remains visible and blocks further cache growth;
+    // The actual source receipt pays for this whole backing independently of
+    // the fixed reserve. Physical occupancy remains visible;
     // it is not a second invoice against the fixed reserve.
     SourceCounted {
         // Owned for its destructor; never downcast, substituted or re-invoiced.
@@ -365,6 +401,25 @@ impl PageAllocation {
             None => ("missing", 0, 0),
         }
     }
+    /// Copy only the actual native source receipt under its payment lock.
+    /// Occupancy identity alone does not authenticate source funding.
+    #[cfg(feature = "test-seams")]
+    pub(super) fn native_source_receipt_for_test(&self) -> Option<usize> {
+        let slot = unsafe { self.block.as_ref() }
+            .payer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match &*slot {
+            #[cfg(feature = "contextdb-internal")]
+            Some(PagePayer::Source(ReadMemoryCharge::Native(charge)))
+            | Some(PagePayer::SourceCounted {
+                charge: ReadMemoryCharge::Native(charge),
+                ..
+            }) => Some(charge.identity_for_test()),
+            _ => None,
+        }
+    }
+
     #[cfg(any(test, feature = "contextdb-internal"))]
     pub(super) fn checksum(&self) -> &Mutex<Option<u128>> {
         &unsafe { self.block.as_ref() }.checksum
@@ -393,10 +448,30 @@ impl PageAllocation {
             _ => false,
         }
     }
+    pub(super) fn fixed_counted_by(&self, counter: &CacheCounter) -> bool {
+        match &*unsafe { self.block.as_ref() }
+            .payer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            Some(PagePayer::Cache(payment)) => payment.fixed && payment.counter_is(counter),
+            _ => false,
+        }
+    }
+    /// Writes use the original native producer when installed. The legacy TLS
+    /// slot may be empty even while native writer admission is active.
+    pub(super) fn zeroed_for_write(len: usize, legacy_admitted_bytes: usize) -> Result<Self> {
+        #[cfg(feature = "contextdb-internal")]
+        if crate::native_storage_admission::native_storage_active() {
+            return Self::zeroed_native(len).map_err(StorageError::Native);
+        }
+        let charge = admit_read_memory(legacy_admitted_bytes)?;
+        Self::zeroed(len, charge)
+    }
     /// Only backing that fits the fixed reserve relinquishes its genuine
     /// source receipt. Overlap/oversized backing keeps that original receipt
     /// and a physical occupancy tally until free, including across flush.
-    pub(super) fn transfer_counted(&self, payment: CachePayment, fixed_room: bool) {
+    pub(super) fn transfer_counted(&self, mut payment: CachePayment, fixed_room: bool) {
         // Capacity is not a receipt. Before the actual engine parent is
         // installed (or on an unqualified standalone backend), keep the true
         // source charge instead of refunding it into an unowned cache reserve.
@@ -408,6 +483,7 @@ impl PageAllocation {
         let previous = slot.take();
         let refund = match previous {
             Some(PagePayer::Source(charge)) if !fixed_room => {
+                payment.retain_source();
                 *slot = Some(PagePayer::SourceCounted {
                     charge,
                     occupancy: payment,
@@ -415,6 +491,7 @@ impl PageAllocation {
                 None
             }
             Some(PagePayer::SourceCounted { charge, occupancy }) if !fixed_room => {
+                payment.retain_source();
                 *slot = Some(PagePayer::SourceCounted {
                     charge,
                     occupancy: payment,

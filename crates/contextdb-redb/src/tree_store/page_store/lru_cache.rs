@@ -1187,3 +1187,13 @@ mod residency_tests {
         assert_eq!(cache.pop_lowest_priority(), Some((2, 20)));
     }
 }
+
+// Quiescent single-query fixtures can compare the actual latest recorded set
+// even when the operation installed its own nested production window.
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl<T> EntryArena<T> {
+    pub(crate) fn visit_latest_page_window_for_test(&self, visit: impl FnMut([u8; 8])) -> bool {
+        let epoch = self.query_epoch.load(Ordering::Acquire);
+        self.visit_page_window(epoch, visit)
+    }
+}

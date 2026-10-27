@@ -954,19 +954,33 @@ impl OwnerReadCancellation {
             "wait_cancellation_listener",
             "Admit the operation's cancellation listener before registration.",
         )?;
-        let callback = ListenerCallback::Paid(
-            ReadShared::try_from_prepaid(told, callback_credit)?.into_cancellation_callback(),
-        );
+        let callback = ListenerCallback::Paid({
+            #[cfg(feature = "test-seams")]
+            let _enrollment = crate::coordination_test_observation::allocation(
+                crate::coordination_test_observation::AllocationClass::CancellationCallback,
+                ReadShared::<F>::layout(),
+                &callback_credit,
+            );
+            ReadShared::try_from_prepaid(told, callback_credit)?.into_cancellation_callback()
+        });
         let listener = NEXT_CANCELLATION_LISTENER.fetch_add(1, Ordering::SeqCst);
-        let (node, credit) = crate::read_memory::try_prepaid_box_with(node_credit, || {
-            Ok(ListenerNode {
-                identity: listener,
-                born: 0,
-                retired: None,
-                callback: callback.clone(),
-                next: None,
-            })
-        })?;
+        let (node, credit) = {
+            #[cfg(feature = "test-seams")]
+            let _enrollment = crate::coordination_test_observation::allocation(
+                crate::coordination_test_observation::AllocationClass::CancellationListenerNode,
+                std::alloc::Layout::new::<ListenerNode>(),
+                &node_credit,
+            );
+            crate::read_memory::try_prepaid_box_with(node_credit, || {
+                Ok(ListenerNode {
+                    identity: listener,
+                    born: 0,
+                    retired: None,
+                    callback: callback.clone(),
+                    next: None,
+                })
+            })?
+        };
         Ok(self.register_entry(
             callback,
             ListenerStorage {

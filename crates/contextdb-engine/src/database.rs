@@ -2130,6 +2130,8 @@ pub struct GroupDisclosure {
 
 #[derive(Debug, Clone, Default)]
 pub struct QueryTrace {
+    /// Fraction of the pages actually touched by this statement still resident at completion.
+    pub cache_resident_fraction: Option<f64>,
     pub groups: Box<[GroupDisclosure]>,
     pub physical_plan: &'static str,
     pub index_used: Option<String>,
@@ -10887,3 +10889,6 @@ mod selected_membership_proof_tests;
 #[cfg(all(test, feature = "test-seams", unix))]
 #[path = "database/last_handle_release_tests.rs"]
 mod last_handle_release_tests;
+
+#[cfg(all(test, feature = "test-seams", target_os = "linux"))]
+mod coexistence_guards;

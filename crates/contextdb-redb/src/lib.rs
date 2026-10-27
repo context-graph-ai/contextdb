@@ -120,6 +120,9 @@ mod db;
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
 pub use db::NativeStorageBackend;
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use db::ReadCacheObservation;
 #[doc(hidden)]
 pub use native_storage_admission::{NativeBackendError, NativeIoCause};
 mod error;
@@ -219,3 +222,6 @@ pub use tree_store::CheckedWriterBackendForTest;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub use native_storage_admission::observe_pending_names_for_test;
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub use tree_store::CachePressureFixtureForTest;

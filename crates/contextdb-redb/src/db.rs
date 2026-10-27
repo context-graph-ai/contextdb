@@ -1374,6 +1374,37 @@ fn allocator_state_is_current(mem: &Arc<TransactionalMemory>) -> Result<bool, Da
     Ok(recorded == mem.get_last_committed_transaction_id()?.raw_id())
 }
 
+/// An observation lease on the actual serving page cache. Cloning the existing
+/// memory owner allocates no control block. Callers release database handle
+/// locks before execution; page windows observe only this cache's identities.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct ReadCacheObservation {
+    memory: Arc<TransactionalMemory>,
+}
+#[cfg(feature = "contextdb-internal")]
+impl ReadCacheObservation {
+    pub fn installed_capacity(&self) -> usize {
+        self.memory.installed_cache_capacity()
+    }
+    pub fn index_bytes(&self) -> usize {
+        self.memory.cache_index_bytes()
+    }
+    pub fn held_page_bytes(&self) -> usize {
+        self.memory.read_cache_held_bytes()
+    }
+    pub fn with_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, Option<f64>) {
+        let (result, window) = self.memory.with_page_window(operation);
+        let mut resident = 0.0;
+        let mut count = 0.0;
+        let measured = window.visit(|id| {
+            resident += self.memory.read_cache_resident_fraction(&[id]);
+            count += 1.0;
+        });
+        (result, (measured && count > 0.0).then(|| resident / count))
+    }
+}
+
 /// Opened redb database file
 ///
 /// Use [`Self::begin_read`] to get a [`ReadTransaction`] object that can be used to read from the database
@@ -1429,6 +1460,42 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn installed_cache_capacity_for_test(&self) -> usize {
+        self.mem.installed_cache_capacity_for_test()
+    }
+
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn with_read_cache_page_window_for_test<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> (R, Option<f64>) {
+        let (result, window) = self.mem.with_page_window(operation);
+        let mut resident = 0.0;
+        let mut count = 0.0;
+        let measured = window.visit_latest_for_test(|id| {
+            resident += self.read_cache_resident_fraction(&[id]);
+            count += 1.0;
+        });
+        (result, (measured && count > 0.0).then(|| resident / count))
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cached_header_for_test(&self) -> Result<crate::CachePageForTest> {
+        self.mem.cached_header_for_test()
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_observation(&self) -> ReadCacheObservation {
+        ReadCacheObservation {
+            memory: self.mem.clone(),
+        }
+    }
+
     /// Exact live reader-registry backing plus its receipt, for one payer.
     #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
     #[doc(hidden)]

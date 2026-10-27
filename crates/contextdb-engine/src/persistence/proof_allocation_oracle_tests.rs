@@ -1197,6 +1197,8 @@ static MEASUREMENT: Mutex<Measurement> = Mutex::new(Measurement {
 
 #[repr(C)]
 struct Header {
+    #[cfg(feature = "test-seams")]
+    coordination_generation: u64,
     // Membership in the narrower declaration observation, independent of the
     // enclosing measured() window. Earlier blocks never debit this census.
     declaration_epoch: usize,
@@ -1216,6 +1218,9 @@ fn allocation_layout(layout: Layout) -> (Layout, usize) {
 unsafe impl GlobalAlloc for MeasuredAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         crate::vector_read_memory::root_observations::install_physical_observer();
+        #[cfg(feature = "test-seams")]
+        let coordination_allocation =
+            contextdb_core::coordination_test_observation::allocation_enter(layout);
         if NATIVE_REQUEST_ACTIVE
             .try_with(std::cell::Cell::get)
             .unwrap_or(false)
@@ -1225,6 +1230,14 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             || crate::vector_read_memory::native_ownership_proof::refuse_allocation(layout)
         {
             native_scan_producer_tests::allocator_null(layout);
+            #[cfg(feature = "test-seams")]
+            contextdb_core::coordination_test_observation::allocation_returned(
+                coordination_allocation,
+                0,
+                0,
+                0,
+                false,
+            );
             return std::ptr::null_mut();
         }
         let (allocation, offset) = allocation_layout(layout);
@@ -1262,6 +1275,14 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 });
             }
             sample_declaration_funding(0, layout.size());
+            #[cfg(feature = "test-seams")]
+            contextdb_core::coordination_test_observation::allocation_returned(
+                coordination_allocation,
+                0,
+                0,
+                0,
+                true,
+            );
             return base;
         }
         let pointer = unsafe { base.add(offset) };
@@ -1308,11 +1329,26 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 .sub(std::mem::size_of::<Header>())
                 .cast::<Header>()
                 .write(Header {
+                    #[cfg(feature = "test-seams")]
+                    coordination_generation:
+                        contextdb_core::coordination_test_observation::allocator_generation(
+                            coordination_allocation,
+                        ),
                     declaration_epoch,
                     window,
                     bytes: allocation.size(),
                 });
         }
+        #[cfg(feature = "test-seams")]
+        contextdb_core::coordination_test_observation::allocation_returned(
+            coordination_allocation,
+            pointer as usize,
+            window,
+            contextdb_core::coordination_test_observation::allocator_generation(
+                coordination_allocation,
+            ),
+            true,
+        );
         // The producer armed this immediately before its concrete constructor.
         // Bind the real allocator pointer, never an erased-handle ABI or stack T.
         NEXT_EXACT_FREE.with(|slot| {
@@ -1526,9 +1562,18 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             pointer as usize,
             layout,
         );
+        #[cfg(feature = "test-seams")]
+        let coordination_free = contextdb_core::coordination_test_observation::before_free(
+            pointer as usize,
+            layout,
+            header.window,
+            header.coordination_generation,
+        );
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
         }
+        #[cfg(feature = "test-seams")]
+        contextdb_core::coordination_test_observation::after_free(coordination_free);
         crate::vector_read_memory::root_observations::after_physical_free(producer_free);
         super::super::writer_row_heads::staging_witness::after_free(pointer as usize);
         selected_json_producer_rows::freed(pointer as usize, layout, true);
@@ -5477,3 +5522,7 @@ fn native_request_overflow_invalidates_the_receipt_after_recording_stops() {
         "the bounded prefix cannot qualify as a complete census"
     );
 }
+
+#[cfg(feature = "test-seams")]
+#[path = "coordination_recorder_support_tests.rs"]
+mod coordination_recorder_support_tests;

@@ -4,6 +4,7 @@
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 #![allow(clippy::type_complexity)] // Existing compatibility and test seam shape.
 
+pub(crate) mod read_coordination;
 mod reader_registration;
 pub(crate) use reader_registration::*;
 #[cfg(any(test, feature = "test-seams"))]
@@ -823,8 +824,6 @@ pub(crate) enum LoadReadImageErrorKind {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LoadReadImageError {
-    #[error("{}", std::ops::Deref::deref(.0))]
-    Funded(contextdb_core::read_memory::ReadShared<LoadReadImageError>),
     #[error("{0}")]
     Memory(Error),
     #[error("read-image release proof failed: {0}")]
@@ -853,11 +852,6 @@ pub(crate) enum LoadReadImageError {
         operation: &'static str,
         reason: physical_admission::WaitIo,
     },
-    #[cfg(unix)]
-    #[error(
-        "read-image I/O failed during acquire reader publication hold: reader publication wait failed: {0}"
-    )]
-    WaitRefused(physical_admission::PublicationWaitRefusal),
     #[error("read-image I/O failed during {operation}: {reason}")]
     Io {
         operation: &'static str,
@@ -917,7 +911,9 @@ struct ReaderSnapshotFileGuard {
     )]
     metadata: std::fs::Metadata,
     registry_lock: ReaderSnapshotRegistryLock,
-    nonblocking_teardown: bool,
+    try_only_teardown: bool,
+    opening_transaction:
+        Option<contextdb_core::read_memory::ReadShared<read_coordination::RegistrationTransaction>>,
     /// What the last departing reader needs to prove no purge-capable writer
     /// exists: the store it reopens for the shared data-file gate, and the
     /// physical identity that reopened descriptor must name.
@@ -936,6 +932,9 @@ struct ReaderSnapshotFileGuard {
 struct ReaderRegistrationTarget<'a> {
     database_path: &'a Path,
     runtime: &'a RuntimeDirectory,
+    // Explicit channel directories remain operator-owned even when the
+    // platform-default directory happens to resolve to the same pathname.
+    preserve_root: bool,
     fence: Option<&'a Mutex<purge_publication::Fence>>,
 }
 
@@ -967,6 +966,8 @@ pub(crate) struct ReadSnapshotRegistrationGuard {
     reader_hold_held: bool,
     /// Its exact record had begun to be written when admission failed.
     record_write_started: bool,
+    opening_transaction:
+        Option<contextdb_core::read_memory::ReadShared<read_coordination::RegistrationTransaction>>,
 }
 
 #[derive(Debug)]

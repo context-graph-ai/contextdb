@@ -39,7 +39,7 @@ fn wait_credit(owner: &ReadMemoryOwner, bytes: usize) -> Result<ReadCredit, Writ
     .map_err(WriterAcquireRefusal::Memory)
 }
 
-struct HelperAdmission {
+pub(super) struct HelperAdmission {
     plan: contextdb_core::read_memory::ReadPrepared<HelperPlan>,
     stack: HelperStack,
 }
@@ -48,12 +48,20 @@ impl HelperAdmission {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn new(owner: &ReadMemoryOwner) -> Result<Self, WriterAcquireRefusal> {
+    pub(super) fn new(owner: &ReadMemoryOwner) -> Result<Self, WriterAcquireRefusal> {
         let plan = wait_credit(owner, ReadShared::<HelperPlan>::layout().size())?;
         let stack = wait_credit(owner, HELPER_STACK_BYTES)?;
-        let plan = ReadShared::try_prepare_native(plan).map_err(|error| {
-            WriterAcquireRefusal::Memory(contextdb_core::Error::NativeEngineOther(error))
-        })?;
+        let plan = {
+            #[cfg(any(test, feature = "test-seams"))]
+            let _enrollment = contextdb_core::coordination_test_observation::allocation(
+                contextdb_core::coordination_test_observation::AllocationClass::HelperPlan,
+                ReadShared::<HelperPlan>::layout(),
+                &plan,
+            );
+            ReadShared::try_prepare_native(plan).map_err(|error| {
+                WriterAcquireRefusal::Memory(contextdb_core::Error::NativeEngineOther(error))
+            })?
+        };
         let stack = HelperStack::map(stack).map_err(WriterAcquireRefusal::Io)?;
         Ok(Self { plan, stack })
     }
@@ -64,9 +72,14 @@ impl HelperAdmission {
 struct HelperStack {
     address: *mut c_void,
     _credit: ReadCredit,
+    #[cfg(any(test, feature = "test-seams"))]
+    observation: Option<contextdb_core::coordination_test_observation::WatchId>,
 }
 impl HelperStack {
     fn map(credit: ReadCredit) -> io::Result<Self> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let observation =
+            contextdb_core::coordination_test_observation::map_before(HELPER_STACK_BYTES, &credit);
         // SAFETY: a private anonymous mapping of the exact admitted extent.
         let address = unsafe {
             libc::mmap(
@@ -79,21 +92,59 @@ impl HelperStack {
             )
         };
         if address == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            #[cfg(any(test, feature = "test-seams"))]
+            contextdb_core::coordination_test_observation::map_returned(
+                observation,
+                address as usize,
+                error.raw_os_error(),
+            );
+            return Err(error);
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        contextdb_core::coordination_test_observation::map_returned(
+            observation,
+            address as usize,
+            None,
+        );
         #[cfg(any(test, feature = "test-seams"))]
         HELPER_STACKS_MAPPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Self {
             address,
             _credit: credit,
+            #[cfg(any(test, feature = "test-seams"))]
+            observation,
         })
     }
 }
 impl Drop for HelperStack {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-seams"))]
+        contextdb_core::coordination_test_observation::unmap_before(
+            self.observation,
+            self.address as usize,
+            HELPER_STACK_BYTES,
+            &self._credit,
+        );
         // SAFETY: unpublished, failed launch, or confirmed reaped helper only.
+        #[cfg(not(any(test, feature = "test-seams")))]
         unsafe {
             libc::munmap(self.address, HELPER_STACK_BYTES);
+        }
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            // SAFETY: the single actual unmap, with immediate errno capture before fixed recording.
+            let result = unsafe { libc::munmap(self.address, HELPER_STACK_BYTES) };
+            let errno = if result == -1 {
+                Some(unsafe { *libc::__errno_location() })
+            } else {
+                None
+            };
+            contextdb_core::coordination_test_observation::unmap_returned(
+                self.observation,
+                result,
+                errno,
+            );
         }
         #[cfg(any(test, feature = "test-seams"))]
         HELPER_STACKS_MAPPED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -316,13 +367,14 @@ impl Helper {
         })
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn pid(&self) -> u32 {
         self.pid as u32
     }
 
     /// Reap an exited (or killed) helper; with `wait` false, only if it has
     /// already exited. Answers its exit status, or None if it is still alive.
-    fn reap(&self, wait: bool) -> io::Result<Option<ReapedStatus>> {
+    pub(super) fn reap(&self, wait: bool) -> io::Result<Option<ReapedStatus>> {
         let _blocked = SignalsBlocked::now()?;
         // SAFETY: an all-zero siginfo is valid output space.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -357,7 +409,7 @@ impl Helper {
         }))
     }
 
-    fn kill(&self) -> io::Result<()> {
+    pub(super) fn kill(&self) -> io::Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if KILL_FAILS.with(std::cell::Cell::get) {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
@@ -382,7 +434,7 @@ impl Helper {
         Ok(())
     }
 
-    fn release_stack(&mut self) {
+    pub(super) fn release_stack(&mut self) {
         // Only called after confirmed reap: unmap before settling its invoice.
         drop(self.stack.take());
     }
@@ -703,24 +755,6 @@ struct ReadWaitFuture<'a> {
     _funding: ReadWaitFunding,
 }
 
-pub(crate) fn wait_for_shared_hold(
-    file: &File,
-    stop: &contextdb_core::read_contract::OwnerReadCancellation,
-    deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
-    store_path: &std::path::Path,
-    memory: crate::read_image_memory::ImageMemoryHandle,
-) -> WaitEnded {
-    wait_for_helper_mode(
-        file,
-        &[super::physical_admission::READER_HOLD_OFFSET],
-        Some(stop),
-        Some(deadline),
-        store_path,
-        Some(memory),
-        None,
-    )
-}
-
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -763,6 +797,9 @@ fn wait_for_helper_mode(
         Ok(owner) => owner,
         Err(error) => return WaitEnded::Refused(WriterAcquireRefusal::Memory(error)),
     };
+    #[cfg(any(test, feature = "test-seams"))]
+    let _funding_binding =
+        contextdb_core::coordination_test_observation::register_current_payer(&owner);
     match preflight(store_path, &owner) {
         Ok(true) => {}
         Ok(false) => return WaitEnded::Refused(WriterAcquireRefusal::CancellableWaitUnsupported),
@@ -777,6 +814,12 @@ fn wait_for_helper_mode(
     );
     let prepared_pipe =
         wait_credit(&owner, ReadShared::<WakePipe>::layout().size()).and_then(|invoice| {
+            #[cfg(any(test, feature = "test-seams"))]
+            let _enrollment = contextdb_core::coordination_test_observation::allocation(
+                contextdb_core::coordination_test_observation::AllocationClass::WakePipe,
+                ReadShared::<WakePipe>::layout(),
+                &invoice,
+            );
             ReadShared::try_prepare_native(invoice).map_err(|error| {
                 WriterAcquireRefusal::Memory(contextdb_core::Error::NativeEngineOther(error))
             })
@@ -1151,3 +1194,7 @@ pub(crate) fn still_quarantined(identity: (u64, u64)) -> bool {
     }
     remains
 }
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "coordination_mapping_support_tests.rs"]
+mod coordination_mapping_support_tests;

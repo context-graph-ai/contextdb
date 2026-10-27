@@ -15,6 +15,7 @@ struct BorrowedTrace<'a> {
     rows_examined: u64,
     maintained_count: Option<BorrowedCount<'a>>,
     groups: &'a [crate::database::GroupDisclosure],
+    cache_resident_fraction: Option<f64>,
 }
 struct Predicates<'a>(&'a [std::borrow::Cow<'static, str>]);
 impl Serialize for Predicates<'_> {
@@ -177,6 +178,7 @@ impl<'a> BorrowedTrace<'a> {
             rows_examined,
             maintained_count: trace.maintained_count.as_deref().map(Into::into),
             groups: &trace.groups,
+            cache_resident_fraction: trace.cache_resident_fraction,
         }
     }
 }

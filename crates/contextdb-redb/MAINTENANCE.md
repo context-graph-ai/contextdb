@@ -1,5 +1,39 @@
 # contextdb-redb maintenance
 
+The `test-seams` native receipt observations in `native_storage_admission.rs`,
+`tree_store/page_store/page_allocation.rs` and `cached_file.rs` copy the real
+`NativePageCharge` receipt identity while borrowing the current page payer under
+its existing mutex. Both Source and SourceCounted expose only a native receipt;
+legacy, unscoped and fixed-cache payments return None. The opaque cache-page
+delegate clones no payer and invokes no callback or downcast. This identity is
+an observation for correlation with actual original admission/free receipts;
+it does not by itself certify accounting, physical release or memory limits.
+
+The internal `ReadCacheObservation` in `db.rs` (exported in `lib.rs`) clones the
+actual existing transactional-memory owner without allocating a new control.
+`page_manager.rs` and `cached_file.rs` expose the installed capacity alongside
+existing actual held-page/index counters. This lease runs the existing bounded
+page window after the engine releases its database-handle lock, avoiding a
+recursive handle read behind a queued writer. Window recording still checks the
+exact transactional-memory identity; a different serving cache is not reported
+as observed. Observation changes no cache capacity, admission or page priority.
+
+Dirty-write and clean-read occupancy in `tree_store/page_store/page_allocation.rs`
+and `cached_file.rs` now distinguish genuine retained source invoices from claims
+against the fixed cache reserve. The existing originally admitted counter gains
+its actual fixed-occupancy atomic; payment provenance changes only while the real
+source charge remains in the page payer. Native writes use the original installed
+native storage producer. Clean-to-dirty copying admits before construction, dirty
+backing keeps its source invoice, and only genuinely source-paid dirty bytes are
+excluded from fixed clean-cache capacity decisions under the write-buffer mutex.
+Physical occupancy and detached owners remain visible until their real release.
+Provisional custody does not evict healthy clean pages. Flush uses available
+capacity with lowest-priority insertion and does not evict hot pages to promote
+output. Source-to-fixed transfer reserves destination custody before refunding
+the original payer. Cache capacity and dirty flush thresholds are unchanged.
+Independent overbooking, alias, failed-admission and physical-free guards remain
+required before accepting this ownership extension.
+
 The `test-seams`-only `commit_work::observe_root_work_for_test` callback observes catalog
 enumeration, directory lookups, named-root finalization, checksum extent visits and directory
 publication boundaries. Its scoped table attribution and fallible callback let independent
@@ -1125,3 +1159,16 @@ measurement; the final walk follows recorded links and rechecks the epoch after 
 Residency uses the production read_cache_resident_fraction probe shared with NativeReadView,
 without I/O or changes to CLOCK priority. The test-seams-only observer
 page_window_entries_visited_for_test counts actual examined entries in that final walk.
+
+
+### Serving-cache observations and independent coexistence controls
+
+`src/db.rs` exposes the internal retained serving-cache observation over the
+original transactional-memory owner. `src/tree_store/page_store/page_manager.rs`
+and `cached_file.rs` report installed page capacity, prepaid index bytes and held
+page bytes, and execute a page window against that exact cache identity. The
+independent test controls additionally expose the installed page capacity after
+the allocator carve and the latest completed window IDs through `lru_cache.rs`;
+these controls are compiled only with test seams. They do not choose admission,
+allocation, cache eviction, or production window results. The source-only upstream
+patch includes these changes and their existing dirty-backing funding changes.

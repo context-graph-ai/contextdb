@@ -1932,7 +1932,6 @@ impl LoadReadImageError {
     #[cfg(test)]
     pub(crate) fn kind(&self) -> LoadReadImageErrorKind {
         match self {
-            Self::Funded(diagnostic) => diagnostic.kind(),
             Self::Memory(_) => LoadReadImageErrorKind::Memory,
             Self::Release(_) => LoadReadImageErrorKind::Release,
             Self::RequiresWriter { cause, .. } => LoadReadImageErrorKind::RequiresWriter(*cause),
@@ -1944,7 +1943,7 @@ impl LoadReadImageError {
             Self::InvalidState { .. } => LoadReadImageErrorKind::InvalidState,
             Self::Io { .. } | Self::IoAtPath { .. } => LoadReadImageErrorKind::Io,
             #[cfg(unix)]
-            Self::WaitIo { .. } | Self::WaitRefused(_) => LoadReadImageErrorKind::Io,
+            Self::WaitIo { .. } => LoadReadImageErrorKind::Io,
         }
     }
 
@@ -1966,9 +1965,6 @@ impl LoadReadImageError {
         // Memory refusals must not format (or copy static labels) on their way
         // out. Wait diagnostics already own a cell prepaid by the actual source.
         match self {
-            Self::Funded(diagnostic) => DirectFileReaderError::Engine(
-                contextdb_core::error::DiagnosticText::from_shared(diagnostic),
-            ),
             Self::Memory(Error::MemoryBudgetExceeded {
                 subsystem,
                 operation,
@@ -2052,9 +2048,7 @@ impl LoadReadImageError {
             | Self::Io { .. }
             | Self::IoAtPath { .. }) => DirectFileReaderError::Engine(error.to_string().into()),
             #[cfg(unix)]
-            error @ (Self::WaitIo { .. } | Self::WaitRefused(_)) => {
-                DirectFileReaderError::Engine(error.to_string().into())
-            }
+            error @ Self::WaitIo { .. } => DirectFileReaderError::Engine(error.to_string().into()),
         }
     }
 }
@@ -3108,10 +3102,50 @@ impl ReaderBreadcrumbGuard {
         Ok(guard)
     }
 
+    /// Diagnostic publication never waits behind authoritative coordination.
+    /// Original request failures remain typed even when a note is omitted.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    pub(super) fn create_for_open(
+        database_path: &Path,
+        runtime: &RuntimeDirectory,
+        breadcrumb: Option<&ReaderBreadcrumb>,
+        context: &crate::executor::bounded::ReadOpenContext,
+    ) -> std::result::Result<Option<Self>, LoadReadImageError> {
+        context.checkpoint().map_err(LoadReadImageError::Memory)?;
+        let serializer = serialize_runtime_root(runtime.root(), true);
+        context.checkpoint().map_err(LoadReadImageError::Memory)?;
+        let Ok(_serializer) = serializer else {
+            return Ok(None);
+        };
+        recreate_created_runtime_root(runtime);
+        let created = Self::create_with_lock_mode(database_path, runtime.path(), breadcrumb, true);
+        context.checkpoint().map_err(LoadReadImageError::Memory)?;
+        let Ok(mut guard) = created else {
+            return Ok(None);
+        };
+        if runtime.root() != runtime.path() {
+            guard.created_root = Some(runtime.path().to_path_buf());
+            guard.serializer_root = Some(runtime.root().to_path_buf());
+        }
+        Ok(Some(guard))
+    }
+
     pub(super) fn create(
         database_path: &Path,
         runtime_root: &Path,
         breadcrumb: Option<&ReaderBreadcrumb>,
+    ) -> std::io::Result<Self> {
+        Self::create_with_lock_mode(database_path, runtime_root, breadcrumb, false)
+    }
+
+    fn create_with_lock_mode(
+        database_path: &Path,
+        runtime_root: &Path,
+        breadcrumb: Option<&ReaderBreadcrumb>,
+        try_only: bool,
     ) -> std::io::Result<Self> {
         validate_reader_runtime_directory(runtime_root)?;
         let path = match breadcrumb {
@@ -3146,7 +3180,11 @@ impl ReaderBreadcrumbGuard {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         let publish = (|| -> std::io::Result<std::fs::Metadata> {
-            fs2::FileExt::lock_exclusive(&file)?;
+            if try_only {
+                fs2::FileExt::try_lock_exclusive(&file)?;
+            } else {
+                fs2::FileExt::lock_exclusive(&file)?;
+            }
             match breadcrumb {
                 Some(breadcrumb) => file.write_all(&encode_reader_breadcrumb(breadcrumb)?)?,
                 None => file.write_all(ANONYMOUS_READER_BREADCRUMB)?,
@@ -3233,7 +3271,7 @@ impl ReaderBreadcrumbGuard {
         }
         on_handoff_settled();
         drop(self.file.take());
-        self.remove_directories(false);
+        self.remove_directories(true);
         self.removed = true;
         Ok((self.path.clone(), retained))
     }
@@ -3258,7 +3296,8 @@ impl Drop for ReaderBreadcrumbGuard {
 
 impl ReaderRegistrationTarget<'_> {
     pub(super) fn created_root(&self) -> Option<&Path> {
-        (self.runtime.root() != self.runtime.path()).then(|| self.runtime.path())
+        (!self.preserve_root && self.runtime.root() != self.runtime.path())
+            .then(|| self.runtime.path())
     }
 }
 
@@ -3530,12 +3569,15 @@ impl ReaderSnapshotFileGuard {
     pub(super) fn create(
         target: &ReaderRegistrationTarget<'_>,
         snapshot: &RegisteredReaderSnapshot,
+        transaction: Option<
+            contextdb_core::read_memory::ReadShared<read_coordination::RegistrationTransaction>,
+        >,
     ) -> std::io::Result<Self> {
         let registry_lock = ReaderSnapshotRegistryLock::acquire_for_registration(
             target.runtime.path(),
             snapshot.physical_identity,
         )?;
-        let mut result = Self::create_locked(target, snapshot, registry_lock, false)?;
+        let mut result = Self::create_locked(target, snapshot, registry_lock, false, transaction)?;
         result.registry_lock.unlock()?;
         Ok(result)
     }
@@ -3552,7 +3594,10 @@ impl ReaderSnapshotFileGuard {
         target: &ReaderRegistrationTarget<'_>,
         snapshot: &RegisteredReaderSnapshot,
         registry_lock: ReaderSnapshotRegistryLock,
-        nonblocking_teardown: bool,
+        try_only_teardown: bool,
+        transaction: Option<
+            contextdb_core::read_memory::ReadShared<read_coordination::RegistrationTransaction>,
+        >,
     ) -> std::io::Result<Self> {
         let runtime_root = target.runtime.path();
         validate_reader_runtime_directory(runtime_root)?;
@@ -3591,7 +3636,7 @@ impl ReaderSnapshotFileGuard {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         let publish = (|| -> std::io::Result<std::fs::Metadata> {
-            if nonblocking_teardown {
+            if try_only_teardown {
                 fs2::FileExt::try_lock_exclusive(&file)?;
             } else {
                 fs2::FileExt::lock_exclusive(&file)?;
@@ -3619,7 +3664,8 @@ impl ReaderSnapshotFileGuard {
             path,
             metadata,
             registry_lock,
-            nonblocking_teardown,
+            try_only_teardown,
+            opening_transaction: transaction,
             database_path: target.database_path.to_path_buf(),
             physical_identity: snapshot.physical_identity,
             created_root: target.created_root().map(Path::to_path_buf),
@@ -3664,14 +3710,26 @@ impl Drop for ReaderSnapshotFileGuard {
         // A leave takes the runtime root's serializer, then the registry lock:
         // the same order as a join, so no join is ever left holding something
         // this leave removed. An owner's leave takes both only by try.
-        let serializer =
-            serialize_runtime_root(&self.serializer_root, self.nonblocking_teardown).ok();
+        let serializer = serialize_runtime_root(
+            &self.serializer_root,
+            self.try_only_teardown
+                || self
+                    .opening_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| transaction.is_staging()),
+        )
+        .ok();
         #[cfg(any(test, feature = "test-seams"))]
         if serializer.is_some() {
             read_persistence_test_scaffold::reader_leave_holding_serializer_for_test();
         }
         let coordinated = serializer.is_some()
-            && if self.nonblocking_teardown {
+            && if self.try_only_teardown
+                || self
+                    .opening_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| transaction.is_staging())
+            {
                 self.registry_lock.try_lock_exclusive().is_ok()
             } else {
                 self.registry_lock.lock_exclusive().is_ok()
@@ -3904,126 +3962,44 @@ impl ReadSnapshotRegistrationGuard {
     )]
     pub(super) fn handoff_publication_hold(
         &self,
-        path: &Path,
+        _path: &Path,
         cancellation: &OwnerReadCancellation,
         deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
         active_ms: u64,
-        memory: crate::read_image_memory::ImageMemoryHandle,
+        _memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<File, LoadReadImageError> {
-        use physical_admission::{ByteLock, Granted, READER_HOLD_OFFSET, WriterAcquireRefusal};
-        let cancelled_or_expired = || {
-            if cancellation.is_cancelled() {
-                Some(Error::ReadCancelled)
-            } else if deadline.0.now_ms() >= deadline.1 {
-                Some(Error::ReadFailure(
-                    contextdb_core::read_contract::ReadFailure::owner_limit_exceeded(
-                        contextdb_core::read_contract::OwnerLimitExceededDetail {
-                            limit: contextdb_core::read_contract::ReadFailureLimit::ActiveMs,
-                            value: active_ms,
-                            required: None,
-                            statement: None,
-                        },
-                    ),
-                ))
-            } else {
-                None
-            }
+        use physical_admission::{ByteLock, Granted, READER_HOLD_OFFSET};
+        let checkpoint = || {
+            read_coordination::check_handoff_authority(
+                cancellation,
+                deadline.0.as_ref(),
+                deadline.1,
+                active_ms,
+            )
+            .map_err(LoadReadImageError::Memory)
         };
-        if let Some(error) = cancelled_or_expired() {
-            return Err(LoadReadImageError::Memory(error));
-        }
-        let original = memory
-            .diagnostic_budget()
-            .map_err(LoadReadImageError::Memory)?;
-        let diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared(
-            original,
-            "reader",
-            "publication_wait_diagnostic",
-            "Release retained reader diagnostics or raise the declared memory limit.",
-        )
-        .map_err(LoadReadImageError::Memory)?;
-        let result = (|| {
-            let wait_io = |reason| LoadReadImageError::WaitIo {
-                operation: "acquire reader publication hold",
+        checkpoint()?;
+        let file = physical_admission::reopen_independent_native(&self.descriptor, false).map_err(
+            |reason| LoadReadImageError::WaitIo {
+                operation: "reopen reader publication hold",
                 reason,
-            };
-            let io_error = |error| wait_io(physical_admission::WaitIo::Io(error));
-            let file = physical_admission::reopen_independent_native(&self.descriptor, false)
-                .map_err(wait_io)?;
-            if physical_admission::try_byte(&file, READER_HOLD_OFFSET, ByteLock::Shared)
-                .map_err(io_error)?
-                == Granted::HeldByAnother
-            {
-                match writer_wait_helper::wait_for_shared_hold(
-                    &file,
-                    cancellation,
-                    deadline.clone(),
-                    path,
-                    memory,
-                ) {
-                    writer_wait_helper::WaitEnded::Granted => {}
-                    writer_wait_helper::WaitEnded::Quarantine(helper) => {
-                        writer_wait_helper::enter_quarantine(
-                            self.snapshot.physical_identity,
-                            file,
-                            helper,
-                        );
-                        return Err(cancelled_or_expired()
-                            .map(LoadReadImageError::Memory)
-                            .unwrap_or_else(|| {
-                                wait_io(physical_admission::WaitIo::Static {
-                                    kind: std::io::ErrorKind::Other,
-                                    reason: "reader publication helper termination is unconfirmed",
-                                })
-                            }));
-                    }
-                    writer_wait_helper::WaitEnded::Refused(refusal) => {
-                        return Err(match refusal {
-                        WriterAcquireRefusal::Cancelled => {
-                            LoadReadImageError::Memory(Error::ReadCancelled)
-                        }
-                        WriterAcquireRefusal::DeadlineExpired => cancelled_or_expired()
-                            .map(LoadReadImageError::Memory)
-                            .unwrap_or_else(|| {
-                                wait_io(physical_admission::WaitIo::Static {
-                                    kind: std::io::ErrorKind::Other,
-                                    reason: "reader publication deadline expired",
-                                })
-                            }),
-                        WriterAcquireRefusal::Memory(error) => LoadReadImageError::Memory(error),
-                        WriterAcquireRefusal::Io(error) => io_error(error),
-                        WriterAcquireRefusal::NativeIo(error) => wait_io(error),
-                        WriterAcquireRefusal::HeldByWriter => LoadReadImageError::WaitRefused(
-                            physical_admission::PublicationWaitRefusal::HeldByWriter,
-                        ),
-                        WriterAcquireRefusal::CancellableWaitUnsupported => LoadReadImageError::WaitRefused(
-                            physical_admission::PublicationWaitRefusal::CancellableWaitUnsupported,
-                        ),
-                        WriterAcquireRefusal::HelperFailed(reason) => LoadReadImageError::WaitRefused(
-                            physical_admission::PublicationWaitRefusal::HelperFailed(reason),
-                        ),
-                        #[cfg(all(
-                            target_os = "linux",
-                            any(target_arch = "x86_64", target_arch = "aarch64")
-                        ))]
-                        WriterAcquireRefusal::Quarantined(helper) => LoadReadImageError::WaitRefused(
-                            physical_admission::PublicationWaitRefusal::Quarantined(
-                                physical_admission::QuarantinedHelperDiagnostic(helper.pid()),
-                            ),
-                        ),
-                    });
-                    }
-                }
+            },
+        )?;
+        loop {
+            checkpoint()?;
+            let acquired =
+                physical_admission::try_byte(&file, READER_HOLD_OFFSET, ByteLock::Shared).map_err(
+                    |reason| LoadReadImageError::WaitIo {
+                        operation: "acquire reader publication hold",
+                        reason: physical_admission::WaitIo::Io(reason),
+                    },
+                )?;
+            checkpoint()?;
+            if acquired == Granted::Yes {
+                return Ok(file);
             }
-            if let Some(error) = cancelled_or_expired() {
-                return Err(LoadReadImageError::Memory(error));
-            }
-            Ok(file)
-        })();
-        result.map_err(|error| match error {
-            error @ LoadReadImageError::Memory(_) => error,
-            error => LoadReadImageError::Funded(diagnostic.publish(error)),
-        })
+            std::thread::yield_now();
+        }
     }
 
     /// Publish a conservative transaction floor before asking the owner for
@@ -4065,6 +4041,7 @@ impl ReadSnapshotRegistrationGuard {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn owner_handoff_start_within(
         path: &Path,
         identity: DatabaseIdentity,
@@ -4074,26 +4051,68 @@ impl ReadSnapshotRegistrationGuard {
         active_ms: u64,
         memory: crate::read_image_memory::ImageMemoryHandle,
     ) -> std::result::Result<Self, LoadReadImageError> {
+        Self::owner_handoff_start_with_transaction(
+            path,
+            identity,
+            runtime_dir,
+            cancellation,
+            deadline,
+            active_ms,
+            memory,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    pub(crate) fn owner_handoff_start_with_transaction(
+        path: &Path,
+        identity: DatabaseIdentity,
+        runtime_dir: Option<&Path>,
+        cancellation: &OwnerReadCancellation,
+        deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
+        active_ms: u64,
+        memory: crate::read_image_memory::ImageMemoryHandle,
+        transaction: Option<
+            contextdb_core::read_memory::ReadShared<read_coordination::RegistrationTransaction>,
+        >,
+    ) -> std::result::Result<Self, LoadReadImageError> {
         #[cfg(unix)]
         let mut guard = Self::open_descriptor(path, false)?;
         #[cfg(not(unix))]
         let mut guard = Self::open(path)?;
+        guard.opening_transaction = transaction;
         if published_writer_identity(path).map(|value| value.0) != Some(identity) {
             return Err(invalid_read_image_state(
                 "owner cursor file identity changed",
             ));
         }
         #[cfg(target_os = "linux")]
-        let _publication_hold =
-            guard.handoff_publication_hold(path, cancellation, deadline, active_ms, memory)?;
+        let _publication_hold = guard.handoff_publication_hold(
+            path,
+            cancellation,
+            deadline.clone(),
+            active_ms,
+            memory,
+        )?;
         guard.snapshot.database_identity = Some(identity);
-        guard.publish(
+        guard.publish_bounded(
             path,
             redb::StorageSnapshotIdentity {
                 transaction_id: 0,
                 user_root: None,
             },
             runtime_dir,
+            &|| {
+                read_coordination::check_handoff_authority(
+                    cancellation,
+                    deadline.0.as_ref(),
+                    deadline.1,
+                    active_ms,
+                )
+            },
         )?;
         Ok(guard)
     }
@@ -4143,11 +4162,24 @@ impl ReadSnapshotRegistrationGuard {
             load_lock_held: false,
             reader_hold_held: false,
             record_write_started: false,
+            opening_transaction: provisional.opening_transaction.clone(),
         };
         #[cfg(target_os = "linux")]
-        let _publication_hold =
-            guard.handoff_publication_hold(path, cancellation, deadline, active_ms, memory)?;
-        guard.publish(path, snapshot, runtime_dir)?;
+        let _publication_hold = guard.handoff_publication_hold(
+            path,
+            cancellation,
+            deadline.clone(),
+            active_ms,
+            memory,
+        )?;
+        guard.publish_bounded(path, snapshot, runtime_dir, &|| {
+            read_coordination::check_handoff_authority(
+                cancellation,
+                deadline.0.as_ref(),
+                deadline.1,
+                active_ms,
+            )
+        })?;
         // The provisional registration began before the owner produced the
         // first page. Preserve that history for each matching registry: a
         // purge between the response and exact-root publication cannot be
@@ -4193,6 +4225,7 @@ impl ReadSnapshotRegistrationGuard {
             load_lock_held: false,
             reader_hold_held: false,
             record_write_started: false,
+            opening_transaction: self.opening_transaction.clone(),
         }
     }
 
@@ -4210,7 +4243,23 @@ impl ReadSnapshotRegistrationGuard {
         database_path: &Path,
         runtime_dir: Option<&Path>,
     ) -> std::result::Result<Self, LoadReadImageError> {
+        Self::open_provisional_with_transaction(database_path, runtime_dir, None)
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    pub(super) fn open_provisional_with_transaction(
+        database_path: &Path,
+        runtime_dir: Option<&Path>,
+        transaction: Option<
+            contextdb_core::read_memory::ReadShared<read_coordination::RegistrationTransaction>,
+        >,
+    ) -> std::result::Result<Self, LoadReadImageError> {
         let mut guard = Self::open_descriptor(database_path, false)?;
+        guard.opening_transaction = transaction;
         guard.publish(
             database_path,
             redb::StorageSnapshotIdentity {
@@ -4225,6 +4274,38 @@ impl ReadSnapshotRegistrationGuard {
             read_persistence_test_scaffold::ReaderPausePoint::AfterProvisional,
         );
         guard.admit()?;
+        Ok(guard)
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    pub(super) fn open_provisional_for_read(
+        database_path: &Path,
+        runtime_dir: Option<&Path>,
+        context: &crate::executor::bounded::ReadOpenContext,
+    ) -> std::result::Result<Self, LoadReadImageError> {
+        context.checkpoint().map_err(LoadReadImageError::Memory)?;
+        let mut guard = Self::open_descriptor(database_path, false)?;
+        guard.opening_transaction = context.registration_transaction().cloned();
+        guard.admit()?;
+        guard.publish_bounded(
+            database_path,
+            redb::StorageSnapshotIdentity {
+                transaction_id: 0,
+                user_root: None,
+            },
+            runtime_dir,
+            &|| context.checkpoint(),
+        )?;
+        #[cfg(any(test, feature = "test-seams"))]
+        read_persistence_test_scaffold::pause_reader_at_point(
+            database_path,
+            read_persistence_test_scaffold::ReaderPausePoint::AfterProvisional,
+        );
+        context.checkpoint().map_err(LoadReadImageError::Memory)?;
         Ok(guard)
     }
 
@@ -4453,6 +4534,7 @@ impl ReadSnapshotRegistrationGuard {
             load_lock_held: admitted,
             reader_hold_held: admitted,
             record_write_started: false,
+            opening_transaction: None,
         })
     }
 
@@ -4500,6 +4582,7 @@ impl ReadSnapshotRegistrationGuard {
             load_lock_held: true,
             reader_hold_held: false,
             record_write_started: false,
+            opening_transaction: None,
         })
     }
 
@@ -4593,6 +4676,56 @@ impl ReadSnapshotRegistrationGuard {
         runtime_dir: Option<&Path>,
         owner_cursor: bool,
     ) -> std::result::Result<(), LoadReadImageError> {
+        self.publish_once(
+            database_path,
+            storage_snapshot,
+            runtime_dir,
+            owner_cursor,
+            owner_cursor,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    fn publish_bounded(
+        &mut self,
+        database_path: &Path,
+        storage_snapshot: redb::StorageSnapshotIdentity,
+        runtime_dir: Option<&Path>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> std::result::Result<(), LoadReadImageError> {
+        loop {
+            checkpoint().map_err(LoadReadImageError::Memory)?;
+            let attempted =
+                self.publish_once(database_path, storage_snapshot, runtime_dir, false, true);
+            checkpoint().map_err(LoadReadImageError::Memory)?;
+            match attempted {
+                Err(LoadReadImageError::RegistryContention { .. }) => {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if read_persistence_test_scaffold::reader_join_wait_hook_installed_for_test() {
+                        read_persistence_test_scaffold::run_reader_join_wait_hook_for_test();
+                    }
+                    std::thread::yield_now();
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    fn publish_once(
+        &mut self,
+        database_path: &Path,
+        storage_snapshot: redb::StorageSnapshotIdentity,
+        runtime_dir: Option<&Path>,
+        _owner_cursor: bool,
+        nonblocking: bool,
+    ) -> std::result::Result<(), LoadReadImageError> {
         self.snapshot.storage_snapshot = storage_snapshot;
         if self.snapshot.database_identity.is_none() {
             self.snapshot.database_identity =
@@ -4653,7 +4786,7 @@ impl ReadSnapshotRegistrationGuard {
                 // holds pages says so whether or not anybody is listening.
                 let open_fence = |runtime: &RuntimeDirectory| {
                     let database_identity = self.snapshot.database_identity?;
-                    let open = if owner_cursor {
+                    let open = if nonblocking {
                         purge_publication::open_for_owner_cursor
                     } else {
                         purge_publication::open_for_reader
@@ -4665,10 +4798,19 @@ impl ReadSnapshotRegistrationGuard {
                             database_identity,
                         )
                         .map(Mutex::new)
-                        .map_err(|error| LoadReadImageError::IoAtPath {
-                            operation: "publish the authoritative erasure fence",
-                            path: runtime.path().to_path_buf(),
-                            reason: error.to_string(),
+                        .map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::WouldBlock {
+                                LoadReadImageError::RegistryContention {
+                                    path: runtime.path().to_path_buf(),
+                                    reason: error.to_string(),
+                                }
+                            } else {
+                                LoadReadImageError::IoAtPath {
+                                    operation: "publish the authoritative erasure fence",
+                                    path: runtime.path().to_path_buf(),
+                                    reason: error.to_string(),
+                                }
+                            }
                         }),
                     )
                 };
@@ -4701,7 +4843,7 @@ impl ReadSnapshotRegistrationGuard {
                         read_persistence_test_scaffold::ReaderPausePoint::BeforeRegistration,
                     );
                     let serializer =
-                        serialize_runtime_root(runtime.root(), owner_cursor).map_err(|error| {
+                        serialize_runtime_root(runtime.root(), nonblocking).map_err(|error| {
                             if error.kind() == std::io::ErrorKind::WouldBlock {
                                 contention(runtime, error)
                             } else {
@@ -4709,7 +4851,7 @@ impl ReadSnapshotRegistrationGuard {
                             }
                         })?;
                     recreate_created_runtime_root(runtime);
-                    let owner_registry_lock = if owner_cursor {
+                    let owner_registry_lock = if nonblocking {
                         Some(
                             ReaderSnapshotRegistryLock::try_acquire_for_registration(
                                 runtime.path(),
@@ -4731,11 +4873,13 @@ impl ReadSnapshotRegistrationGuard {
                     read_persistence_test_scaffold::reader_fences_opened_for_test(
                         std::slice::from_ref(runtime),
                         self.snapshot.physical_identity,
-                        owner_cursor,
+                        _owner_cursor,
                     );
                     let target = ReaderRegistrationTarget {
                         database_path,
                         runtime,
+                        preserve_root: runtime_dir
+                            .is_some_and(|supplied| supplied == runtime.path()),
                         fence: fence.as_ref(),
                     };
                     let created = match owner_registry_lock {
@@ -4744,20 +4888,28 @@ impl ReadSnapshotRegistrationGuard {
                             &self.snapshot,
                             registry_lock,
                             true,
+                            self.opening_transaction.clone(),
                         ),
-                        None => ReaderSnapshotFileGuard::create(&target, &self.snapshot),
+                        None => ReaderSnapshotFileGuard::create(
+                            &target,
+                            &self.snapshot,
+                            self.opening_transaction.clone(),
+                        ),
                     };
                     // Under the serializer nothing of this root departs, so a
                     // missing fence or directory is a coordination failure the
                     // reader is told about retryably, never retried here.
                     let mut registration = created.map_err(|error| {
-                        if error.kind() == std::io::ErrorKind::NotFound {
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::WouldBlock
+                        ) {
                             contention(runtime, error)
                         } else {
                             io_failure(runtime, error)
                         }
                     })?;
-                    if owner_cursor {
+                    if nonblocking {
                         registration
                             .registry_lock
                             .unlock()
@@ -4978,8 +5130,27 @@ impl Drop for ReadSnapshotRegistrationGuard {
         // Teardown must enter the registry critical section while the
         // authenticated data descriptor still exists. Rust would otherwise
         // drop `descriptor` before the later `registration` field.
-        drop(self.registration.take());
-        self.other_registrations.clear();
+        let staging = self
+            .opening_transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.is_staging());
+        for registration in self
+            .registration
+            .take()
+            .into_iter()
+            .chain(self.other_registrations.drain(..))
+        {
+            if staging {
+                // Only the thread consuming the final strong count owns the record.
+                // Other readers retain their original normal teardown authority.
+                if let Some(mut registration) = Arc::into_inner(registration) {
+                    registration.try_only_teardown = true;
+                    drop(registration);
+                }
+            } else {
+                drop(registration);
+            }
+        }
         drop(self.purge_publication.take());
         self.other_purge_publications.clear();
     }

@@ -48,7 +48,8 @@ const CANONICAL_QUERY_RESULT_BYTES: &[u8] = &[
     1, 10, 0, 1, 1, 2, 13, 3, 0, 0, 0, 0, 0, 0, 0x0c, 0x40, 4, 1, b'v', 5, 16, 0x55, 0x55, 0x55,
     0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 6, 3, 7, 7, b'{',
     b'"', b'a', b'"', b':', b'1', b'}', 8, 2, 0, 0, 0x80, 0x3f, 0, 0, 0, 0xc0, 9, 42, 2, 1, b'P',
-    1, 1, b'I', 1, 1, b'p', 1, 1, b'i', 1, b'r', 1, 1, 1, b't', 1, b'v', 0, 3, 0, 0, 1, 1, 1, b'd',
+    1, 1, b'I', 1, 1, b'p', 1, 1, b'i', 1, b'r', 1, 1, 1, b't', 1, b'v', 0, 3, 0, 0, 0, 1, 1, 1,
+    b'd',
 ];
 
 const HELD_BY_READERS_FAILURE: &[u8] = &[9, 2, 1, 2, 1, 7, 1, b'r', 9];
@@ -238,6 +239,7 @@ fn query_result() -> QueryResult {
             vector_search: None,
             rows_examined: 3,
             maintained_count: None,
+            cache_resident_fraction: None,
         };
         query_fixture.cascade = Some(CascadeReport {
             dropped_indexes: vec!["d".to_owned()],
@@ -268,6 +270,7 @@ fn canonical_query_result() -> CanonicalQueryResult {
             vector_search: None,
             rows_examined: 3,
             maintained_count: None,
+            cache_resident_fraction: None,
         },
         cascade: Some(CanonicalCascadeReport {
             dropped_indexes: vec!["d".to_owned()],
@@ -336,7 +339,7 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
             .expect("decode independent canonical query bytes"),
         expected
     );
-    let mut terminal_fixture = vec![1, 109];
+    let mut terminal_fixture = vec![1, 110];
     terminal_fixture.extend_from_slice(CANONICAL_QUERY_RESULT_BYTES);
     assert_response_codec(
         LocalResponse::TerminalSuccess {
@@ -478,6 +481,20 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
     canonical.trace.rows_examined = 4;
     assert_query_mutation(result, canonical, 102, 4);
 
+    // Option tag followed by the independently written IEEE-754 little-endian
+    // representation of 0.5; the remaining cascade bytes stay unchanged.
+    let mut measured = query_result();
+    let mut canonical_measured = expected.clone();
+    measured.trace.cache_resident_fraction = Some(0.5);
+    canonical_measured.trace.cache_resident_fraction = Some(0.5);
+    let mut measured_bytes = CANONICAL_QUERY_RESULT_BYTES.to_vec();
+    measured_bytes.splice(105..106, [1, 0, 0, 0, 0, 0, 0, 0xe0, 0x3f]);
+    assert_eq!(encode_query_result(&measured).unwrap(), measured_bytes);
+    assert_eq!(
+        decode_query_result(&measured_bytes).unwrap(),
+        canonical_measured
+    );
+
     let mut result = base;
     let mut canonical = expected;
     result.cascade.as_mut().expect("cascade").dropped_indexes[0] = "e".to_owned();
@@ -486,7 +503,7 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
         .as_mut()
         .expect("canonical cascade")
         .dropped_indexes[0] = "e".to_owned();
-    assert_query_mutation(result, canonical, 108, b'e');
+    assert_query_mutation(result, canonical, 109, b'e');
 
     assert!(matches!(
         decode_query_result(

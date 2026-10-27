@@ -809,9 +809,16 @@ impl DirectCursorResourceWitness {
 /// delay a test without mutating the image, target, or publication state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HydrationPhase {
-    PersistenceReleaseSealed { breadcrumb_path: Option<PathBuf> },
-    BackendTargetConstructed { breadcrumb_path: Option<PathBuf> },
-    ExternallyUsable { breadcrumb_path: Option<PathBuf> },
+    PersistenceReleaseSealed {
+        breadcrumb_path: Option<PathBuf>,
+    },
+    BackendTargetConstructed {
+        breadcrumb_path: Option<PathBuf>,
+    },
+    #[cfg(any(test, feature = "test-seams"))]
+    ExternallyUsable {
+        breadcrumb_path: Option<PathBuf>,
+    },
 }
 
 /// Test-only copies of production-owned hydration phases. In particular,
@@ -831,6 +838,7 @@ pub trait HydrationObserver: Send + Sync {
     fn checkpoint(&self, checkpoint: HydrationCheckpoint);
 }
 
+#[derive(Clone)]
 struct HydrationObservation {
     #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn HydrationObserver>>,
@@ -1235,7 +1243,7 @@ fn handoff_to_backend_neutral_reader(
     config: DirectReaderConfig,
     declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     observation: HydrationObservation,
-) -> Result<DirectFileReader, DirectFileReaderError> {
+) -> Result<(DirectFileReader, Option<PathBuf>), DirectFileReaderError> {
     if release_receipt.source_accesses() == 0 {
         return Err(DirectFileReaderError::MissingPrerequisite(
             DirectReaderPrerequisite::PersistenceSealedReleaseReceipt,
@@ -1277,8 +1285,7 @@ fn handoff_to_backend_neutral_reader(
     // Constructing `DirectFileReader` consumes the private receipt. External
     // usability is observed only after that final release transition.
     let reader = constructed.publish()?;
-    observation.checkpoint(HydrationPhase::ExternallyUsable { breadcrumb_path });
-    Ok(reader)
+    Ok((reader, breadcrumb_path))
 }
 
 fn consume_released_persistence_load(
@@ -1286,7 +1293,7 @@ fn consume_released_persistence_load(
     config: DirectReaderConfig,
     declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     observation: HydrationObservation,
-) -> Result<DirectFileReader, DirectFileReaderError> {
+) -> Result<(DirectFileReader, Option<PathBuf>), DirectFileReaderError> {
     let (pending_image, release_receipt, retained_source): (
         crate::persistence::ReadPersistenceImage,
         crate::persistence::ReadPersistenceReleaseReceipt,
@@ -1658,7 +1665,9 @@ impl DirectFileReader {
             HydrationObservation::disabled(),
             None,
             cancellation,
+            None,
         )
+        .map(|(reader, _)| reader)
     }
 
     pub(crate) fn from_owner_snapshot_with_cancellation(
@@ -1673,7 +1682,9 @@ impl DirectFileReader {
             HydrationObservation::disabled(),
             Some(registration),
             cancellation,
+            None,
         )
+        .map(|(reader, _)| reader)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -1689,13 +1700,33 @@ impl DirectFileReader {
         config: DirectReaderConfig,
         observation: HydrationObservation,
     ) -> Result<Self, DirectFileReaderError> {
+        let (reader, breadcrumb_path) = Self::open_inner_with_cancellation(
+            path,
+            config,
+            observation.clone(),
+            None,
+            &OwnerReadCancellation::new(),
+            None,
+        )?;
+        observation.checkpoint(HydrationPhase::ExternallyUsable { breadcrumb_path });
+        Ok(reader)
+    }
+
+    pub(crate) fn open_with_route_deadline(
+        path: &Path,
+        config: DirectReaderConfig,
+        cancellation: &OwnerReadCancellation,
+        deadline: u64,
+    ) -> Result<Self, DirectFileReaderError> {
         Self::open_inner_with_cancellation(
             path,
             config,
-            observation,
+            HydrationObservation::disabled(),
             None,
-            &OwnerReadCancellation::new(),
+            cancellation,
+            Some(deadline),
         )
+        .map(|(reader, _)| reader)
     }
 
     fn open_inner_with_cancellation(
@@ -1704,7 +1735,8 @@ impl DirectFileReader {
         observation: HydrationObservation,
         registration: Option<crate::persistence::ReadSnapshotRegistrationGuard>,
         cancellation: &OwnerReadCancellation,
-    ) -> Result<Self, DirectFileReaderError> {
+        opening_deadline: Option<u64>,
+    ) -> Result<(Self, Option<PathBuf>), DirectFileReaderError> {
         // Resolve this image's declared parent once. Preparation and captured
         // directory reads retain one child; statements use this same parent.
         let declared_read_memory =
@@ -1729,16 +1761,40 @@ impl DirectFileReader {
             cancellation.clone(),
         )
         .map_err(crate::read_image::history_answer_error)?;
+        let open_context = match opening_deadline {
+            Some(deadline) => open_context.with_opening_deadline(config.clock.clone(), deadline),
+            None => open_context,
+        };
+        open_context
+            .checkpoint()
+            .map_err(crate::read_image::history_answer_error)?;
+        let transaction_ticket = if cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )) {
+            Some(
+                crate::persistence::read_coordination::RegistrationCommitTicket::new(
+                    open_context.read_memory(),
+                )
+                .map_err(crate::read_image::history_answer_error)?,
+            )
+        } else {
+            None
+        };
+        let open_context = match transaction_ticket.as_ref() {
+            Some(ticket) => open_context.with_registration_transaction(ticket.transaction()),
+            None => open_context,
+        };
         let load = crate::persistence::load_read_image_at_registration_with_cache_share(
             path,
             config.memory_limit,
             config.read_cache_share,
             config.runtime_dir.as_deref(),
             registration,
-            open_context,
+            open_context.clone(),
         )
         .map_err(|error| error.into_direct_reader_error())?;
-        let reader =
+        let (reader, breadcrumb_path) =
             consume_released_persistence_load(load, config, declared_read_memory, observation)?;
         #[cfg(all(test, feature = "test-seams"))]
         let reader = {
@@ -1746,7 +1802,13 @@ impl DirectFileReader {
             reader.original_image_counter = Some(original_image_counter);
             reader
         };
-        Ok(reader)
+        open_context
+            .checkpoint()
+            .map_err(crate::read_image::history_answer_error)?;
+        if let Some(ticket) = transaction_ticket {
+            ticket.commit();
+        }
+        Ok((reader, breadcrumb_path))
     }
 
     pub(crate) fn prepaid_cache_index_bytes(&self) -> usize {

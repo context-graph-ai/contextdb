@@ -913,6 +913,13 @@ impl Drop for NativeDeclaredChild {
 }
 impl ReadMemoryBudget for NativeDeclaredChild {
     #[cfg(feature = "test-seams")]
+    fn coordination_counter_for_test(
+        &self,
+    ) -> Option<contextdb_core::coordination_test_observation::FundingCounter<'_>> {
+        Some(contextdb_core::coordination_test_observation::FundingCounter::U64(&self.retained))
+    }
+
+    #[cfg(feature = "test-seams")]
     fn native_allocation_for_test(&self, _layout: std::alloc::Layout) {
         // The child's cell is paid by the original parent, not its own payload.
         crate::read_work_probe::allocator_events::funding_next(
@@ -1301,6 +1308,13 @@ impl DeclaredReadMemory {
 }
 
 impl ReadMemoryBudget for DeclaredReadMemory {
+    #[cfg(feature = "test-seams")]
+    fn coordination_counter_for_test(
+        &self,
+    ) -> Option<contextdb_core::coordination_test_observation::FundingCounter<'_>> {
+        Some(contextdb_core::coordination_test_observation::FundingCounter::U64(&self.retained))
+    }
+
     #[cfg(feature = "test-seams")]
     fn native_allocation_for_test(&self, layout: std::alloc::Layout) {
         if let Some(token) = self.observation {

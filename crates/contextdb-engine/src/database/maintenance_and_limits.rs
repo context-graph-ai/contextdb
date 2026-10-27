@@ -344,6 +344,7 @@ impl Database {
                 });
         let trace = if covered {
             QueryTrace {
+                cache_resident_fraction: None,
                 groups: Default::default(),
                 physical_plan: "IndexScan",
                 index_used: None,
@@ -6152,6 +6153,17 @@ impl Database {
             self.accountant.clone(),
             visitor,
         )
+    }
+
+    /// Borrow the actual serving cache without retaining the persistence handle lock.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    pub(crate) fn read_cache_observation(&self) -> Result<Option<redb::ReadCacheObservation>> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(None), |persistence| persistence.read_cache_observation())
     }
 
     /// Bytes the declared reader memory currently holds for reads.

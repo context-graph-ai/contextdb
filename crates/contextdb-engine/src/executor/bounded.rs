@@ -277,7 +277,7 @@ fn charge_cursor_replay(units: u64) -> std::result::Result<(), BoundedExecutionE
 }
 
 #[derive(Clone)]
-enum RequestCancellation {
+pub(crate) enum RequestCancellation {
     Legacy(OwnerReadCancellation),
     Native(contextdb_core::read_contract::NativeReadCancellation),
 }
@@ -653,7 +653,15 @@ impl Drop for CursorPageInvoice {
 /// Active preparation for a committed reader uses the bounded kernel's
 /// existing cancellation and deadline checks and its declared request owner.
 #[derive(Clone)]
-pub(crate) struct ReadOpenContext(ControlArc<RequestContext>);
+pub(crate) struct ReadOpenContext(
+    ControlArc<RequestContext>,
+    Option<
+        contextdb_core::read_memory::ReadShared<
+            crate::persistence::read_coordination::RegistrationTransaction,
+        >,
+    >,
+    Option<(Arc<dyn DeadlineClock>, u64)>,
+);
 
 /// An operation retained by this request cannot hold a strong request back-reference.
 /// Upgrading uses the same cancellation, deadline and aggregate work state.
@@ -681,7 +689,7 @@ impl ReadOpenContext {
     // Wrap the actual executing request. Constructing a second RequestContext
     // would reset its cancellation, active deadline and aggregate work.
     fn from_request(context: &ControlArc<RequestContext>) -> Self {
-        Self(context.clone())
+        Self(context.clone(), None, None)
     }
 
     #[expect(
@@ -709,7 +717,7 @@ impl ReadOpenContext {
             None,
             None,
         )
-        .map(Self)
+        .map(|context| Self(context, None, None))
         .map_err(Self::engine_error)
     }
 
@@ -718,7 +726,51 @@ impl ReadOpenContext {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(crate) fn checkpoint(&self) -> contextdb_core::Result<()> {
-        self.0.checkpoint().map_err(Self::engine_error)
+        self.0.checkpoint().map_err(Self::engine_error)?;
+        if self
+            .2
+            .as_ref()
+            .is_some_and(|(clock, deadline)| clock.now_ms() >= *deadline)
+        {
+            return Err(Error::ReadFailure(ReadFailure::owner_limit_exceeded(
+                contextdb_core::read_contract::OwnerLimitExceededDetail {
+                    limit: contextdb_core::read_contract::ReadFailureLimit::ActiveMs,
+                    value: self.0.limits.active_ms,
+                    required: None,
+                    statement: None,
+                },
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_opening_deadline(
+        mut self,
+        clock: Arc<dyn DeadlineClock>,
+        deadline: u64,
+    ) -> Self {
+        self.2 = Some((clock, deadline));
+        self
+    }
+
+    pub(crate) fn with_registration_transaction(
+        mut self,
+        transaction: contextdb_core::read_memory::ReadShared<
+            crate::persistence::read_coordination::RegistrationTransaction,
+        >,
+    ) -> Self {
+        self.1 = Some(transaction);
+        self
+    }
+
+    pub(crate) fn registration_transaction(
+        &self,
+    ) -> Option<
+        &contextdb_core::read_memory::ReadShared<
+            crate::persistence::read_coordination::RegistrationTransaction,
+        >,
+    > {
+        self.1.as_ref()
     }
 
     pub(crate) fn memory_limit(&self) -> usize {

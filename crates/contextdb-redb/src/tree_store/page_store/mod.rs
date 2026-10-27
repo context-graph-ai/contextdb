@@ -47,3 +47,6 @@ pub use cached_file::{CachePageForTest, CacheWriteControlForTest, CacheWriteForT
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 #[doc(hidden)]
 pub use cached_file::CheckedWriterBackendForTest;
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub use cached_file::CachePressureFixtureForTest;

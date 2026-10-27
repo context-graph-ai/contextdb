@@ -495,8 +495,12 @@ impl RedbPersistence {
                 if registry_lock.try_lock_exclusive().is_err() {
                     continue;
                 }
-                let created_root =
-                    (runtime.root() != runtime.path()).then(|| runtime.path().to_path_buf());
+                let supplied = self
+                    .runtime_dir
+                    .as_deref()
+                    .is_some_and(|path| path == runtime.path());
+                let created_root = (!supplied && runtime.root() != runtime.path())
+                    .then(|| runtime.path().to_path_buf());
                 remove_registry_if_last(
                     &reader_snapshot_directory(runtime.path(), identity),
                     &registry_lock.path,
@@ -1130,6 +1134,19 @@ impl RedbPersistence {
                 Err(err)
             }
         }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating. "
+    )]
+    pub(crate) fn read_cache_observation(&self) -> Result<Option<redb::ReadCacheObservation>> {
+        let database = self.db.read().map_err(Self::storage_error)?;
+        // Retain actual memory before releasing the handle lock. Statements
+        // read this lock too, so no guard crosses statement execution.
+        Ok(database
+            .as_ref()
+            .map(redb::Database::read_cache_observation))
     }
 
     /// Settle the native capacity after the effective persisted limit is known,

@@ -1173,3 +1173,7 @@ unsafe fn observe_allocation_funding(admission: NativeStorageAdmission) -> Nativ
         unsafe { admission.with_allocation_funding_inspector(inspect_scope_allocation_funding) };
     admission
 }
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "coexistence_native_writer_cap_guard.rs"]
+mod coexistence_native_writer_cap_guard;
