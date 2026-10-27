@@ -386,96 +386,100 @@ fn canonical_result_crosses_frames_and_publishes_only_the_exact_terminal_assembl
     };
     let canonical = encode_query_result(&result).expect("encode the route-neutral result");
     assert!(canonical.len() > MAX_FRAME_BYTES);
-    let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
-        result_rows: 2,
-        result_bytes: canonical.len() as u64,
-        work: 10_000,
-        active_ms: 10_000,
-        memory: (canonical.len() * 2) as u64,
-        cursor_page_rows: 1,
-        cursor_page_bytes: 1_024,
-        cursor_idle_ms: 1_000,
-        cursor_lifetime_ms: 2_000,
-    });
+    let exercise = |memory| {
+        let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
+            result_rows: 2,
+            result_bytes: canonical.len() as u64,
+            work: 10_000,
+            active_ms: 10_000,
+            memory,
+            cursor_page_rows: 1,
+            cursor_page_bytes: 1_024,
+            cursor_idle_ms: 1_000,
+            cursor_lifetime_ms: 2_000,
+        });
 
-    let responses = split_canonical_result(&canonical).expect("split the canonical result");
-    assert!(
-        responses.len() >= 2,
-        "the result must cross at least two envelopes"
-    );
-    assert!(matches!(
-        responses.last(),
-        Some(LocalResponse::TerminalSuccess { .. })
-    ));
-    let frames = responses
-        .iter()
-        .map(|response| {
-            let expectation = LocalResponseExpectation::OrdinaryResult;
-            let frame = boundary
-                .encode_fixture_frame(LocalOutboundMessage::Response {
-                    response,
-                    expectation: &expectation,
-                })
-                .expect("encode complete response through the bounded boundary");
-            assert!(
-                frame.len() - 4 <= MAX_FRAME_BYTES,
-                "the complete response envelope must fit the payload ceiling"
-            );
-            frame
-        })
-        .collect::<Vec<_>>();
+        let responses = split_canonical_result(&canonical).expect("split the canonical result");
+        assert!(
+            responses.len() >= 2,
+            "the result must cross at least two envelopes"
+        );
+        assert!(matches!(
+            responses.last(),
+            Some(LocalResponse::TerminalSuccess { .. })
+        ));
+        let frames = responses
+            .iter()
+            .map(|response| {
+                let expectation = LocalResponseExpectation::OrdinaryResult;
+                let frame = boundary
+                    .encode_fixture_frame(LocalOutboundMessage::Response {
+                        response,
+                        expectation: &expectation,
+                    })
+                    .expect("encode complete response through the bounded boundary");
+                assert!(
+                    frame.len() - 4 <= MAX_FRAME_BYTES,
+                    "the complete response envelope must fit the payload ceiling"
+                );
+                frame
+            })
+            .collect::<Vec<_>>();
 
-    OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
-    let mut receiver = OrdinaryResultReceiver::new();
-    for (index, frame) in frames.into_iter().enumerate() {
-        let mut reader = SliceReader::new(frame);
-        let mut allocator = AllocationLimit {
-            maximum: MAX_FRAME_BYTES,
-            calls: 0,
-        };
-        let outcome = boundary
-            .receive_ordinary_result_frame(&mut receiver, &mut reader, &mut allocator)
-            .expect("read and publish through the production receiver");
-        assert_eq!(allocator.calls, 1);
-        assert_eq!(reader.offset, reader.bytes.len());
-
-        if index + 1 == responses.len() {
-            let ResultReceiveOutcome::Published(assembled) = outcome else {
-                panic!("terminal success must publish the assembled result");
+        OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
+        let mut receiver = OrdinaryResultReceiver::new();
+        for (index, frame) in frames.into_iter().enumerate() {
+            let mut reader = SliceReader::new(frame);
+            let mut allocator = AllocationLimit {
+                maximum: MAX_FRAME_BYTES,
+                calls: 0,
             };
-            assert_eq!(assembled.bytes, canonical);
-            assert_eq!(receiver.state(), ResultReceiveState::Published);
-            assert_eq!(receiver.buffered_byte_count(), 0);
-            assert!(
-                OrdinaryResultReceiver::canonical_preflight_matches_for_test(
-                    &canonical,
-                    (canonical.len() * 2) as u64,
-                    true,
-                )
-            );
-            assert_eq!(
-                OrdinaryResultReceiver::canonical_decode_entries_for_test(),
-                1
-            );
-            assert_eq!(
-                OrdinaryResultReceiver::canonical_receive_events_for_test(),
-                vec![
-                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_PASSED,
-                    OrdinaryResultReceiver::TEST_EVENT_CANONICAL_DECODE_AUTHORIZED,
-                    OrdinaryResultReceiver::TEST_EVENT_PUBLISHED,
-                    OrdinaryResultReceiver::TEST_EVENT_ASSEMBLED_RESULT,
-                ],
-                "the real terminal receiver must complete allocation-free preflight before entering the canonical decoder and publication boundaries"
-            );
-        } else {
-            assert_eq!(outcome, ResultReceiveOutcome::Pending);
-            assert_eq!(receiver.state(), ResultReceiveState::Receiving);
-            assert_eq!(
-                OrdinaryResultReceiver::canonical_decode_entries_for_test(),
-                0
-            );
+            let outcome = boundary
+                .receive_ordinary_result_frame(&mut receiver, &mut reader, &mut allocator)
+                .expect("read and publish through the production receiver");
+            assert_eq!(allocator.calls, 1);
+            assert_eq!(reader.offset, reader.bytes.len());
+
+            if index + 1 == responses.len() {
+                let ResultReceiveOutcome::Published(assembled) = outcome else {
+                    panic!("terminal success must publish the assembled result");
+                };
+                assert_eq!(assembled.bytes, canonical);
+                assert_eq!(receiver.state(), ResultReceiveState::Published);
+                assert_eq!(receiver.buffered_byte_count(), 0);
+                assert!(
+                    OrdinaryResultReceiver::canonical_preflight_matches_for_test(
+                        &canonical, memory, true,
+                    )
+                );
+                assert_eq!(
+                    OrdinaryResultReceiver::canonical_decode_entries_for_test(),
+                    1
+                );
+                assert_eq!(
+                    OrdinaryResultReceiver::canonical_receive_events_for_test(),
+                    vec![
+                        OrdinaryResultReceiver::TEST_EVENT_CANONICAL_PREFLIGHT_PASSED,
+                        OrdinaryResultReceiver::TEST_EVENT_CANONICAL_DECODE_AUTHORIZED,
+                        OrdinaryResultReceiver::TEST_EVENT_PUBLISHED,
+                        OrdinaryResultReceiver::TEST_EVENT_ASSEMBLED_RESULT,
+                    ],
+                    "the real terminal receiver must complete allocation-free preflight before entering the canonical decoder and publication boundaries"
+                );
+            } else {
+                assert_eq!(outcome, ResultReceiveOutcome::Pending);
+                assert_eq!(receiver.state(), ResultReceiveState::Receiving);
+                assert_eq!(
+                    OrdinaryResultReceiver::canonical_decode_entries_for_test(),
+                    0
+                );
+            }
         }
-    }
+    };
+    // Measure the actual original-parent admissions once, then prove the full
+    // journey under that finite ceiling rather than a wire-length multiplier.
+    let memory = super::wire_fixture_test_support::measured_receive_memory(&exercise);
+    exercise(memory);
 }
 
 #[test]

@@ -260,3 +260,20 @@ pub fn assert_native_refusal_within_ceiling(
         "native admission must refuse before crossing the declared ceiling: {peak} > {ceiling}"
     );
 }
+
+#[cfg(feature = "test-seams")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: used by local transport receive fixtures"
+)]
+pub fn measured_receive_memory(exercise: &impl Fn(u64)) -> u64 {
+    use contextdb_engine::vector_read_memory::{
+        take_reader_budget_ledger_for_test, watch_reader_budget_ledger_for_test,
+    };
+    watch_reader_budget_ledger_for_test();
+    exercise(u64::MAX);
+    let admissions = take_reader_budget_ledger_for_test();
+    let peak = native_receive_peak(&admissions);
+    eprintln!("finite receive ceiling from original-parent admissions: {peak}");
+    peak
+}
