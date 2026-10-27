@@ -65,6 +65,10 @@ impl NativeVectorScoreObserver for CountScores {
     }
 }
 
+#[expect(
+    clippy::redundant_closure,
+    reason = "The fixture keeps an explicit invocation boundary around the observed operation."
+)]
 pub(crate) fn observe_work<T>(
     db: &contextdb_engine::Database,
     operation: impl FnOnce() -> T,
