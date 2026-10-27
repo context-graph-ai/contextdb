@@ -157,6 +157,10 @@ fn assert_reached_through_the_index(shape: &str, trace: &QueryTrace) {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn a_range_over_a_declared_index_traces_its_walk_with_a_transaction_open() {
     let db = indexed_events();
 
@@ -194,6 +198,10 @@ fn a_range_over_a_declared_index_traces_its_walk_with_a_transaction_open() {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn an_ordered_read_of_a_declared_index_traces_its_walk_with_a_transaction_open() {
     let db = indexed_events();
 
@@ -248,6 +256,10 @@ fn an_ordered_read_of_a_declared_index_traces_its_walk_with_a_transaction_open()
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn an_index_read_with_a_transaction_open_still_answers_with_the_rows_it_staged() {
     let db = indexed_events();
 

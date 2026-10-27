@@ -113,6 +113,10 @@ fn routes(disclosure: &VectorSearchDisclosure) -> Vec<(Option<VectorSearchRoute>
 
 /// Explain the statement passively, execute it, and require the same route
 /// for the statement and for every partition. Returns the executed route.
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn assert_passive_predicts_executed(db: &Database, filter: Option<&str>) -> VectorSearchRoute {
     let where_clause = filter.map_or(String::new(), |kind| format!("WHERE kind = '{kind}' "));
     let query = [0.1_f32; DIMENSION]

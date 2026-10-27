@@ -22094,6 +22094,10 @@ mod paged_vector_accounting_tests {
     /// underneath the search, and the fetch that released them under-ran the
     /// request: `bounded_read/release requested N bytes, M available of M`.
     #[test]
+    #[expect(
+        clippy::needless_borrow,
+        reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+    )]
     fn a_drained_paged_vector_cursor_returns_every_byte_it_took() {
         let rows = 64usize;
         let root = tempfile::tempdir().expect("task-scoped fixture");

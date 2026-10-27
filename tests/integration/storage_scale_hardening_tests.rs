@@ -1048,6 +1048,10 @@ fn ssh_c1_rows_identical_inmem() {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn ssh_c1_trace_identical() {
     let db = Database::open_memory();
     exec(
@@ -1710,6 +1714,10 @@ fn ssh_c2_subscribe_after_reopen() {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn ssh_c2_sync_applied_index_ddl_lifecycle() {
     let source = Database::open_memory();
     let peer = Database::open_memory();

@@ -225,6 +225,10 @@ fn ids(rows: &[Vec<Value>]) -> Vec<i64> {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     use std::os::unix::fs::PermissionsExt;
 

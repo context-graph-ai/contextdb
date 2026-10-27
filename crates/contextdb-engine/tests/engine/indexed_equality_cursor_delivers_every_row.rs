@@ -142,6 +142,10 @@ fn rendered(rows: &[Vec<Value>]) -> Vec<String> {
     rows.iter().map(|row| format!("{row:?}")).collect()
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn page_through(
     database: &Database,
     sql: &str,
@@ -252,6 +256,10 @@ fn compared(rows: &[String], ordered: bool) -> Vec<String> {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn an_indexed_lookup_read_one_page_at_a_time_gives_what_one_call_gives() {
     let database = seeded();
     let mut losses = Vec::new();

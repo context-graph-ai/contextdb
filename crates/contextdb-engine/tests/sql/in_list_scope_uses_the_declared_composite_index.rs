@@ -372,6 +372,10 @@ fn returned_ids(rows: &[Vec<Value>]) -> BTreeSet<Uuid> {
         .collect()
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn assert_active_plan(result: &contextdb_engine::QueryResult) {
     assert_eq!(returned_ids(&result.rows()), expected_ids());
     assert_eq!(

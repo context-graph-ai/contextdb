@@ -369,6 +369,10 @@ fn plain_fixture(path: &std::path::Path, indexed: bool) -> Arc<Database> {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_cleanup() {
     for indexed in [false, true] {
         for ending in ["close", "cancel", "drop"] {
@@ -524,6 +528,10 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
+)]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
 )]
 fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_writes() {
     use contextdb_core::{Principal, ScopeLabel};

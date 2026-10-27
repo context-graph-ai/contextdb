@@ -950,6 +950,10 @@ fn a_checkpointed_commit_killed_at_every_write_leaves_the_old_or_the_new_state()
 /// the store is the old or the new state, another reopen keeps it, and the
 /// next append from it converges with the control. Returns the state.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn kill_and_recover(
     root: &std::path::Path,
     base: &std::path::Path,

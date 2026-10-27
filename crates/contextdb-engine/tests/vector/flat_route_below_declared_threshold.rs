@@ -778,6 +778,10 @@ fn comparable_routes(
         .collect()
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn assert_explain_predicts_execution(db: &Database, filter: &str) {
     let query = vector(1_000_000)
         .iter()

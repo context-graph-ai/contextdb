@@ -182,6 +182,10 @@ trait QuantizedAnswer {
     fn check(&self, route: &str, shape: &str);
 }
 impl QuantizedAnswer for QueryResult {
+    #[expect(
+        clippy::needless_borrow,
+        reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+    )]
     fn check(&self, route: &str, shape: &str) {
         let rows: Vec<_> = self.rows().iter().collect();
         assert_answers_the_quantized_columns(&self.trace().physical_plan, &rows, route, shape);
@@ -193,6 +197,10 @@ struct CursorAnswer {
     pages: Vec<contextdb_engine::CursorPage>,
 }
 impl QuantizedAnswer for CursorAnswer {
+    #[expect(
+        clippy::needless_borrow,
+        reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+    )]
     fn check(&self, route: &str, shape: &str) {
         let rows: Vec<_> = self
             .cursor

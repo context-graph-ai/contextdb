@@ -55,6 +55,10 @@ fn advised_statement(rendered: &str) -> String {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn the_declaration_explain_advises_keeps_the_declarations_already_made() {
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let path = root.path().join("advice.db");

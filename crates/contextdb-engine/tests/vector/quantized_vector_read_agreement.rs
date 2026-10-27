@@ -61,6 +61,10 @@ fn select_sql(table: &str) -> String {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn a_quantized_column_reads_the_same_warm_reopened_and_through_the_file() {
     let root = tempfile::tempdir().expect("scratch directory");
     let path = root.path().join("quantized.db");

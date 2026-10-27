@@ -392,6 +392,10 @@ const PLAN_VOCABULARY: [&str; 10] = [
 ];
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn a_bounded_read_describes_its_plan_the_way_the_executor_does() {
     let mut disagreements = Vec::new();
     let mut covered = BTreeSet::new();
@@ -554,6 +558,10 @@ fn target_only_cases() -> [(&'static str, &'static str, Uuid); 2] {
 }
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn a_bounded_read_probes_adjacency_when_only_the_end_of_a_hop_is_pinned() {
     let mut disagreements = Vec::new();
 
@@ -771,6 +779,10 @@ const STARTED_ACROSS_TABLES: &str = "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[
                                      COLUMNS (b.id AS t))";
 
 #[test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn a_bounded_read_probes_adjacency_when_the_start_is_named_by_something_other_than_its_id() {
     let mut disagreements = Vec::new();
 

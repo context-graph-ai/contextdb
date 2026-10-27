@@ -512,6 +512,10 @@ const FORCE_PAGED_DRAINS_SEQUENTIAL: bool = false;
 /// Returns the interleaved measurement and, beside it, the same two cursors
 /// drained one after the other as the undisturbed control, plus the number of
 /// capacity displacements observed while both cursors were live.
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn measure_paged_scale(rows: usize) -> (PagedMeasurement, PagedMeasurement, usize) {
     let root = tempfile::tempdir().expect("task-scoped wide fixture");
     let path = root.path().join(format!("paged-{rows}.redb"));
@@ -855,6 +859,10 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
 
 /// Drain one open cursor page by page, returning every id it delivered in the
 /// order it delivered them.
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn drain_cursor(
     opened: &mut contextdb_engine::direct_file_reader::test_seams::DirectCursorOpen,
     page: NonZeroUsize,

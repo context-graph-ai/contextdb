@@ -145,6 +145,10 @@ fn rendered(rows: &[Vec<Value>]) -> Vec<String> {
     rows.iter().map(|row| format!("{row:?}")).collect()
 }
 
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn page_through(database: &Database, sql: &str, sql_params: &HashMap<String, Value>) -> Paged {
     let charged_before = charged(database);
     let session = database
@@ -188,6 +192,10 @@ fn page_through(database: &Database, sql: &str, sql_params: &HashMap<String, Val
 }
 
 /// Ask one statement both ways and hold the paged answer to the whole one.
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 fn both_ways(what: &str, sql: &str, sql_params: &HashMap<String, Value>, ordered: bool) {
     let database = seeded();
     let whole = database

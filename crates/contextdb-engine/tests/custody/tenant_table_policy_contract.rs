@@ -348,6 +348,10 @@ impl ClientTransport for AdversarialBoundTablePull {
 
 // The hub declares durable table policy; an edge must be refused.
 #[tokio::test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 async fn a_declaration_persists_across_restart_and_restore_renders_with_version_and_digest_and_is_refused_on_an_edge()
  {
     let _clock = Wallclock::test_clock_guard(|| T0);
