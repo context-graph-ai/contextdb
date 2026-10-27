@@ -111,6 +111,10 @@ pub(super) fn begin(
     }
     Some(begin_counter(phase, &memory.accountant))
 }
+#[expect(
+    clippy::collapsible_if,
+    reason = "The fixture keeps each observation precondition explicit."
+)]
 fn begin_counter(phase: usize, owner: &AccountantHandle) -> SourceObservation {
     assert!(!ACTIVE.replace(true));
     let counter = owner.writer_registration_observation_for_test().4;

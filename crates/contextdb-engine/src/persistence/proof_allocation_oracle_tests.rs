@@ -1059,6 +1059,10 @@ impl Measurement {
     }
 }
 impl std::fmt::Debug for PurgePeakReceipt {
+    #[expect(
+        clippy::collapsible_if,
+        reason = "The fixture keeps each observation precondition explicit."
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let complete = {
             let measurement = MEASUREMENT.lock().unwrap();

@@ -3188,6 +3188,10 @@ pub(crate) mod compaction_admission_capture {
         c.cut |= event == "cut";
         c.stopped = event == "refuse";
     }
+    #[expect(
+        clippy::collapsible_if,
+        reason = "The fixture keeps each observation precondition explicit."
+    )]
     pub(crate) fn refusal(owner: &MemoryAccountant, bytes: usize, available: usize, cap: usize) {
         note(owner, "refuse", bytes);
         CAPTURE.with(|slot| {

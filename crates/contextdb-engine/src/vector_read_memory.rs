@@ -59,12 +59,12 @@ impl MemoryBudget for ReaderVectorBudget {
         if result.is_ok() {
             let identity = Arc::as_ptr(&self.reader) as *const () as usize;
             READER_BUDGET_LEDGER.with(|ledger| {
-                if let Some(entries) = ledger.borrow_mut().as_mut() {
-                    if let Some(event) = entries.last_mut().filter(|event| {
+                if let Some(entries) = ledger.borrow_mut().as_mut()
+                    && let Some(event) = entries.last_mut().filter(|event| {
                         event.owner_identity == identity && event.what == "vector_copy/materialize"
-                    }) {
-                        event.what = format!("{component}/{operation}");
-                    }
+                    })
+                {
+                    event.what = format!("{component}/{operation}");
                 }
             });
         }
@@ -89,12 +89,12 @@ pub(crate) fn budget(
 #[cfg(any(test, feature = "test-seams"))]
 fn note_copy_admission(identity: usize, component: &str, operation: &str) {
     READER_BUDGET_LEDGER.with(|ledger| {
-        if let Some(entries) = ledger.borrow_mut().as_mut() {
-            if let Some(event) = entries.last_mut().filter(|event| {
+        if let Some(entries) = ledger.borrow_mut().as_mut()
+            && let Some(event) = entries.last_mut().filter(|event| {
                 event.owner_identity == identity && event.what == "vector_copy/materialize"
-            }) {
-                event.what = format!("{component}/{operation}");
-            }
+            })
+        {
+            event.what = format!("{component}/{operation}");
         }
     });
 }
@@ -1236,15 +1236,15 @@ pub(crate) fn note_reader_body_admission_for_test(
     lsn: contextdb_core::Lsn,
 ) {
     READER_BUDGET_LEDGER.with(|ledger| {
-        if let Some(events) = ledger.borrow_mut().as_mut() {
-            if let Some(event) = events.last_mut().filter(|event| {
+        if let Some(events) = ledger.borrow_mut().as_mut()
+            && let Some(event) = events.last_mut().filter(|event| {
                 event.owner_identity != event.parent_identity
                     && event.bytes == bytes
                     && event.what != "release"
-            }) {
-                event.what = "vector_store/load_raw_vector_candidate".into();
-                event.row_identity = Some((row.0, created.0, lsn.0));
-            }
+            })
+        {
+            event.what = "vector_store/load_raw_vector_candidate".into();
+            event.row_identity = Some((row.0, created.0, lsn.0));
         }
     });
 }
@@ -1256,12 +1256,12 @@ pub(crate) fn note_reader_container_allocation_for_test(
     element_bytes: usize,
 ) {
     READER_BUDGET_LEDGER.with(|ledger| {
-        if let Some(events) = ledger.borrow_mut().as_mut() {
-            if let Some(event) = events.last_mut().filter(|event| {
+        if let Some(events) = ledger.borrow_mut().as_mut()
+            && let Some(event) = events.last_mut().filter(|event| {
                 event.owner_identity != event.parent_identity && event.bytes == bytes
-            }) {
-                event.allocation = Some((pointer, capacity, element_bytes));
-            }
+            })
+        {
+            event.allocation = Some((pointer, capacity, element_bytes));
         }
     });
 }
