@@ -3877,113 +3877,6 @@ pub(super) fn constraint_key_bytes(values: &[Value]) -> usize {
         )
 }
 
-#[cfg(test)]
-mod historical_group_consumer_tests {
-    //! Every consumer of a historical index decides a (key, row) group once:
-    //! a row whose indexed value alternated many times holds many intervals
-    //! in one group, and none of them adds work to a read at an older
-    //! snapshot, before or after a reopen.
-    use super::*;
-    use crate::read_work_probe::{ReadWorkObservationScope, ReadWorkPhase};
-
-    /// Physical historical postings each consumer pulled from storage for
-    /// key 'a' at a snapshot after `cycles` a/b alternations of one row.
-    fn postings_per_consumer(cycles: usize, reopen: bool) -> [u64; 4] {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("alternating.db");
-        let mut db = Database::open(&path).unwrap();
-        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        let run = |db: &Database, sql: &str| {
-            db.execute(sql, &HashMap::new()).unwrap();
-        };
-        run(
-            &db,
-            "CREATE TABLE tagged (id INT PRIMARY KEY, tag TEXT) HISTORY ALL",
-        );
-        run(&db, "CREATE INDEX tagged_by_tag ON tagged (tag)");
-        run(&db, "INSERT INTO tagged VALUES (1, 'a')");
-        for _ in 0..cycles {
-            run(&db, "UPDATE tagged SET tag = 'b' WHERE id = 1");
-            run(&db, "UPDATE tagged SET tag = 'a' WHERE id = 1");
-        }
-        let snapshot = db.snapshot();
-        run(&db, "UPDATE tagged SET tag = 'b' WHERE id = 1");
-        if reopen {
-            db.close().unwrap();
-            drop(db);
-            db = Database::open(&path).unwrap();
-            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        }
-        let a = Value::Text("a".into());
-        let observe = |read: &dyn Fn() -> Option<RowId>| {
-            let work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
-            assert_eq!(read(), Some(RowId(1)), "the row held 'a' at the snapshot");
-            work.historical_counters().historical_posting_windows
-        };
-        let point = observe(&|| {
-            db.point_lookup("tagged", "tag", &a, snapshot)
-                .unwrap()
-                .map(|row| row.row_id)
-        });
-        let values = observe(&|| {
-            let reader = db.declared_reader_memory().unwrap();
-            db.writer_indexed_rows_for_values(
-                "tagged",
-                &["tag".into()],
-                std::slice::from_ref(&a),
-                snapshot,
-                reader,
-            )
-            .unwrap()
-            .and_then(|rows| rows.first().map(|row| row.row_id))
-        });
-        let rank = observe(&|| {
-            let reader = db.declared_reader_memory().unwrap();
-            let policy = RankPolicy {
-                joined_table: "tagged".into(),
-                joined_column: "tag".into(),
-                anchor_column: String::new(),
-                sort_key: String::new(),
-                formula: String::new(),
-                protected_index: "tagged_by_tag".into(),
-            };
-            db.writer_rank_join(&policy, &a, snapshot, reader)
-                .unwrap()
-                .map(|row| row.row_id)
-        });
-        let constraint = observe(&|| {
-            let reader = db.declared_reader_memory().unwrap();
-            db.writer_indexed_row_with_overlay(
-                "tagged",
-                &["tag".into()],
-                std::slice::from_ref(&a),
-                snapshot,
-                &HashSet::new(),
-                None,
-                None,
-                reader,
-            )
-            .unwrap()
-            .flatten()
-        });
-        db.close().unwrap();
-        [point, values, rank, constraint]
-    }
-
-    #[test]
-    fn every_historical_index_consumer_steps_a_rows_interval_history_once() {
-        for reopen in [false, true] {
-            let short = postings_per_consumer(4, reopen);
-            let long = postings_per_consumer(32, reopen);
-            assert_eq!(
-                short, long,
-                "reopen={reopen}: point, indexed-values, rank-join and constraint reads pull the \
-                 same postings whether the row alternated 4 or 32 times"
-            );
-        }
-    }
-}
-
 impl Database {
     #[expect(
         clippy::result_large_err,
@@ -4094,3 +3987,110 @@ impl Database {
 }
 
 use crate::persistence::writer_source::WriterSnapshotHandle;
+
+#[cfg(test)]
+mod historical_group_consumer_tests {
+    //! Every consumer of a historical index decides a (key, row) group once:
+    //! a row whose indexed value alternated many times holds many intervals
+    //! in one group, and none of them adds work to a read at an older
+    //! snapshot, before or after a reopen.
+    use super::*;
+    use crate::read_work_probe::{ReadWorkObservationScope, ReadWorkPhase};
+
+    /// Physical historical postings each consumer pulled from storage for
+    /// key 'a' at a snapshot after `cycles` a/b alternations of one row.
+    fn postings_per_consumer(cycles: usize, reopen: bool) -> [u64; 4] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alternating.db");
+        let mut db = Database::open(&path).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let run = |db: &Database, sql: &str| {
+            db.execute(sql, &HashMap::new()).unwrap();
+        };
+        run(
+            &db,
+            "CREATE TABLE tagged (id INT PRIMARY KEY, tag TEXT) HISTORY ALL",
+        );
+        run(&db, "CREATE INDEX tagged_by_tag ON tagged (tag)");
+        run(&db, "INSERT INTO tagged VALUES (1, 'a')");
+        for _ in 0..cycles {
+            run(&db, "UPDATE tagged SET tag = 'b' WHERE id = 1");
+            run(&db, "UPDATE tagged SET tag = 'a' WHERE id = 1");
+        }
+        let snapshot = db.snapshot();
+        run(&db, "UPDATE tagged SET tag = 'b' WHERE id = 1");
+        if reopen {
+            db.close().unwrap();
+            drop(db);
+            db = Database::open(&path).unwrap();
+            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        }
+        let a = Value::Text("a".into());
+        let observe = |read: &dyn Fn() -> Option<RowId>| {
+            let work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
+            assert_eq!(read(), Some(RowId(1)), "the row held 'a' at the snapshot");
+            work.historical_counters().historical_posting_windows
+        };
+        let point = observe(&|| {
+            db.point_lookup("tagged", "tag", &a, snapshot)
+                .unwrap()
+                .map(|row| row.row_id)
+        });
+        let values = observe(&|| {
+            let reader = db.declared_reader_memory().unwrap();
+            db.writer_indexed_rows_for_values(
+                "tagged",
+                &["tag".into()],
+                std::slice::from_ref(&a),
+                snapshot,
+                reader,
+            )
+            .unwrap()
+            .and_then(|rows| rows.first().map(|row| row.row_id))
+        });
+        let rank = observe(&|| {
+            let reader = db.declared_reader_memory().unwrap();
+            let policy = RankPolicy {
+                joined_table: "tagged".into(),
+                joined_column: "tag".into(),
+                anchor_column: String::new(),
+                sort_key: String::new(),
+                formula: String::new(),
+                protected_index: "tagged_by_tag".into(),
+            };
+            db.writer_rank_join(&policy, &a, snapshot, reader)
+                .unwrap()
+                .map(|row| row.row_id)
+        });
+        let constraint = observe(&|| {
+            let reader = db.declared_reader_memory().unwrap();
+            db.writer_indexed_row_with_overlay(
+                "tagged",
+                &["tag".into()],
+                std::slice::from_ref(&a),
+                snapshot,
+                &HashSet::new(),
+                None,
+                None,
+                reader,
+            )
+            .unwrap()
+            .flatten()
+        });
+        db.close().unwrap();
+        [point, values, rank, constraint]
+    }
+
+    #[test]
+    fn every_historical_index_consumer_steps_a_rows_interval_history_once() {
+        for reopen in [false, true] {
+            let short = postings_per_consumer(4, reopen);
+            let long = postings_per_consumer(32, reopen);
+            assert_eq!(
+                short, long,
+                "reopen={reopen}: point, indexed-values, rank-join and constraint reads pull the \
+                 same postings whether the row alternated 4 or 32 times"
+            );
+        }
+    }
+}
