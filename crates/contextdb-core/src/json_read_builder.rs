@@ -1150,6 +1150,10 @@ mod finite_recipe_provenance_rows {
     // A private constructor/provenance row, explicitly NOT a selected-root
     // reachability claim. The selected root always installs a memory owner.
     #[test]
+    #[expect(
+        clippy::err_expect,
+        reason = "The refusal fixture inspects the error without requiring Debug on the successful value."
+    )]
     fn finite_native_data_recipes_preserve_their_real_constructor_provenance() {
         let scope = ClosedScope::enter();
         let produced: ClosedError<serde_json::Error> = capacity_error();
