@@ -119,14 +119,13 @@ fn a_commit_that_meets_a_busy_registry_succeeds_and_retains_and_purge_is_refused
         .expect("close the writer");
 }
 
-/// Test-estate reason (2026-10-15): a reader protects its snapshot from the moment it registers (a
-/// provisional record: transaction 0, no root), so a scan sees it; a reader that then loses the
-/// data-lock race to a writer detaches and routes to the writer.
+/// A provisional registration protects every root and is visible only after
+/// physical reader admission. It detaches when the admitted reader closes.
 #[test]
-fn a_provisional_registration_is_visible_to_a_scan_then_detached_when_the_data_lock_race_is_lost() {
+fn a_provisional_registration_is_visible_after_data_admission_and_detaches_on_reader_close() {
     if crate::test_process::rerun_alone(
         module_path!(),
-        "a_provisional_registration_is_visible_to_a_scan_then_detached_when_the_data_lock_race_is_lost",
+        "a_provisional_registration_is_visible_after_data_admission_and_detaches_on_reader_close",
         &[],
     ) {
         return;
@@ -166,21 +165,31 @@ fn a_provisional_registration_is_visible_to_a_scan_then_detached_when_the_data_l
         other => panic!("the scan in the gap must be complete: {other:?}"),
     }
 
-    // The writer opens in the gap: the reader holds neither the hold nor the
-    // data lock yet.
-    let writer = crate::Database::open_with_options(&path, writer_options(&runtime))
-        .expect("the writer opens while the reader is only provisional");
+    // Publication follows physical admission, so an independent writer data
+    // lock cannot win while the provisional reader remains paused.
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(matches!(
+        physical_admission::try_data(&probe, physical_admission::ByteLock::Exclusive).unwrap(),
+        physical_admission::Granted::HeldByAnother
+    ));
+    drop(probe);
     pause.release(ticket);
     let session = heard
         .recv_timeout(WATCHDOG)
         .expect("the reader never finished")
-        .expect("a reader that lost the race is routed, not refused");
+        .expect("the physically admitted reader finishes snapshot capture");
     reader.join().expect("the reader thread finishes");
     assert_eq!(
         session.route(),
-        contextdb_core::read_contract::ReadRoute::Owner,
-        "the reader that lost the data-lock race is answered by the writer that won it"
+        contextdb_core::read_contract::ReadRoute::File,
+        "the reader admitted before publication captures its file snapshot"
     );
+    let writer = crate::Database::open_with_options(&path, writer_options(&runtime))
+        .expect("the writer opens after the reader finishes snapshot capture");
     drop(session);
     assert!(
         snapshot_paths_for_test(&runtime, identity).is_empty(),
