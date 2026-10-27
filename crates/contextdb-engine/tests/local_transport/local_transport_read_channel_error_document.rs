@@ -41,6 +41,10 @@ fn ceiling() -> u64 {
 /// One engine answer per class this channel names. Every sample carries real
 /// field values, because a class that only ever travels empty proves nothing
 /// about the fields a caller reads.
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
 fn one_answer_per_named_class() -> Vec<Error> {
     vec![
         Error::ReadSessionNotImplemented,

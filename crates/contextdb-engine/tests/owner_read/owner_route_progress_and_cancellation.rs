@@ -797,6 +797,10 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
 fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_replays_the_page() {
     let directory = tempfile::TempDir::new().expect("task-scoped publication directory");
     let path = directory.path().join("owner-publication.db");
@@ -1213,6 +1217,10 @@ impl OwnerServicePublicationObserver for WriterContendedPublicationObserver {
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
 )]
 fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationContention) {
     use std::collections::BTreeMap;

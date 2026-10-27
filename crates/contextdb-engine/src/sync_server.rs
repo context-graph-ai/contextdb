@@ -1024,17 +1024,17 @@ impl SyncServer {
                     );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture binding requires an authenticated edge".to_string()).into(),
+                            "fixture binding requires an authenticated edge".to_string(),
                         )
                     })?;
                     let hub_node_id = local_node_id.ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture binding requires an authenticated hub".to_string()).into(),
+                            "fixture binding requires an authenticated hub".to_string(),
                         )
                     })?;
                     let signer = signer.ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture binding requires the hub signing key".to_string()).into(),
+                            "fixture binding requires the hub signing key".to_string(),
                         )
                     })?;
                     let request = decoded_memory
@@ -1050,7 +1050,7 @@ impl SyncServer {
                     )
                     .map_err(|e| e.to_string());
                     let response = rmp_serde::to_vec_named(&record)
-                        .map_err(|error| TransportError::Other((error.to_string()).into()))?;
+                        .map_err(|error| TransportError::Other(error.to_string()))?;
                     (req.responder)(response).await
                 }) as crate::transport::TransportFuture<'static, ()>
             }) as RequestHandler
@@ -1082,17 +1082,17 @@ impl SyncServer {
                     );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture outcome requires an authenticated edge".to_string()).into(),
+                            "fixture outcome requires an authenticated edge".to_string(),
                         )
                     })?;
                     let hub_node_id = local_node_id.ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture outcome requires an authenticated hub".to_string()).into(),
+                            "fixture outcome requires an authenticated hub".to_string(),
                         )
                     })?;
                     let signer = signer.ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture outcome requires the hub signing key".to_string()).into(),
+                            "fixture outcome requires the hub signing key".to_string(),
                         )
                     })?;
                     let request = decoded_memory
@@ -1112,7 +1112,7 @@ impl SyncServer {
                     )
                     .map_err(|e| e.to_string());
                     let response = rmp_serde::to_vec_named(&record)
-                        .map_err(|error| TransportError::Other((error.to_string()).into()))?;
+                        .map_err(|error| TransportError::Other(error.to_string()))?;
                     (req.responder)(response).await
                 }) as crate::transport::TransportFuture<'static, ()>
             }) as RequestHandler
@@ -1144,17 +1144,17 @@ impl SyncServer {
                     );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture outcome requires an authenticated edge".to_string()).into(),
+                            "fixture outcome requires an authenticated edge".to_string(),
                         )
                     })?;
                     let hub_node_id = local_node_id.ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture outcome requires an authenticated hub".to_string()).into(),
+                            "fixture outcome requires an authenticated hub".to_string(),
                         )
                     })?;
                     let signer = signer.ok_or_else(|| {
                         TransportError::Other(
-                            ("fixture outcome requires the hub signing key".to_string()).into(),
+                            "fixture outcome requires the hub signing key".to_string(),
                         )
                     })?;
                     let request = decoded_memory
@@ -1175,7 +1175,7 @@ impl SyncServer {
                     )
                     .map_err(|e| e.to_string());
                     let response = rmp_serde::to_vec_named(&record)
-                        .map_err(|error| TransportError::Other((error.to_string()).into()))?;
+                        .map_err(|error| TransportError::Other(error.to_string()))?;
                     (req.responder)(response).await
                 }) as crate::transport::TransportFuture<'static, ()>
             }) as RequestHandler

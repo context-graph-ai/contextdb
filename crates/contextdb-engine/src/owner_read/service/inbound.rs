@@ -754,6 +754,10 @@ mod completed_query_refusal_tests {
     // Decisive mutant: restore the completed691 decode_query_request(...)?;
     // No earlier mapped test exercises this completed-payload failure branch.
     #[test]
+    #[expect(
+        clippy::useless_conversion,
+        reason = "The fixture retains its explicit conversion at the ownership boundary."
+    )]
     fn actual_decoder_refusal_keeps_child_fifo_and_exact_transport_diagnosis() {
         for constrain_parent in [false, true] {
             let database = Database::open_memory();

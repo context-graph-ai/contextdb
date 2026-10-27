@@ -454,6 +454,10 @@ impl Harness {
         }
     }
 
+    #[expect(
+        clippy::useless_conversion,
+        reason = "The fixture retains its explicit conversion at the ownership boundary."
+    )]
     fn client(&self, connection: u8) -> Arc<Mutex<OwnerClient>> {
         if let Some(client) = self
             .clients
@@ -510,6 +514,10 @@ impl Harness {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[expect(
+        clippy::useless_conversion,
+        reason = "The fixture retains its explicit conversion at the ownership boundary."
     )]
     fn request_with_handshake(
         &self,

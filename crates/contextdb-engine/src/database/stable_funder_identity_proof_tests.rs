@@ -159,6 +159,10 @@ fn default_funder_identity_preserves_trait_data_address() {
 
 #[test]
 #[serial]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
 fn independent_writer_invocations_keep_caller_credit_and_allocation_dedup() {
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -290,6 +294,10 @@ fn independent_writer_invocations_keep_caller_credit_and_allocation_dedup() {
 
 #[test]
 #[serial]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
 fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original() {
     embedded_graph_reader_scratch_rows();
     let first = Arc::new(MemoryAccountant::no_limit());

@@ -739,16 +739,13 @@ pub(super) fn snapshot_stage(
             total_fragments: u32::try_from(fragment_count(usize::try_from(total_bytes).map_err(
                 |_| {
                     TransportError::Other(
-                        ("oversized request length cannot be represented on this platform"
-                            .to_string())
-                        .into(),
+                        "oversized request length cannot be represented on this platform"
+                            .to_string(),
                     )
                 },
             )?))
             .map_err(|_| {
-                TransportError::Other(
-                    ("oversized request has too many fragments".to_string()).into(),
-                )
+                TransportError::Other("oversized request has too many fragments".to_string())
             })?,
             transfer_digest: request_transfer_digest(
                 subject,
@@ -757,16 +754,13 @@ pub(super) fn snapshot_stage(
                 u32::try_from(fragment_count(usize::try_from(total_bytes).map_err(
                     |_| {
                         TransportError::Other(
-                            ("oversized request length cannot be represented on this platform"
-                                .to_string())
-                            .into(),
+                            "oversized request length cannot be represented on this platform"
+                                .to_string(),
                         )
                     },
                 )?))
                 .map_err(|_| {
-                    TransportError::Other(
-                        ("oversized request has too many fragments".to_string()).into(),
-                    )
+                    TransportError::Other("oversized request has too many fragments".to_string())
                 })?,
             ),
         },
@@ -788,9 +782,9 @@ pub(super) fn snapshot_stage(
         return Ok(None);
     };
     let manifest: StageManifest = rmp_serde::from_slice(&encoded).map_err(|err| {
-        TransportError::Other(
-            (format!("cannot decode durable oversized request manifest: {err}")).into(),
-        )
+        TransportError::Other(format!(
+            "cannot decode durable oversized request manifest: {err}"
+        ))
     })?;
     if manifest.version != MANIFEST_VERSION
         || manifest.subject != subject
@@ -799,7 +793,7 @@ pub(super) fn snapshot_stage(
         || manifest.total_bytes != total_bytes
     {
         return Err(TransportError::Other(
-            ("durable oversized request stage identity does not match".to_string()).into(),
+            "durable oversized request stage identity does not match".to_string(),
         ));
     }
     let mut fragments = Vec::new();
@@ -886,9 +880,9 @@ fn snapshot_all_stages_at(
             continue;
         };
         let manifest: StageManifest = rmp_serde::from_slice(&encoded).map_err(|err| {
-            TransportError::Other(
-                (format!("cannot decode durable oversized request manifest: {err}")).into(),
-            )
+            TransportError::Other(format!(
+                "cannot decode durable oversized request manifest: {err}"
+            ))
         })?;
         let mut fragments = Vec::new();
         for sequence in 0..manifest.total_fragments {

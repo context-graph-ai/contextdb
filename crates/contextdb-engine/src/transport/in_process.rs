@@ -169,9 +169,9 @@ async fn exchange(
     })
     .await?;
 
-    let response_bytes = reply_rx.await.map_err(|_| {
-        TransportError::Other(("responder dropped without replying".to_string()).into())
-    })?;
+    let response_bytes = reply_rx
+        .await
+        .map_err(|_| TransportError::Other("responder dropped without replying".to_string()))?;
 
     inner
         .exchanges

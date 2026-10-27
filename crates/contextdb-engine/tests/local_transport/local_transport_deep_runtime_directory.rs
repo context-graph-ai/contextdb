@@ -98,6 +98,10 @@ fn owner_channel(store: &Path, runtime_directory: &Path) -> PathBuf {
 }
 
 #[test]
+#[expect(
+    clippy::useless_conversion,
+    reason = "The fixture retains its explicit conversion at the ownership boundary."
+)]
 fn an_owner_serves_and_a_reader_reads_below_a_runtime_directory_past_the_address_limit() {
     let base = tempfile::Builder::new()
         .prefix("cdb")
