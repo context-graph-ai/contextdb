@@ -800,7 +800,7 @@ fn project_edges(parts: &ReadPersistenceImageParts) -> Result<Vec<DirectStoredEd
             std::ops::Bound::Unbounded,
             budget,
         )?;
-    while let Some(window) = cursor.next_edge_with(&mut || Ok(()))? {
+    while let Some(window) = cursor.next_edge_with(&|| Ok(()))? {
         let edge = window.edge();
         if edge.deleted_tx.is_some() {
             continue;
