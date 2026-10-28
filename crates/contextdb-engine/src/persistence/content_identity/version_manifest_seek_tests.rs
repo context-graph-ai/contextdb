@@ -36,6 +36,7 @@ fn store(members: &[u64]) -> (tempfile::TempDir, super::super::ProofFixtureDatab
     let database = super::super::ProofFixtureDatabase::create(root.path().join("seek.db"))
         .expect("create the proof fixture");
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     let records = members
         .iter()

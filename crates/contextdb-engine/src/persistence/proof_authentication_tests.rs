@@ -31,6 +31,7 @@ fn fixture(
     let database = ProofFixtureDatabase::create(path).expect("create proof fixture");
     let records = (0..rows).map(|row| posting(row, false)).collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,

@@ -29,6 +29,7 @@ fn committed(
         .map(|row| wide_posting(row, key_bytes))
         .collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,

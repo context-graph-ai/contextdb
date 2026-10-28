@@ -2008,6 +2008,7 @@ fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
         .map(|row| wide_posting(row, 70 * 1024))
         .collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
@@ -2114,6 +2115,7 @@ fn reset_family_fixture(path: &std::path::Path, nodes: u64) -> ProofFixtureDatab
         )
     }));
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
