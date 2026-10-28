@@ -540,8 +540,10 @@ impl RedbPersistence {
                 let (p, body) = item.map_err(Self::storage_error)?;
                 self.graph_writer_window(|| {
                     let selected = if let (Some(working), Some(selection), Some(frame)) =
-                        (working, selection, original)
+                        (working, selection, original_window.as_ref())
                     {
+                        // Decoded edge backing dies in this iteration; its
+                        // reservation must retire with the same window.
                         let edge: AdjEntry = frame.decode(body.value())?;
                         working.selected_graph_type_original(
                             frame.original,
