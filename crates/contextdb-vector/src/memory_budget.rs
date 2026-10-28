@@ -206,7 +206,7 @@ impl From<contextdb_core::read_memory::ReadMemoryOwner> for MemoryBudgetOwner {
         Self(MemoryBudgetOwnerKind::Reader(ReaderCopyBudget {
             reader,
             observer: None,
-            preserve_errors: false,
+            mode: ReaderCopyMode::ProjectErrors,
         }))
     }
 }
@@ -263,13 +263,29 @@ impl MemoryBudgetOwner {
 }
 /// Inline adaptation retains the actual owner; it has no control allocation.
 /// The optional observation callback carries no ownership or funding power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderCopyMode {
+    ProjectErrors,
+    PreserveErrors,
+    AnswerImage,
+}
 #[derive(Debug, Clone)]
 struct ReaderCopyBudget {
     reader: contextdb_core::read_memory::ReadMemoryOwner,
     observer: Option<fn(usize, &str, &str)>,
-    preserve_errors: bool,
+    mode: ReaderCopyMode,
 }
 impl MemoryBudgetOwner {
+    /// Reuse an answer image's original reader without a forwarding allocation.
+    /// These are the same labels the image's budget bridge uses.
+    #[doc(hidden)]
+    pub fn for_answer_image(reader: contextdb_core::read_memory::ReadMemoryOwner) -> Self {
+        Self(MemoryBudgetOwnerKind::Reader(ReaderCopyBudget {
+            reader,
+            observer: None,
+            mode: ReaderCopyMode::AnswerImage,
+        }))
+    }
     #[doc(hidden)]
     pub fn with_read_copy_observer(mut self, observer: fn(usize, &str, &str)) -> Self {
         if let MemoryBudgetOwnerKind::Reader(reader) = &mut self.0 {
@@ -282,7 +298,7 @@ impl MemoryBudgetOwner {
     #[doc(hidden)]
     pub fn preserving_read_copy_errors(mut self) -> Self {
         if let MemoryBudgetOwnerKind::Reader(reader) = &mut self.0 {
-            reader.preserve_errors = true;
+            reader.mode = ReaderCopyMode::PreserveErrors;
         }
         self
     }
@@ -296,13 +312,21 @@ impl MemoryBudget for ReaderCopyBudget {
         hint: &'static str,
     ) -> Result<()> {
         use contextdb_core::read_memory::ReadMemoryBudget;
-        let result = self.reader.try_reserve(
-            bytes,
-            "vector_copy",
-            "materialize",
-            "Reduce the selected copy or raise the executing reader's memory limit.",
-        );
-        let result = if self.preserve_errors {
+        let (subsystem, admission, advice) = if self.mode == ReaderCopyMode::AnswerImage {
+            (
+                "reader",
+                "materialize_answer",
+                "Reduce the statement's output or raise the declared reader memory limit.",
+            )
+        } else {
+            (
+                "vector_copy",
+                "materialize",
+                "Reduce the selected copy or raise the executing reader's memory limit.",
+            )
+        };
+        let result = self.reader.try_reserve(bytes, subsystem, admission, advice);
+        let result = if self.mode != ReaderCopyMode::ProjectErrors {
             result
         } else {
             result.map_err(|error| match error {
@@ -345,14 +369,16 @@ impl MemoryBudget for ReaderCopyBudget {
                     budget_limit_bytes,
                     hint,
                     ..
-                } if !self.preserve_errors => contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem,
-                    operation,
-                    requested_bytes,
-                    available_bytes,
-                    budget_limit_bytes,
-                    hint,
-                },
+                } if self.mode == ReaderCopyMode::ProjectErrors => {
+                    contextdb_core::Error::MemoryBudgetExceeded {
+                        subsystem,
+                        operation,
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        hint,
+                    }
+                }
                 other => other,
             })
     }
@@ -396,13 +422,21 @@ impl MemoryBudget for ReaderCopyBudget {
         hint: &str,
     ) -> Result<()> {
         use contextdb_core::read_memory::ReadMemoryBudget;
-        let result = self.reader.try_reserve(
-            bytes,
-            "vector_copy",
-            "materialize",
-            "Reduce the selected copy or raise the executing reader's memory limit.",
-        );
-        let result = if self.preserve_errors {
+        let (subsystem, admission, advice) = if self.mode == ReaderCopyMode::AnswerImage {
+            (
+                "reader",
+                "materialize_answer",
+                "Reduce the statement's output or raise the declared reader memory limit.",
+            )
+        } else {
+            (
+                "vector_copy",
+                "materialize",
+                "Reduce the selected copy or raise the executing reader's memory limit.",
+            )
+        };
+        let result = self.reader.try_reserve(bytes, subsystem, admission, advice);
+        let result = if self.mode != ReaderCopyMode::ProjectErrors {
             result
         } else {
             result.map_err(|error| match error {

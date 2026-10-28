@@ -1381,13 +1381,14 @@ impl RedbPersistence {
             .map(|(table, row_id, _, _)| (table.as_str(), *row_id))
             .collect::<HashSet<_>>()
         {
-            identity_mutations.push(Self::current_row_identity_mutation_in_write(
+            let current_identity = Self::current_row_identity_mutation_in_write(
                 write_txn,
                 table,
                 row_id,
                 table_meta.get(table),
-                rewrite_workspace.as_deref_mut(),
-            )?);
+                posting_outputs.original(),
+            )?;
+            posting_outputs.push_original(current_identity)?;
         }
 
         if !orphaned_source_lsn_rows.is_empty() {

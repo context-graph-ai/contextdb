@@ -121,7 +121,10 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn pin_snapshot(&self, snapshot: SnapshotId) -> contextdb_core::Result<SnapshotPin<'_>> {
-        let read_memory = self.declared_reader_memory()?;
+        // Pins retain the already declared parent; prepaid registrations must
+        // not allocate a request child or spend reader bytes a second time.
+        // Overflow registrations carry their own exact credit on this parent.
+        let read_memory = self.declared_read_memory.original_owner();
         let slot = self
             .snapshot_registry
             .acquire_pin_slot(read_memory.clone())?;

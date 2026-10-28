@@ -3383,27 +3383,34 @@ impl WriterReadCursor {
                     None,
                     None,
                 );
-                let edge: AdjEntry = decode_window_exact(value).map_err(|error| match error {
-                    Error::Other(reason) => Error::StoreCorrupted {
-                        path: "graph adjacency".into(),
-                        reason,
-                    },
-                    other => other,
-                })?;
-                crate::read_image_memory::reserve(key.len())?;
-                let expected = if reverse {
-                    RedbPersistence::graph_rev_key(&edge)
-                } else {
-                    RedbPersistence::graph_fwd_key(&edge)
-                };
-                if expected != key {
-                    return Err(Error::StoreCorrupted {
-                        path: "graph adjacency".into(),
-                        reason: "edge key does not match its payload".into(),
-                    });
-                }
-                root.verify_graph_edge_at_root(key, value, &edge, reverse, &owner)?;
-                Ok(edge)
+                // The returned window retains this decoder's original invoice.
+                // Proof scratch remains separate and cannot escape in the edge.
+                let decode_owner = crate::read_image_memory::active_owner()?;
+                root.decode_and_verify_graph_edge_at_root(key, value, reverse, &owner, || {
+                    decode_owner.scope(|| {
+                        let edge: AdjEntry =
+                            decode_window_exact(value).map_err(|error| match error {
+                                Error::Other(reason) => Error::StoreCorrupted {
+                                    path: "graph adjacency".into(),
+                                    reason,
+                                },
+                                other => other,
+                            })?;
+                        crate::read_image_memory::reserve(key.len())?;
+                        let expected = if reverse {
+                            RedbPersistence::graph_rev_key(&edge)
+                        } else {
+                            RedbPersistence::graph_fwd_key(&edge)
+                        };
+                        if expected != key {
+                            return Err(Error::StoreCorrupted {
+                                path: "graph adjacency".into(),
+                                reason: "edge key does not match its payload".into(),
+                            });
+                        }
+                        Ok(edge)
+                    })
+                })
             },
             handoff,
         )

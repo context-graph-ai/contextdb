@@ -1434,10 +1434,6 @@ impl MaintenanceContext {
         preparation: RetentionPreparation,
     ) -> Result<()> {
         let tx = self.tx_mgr.try_begin()?;
-        let workspace =
-            std::cell::RefCell::new(crate::memory_accounting::OwnedMemoryReservation::new(
-                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-            ));
         // Armed just before the durable apply; see `PublicationInterruptionWatch`.
         // This commit is durable the moment the manager applies it, and the
         // in-memory commit bookkeeping that makes it visible happens after --
@@ -1450,6 +1446,13 @@ impl MaintenanceContext {
             tx,
             maintenance_read_memory.clone(),
             |expiry_lsn| {
+                // The selection owns this scratch only while the callback runs.
+                // Published auxiliary bodies retain their separate original invoices.
+                let workspace = std::cell::RefCell::new(
+                    crate::memory_accounting::OwnedMemoryReservation::new(
+                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                    ),
+                );
                 // The reserved-LSN callback holds the commit frontier. Borrow
                 // authoritative rows there; copy only admitted mutation identities.
                 let metas = self.relational.table_meta.read();
@@ -1611,9 +1614,8 @@ impl MaintenanceContext {
                 if let Some(watch) = watch_completed {
                     watch.completed();
                 }
-                // The callback selections, staged bodies and terminal have
-                // physically dropped before their selection workspace ends.
-                drop(workspace);
+                // Staged bodies and terminal keep their own original invoices
+                // until their physical destruction above.
                 Ok(())
             }
             Err(failure) => {

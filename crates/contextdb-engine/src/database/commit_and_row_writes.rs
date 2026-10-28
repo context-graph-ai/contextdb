@@ -16,6 +16,21 @@ impl Drop for DetachedRowUnwindRefund<'_> {
     }
 }
 
+/// Transaction metadata has no successful/failure return path during unwind.
+/// Its lineage memo and row-graph journal still own real preparation invoices.
+/// Declare this before commit locals so those locals drop before the metadata.
+struct CommitMetadataUnwindCleanup<'a> {
+    database: &'a Database,
+    tx: TxId,
+}
+impl Drop for CommitMetadataUnwindCleanup<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.database.remove_original_terminal_stages(self.tx);
+        }
+    }
+}
+
 impl Database {
     pub(super) fn take_local_schema_stage(&self, lsn: Lsn) -> Option<LocalSchemaStage> {
         self.local_schema_stages.lock().remove(&lsn)
@@ -133,6 +148,7 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        let _metadata_unwind = CommitMetadataUnwindCleanup { database: self, tx };
         #[cfg(feature = "test-seams")]
         let _publication_admission = self.publication_admission_for_test(tx);
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();

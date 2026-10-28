@@ -680,7 +680,13 @@ impl Database {
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
         )?;
-        crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, |image| {
+        let transient_answer = answer_memory.value.scope(|| -> Result<bool> {
+            Ok(match self.cached_statement(sql) {
+                Some(cached) => matches!(cached.stmt, Statement::Select(_)),
+                None => matches!(contextdb_parser::parse(sql)?, Statement::Select(_)),
+            })
+        })?;
+        let execute = |image: &crate::read_image_memory::ImageMemoryHandle| {
             let _decode_scope = image.enter();
             let mut answer_copy = image.vector_copy(0)?;
             #[cfg(any(test, feature = "test-seams"))]
@@ -698,7 +704,15 @@ impl Database {
                 answer_copy.into_image();
             }
             result
-        })
+        };
+        if transient_answer {
+            crate::read_image_memory::QueryAnswerCharge::execute_with_transient_image(
+                answer_memory,
+                execute,
+            )
+        } else {
+            crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, execute)
+        }
     }
 
     #[expect(
@@ -1489,14 +1503,18 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         if !crate::executor::bounded::kernel_can_answer(plan) {
-            return crate::executor::execute_plan_with_native_trace_refund(
-                self,
-                plan,
-                params,
-                tx,
-                vector_copy_owner,
-                read_memory.clone(),
-                native_trace_refund,
+            return crate::read_image_memory::QueryAnswerCharge::execute_legacy_with_active_image(
+                || {
+                    crate::executor::execute_plan_with_native_trace_refund(
+                        self,
+                        plan,
+                        params,
+                        tx,
+                        vector_copy_owner,
+                        read_memory.clone(),
+                        native_trace_refund,
+                    )
+                },
             );
         }
         let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
@@ -3055,7 +3073,13 @@ impl Database {
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
         )?;
-        crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, |image| {
+        let transient_answer = answer_memory.value.scope(|| -> Result<bool> {
+            Ok(match self.cached_statement(sql) {
+                Some(cached) => matches!(cached.stmt, Statement::Select(_)),
+                None => matches!(contextdb_parser::parse(sql)?, Statement::Select(_)),
+            })
+        })?;
+        let execute = |image: &crate::read_image_memory::ImageMemoryHandle| {
             let _decode_scope = image.enter();
             let mut answer_copy = image.vector_copy(0)?;
             let scope = QueryRowsExaminedScope::enter(self);
@@ -3072,7 +3096,15 @@ impl Database {
                 answer_copy.into_image();
             }
             result
-        })
+        };
+        if transient_answer {
+            crate::read_image_memory::QueryAnswerCharge::execute_with_transient_image(
+                answer_memory,
+                execute,
+            )
+        } else {
+            crate::read_image_memory::QueryAnswerCharge::execute_with_image(answer_memory, execute)
+        }
     }
 
     #[expect(
