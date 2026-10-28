@@ -906,6 +906,7 @@ dependencies = [
  "contextdb-tx",
  "criterion",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "getrandom 0.3.4",
  "iroh",
  "iroh-relay",

@@ -3533,6 +3533,7 @@ async fn published_hub_announces_to_the_operator_lookup_service() {
 #[cfg(feature = "mdns")]
 #[tokio::test]
 async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
+    use futures_util::StreamExt;
     let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     // The LOOKUP knob end to end with zero third-party anything: both sides
     // opt into lookup=mdns (LAN-local), the edge's ticket carries ONLY the
@@ -3562,26 +3563,51 @@ async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
         "iroh:?to={id_only_ticket}&lookup=mdns&identity={}",
         edge_identity.display()
     );
-    let client = SyncClient::new(edge.clone(), &dial, contextdb_core::TenantId::from(tenant))
-        .expect("construct SyncClient fixture");
-
-    // mDNS convergence can take a few announce cycles; retry the push until
-    // the resolve succeeds (bounded by the outer test timeout).
-    let mut last_err = String::new();
-    let mut pushed = false;
-    for _ in 0..6 {
-        match within(client.push()).await {
-            Ok(_) => {
-                pushed = true;
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(&edge_identity).expect("edge identity"));
+    let (transport, control) = client_with_test_controller_for_test(&dial);
+    control.pause_before_discovery_connect_for_test();
+    let client = Arc::new(
+        SyncClient::with_authenticated_transport_and_identity_for_test(
+            edge.clone(),
+            transport,
+            contextdb_core::TenantId::from(tenant),
+            identity,
+        )
+        .expect("construct SyncClient fixture"),
+    );
+    let push = tokio::spawn({
+        let client = client.clone();
+        async move { client.push().await }
+    });
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let endpoint = control.wait_for_discovery_endpoint_for_test().await;
+        let lookup = endpoint.address_lookup().expect("client address lookup");
+        let results = lookup.resolve(full.endpoint_addr().id);
+        tokio::pin!(results);
+        let mut discovered = false;
+        while let Some(result) = results.next().await {
+            if let Ok(Ok(item)) = result
+                && item.endpoint_id() == full.endpoint_addr().id
+                && item.provenance() == "mdns"
+                && !item.to_endpoint_addr().is_empty()
+            {
+                discovered = true;
                 break;
             }
-            Err(err) => {
-                last_err = err.to_string();
-                client.reconnect().await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
         }
-    }
+        if !discovered {
+            panic!("mDNS peer discovery never delivered");
+        }
+        control.release_discovery_connect_for_test();
+        push.await.expect("mDNS push task")
+    })
+    .await
+    .expect("mDNS peer discovery or push completion never delivered");
+    let (pushed, last_err) = match result {
+        Ok(_) => (true, String::new()),
+        Err(err) => (false, err.to_string()),
+    };
     assert!(
         pushed,
         "push via an identity-only ticket must succeed once mDNS resolves the hub, last error: {last_err}"
@@ -3697,10 +3723,16 @@ async fn sync_status_reports_unreachable_after_hub_dies() {
     create_notes_table(&edge);
     insert_note(&edge, Uuid::new_v4(), "liveness-probe");
     let edge_identity = dir.path().join("liveness-edge.fabric-identity.key");
-    let client = SyncClient::new(
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(&edge_identity).expect("edge identity"));
+    let (transport, control) =
+        client_with_test_controller_for_test(&peer_dial_spec(&hub.ticket, &edge_identity));
+    control.watch_connection_close_for_test();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge.clone(),
-        &peer_dial_spec(&hub.ticket, &edge_identity),
+        transport,
         contextdb_core::TenantId::from(tenant),
+        identity,
     )
     .expect("construct SyncClient fixture");
     within(client.push()).await.expect("push while hub is up");
@@ -3710,17 +3742,12 @@ async fn sync_status_reports_unreachable_after_hub_dies() {
     );
 
     hub.stop().await;
-    // Bounded poll on the observable condition (was a fixed 1 s settle sleep):
-    // after the hub dies the liveness probe must eventually report dead. The
-    // deadline is a failure ceiling, not a timing assertion.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while client.is_connected().await {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "is_connected must report the dead hub within the failure ceiling"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        control.wait_for_connection_close_for_test(),
+    )
+    .await
+    .expect("connection close never delivered");
 
     // The operator-facing health answer must tell the truth: the cached
     // connection is dead, so the client is NOT connected, and a fresh

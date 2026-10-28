@@ -1320,18 +1320,30 @@ pub struct LargeResponseCompleteOutcomeObservation {
 
 /// Test-only control of the real client retry path for a durable response
 /// chunk. It is compiled out of production builds.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct IrohClientTestController {
     control: Arc<IrohClientTestControlState>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 struct IrohClientTestControlState {
-    #[cfg(test)]
+    #[cfg(feature = "mdns")]
+    discovery_pause_armed: AtomicBool,
+    #[cfg(feature = "mdns")]
+    discovery_endpoint: Mutex<Option<Endpoint>>,
+    #[cfg(feature = "mdns")]
+    discovery_ready: Notify,
+    #[cfg(feature = "mdns")]
+    discovery_released: AtomicBool,
+    #[cfg(feature = "mdns")]
+    discovery_release: Notify,
+    watch_connection_close: AtomicBool,
+    watched_connection: Mutex<Option<Connection>>,
+    #[cfg(all(test, feature = "test-seams"))]
     force_next_admitted_timeout: AtomicBool,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-seams"))]
     admitted_timeout_notice: Arc<Notify>,
     pause_after_response_chunk_failure: Mutex<Option<u64>>,
     response_chunk_retry_paused: AtomicBool,
@@ -1340,13 +1352,25 @@ struct IrohClientTestControlState {
     response_chunk_retry_resume_notice: Notify,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl Default for IrohClientTestControlState {
     fn default() -> Self {
         Self {
-            #[cfg(test)]
+            #[cfg(feature = "mdns")]
+            discovery_pause_armed: AtomicBool::new(false),
+            #[cfg(feature = "mdns")]
+            discovery_endpoint: Mutex::new(None),
+            #[cfg(feature = "mdns")]
+            discovery_ready: Notify::new(),
+            #[cfg(feature = "mdns")]
+            discovery_released: AtomicBool::new(false),
+            #[cfg(feature = "mdns")]
+            discovery_release: Notify::new(),
+            watch_connection_close: AtomicBool::new(false),
+            watched_connection: Mutex::new(None),
+            #[cfg(all(test, feature = "test-seams"))]
             force_next_admitted_timeout: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "test-seams"))]
             admitted_timeout_notice: Arc::new(Notify::new()),
             pause_after_response_chunk_failure: Mutex::new(None),
             response_chunk_retry_paused: AtomicBool::new(false),
@@ -1357,10 +1381,71 @@ impl Default for IrohClientTestControlState {
     }
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 impl IrohClientTestController {
-    #[cfg(test)]
-    pub(crate) fn next_admitted_timeout_signal_for_test(&self) -> Arc<Notify> {
+    /// Pause the next connection after endpoint creation and before dialing.
+    #[cfg(feature = "mdns")]
+    pub fn pause_before_discovery_connect_for_test(&self) {
+        *self
+            .control
+            .discovery_endpoint
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
+        self.control
+            .discovery_released
+            .store(false, Ordering::SeqCst);
+        self.control
+            .discovery_pause_armed
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "mdns")]
+    pub async fn wait_for_discovery_endpoint_for_test(&self) -> Endpoint {
+        loop {
+            let ready = self.control.discovery_ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if let Some(endpoint) = self
+                .control
+                .discovery_endpoint
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone()
+            {
+                return endpoint;
+            }
+            ready.await;
+        }
+    }
+
+    #[cfg(feature = "mdns")]
+    pub fn release_discovery_connect_for_test(&self) {
+        self.control
+            .discovery_released
+            .store(true, Ordering::SeqCst);
+        self.control.discovery_release.notify_waiters();
+    }
+
+    /// Capture the next real connection so a test can await its close event.
+    pub fn watch_connection_close_for_test(&self) {
+        self.control
+            .watch_connection_close
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub async fn wait_for_connection_close_for_test(&self) {
+        let connection = self
+            .control
+            .watched_connection
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+            .expect("watched connection was not established");
+        let _ = connection.closed().await;
+    }
+
+    #[cfg(all(test, feature = "test-seams"))]
+    pub fn next_admitted_timeout_signal_for_test(&self) -> Arc<Notify> {
         self.control
             .force_next_admitted_timeout
             .store(true, Ordering::SeqCst);
@@ -3112,7 +3197,7 @@ pub(super) fn client_with_lineage_signer(
             identity,
             has_stable_edge_identity,
             state: tokio::sync::Mutex::new(None),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_control: Arc::new(IrohClientTestControlState::default()),
         }),
         signer,
@@ -3151,7 +3236,7 @@ pub(super) fn sync_client_with_lineage_signer(
             identity,
             has_stable_edge_identity,
             state: tokio::sync::Mutex::new(None),
-            #[cfg(feature = "test-seams")]
+            #[cfg(any(test, feature = "test-seams"))]
             test_control: Arc::new(IrohClientTestControlState::default()),
         }),
         signer,
@@ -3160,7 +3245,7 @@ pub(super) fn sync_client_with_lineage_signer(
 
 /// Construct the normal authenticated Iroh client with test-only retry
 /// controls. This factory is absent from production builds.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn client_with_test_controller_for_test(
     spec: &str,
@@ -3209,7 +3294,7 @@ struct IrohClientTransport {
     identity: Option<Arc<FabricIdentity>>,
     has_stable_edge_identity: bool,
     state: tokio::sync::Mutex<Option<ClientState>>,
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     test_control: Arc<IrohClientTestControlState>,
 }
 
@@ -3259,6 +3344,28 @@ impl IrohClientTransport {
             parsed.lookup(),
         )
         .await?;
+        #[cfg(all(feature = "mdns", any(test, feature = "test-seams")))]
+        if self
+            .test_control
+            .discovery_pause_armed
+            .swap(false, Ordering::SeqCst)
+        {
+            *self
+                .test_control
+                .discovery_endpoint
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()) = Some(endpoint.clone());
+            self.test_control.discovery_ready.notify_waiters();
+            loop {
+                let release = self.test_control.discovery_release.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
+                if self.test_control.discovery_released.load(Ordering::SeqCst) {
+                    break;
+                }
+                release.await;
+            }
+        }
         let connection = match connect(&endpoint, target, SYNC_ALPN).await {
             Ok(connection) => connection,
             Err(err) => {
@@ -3266,6 +3373,18 @@ impl IrohClientTransport {
                 return Err(err);
             }
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        if self
+            .test_control
+            .watch_connection_close
+            .load(Ordering::SeqCst)
+        {
+            *self
+                .test_control
+                .watched_connection
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()) = Some(connection.clone());
+        }
         *state = Some(ClientState {
             endpoint,
             connection: connection.clone(),
@@ -3281,7 +3400,7 @@ impl IrohClientTransport {
         }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[cfg(any(test, feature = "test-seams"))]
     async fn pause_after_response_chunk_failure_for_test(&self, sequence: u64, attempt: usize) {
         if attempt != 0 {
             return;
@@ -3482,7 +3601,7 @@ impl IrohClientTransport {
                     Err(_) => last_error = Some(TransportError::Timeout),
                 }
                 self.drop_state().await;
-                #[cfg(feature = "test-seams")]
+                #[cfg(any(test, feature = "test-seams"))]
                 self.pause_after_response_chunk_failure_for_test(sequence, attempt)
                     .await;
             }
