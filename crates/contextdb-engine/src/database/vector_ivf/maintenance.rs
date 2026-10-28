@@ -5,6 +5,8 @@ impl MaintenanceContext {
         &self,
         memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<VectorMaintenanceReport> {
+        #[cfg(feature = "test-seams")]
+        let _native_activity = self.vector.native_index_activity_scope_for_test();
         let Some(persistence) = &self.persistence else {
             return Ok(VectorMaintenanceReport::default());
         };

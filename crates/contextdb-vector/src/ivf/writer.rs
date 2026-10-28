@@ -250,6 +250,8 @@ impl<S: PageStore> ClusteredIndex<S> {
         let generation = serving_at_start
             .map_or(Some(1), |m| m.generation.checked_add(1))
             .ok_or_else(overflow)?;
+        #[cfg(feature = "test-seams")]
+        crate::build_observation::before_vector_build();
         let state = BuildState {
             manifest: Manifest {
                 partition,
@@ -1064,6 +1066,8 @@ impl<S: PageStore> ClusteredIndex<S> {
             return Err(super::memory::corrupt_page(key));
         }
         let book = load_seal_book(&self.owner, &self.store, m, &mut c)?;
+        #[cfg(feature = "test-seams")]
+        crate::build_observation::before_vector_rewrite();
         let mut tx = self.store.begin()?;
         if c.remap_output == 0 {
             c.remap_output = c.allocate_run()?;
@@ -1258,6 +1262,8 @@ impl<S: PageStore> ClusteredIndex<S> {
         }
         let left = Run::load(&self.store, m, c.coalesce_left)?;
         let right = Run::load(&self.store, m, c.coalesce_right)?;
+        #[cfg(feature = "test-seams")]
+        crate::build_observation::before_vector_rewrite();
         let mut tx = self.store.begin()?;
         let mut a = m;
         a.run = c.coalesce_left;
