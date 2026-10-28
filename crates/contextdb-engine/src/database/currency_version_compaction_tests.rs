@@ -963,13 +963,18 @@ fn changes_since_survives_reopen_after_compaction() {
                 )
                 .unwrap();
                 let tx = db.begin().unwrap();
-                db.insert_edge(tx, source, target, "standalone_link".into(), HashMap::new())
-                    .unwrap();
+                db.insert_edge(
+                    tx,
+                    source,
+                    target,
+                    "link".into(),
+                    HashMap::from([("origin".into(), Value::Text("standalone".into()))]),
+                )
+                .unwrap();
                 db.commit(tx).unwrap();
                 if !deleted {
                     let tx = db.begin().unwrap();
-                    db.delete_edge(tx, source, target, "standalone_link")
-                        .unwrap();
+                    db.delete_edge(tx, source, target, "link").unwrap();
                     db.commit(tx).unwrap();
                 }
                 let since = db.current_lsn();
@@ -977,11 +982,16 @@ fn changes_since_survives_reopen_after_compaction() {
                     .unwrap();
                 let tx = db.begin().unwrap();
                 if deleted {
-                    db.delete_edge(tx, source, target, "standalone_link")
-                        .unwrap();
+                    db.delete_edge(tx, source, target, "link").unwrap();
                 } else {
-                    db.insert_edge(tx, source, target, "standalone_link".into(), HashMap::new())
-                        .unwrap();
+                    db.insert_edge(
+                        tx,
+                        source,
+                        target,
+                        "link".into(),
+                        HashMap::from([("origin".into(), Value::Text("standalone".into()))]),
+                    )
+                    .unwrap();
                 }
                 db.commit(tx).unwrap();
                 db.access.contexts = Some([ContextId::new(context)].into_iter().collect());
