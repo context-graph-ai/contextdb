@@ -170,9 +170,9 @@ impl From<NativeTerminal> for WireError {
                 NativeRefusal::MemoryBudgetExceeded { .. }
                 | NativeRefusal::ProcessMemoryBudgetExceeded { .. },
             )
-            | NativeTerminal::Kernel(contextdb_core::Error::MemoryBudgetExceeded { .. })) => {
-                Self::Resource(terminal.into_error())
-            }
+            | NativeTerminal::Kernel(contextdb_core::Error::MemoryBudgetExceeded {
+                ..
+            })) => Self::Resource(terminal.into_error()),
             other => Self::Native(other),
         }
     }
@@ -487,6 +487,43 @@ pub(crate) fn encode_terminal(
         | NativeTerminal::Kernel(_)
         | NativeTerminal::Class(_) => return None,
     };
+    encode_borrowed_refusal(refusal, out)
+}
+
+/// The shared resource variant keeps native memory refusal serialization
+/// borrowed, including when admission failed before a reply could be allocated.
+pub(crate) fn encode_resource_memory_refusal(
+    error: &contextdb_core::Error,
+    out: &mut [u8; TERMINAL_BYTES],
+) -> Option<usize> {
+    let contextdb_core::Error::MemoryBudgetExceeded {
+        subsystem,
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+    } = error
+    else {
+        return None;
+    };
+    encode_borrowed_refusal(
+        WireRefusalRef::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint,
+        },
+        out,
+    )
+}
+
+fn encode_borrowed_refusal(
+    refusal: WireRefusalRef<'_>,
+    out: &mut [u8; TERMINAL_BYTES],
+) -> Option<usize> {
     let capacity = out.len();
     let mut cursor = std::io::Cursor::new(&mut out[..]);
     serde::Serialize::serialize(

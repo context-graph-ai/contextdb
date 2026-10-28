@@ -4890,21 +4890,28 @@ async fn answer_native_refusal(
     // A native terminal is encoded borrowed into this fixed buffer: a typed
     // refusal keeps its kind and details, anything else answers its static
     // class. Nothing here allocates.
-    if let super::WireError::Native(terminal) = error {
+    if matches!(
+        error,
+        super::WireError::Native(_)
+            | super::WireError::Resource(contextdb_core::Error::MemoryBudgetExceeded { .. })
+    ) {
         let mut encoded = [0u8; super::TERMINAL_BYTES];
-        let written = match super::encode_terminal(terminal, &mut encoded) {
+        let (length, class) = match error {
+            super::WireError::Native(terminal) => (
+                super::encode_terminal(terminal, &mut encoded),
+                super::terminal_class_of(terminal),
+            ),
+            super::WireError::Resource(resource) => (
+                super::encode_resource_memory_refusal(resource, &mut encoded),
+                super::terminal_class::FAULT,
+            ),
+            _ => unreachable!("native or memory refusal matched above"),
+        };
+        let written = match length {
             Some(length) => {
                 write_reply_native(send, recv, REPLY_TYPED_REFUSAL, &encoded[..length]).await
             }
-            None => {
-                write_reply_native(
-                    send,
-                    recv,
-                    REPLY_HANDLER_ERROR,
-                    super::terminal_class_of(terminal).as_bytes(),
-                )
-                .await
-            }
+            None => write_reply_native(send, recv, REPLY_HANDLER_ERROR, class.as_bytes()).await,
         };
         #[cfg(test)]
         TERMINAL_WRITES
