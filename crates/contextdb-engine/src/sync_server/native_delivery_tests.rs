@@ -470,51 +470,23 @@ fn decode_outcomes(reply: &[u8]) -> usize {
 /// The error a native request's result reaches its caller as: a native
 /// terminal is converted as the caller handoff converts it; a Legacy resource
 /// error is already that error.
-fn handed_off(result: &crate::transport::WireResult<()>) -> Option<contextdb_core::Error> {
+fn handed_off(result: crate::transport::WireResult<()>) -> Option<contextdb_core::Error> {
     match result {
         Err(crate::transport::WireError::Native(terminal)) => Some(match terminal {
             crate::transport::NativeTerminal::Refused(refusal) => {
-                crate::transport::NativeTerminal::Refused(*refusal).into_error()
+                crate::transport::NativeTerminal::Refused(refusal).into_error()
             }
             crate::transport::NativeTerminal::Kernel(error) => match error {
-                contextdb_core::Error::ReadFailure(failure) => {
-                    contextdb_core::Error::ReadFailure(failure.clone())
-                }
-                contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem,
-                    operation,
-                    requested_bytes,
-                    available_bytes,
-                    budget_limit_bytes,
-                    hint,
-                } => contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem: subsystem
-                        .static_text()
-                        .map(Into::into)
-                        .unwrap_or_else(|| subsystem.as_ref().to_owned().into()),
-                    operation: operation
-                        .static_text()
-                        .map(Into::into)
-                        .unwrap_or_else(|| operation.as_ref().to_owned().into()),
-                    requested_bytes: *requested_bytes,
-                    available_bytes: *available_bytes,
-                    budget_limit_bytes: *budget_limit_bytes,
-                    hint: hint
-                        .static_text()
-                        .map(Into::into)
-                        .unwrap_or_else(|| hint.as_ref().to_owned().into()),
-                },
+                error @ (contextdb_core::Error::ReadFailure(_)
+                | contextdb_core::Error::MemoryBudgetExceeded { .. }) => error,
                 other => contextdb_core::Error::SyncError(other.to_string().into()),
             },
             crate::transport::NativeTerminal::Cancelled => contextdb_core::Error::ReadCancelled,
             crate::transport::NativeTerminal::Class(class) => {
-                contextdb_core::Error::SyncError((*class).into())
+                contextdb_core::Error::SyncError(class.into())
             }
         }),
-        Err(crate::transport::WireError::Resource(error)) => Some(match error {
-            contextdb_core::Error::ReadCancelled => contextdb_core::Error::ReadCancelled,
-            other => contextdb_core::Error::SyncError(other.to_string().into()),
-        }),
+        Err(crate::transport::WireError::Resource(error)) => Some(error),
         _ => None,
     }
 }
@@ -820,9 +792,10 @@ async fn refusal_and_cancellation_release_every_request_byte() {
     let route = installation(&world.server(&tight));
     let installation_before = installation_parent.retained_bytes_for_test();
     let (refused, body) = drive(&world, &route, &request, |_| {});
-    let refusal = match handed_off(&refused) {
+    let refused_debug = format!("{refused:?}");
+    let refusal = match handed_off(refused) {
         Some(error @ contextdb_core::Error::MemoryBudgetExceeded { .. }) => error.to_string(),
-        other => panic!("expected a typed memory refusal, got {other:?} from {refused:?}"),
+        other => panic!("expected a typed memory refusal, got {other:?} from {refused_debug}"),
     };
     assert!(body.is_none(), "no partial reply");
     assert_eq!(tight.retained_bytes_for_test(), native_root_bytes_for_test());
@@ -838,7 +811,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
     let installation_before = installation_parent.retained_bytes_for_test();
     let (cancelled_early, body) = drive(&world, &route, &request, |cancel| cancel.cancel());
     assert!(matches!(
-        handed_off(&cancelled_early),
+        handed_off(cancelled_early),
         Some(contextdb_core::Error::ReadCancelled)
     ));
     assert!(body.is_none());
@@ -871,7 +844,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
         });
     });
     assert!(matches!(
-        handed_off(&cancelled_late),
+        handed_off(cancelled_late),
         Some(contextdb_core::Error::ReadCancelled)
     ));
     assert!(body.is_none());
@@ -3024,7 +2997,7 @@ async fn a_page_that_cannot_fit_refuses_with_the_typed_page_byte_limit() {
         let route = installation(&world.server(&requests));
         let request = world.request_bytes(9, None);
         let (result, reply) = drive(&world, &route, &request, |_| {});
-        let refused = handed_off(&result);
+        let refused = handed_off(result);
         lines.push(format!("bound={page_bytes} refused={refused:?}"));
         assert!(
             matches!(
