@@ -942,7 +942,13 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
     let path = root.path().join("owner-overlap.db");
     let runtime = fixture::runtime(root.path());
     seed(&path);
-    let baseline = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
+    let baseline =
+        ReadSession::open_with_clock_for_test(&path, roomy(), Arc::new(ManualDeadlineClock::at(0)))
+            .unwrap();
+    assert_eq!(
+        baseline.route(),
+        contextdb_core::read_contract::ReadRoute::File
+    );
     let expected = {
         let fixture_answer_28 = baseline
             .execute(&SQL.replace("AUTO", "EXACT"), &q())
@@ -950,6 +956,8 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
         fixture_answer_28.rows().to_vec()
     };
     drop(baseline);
+    let request_clock = Arc::new(ManualDeadlineClock::at(0));
+    let (drain_started, _drain_seen) = mpsc::channel();
     let (tx, reached) = mpsc::channel();
     let park = Arc::new(Park {
         armed: AtomicBool::new(true),
@@ -962,6 +970,15 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
             maintenance_policy: MaintenancePolicy::CallerDriven,
             owner_reads: OwnerReadConfig {
                 runtime_dir: Some(runtime.clone()),
+                test_hooks: Some(contextdb_engine::OwnerReadTestHooks {
+                    clock: request_clock.clone(),
+                    drain_started,
+                    active_request_registered: None,
+                    accept_thread_exited: None,
+                    accept_thread_joined: None,
+                    service_dropped: None,
+                    quiescent_stop: None,
+                }),
                 ..Default::default()
             },
             test_kernel_observer: Some(park.clone()),
@@ -969,13 +986,18 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
         },
     )
     .unwrap();
-    let reader = ReadSession::with_runtime_directory_for_test(&runtime, || {
+    let reader = {
         let mut options = roomy();
         // This fixture synchronizes at a source barrier; the writer, not
         // elapsed kernel time, controls when the reader may continue.
         options.limits.active_ms = u64::MAX;
-        ReadSession::open_with_options(&path, options)
-    })
+        ReadSession::open_in_runtime_dir_with_clock_for_test(
+            &path,
+            options,
+            Some(runtime.clone()),
+            request_clock.clone(),
+        )
+    }
     .unwrap();
     assert_eq!(
         reader.route(),

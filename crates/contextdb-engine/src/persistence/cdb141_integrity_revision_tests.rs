@@ -435,7 +435,12 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
     }
     assert_all_history_witnesses(&exported);
     {
-        let file = ReadSession::open(&exported).unwrap();
+        let file = ReadSession::open_with_clock_for_test(
+            &exported,
+            Default::default(),
+            std::sync::Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+        )
+        .unwrap();
         assert_eq!(
             file.execute(
                 "SELECT id, body FROM integrity_rows WHERE bucket = 1",
@@ -499,7 +504,12 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
         db.close().unwrap();
     }
     assert_all_history_witnesses(&path);
-    let file = ReadSession::open(&path).unwrap();
+    let file = ReadSession::open_with_clock_for_test(
+        &path,
+        Default::default(),
+        std::sync::Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )
+    .unwrap();
     assert_eq!(
         file.execute(
             "SELECT id, body FROM integrity_rows WHERE bucket = 2",
