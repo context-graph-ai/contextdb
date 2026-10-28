@@ -1346,3 +1346,121 @@ fn generic_reader_registry_scanner_fails_closed_under_root_serializer_contention
 
     drop(pin);
 }
+
+// Both stores publish into the same supplied root and the child's private
+// platform root. No other process can join either root in these tests.
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+fn unrelated_writer(directory: &Path, runtime: &Path) -> RedbPersistence {
+    let path = directory.join("unrelated.db");
+    crate::Database::open(&path).unwrap().close().unwrap();
+    RedbPersistence::open_with_cache_in_runtime_dir(&path, REDB_CACHE_BYTES, Some(runtime)).unwrap()
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn unrelated_store_reader_leave_does_not_refuse_owner_cursor_admission() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "unrelated_store_reader_leave_does_not_refuse_owner_cursor_admission",
+        &[],
+    ) {
+        return;
+    }
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+    let (directory, store_b, runtime) = writer();
+    let store_a = unrelated_writer(directory.path(), &runtime);
+    assert_ne!(
+        store_a.physical_identity().unwrap(),
+        store_b.physical_identity().unwrap()
+    );
+    drop(store_b.owner_cursor_pin().expect("B admits before A joins"));
+    let leaving = store_a
+        .owner_cursor_pin()
+        .expect("A joins the shared runtime");
+    let park = read_persistence_test_scaffold::arm_reader_leave_park_for_test();
+    let leave = std::thread::spawn(move || drop(leaving));
+    park.parked
+        .recv()
+        .expect("A leave holds the shared root serializer");
+
+    // Capture the result while A still owns the serializer, and release A
+    // before asserting so even a refused admission cannot strand a worker.
+    let during = store_b.owner_cursor_pin_for_admission();
+    let diagnostic = during.as_ref().err().map(|error| match error {
+        OwnerCursorPinAdmissionError::Busy(error) => format!("Busy({error:?})"),
+        OwnerCursorPinAdmissionError::Refused(error) => format!("Refused({error:?})"),
+    });
+    park.resume.send(()).unwrap();
+    leave.join().unwrap();
+    drop(store_b.owner_cursor_pin().expect("B admits after A leaves"));
+    eprintln!("RUNTIME_ROOT unrelated leave admission: {diagnostic:?}");
+    assert!(
+        during.is_ok(),
+        "A's reader leave must not refuse B's reader: {diagnostic:?}"
+    );
+    drop(during);
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn unrelated_store_reader_leave_preserves_own_registry_typed_refusal() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "unrelated_store_reader_leave_preserves_own_registry_typed_refusal",
+        &[],
+    ) {
+        return;
+    }
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+    let (directory, store_b, runtime) = writer();
+    let store_a = unrelated_writer(directory.path(), &runtime);
+    let identity_b = store_b.physical_identity().unwrap();
+    assert_ne!(store_a.physical_identity().unwrap(), identity_b);
+    let leaving = store_a
+        .owner_cursor_pin()
+        .expect("A joins the shared runtime");
+    let held = Rc::new(RefCell::new(None));
+    let hook_held = Rc::clone(&held);
+    let hook_runtime = runtime.clone();
+    BEFORE_PROVIDER_ADMISSION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // B has already published. Make only B's own registry untrusted,
+            // then stop a real unrelated reader's leave before B's scan.
+            let registry = ReaderSnapshotRegistryLock::open(&hook_runtime, identity_b).unwrap();
+            std::fs::set_permissions(&registry.path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            let park = read_persistence_test_scaffold::arm_reader_leave_park_for_test();
+            let leave = std::thread::spawn(move || drop(leaving));
+            park.parked
+                .recv()
+                .expect("A leave holds the shared root serializer");
+            *hook_held.borrow_mut() = Some((park, leave));
+        }));
+    });
+    let result = store_b.owner_cursor_pin_for_admission();
+    let (park, leave) = held
+        .borrow_mut()
+        .take()
+        .expect("B reached provider admission");
+    park.resume.send(()).unwrap();
+    leave.join().unwrap();
+    let path = reader_snapshot_registry_lock_path(&runtime, identity_b);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(
+        store_b
+            .owner_cursor_pin()
+            .expect("B admits after its own registry is restored"),
+    );
+    let error = result.err().expect("B's untrusted registry must refuse");
+    let terminal = matches!(&error, OwnerCursorPinAdmissionError::Refused(_));
+    let error = error.into_error();
+    eprintln!("RUNTIME_ROOT own registry refusal during unrelated leave: {error:?}");
+    assert!(terminal, "B's own trust failure stays terminal: {error:?}");
+    assert_coordination_refusal(error, &runtime, "registry is indeterminate");
+}
