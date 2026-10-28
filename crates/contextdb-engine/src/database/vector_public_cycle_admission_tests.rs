@@ -412,8 +412,9 @@ enum UnknownCatalog {
     )
 )]
 fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCatalog) {
+    let startup_writer_budget = Some(64 * 1024 * 1024);
     let actual_capacity =
-        crate::persistence::redb_writer_cache_bytes_for_limit(Some(64 * 1024 * 1024));
+        crate::persistence::redb_writer_cache_bytes_for_limit(startup_writer_budget);
     #[expect(
         non_snake_case,
         reason = "This binding names the malformed source extent byte quota."
@@ -619,7 +620,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     let db = Database::open_with_options(
         &copy,
         crate::read_session::DatabaseOpenOptions {
-            memory_limit: Some(64 * 1024 * 1024),
+            memory_limit: startup_writer_budget,
             ..Default::default()
         },
     )
@@ -849,7 +850,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         );
     }
     drop(observation);
-    db.accountant.set_budget(None).unwrap();
+    db.accountant.set_budget(startup_writer_budget).unwrap();
     if matches!(kind, UnknownCatalog::DurableOnly) {
         let vector_fixture_reader_2 = db
             .declared_reader_memory()
