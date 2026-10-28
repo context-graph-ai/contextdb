@@ -1488,11 +1488,30 @@ impl crate::transport::ClientTransport for LoseDeliveryAfter {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page() {
     with_final_native_roots! { (requests);
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    struct FrozenRequestClock;
+    impl contextdb_core::read_contract::DeadlineClock for FrozenRequestClock {
+        fn now_ms(&self) -> u64 { 0 }
+        fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+            Box::pin(std::future::pending())
+        }
+    }
     let world = World::new();
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);
-    let hub = start_native(&world, &server).await;
+    // native_stop installs and captures read_clock during the first poll.
+    // Restore the existing thread-local seam after each poll; the installation
+    // retains this genuine request clock across its serving thread.
+    let hub = {
+        let clock = Arc::new(FrozenRequestClock);
+        let mut start = std::pin::pin!(start_native(&world, &server));
+        std::future::poll_fn(|cx| {
+            crate::read_session::with_route_selection_clock_for_test(clock.clone(), || {
+                std::future::Future::poll(start.as_mut(), cx)
+            })
+        }).await
+    };
     world.bind().await;
     let page = crate::DatabaseOpenOptions::default()
         .owner_reads
