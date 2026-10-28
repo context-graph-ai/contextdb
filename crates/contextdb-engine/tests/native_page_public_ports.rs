@@ -461,7 +461,18 @@ fn cold_case(route: Route, phase: SetupPhase, fault: Fault) -> (bool, Vec<String
         observer.fault.store(0, Ordering::SeqCst);
     }
     if matches!(fault, Fault::OneShotIo) {
-        match capture.run(|| public_rows(&db, route)) {
+        let observed_builds = builds.clone();
+        let retried = capture.run(|| {
+            with_native_ivf_work_observer_for_test(
+                Arc::new(move |point| {
+                    if point == NativeIvfWorkPoint::BuildBatch {
+                        observed_builds.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+                || public_rows(&db, route),
+            )
+        });
+        match retried {
             Ok(retried) => if retried != expected { failures.push(format!("{label}: retry changed the original complete answer")); },
             Err(error) => failures.push(format!("{label}: original retry-success assertion: next SAME-source query refused: {error:?}")),
         }
