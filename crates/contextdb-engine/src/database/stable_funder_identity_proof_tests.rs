@@ -398,7 +398,7 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     assert_eq!(parent.retained_bytes_for_test(), controls);
     drop(reader_a);
     drop(reader_b);
-    assert_eq!(parent.retained_bytes_for_test(), 0);
+    parent.assert_only_original_root_and_free_for_test();
     drop(a);
     drop(b);
     drop(db);
