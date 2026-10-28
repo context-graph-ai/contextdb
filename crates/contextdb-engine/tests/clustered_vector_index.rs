@@ -83,3 +83,6 @@ mod public_rust_auto_and_overlay;
 
 #[path = "clustered_vector_index/reader_turnover_cleanup.rs"]
 mod reader_turnover_cleanup;
+
+#[path = "clustered_vector_index/concurrent_publication.rs"]
+mod concurrent_publication;
