@@ -226,7 +226,7 @@ fn a_damaged_removed_predecessor_is_still_authenticated() {
     let family = LogicalFamily::ChangeAndDdl;
     let write = database.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let damaged = nodes
             .iter()
             .unwrap()

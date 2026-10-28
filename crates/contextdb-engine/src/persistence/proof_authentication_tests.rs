@@ -56,7 +56,7 @@ fn damage_leaf_key(
     let family = LogicalFamily::SchemaAndIndexes;
     let write = database.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let mut target = None;
         for row in nodes.iter().unwrap() {
             let (key, value) = row.unwrap();

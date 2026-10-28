@@ -126,7 +126,7 @@ fn assert_image(db: &redb::Database, family: LogicalFamily, records: &[ContentId
         actual == expected,
         "incremental root differs from independent sorted rebuild"
     );
-    let stored = read.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let stored = crate::persistence::content_identity::payloads::open(&read).unwrap();
     let mut count = 0;
     for row in stored.iter().unwrap() {
         let (key, bytes) = row.unwrap();
@@ -343,7 +343,7 @@ fn wide_separator_reference_corruption_is_rejected_before_a_posting_is_used() {
     let target = mutation_tree_key(&records[0]).unwrap();
     let write = db.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let storage_key = node_storage_key(LogicalFamily::SchemaAndIndexes, &key_hash(&target));
         let mut damaged = nodes
             .get(storage_key.as_slice())
@@ -556,7 +556,7 @@ fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
     );
     let write = db.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let storage_key = node_storage_key(LogicalFamily::SchemaAndIndexes, &key_hash(&target));
         let mut damaged = nodes
             .get(storage_key.as_slice())
