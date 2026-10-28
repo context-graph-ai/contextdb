@@ -77,6 +77,7 @@ fn scope(
             active_ms: 20,
         },
         read_memory: None,
+        publication_funding: None,
     }
 }
 
