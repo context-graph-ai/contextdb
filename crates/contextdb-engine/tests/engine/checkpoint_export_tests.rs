@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -432,6 +432,12 @@ fn ce06_persisted_config_round_trip_disk_limit() {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn ce07_cron_schedule_round_trip_fires_on_artifact() {
+    let _tickler = Database::suppress_cron_tickler_for_test();
+    let now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let now = now.clone();
+        contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
+    };
     let (_tmp, src, dest) = new_export_fixture();
 
     src.execute("CREATE TABLE cron_log (id UUID PRIMARY KEY)", &p())
@@ -468,18 +474,16 @@ fn ce07_cron_schedule_round_trip_fires_on_artifact() {
         })
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut count = baseline;
-    while Instant::now() < deadline {
-        count = artifact
-            .scan("cron_log", artifact.snapshot())
-            .map(|r| r.len())
-            .unwrap_or(0);
-        if count > baseline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    now.fetch_add(201, Ordering::SeqCst);
+    let read_memory = artifact.declared_reader_memory().unwrap();
+    let mut copy_owner = contextdb_engine::vector_read_memory::admission(read_memory.clone());
+    artifact
+        .cron_dispatch_due_without_wait_for_test(&mut copy_owner, read_memory)
+        .unwrap();
+    let count = artifact
+        .scan("cron_log", artifact.snapshot())
+        .map(|r| r.len())
+        .unwrap_or(0);
     assert!(
         count > baseline,
         "exported CREATE SCHEDULE must fire on the reopened artifact; baseline {baseline}, count {count}"
@@ -531,15 +535,7 @@ fn ce08_trigger_declaration_round_trip_fires_on_artifact() {
         )
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut audit_rows = Vec::new();
-    while Instant::now() < deadline {
-        audit_rows = rows(&artifact, "SELECT id, kind FROM audit");
-        if !audit_rows.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let audit_rows = rows(&artifact, "SELECT id, kind FROM audit");
     assert_eq!(
         audit_rows,
         vec![vec![Value::Uuid(row_id), Value::Text("measurement".into())]],
@@ -593,8 +589,10 @@ fn ce09_event_bus_definitions_and_durable_queue_round_trip() {
 
     let received: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let received_cb = received.clone();
+    let (delivered_tx, delivered_rx) = std::sync::mpsc::channel();
     let reg = artifact.register_sink("slack", None, move |event| {
         received_cb.lock().unwrap().push(event.clone());
+        delivered_tx.send(()).unwrap();
         Ok(())
     });
     assert!(
@@ -602,10 +600,9 @@ fn ce09_event_bus_definitions_and_durable_queue_round_trip() {
         "sink definition must survive export; registration failed: {reg:?}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && received.lock().unwrap().is_empty() {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    delivered_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("sink delivery never delivered");
     {
         let events = received.lock().unwrap();
         assert_eq!(
@@ -629,10 +626,9 @@ fn ce09_event_bus_definitions_and_durable_queue_round_trip() {
             &p(),
         )
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && received.lock().unwrap().len() < 2 {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    delivered_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("sink delivery never delivered");
     let events = received.lock().unwrap();
     assert_eq!(
         events.len(),
@@ -764,6 +760,7 @@ fn ce11_expired_unpruned_row_exported_and_source_pruning_resumes() {
 // ---------------------------------------------------------------------------
 #[test]
 fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let (_tmp, src, dest) = new_export_fixture();
 
     src.execute("CREATE TABLE pair_a (id INTEGER PRIMARY KEY, v TEXT)", &p())
@@ -782,8 +779,20 @@ fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
     let lsn_pre = src.current_lsn();
     let stop = AtomicBool::new(false);
     let committed = AtomicU64::new(0);
+    let pause = src.pause_after_export_snapshot_capture_for_test();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (landed_tx, landed_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
     let report = std::thread::scope(|scope| {
-        let writer = scope.spawn(|| {
+        let writer_src = &src;
+        let writer_stop = &stop;
+        let writer_committed = &committed;
+        let writer = scope.spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            let src = writer_src;
+            let stop = writer_stop;
+            let committed = writer_committed;
             // Each commit inserts pair i ('orig') AND seals pair i-1, all in
             // one transaction. Committed state after commit i is therefore
             // exactly: ids 0..=i, v == 'sealed' for id < i, 'orig' for id == i.
@@ -817,20 +826,47 @@ fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
                 .expect("writer update in pair_b");
                 src.commit(tx)
                     .expect("writer commits must not be blocked or fail during export");
-                committed.fetch_add(1, Ordering::SeqCst);
+                let count = committed.fetch_add(1, Ordering::SeqCst) + 1;
+                if count == 5 {
+                    ready_tx.send(()).unwrap();
+                    go_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("export capture release never delivered");
+                } else if count == 7 {
+                    landed_tx.send(()).unwrap();
+                    finish_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("writer finish never delivered");
+                }
             }
         });
-        // Forced overlap: wait until the writer is demonstrably committing,
-        // export while it is still running, stop it only AFTER export returns.
-        while committed.load(Ordering::SeqCst) < 5 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        ready_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("writer readiness never delivered");
         let committed_at_export_start = committed.load(Ordering::SeqCst);
-        let report = src
-            .export_snapshot(&dest)
+        let exporter = scope.spawn(|| {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            src.export_snapshot(&dest)
+        });
+        assert!(
+            pause.wait_until_reached(Duration::from_secs(60)),
+            "export capture never delivered"
+        );
+        go_tx.send(()).unwrap();
+        if landed_rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            stop.store(true, Ordering::SeqCst);
+            pause.release();
+            let _ = finish_tx.send(());
+            panic!("two writer commits never delivered");
+        }
+        pause.release();
+        let report = exporter
+            .join()
+            .expect("export thread completes")
             .expect("export under concurrent writers must succeed");
         let committed_at_export_end = committed.load(Ordering::SeqCst);
         stop.store(true, Ordering::SeqCst);
+        finish_tx.send(()).unwrap();
         assert!(
             committed_at_export_end >= committed_at_export_start + 2,
             "commits must keep landing WHILE export runs (got {} -> {}); \
@@ -890,6 +926,7 @@ fn ce12_export_under_concurrent_writers_lands_on_single_commit_boundary() {
 // ---------------------------------------------------------------------------
 #[test]
 fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let (_tmp, src, dest) = new_export_fixture();
 
     src.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &p())
@@ -909,8 +946,20 @@ fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
 
     let stop = AtomicBool::new(false);
     let committed = AtomicU64::new(0);
+    let pause = src.pause_after_export_snapshot_capture_for_test();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let (landed_tx, landed_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        let writer = scope.spawn(|| {
+        let writer_src = &src;
+        let writer_stop = &stop;
+        let writer_committed = &committed;
+        let writer = scope.spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            let src = writer_src;
+            let stop = writer_stop;
+            let committed = writer_committed;
             let mut i: u128 = 0;
             while !stop.load(Ordering::SeqCst) {
                 let node = Uuid::from_u128(0xCE13_1000 + i);
@@ -926,19 +975,47 @@ fn ce13_export_under_concurrent_writers_never_tears_row_edge_commits() {
                     .expect("writer insert edge");
                 src.commit(tx)
                     .expect("writer commits must not be blocked or fail during export");
-                committed.fetch_add(1, Ordering::SeqCst);
+                let count = committed.fetch_add(1, Ordering::SeqCst) + 1;
+                if count == 5 {
+                    ready_tx.send(()).unwrap();
+                    go_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("export capture release never delivered");
+                } else if count == 7 {
+                    landed_tx.send(()).unwrap();
+                    finish_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("writer finish never delivered");
+                }
             }
         });
-        // Forced overlap: export only once the writer is demonstrably
-        // committing; stop it only AFTER export returns.
-        while committed.load(Ordering::SeqCst) < 5 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        ready_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("writer readiness never delivered");
         let committed_at_export_start = committed.load(Ordering::SeqCst);
-        src.export_snapshot(&dest)
+        let exporter = scope.spawn(|| {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
+            src.export_snapshot(&dest)
+        });
+        assert!(
+            pause.wait_until_reached(Duration::from_secs(60)),
+            "export capture never delivered"
+        );
+        go_tx.send(()).unwrap();
+        if landed_rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            stop.store(true, Ordering::SeqCst);
+            pause.release();
+            let _ = finish_tx.send(());
+            panic!("two writer commits never delivered");
+        }
+        pause.release();
+        let _report = exporter
+            .join()
+            .expect("export thread completes")
             .expect("export under concurrent writers must succeed");
         let committed_at_export_end = committed.load(Ordering::SeqCst);
         stop.store(true, Ordering::SeqCst);
+        finish_tx.send(()).unwrap();
         assert!(
             committed_at_export_end >= committed_at_export_start + 2,
             "row+edge commits must keep landing WHILE export runs (got {} -> {})",
