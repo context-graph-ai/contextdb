@@ -1735,7 +1735,7 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
 mod edge_column_owner_contract {
     use super::*;
 
-    const EDGE_COLUMNS: &str = "id INTEGER PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, note TEXT, UNIQUE (id)";
+    const EDGE_COLUMNS: &str = "id INTEGER PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, note TEXT, binding_key INTEGER DEFAULT 0, UNIQUE (id, binding_key)";
     const SOURCE: uuid::Uuid = uuid::Uuid::from_u128(0x77501);
     const TARGET: uuid::Uuid = uuid::Uuid::from_u128(0x77502);
 
@@ -2040,6 +2040,7 @@ mod edge_column_owner_contract {
             ("target_id".into(), "UUID".into()),
             ("edge_type".into(), "TEXT".into()),
             ("note".into(), "TEXT".into()),
+            ("binding_key".into(), "INTEGER DEFAULT 0".into()),
         ];
         if rename {
             columns
@@ -2058,7 +2059,7 @@ mod edge_column_owner_contract {
         if dag {
             constraints.push("DAG('LINK')".into());
         }
-        let key = ["id"]
+        let key = ["id", "binding_key"]
             .into_iter()
             .map(|name| {
                 if rename && name == column {
