@@ -8639,3 +8639,6 @@ mod historical_root_guard_tests;
 
 #[cfg(test)]
 mod retention_retired_binding_guard_tests;
+
+#[cfg(test)]
+mod retention_obligations_guard_tests;
