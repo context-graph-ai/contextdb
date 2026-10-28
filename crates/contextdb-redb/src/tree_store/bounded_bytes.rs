@@ -518,7 +518,7 @@ impl<'a> BoundedByteCursor<'a> {
             match page.memory()[0] {
                 LEAF => self.leaf = Some((page, 0)),
                 BRANCH => {
-                    if self.authenticated && self.branches.len() == self.branches.capacity() {
+                    if self.branches.len() == self.branches.capacity() {
                         let capacity = self
                             .branches
                             .capacity()

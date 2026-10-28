@@ -1,3 +1,12 @@
+Read-only bounded byte cursors admit branch-navigation backing before growing
+their Vec, using the same original read-admission source as authenticated cursors.
+The replacement invoice is admitted before reserve_exact, retained alongside the
+actual branch backing and refunded after that backing is freed. This changes
+src/tree_store/bounded_bytes.rs; no limit, page charge or navigation validation
+changes. The complete source patch below is regenerated from the checksum-verified
+redb 4.1.0 archive. Independent pre-allocation refusal and exact live-navigation
+custody guards qualify this path.
+
 # contextdb-redb maintenance
 
 The `test-seams` native receipt observations in `native_storage_admission.rs`,
