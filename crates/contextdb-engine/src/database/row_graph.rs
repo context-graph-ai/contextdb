@@ -620,9 +620,10 @@ impl Database {
             }
         }
         if callback.is_some() && !retired {
-            return Err(Error::SyncError(
-                "owning edge row has no exact graph witness".into(),
-            ));
+            return Err(Error::StoreCorrupted {
+                path: "row-derived adjacency".into(),
+                reason: "owning edge row has no exact graph witness".into(),
+            });
         }
         Ok(result)
     }
