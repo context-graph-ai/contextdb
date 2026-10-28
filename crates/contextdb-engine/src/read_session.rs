@@ -2614,6 +2614,12 @@ impl ReadSession {
                     // A readable clean copy may have no companion yet. Its first
                     // authenticated writer establishes the store identity.
                     if identity.is_some_and(|identity| observed.identity != identity) {
+                        // A different store at the old pathname is not a new
+                        // writer of this registered descriptor. Keep serving the
+                        // captured file; do not adopt or dial that foreign store.
+                        if reader.database_path_was_replaced() {
+                            return Ok(None);
+                        }
                         return Err(mismatch());
                     }
                     if !observed.held && Some(observed.run) == file_writer_run {

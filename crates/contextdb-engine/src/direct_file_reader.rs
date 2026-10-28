@@ -1657,6 +1657,12 @@ impl DirectFileReader {
         self.retained_source.database_path()
     }
 
+    pub(crate) fn database_path_was_replaced(&self) -> bool {
+        self.retained_source
+            .registration()
+            .path_was_replaced(self.database_path())
+    }
+
     /// The committed frontier decoded from this reader's retained image.
     pub(crate) fn snapshot_lsn(&self) -> Lsn {
         self.image.changes.current_lsn

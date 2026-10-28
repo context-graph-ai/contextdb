@@ -5298,6 +5298,25 @@ impl ReadSnapshotRegistrationGuard {
         self.snapshot.database_identity
     }
 
+    /// A retained descriptor names the captured store even if its old pathname
+    /// was removed or now names a different physical store. An unreadable path
+    /// is not evidence of replacement and cannot bypass identity refusal.
+    pub(crate) fn path_was_replaced(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            match std::fs::metadata(path) {
+                Ok(metadata) => (metadata.dev(), metadata.ino()) != self.snapshot.physical_identity,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn observation(&self) -> ReaderSnapshotRegistrationObservation {
         ReaderSnapshotRegistrationObservation {
