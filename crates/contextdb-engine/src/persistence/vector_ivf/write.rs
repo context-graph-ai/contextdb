@@ -1692,7 +1692,7 @@ impl WriteOperation<'_, '_, '_> {
 impl WriteScope<'_, '_> {
     /// Delete at most the declared number of inactive payloads. Native COW
     /// retains the old physical roots for existing registered source holders.
-    pub(super) fn reclaim_inactive(&mut self, limit: usize) -> Result<bool> {
+    pub(super) fn reclaim_inactive(&mut self, mut limit: usize) -> Result<bool> {
         use redb::{ReadableTable, ReadableTableMetadata};
         let serving = self.record.borrow().manifest()?.ok_or_else(corrupt)?;
         let build = self
@@ -1723,15 +1723,27 @@ impl WriteScope<'_, '_> {
             let mut cursor = scopes
                 .range(prefix.as_slice()..)
                 .map_err(RedbPersistence::storage_error)?;
-            let Some(entry) = cursor.next() else {
-                return Ok(false);
+            let retired = match cursor.next() {
+                Some(entry) => {
+                    let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+                    if key.value().starts_with(&prefix) {
+                        Some((
+                            <[u8; 73]>::try_from(key.value()).map_err(|_| corrupt())?,
+                            control::decode_retired_family(key.value(), value.value())?,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
             };
-            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-            if !key.value().starts_with(&prefix) {
-                return Ok(false);
-            }
-            retired_key = Some(<[u8; 73]>::try_from(key.value()).map_err(|_| corrupt())?);
-            control::decode_retired_family(key.value(), value.value())?
+            drop(cursor);
+            drop(scopes);
+            let Some((key, family)) = retired else {
+                return self.reclaim_obsolete_copy_runs(serving.generation, build, &mut limit);
+            };
+            retired_key = Some(key);
+            family
         };
         #[cfg(feature = "test-seams")]
         crate::vector_ivf_observations::work_point(NativeIvfWorkPoint::ReclaimBatch);
@@ -1849,13 +1861,140 @@ impl WriteScope<'_, '_> {
         let mut cursor = scopes
             .range(prefix.as_slice()..)
             .map_err(RedbPersistence::storage_error)?;
-        match cursor.next() {
-            Some(entry) => Ok(entry
+        let retired_pending = match cursor.next() {
+            Some(entry) => entry
                 .map_err(RedbPersistence::storage_error)?
                 .0
                 .value()
-                .starts_with(&prefix)),
-            None => Ok(false),
+                .starts_with(&prefix),
+            None => false,
+        };
+        drop(cursor);
+        drop(scopes);
+        if retired_pending {
+            return Ok(true);
         }
+        self.reclaim_obsolete_copy_runs(serving.generation, build, &mut remaining)
+    }
+
+    /// The permanent journal table also contains per-generation copy runs.
+    /// After inactive families are gone, writer traversal stops before runs
+    /// older than every serving/build generation. The caller already holds
+    /// the ordinary snapshot-safe reclamation gate.
+    fn reclaim_obsolete_copy_runs(
+        &mut self,
+        serving: u64,
+        building: Option<u64>,
+        remaining: &mut usize,
+    ) -> Result<bool> {
+        use redb::{ReadableTable, ReadableTableMetadata};
+        let floor = building.map_or(serving, |generation| generation.min(serving));
+        if floor == 0 {
+            return Ok(false);
+        }
+        let Some(slot) = self
+            .record
+            .borrow()
+            .families
+            .iter()
+            .position(|family| family.is_some_and(|family| family.generation == 0))
+        else {
+            return Ok(false);
+        };
+        let family = self.record.borrow().families[slot].ok_or_else(corrupt)?;
+        let kind_index = usize::from(header::kind_tag(PageKind::RowCopies) - 1);
+        let bit = 1u16 << kind_index;
+        if family.kinds.present & bit == 0 {
+            return Ok(false);
+        }
+        let name = io::KindTableName::new(family.storage, PageKind::RowCopies)?;
+        let definition = redb::TableDefinition::<&[u8], &[u8]>::new(name.as_str()?);
+        let mut table = self
+            .session
+            .write
+            .open_table(definition)
+            .map_err(RedbPersistence::storage_error)?;
+        let mut after = [0; header::KEY_BYTES];
+        let mut changed = false;
+        let pending = loop {
+            self.check_cancel()?;
+            let next = {
+                let mut cursor = table
+                    .range(after.as_slice()..)
+                    .map_err(RedbPersistence::storage_error)?;
+                let mut next = None;
+                for entry in &mut cursor {
+                    self.check_cancel()?;
+                    let (key, _) = entry.map_err(RedbPersistence::storage_error)?;
+                    let key =
+                        <[u8; header::KEY_BYTES]>::try_from(key.value()).map_err(|_| corrupt())?;
+                    let decoded = header::key_from_bytes(&key)?;
+                    if decoded.kind != PageKind::RowCopies
+                        || decoded.partition != 0
+                        || decoded.generation != 0
+                        || decoded.list != 0
+                    {
+                        return Err(corrupt());
+                    }
+                    if decoded.run < floor {
+                        next = Some(key);
+                        break;
+                    }
+                }
+                next
+            };
+            let Some(key) = next else {
+                break false;
+            };
+            if *remaining == 0 {
+                break true;
+            }
+            #[cfg(feature = "test-seams")]
+            if !changed {
+                crate::vector_ivf_observations::work_point(NativeIvfWorkPoint::ReclaimBatch);
+            }
+            if table
+                .remove(key.as_slice())
+                .map_err(RedbPersistence::storage_error)?
+                .is_none()
+            {
+                return Err(corrupt());
+            }
+            *remaining -= 1;
+            changed = true;
+            after = key;
+        };
+        let empty = table.is_empty().map_err(RedbPersistence::storage_error)?;
+        drop(table);
+        if changed {
+            let root = if empty {
+                self.session
+                    .write
+                    .delete_table(definition)
+                    .map_err(RedbPersistence::storage_error)?;
+                None
+            } else {
+                Some(
+                    NativeIo::Borrowed(self.session.write)
+                        .fingerprint(name.as_str()?)?
+                        .ok_or_else(corrupt)?,
+                )
+            };
+            {
+                let mut record = self.record.borrow_mut();
+                let family = record.families[slot].as_mut().ok_or_else(corrupt)?;
+                if let Some(root) = root {
+                    family.kinds.roots[kind_index] = root;
+                } else {
+                    family.kinds.present &= !bit;
+                    family.kinds.roots[kind_index] = [0; 32];
+                }
+            }
+            self.verified[slot].set(0);
+            self.verdicts[slot].set(None);
+            self.begin()?.commit()?;
+            self.check_cancel()?;
+        }
+        Ok(pending)
     }
 }
