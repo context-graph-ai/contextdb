@@ -122,7 +122,12 @@ fn assert_public(path: &Path, reverse: bool) {
             sql_rows(),
             "retirement never cascades into SQL edge rows"
         );
-        let owner = ReadSession::open(path).unwrap();
+        let owner = ReadSession::open_with_clock_for_test(
+            path,
+            Default::default(),
+            Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+        )
+        .unwrap();
         assert_eq!(owner.route(), ReadRoute::Owner);
         assert_eq!(
             owner.execute(query(reverse), &bindings()).unwrap().rows(),
@@ -143,7 +148,12 @@ fn assert_public(path: &Path, reverse: bool) {
         drop(owner);
         close(db);
     }
-    let file = ReadSession::open(path).unwrap();
+    let file = ReadSession::open_with_clock_for_test(
+        path,
+        Default::default(),
+        Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )
+    .unwrap();
     assert_eq!(file.route(), ReadRoute::File);
     assert_eq!(
         file.execute(query(reverse), &bindings()).unwrap().rows(),

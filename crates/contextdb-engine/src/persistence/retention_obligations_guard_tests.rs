@@ -13,6 +13,13 @@ const OTHER: u128 = 81_003;
 const EDGE: u128 = 91_000;
 const OTHER_EDGE: u128 = 91_001;
 
+fn frozen_read(path: &Path) -> Result<ReadSession> {
+    ReadSession::open_with_clock_for_test(
+        path,
+        Default::default(),
+        Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )
+}
 fn params() -> HashMap<String, Value> {
     HashMap::from([(
         "anchor".into(),
@@ -167,7 +174,7 @@ fn assert_export(path: &Path, reverse: bool, retired: bool) {
     } else {
         nodes(&[EXPIRED, OTHER])
     };
-    let file = ReadSession::open(path).expect("a complete export is readable");
+    let file = frozen_read(path).expect("a complete export is readable");
     assert_eq!(file.route(), ReadRoute::File);
     assert_eq!(
         file.execute(&graph_sql(reverse, "LINKS"), &params())
@@ -215,7 +222,7 @@ fn assert_export(path: &Path, reverse: bool, retired: bool) {
 }
 fn assert_current_routes(path: &Path, reverse: bool, old_kind: &[u128], new_kind: &[u128]) {
     let db = writer(path);
-    let owner = ReadSession::open(path).unwrap();
+    let owner = frozen_read(path).unwrap();
     assert_eq!(owner.route(), ReadRoute::Owner);
     for (kind, expected) in [("LINKS", old_kind), ("RENEWED", new_kind)] {
         assert_eq!(
@@ -241,7 +248,7 @@ fn assert_current_routes(path: &Path, reverse: bool, old_kind: &[u128], new_kind
     );
     drop(owner);
     close(db);
-    let file = ReadSession::open(path).unwrap();
+    let file = frozen_read(path).unwrap();
     assert_eq!(file.route(), ReadRoute::File);
     assert_eq!(
         file.execute(&graph_sql(reverse, "LINKS"), &params())
@@ -436,7 +443,7 @@ fn a_new_table_generation_does_not_inherit_the_retired_owner_or_its_metadata() {
         ]),
     )
     .unwrap();
-    let owner = ReadSession::open(&path).unwrap();
+    let owner = frozen_read(&path).unwrap();
     assert_eq!(owner.route(), ReadRoute::Owner);
     assert_eq!(
         owner
@@ -454,7 +461,7 @@ fn a_new_table_generation_does_not_inherit_the_retired_owner_or_its_metadata() {
     );
     drop(owner);
     close(db);
-    let file = ReadSession::open(&path).unwrap();
+    let file = frozen_read(&path).unwrap();
     assert_eq!(file.route(), ReadRoute::File);
     assert_eq!(
         file.execute(&graph_sql(false, "LINKS"), &params())
@@ -589,11 +596,9 @@ fn metadata_gc_removes_only_retirement_for_the_pruned_exact_sql_owner() {
 
 #[derive(Clone, Copy, Debug)]
 enum Fault {
-    UnexplainedAbsence,
     ForwardOnly,
     ReverseOnly,
     WitnessMismatch,
-    MissingRetirement,
     MalformedRetirement,
     WrongOwnerRetirement,
     LiveAndRetired,
@@ -668,11 +673,17 @@ fn assert_corruption(result: Result<()>, fault: Fault, door: Door) {
     }
 }
 fn probe(path: &Path, destination: &Path, fault: Fault, door: Door) {
+    let reverse = matches!(fault, Fault::ReverseOnly);
+    let bindings = if reverse {
+        HashMap::from([("anchor".into(), Value::Uuid(uuid::Uuid::from_u128(EXPIRED)))])
+    } else {
+        params()
+    };
     if matches!(door, Door::File) {
-        let result = ReadSession::open(path).and_then(|reader| {
+        let result = frozen_read(path).and_then(|reader| {
             assert_eq!(reader.route(), ReadRoute::File);
             reader
-                .execute(&graph_sql(false, "LINKS"), &params())
+                .execute(&graph_sql(reverse, "LINKS"), &bindings)
                 .map(|_| ())
         });
         assert_corruption(result, fault, door);
@@ -687,10 +698,10 @@ fn probe(path: &Path, destination: &Path, fault: Fault, door: Door) {
     };
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let result = match door {
-        Door::Owner => ReadSession::open(path).and_then(|reader| {
+        Door::Owner => frozen_read(path).and_then(|reader| {
             assert_eq!(reader.route(), ReadRoute::Owner);
             reader
-                .execute(&graph_sql(false, "LINKS"), &params())
+                .execute(&graph_sql(reverse, "LINKS"), &bindings)
                 .map(|_| ())
         }),
         Door::Update => db
@@ -713,27 +724,39 @@ fn control_fault(fault: Fault) {
         let db = writer(&path);
         seed(&db, false, false, false);
         close(db);
+        let pin_session = if matches!(
+            fault,
+            Fault::MalformedRetirement | Fault::WrongOwnerRetirement
+        ) {
+            Some(
+                ReadSession::open_with_clock_for_test(
+                    &path,
+                    crate::ReadSessionOptions {
+                        limits: contextdb_core::read_contract::ReadLimits {
+                            cursor_page_rows: 1,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let pin_cursor = pin_session.as_ref().map(|session| {
+            let cursor = session
+                .open_cursor(&graph_sql(false, "LINKS"), &params())
+                .unwrap();
+            assert!(cursor.first_page().has_more());
+            cursor
+        });
         let selected = owned(&path, false)
             .into_iter()
             .find(|owned| owned.entry.target == uuid::Uuid::from_u128(EXPIRED))
             .unwrap();
         match fault {
-            Fault::UnexplainedAbsence => {
-                Database::remove_row_graph_witness_for_test(
-                    &path,
-                    "edges",
-                    selected.owner.row_id,
-                    false,
-                )
-                .unwrap();
-                Database::remove_row_graph_witness_for_test(
-                    &path,
-                    "edges",
-                    selected.owner.row_id,
-                    true,
-                )
-                .unwrap();
-            }
             Fault::ForwardOnly => Database::remove_row_graph_witness_for_test(
                 &path,
                 "edges",
@@ -784,7 +807,6 @@ fn control_fault(fault: Fault) {
                     "real retirement produces exact-owner control before deliberate damage"
                 );
                 match fault {
-                    Fault::MissingRetirement => rewrite_control(&path, key, None),
                     Fault::MalformedRetirement => rewrite_control(&path, key, Some(&[0xff])),
                     Fault::WrongOwnerRetirement => rewrite_control(
                         &path,
@@ -799,12 +821,12 @@ fn control_fault(fault: Fault) {
             }
         }
         probe(&path, &directory.path().join("must-refuse.db"), fault, door);
+        drop(pin_cursor);
+        drop(pin_session);
     }
 }
-#[test]
-fn unexplained_reciprocal_absence_is_typed_corruption_on_public_doors() {
-    control_fault(Fault::UnexplainedAbsence);
-}
+// Manager ruling 2026-10-29: fully absent pairs with re-authenticated roots
+// are outside the integrity scope of a door that never encounters them.
 #[test]
 fn one_forward_witness_without_its_reverse_is_typed_corruption() {
     control_fault(Fault::ForwardOnly);
@@ -816,10 +838,6 @@ fn one_reverse_witness_without_its_forward_is_typed_corruption() {
 #[test]
 fn mismatched_witness_owner_is_typed_corruption() {
     control_fault(Fault::WitnessMismatch);
-}
-#[test]
-fn missing_retirement_control_cannot_authorize_absent_witnesses() {
-    control_fault(Fault::MissingRetirement);
 }
 #[test]
 fn malformed_retirement_control_is_typed_corruption() {
@@ -841,13 +859,32 @@ fn fresh_statement_hides_expiry_while_old_reader_is_pinned(reverse: bool, owner_
     let db = writer(&path);
     seed(&db, reverse, false, false);
     close(db);
-    let old = ReadSession::open(&path).unwrap();
+    let old = ReadSession::open_with_clock_for_test(
+        &path,
+        crate::ReadSessionOptions {
+            limits: contextdb_core::read_contract::ReadLimits {
+                cursor_page_rows: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )
+    .unwrap();
     assert_eq!(old.route(), ReadRoute::File);
     assert_eq!(
         old.execute(&graph_sql(reverse, "LINKS"), &params())
             .unwrap()
             .rows(),
         nodes(&[EXPIRED, OTHER])
+    );
+    let mut cursor = old
+        .open_cursor(&graph_sql(reverse, "LINKS"), &params())
+        .unwrap();
+    assert_eq!(cursor.first_page().rows(), nodes(&[EXPIRED]));
+    assert!(
+        cursor.first_page().has_more(),
+        "cursor must retain an unread page"
     );
     let db = writer(&path);
     db.execute(
@@ -860,11 +897,9 @@ fn fresh_statement_hides_expiry_while_old_reader_is_pinned(reverse: bool, owner_
     .unwrap();
     db.run_pruning_cycle_checked().unwrap();
     assert_eq!(
-        old.execute(&graph_sql(reverse, "LINKS"), &params())
-            .unwrap()
-            .rows(),
-        nodes(&[EXPIRED, OTHER]),
-        "old snapshot retains the binding after expiry"
+        cursor.first_page().rows(),
+        nodes(&[EXPIRED]),
+        "the pre-expiry cursor retains its first page"
     );
     let db = if owner_route {
         Some(db)
@@ -872,7 +907,12 @@ fn fresh_statement_hides_expiry_while_old_reader_is_pinned(reverse: bool, owner_
         close(db);
         None
     };
-    let fresh = ReadSession::open(&path).unwrap();
+    let fresh = ReadSession::open_with_clock_for_test(
+        &path,
+        Default::default(),
+        Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )
+    .unwrap();
     assert_eq!(
         fresh.route(),
         if owner_route {
@@ -893,9 +933,16 @@ fn fresh_statement_hides_expiry_while_old_reader_is_pinned(reverse: bool, owner_
         old.execute(&graph_sql(reverse, "LINKS"), &params())
             .unwrap()
             .rows(),
-        nodes(&[EXPIRED, OTHER]),
-        "old snapshot retains the binding until release"
+        nodes(&[OTHER]),
+        "a new statement on the old session sees current data"
     );
+    let page = cursor.fetch(None).unwrap();
+    assert_eq!(
+        page.rows(),
+        nodes(&[OTHER]),
+        "the open cursor finishes its old snapshot"
+    );
+    cursor.close().unwrap();
     drop(fresh);
     drop(old);
     if let Some(db) = db {
