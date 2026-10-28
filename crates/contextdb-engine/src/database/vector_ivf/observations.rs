@@ -721,6 +721,13 @@ impl Database {
 
 #[cfg(feature = "test-seams")]
 impl Database {
+    /// Observe this writer's actual current debit without acquiring database,
+    /// commit or maintenance exclusion, including inside a borrowed read drive.
+    #[doc(hidden)]
+    pub fn writer_memory_usage_for_test(&self) -> crate::memory_accounting::MemoryUsage {
+        self.finalization.accountant.usage()
+    }
+
     /// Publish private fixture bytes through the original writer's ordinary
     /// native transaction, root binding and recovery publication sequence.
     #[doc(hidden)]
