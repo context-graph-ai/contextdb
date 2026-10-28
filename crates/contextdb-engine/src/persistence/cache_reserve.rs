@@ -12,6 +12,8 @@ struct ReserveBlock {
     reserve: Option<ControlCredit>,
     control: Option<ControlCredit>,
     writer: Option<WriterUse>,
+    #[cfg(feature = "test-seams")]
+    observation: Option<redb::native_page_observations::NativeFixedReserveObservationForTest>,
 }
 unsafe fn retain(raw: NonNull<()>) {
     unsafe { raw.cast::<ReserveBlock>().as_ref() }
@@ -27,6 +29,9 @@ struct ReserveFree {
     _reserve: Option<ControlCredit>,
     _control: Option<ControlCredit>,
     _writer: Option<WriterUse>,
+    // Last: genuine reserve/control/writer fields settle before this notification.
+    #[cfg(feature = "test-seams")]
+    _observation: Option<redb::native_page_observations::NativeFixedReserveObservationForTest>,
 }
 impl Drop for ReserveFree {
     fn drop(&mut self) {
@@ -44,11 +49,26 @@ unsafe fn finish(raw: NonNull<()>) {
     }
     fence(Ordering::Acquire);
     let block = unsafe { pointer.as_mut() };
+    #[cfg(feature = "test-seams")]
+    if let Some(observation) = &mut block.observation {
+        observation.actual_release_bytes(
+            block
+                .reserve
+                .as_ref()
+                .map_or(0, |credit| credit.observation_for_test().1)
+                + block
+                    .control
+                    .as_ref()
+                    .map_or(0, |credit| credit.observation_for_test().1),
+        );
+    }
     let _free = ReserveFree {
         pointer,
         _reserve: block.reserve.take(),
         _control: block.control.take(),
         _writer: block.writer.take(),
+        #[cfg(feature = "test-seams")]
+        _observation: block.observation.take(),
     };
     unsafe { std::ptr::drop_in_place(pointer.as_ptr()) };
 }
@@ -98,8 +118,36 @@ pub(super) fn original(
             reserve: Some(reserve),
             control: Some(control),
             writer,
+            #[cfg(feature = "test-seams")]
+            observation: None,
         })
     };
+    #[cfg(feature = "test-seams")]
+    unsafe {
+        let block = &mut *pointer.as_ptr();
+        let bytes = block
+            .reserve
+            .as_ref()
+            .map_or(0, |credit| credit.observation_for_test().1)
+            + block
+                .control
+                .as_ref()
+                .map_or(0, |credit| credit.observation_for_test().1);
+        let funder = block
+            .reserve
+            .as_ref()
+            .expect("live original reserve")
+            .observation_for_test()
+            .0;
+        block.observation = Some(
+            redb::native_page_observations::observe_fixed_reserve_for_test(
+                pointer.as_ptr() as usize,
+                funder,
+                bytes,
+                layout,
+            ),
+        );
+    }
     #[cfg(test)]
     LAST_RESERVE.with(|slot| slot.set(pointer.as_ptr() as usize));
     // SAFETY: immutable original receipts and held writer use are Send + Sync;
