@@ -820,7 +820,60 @@ impl VectorMaintenanceFailureDetails {
             "read_vector_generation_source_page" => "read_vector_generation_source_page",
             "inspect_vector_generation_inventory" => "inspect_vector_generation_inventory",
             "prepare_hnsw_tail" => "prepare_hnsw_tail",
+            "clustered_calibration_capture" => "clustered_calibration_capture",
+            "clustered_calibration_dependency" => "clustered_calibration_dependency",
+            "clustered_calibration_metadata_control" => "clustered_calibration_metadata_control",
+            "clustered_calibration_query_identity" => "clustered_calibration_query_identity",
+            "clustered_calibration_query_output" => "clustered_calibration_query_output",
+            "clustered_calibration_sample_page" => "clustered_calibration_sample_page",
+            "clustered_calibration_source" => "clustered_calibration_source",
+            "clustered_calibration_source_range" => "clustered_calibration_source_range",
+            "clustered_calibration_source_route" => "clustered_calibration_source_route",
+            "clustered_candidate_verification_window" => "clustered_candidate_verification_window",
+            "clustered_canonical_visit" => "clustered_canonical_visit",
+            "clustered_codebook" => "clustered_codebook",
+            "clustered_descriptor_window" => "clustered_descriptor_window",
+            "clustered_erasure_controls" => "clustered_erasure_controls",
+            "clustered_erasure_slot_input" => "clustered_erasure_slot_input",
+            "clustered_layout" => "clustered_layout",
+            "clustered_manifest" => "clustered_manifest",
+            "clustered_native_seal" => "clustered_native_seal",
+            "clustered_outer_write" => "clustered_outer_write",
+            "clustered_qualification_record" => "clustered_qualification_record",
+            "clustered_qualification_selection" => "clustered_qualification_selection",
+            "clustered_query" => "clustered_query",
+            "clustered_retained_codebook" => "clustered_retained_codebook",
+            "clustered_retained_control" => "clustered_retained_control",
+            "clustered_retained_directory" => "clustered_retained_directory",
+            "clustered_retained_registry" => "clustered_retained_registry",
+            "clustered_retained_stage" => "clustered_retained_stage",
+            "clustered_served_depth" => "clustered_served_depth",
+            "clustered_source_control" => "clustered_source_control",
+            "clustered_source_range" => "clustered_source_range",
+            "clustered_writer_workspace" => "clustered_writer_workspace",
+            "maintenance_route_output" => "maintenance_route_output",
+            "materialize" => "materialize",
+            "native_canonical_merge" => "native_canonical_merge",
+            "native_explain_scope" => "native_explain_scope",
+            "native_partition_hits" => "native_partition_hits",
+            "native_public_results" => "native_public_results",
+            "native_vector_declaration" => "native_vector_declaration",
+            "resolve_clustered_policy" => "resolve_clustered_policy",
             _ => "vector_maintenance",
+        }
+    }
+
+    fn safe_memory_operation(operation: &contextdb_core::error::DiagnosticLabel) -> &'static str {
+        // Native static labels already name the actual refusal site. Preserve
+        // them without allocation; keep private legacy suffixes normalized.
+        match operation.static_text() {
+            Some(name)
+                if !name.starts_with("build_hnsw@")
+                    && !name.starts_with("prepare_authoritative_purge_hnsw@") =>
+            {
+                name
+            }
+            _ => Self::safe_operation(operation),
         }
     }
 
@@ -875,7 +928,7 @@ impl VectorMaintenanceFailureDetails {
                 ..
             } => Self {
                 failure: VectorMaintenanceFailure::MemoryLimit,
-                operation: Self::safe_operation(operation),
+                operation: Self::safe_memory_operation(operation),
                 requested_bytes: Some(Self::usize_as_u64(*requested_bytes)),
                 available_bytes: Some(Self::usize_as_u64(*available_bytes)),
                 current_bytes: Some(Self::usize_as_u64(
