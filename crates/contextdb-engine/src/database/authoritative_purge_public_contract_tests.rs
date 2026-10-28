@@ -300,16 +300,23 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
             .unwrap()
             .progress()
             .unwrap();
-        context
-            .publish_paged_vector_build(
-                &route,
-                &persistence,
-                &record,
-                &complete,
-                plan,
-                db.declared_reader_memory().unwrap(),
-            )
-            .unwrap();
+        {
+            let _fixture_decode_scope =
+                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    db.accountant.clone(),
+                )
+                .unwrap();
+            context
+                .publish_paged_vector_build(
+                    &route,
+                    &persistence,
+                    &record,
+                    &complete,
+                    plan,
+                    db.declared_reader_memory().unwrap(),
+                )
+                .unwrap();
+        }
         db.execute(
             "CREATE TABLE audit_history (id INT PRIMARY KEY, v VECTOR(3))",
             &HashMap::new(),

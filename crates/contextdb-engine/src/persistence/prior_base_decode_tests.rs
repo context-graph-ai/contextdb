@@ -417,6 +417,10 @@ fn write_and_load_raw_entry(
     )
 )]
 fn oversized_raw_dimension_or_route_is_refused_before_body_decode() {
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     let (_directory, persistence) = writer();
     let expected = raw_entry(1, VectorQuantization::F32);
     let membership = raw_membership(&expected);
