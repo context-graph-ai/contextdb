@@ -49,6 +49,24 @@ impl Registry {
             .find(|s| s.id == id)
             .expect("service observation generation lost")
     }
+    fn release_scope(&mut self, id: u64) {
+        let i = self
+            .scopes
+            .iter()
+            .position(|s| s.is_some_and(|s| s.id == id))
+            .expect("service observation lease lost");
+        let s = self.scopes[i].as_mut().unwrap();
+        s.leases = s.leases.checked_sub(1).expect("service lease underflow");
+        if s.leases == 0 {
+            assert_eq!(
+                (s.used, s.controls),
+                (0, 0),
+                "service observation cannot retire live charges"
+            );
+            self.scopes[i] = None;
+            ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 #[derive(Debug)]
 pub(crate) struct ServiceObservation {
@@ -97,23 +115,10 @@ impl Clone for ServiceObservation {
 }
 impl Drop for ServiceObservation {
     fn drop(&mut self) {
-        let mut r = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
-        let i = r
-            .scopes
-            .iter()
-            .position(|s| s.is_some_and(|s| s.id == self.id))
-            .expect("service observation lease lost");
-        let s = r.scopes[i].as_mut().unwrap();
-        s.leases = s.leases.checked_sub(1).expect("service lease underflow");
-        if s.leases == 0 {
-            assert_eq!(
-                (s.used, s.controls),
-                (0, 0),
-                "service observation cannot retire live charges"
-            );
-            r.scopes[i] = None;
-            ACTIVE.fetch_sub(1, Ordering::Relaxed);
-        }
+        REGISTRY
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .release_scope(self.id);
     }
 }
 pub(crate) struct ServiceScope {
@@ -127,8 +132,7 @@ impl Drop for ServiceScope {
 }
 #[derive(Debug)]
 pub(super) struct ChildControl {
-    id: u64,
-    _scope: ServiceObservation,
+    id: std::num::NonZeroU64,
 }
 impl ChildControl {
     pub(super) fn prepare() -> Option<Self> {
@@ -155,12 +159,11 @@ impl ChildControl {
             pending: false,
         });
         Some(Self {
-            id,
-            _scope: ServiceObservation { id: scope },
+            id: std::num::NonZeroU64::new(id).expect("nonzero service generation"),
         })
     }
     pub(super) fn id(&self) -> u64 {
-        self.id
+        self.id.get()
     }
 }
 impl Drop for ChildControl {
@@ -169,7 +172,7 @@ impl Drop for ChildControl {
         let i = r
             .children
             .iter()
-            .position(|c| c.is_some_and(|c| c.id == self.id))
+            .position(|c| c.is_some_and(|c| c.id == self.id.get()))
             .expect("service child observation lost");
         let c = r.children[i].as_mut().unwrap();
         if !c.pending {
@@ -192,6 +195,7 @@ impl Drop for ChildControl {
         if !pending {
             r.children[i] = None;
         }
+        r.release_scope(scope);
     }
 }
 pub(super) fn controls(id: Option<u64>, bytes: usize) {
