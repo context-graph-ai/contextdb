@@ -156,7 +156,11 @@ impl MaintenanceContext {
                         built.insert(route.index.clone());
                     }
                 }
-                Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
+                Err(
+                    error @ (Error::ReadCancelled
+                    | Error::PublicationInterrupted
+                    | Error::StoreCorrupted { .. }),
+                ) => {
                     return Err(error);
                 }
                 Err(error) => {

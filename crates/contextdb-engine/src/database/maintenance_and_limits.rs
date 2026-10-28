@@ -539,6 +539,13 @@ impl Database {
         // Retire those physical holders before the closing observation, while
         // this caller still holds maintenance exclusion.
         drop(operation);
+        if matches!(&result, Err(Error::StoreCorrupted { .. })) {
+            // Fatal storage damage still completes this attempted wake. All
+            // attempt-owned roots are gone before its liveness stamp.
+            maintenance_runtime::record_maintenance_attempt_finished(
+                &self.last_maintenance_cycle_at,
+            );
+        }
         #[cfg(any(test, feature = "test-seams"))]
         let emission = result
             .is_ok()

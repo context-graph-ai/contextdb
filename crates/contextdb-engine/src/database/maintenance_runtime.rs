@@ -3863,7 +3863,7 @@ impl MaintenanceContext {
         // Recorded whether this cycle reclaimed anything or not -- a caller
         // that dutifully drives an empty cycle is still driving, and must
         // never trip the caller-driven backlog warning.
-        *self.last_maintenance_cycle_at.lock() = Some(std::time::Instant::now());
+        record_maintenance_attempt_finished(&self.last_maintenance_cycle_at);
         Ok(MaintenanceReport {
             pruning,
             currency,
@@ -3872,6 +3872,13 @@ impl MaintenanceContext {
             compaction,
         })
     }
+}
+
+/// Record a finished wake after its attempt-owned work has ended.
+pub(super) fn record_maintenance_attempt_finished(
+    stamp: &parking_lot::Mutex<Option<std::time::Instant>>,
+) {
+    *stamp.lock() = Some(std::time::Instant::now());
 }
 
 /// Observability: an operator must be able to see maintenance happen. Silent
