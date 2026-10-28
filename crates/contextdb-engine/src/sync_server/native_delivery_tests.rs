@@ -3761,11 +3761,12 @@ async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
     use crate::transport::native_pause::{self, Point};
     // A parameter of the exchange, not a synchronization: the hub holds the
     // first attempt until the test releases it, however long that is.
-    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+    // The selected first request drives its timeout; no wall-clock interval triggers retry.
+    const ATTEMPT_TIMEOUT: Duration = Duration::MAX;
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let hub = IrohHub::start(&requests).await;
-    let client = crate::transport::client_transport(&crate::transport::peer_dial_spec(
+    let (client, timeout) = crate::transport::iroh::client_with_test_controller_for_test(&crate::transport::peer_dial_spec(
         &hub.ticket,
         &hub.dir.path().join("edge.key"),
     ));
@@ -3789,6 +3790,7 @@ async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
     let reader =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let gate = native_pause::arm(Point::AfterSelection);
+    gate.notify_on_reach_for_test(timeout.next_admitted_timeout_signal_for_test());
     let child = reader.child().expect("request reader");
     let body = BoundedWireBody::from_legacy_reply(request, child).expect("request body");
     let subject = delivery_outcomes_subject(TENANT);
