@@ -12,6 +12,36 @@ use super::{
 use crate::MemoryBudgetOwner;
 use contextdb_core::Result;
 
+/// Exact existing search-constructor allowance, without allocation or admission.
+/// Codebooks remain separately admitted whole objects; native frames keep their owners.
+pub fn query_workspace_allocation_bytes(policy: Policy, output_slots: usize) -> Result<usize> {
+    let k = output_slots;
+    if k == 0 {
+        return Ok(0);
+    }
+    let depth = policy.rerank.max(k);
+    let raw_bytes = policy
+        .dimensions
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(overflow)?;
+    let charge = bytes::<Candidate>(depth)?
+        .checked_add(bytes::<Candidate>(k)?)
+        .and_then(|x| x.checked_add(bytes::<(f64, u32)>(policy.lists as usize).ok()?))
+        .and_then(|x| x.checked_add(raw_bytes))
+        .and_then(|x| x.checked_add(policy.dimensions.checked_mul(5)?))
+        .and_then(|x| {
+            x.checked_add(
+                PAGE_BYTES * 12
+                    + std::mem::size_of::<blake3::Hasher>()
+                    + std::mem::size_of::<Catalog>() * 2
+                    + std::mem::size_of::<Work>(),
+            )
+        })
+        .ok_or_else(overflow)?;
+    Ok(charge)
+}
+
 /// Search into caller-admitted output. Catalogs, codebooks and work are from the
 /// captured native transaction; no test observer participates in this path.
 pub fn search(
@@ -81,20 +111,7 @@ fn search_impl<E>(
         .checked_mul(4)
         .and_then(|x| x.checked_add(8))
         .ok_or_else(overflow)?;
-    let charge = bytes::<Candidate>(depth)?
-        .checked_add(bytes::<Candidate>(k)?)
-        .and_then(|x| x.checked_add(bytes::<(f64, u32)>(policy.lists as usize).ok()?))
-        .and_then(|x| x.checked_add(raw_bytes))
-        .and_then(|x| x.checked_add(policy.dimensions.checked_mul(5)?))
-        .and_then(|x| {
-            x.checked_add(
-                PAGE_BYTES * 12
-                    + std::mem::size_of::<blake3::Hasher>()
-                    + std::mem::size_of::<Catalog>() * 2
-                    + std::mem::size_of::<Work>(),
-            )
-        })
-        .ok_or_else(overflow)?;
+    let charge = query_workspace_allocation_bytes(policy, k)?;
     let _scratch = Invoice::reserve(owner, charge, "clustered_query")?;
     let mut candidates = Vec::with_capacity(depth);
     let mut merged = Vec::with_capacity(k);
@@ -323,6 +340,7 @@ fn search_impl<E>(
                     source.before_distance(DistanceKind::Canonical)?;
                     candidate.distance = cosine(query, &values);
                     work.full_precision_evaluations += 1;
+                    work.reranked_candidates += 1;
                 }
                 candidates.sort_unstable_by(super::types::order);
                 if !old {

@@ -2676,6 +2676,18 @@ impl Database {
         self.mem.growth_step(usable, required)
     }
 
+    /// Observe the actual allocator's minimum retry layout without allocating.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn allocation_plan_for_test(
+        &self,
+        allocation_size: usize,
+        withhold_reusable_space: bool,
+    ) -> Result<crate::allocation_observation::AllocationPlanForTest, StorageError> {
+        self.mem
+            .allocation_plan_for_test(allocation_size, withhold_reusable_space)
+    }
+
     /// Finish writable housekeeping while the caller still owns its writer
     /// lock, then allow read-only opens over the committed root during a
     /// graceful drain. The caller must prevent all later writes. Drop releases

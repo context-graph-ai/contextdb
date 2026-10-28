@@ -83,7 +83,7 @@ fn a_one_context_search_reads_only_its_own_segments_and_fewer_pages_than_all() {
         }
     }
     db.commit(tx).expect("commit every Context");
-    drive_until_serving(&db);
+    drive_until_serving(&db, CONTEXTS as usize * ROWS_PER_CONTEXT as usize, 1, 10);
     let generations = (0..CONTEXTS)
         .map(|ordinal| {
             let generation = serving(
@@ -212,7 +212,7 @@ fn an_unrelated_context_growing_and_republishing_leaves_a_fixed_context_s_work_u
     insert_rows(&db, 0, 0..TARGET_ROWS);
     insert_rows(&db, 1, 10_000..10_000 + UNRELATED_N);
     insert_rows(&db, 2, 20_000..20_000 + UNRELATED_N);
-    drive_until_serving(&db);
+    drive_until_serving(&db, (TARGET_ROWS + 2 * UNRELATED_N) as usize, 1, 10);
 
     let generation = |ordinal: u128| {
         serving(
@@ -241,7 +241,7 @@ fn an_unrelated_context_growing_and_republishing_leaves_a_fixed_context_s_work_u
          canonical, buffer, list, visibility, re-rank and directory work are exactly equal"
     );
 
-    drive_until_serving(&db);
+    drive_until_serving(&db, (TARGET_ROWS + 4 * UNRELATED_N) as usize, 1, 10);
     for (index, ordinal) in [1_u128, 2].into_iter().enumerate() {
         assert_ne!(
             generation(ordinal).generation,

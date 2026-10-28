@@ -12,7 +12,6 @@ pub(super) struct Records {
 pub(super) trait SemanticView {
     fn checkpoint(&self) -> Result<()>;
     fn generation_manifest(&self, generation: u64) -> Result<Manifest>;
-    fn staged_build(&self) -> Result<Option<BuildState>>;
     fn reservoir_samples(&self, generation: u64) -> Result<u64>;
     fn payload(&self, key: PageKey, out: &mut [u8; PAGE_BYTES]) -> Result<bool>;
 }
@@ -168,7 +167,22 @@ pub(super) fn derive(
             if key.list >= m.lists || key.run != 0 {
                 return Err(corrupt());
             }
-            if key.ordinal >= allocated(view, m, key.list, related)? {
+            let allocation_end = allocated(view, m, key.list, related)?;
+            if key.ordinal >= allocation_end {
+                return Err(corrupt());
+            }
+            // Every list page, including its terminal page, has a real link
+            // record. Authenticate that dependency even when the caller's
+            // known record count does not require following the final link.
+            let next = scalar(
+                view,
+                m,
+                PageKind::ListLinks,
+                key.list,
+                mul(key.ordinal, 8)?,
+                related,
+            )?;
+            if next > allocation_end || next == add(key.ordinal, 1)? {
                 return Err(corrupt());
             }
             // Lists ordinal l = allocated id - 1; metadata offset is l*8.

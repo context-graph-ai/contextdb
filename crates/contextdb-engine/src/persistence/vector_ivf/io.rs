@@ -33,7 +33,6 @@ impl KindTableName {
 }
 
 pub(super) enum NativeIo<'a> {
-    Captured(&'a redb::NativeReadView),
     CapturedTransaction {
         read: &'a redb::ReadTransaction,
         admission: &'a super::super::native_storage_admission::StorageAdmissionScope,
@@ -44,9 +43,6 @@ impl NativeIo<'_> {
     pub fn fingerprint(&self, name: &str) -> Result<Option<[u8; 32]>> {
         let definition = TableDefinition::<&[u8], &[u8]>::new(name);
         match self {
-            Self::Captured(view) => view
-                .table_root_fingerprint(definition)
-                .map_err(RedbPersistence::storage_error),
             Self::CapturedTransaction { read, admission } => {
                 admission.run_original_unqualified(|| {
                     read.table_root_fingerprint(definition)
@@ -81,12 +77,6 @@ impl NativeIo<'_> {
         read: impl FnOnce(Option<&[u8]>) -> Result<T>,
     ) -> Result<T> {
         match self {
-            Self::Captured(view) => {
-                let value = view
-                    .get_native_byte_value(name, key)
-                    .map_err(RedbPersistence::storage_error)?;
-                read(value.as_ref().map(|v| v.value()))
-            }
             Self::CapturedTransaction {
                 read: transaction,
                 admission,
@@ -109,17 +99,30 @@ impl NativeIo<'_> {
     pub fn write(&self) -> Result<&redb::WriteTransaction> {
         match self {
             Self::Borrowed(write) => Ok(write),
-            Self::Captured(_) | Self::CapturedTransaction { .. } => Err(corrupt()),
+            Self::CapturedTransaction { .. } => Err(corrupt()),
         }
     }
     pub fn put(&self, name: &str, key: &[u8], value: &[u8]) -> Result<()> {
-        let table = TableDefinition::<&[u8], &[u8]>::new(name);
-        self.write()?
-            .open_table(table)
-            .map_err(RedbPersistence::storage_error)?
-            .insert(key, value)
+        self.put_using(name, key, value, |insert| insert())
+    }
+    pub fn put_using(
+        &self,
+        name: &str,
+        key: &[u8],
+        value: &[u8],
+        wrap: impl FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<()> {
+        let mut table = self
+            .write()?
+            .open_table(TableDefinition::<&[u8], &[u8]>::new(name))
             .map_err(RedbPersistence::storage_error)?;
-        Ok(())
+        let mut insert = || {
+            table
+                .insert(key, value)
+                .map_err(RedbPersistence::storage_error)?;
+            Ok(())
+        };
+        wrap(&mut insert)
     }
 }
 
@@ -155,6 +158,15 @@ pub(super) fn allocate_storage(
         {
             return Err(corrupt());
         }
+    }
+    let qualification = super::qualification::TableName::new(next)?;
+    if write
+        .table_exists(TableDefinition::<&[u8], &[u8]>::new(
+            qualification.as_str()?,
+        ))
+        .map_err(RedbPersistence::storage_error)?
+    {
+        return Err(corrupt());
     }
     let following = next.checked_add(1).ok_or_else(corrupt)?;
     native_value[..8].copy_from_slice(b"CDBIVFA1");

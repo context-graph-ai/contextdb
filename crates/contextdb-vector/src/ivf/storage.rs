@@ -122,6 +122,12 @@ pub enum DistanceKind {
 }
 
 pub trait ReadPages {
+    /// Optional immutable source retained by maintenance through a replacement
+    /// switch. The reader still admits and owns its ordinary constructor object;
+    /// this loan replaces only where that constructor obtains the same values.
+    fn retained_codebook(&self, _manifest: Manifest) -> Option<&super::RetainedCodebook> {
+        None
+    }
     /// Snapshot identity is implicit in the supplying pinned view. The verdict
     /// lives inline in its already admitted manifest/control holder; eviction is
     /// permitted and re-admission then requires verification again.

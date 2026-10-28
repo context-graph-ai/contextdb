@@ -3525,7 +3525,6 @@ impl DatabaseTransactionHost {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn try_with_commit_lock_for<F, R>(
         &self,
         duration: std::time::Duration,

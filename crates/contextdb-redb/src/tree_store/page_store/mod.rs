@@ -50,3 +50,10 @@ pub use cached_file::CheckedWriterBackendForTest;
 
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 pub use cached_file::CachePressureFixtureForTest;
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn native_dirty_page_layout(bytes: usize) -> Option<std::alloc::Layout> {
+    page_allocation::PageAllocation::layout(bytes)
+        .ok()
+        .map(|(layout, _)| layout)
+}

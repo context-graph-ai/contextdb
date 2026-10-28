@@ -1,6 +1,8 @@
 //! Borrowed native writer. Kernel commits seal inside one outer transaction;
 //! only the outer owner can commit rows and the final Configuration binding.
 use super::*;
+mod erasure;
+mod qualification;
 use super::{
     control::{Family, KindRoots, ScopeRecord},
     header::HeaderIdentity,
@@ -9,6 +11,8 @@ use super::{
     seal::NativeSealView,
     semantic::{SealView, SemanticView},
 };
+#[cfg(feature = "test-seams")]
+use crate::vector_ivf_observations::*;
 use contextdb_core::Lsn;
 use contextdb_vector::MemoryBudgetOwner;
 use contextdb_vector::ivf::storage::{
@@ -20,7 +24,7 @@ use std::cell::{Cell, Ref, RefCell};
 /// Missing summaries are legitimate only for an actually empty route. A
 /// bounded first-key seek proves that case; existing source rows never become
 /// an invented empty baseline for native coverage.
-fn source_summary(
+pub(super) fn source_summary(
     write: &redb::WriteTransaction,
     route: &[u8],
 ) -> Result<super::super::vector_membership_pages::MembershipSummary> {
@@ -56,17 +60,23 @@ fn source_summary(
 
 /// One borrowed outer write. A mutable borrow admits at most one scope window.
 /// This holder never commits or opens a second native write transaction.
-pub(super) struct WriteSession<'a> {
+pub(crate) struct WriteSession<'a> {
     write: &'a redb::WriteTransaction,
     admission: &'a super::super::native_storage_admission::StorageAdmissionScope,
     owner: MemoryBudgetOwner,
     snapshot: contextdb_core::SnapshotId,
     snapshot_lsn: Lsn,
     row_commit_lsn: Lsn,
+    #[cfg(feature = "test-seams")]
+    pub(super) disk_owner: Option<NativeIvfPhysicalDiskOwnerForTest>,
     next_operation: Cell<u64>,
     failed: Cell<bool>,
     bound: Cell<bool>,
     _invoice: Invoice,
+    #[cfg(feature = "test-seams")]
+    observer: Producer,
+    #[cfg(feature = "test-seams")]
+    source_instance: NativeIvfSourceInstance,
 }
 impl<'a> WriteSession<'a> {
     pub fn borrow(
@@ -80,12 +90,27 @@ impl<'a> WriteSession<'a> {
         if row_commit_lsn < snapshot_lsn {
             return Err(corrupt());
         }
+        #[cfg(feature = "test-seams")]
+        let (observer, source_instance) = (
+            Producer::current(),
+            NativeIvfSourceInstance::Write {
+                admitted_session: crate::vector_ivf_observations::instance()?,
+                outer_write_object: write as *const _ as usize,
+            },
+        );
         let invoice =
             Invoice::reserve(&owner, std::mem::size_of::<Self>(), "clustered_outer_write")?;
         admission.run_original_unqualified(|| {
             super::super::content_identity::validate_clustered_scope_root_in_write(write)?;
             super::super::vector_membership_pages::validate_in_write(write)?;
-            seal::require_global_empty(write)
+            let result = seal::require_global_empty(write);
+            #[cfg(feature = "test-seams")]
+            observer.emit(NativeIvfSealEvent::GlobalPendingChecked {
+                source_instance,
+                empty: result.is_ok(),
+                stage: NativeIvfGlobalPendingStage::SessionBegin,
+            });
+            result
         })?;
         Ok(Self {
             write,
@@ -94,10 +119,16 @@ impl<'a> WriteSession<'a> {
             snapshot,
             snapshot_lsn,
             row_commit_lsn,
+            #[cfg(feature = "test-seams")]
+            disk_owner: None,
             next_operation: Cell::new(1),
             failed: Cell::new(false),
             bound: Cell::new(false),
             _invoice: invoice,
+            #[cfg(feature = "test-seams")]
+            observer,
+            #[cfg(feature = "test-seams")]
+            source_instance,
         })
     }
     fn usable(&self) -> Result<()> {
@@ -142,8 +173,27 @@ impl<'a> WriteSession<'a> {
     pub fn bind_final(&mut self) -> Result<()> {
         self.usable()?;
         let result = self.admission.run_original_unqualified(|| {
-            seal::require_global_empty(self.write)?;
-            super::super::content_identity::bind_vector_pages_root_in_write(self.write)
+            let result = seal::require_global_empty(self.write);
+            #[cfg(feature = "test-seams")]
+            self.observer
+                .emit(NativeIvfSealEvent::GlobalPendingChecked {
+                    source_instance: self.source_instance,
+                    empty: result.is_ok(),
+                    stage: NativeIvfGlobalPendingStage::BeforeFinalBinding,
+                });
+            result?;
+            #[cfg(feature = "test-seams")]
+            self.observer
+                .boundary(NativeIvfFaultBoundary::BeforeConfigurationBind)?;
+            super::super::content_identity::bind_vector_pages_root_in_write(self.write)?;
+            #[cfg(feature = "test-seams")]
+            {
+                let root =
+                    super::super::content_identity::vector_schema_pages_root_in_write(self.write)?;
+                self.observer
+                    .emit(NativeIvfSealEvent::ConfigurationBound { root });
+            }
+            Ok(())
         });
         if result.is_err() {
             self.failed.set(true);
@@ -159,16 +209,24 @@ impl<'a> WriteSession<'a> {
 pub struct WriteScope<'a, 'tx> {
     session: &'a mut WriteSession<'tx>,
     index: &'a VectorIndexRef,
+    #[cfg(feature = "test-seams")]
     tuple: &'a VectorPartitionKey,
     route: Vec<u8>,
-    key: [u8; 64],
-    record: RefCell<ScopeRecord>,
+    pub(super) key: [u8; 64],
+    pub(super) record: RefCell<ScopeRecord>,
+    identity_lsn: Cell<Option<u64>>,
+    writer_loan: Cell<bool>,
+    operation_open: Cell<bool>,
     verified: [Cell<u16>; control::ROOTS],
     dirty: [Cell<u16>; control::ROOTS],
     verdicts: [Cell<Option<Verdict>>; control::ROOTS],
     checkpoint: &'a dyn Fn() -> Result<()>,
     distance: &'a dyn Fn(DistanceKind) -> Result<()>,
     completed: bool,
+    #[cfg(feature = "test-seams")]
+    active_operation: Cell<Option<u64>>,
+    #[cfg(feature = "test-seams")]
+    attempts: Cell<u64>,
     _invoice: Invoice,
 }
 impl Drop for WriteScope<'_, '_> {
@@ -179,6 +237,59 @@ impl Drop for WriteScope<'_, '_> {
     }
 }
 impl<'a, 'tx> WriteScope<'a, 'tx> {
+    pub(crate) fn native_entry_backing_quote(&self) -> Result<usize> {
+        self.session
+            .write
+            .native_dirty_byte_entry_layout(header::KEY_BYTES, header::VALUE_BYTES)
+            .map(|layout| layout.size())
+            .ok_or_else(corrupt)
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(super) fn constructor_context_for_test(
+        &self,
+    ) -> (
+        &'tx redb::WriteTransaction,
+        contextdb_core::SnapshotId,
+        MemoryBudgetOwner,
+    ) {
+        (
+            self.session.write,
+            self.session.snapshot,
+            self.session.owner.clone(),
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    fn observed_scope(&self) -> NativeIvfScopeRef<'_> {
+        let schema = self.record.borrow().schema;
+        NativeIvfScopeRef {
+            index: self.index,
+            tuple: self.tuple,
+            table_generation: schema.table_generation,
+            column_incarnation: schema.column_incarnation,
+            snapshot_lsn: self.session.snapshot_lsn,
+            row_commit_lsn: Some(self.session.row_commit_lsn),
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    fn observed_operation(
+        &self,
+        operation: Option<u64>,
+        key: PageKey,
+    ) -> Result<NativeIvfOperationRef<'_>> {
+        let record = self.record.borrow();
+        Ok(NativeIvfOperationRef {
+            scope: self.observed_scope(),
+            operation,
+            source_instance: self.session.source_instance,
+            storage: record
+                .family(key.generation)
+                .map_or(0, |family| family.storage),
+            generation: key.generation,
+        })
+    }
+
     /// Borrow this admitted native store into the production kernel with its
     /// retained original payer. Callers cannot replace that funding owner.
     pub fn with_clustered_writer<R>(
@@ -192,7 +303,61 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
         let result = {
             let mut writer =
                 contextdb_vector::ivf::ClusteredIndex::new(&mut *self, policy, training, owner)?;
-            run(&mut writer)
+            let result = run(&mut writer);
+            #[cfg(feature = "test-seams")]
+            crate::vector_ivf_observations::observe_buffer(
+                writer
+                    .storage()
+                    .session
+                    .owner
+                    .as_ref()
+                    .stable_funder_identity(),
+                writer.storage().index,
+                writer.buffer(),
+            );
+            result
+        };
+        if result.is_err() {
+            self.session.failed.set(true);
+        }
+        result
+    }
+    pub(super) fn with_row_writer<R>(
+        &self,
+        policy: contextdb_vector::ivf::Policy,
+        training: contextdb_vector::ivf::TrainingPolicy,
+        run: impl FnOnce(&mut contextdb_vector::ivf::ClusteredIndex<&Self>) -> Result<R>,
+    ) -> Result<R> {
+        self.check_cancel()?;
+        if self.writer_loan.replace(true) {
+            return Err(Error::InvalidStateTransition(
+                "native partition writer is already borrowed".into(),
+            ));
+        }
+        struct ReturnLoan<'a>(&'a Cell<bool>);
+        impl Drop for ReturnLoan<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _loan = ReturnLoan(&self.writer_loan);
+        let owner = self.session.owner.clone();
+        let result = {
+            let mut writer =
+                contextdb_vector::ivf::ClusteredIndex::new(self, policy, training, owner)?;
+            let result = run(&mut writer);
+            #[cfg(feature = "test-seams")]
+            crate::vector_ivf_observations::observe_buffer(
+                writer
+                    .storage()
+                    .session
+                    .owner
+                    .as_ref()
+                    .stable_funder_identity(),
+                writer.storage().index,
+                writer.buffer(),
+            );
+            result
         };
         if result.is_err() {
             self.session.failed.set(true);
@@ -229,16 +394,24 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
         Ok(Self {
             session,
             index,
+            #[cfg(feature = "test-seams")]
             tuple,
             route,
             key,
             record: RefCell::new(record),
+            identity_lsn: Cell::new(None),
+            writer_loan: Cell::new(false),
+            operation_open: Cell::new(false),
             verified: std::array::from_fn(|_| Cell::new(0)),
             dirty: std::array::from_fn(|_| Cell::new(0)),
             verdicts: std::array::from_fn(|_| Cell::new(None)),
             checkpoint,
             distance,
             completed: false,
+            #[cfg(feature = "test-seams")]
+            active_operation: Cell::new(None),
+            #[cfg(feature = "test-seams")]
+            attempts: Cell::new(0),
             _invoice: construction.invoice,
         })
     }
@@ -267,21 +440,212 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
         if self.verified[slot].get() & bit == 0 {
             let actual = NativeIo::Borrowed(self.session.write).fingerprint(name.as_str()?)?;
             let expected = present.then_some(family.kinds.roots[usize::from(tag - 1)]);
+            #[cfg(feature = "test-seams")]
+            self.session
+                .observer
+                .emit(NativeIvfSealEvent::KindFingerprintCompared {
+                    operation: self.observed_operation(self.active_operation.get(), key)?,
+                    kind: key.kind,
+                    expected,
+                    actual,
+                });
             if actual != expected {
                 return Err(corrupt());
             }
             self.verified[slot].set(self.verified[slot].get() | bit);
         }
+        #[cfg(feature = "test-seams")]
+        self.session
+            .observer
+            .emit(NativeIvfSealEvent::VerificationMaskUsed {
+                operation: self.observed_operation(self.active_operation.get(), key)?,
+                kind: key.kind,
+                mask: self.verified[slot].get(),
+            });
         Ok(present)
     }
     fn changed(&self, key: PageKey) -> Result<()> {
         let slot = self.slot(key.generation).ok_or_else(corrupt)?;
         let bit = 1u16 << (header::kind_tag(key.kind) - 1);
         self.dirty[slot].set(self.dirty[slot].get() | bit);
+        #[cfg(feature = "test-seams")]
+        let previous = self.verified[slot].get();
         self.verified[slot].set(0);
+        #[cfg(feature = "test-seams")]
+        self.session
+            .observer
+            .emit(NativeIvfSealEvent::VerificationMaskReset {
+                operation: self.observed_operation(self.active_operation.get(), key)?,
+                previous,
+                current: 0,
+            });
         self.verdicts[slot].set(None);
         Ok(())
     }
+    /// Pending-directory backing is a real original-owned object. Construct
+    /// the named root slots before choosing a DEFAULT workspace; later root
+    /// finalization reuses that backing and still admits its own native credit.
+    pub(super) fn prepare_kind_tables(&self, generation: u64, kinds: &[PageKind]) -> Result<()> {
+        let operation = if self.slot(generation).is_none() {
+            let operation = self.begin_operation()?;
+            self.ensure_family(generation, &mut operation.workspace.borrow_mut())?;
+            Some(operation)
+        } else {
+            None
+        };
+        for &kind in kinds {
+            let key = PageKey {
+                partition: 0,
+                generation,
+                kind,
+                list: 0,
+                ordinal: 0,
+                run: 0,
+            };
+            self.verify_kind(key)?;
+            let storage = self
+                .record
+                .borrow()
+                .family(generation)
+                .ok_or_else(corrupt)?
+                .storage;
+            let name = KindTableName::new(storage, kind)?;
+            drop(
+                self.session
+                    .write
+                    .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(name.as_str()?))
+                    .map_err(RedbPersistence::storage_error)?,
+            );
+        }
+        // An empty table has no payload fingerprint. Actual kernel writes
+        // publish its first authenticated root; no empty root is invented.
+        if let Some(operation) = operation {
+            operation.commit()?;
+        }
+        Ok(())
+    }
+    pub(super) fn prepare_existing_roots(&self) -> Result<()> {
+        for definition in [
+            SCOPES,
+            io::PENDING,
+            super::super::vector_membership_pages::SOURCE,
+            super::super::vector_membership_pages::SUMMARY,
+            super::super::VECTOR_PARTITION_MEMBERSHIP_TABLE,
+            super::super::VECTORS_TABLE,
+        ] {
+            drop(
+                self.session
+                    .write
+                    .open_table(definition)
+                    .map_err(RedbPersistence::storage_error)?,
+            );
+        }
+        for slot in 0..control::ROOTS {
+            let family = self.record.borrow().families[slot];
+            if let Some(family) = family {
+                for tag in 1..=16 {
+                    if family.kinds.present & (1 << (tag - 1)) != 0 {
+                        let name = KindTableName::new(family.storage, header::kind_from_tag(tag)?)?;
+                        drop(
+                            self.session
+                                .write
+                                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                                    name.as_str()?,
+                                ))
+                                .map_err(RedbPersistence::storage_error)?,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn prepare_row_roots(&self) -> Result<()> {
+        self.prepare_existing_roots()?;
+        self.prepare_kind_tables(0, &[PageKind::RowVersions, PageKind::RowCopies])?;
+        let generation = self.manifest(0)?.map_or(0, |manifest| manifest.generation);
+        self.prepare_kind_tables(
+            generation,
+            &[
+                PageKind::Canonical,
+                PageKind::Visibility,
+                PageKind::Tail,
+                PageKind::Catalog,
+                PageKind::SlotMetadata,
+            ],
+        )
+    }
+    pub(super) fn prepare_tail_roots(&self, derived_usable: bool) -> Result<()> {
+        // A recorded derived-page verdict makes the kernel seal only canonical
+        // tail/run metadata. Preopening an unused broken directory would stop
+        // the rebuild before that independent recovery path can start.
+        if !derived_usable {
+            return Ok(());
+        }
+        if let Some(manifest) = self.manifest(0)? {
+            if manifest.slots > manifest.sealed_slots {
+                self.prepare_kind_tables(
+                    manifest.generation,
+                    &[PageKind::Directory, PageKind::DirectoryPresence],
+                )?;
+                if manifest.active_lists != 0 {
+                    self.prepare_kind_tables(
+                        manifest.generation,
+                        &[
+                            PageKind::Lists,
+                            PageKind::ListUsed,
+                            PageKind::ListLinks,
+                            PageKind::ListAllocator,
+                        ],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn prepare_build_roots(
+        &self,
+        generation: u64,
+        phase: contextdb_vector::ivf::storage::BuildPhase,
+    ) -> Result<()> {
+        use contextdb_vector::ivf::storage::BuildPhase;
+        match phase {
+            BuildPhase::Ingest => {
+                self.prepare_kind_tables(0, &[PageKind::RowVersions, PageKind::RowCopies])?;
+                self.prepare_kind_tables(
+                    generation,
+                    &[
+                        PageKind::Canonical,
+                        PageKind::Visibility,
+                        PageKind::SlotMetadata,
+                        PageKind::Reservoir,
+                    ],
+                )
+            }
+            BuildPhase::Seed | BuildPhase::Train => self.prepare_kind_tables(
+                generation,
+                &[
+                    PageKind::Codebook,
+                    PageKind::Accumulators,
+                    PageKind::Directory,
+                    PageKind::DirectoryPresence,
+                ],
+            ),
+            BuildPhase::Assign => self.prepare_kind_tables(
+                generation,
+                &[
+                    PageKind::Lists,
+                    PageKind::ListUsed,
+                    PageKind::ListLinks,
+                    PageKind::ListAllocator,
+                    PageKind::Catalog,
+                ],
+            ),
+            BuildPhase::Publish => self.prepare_kind_tables(generation, &[PageKind::Catalog]),
+            BuildPhase::Ready => Ok(()),
+        }
+    }
+
     fn ensure_family(&self, generation: u64, work: &mut SealWorkspace) -> Result<()> {
         if self.slot(generation).is_some() {
             return Ok(());
@@ -304,6 +668,7 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
             generation,
             storage,
             kinds: KindRoots::empty(),
+            qualification_root: None,
             policy_revision: record.policy_revision,
             source_frontier: self.session.snapshot_lsn.0,
             source_snapshot: self.session.snapshot.0,
@@ -311,6 +676,7 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
             manifest: None,
             committed_through_lsn: self.session.row_commit_lsn.0,
             reservoir_samples: None,
+            training_seed: None,
             basis_entries: summary.entries,
             basis_live_entries: summary.live_entries,
         });
@@ -337,7 +703,7 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
     }
     fn retire_inactive_family(&self, work: &mut SealWorkspace) -> Result<usize> {
         let serving = self.record.borrow().manifest()?.ok_or_else(corrupt)?;
-        // Exact accepted Catalog wire: word9 is the legacy Option tag. A
+        // Catalog wire format: word9 is the legacy Option tag. A
         // retired run alone is insufficient; the whole legacy generation
         // remains active until this actual authenticated control reaches C.
         if !self.payload(
@@ -405,35 +771,74 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
         Ok(slot)
     }
     fn payload(&self, key: PageKey, out: &mut [u8; PAGE_BYTES]) -> Result<bool> {
-        self.session.usable()?;
-        (self.checkpoint)()?;
-        if key.partition != 0 {
-            return Err(corrupt());
-        }
-        if !self.verify_kind(key)? {
-            return Ok(false);
-        }
-        let record = self.record.borrow();
-        let family = record.family(key.generation).ok_or_else(corrupt)?;
-        let name = KindTableName::new(family.storage, key.kind)?;
-        NativeIo::Borrowed(self.session.write).with_existing_value(
-            name.as_str()?,
-            &header::key_bytes(key),
-            |value| {
-                let Some(value) = value else { return Ok(false) };
-                let page = header::AdmittedIvfPage::open(
-                    HeaderIdentity {
-                        index: &record.index,
-                        tuple: &record.tuple,
-                        family,
-                    },
-                    key,
-                    value,
-                )?;
-                out.copy_from_slice(page.payload);
-                Ok(true)
-            },
-        )
+        #[cfg(feature = "test-seams")]
+        let attempt = {
+            let next = self.attempts.get().checked_add(1).ok_or_else(corrupt)?;
+            self.attempts.set(next);
+            next
+        };
+        #[cfg(feature = "test-seams")]
+        self.session
+            .observer
+            .emit(NativeIvfSealEvent::PageReadAttempt {
+                operation: self.observed_operation(self.active_operation.get(), key)?,
+                source_instance: self.session.source_instance,
+                attempt,
+                key,
+            });
+        let result = (|| {
+            self.session.usable()?;
+            (self.checkpoint)()?;
+            if key.partition != 0 {
+                return Err(corrupt());
+            }
+            if !self.verify_kind(key)? {
+                return Ok(false);
+            }
+            let record = self.record.borrow();
+            let family = record.family(key.generation).ok_or_else(corrupt)?;
+            let name = KindTableName::new(family.storage, key.kind)?;
+            NativeIo::Borrowed(self.session.write).with_existing_value(
+                name.as_str()?,
+                &header::key_bytes(key),
+                |value| {
+                    let Some(value) = value else { return Ok(false) };
+                    let page = header::AdmittedIvfPage::open(
+                        HeaderIdentity {
+                            index: &record.index,
+                            tuple: &record.tuple,
+                            family,
+                        },
+                        key,
+                        value,
+                    )?;
+                    #[cfg(feature = "test-seams")]
+                    self.session.observer.emit(NativeIvfSealEvent::PageOpened {
+                        operation: self.observed_operation(self.active_operation.get(), key)?,
+                        key,
+                        header: value[..192].try_into().map_err(|_| corrupt())?,
+                        payload: page.payload,
+                    });
+                    out.copy_from_slice(page.payload);
+                    Ok(true)
+                },
+            )
+        })();
+        #[cfg(feature = "test-seams")]
+        self.session
+            .observer
+            .emit(NativeIvfSealEvent::PageReadOutcome {
+                operation: self.observed_operation(self.active_operation.get(), key)?,
+                source_instance: self.session.source_instance,
+                attempt,
+                key,
+                outcome: match &result {
+                    Err(e) => NativeIvfPageReadOutcome::Failed(e),
+                    Ok(true) => NativeIvfPageReadOutcome::Authenticated,
+                    Ok(false) => NativeIvfPageReadOutcome::Absent,
+                },
+            });
+        result
     }
 }
 
@@ -447,7 +852,9 @@ impl ReadPages for WriteScope<'_, '_> {
         if partition == 0
             && let Some(slot) = self.slot(generation)
         {
-            self.verdicts[slot].set(Some(verdict));
+            if self.verdicts[slot].get().is_none() {
+                self.verdicts[slot].set(Some(verdict));
+            }
         }
     }
     fn snapshot_lsn(&self) -> Result<u64> {
@@ -461,7 +868,26 @@ impl ReadPages for WriteScope<'_, '_> {
         (self.checkpoint)()
     }
     fn before_distance(&self, kind: DistanceKind) -> Result<()> {
-        (self.distance)(kind)
+        (self.distance)(kind)?;
+        if kind == DistanceKind::Centroid {
+            let mut record = self.record.borrow_mut();
+            match record.build_state()?.map(|b| b.phase) {
+                Some(contextdb_vector::ivf::storage::BuildPhase::Train) => {
+                    record.training_evaluations = record
+                        .training_evaluations
+                        .checked_add(1)
+                        .ok_or_else(corrupt)?
+                }
+                Some(contextdb_vector::ivf::storage::BuildPhase::Assign) => {
+                    record.assignment_evaluations = record
+                        .assignment_evaluations
+                        .checked_add(1)
+                        .ok_or_else(corrupt)?
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
     fn manifest(&self, partition: u64) -> Result<Option<Manifest>> {
         if partition != 0 {
@@ -488,27 +914,126 @@ impl<'a, 'tx> PageStore for WriteScope<'a, 'tx> {
     where
         Self: 's;
     fn begin(&mut self) -> Result<Self::Transaction<'_>> {
+        self.begin_operation()
+    }
+}
+impl<'a, 'tx> WriteScope<'a, 'tx> {
+    fn begin_operation(&self) -> Result<WriteOperation<'_, 'a, 'tx>> {
         self.check_cancel()?;
+        if self.operation_open.get() {
+            return Err(Error::InvalidStateTransition(
+                "native kernel operation is already open".into(),
+            ));
+        }
         let operation = self.session.operation()?;
-        seal::require_operation_empty(
-            self.session.write,
-            &seal::operation_prefix(&self.key, operation),
-        )?;
+        let prefix = seal::operation_prefix(&self.key, operation);
+        let checked = seal::require_operation_empty(self.session.write, &prefix);
+        #[cfg(feature = "test-seams")]
+        self.session
+            .observer
+            .emit(NativeIvfSealEvent::OperationPrefixChecked {
+                source_instance: self.session.source_instance,
+                scope_key: &self.key,
+                operation,
+                prefix: &prefix,
+                empty: checked.is_ok(),
+                stage: NativeIvfOperationPrefixStage::Begin,
+            });
+        checked?;
+        #[cfg(feature = "test-seams")]
+        self.active_operation.set(Some(operation));
         let workspace = SealWorkspace::reserve_for::<WriteOperation<'_, '_, '_>>(
             &self.session.owner,
             operation,
         )?;
-        Ok(WriteOperation {
+        #[cfg(feature = "test-seams")]
+        let before_build = self.record.borrow().build_state()?;
+        self.operation_open.set(true);
+        let result = WriteOperation {
             scope: self,
             operation,
             finished: false,
+            #[cfg(feature = "test-seams")]
+            before_build,
             workspace: RefCell::new(workspace),
-        })
+        };
+        #[cfg(feature = "test-seams")]
+        let mut result = result;
+        #[cfg(feature = "test-seams")]
+        {
+            let base = &result as *const _ as usize;
+            let workspace = result.workspace.get_mut();
+            let windows = [
+                NativeIvfWindowRange {
+                    role: NativeIvfWindowRole::NativeValue,
+                    offset: &workspace.native_value as *const _ as usize - base,
+                    layout: std::alloc::Layout::new::<[u8; 4096]>(),
+                },
+                NativeIvfWindowRange {
+                    role: NativeIvfWindowRole::PreviousPayload,
+                    offset: &workspace.previous_payload as *const _ as usize - base,
+                    layout: std::alloc::Layout::new::<[u8; 3904]>(),
+                },
+                NativeIvfWindowRange {
+                    role: NativeIvfWindowRole::RelatedMetadata,
+                    offset: &workspace.related_metadata as *const _ as usize - base,
+                    layout: std::alloc::Layout::new::<[u8; 3904]>(),
+                },
+            ];
+            workspace._invoice.observe_object(
+                NativeIvfObjectKind::SealWorkspace,
+                std::alloc::Layout::new::<WriteOperation<'_, '_, '_>>(),
+                Some(result.scope.key),
+                Some(&windows),
+            )?;
+        }
+        Ok(result)
     }
 }
 
 // A kernel window borrows the admitted scope instead of moving or cloning it.
 // These implementations forward to the same native owner and transaction.
+impl ReadPages for &WriteScope<'_, '_> {
+    fn inspection_verdict(&self, partition: u64, generation: u64) -> Option<Verdict> {
+        (**self).inspection_verdict(partition, generation)
+    }
+    fn record_inspection_verdict(&self, partition: u64, generation: u64, verdict: Verdict) {
+        (**self).record_inspection_verdict(partition, generation, verdict)
+    }
+    fn snapshot_lsn(&self) -> Result<u64> {
+        (**self).snapshot_lsn()
+    }
+    fn index_identity(&self) -> &VectorIndexRef {
+        (**self).index_identity()
+    }
+    fn check_cancel(&self) -> Result<()> {
+        (**self).check_cancel()
+    }
+    fn before_distance(&self, kind: DistanceKind) -> Result<()> {
+        (**self).before_distance(kind)
+    }
+    fn manifest(&self, partition: u64) -> Result<Option<Manifest>> {
+        (**self).manifest(partition)
+    }
+    fn build_state(&self, partition: u64) -> Result<Option<BuildState>> {
+        (**self).build_state(partition)
+    }
+    fn next_partition(&self, after: Option<u64>) -> Result<Option<u64>> {
+        (**self).next_partition(after)
+    }
+    fn read_admitted_page(&self, key: PageKey, out: &mut [u8; PAGE_BYTES]) -> Result<bool> {
+        (**self).read_admitted_page(key, out)
+    }
+}
+impl<'a, 'tx> PageStore for &WriteScope<'a, 'tx> {
+    type Transaction<'s>
+        = WriteOperation<'s, 'a, 'tx>
+    where
+        Self: 's;
+    fn begin(&mut self) -> Result<Self::Transaction<'_>> {
+        (**self).begin_operation()
+    }
+}
 impl ReadPages for &mut WriteScope<'_, '_> {
     fn inspection_verdict(&self, partition: u64, generation: u64) -> Option<Verdict> {
         (**self).inspection_verdict(partition, generation)
@@ -547,20 +1072,25 @@ impl<'a, 'tx> PageStore for &mut WriteScope<'a, 'tx> {
     where
         Self: 's;
     fn begin(&mut self) -> Result<Self::Transaction<'_>> {
-        (**self).begin()
+        (**self).begin_operation()
     }
 }
 
 /// The complete operation layout, with exactly the three copied windows in
 /// workspace. Dropping without a successful seal poisons the outer session.
 pub struct WriteOperation<'s, 'a, 'tx> {
-    scope: &'s mut WriteScope<'a, 'tx>,
+    scope: &'s WriteScope<'a, 'tx>,
     operation: u64,
     finished: bool,
+    #[cfg(feature = "test-seams")]
+    before_build: Option<BuildState>,
     workspace: RefCell<SealWorkspace>,
 }
 impl Drop for WriteOperation<'_, '_, '_> {
     fn drop(&mut self) {
+        self.scope.operation_open.set(false);
+        #[cfg(feature = "test-seams")]
+        self.scope.active_operation.set(None);
         if !self.finished {
             self.scope.session.failed.set(true);
         }
@@ -578,9 +1108,6 @@ impl SemanticView for WriteOperation<'_, '_, '_> {
             .and_then(|f| f.manifest)
             .ok_or_else(corrupt)?
             .manifest()
-    }
-    fn staged_build(&self) -> Result<Option<BuildState>> {
-        self.scope.record.borrow().build_state()
     }
     fn reservoir_samples(&self, generation: u64) -> Result<u64> {
         self.scope
@@ -600,11 +1127,63 @@ impl SealView for WriteOperation<'_, '_, '_> {
         let record = self.scope.record.borrow();
         let family = record.family(key.generation).ok_or_else(corrupt)?;
         let marker = seal::marker_key(&self.scope.key, self.operation, family.storage, key);
-        seal::mark(self.scope.session.write, &marker, None)?;
+        #[cfg(feature = "test-seams")]
+        self.scope
+            .session
+            .observer
+            .boundary(NativeIvfFaultBoundary::BeforeMarkerWrite {
+                operation: self.observed_operation(key)?,
+                key,
+            })?;
+        let newly_inserted = seal::mark(self.scope.session.write, &marker, None)?;
+        #[cfg(feature = "test-seams")]
+        self.scope
+            .session
+            .observer
+            .emit(NativeIvfSealEvent::MarkerInserted {
+                operation: self.observed_operation(key)?,
+                key,
+                newly_inserted,
+            });
+        #[cfg(not(feature = "test-seams"))]
+        let _ = newly_inserted;
         Ok(())
     }
 }
 impl NativeSealView for WriteOperation<'_, '_, '_> {
+    #[cfg(feature = "test-seams")]
+    fn observe_page_write_for_test(
+        &self,
+        key: PageKey,
+        insert: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        crate::vector_ivf_observations::disk::observe_native_ivf_write_for_test(
+            self.scope.session.disk_owner.as_ref(),
+            self.scope.observed_scope(),
+            crate::vector_ivf_observations::disk::native_ivf_write_class_for_test(
+                self.before_build,
+                key.kind,
+            ),
+            insert,
+        )
+    }
+    #[cfg(feature = "test-seams")]
+    fn observed_operation(&self, key: PageKey) -> Result<NativeIvfOperationRef<'_>> {
+        self.scope.observed_operation(Some(self.operation), key)
+    }
+    #[cfg(feature = "test-seams")]
+    fn observer(&self) -> &Producer {
+        &self.scope.session.observer
+    }
+    #[cfg(feature = "test-seams")]
+    fn source_instance(&self) -> NativeIvfSourceInstance {
+        self.scope.session.source_instance
+    }
+    #[cfg(feature = "test-seams")]
+    fn observed_scope(&self) -> NativeIvfScopeRef<'_> {
+        self.scope.observed_scope()
+    }
+
     fn write(&self) -> &redb::WriteTransaction {
         self.scope.session.write
     }
@@ -671,7 +1250,11 @@ impl ReadPages for WriteOperation<'_, '_, '_> {
 }
 impl WritePages for WriteOperation<'_, '_, '_> {
     fn commit_lsn(&self) -> Result<u64> {
-        Ok(self.scope.session.row_commit_lsn.0)
+        Ok(self
+            .scope
+            .identity_lsn
+            .get()
+            .unwrap_or(self.scope.session.row_commit_lsn.0))
     }
     fn put_page(&mut self, key: PageKey, payload: &[u8; PAGE_BYTES]) -> Result<()> {
         self.check_cancel()?;
@@ -685,7 +1268,15 @@ impl WritePages for WriteOperation<'_, '_, '_> {
         let name = KindTableName::new(family.storage, key.kind)?;
         let marker = seal::marker_key(&self.scope.key, self.operation, family.storage, key);
         let native = NativeIo::Borrowed(self.scope.session.write);
-        if existed {
+        #[cfg(feature = "test-seams")]
+        self.scope
+            .session
+            .observer
+            .boundary(NativeIvfFaultBoundary::BeforeMarkerWrite {
+                operation: self.observed_operation(key)?,
+                key,
+            })?;
+        let newly_inserted = if existed {
             native.with_existing_value(name.as_str()?, &header::key_bytes(key), |old| {
                 let old = old
                     .map(|value| {
@@ -716,9 +1307,8 @@ impl WritePages for WriteOperation<'_, '_, '_> {
                 } else {
                     None
                 };
-                seal::mark(self.scope.session.write, &marker, previous)?;
-                Ok(())
-            })?;
+                seal::mark(self.scope.session.write, &marker, previous)
+            })?
         } else {
             let mut work = self.workspace.borrow_mut();
             work.previous_payload.fill(0);
@@ -730,8 +1320,19 @@ impl WritePages for WriteOperation<'_, '_, '_> {
                 self.scope.session.write,
                 &marker,
                 counter.then_some(&work.previous_payload),
-            )?;
-        }
+            )?
+        };
+        #[cfg(feature = "test-seams")]
+        self.scope
+            .session
+            .observer
+            .emit(NativeIvfSealEvent::MarkerInserted {
+                operation: self.observed_operation(key)?,
+                key,
+                newly_inserted,
+            });
+        #[cfg(not(feature = "test-seams"))]
+        let _ = newly_inserted;
         let mut work = self.workspace.borrow_mut();
         header::encode(
             HeaderIdentity {
@@ -744,7 +1345,31 @@ impl WritePages for WriteOperation<'_, '_, '_> {
             payload,
             &mut work.native_value,
         )?;
+        #[cfg(feature = "test-seams")]
+        self.scope
+            .session
+            .observer
+            .boundary(NativeIvfFaultBoundary::BeforePayloadWrite {
+                operation: self.observed_operation(key)?,
+                key,
+            })?;
+        #[cfg(feature = "test-seams")]
+        native.put_using(
+            name.as_str()?,
+            &header::key_bytes(key),
+            &work.native_value,
+            |insert| self.observe_page_write_for_test(key, insert),
+        )?;
+        #[cfg(not(feature = "test-seams"))]
         native.put(name.as_str()?, &header::key_bytes(key), &work.native_value)?;
+        #[cfg(feature = "test-seams")]
+        self.scope
+            .session
+            .observer
+            .emit(NativeIvfSealEvent::PayloadWritten {
+                operation: self.observed_operation(key)?,
+                key,
+            });
         drop(record);
         self.scope.changed(key)
     }
@@ -753,6 +1378,15 @@ impl WritePages for WriteOperation<'_, '_, '_> {
         self.scope
             .ensure_family(state.manifest.generation, &mut self.workspace.borrow_mut())?;
         let before = self.scope.record.borrow().build_state()?;
+        #[cfg(feature = "test-seams")]
+        if before.is_none_or(|b| b.manifest.generation != state.manifest.generation) {
+            self.scope
+                .session
+                .observer
+                .emit(NativeIvfSealEvent::BuildStarted {
+                    scope: self.scope.observed_scope(),
+                });
+        }
         {
             let mut record = self.scope.record.borrow_mut();
             let slot = record
@@ -766,6 +1400,7 @@ impl WritePages for WriteOperation<'_, '_, '_> {
             let family = record.families[slot].as_mut().ok_or_else(corrupt)?;
             family.manifest = Some(state.manifest.into());
             family.reservoir_samples = Some(state.training.reservoir_samples as u64);
+            family.training_seed = Some(state.training.seed);
             family.committed_through_lsn = self.scope.session.row_commit_lsn.0;
             record.build = Some(state.into());
         }
@@ -797,6 +1432,57 @@ impl WritePages for WriteOperation<'_, '_, '_> {
             record.serving = Some(manifest.into());
             before
         };
+        // Prepared remap slots are created exactly once, before their run root
+        // becomes visible. Count their real persisted marker in this same seal.
+        if let Some(old) = before.filter(|old| old.generation == manifest.generation) {
+            let mut prepared = 0u64;
+            let mut work = self.workspace.borrow_mut();
+            for slot in old.slots..manifest.slots {
+                let offset = slot
+                    .checked_mul(40)
+                    .and_then(|n| n.checked_add(32))
+                    .ok_or_else(corrupt)?;
+                let mut raw = [0; 8];
+                let mut copied = 0;
+                while copied < 8 {
+                    let position = offset.checked_add(copied as u64).ok_or_else(corrupt)?;
+                    if !self.scope.payload(
+                        manifest.key(PageKind::SlotMetadata, 0, position / PAGE_BYTES as u64),
+                        &mut work.previous_payload,
+                    )? {
+                        return Err(corrupt());
+                    }
+                    let start = (position % PAGE_BYTES as u64) as usize;
+                    let take = (8 - copied).min(PAGE_BYTES - start);
+                    raw[copied..copied + take]
+                        .copy_from_slice(&work.previous_payload[start..start + take]);
+                    copied += take;
+                }
+                match u64::from_le_bytes(raw) {
+                    0 => {}
+                    1 => prepared = prepared.checked_add(1).ok_or_else(corrupt)?,
+                    _ => return Err(corrupt()),
+                }
+            }
+            let mut record = self.scope.record.borrow_mut();
+            record.legacy_entries_prepared = record
+                .legacy_entries_prepared
+                .checked_add(prepared)
+                .ok_or_else(corrupt)?;
+            #[cfg(feature = "test-seams")]
+            if prepared != 0 {
+                let total = record.legacy_entries_prepared;
+                drop(record);
+                self.scope
+                    .session
+                    .observer
+                    .emit(NativeIvfSealEvent::LegacyEntriesPrepared {
+                        scope: self.scope.observed_scope(),
+                        entries: prepared,
+                        total,
+                    });
+            }
+        }
         semantic::manifest_dependencies(
             self,
             before,
@@ -811,7 +1497,365 @@ impl WritePages for WriteOperation<'_, '_, '_> {
             record.validate(self.scope.index, record.schema, record.tuple)?;
         }
         seal::seal_operation(&self, self.operation, &mut self.workspace.borrow_mut())?;
+        #[cfg(feature = "test-seams")]
+        self.observe_ingested()?;
         self.finished = true;
         Ok(())
+    }
+}
+
+pub(super) fn control_bytes(index: &VectorIndexRef, tuple: &VectorPartitionKey) -> Result<usize> {
+    memory::route_bytes(index, tuple)?
+        .checked_add(std::mem::size_of::<WriteSession<'_>>())
+        .and_then(|n| n.checked_add(std::mem::size_of::<WriteScope<'_, '_>>()))
+        .and_then(|n| n.checked_add(std::mem::size_of::<WriteOperation<'_, '_, '_>>()))
+        .ok_or_else(corrupt)
+}
+
+impl WriteScope<'_, '_> {
+    pub(super) fn with_source_row_identity<R>(
+        &self,
+        identity: contextdb_vector::ivf::RowIdentity,
+        run: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        if self
+            .identity_lsn
+            .replace(Some(identity.commit_lsn))
+            .is_some()
+        {
+            return Err(corrupt());
+        }
+        struct Reset<'a>(&'a Cell<Option<u64>>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(None);
+            }
+        }
+        let _reset = Reset(&self.identity_lsn);
+        let value = run()?;
+        #[cfg(feature = "test-seams")]
+        self.session
+            .observer
+            .emit(NativeIvfSealEvent::JournalInitialized {
+                scope: self.observed_scope(),
+                identity,
+                deleted: false,
+            });
+        Ok(value)
+    }
+    pub(super) fn after_row_staged(
+        &self,
+        identity: contextdb_vector::ivf::RowIdentity,
+        deleted: bool,
+    ) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        self.session.observer.boundary(
+            NativeIvfFaultBoundary::AfterAuthoritativeAndJournalStaged {
+                scope: self.observed_scope(),
+                identity,
+                deleted,
+            },
+        )?;
+        #[cfg(not(feature = "test-seams"))]
+        let _ = (identity, deleted);
+        Ok(())
+    }
+    pub(super) fn prepare_source_changes(
+        &mut self,
+        before: &super::super::vector_membership_pages::MembershipSummary,
+        after: &super::super::vector_membership_pages::MembershipSummary,
+    ) -> Result<()> {
+        {
+            let mut record = self.record.borrow_mut();
+            if record.canonical_complete
+                && (record.current_membership_digest != before.source_identity()
+                    || record.current_membership_entries != before.entries
+                    || record.current_membership_live_entries != before.live_entries)
+            {
+                return Err(corrupt());
+            }
+            // A complete empty source plus every successfully applied mutation
+            // establishes coverage. An old populated source needs bounded ingestion.
+            record.canonical_complete |= before.entries == 0;
+            if record
+                .build_state()?
+                .is_some_and(|b| b.phase != contextdb_vector::ivf::storage::BuildPhase::Ready)
+            {
+                for (delta, (a, b)) in record.build_changes.digest.iter_mut().zip(
+                    before
+                        .source_identity()
+                        .into_iter()
+                        .zip(after.source_identity()),
+                ) {
+                    *delta ^= a ^ b;
+                }
+                let changes = &mut record.build_changes;
+                changes.inserted = changes
+                    .inserted
+                    .checked_add(after.entries.saturating_sub(before.entries))
+                    .ok_or_else(corrupt)?;
+                changes.removed = changes
+                    .removed
+                    .checked_add(before.entries.saturating_sub(after.entries))
+                    .ok_or_else(corrupt)?;
+                changes.live_inserted = changes
+                    .live_inserted
+                    .checked_add(after.live_entries.saturating_sub(before.live_entries))
+                    .ok_or_else(corrupt)?;
+                changes.live_removed = changes
+                    .live_removed
+                    .checked_add(before.live_entries.saturating_sub(after.live_entries))
+                    .ok_or_else(corrupt)?;
+            }
+            record.current_membership_digest = after.source_identity();
+            record.current_membership_entries = after.entries;
+            record.current_membership_live_entries = after.live_entries;
+            record.committed_through_lsn = self.session.row_commit_lsn.0;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl WriteOperation<'_, '_, '_> {
+    fn observe_ingested(&self) -> Result<()> {
+        let Some(before) = self
+            .before_build
+            .filter(|b| b.phase == contextdb_vector::ivf::storage::BuildPhase::Ingest)
+        else {
+            return Ok(());
+        };
+        let Some(after) = self.scope.record.borrow().build_state()? else {
+            return Ok(());
+        };
+        if before.manifest.generation != after.manifest.generation {
+            return Ok(());
+        }
+        let stride = (after.manifest.dimensions as u64)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(corrupt)?;
+        for slot in before.manifest.slots..after.manifest.slots {
+            let mut row_bytes = [0u8; 8];
+            let offset = slot.checked_mul(stride).ok_or_else(corrupt)?;
+            let mut copied = 0usize;
+            let mut work = self.workspace.borrow_mut();
+            while copied < 8 {
+                let position = offset + copied as u64;
+                let ordinal = position / PAGE_BYTES as u64;
+                let start = (position % PAGE_BYTES as u64) as usize;
+                if !self.scope.payload(
+                    after.manifest.key(PageKind::Canonical, 0, ordinal),
+                    &mut work.previous_payload,
+                )? {
+                    return Err(corrupt());
+                }
+                let take = (8 - copied).min(PAGE_BYTES - start);
+                row_bytes[copied..copied + take]
+                    .copy_from_slice(&work.previous_payload[start..start + take]);
+                copied += take;
+            }
+            let offset = slot.checked_mul(40).ok_or_else(corrupt)?;
+            let mut lsn = [0u8; 8];
+            let mut copied = 0;
+            while copied < 8 {
+                let position = offset + copied as u64;
+                let ordinal = position / PAGE_BYTES as u64;
+                let start = (position % PAGE_BYTES as u64) as usize;
+                if !self.scope.payload(
+                    after.manifest.key(PageKind::SlotMetadata, 0, ordinal),
+                    &mut work.previous_payload,
+                )? {
+                    return Err(corrupt());
+                }
+                let take = (8 - copied).min(PAGE_BYTES - start);
+                lsn[copied..copied + take]
+                    .copy_from_slice(&work.previous_payload[start..start + take]);
+                copied += take;
+            }
+            drop(work);
+            self.scope
+                .session
+                .observer
+                .emit(NativeIvfSealEvent::SourceRowIngested {
+                    scope: self.scope.observed_scope(),
+                    identity: contextdb_vector::ivf::RowIdentity {
+                        row: u64::from_le_bytes(row_bytes),
+                        commit_lsn: u64::from_le_bytes(lsn),
+                    },
+                });
+        }
+        Ok(())
+    }
+}
+
+impl WriteScope<'_, '_> {
+    /// Delete at most the declared number of inactive payloads. Native COW
+    /// retains the old physical roots for existing registered source holders.
+    pub(super) fn reclaim_inactive(&mut self, limit: usize) -> Result<bool> {
+        use redb::{ReadableTable, ReadableTableMetadata};
+        let serving = self.record.borrow().manifest()?.ok_or_else(corrupt)?;
+        let build = self
+            .record
+            .borrow()
+            .build_state()?
+            .filter(|b| b.phase != contextdb_vector::ivf::storage::BuildPhase::Ready)
+            .map(|b| b.manifest.generation);
+        let slot = self.record.borrow().families.iter().position(|f| {
+            f.is_some_and(|f| {
+                f.generation != serving.generation
+                    && Some(f.generation) != build
+                    && (f.generation != 0 || f.kinds.present & !((1u16 << 14) | (1u16 << 15)) != 0)
+            })
+        });
+        let mut retired_key = None;
+        let mut family = if let Some(slot) = slot {
+            self.record.borrow().families[slot].ok_or_else(corrupt)?
+        } else {
+            let mut prefix = [0; 65];
+            prefix[..64].copy_from_slice(&self.key);
+            prefix[64] = b'R';
+            let scopes = self
+                .session
+                .write
+                .open_table(SCOPES)
+                .map_err(RedbPersistence::storage_error)?;
+            let mut cursor = scopes
+                .range(prefix.as_slice()..)
+                .map_err(RedbPersistence::storage_error)?;
+            let Some(entry) = cursor.next() else {
+                return Ok(false);
+            };
+            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+            if !key.value().starts_with(&prefix) {
+                return Ok(false);
+            }
+            retired_key = Some(<[u8; 73]>::try_from(key.value()).map_err(|_| corrupt())?);
+            control::decode_retired_family(key.value(), value.value())?
+        };
+        #[cfg(feature = "test-seams")]
+        crate::vector_ivf_observations::work_point(NativeIvfWorkPoint::ReclaimBatch);
+        self.check_cancel()?;
+        let mut remaining = limit;
+        let native = NativeIo::Borrowed(self.session.write);
+        for tag in 1..=16 {
+            let bit = 1 << (tag - 1);
+            // Generation zero also owns the permanent version/copy journal.
+            // Its pre-codebook vectors and runs retire at C; the journal stays.
+            if family.generation == 0 && matches!(tag, 15 | 16) {
+                continue;
+            }
+            if family.kinds.present & bit == 0 {
+                continue;
+            }
+            let kind = header::kind_from_tag(tag)?;
+            let name = io::KindTableName::new(family.storage, kind)?;
+            let definition = redb::TableDefinition::<&[u8], &[u8]>::new(name.as_str()?);
+            {
+                let mut table = self
+                    .session
+                    .write
+                    .open_table(definition)
+                    .map_err(RedbPersistence::storage_error)?;
+                while remaining != 0 {
+                    self.check_cancel()?;
+                    let key = {
+                        let mut cursor = table.iter().map_err(RedbPersistence::storage_error)?;
+                        match cursor.next() {
+                            Some(entry) => Some(
+                                <[u8; header::KEY_BYTES]>::try_from(
+                                    entry.map_err(RedbPersistence::storage_error)?.0.value(),
+                                )
+                                .map_err(|_| corrupt())?,
+                            ),
+                            None => None,
+                        }
+                    };
+                    let Some(key) = key else {
+                        break;
+                    };
+                    table
+                        .remove(key.as_slice())
+                        .map_err(RedbPersistence::storage_error)?;
+                    remaining -= 1;
+                }
+                let empty = table.is_empty().map_err(RedbPersistence::storage_error)?;
+                drop(table);
+                if empty {
+                    self.session
+                        .write
+                        .delete_table(definition)
+                        .map_err(RedbPersistence::storage_error)?;
+                    family.kinds.present &= !bit;
+                    family.kinds.roots[(tag - 1) as usize] = [0; 32];
+                } else {
+                    family.kinds.roots[(tag - 1) as usize] =
+                        native.fingerprint(name.as_str()?)?.ok_or_else(corrupt)?;
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        self.reclaim_qualification(&mut family, &mut remaining)?;
+        if let Some(slot) = slot {
+            self.record.borrow_mut().families[slot] =
+                if family.kinds.present == 0 && family.qualification_root.is_none() {
+                    None
+                } else {
+                    Some(family)
+                };
+            self.verified[slot].set(0);
+            self.verdicts[slot].set(None);
+        } else if let Some(key) = retired_key {
+            if family.kinds.present == 0 && family.qualification_root.is_none() {
+                self.session
+                    .write
+                    .open_table(SCOPES)
+                    .map_err(RedbPersistence::storage_error)?
+                    .remove(key.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
+            } else {
+                let mut payload = [0; PAGE_BYTES];
+                control::encode_retired_family(&key, &family, &mut payload)?;
+                native.put(SCOPES.name(), &key, &payload)?;
+            }
+        }
+        self.begin()?.commit()?;
+        self.check_cancel()?;
+        let pending = self
+            .record
+            .borrow()
+            .families
+            .iter()
+            .flatten()
+            .any(|family| {
+                family.generation != serving.generation
+                    && Some(family.generation) != build
+                    && (family.generation != 0
+                        || family.kinds.present & !((1u16 << 14) | (1u16 << 15)) != 0)
+            });
+        if pending {
+            return Ok(true);
+        }
+        let mut prefix = [0; 65];
+        prefix[..64].copy_from_slice(&self.key);
+        prefix[64] = b'R';
+        let scopes = self
+            .session
+            .write
+            .open_table(SCOPES)
+            .map_err(RedbPersistence::storage_error)?;
+        let mut cursor = scopes
+            .range(prefix.as_slice()..)
+            .map_err(RedbPersistence::storage_error)?;
+        match cursor.next() {
+            Some(entry) => Ok(entry
+                .map_err(RedbPersistence::storage_error)?
+                .0
+                .value()
+                .starts_with(&prefix)),
+            None => Ok(false),
+        }
     }
 }

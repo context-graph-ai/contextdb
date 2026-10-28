@@ -23,7 +23,7 @@ fn store(path: &std::path::Path, dimensions: usize) -> Database {
         )
         .unwrap();
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, 64, 1, 1);
     db
 }
 #[derive(Clone, Copy)]
@@ -882,15 +882,18 @@ fn real_one_list_page_489_search_loads_the_link_used_and_list_boundaries() {
         .unwrap();
     }
     db.commit(tx).unwrap();
-    drive_until_serving(&db);
-    let owner = native_ivf_original_owner_for_test(&db);
+    drive_until_serving(&db, 489, 1, 1);
+    let reader = db.declared_reader_memory().unwrap();
+    let owner = reader.accounting_identity();
+    assert_ne!(owner, native_ivf_original_owner_for_test(&db));
     let (result, state) = captured(
         owner,
         [e(12, 1, 489, 1), e(14, 1, 489, 1), e(2, 488, 488, 1)],
         || {
-            db.execute(
+            db.execute_with_read_memory(
                 "SELECT id FROM items ORDER BY v <=> $q USE VECTOR INDEXED LIMIT 489",
                 &params([("q", Value::Vector(unit_vector(488, 3888)))]),
+                reader.clone(),
             )
         },
     );
@@ -914,13 +917,16 @@ fn actual_page_identity_damage_refuses_indexed_before_scoring_and_auto_uses_cano
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("actual-page-fault.db");
         let db = store(&path, 8);
-        let owner = native_ivf_original_owner_for_test(&db);
+        let reader = db.declared_reader_memory().unwrap();
+        let owner = reader.accounting_identity();
+        assert_ne!(owner, native_ivf_original_owner_for_test(&db));
         let query = params([("q", Value::Vector(unit_vector(7, 8)))]);
         let (healthy, state) = captured(owner, [None; 3], || {
             observe_search(&db, || {
-                db.execute(
+                db.execute_with_read_memory(
                     "SELECT id FROM items ORDER BY v <=> $q USE VECTOR INDEXED LIMIT 64",
                     &query,
+                    reader.clone(),
                 )
                 .unwrap()
             })
@@ -981,7 +987,7 @@ fn equal_schema_counters_on_different_index_names_never_share_native_authority()
             .unwrap();
         }
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, 32, 1, 10);
     let snapshot = db.snapshot();
     let a = native_ivf_scope_roots_at_snapshot_for_test(
         &db,

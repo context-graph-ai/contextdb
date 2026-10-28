@@ -1204,3 +1204,54 @@ writer's `zeroed_for_write` construction point.
 | Changed source | Reason |
 |---|---|
 | `src/db.rs`, `src/transactions.rs` | Remove three expectations for the unknown `clippy::assert_is_empty` lint. The existing const-constructor assertions need no exception on Rust 1.94.0; constructor behavior and the minimum supported Rust version are unchanged. |
+
+## Allocator admission observation for index disk guards
+
+The `test-seams`-only allocation observer reports the actual requested size,
+physical file length and minimum quota-retry growth. The read-only plan uses
+the same `minimum_growth_layout` calculation as the existing production retry;
+ordinary allocation and growth policy are unchanged. Its callback runs after
+releasing the allocator state lock. It may change an external backend ceiling,
+but must not recursively begin a transaction while the current write is active.
+
+A caller-scoped test fault can exclude existing reusable blocks for each observed
+allocation. It grows through the ordinary backend path and records the selected
+block only in the newly added suffix; existing free blocks remain free. Ending
+the scope restores ordinary reuse, including on unwind. The fork knows no index
+classes or disk policy; the engine chooses the scope and owns the ceiling.
+The observer retains no allocation registry or production state.
+
+| Changed source | Reason |
+|---|---|
+| `src/allocation_observation.rs` (added), `src/lib.rs` | Test-only scoped borrowed allocator plans, completed-allocation observations and temporary exclusion of existing reusable blocks. |
+| `src/db.rs`, `src/tree_store/page_store/page_manager.rs` | Read-only access to the allocator's real minimum retry layout; callbacks outside the allocator lock and real newly grown block selection during the scoped fault. |
+
+Upstream proposal (not submitted): optional scoped allocator observation for
+quota-boundary tests, with no production policy or default allocator change.
+Runtime proof and independent review are required before landing.
+
+The same observer also reports actual mutable-page access through `storage.write`,
+including an existing dirty extent that needs zero growth. Placement refusal,
+write admission and successful mutable backing access are separate callbacks;
+these observations describe transactional writes, not a durability/sync receipt.
+External callbacks run without the allocator lock. A synchronous borrowed observer
+scope avoids allocating an observer control for every write. Its private lifetime
+erasure is bounded by the installing call and restores the prior slot on unwind;
+pages and returned objects never retain the borrowed reference. `PageMut` gains
+no observer field and ordinary builds gain no observation state.
+
+
+## Native dirty-backing capacity quote
+
+The hidden `contextdb-internal` `WriteTransaction::native_dirty_byte_entry_layout`
+quotes a fresh byte leaf's real backing from `RawLeafBuilder::required_bytes`,
+the current file's actual base-page size and `PageAllocation::layout`. It creates
+no object, reserves no bytes and changes no allocator policy. The engine combines
+this producer-owned backing quote with its original StorageReceipt layout while
+sizing the writer workspace; actual writes still admit once on the same owner.
+
+| Changed source | Reason |
+|---|---|
+| `src/transactions.rs`, `src/tree_store/mod.rs`, `src/tree_store/page_store/mod.rs` | Pure native dirty-byte-entry backing quote using existing serialization, live page geometry and actual allocation layout; no new payer or admission. |
+
+Upstream proposal remains unsubmitted. Runtime and independent review are required.

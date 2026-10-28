@@ -5,7 +5,7 @@
 //! one. Once the old reader is gone, reclamation releases the old generation.
 
 use super::support::{
-    MAX_MAINTENANCE_CYCLES, drive_until_serving, empty, int_ids, ivf, observe_search,
+    drive_until_serving, empty, int_ids, ivf, maintenance_cycles, observe_search,
     open_caller_driven, params, retained_generations, serving, unit_vector,
 };
 use contextdb_core::Value;
@@ -60,7 +60,7 @@ fn a_pinned_reader_keeps_its_view_through_commit_replacement_and_reclamation() {
     for id in 0..ROWS {
         insert(&db, id, unit_vector(id as u64, DIMENSIONS));
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     let first = serving(&db, "isolated_items", "embedding", &[])
         .expect("the first generation is serving")
         .generation;
@@ -127,7 +127,7 @@ fn a_pinned_reader_keeps_its_view_through_commit_replacement_and_reclamation() {
     );
 
     let mut replaced = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(41, 1, 10) {
         db.run_maintenance_cycle().expect("one maintenance cycle");
         assert_eq!(
             at_before(),
@@ -158,7 +158,7 @@ fn a_pinned_reader_keeps_its_view_through_commit_replacement_and_reclamation() {
         .expect("a generation is serving")
         .generation;
     let mut released = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(41, 1, 10) {
         db.run_maintenance_cycle().expect("one maintenance cycle");
         if retained_generations(&db, "isolated_items", "embedding", &[]) == vec![serving_now] {
             released = true;

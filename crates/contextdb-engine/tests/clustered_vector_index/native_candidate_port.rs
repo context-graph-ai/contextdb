@@ -46,7 +46,7 @@ fn rank_fixture(db: &Database) {
         )
         .unwrap();
     }
-    drive_until_serving(db);
+    drive_until_serving(db, 8, 1, 10);
 }
 fn exact_sql(k: usize) -> String {
     format!(

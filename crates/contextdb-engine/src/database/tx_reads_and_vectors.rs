@@ -4825,12 +4825,11 @@ impl Database {
                     }
                     scored.try_push((row_id, cosine_similarity(&entry.vector, query)))?;
                 }
-                scored.sort_unstable_by(|left, right| {
-                    right
-                        .1
-                        .total_cmp(&left.1)
-                        .then_with(|| left.0.cmp(&right.0))
-                });
+                if !self.has_native_ivf_source() || staged_entries!=0 || moved_entries!=0 {
+                    scored.sort_unstable_by(|left, right| {
+                        right.1.total_cmp(&left.1).then_with(||left.0.cmp(&right.0))
+                    });
+                }
                 scored.truncate(k);
                 trace.set_final_row_ids(&scored)?;
                 trace.trace.supplemented_row_count = trace
@@ -5037,12 +5036,9 @@ impl Database {
                 }
                 scored.try_push((row_id, cosine_similarity(entry.vector(), query)))?;
             }
-            scored.sort_unstable_by(|left, right| {
-                right
-                    .1
-                    .total_cmp(&left.1)
-                    .then_with(|| left.0.cmp(&right.0))
-            });
+            if !self.has_native_ivf_source() || staged_entries!=0 || !moved.is_empty() {
+                scored.sort_unstable_by(|left,right|right.1.total_cmp(&left.1).then_with(||left.0.cmp(&right.0)));
+            }
             scored.truncate(k);
             trace.set_final_row_ids(&scored)?;
             trace.trace.supplemented_row_count = trace

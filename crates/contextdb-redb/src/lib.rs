@@ -112,6 +112,9 @@ pub use types::{Key, MutInPlaceValue, TypeName, Value};
 
 pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod allocation_observation;
 pub mod backends;
 #[cfg(feature = "test-seams")]
 pub mod commit_work;

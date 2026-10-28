@@ -57,7 +57,7 @@ fn store(path: &std::path::Path) -> Database {
         }
     }
     db.commit(tx).expect("commit every Context");
-    drive_until_serving(&db);
+    drive_until_serving(&db, CONTEXTS as usize * ROWS_PER_CONTEXT as usize, 1, 10);
     db
 }
 

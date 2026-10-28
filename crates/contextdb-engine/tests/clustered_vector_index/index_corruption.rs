@@ -79,7 +79,7 @@ fn damaged_index_pages_refuse_indexed_and_never_stop_writes() {
         for id in BUILT {
             insert(&db, id);
         }
-        drive_until_serving(&db);
+        drive_until_serving(&db, 200, 1, 10);
         for id in SEALED {
             insert(&db, id);
         }
@@ -148,7 +148,7 @@ fn damaged_index_pages_refuse_indexed_and_never_stop_writes() {
             progress.in_flight || replaced,
             "{damage:?}: the next maintenance call starts a replacement: {progress:?}"
         );
-        drive_until_serving(&db);
+        drive_until_serving(&db, 300, 1, 10);
         assert!(
             serving(&db, "damaged_items", "embedding", &[])
                 .is_some_and(|serving| serving.generation > generation),

@@ -8,6 +8,8 @@ use super::{
     memory::{Invoice, ScopeConstruction},
     semantic::SemanticView,
 };
+#[cfg(feature = "test-seams")]
+use crate::vector_ivf_observations::*;
 use contextdb_vector::ivf::storage::{
     BuildState, DistanceKind, Manifest, PageKey, PageKind, ReadPages, Verdict,
 };
@@ -21,8 +23,13 @@ pub(super) struct NativeAuthority<'a> {
     pub snapshot: contextdb_core::SnapshotId,
     pub snapshot_lsn: u64,
     owner: MemoryBudgetOwner,
-    admission: super::super::native_storage_admission::StorageAdmissionScope,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
+    pub(super) admission: super::super::native_storage_admission::StorageAdmissionScope,
     _invoice: Invoice,
+    #[cfg(feature = "test-seams")]
+    observer: Producer,
+    #[cfg(feature = "test-seams")]
+    source_instance: NativeIvfSourceInstance,
 }
 impl<'a> NativeAuthority<'a> {
     pub fn open(
@@ -38,8 +45,8 @@ impl<'a> NativeAuthority<'a> {
             std::mem::size_of::<Self>(),
             "clustered_source_control",
         )?;
-        let admission =
-            StorageAdmissionScope::reader_operation(memory).map_err(original_storage_error)?;
+        let admission = StorageAdmissionScope::reader_operation(memory.clone())
+            .map_err(original_storage_error)?;
         let (snapshot, snapshot_lsn) = admission.run_original_unqualified(|| {
             let (_, snapshot, lsn) = root.authenticate()?;
             super::super::vector_membership_pages::validate_in_read(&root.read)?;
@@ -59,10 +66,18 @@ impl<'a> NativeAuthority<'a> {
             Ok((snapshot, lsn.0))
         })?;
         Ok(Self {
+            #[cfg(feature = "test-seams")]
+            observer: Producer::current(),
+            #[cfg(feature = "test-seams")]
+            source_instance: NativeIvfSourceInstance::Read {
+                admitted_object: crate::vector_ivf_observations::instance()?,
+                snapshot: root.read.storage_snapshot_identity(),
+            },
             root,
             snapshot,
             snapshot_lsn,
             owner,
+            memory,
             admission,
             _invoice: invoice,
         })
@@ -70,13 +85,13 @@ impl<'a> NativeAuthority<'a> {
     pub fn vector_owner(&self) -> &MemoryBudgetOwner {
         &self.owner
     }
-    fn native(&self) -> NativeIo<'_> {
+    pub(super) fn native(&self) -> NativeIo<'_> {
         NativeIo::CapturedTransaction {
             read: &self.root.read,
             admission: &self.admission,
         }
     }
-    fn source_summary(
+    pub(super) fn source_summary(
         &self,
         route: &[u8],
     ) -> Result<super::super::vector_membership_pages::MembershipSummary> {
@@ -116,11 +131,18 @@ impl<'a> NativeAuthority<'a> {
 pub(super) struct PageSource<'a> {
     pub authority: &'a NativeAuthority<'a>,
     pub index: &'a VectorIndexRef,
+    #[cfg(feature = "test-seams")]
     pub tuple: &'a VectorPartitionKey,
+    #[cfg(feature = "test-seams")]
     pub route: Vec<u8>,
     pub record: RefCell<ScopeRecord>,
     pub source_summary: super::super::vector_membership_pages::MembershipSummary,
     pub scope_key: [u8; 64],
+    retained_entry: Option<super::retained::EntryOwner>,
+    query_manifest: Cell<Option<Manifest>>,
+    cache: RefCell<Option<contextdb_core::read_memory::ReadShared<super::cache::DescriptorWindow>>>,
+    #[cfg(feature = "test-seams")]
+    attempts: Cell<u64>,
     verified: [Cell<u16>; control::ROOTS],
     verdicts: [Cell<Option<Verdict>>; control::ROOTS],
     page_work: Cell<Work>,
@@ -129,6 +151,158 @@ pub(super) struct PageSource<'a> {
     _invoice: Invoice,
 }
 impl<'a> PageSource<'a> {
+    #[cfg(feature = "test-seams")]
+    fn observed_scope(&self) -> NativeIvfScopeRef<'_> {
+        let schema = self.record.borrow().schema;
+        NativeIvfScopeRef {
+            index: self.index,
+            tuple: self.tuple,
+            table_generation: schema.table_generation,
+            column_incarnation: schema.column_incarnation,
+            snapshot_lsn: contextdb_core::Lsn(self.authority.snapshot_lsn),
+            row_commit_lsn: None,
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    fn observed_operation(&self, key: PageKey) -> NativeIvfOperationRef<'_> {
+        NativeIvfOperationRef {
+            scope: self.observed_scope(),
+            operation: None,
+            source_instance: self.authority.source_instance,
+            generation: key.generation,
+            storage: self
+                .record
+                .borrow()
+                .family(key.generation)
+                .map_or(0, |f| f.storage),
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    pub(super) fn inspect_control<R>(
+        &self,
+        visit: impl FnOnce(NativeIvfCapturedRootRef, NativeIvfStoredScopeRef<'_>, &[u8]) -> Result<R>,
+    ) -> Result<R> {
+        let record = self.record.borrow();
+        let root = NativeIvfCapturedRootRef {
+            snapshot: self.authority.root.read.storage_snapshot_identity(),
+            scopes_fingerprint: self.native().fingerprint(SCOPES.name())?,
+            configuration_vector_binding: self.authority.admission.run_original_unqualified(
+                || {
+                    super::super::content_identity::vector_pages_root_in_read(
+                        &self.authority.root.read,
+                    )
+                },
+            )?,
+        };
+        self.native()
+            .with_existing_value(SCOPES.name(), &self.scope_key, |value| {
+                visit(
+                    root,
+                    record.observed(&self.scope_key)?,
+                    value.ok_or_else(corrupt)?,
+                )
+            })
+    }
+    #[cfg(feature = "test-seams")]
+    pub(super) fn inspect_descriptor(
+        &self,
+    ) -> Result<Option<crate::vector_ivf_observations::NativeIvfServingDescriptorForTest>> {
+        self.native()
+            .with_value(SCOPES.name(), &descriptor::key(&self.scope_key), |value| {
+                value
+                    .map(|value| {
+                        Ok(
+                            crate::vector_ivf_observations::NativeIvfServingDescriptorForTest {
+                                manifest: descriptor::decode(
+                                    &self.scope_key,
+                                    &self.record.borrow(),
+                                    value,
+                                )?,
+                                bytes: value.try_into().map_err(|_| corrupt())?,
+                            },
+                        )
+                    })
+                    .transpose()
+            })
+    }
+    pub(super) fn load_serving_descriptor(&self) -> Result<Option<Manifest>> {
+        if let Some(manifest) = self.query_manifest.get() {
+            return Ok(Some(manifest));
+        }
+        if let Some(window) = self.authority.root.native_ivf_cache().get(&self.scope_key) {
+            // The holder is an authenticated immutable storage root. Match its
+            // scope's current manifest before borrowing the cached descriptor.
+            if descriptor::decode(&self.scope_key, &self.record.borrow(), &window.descriptor)?
+                != window.manifest
+                || Some(window.manifest) != self.record.borrow().manifest()?
+            {
+                return Err(corrupt());
+            }
+            self.query_manifest.set(Some(window.manifest));
+            #[cfg(feature = "test-seams")]
+            self.authority
+                .observer
+                .emit(NativeIvfSealEvent::QueryManifestSelected {
+                    scope: self.observed_scope(),
+                    descriptor: &window.descriptor,
+                    manifest: window.manifest,
+                });
+            let manifest = window.manifest;
+            *self.cache.borrow_mut() = Some(window);
+            return Ok(Some(manifest));
+        }
+        let record = self.record.borrow();
+        if record.serving.is_none() {
+            return Ok(None);
+        }
+        let manifest = self.native().with_existing_value(
+            SCOPES.name(),
+            &descriptor::key(&self.scope_key),
+            |value| {
+                let bytes = value.ok_or_else(corrupt)?;
+                let manifest =
+                    descriptor::decode(&self.scope_key, &record, bytes).map_err(|_| {
+                        Error::IndexCorrupted {
+                            index: self.index.clone(),
+                            reason:
+                                "the saved serving descriptor differs from its authenticated scope"
+                                    .into(),
+                        }
+                    })?;
+                #[cfg(feature = "test-seams")]
+                {
+                    let stored = bytes.try_into().map_err(|_| corrupt())?;
+                    self.authority
+                        .observer
+                        .emit(NativeIvfSealEvent::ServingDescriptorLoaded {
+                            scope: self.observed_scope(),
+                            stored,
+                            manifest,
+                        });
+                    self.authority
+                        .observer
+                        .emit(NativeIvfSealEvent::QueryManifestSelected {
+                            scope: self.observed_scope(),
+                            descriptor: stored,
+                            manifest,
+                        });
+                    crate::writer_query_test_seams::note_saved_graph_load(bytes.len());
+                }
+                let stored = bytes.try_into().map_err(|_| corrupt())?;
+                let window = self.authority.root.native_ivf_cache().install(
+                    self.scope_key,
+                    stored,
+                    manifest,
+                    self.authority.memory.clone(),
+                )?;
+                *self.cache.borrow_mut() = Some(window);
+                Ok(manifest)
+            },
+        )?;
+        self.query_manifest.set(Some(manifest));
+        Ok(Some(manifest))
+    }
+
     pub fn open(
         authority: &'a NativeAuthority<'a>,
         index: &'a VectorIndexRef,
@@ -168,14 +342,26 @@ impl<'a> PageSource<'a> {
             return Err(corrupt());
         }
         for family in record.families.iter().flatten() {
-            if family.committed_through_lsn > authority.snapshot_lsn {
+            if family.committed_through_lsn > authority.snapshot_lsn
+                || family.source_snapshot > authority.snapshot.0
+            {
                 return Err(corrupt());
             }
         }
-        Ok(Some(Self {
+        let result = Self {
             authority,
+            retained_entry: authority
+                .root
+                .native_ivf_cache()
+                .retained_entry(super::retained::route_identity(index, tuple), key),
+            query_manifest: Cell::new(None),
+            cache: RefCell::new(None),
+            #[cfg(feature = "test-seams")]
+            attempts: Cell::new(0),
             index,
+            #[cfg(feature = "test-seams")]
             tuple,
+            #[cfg(feature = "test-seams")]
             route,
             record: RefCell::new(record),
             source_summary,
@@ -186,9 +372,35 @@ impl<'a> PageSource<'a> {
             checkpoint,
             distance,
             _invoice: construction.invoice,
-        }))
+        };
+        #[cfg(feature = "test-seams")]
+        {
+            let scopes_fingerprint = authority.native().fingerprint(SCOPES.name())?;
+            let configuration_vector_binding =
+                authority.admission.run_original_unqualified(|| {
+                    super::super::content_identity::vector_pages_root_in_read(&authority.root.read)
+                })?;
+            let record = result.record.borrow();
+            authority
+                .observer
+                .emit(NativeIvfSealEvent::RootControlLoaded {
+                    scope: result.observed_scope(),
+                    stored_bytes: PAGE_BYTES,
+                });
+            authority.observer.emit(NativeIvfSealEvent::ScopeOpened {
+                scope: result.observed_scope(),
+                source_instance: authority.source_instance,
+                captured_root: NativeIvfCapturedRootRef {
+                    snapshot: authority.root.read.storage_snapshot_identity(),
+                    scopes_fingerprint,
+                    configuration_vector_binding,
+                },
+                stored: record.observed(&result.scope_key)?,
+            });
+        }
+        Ok(Some(result))
     }
-    fn native(&self) -> NativeIo<'_> {
+    pub(super) fn native(&self) -> NativeIo<'_> {
         self.authority.native()
     }
     fn family_slot(&self, generation: u64) -> Option<usize> {
@@ -209,16 +421,39 @@ impl<'a> PageSource<'a> {
         let tag = header::kind_tag(key.kind);
         let bit = 1u16 << (tag - 1);
         let present = family.kinds.present & bit != 0;
+        if let Some(window) = self.cache.borrow().as_ref() {
+            self.verified[slot].set(self.verified[slot].get() | window.verified.lock().0[slot]);
+        }
         if self.verified[slot].get() & bit != 0 {
+            #[cfg(feature = "test-seams")]
+            self.authority
+                .observer
+                .emit(NativeIvfSealEvent::VerificationMaskUsed {
+                    operation: self.observed_operation(key),
+                    kind: key.kind,
+                    mask: self.verified[slot].get(),
+                });
             return Ok(present);
         }
         let name = KindTableName::new(family.storage, key.kind)?;
         let actual = self.native().fingerprint(name.as_str()?)?;
         let expected = present.then_some(family.kinds.roots[usize::from(tag - 1)]);
+        #[cfg(feature = "test-seams")]
+        self.authority
+            .observer
+            .emit(NativeIvfSealEvent::KindFingerprintCompared {
+                operation: self.observed_operation(key),
+                kind: key.kind,
+                expected,
+                actual,
+            });
         if actual != expected {
             return Err(corrupt());
         }
         self.verified[slot].set(self.verified[slot].get() | bit);
+        if let Some(window) = self.cache.borrow().as_ref() {
+            window.verified.lock().0[slot] |= bit;
+        }
         Ok(present)
     }
     fn attempted(&self, key: PageKey) -> Result<()> {
@@ -249,47 +484,125 @@ impl<'a> PageSource<'a> {
         key: PageKey,
         visit: impl FnOnce(Option<AdmittedIvfPage<'_>>) -> Result<T>,
     ) -> Result<T> {
-        (self.checkpoint)()?;
-        self.attempted(key)?;
-        if key.partition != 0 {
-            return Err(corrupt());
-        }
-        if !self.verify_kind(key)? {
-            return visit(None);
-        }
-        let record = self.record.borrow();
-        let family = record.family(key.generation).ok_or_else(corrupt)?;
-        let name = KindTableName::new(family.storage, key.kind)?;
-        self.native()
-            .with_existing_value(name.as_str()?, &header::key_bytes(key), |value| {
-                let value = value
-                    .map(|value| -> Result<_> {
-                        let page = AdmittedIvfPage::open(
-                            HeaderIdentity {
-                                index: &record.index,
-                                tuple: &record.tuple,
+        #[cfg(feature = "test-seams")]
+        let attempt = {
+            let next = self.attempts.get().checked_add(1).ok_or_else(corrupt)?;
+            self.attempts.set(next);
+            next
+        };
+        #[cfg(feature = "test-seams")]
+        self.authority
+            .observer
+            .emit(NativeIvfSealEvent::PageReadAttempt {
+                operation: self.observed_operation(key),
+                source_instance: self.authority.source_instance,
+                attempt,
+                key,
+            });
+        #[cfg(feature = "test-seams")]
+        let present = Cell::new(false);
+        let result = (|| {
+            (self.checkpoint)()?;
+            self.attempted(key)?;
+            if key.partition != 0 {
+                return Err(corrupt());
+            }
+            if !self.verify_kind(key)? {
+                return visit(None);
+            }
+            let record = self.record.borrow();
+            let family = record.family(key.generation).ok_or_else(corrupt)?;
+            let name = KindTableName::new(family.storage, key.kind)?;
+            self.native()
+                .with_existing_value(name.as_str()?, &header::key_bytes(key), |value| {
+                    let value = value
+                        .map(|value| -> Result<_> {
+                            let page = AdmittedIvfPage::open(
+                                HeaderIdentity {
+                                    index: &record.index,
+                                    tuple: &record.tuple,
+                                    family,
+                                },
+                                key,
+                                value,
+                            )?;
+                            super::frontier::validate(
+                                &self.native(),
+                                &self.scope_key,
                                 family,
-                            },
-                            key,
-                            value,
-                        )?;
-                        super::frontier::validate(
-                            &self.native(),
-                            &self.scope_key,
-                            family,
-                            key,
-                            self.authority.snapshot_lsn,
-                        )?;
-                        Ok(page)
-                    })
-                    .transpose()?;
-                visit(value)
-            })
+                                key,
+                                self.authority.snapshot_lsn,
+                            )?;
+                            #[cfg(feature = "test-seams")]
+                            self.authority
+                                .observer
+                                .emit(NativeIvfSealEvent::PageOpened {
+                                    operation: self.observed_operation(key),
+                                    key,
+                                    header: value[..192].try_into().map_err(|_| corrupt())?,
+                                    payload: page.payload,
+                                });
+                            #[cfg(feature = "test-seams")]
+                            present.set(true);
+                            Ok(page)
+                        })
+                        .transpose()?;
+                    visit(value)
+                })
+        })();
+        #[cfg(feature = "test-seams")]
+        self.authority
+            .observer
+            .emit(NativeIvfSealEvent::PageReadOutcome {
+                operation: self.observed_operation(key),
+                source_instance: self.authority.source_instance,
+                attempt,
+                key,
+                outcome: match &result {
+                    Err(e) => NativeIvfPageReadOutcome::Failed(e),
+                    Ok(_) => {
+                        if present.get() {
+                            NativeIvfPageReadOutcome::Authenticated
+                        } else {
+                            NativeIvfPageReadOutcome::Absent
+                        }
+                    }
+                },
+            });
+        result
     }
     /// Actual payload attempts include internal semantic-validation metadata
     /// reads. Distance counters remain the kernel's actual completed scores.
     pub fn actual_page_work(&self) -> Work {
         self.page_work.get()
+    }
+    /// Exhaustive canonical search takes its manifest from the authenticated
+    /// source-coverage control, independent of the derived serving descriptor.
+    pub fn select_canonical_authority(&self) -> Result<()> {
+        self.query_manifest.set(self.record.borrow().manifest()?);
+        Ok(())
+    }
+    /// Maintenance's view is the actual completed, unpublished producer build.
+    /// No caller-supplied manifest can become this authority.
+    pub(super) fn select_build_authority(&self) -> Result<Manifest> {
+        let record = self.record.borrow();
+        let build = record
+            .build_state()?
+            .filter(|build| build.phase == contextdb_vector::ivf::storage::BuildPhase::Publish)
+            .ok_or_else(corrupt)?;
+        let family = record
+            .family(build.manifest.generation)
+            .ok_or_else(corrupt)?;
+        if family
+            .manifest
+            .map(control::ManifestRecord::manifest)
+            .transpose()?
+            != Some(build.manifest)
+        {
+            return Err(corrupt());
+        }
+        self.query_manifest.set(Some(build.manifest));
+        Ok(build.manifest)
     }
     pub fn canonical_ready(&self) -> bool {
         let record = self.record.borrow();
@@ -298,18 +611,65 @@ impl<'a> PageSource<'a> {
     }
 }
 impl ReadPages for PageSource<'_> {
+    fn retained_codebook(
+        &self,
+        manifest: Manifest,
+    ) -> Option<&contextdb_vector::ivf::RetainedCodebook> {
+        self.retained_entry
+            .as_ref()
+            .filter(|entry| entry.book.matches(manifest))
+            .map(|entry| &entry.book)
+    }
     fn inspection_verdict(&self, partition: u64, generation: u64) -> Option<Verdict> {
         if partition != 0 {
             return None;
         }
-        self.family_slot(generation)
-            .and_then(|s| self.verdicts[s].get())
+        self.family_slot(generation).and_then(|slot| {
+            self.verdicts[slot].get().or_else(|| {
+                self.cache
+                    .borrow()
+                    .as_ref()
+                    .and_then(|window| window.verified.lock().1[slot])
+            })
+        })
     }
     fn record_inspection_verdict(&self, partition: u64, generation: u64, verdict: Verdict) {
         if partition == 0
             && let Some(slot) = self.family_slot(generation)
         {
-            self.verdicts[slot].set(Some(verdict));
+            if self.verdicts[slot].get().is_none() {
+                #[cfg(feature = "test-seams")]
+                if self
+                    .cache
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|window| window.verified.lock().1[slot].is_none())
+                    && self
+                        .record
+                        .borrow()
+                        .family(generation)
+                        .and_then(|family| family.manifest)
+                        .and_then(|manifest| manifest.manifest().ok())
+                        .is_some_and(|manifest| manifest.active_lists != 0)
+                {
+                    crate::vector_ivf_observations::observe_verification(
+                        crate::vector_ivf_observations::NativeIvfVerificationForTest {
+                            window: self
+                                .authority
+                                .root
+                                .native_ivf_cache()
+                                .observation_identity_for_test(),
+                            index: self.index,
+                            generation,
+                            verdict,
+                        },
+                    );
+                }
+                self.verdicts[slot].set(Some(verdict));
+            }
+            if let Some(window) = self.cache.borrow().as_ref() {
+                window.verified.lock().1[slot].get_or_insert(verdict);
+            }
         }
     }
     fn snapshot_lsn(&self) -> Result<u64> {
@@ -322,13 +682,21 @@ impl ReadPages for PageSource<'_> {
         (self.checkpoint)()
     }
     fn before_distance(&self, kind: DistanceKind) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        if matches!(
+            kind,
+            DistanceKind::Quantized | DistanceKind::Canonical | DistanceKind::Buffer
+        ) {
+            work_point(NativeIvfWorkPoint::CandidateScoring);
+            (self.checkpoint)()?;
+        }
         (self.distance)(kind)
     }
     fn manifest(&self, partition: u64) -> Result<Option<Manifest>> {
         if partition != 0 {
             return Ok(None);
         }
-        self.record.borrow().manifest()
+        self.load_serving_descriptor()
     }
     fn build_state(&self, partition: u64) -> Result<Option<BuildState>> {
         if partition != 0 {
@@ -348,6 +716,11 @@ impl ReadPages for PageSource<'_> {
     fn read_admitted_page(&self, key: PageKey, output: &mut [u8; PAGE_BYTES]) -> Result<bool> {
         self.with_page(key, |page| {
             let Some(page) = page else { return Ok(false) };
+            #[cfg(feature = "test-seams")]
+            if key.kind == PageKind::Lists {
+                work_point(NativeIvfWorkPoint::ListPageRead);
+                (self.checkpoint)()?;
+            }
             // The kernel's already admitted output page is this validation's
             // bounded related window, then receives the actual payload.
             let records = semantic::derive(self, key, page.payload, output)?;
@@ -372,9 +745,6 @@ impl SemanticView for PageSource<'_> {
             .ok_or_else(corrupt)?
             .manifest()
     }
-    fn staged_build(&self) -> Result<Option<BuildState>> {
-        self.record.borrow().build_state()
-    }
     fn reservoir_samples(&self, generation: u64) -> Result<u64> {
         self.record
             .borrow()
@@ -390,5 +760,147 @@ impl SemanticView for PageSource<'_> {
             out.copy_from_slice(page.payload);
             Ok(true)
         })
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl PageSource<'_> {
+    pub(super) fn inspect_scope_roots(
+        &self,
+    ) -> Result<crate::vector_ivf_observations::NativeIvfScopeRootsForTest> {
+        use crate::vector_ivf_observations::NativeIvfScopeRootsForTest;
+        let record = self.record.borrow();
+        let manifest = record.manifest()?.ok_or_else(corrupt)?;
+        let family = record.family(manifest.generation).ok_or_else(corrupt)?;
+        let mut actual_roots = [[0; 32]; 16];
+        for tag in 1..=16 {
+            let name = KindTableName::new(family.storage, header::kind_from_tag(tag)?)?;
+            let actual = self.native().fingerprint(name.as_str()?)?;
+            actual_roots[usize::from(tag - 1)] = actual.unwrap_or([0; 32]);
+        }
+        Ok(NativeIvfScopeRootsForTest {
+            index_digest: record.index,
+            tuple_digest: record.tuple,
+            snapshot_lsn: self.authority.snapshot_lsn,
+            table_generation: record.schema.table_generation,
+            column_incarnation: record.schema.column_incarnation,
+            frozen_frontier: family.source_frontier,
+            frozen_source_identity: family.source_identity,
+            current_frontier: record.committed_through_lsn,
+            current_digest: record.current_membership_digest,
+            current_entries: record.current_membership_entries,
+            current_live_entries: record.current_membership_live_entries,
+            expected_roots: family.kinds.roots,
+            actual_roots,
+            present: family.kinds.present,
+        })
+    }
+    pub(super) fn visit_authoritative_source(
+        &self,
+        visit: &mut dyn FnMut(crate::vector_ivf_observations::NativeIvfSourceRecordForTest<'_>),
+    ) -> Result<()> {
+        self.authority.admission.run_original_unqualified(|| {
+            let source = self
+                .authority
+                .root
+                .read
+                .open_byte_table_bounded(super::super::vector_membership_pages::SOURCE)
+                .map_err(RedbPersistence::storage_error)?;
+            let mut cursor = source
+                .prefix_bounded(&self.route)
+                .map_err(RedbPersistence::storage_error)?;
+            while let Some(next) = cursor.next() {
+                self.check_cancel()?;
+                let (key, value) = next.map_err(RedbPersistence::storage_error)?;
+                let record = super::super::vector_membership_pages::decode_source_member(
+                    key.value(),
+                    value.value(),
+                )?;
+                if record.index != *self.index || record.partition_key != *self.tuple {
+                    return Err(corrupt());
+                }
+                visit(
+                    crate::vector_ivf_observations::NativeIvfSourceRecordForTest {
+                        key: key.value(),
+                        encoded: value.value(),
+                        live: record.deleted_tx.is_none(),
+                    },
+                );
+            }
+            Ok(())
+        })
+    }
+}
+
+impl PageSource<'_> {
+    pub(super) fn activate_retained(
+        &mut self,
+        tuple: &VectorPartitionKey,
+        selection: super::retained::Selection<'_>,
+    ) -> Result<()> {
+        // The initial generation cannot be in replacement state B. This
+        // existing durable build metadata avoids a derived catalog read there.
+        let possible = {
+            let record = self.record.borrow();
+            let serving = record.manifest()?;
+            record.build_state()?.is_some_and(|build| {
+                build.phase == contextdb_vector::ivf::storage::BuildPhase::Ready
+                    && build.serving_at_start.is_some()
+                    && serving
+                        .is_some_and(|serving| serving.generation == build.manifest.generation)
+            })
+        };
+        if !possible {
+            return Ok(());
+        }
+        let Some(manifest) = contextdb_vector::ivf::retained_codebook_manifest(self, 0)? else {
+            return Ok(());
+        };
+        if self
+            .retained_entry
+            .as_ref()
+            .is_some_and(|entry| entry.book.matches(manifest))
+        {
+            return Ok(());
+        }
+        let route = super::retained::route_identity(self.index, tuple);
+        (selection.boundary)(&mut || {
+            let entry = selection.cache.ensure_retained(
+                &(selection.owner)()?,
+                self,
+                route,
+                self.scope_key,
+                manifest,
+            )?;
+            self.authority
+                .root
+                .native_ivf_cache()
+                .adopt_retained(selection.cache);
+            self.retained_entry = Some(entry);
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl PageSource<'_> {
+    pub(super) fn retained_for_test(
+        &self,
+    ) -> crate::vector_ivf_observations::NativeIvfRetainedCodebookForTest {
+        use crate::vector_ivf_observations::NativeIvfRetainedCodebookForTest;
+        if let Some(entry) = &self.retained_entry {
+            NativeIvfRetainedCodebookForTest {
+                manifest: Some(entry.book.manifest()),
+                charged_bytes: entry.book.charged_bytes(),
+                original_owner: entry.book.original_owner_for_test(),
+            }
+        } else {
+            NativeIvfRetainedCodebookForTest {
+                manifest: None,
+                charged_bytes: 0,
+                original_owner: 0,
+            }
+        }
     }
 }

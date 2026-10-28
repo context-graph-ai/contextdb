@@ -271,7 +271,7 @@ fn mutations_before_initial_maintenance_do_not_resurrect_rows_when_native_build_
             journal
         );
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 16, 10);
     for mode in ["INDEXED", "EXACT"] {
         for id in [3, 47] {
             assert_partial_answers(answer(&db, mode, 70_000 + id as u64), id);
@@ -359,7 +359,7 @@ fn initialized_live_and_preingest_tombstone_journals_refuse_stale_row_identity()
             );
         }
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 16, 10);
     for mode in ["INDEXED", "EXACT"] {
         assert_partial_answers(answer(&db, mode, 70_047), 47);
     }
@@ -409,7 +409,7 @@ fn failure_after_source_and_preingest_journal_staging_rolls_back_both() {
             journal
         );
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 16, 10);
     for mode in ["INDEXED", "EXACT"] {
         for id in [51, 53] {
             assert_eq!(answer(&db, mode, id as u64).first(), Some(&id));
@@ -425,14 +425,14 @@ fn native_indexed_file_search_survives_restart_replacement_and_erasure() {
     let db = open_caller_driven(&path);
     seed(&db);
     enable_native(&db);
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     let first = serving(&db, "items", "v", &[]).unwrap();
     db.execute(
         "ALTER TABLE items ALTER COLUMN v SET WITH (training_seed = 7)",
         &empty(),
     )
     .unwrap();
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     let replacement = serving(&db, "items", "v", &[]).unwrap();
     assert_ne!(first.generation, replacement.generation);
     change(&db);
@@ -457,7 +457,7 @@ fn native_indexed_file_search_survives_restart_replacement_and_erasure() {
             .rows_affected(),
         1
     );
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     assert_eq!(
         retained_generations(&db, "items", "v", &[]),
         vec![replacement.generation]
@@ -505,7 +505,7 @@ fn first_saved_search_loads_compact_serving_descriptor_as_real_manifest_source()
     let db = open_caller_driven(&path);
     seed(&db);
     enable_native(&db);
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     let generation = serving(&db, "items", "v", &[]).unwrap().generation;
     let expected = answer(&db, "EXACT", 7);
     db.close().unwrap();
@@ -740,6 +740,22 @@ fn default_policy_resolution_matches_producer_checked_layout_and_constructor_deb
             let layout =
                 codebook_allocation_layout(dimensions, resolved.active_lists, training_counts)
                     .unwrap();
+            if resolved.active_lists == 0 {
+                assert_eq!(population, 0);
+                assert_eq!(layout.charged_bytes, 0);
+                let attempt = native_ivf_constructor_attempt_for_test(
+                    &db,
+                    &index(),
+                    &tuple(),
+                    ConstructorAllocation::Codebook { training_counts },
+                    0,
+                );
+                assert!(!attempt.overflow);
+                attempt.outcome.unwrap();
+                assert_eq!(attempt.event_count, 0, "empty codebook has no reservation");
+                assert_eq!(attempt.retained_after_drop, 0);
+                continue;
+            }
             assert!(layout.charged_bytes > 0);
             if !training_counts {
                 assert_eq!(layout.counts.size(), 0);

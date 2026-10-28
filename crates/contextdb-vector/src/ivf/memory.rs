@@ -6,28 +6,53 @@ use contextdb_core::{Error, Result};
 pub(crate) struct Invoice {
     owner: MemoryBudgetOwner,
     bytes: usize,
+    #[cfg(feature = "test-seams")]
+    observation: super::layout_observation::ReservationObservation,
 }
 impl Invoice {
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.bytes
+    }
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn original_owner_for_test(&self) -> usize {
+        let (original, _, _) = self.owner.as_ref().original_read_payer_for_test();
+        if original == 0 {
+            self.owner.as_ref().stable_funder_identity()
+        } else {
+            original
+        }
+    }
     pub(crate) fn reserve(
         owner: &MemoryBudgetOwner,
         bytes: usize,
         operation: &'static str,
     ) -> Result<Self> {
+        #[cfg(feature = "test-seams")]
+        let observation =
+            super::layout_observation::ReservationObservation::capture(owner, bytes, operation)?;
         owner.try_allocate_for_static(
             bytes,
             "vector_index",
             operation,
             "Release retained vector objects or raise the declared memory limit.",
         )?;
+        #[cfg(feature = "test-seams")]
+        observation.debited();
         Ok(Self {
             owner: owner.clone(),
             bytes,
+            #[cfg(feature = "test-seams")]
+            observation,
         })
     }
 }
 impl Drop for Invoice {
     fn drop(&mut self) {
+        #[cfg(feature = "test-seams")]
+        self.observation.buffers_freed();
         self.owner.release(self.bytes);
+        #[cfg(feature = "test-seams")]
+        self.observation.released();
     }
 }
 

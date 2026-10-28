@@ -60,7 +60,7 @@ fn exact_returns_full_precision_order_where_int8_records_tie() {
         )
         .expect("commit one vector");
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, 6, 1, 10);
 
     let query = angle(0.45);
     let expected = ranked(&query, &rows);
@@ -138,7 +138,7 @@ fn exact_rescores_every_allowed_vector_and_indexed_does_strictly_less_work() {
         }
     }
     db.commit(tx).expect("commit both Contexts");
-    drive_until_serving(&db);
+    drive_until_serving(&db, 1200, 1, 10);
     for ordinal in 0..2_u128 {
         let generation = serving(
             &db,

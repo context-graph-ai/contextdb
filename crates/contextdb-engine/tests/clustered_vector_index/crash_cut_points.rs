@@ -83,7 +83,7 @@ fn run_child(path: &Path, selected: &str) {
     observe_publication_cuts(
         Arc::new(move |cut| {
             if format!("{cut:?}") == selected {
-                println!("{MARKER} {cut:?}");
+                println!("\n{MARKER} {cut:?}");
                 std::io::stdout().flush().unwrap();
                 let mut byte = [0];
                 std::io::stdin()
@@ -91,7 +91,7 @@ fn run_child(path: &Path, selected: &str) {
                     .expect("the parent kills the paused child before releasing stdin");
             }
         }),
-        || drive_until_serving(&db),
+        || drive_until_serving(&db, (BUILT_ROWS + DELTA_ROWS) as usize, 1, 10),
     );
     db.close().unwrap();
     println!("{FINISHED}");
@@ -112,7 +112,7 @@ fn prepare(path: &Path) -> u64 {
     for id in 0..BUILT_ROWS {
         insert(&db, id);
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, BUILT_ROWS as usize, 1, 10);
     let first = serving(&db, "published_items", "embedding", &[])
         .expect("the first generation is serving")
         .generation;
@@ -200,7 +200,7 @@ fn a_crash_at_either_publication_boundary_leaves_one_complete_generation() {
         }
         assert_every_row_is_served_by_the_index(&db, &selected);
 
-        drive_until_serving(&db);
+        drive_until_serving(&db, (BUILT_ROWS + DELTA_ROWS) as usize, 1, 10);
         assert_ne!(
             serving(&db, "published_items", "embedding", &[])
                 .expect("recovery leaves a serving generation")

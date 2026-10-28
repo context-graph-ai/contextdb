@@ -4884,6 +4884,10 @@ impl Database {
         let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
         if let Some(layout) = vector_index_layout_from_column(column) {
+            self.validate_native_ivf_declaration(
+                &VectorIndexRef::new(table, index_column),
+                column,
+            )?;
             self.vector_store.register_index_with_layout(
                 VectorIndexRef::new(table, index_column),
                 layout,
@@ -4908,6 +4912,7 @@ impl Database {
     ) -> Result<()> {
         let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
+        self.validate_native_ivf_declaration(index, column)?;
         self.vector_store.with_index_layout(index, |_| ())?;
         if let Some(max_partitions) = column.effective_max_partitions()
             && self.vector_store.live_or_retained_partition_count(index)? > max_partitions as usize

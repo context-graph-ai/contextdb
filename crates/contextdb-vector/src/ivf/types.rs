@@ -118,6 +118,8 @@ pub struct Work {
     pub centroid_evaluations: u64,
     pub quantized_evaluations: u64,
     pub full_precision_evaluations: u64,
+    /// Actual canonical re-ranks of quantized candidates; a subset of full-precision work.
+    pub reranked_candidates: u64,
     pub buffer_evaluations: u64,
     pub list_pages_read: u64,
     pub codebook_pages_read: u64,

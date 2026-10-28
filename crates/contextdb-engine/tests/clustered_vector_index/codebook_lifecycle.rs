@@ -10,8 +10,8 @@
 //! finishes the switch and the remap.
 
 use super::support::{
-    IndexTestOptions, MAX_MAINTENANCE_CYCLES, PublicationCut, build_progress, cosine_distance,
-    count, delta_runs, drive_until_serving, empty, int_ids, ivf, observe_publication_cuts,
+    IndexTestOptions, PublicationCut, build_progress, cosine_distance, count, delta_runs,
+    drive_until_serving, empty, int_ids, ivf, maintenance_cycles, observe_publication_cuts,
     observe_search, open_with_index_test_options, params, remap_progress, retained_generations,
     serving, unit_vector, write_buffer,
 };
@@ -116,13 +116,25 @@ fn sample_ids() -> Vec<i64> {
 }
 
 fn drive_remap_to_completion(db: &Database, stage: &str) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + SEALED.end - SEALED.start) as usize,
+        BATCH as usize,
+        10,
+    ) {
         if remap_progress(db, "life_items", "embedding", &[]).entries_remaining == 0 {
             return;
         }
         db.run_maintenance_cycle().expect("one maintenance cycle");
     }
-    panic!("{stage}: the remap did not finish in {MAX_MAINTENANCE_CYCLES} cycles");
+    panic!(
+        "{stage}: the remap did not finish in {} cycles",
+        maintenance_cycles(
+            (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + SEALED.end - SEALED.start)
+                as usize,
+            BATCH as usize,
+            10
+        )
+    );
 }
 
 fn assert_every_run_on_the_serving_codebook(db: &Database, stage: &str) {
@@ -191,7 +203,7 @@ fn writes_before_the_first_codebook_stay_exactly_searchable_and_the_first_public
         "the unclustered runs are searched exactly"
     );
 
-    drive_until_serving(&db);
+    drive_until_serving(&db, ids.len(), BATCH as usize, 10);
     assert!(serving(&db, "life_items", "embedding", &[]).is_some());
     drive_remap_to_completion(&db, "first publication");
     assert_every_run_on_the_serving_codebook(&db, "first publication");
@@ -205,11 +217,15 @@ fn writes_before_the_first_codebook_stay_exactly_searchable_and_the_first_public
 fn seal_runs_while_a_replacement_trains(db: &Database) -> (u64, u64) {
     create(db);
     insert_all(db, BUILT);
-    drive_until_serving(db);
+    drive_until_serving(db, (BUILT.end - BUILT.start) as usize, BATCH as usize, 10);
     let first = serving(db, "life_items", "embedding", &[]).expect("the first generation serves");
     insert_all(db, GROWTH);
     let mut training = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + SEALED.end - SEALED.start) as usize,
+        BATCH as usize,
+        10,
+    ) {
         db.run_maintenance_cycle().expect("one maintenance cycle");
         if build_progress(db, "life_items", "embedding", &[]).in_flight {
             training = true;
@@ -262,7 +278,12 @@ fn runs_sealed_while_a_replacement_trains_stay_served_and_are_remapped_in_bounde
         let _pin = db.pin_snapshot(old).expect("pin an old reader");
         let old_answer = int_ids(&db.execute_at_snapshot(sql, &query, old).unwrap());
         let mut published = false;
-        for _ in 0..MAX_MAINTENANCE_CYCLES {
+        for _ in 0..maintenance_cycles(
+            (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + SEALED.end - SEALED.start)
+                as usize,
+            BATCH as usize,
+            10,
+        ) {
             db.run_maintenance_cycle().expect("one maintenance cycle");
             assert_eq!(count(&db, "life_items"), all_ids().len() as i64);
             assert_served(
@@ -324,7 +345,11 @@ fn runs_sealed_while_a_replacement_trains_stay_served_and_are_remapped_in_bounde
         "the remap resumes from its persisted cursor"
     );
     let mut batches = 0;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + SEALED.end - SEALED.start) as usize,
+        BATCH as usize,
+        10,
+    ) {
         let before = remap_progress(&db, "life_items", "embedding", &[]);
         if before.entries_remaining == 0 {
             break;
@@ -374,7 +399,7 @@ fn run_child(path: &Path, selected: &str) {
     observe_publication_cuts(
         Arc::new(move |cut| {
             if format!("{cut:?}") == selected {
-                println!("{MARKER} {cut:?}");
+                println!("\n{MARKER} {cut:?}");
                 std::io::stdout().flush().unwrap();
                 let mut byte = [0];
                 std::io::stdin()
@@ -382,7 +407,7 @@ fn run_child(path: &Path, selected: &str) {
                     .expect("the parent kills the paused child before releasing stdin");
             }
         }),
-        || drive_until_serving(&db),
+        || drive_until_serving(&db, 456, 16, 10),
     );
     db.close().unwrap();
     println!("{FINISHED}");
@@ -493,7 +518,7 @@ fn a_crash_immediately_before_or_after_the_codebook_switch_leaves_every_row_serv
         assert_eq!(count(&db, "life_items"), all_ids().len() as i64);
         assert_served(&db, all_ids(), &format!("{selected}, on reopen"));
 
-        drive_until_serving(&db);
+        drive_until_serving(&db, 456, 16, 10);
         drive_remap_to_completion(&db, &selected);
         assert_ne!(
             serving(&db, "life_items", "embedding", &[])

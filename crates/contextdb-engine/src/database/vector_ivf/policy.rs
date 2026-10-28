@@ -669,6 +669,59 @@ pub(crate) fn validate_query(
     }
     Ok(())
 }
+/// Literal statement breadth, retained as scalars with the query continuation.
+/// An inner None clears the corresponding column declaration for this query.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QueryBreadth {
+    pub target: Option<Option<u16>>,
+    pub probes: Option<Option<u32>>,
+    pub refine_factor: Option<Option<u32>>,
+}
+impl QueryBreadth {
+    pub(crate) fn resolve(
+        table: &str,
+        column: &str,
+        policy: Option<&ast::VectorSearchOverride>,
+    ) -> Result<Self> {
+        validate_query(table, column, policy)?;
+        if let Some(ast::VectorSearchOverride::Objectives { target_accuracy }) = policy {
+            return Ok(Self {
+                target: Some(
+                    hundredths(table, column, "TARGET_ACCURACY", target_accuracy, 1, 10000)?
+                        .map(|value| {
+                            u16::try_from(value)
+                                .map_err(|_| invalid(table, column, "TARGET_ACCURACY"))
+                        })
+                        .transpose()?,
+                ),
+                ..Self::default()
+            });
+        }
+        let Some(ast::VectorSearchOverride::Ivf {
+            probes,
+            refine_factor,
+        }) = policy
+        else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            target: None,
+            probes: probes
+                .as_ref()
+                .map(|v| {
+                    unsigned(table, column, "PROBES", v, false).and_then(|v| {
+                        v.map(|v| u32::try_from(v).map_err(|_| invalid(table, column, "PROBES")))
+                            .transpose()
+                    })
+                })
+                .transpose()?,
+            refine_factor: refine_factor
+                .as_ref()
+                .map(|v| hundredths(table, column, "REFINE_FACTOR", v, 100, u32::MAX))
+                .transpose()?,
+        })
+    }
+}
 pub(crate) fn query_policy_capacity(policy: Option<&ast::VectorSearchOverride>) -> usize {
     let value = |v: &V| match v {
         V::Value(s) => s.capacity(),

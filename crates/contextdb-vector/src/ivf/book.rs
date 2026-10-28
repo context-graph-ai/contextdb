@@ -29,7 +29,8 @@ pub fn codebook_allocation_layout(
     let n = dimensions
         .checked_mul(active_lists as usize)
         .ok_or_else(overflow)?;
-    let control = std::alloc::Layout::new::<BookData>();
+    let control = std::alloc::Layout::array::<BookData>(usize::from(active_lists != 0))
+        .map_err(|_| overflow())?;
     let values = std::alloc::Layout::array::<f32>(n).map_err(|_| overflow())?;
     let counts = std::alloc::Layout::array::<u64>(if training_counts {
         active_lists as usize
@@ -51,26 +52,42 @@ pub fn codebook_allocation_layout(
 }
 
 pub(crate) struct Codebook {
-    data: Box<BookData>,
+    data: Option<Box<BookData>>,
     dimensions: usize,
     active: usize,
-    _invoice: Invoice,
+    _invoice: Option<Invoice>,
 }
 impl Codebook {
     pub(crate) fn empty(owner: &MemoryBudgetOwner, manifest: Manifest) -> Result<Self> {
         Self::allocate(owner, manifest, true)
     }
     fn allocate(owner: &MemoryBudgetOwner, manifest: Manifest, counts: bool) -> Result<Self> {
+        Self::allocate_for(owner, manifest, counts, "clustered_codebook")
+    }
+    fn allocate_for(
+        owner: &MemoryBudgetOwner,
+        manifest: Manifest,
+        counts: bool,
+        operation: &'static str,
+    ) -> Result<Self> {
         let layouts =
             codebook_allocation_layout(manifest.dimensions, manifest.active_lists, counts)?;
+        if manifest.active_lists == 0 {
+            return Ok(Self {
+                data: None,
+                dimensions: manifest.dimensions,
+                active: 0,
+                _invoice: None,
+            });
+        }
         let n = layouts.values.size() / std::mem::size_of::<f32>();
-        let invoice = Invoice::reserve(owner, layouts.charged_bytes, "clustered_codebook")?;
+        let invoice = Invoice::reserve(owner, layouts.charged_bytes, operation)?;
         #[cfg(feature = "test-seams")]
         super::layout_observation::admitted(super::IvfConstructorAllocationForTest::Codebook(
             layouts,
         ));
-        Ok(Self {
-            data: Box::new(BookData {
+        let book = Self {
+            data: Some(Box::new(BookData {
                 values: vec![0.0; n],
                 counts: vec![
                     0;
@@ -80,11 +97,16 @@ impl Codebook {
                         0
                     }
                 ],
-            }),
+            })),
             dimensions: manifest.dimensions,
             active: manifest.active_lists as usize,
-            _invoice: invoice,
-        })
+            _invoice: Some(invoice),
+        };
+        #[cfg(feature = "test-seams")]
+        super::layout_observation::constructed(super::IvfConstructorAllocationForTest::Codebook(
+            layouts,
+        ));
+        Ok(book)
     }
     pub(crate) fn load(
         owner: &MemoryBudgetOwner,
@@ -98,6 +120,27 @@ impl Codebook {
         source: &impl ReadPages,
         manifest: Manifest,
     ) -> Result<Self> {
+        source.check_cancel()?;
+        if let Some(retained) = source.retained_codebook(manifest) {
+            if !retained.matches(manifest) {
+                return Err(corrupt());
+            }
+            let mut book = Self::allocate(owner, manifest, false)?;
+            if book.active != 0 {
+                let input = &retained.book.data().values;
+                for (output, input) in book
+                    .data_mut()
+                    .values
+                    .chunks_mut(PAGE_BYTES / 4)
+                    .zip(input.chunks(PAGE_BYTES / 4))
+                {
+                    source.check_cancel()?;
+                    output.copy_from_slice(input);
+                }
+            }
+            source.check_cancel()?;
+            return Ok(book);
+        }
         Self::load_inner(owner, source, manifest, false)
     }
     fn load_inner(
@@ -106,12 +149,29 @@ impl Codebook {
         manifest: Manifest,
         counts: bool,
     ) -> Result<Self> {
-        let mut book = Self::allocate(owner, manifest, counts)?;
-        let counts_digest = read_values(source, manifest, Some(&mut book.data.values))?;
+        Self::load_inner_for(owner, source, manifest, counts, "clustered_codebook")
+    }
+    fn load_inner_for(
+        owner: &MemoryBudgetOwner,
+        source: &impl ReadPages,
+        manifest: Manifest,
+        counts: bool,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let mut book = Self::allocate_for(owner, manifest, counts, operation)?;
+        if book.active == 0 {
+            return Ok(book);
+        }
+        let counts_digest = read_values(source, manifest, Some(&mut book.data_mut().values))?;
         let mut page = [0; PAGE_BYTES];
         if counts {
             let mut hash = blake3::Hasher::new();
-            for (ordinal, chunk) in book.data.counts.chunks_mut(PAGE_BYTES / 8).enumerate() {
+            for (ordinal, chunk) in book
+                .data_mut()
+                .counts
+                .chunks_mut(PAGE_BYTES / 8)
+                .enumerate()
+            {
                 if !super::storage::read_page(
                     source,
                     manifest.key(PageKind::Accumulators, 0, ordinal as u64),
@@ -148,17 +208,24 @@ impl Codebook {
         }
         Ok(best)
     }
+    fn data(&self) -> &BookData {
+        self.data.as_deref().expect("active codebook has data")
+    }
+    fn data_mut(&mut self) -> &mut BookData {
+        self.data.as_deref_mut().expect("active codebook has data")
+    }
     pub(crate) fn row(&self, list: usize) -> &[f32] {
-        &self.data.values[list * self.dimensions..(list + 1) * self.dimensions]
+        &self.data().values[list * self.dimensions..(list + 1) * self.dimensions]
     }
     pub(crate) fn seed(&mut self, list: usize, vector: &[f32]) {
-        self.data.values[list * self.dimensions..(list + 1) * self.dimensions]
-            .copy_from_slice(vector);
+        let dimensions = self.dimensions;
+        self.data_mut().values[list * dimensions..(list + 1) * dimensions].copy_from_slice(vector);
         self.normalize(list);
-        self.data.counts[list] = 1;
+        self.data_mut().counts[list] = 1;
     }
     fn normalize(&mut self, list: usize) {
-        let row = &mut self.data.values[list * self.dimensions..(list + 1) * self.dimensions];
+        let dimensions = self.dimensions;
+        let row = &mut self.data_mut().values[list * dimensions..(list + 1) * dimensions];
         let norm = row
             .iter()
             .map(|x| f64::from(*x).powi(2))
@@ -172,8 +239,11 @@ impl Codebook {
     }
     pub(crate) fn train(&mut self, source: &impl ReadPages, vector: &[f32]) -> Result<()> {
         let list = self.nearest(source, vector)?;
-        self.data.counts[list] = self.data.counts[list].checked_add(1).ok_or_else(corrupt)?;
-        let count = self.data.counts[list] as f64;
+        let next = self.data().counts[list]
+            .checked_add(1)
+            .ok_or_else(corrupt)?;
+        self.data_mut().counts[list] = next;
+        let count = next as f64;
         let norm = vector
             .iter()
             .map(|x| f64::from(*x).powi(2))
@@ -182,7 +252,8 @@ impl Codebook {
         if norm == 0.0 {
             return Ok(());
         }
-        for (dst, src) in self.data.values[list * self.dimensions..(list + 1) * self.dimensions]
+        let dimensions = self.dimensions;
+        for (dst, src) in self.data_mut().values[list * dimensions..(list + 1) * dimensions]
             .iter_mut()
             .zip(vector)
         {
@@ -196,8 +267,11 @@ impl Codebook {
         target: &mut impl WritePages,
         manifest: Manifest,
     ) -> Result<[u8; 32]> {
+        if self.active == 0 {
+            return Ok([0; 32]);
+        }
         let mut values_hash = blake3::Hasher::new();
-        for (ordinal, chunk) in self.data.values.chunks(PAGE_BYTES / 4).enumerate() {
+        for (ordinal, chunk) in self.data().values.chunks(PAGE_BYTES / 4).enumerate() {
             let mut page = [0u8; PAGE_BYTES];
             for (i, value) in chunk.iter().enumerate() {
                 let bits = value.to_le_bytes();
@@ -211,7 +285,7 @@ impl Codebook {
             )?;
         }
         let mut counts_hash = blake3::Hasher::new();
-        for (ordinal, chunk) in self.data.counts.chunks(PAGE_BYTES / 8).enumerate() {
+        for (ordinal, chunk) in self.data().counts.chunks(PAGE_BYTES / 8).enumerate() {
             let mut page = [0u8; PAGE_BYTES];
             for (i, value) in chunk.iter().enumerate() {
                 let bits = value.to_le_bytes();
@@ -445,4 +519,73 @@ fn read_values(
         return Err(super::memory::corrupt_page(m.key(PageKind::Codebook, 0, 1)));
     }
     Ok(counts_digest)
+}
+
+/// One immutable codebook, loaded by the existing checked constructor and paid
+/// by its original maintenance owner. Its holder owns the separate metadata
+/// control; this object retains the actual values invoice until physical free.
+/// Query constructors may consume these values while admitting their own real
+/// operation object on the original reader owner.
+pub struct RetainedCodebook {
+    manifest: Manifest,
+    book: Codebook,
+}
+impl RetainedCodebook {
+    pub fn load(
+        owner: &MemoryBudgetOwner,
+        source: &impl ReadPages,
+        manifest: Manifest,
+    ) -> Result<Self> {
+        Ok(Self {
+            manifest,
+            book: Codebook::load_inner_for(
+                owner,
+                source,
+                manifest,
+                false,
+                "clustered_retained_codebook",
+            )?,
+        })
+    }
+    pub fn manifest(&self) -> Manifest {
+        self.manifest
+    }
+    pub fn charged_bytes(&self) -> usize {
+        self.book
+            ._invoice
+            .as_ref()
+            .map_or(0, Invoice::charged_bytes)
+    }
+    #[cfg(feature = "test-seams")]
+    pub fn original_owner_for_test(&self) -> usize {
+        self.book
+            ._invoice
+            .as_ref()
+            .map_or(0, Invoice::original_owner_for_test)
+    }
+    pub fn matches(&self, manifest: Manifest) -> bool {
+        self.manifest.partition == manifest.partition
+            && self.manifest.generation == manifest.generation
+            && self.manifest.dimensions == manifest.dimensions
+            && self.manifest.active_lists == manifest.active_lists
+            && self.manifest.codebook == manifest.codebook
+    }
+}
+
+/// The current tuple's recorded old codebook, without opening any centroid or
+/// directory payload. An already quarantined legacy portion uses the existing
+/// exhaustive route and needs no unusable centroid object.
+pub fn retained_codebook_manifest(
+    source: &impl ReadPages,
+    partition: u64,
+) -> Result<Option<Manifest>> {
+    let Some(manifest) = source.manifest(partition)? else {
+        return Ok(None);
+    };
+    let catalog = super::catalog::Catalog::load(source, manifest)?;
+    Ok(if catalog.legacy_unserviceable {
+        None
+    } else {
+        catalog.legacy.filter(|manifest| manifest.active_lists != 0)
+    })
 }

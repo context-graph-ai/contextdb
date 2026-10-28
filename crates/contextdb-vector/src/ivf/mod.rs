@@ -15,8 +15,13 @@ pub mod storage;
 mod types;
 mod versions;
 mod writer;
-pub use catalog::{CatalogState, inspect as inspect_catalog};
-pub use search::{search, search_with_eligibility, search_with_work, visit_visible_canonical};
+pub use catalog::{
+    CatalogState, inspect as inspect_catalog, inspect_and_record as inspect_and_record_catalog,
+};
+pub use search::{
+    query_workspace_allocation_bytes, search, search_with_eligibility, search_with_work,
+    visit_visible_canonical,
+};
 pub use storage::Verdict;
 pub use types::{
     BufferState, CandidateIdentity, CandidateSource, CanonicalCandidate, Hit, Mode, Policy,
@@ -24,12 +29,15 @@ pub use types::{
 };
 pub use writer::{ClusteredIndex, RemapProgress};
 
-pub use book::{CodebookAllocationLayouts, codebook_allocation_layout};
+pub use book::{
+    CodebookAllocationLayouts, RetainedCodebook, codebook_allocation_layout,
+    retained_codebook_manifest,
+};
 pub use writer::{WriterWorkspaceLayout, workspace_allocation_layout};
 #[cfg(feature = "test-seams")]
 mod layout_observation;
 #[cfg(feature = "test-seams")]
 pub use layout_observation::{
-    IvfConstructorAllocationForTest, IvfConstructorObserverForTest,
+    IvfConstructorAllocationForTest, IvfConstructorObserverForTest, load_codebook_values_for_test,
     with_ivf_constructor_observer_for_test,
 };

@@ -1056,3 +1056,12 @@ impl contextdb_vector::store::StreamedVectorSuffixHandle for CapturedSuffixLoade
 }
 
 use crate::persistence::writer_source::WriterSnapshotHandle;
+
+impl CapturedVectorRootLease {
+    pub(crate) fn native_ivf_cache(&self) -> &crate::persistence::vector_ivf::NativeIvfCache {
+        match &self.holder {
+            CapturedRootHolder::Writer(root) => &root.native_ivf_cache,
+            CapturedRootHolder::Retained(source) => &source.native_ivf_cache,
+        }
+    }
+}

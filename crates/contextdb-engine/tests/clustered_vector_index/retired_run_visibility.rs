@@ -9,8 +9,8 @@
 //! later updates, and every row is still answered once, through reopen.
 
 use super::support::{
-    GenerationPage, IndexTestOptions, MAX_MAINTENANCE_CYCLES, drive_until_serving, empty,
-    generation_pages, int_ids, ivf, legacy_runs, observe_search, old_copy_visible,
+    GenerationPage, IndexTestOptions, drive_until_serving, empty, generation_pages, int_ids, ivf,
+    legacy_runs, maintenance_cycles, observe_search, old_copy_visible,
     open_with_index_test_options, params, retained_generations, retired_legacy_rows, serving,
     switch_state, unit_vector,
 };
@@ -138,7 +138,7 @@ fn a_change_to_a_row_in_a_retired_legacy_run_keeps_old_pages_until_state_c() {
     for id in BUILT {
         insert(&db, id);
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, (BUILT.end - BUILT.start) as usize, 8, 10);
     let old = serving(&db, TABLE, "embedding", &[])
         .expect("a generation serves")
         .generation;
@@ -149,7 +149,12 @@ fn a_change_to_a_row_in_a_retired_legacy_run_keeps_old_pages_until_state_c() {
     }
     let mut during = DURING;
     let mut published = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES * 4 {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start) as usize + 40 + (DURING.end - DURING.start) as usize,
+        8,
+        10,
+    ) * 4
+    {
         cycle(&db);
         if serving(&db, TABLE, "embedding", &[]).is_some_and(|serving| serving.generation > old) {
             published = true;
@@ -178,7 +183,12 @@ fn a_change_to_a_row_in_a_retired_legacy_run_keeps_old_pages_until_state_c() {
     // Retire legacy runs one maintenance cycle at a time until at least one
     // has retired and at least one remains; no old-generation page is
     // released or allocated meanwhile.
-    for step in 0..MAX_MAINTENANCE_CYCLES * 4 {
+    for step in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start) as usize + 40 + (DURING.end - DURING.start) as usize,
+        8,
+        10,
+    ) * 4
+    {
         let remaining = legacy_runs(&db, TABLE, "embedding", &[]);
         if remaining < at_publication && remaining > 0 {
             break;
@@ -249,7 +259,12 @@ fn a_change_to_a_row_in_a_retired_legacy_run_keeps_old_pages_until_state_c() {
     );
 
     let mut reached_c = false;
-    for step in 0..MAX_MAINTENANCE_CYCLES * 4 {
+    for step in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start) as usize + 40 + (DURING.end - DURING.start) as usize,
+        8,
+        10,
+    ) * 4
+    {
         if switch_state(&db, TABLE, "embedding", &[]).legacy.is_none() {
             reached_c = true;
             break;
@@ -265,7 +280,12 @@ fn a_change_to_a_row_in_a_retired_legacy_run_keeps_old_pages_until_state_c() {
     assert_current(&db, changed, deleted, untouched, "in state C");
 
     let mut reclaimed = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES * 4 {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start) as usize + 40 + (DURING.end - DURING.start) as usize,
+        8,
+        10,
+    ) * 4
+    {
         if !retained_generations(&db, TABLE, "embedding", &[]).contains(&old) {
             reclaimed = true;
             break;

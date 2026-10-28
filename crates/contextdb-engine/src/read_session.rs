@@ -4014,6 +4014,7 @@ impl ReadSession {
         cancellation: &OwnerReadCancellation,
         query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
     ) -> Result<OwnedQueryResult> {
+        let _native_selection = crate::database::vector_ivf::ReadOnlySelection::enter();
         match selected {
             ReadSessionState::LiveDatabase(database) => {
                 let cache = database.read_cache_observation()?;
@@ -4487,6 +4488,7 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ReadCursor> {
+        let _native_selection = crate::database::vector_ivf::ReadOnlySelection::enter();
         let selected_state = self.selected_state();
         let route = selected_state.route();
         match selected_state.as_ref() {
@@ -7658,6 +7660,7 @@ impl ReadCursor {
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<CursorPage> {
+        let _native_selection = crate::database::vector_ivf::ReadOnlySelection::enter();
         let resources = Arc::clone(&self.state.resources);
         let progress = self.state.progress.as_ref().map(Arc::clone);
         contextdb_core::find_attribution::begin("cursor fetch");
@@ -7871,6 +7874,24 @@ impl ReadSession {
             }
             ReadSessionState::OwnerChannel(_) => Err(Error::PlanError(
                 "owner-channel session has no local installed history database".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl ReadSession {
+    pub fn native_ivf_verification_window_for_test(&self) -> Result<u64> {
+        match self.selected_state().as_ref() {
+            ReadSessionState::LiveDatabase(database) => {
+                database.native_ivf_verification_window_for_test()
+            }
+            ReadSessionState::DirectFile(reader) => reader
+                .execution_target()
+                .resident_history_database_for_test()?
+                .native_ivf_verification_window_for_test(),
+            ReadSessionState::OwnerChannel(_) => Err(Error::Other(
+                "remote verification observations belong to the serving process".into(),
             )),
         }
     }

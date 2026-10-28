@@ -1,24 +1,21 @@
 //! A read-only session that finds live damage in a Context's derived index
 //! pages tells the operator in plain words and never writes the store: its
-//! inspection row shows the rebuild recovery action and the note "quarantined
-//! in memory for this reader (AUTO routed to EXACT, verified once per
-//! admitted manifest window); persisted and rebuilt on the next writer open",
-//! AUTO answers exactly, and INDEXED is refused as store corruption. The next
-//! writer open persists the verdict: the row still shows the rebuild action,
-//! with the note "damage recorded; rebuild scheduled for the next maintenance
-//! cycle", and that verdict is in the store: a fresh read-only session opened
-//! after the writer closes, before any maintenance, shows the same action and
-//! note without verifying the damage again. Maintenance then rebuilds, after
-//! which no recovery action or note remains. No
-//! inspection value anywhere says [unrecorded] or [recorded].
+//! inspection row shows the rebuild recovery action and the note "damage seen
+//! by a reader; not yet recorded (a writer records it when it next touches this
+//! partition)". AUTO answers exactly, and INDEXED is refused as store corruption.
+//! The next writer's first SHOW touches the partition and records the verdict:
+//! the row still shows the rebuild action, with the note "recorded". A fresh
+//! read-only session opened after the writer closes, before any maintenance,
+//! shows the same action and note without verifying the damage again.
+//! Maintenance then rebuilds, after which no recovery action or note remains.
+//! No inspection value anywhere says [unrecorded] or [recorded].
 
 use super::support::{
-    IndexDamage, IndexTestOptions, SearchRoute, damage_serving_index, damage_verifications,
-    drive_until_serving, empty, int_ids, ivf, observe_search, open_reader,
+    IndexDamage, IndexTestOptions, QuerySession, SearchRoute, damage_serving_index,
+    damage_verifications, drive_until_serving, empty, int_ids, ivf, observe_search, open_reader,
     open_with_index_test_options, params, partition_inspection, unit_vector, verdict_recorded,
 };
 use contextdb_core::Value;
-use contextdb_engine::Database;
 use std::path::Path;
 
 const DIMENSIONS: usize = 16;
@@ -27,10 +24,10 @@ const OPTIONS: IndexTestOptions = IndexTestOptions {
     write_buffer_cap_bytes: Some(1024),
     build_batch_rows: None,
 };
-const WRITER_NOTE: &str = "damage recorded; rebuild scheduled for the next maintenance cycle";
-const READER_NOTE: &str = "quarantined in memory for this reader (AUTO routed to EXACT, verified once per admitted manifest window); persisted and rebuilt on the next writer open";
+const WRITER_NOTE: &str = "recorded";
+const READER_NOTE: &str = "damage seen by a reader; not yet recorded (a writer records it when it next touches this partition)";
 
-fn query(db: &Database, id: i64, mode: &str) -> contextdb_core::Result<Vec<i64>> {
+fn query(db: &dyn QuerySession, id: i64, mode: &str) -> contextdb_core::Result<Vec<i64>> {
     db.execute(
         &format!(
             "SELECT id FROM damaged_items ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 10"
@@ -40,7 +37,7 @@ fn query(db: &Database, id: i64, mode: &str) -> contextdb_core::Result<Vec<i64>>
     .map(|result| int_ids(&result))
 }
 
-fn assert_no_persistence_labels(db: &Database, when: &str) {
+fn assert_no_persistence_labels(db: &dyn QuerySession, when: &str) {
     let row = partition_inspection(db, "damaged_items", "embedding", &[]);
     for text in &row.texts {
         assert!(
@@ -91,7 +88,7 @@ fn a_read_only_session_reports_live_damage_in_plain_words_and_the_next_writer_pe
             )
             .expect("commit one row");
     }
-    drive_until_serving(&writer);
+    drive_until_serving(&writer, 240, 1, 10);
     assert_eq!(
         partition_inspection(&writer, "damaged_items", "embedding", &[]).recovery_action,
         "none",
@@ -159,10 +156,10 @@ fn a_read_only_session_reports_live_damage_in_plain_words_and_the_next_writer_pe
             persisted.note.as_deref()
         ),
         ("rebuild", Some(WRITER_NOTE)),
-        "the writer open records the damage and schedules the rebuild: {persisted:?}"
+        "the writer's first SHOW touches the partition and records the damage: {persisted:?}"
     );
-    assert_no_persistence_labels(&writer, "after the writer opens");
-    // Closed with no maintenance: what the writer open wrote is all a later
+    assert_no_persistence_labels(&writer, "after the writer's first SHOW");
+    // Closed with no maintenance: what the writer's first SHOW wrote is all a later
     // reader can see.
     writer
         .close()
@@ -171,7 +168,7 @@ fn a_read_only_session_reports_live_damage_in_plain_words_and_the_next_writer_pe
     let after_writer = store_bytes(&path);
     assert!(
         after_writer != before_reader,
-        "the writer open wrote the verdict to the store"
+        "the writer's first SHOW wrote the verdict to the store"
     );
     {
         let reader = open_reader(&path);
@@ -200,7 +197,7 @@ fn a_read_only_session_reports_live_damage_in_plain_words_and_the_next_writer_pe
     );
 
     let writer = open_with_index_test_options(&path, OPTIONS);
-    drive_until_serving(&writer);
+    drive_until_serving(&writer, 240, 1, 10);
     assert_eq!(
         partition_inspection(&writer, "damaged_items", "embedding", &[]).recovery_action,
         "none",
@@ -264,16 +261,16 @@ fn a_read_only_session_reports_live_damage_in_plain_words_and_the_next_writer_pe
     let persisted = partition_inspection(&writer, "damaged_items", "embedding", &[]);
     assert_eq!(
         persisted.recovery_action, "rebuild",
-        "after the writer opens, the persisted verdict still shows the rebuild action: {persisted:?}"
+        "after the writer's first SHOW, the persisted verdict still shows the rebuild action: {persisted:?}"
     );
     assert_eq!(
         persisted.note.as_deref(),
         Some(WRITER_NOTE),
-        "the note now says the damage is recorded and the rebuild scheduled: {persisted:?}"
+        "the note now says the damage is recorded: {persisted:?}"
     );
-    assert_no_persistence_labels(&writer, "after the writer opens");
+    assert_no_persistence_labels(&writer, "after the writer's first SHOW");
 
-    drive_until_serving(&writer);
+    drive_until_serving(&writer, 240, 1, 10);
     let rebuilt = partition_inspection(&writer, "damaged_items", "embedding", &[]);
     assert_eq!(
         (rebuilt.recovery_action.as_str(), rebuilt.note.as_deref()),

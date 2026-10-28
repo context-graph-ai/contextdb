@@ -428,3 +428,29 @@ pub fn inspect(
         },
     }))
 }
+
+/// Verify through the existing metadata path and persist its first damage
+/// verdict in the caller's ordinary native transaction. This needs no vector
+/// buffer, training workspace or codebook constructor.
+pub fn inspect_and_record(
+    store: &mut impl super::storage::PageStore,
+    partition: u64,
+    max_delta_runs: u64,
+) -> Result<Option<CatalogState>> {
+    store.check_cancel()?;
+    let Some(state) = inspect(store, partition, max_delta_runs)? else {
+        return Ok(None);
+    };
+    if let Some(key) = state.unserviceable
+        && !state.verdict_recorded
+    {
+        let manifest = store.manifest(partition)?.ok_or_else(corrupt)?;
+        let mut catalog = Catalog::load(store, manifest)?;
+        catalog.unserviceable.get_or_insert(key);
+        let mut transaction = store.begin()?;
+        catalog.store(&mut transaction, manifest)?;
+        transaction.commit()?;
+        return inspect(store, partition, max_delta_runs);
+    }
+    Ok(Some(state))
+}

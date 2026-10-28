@@ -139,6 +139,17 @@ impl Database {
         } else {
             self.snapshot_registry.register(snapshot)
         };
+        if let Some(root) = &root {
+            if let Some(registered) = self
+                .snapshot_registry
+                .state
+                .lock()
+                .active
+                .get_mut(&registration.token)
+            {
+                registered.native_root = Some(root.downgrade());
+            }
+        }
         Ok(SnapshotPin {
             _database: self,
             _registration: registration,
@@ -2625,12 +2636,13 @@ impl Database {
         k: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
+        query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
         is_reader_memory_refusal: impl Fn(&E) -> bool,
         allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
-        before_source_entry: impl FnMut() -> std::result::Result<(), E>,
-        before_exact_candidate: impl FnMut() -> std::result::Result<(), E>,
-        before_distance: impl FnMut() -> std::result::Result<(), E>,
-        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        mut before_exact_candidate: impl FnMut() -> std::result::Result<(), E>,
+        mut before_distance: impl FnMut() -> std::result::Result<(), E>,
+        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -2642,6 +2654,30 @@ impl Database {
     {
         let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
+        if self.persistence.is_some() || self.retained_graph_source.is_some() {
+            if let Some(result) = self.native_ivf_bounded_search(
+                index,
+                query,
+                k,
+                groups,
+                mode,
+                query_breadth,
+                &mut before_source_entry,
+                &mut before_exact_candidate,
+                &mut before_distance,
+                &mut before_retain,
+                &mut release_retained,
+                _read_memory.clone(),
+                row_check,
+            )? {
+                return Ok(result);
+            }
+            // An unavailable native canonical scope retains the existing exact
+            // fallback below. INDEXED already returned its typed refusal.
+            return self.with_vector_read_admission(vector_copy_owner, |_| {
+                Ok(crate::executor::BoundedVectorSearchOutcome::Unavailable)
+            });
+        }
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             self.clear_last_vector_search_trace();
             let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(

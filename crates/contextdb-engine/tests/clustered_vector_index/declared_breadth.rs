@@ -53,7 +53,7 @@ fn explicit_probes_and_refine_factor_bound_list_pages_and_rescores_exactly() {
         }
     }
     db.commit(tx).expect("commit every Context");
-    drive_until_serving(&db);
+    drive_until_serving(&db, CONTEXTS as usize * ROWS_PER_CONTEXT as usize, 1, 10);
 
     for ordinal in 0..CONTEXTS {
         let settings = inspected_search_settings(

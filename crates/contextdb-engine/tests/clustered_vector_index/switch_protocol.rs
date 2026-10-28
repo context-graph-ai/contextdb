@@ -13,10 +13,10 @@
 //! with the same property.
 
 use super::support::{
-    IndexTestOptions, LegacyEntries, MAX_MAINTENANCE_CYCLES, PublicationCut, ReplacementTrigger,
-    SwitchPhase, SwitchState, build_progress, delta_entries, drive_until_serving, empty, int_ids,
-    ivf, legacy_entries_prepared_total, observe_publication_cuts, open_with_index_test_options,
-    params, serving, switch_state, unit_vector, write_buffer,
+    IndexTestOptions, LegacyEntries, PublicationCut, ReplacementTrigger, SwitchPhase, SwitchState,
+    build_progress, delta_entries, drive_until_serving, empty, int_ids, ivf,
+    legacy_entries_prepared_total, maintenance_cycles, observe_publication_cuts,
+    open_with_index_test_options, params, serving, switch_state, unit_vector, write_buffer,
 };
 use contextdb_core::{Value, Wallclock};
 use contextdb_engine::Database;
@@ -185,11 +185,16 @@ struct SwitchFixture {
 fn reach_state_b(db: &Database) -> SwitchFixture {
     create(db);
     insert_all(db, BUILT);
-    drive_until_serving(db);
+    drive_until_serving(db, (BUILT.end - BUILT.start) as usize, BATCH as usize, 10);
     let old = serving(db, "switch_items", "embedding", &[]).expect("the first generation serves");
     insert_all(db, GROWTH);
     let mut training = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + LEGACY.end - LEGACY.start + 300)
+            as usize,
+        BATCH as usize,
+        10,
+    ) {
         bounded_cycle(db, "while the replacement starts");
         if build_progress(db, "switch_items", "embedding", &[]).in_flight {
             training = true;
@@ -203,7 +208,12 @@ fn reach_state_b(db: &Database) -> SwitchFixture {
     let committed = BUILT.chain(GROWTH).chain(LEGACY).collect::<BTreeSet<_>>();
     let prepared_before_publication = prepared(db);
     let mut published = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + LEGACY.end - LEGACY.start + 300)
+            as usize,
+        BATCH as usize,
+        10,
+    ) {
         bounded_cycle(db, "up to and including the publication call");
         if matches!(serving(db, "switch_items", "embedding", &[]), Some(now) if now.generation != old.generation)
         {
@@ -271,7 +281,12 @@ fn remap_to_completion(db: &Database, fixture: &mut SwitchFixture, stage: &str) 
         .codebook;
     let mut next_id = AFTER_SWITCH_FIRST;
     let mut remapped = state(db).legacy_entries_remapped;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + LEGACY.end - LEGACY.start + 300)
+            as usize,
+        BATCH as usize,
+        10,
+    ) {
         let now = state(db);
         if now.phase == SwitchPhase::Serving {
             break;
@@ -382,7 +397,7 @@ fn run_child(path: &Path) {
     observe_publication_cuts(
         Arc::new(|cut| {
             if cut == PublicationCut::DuringRemapBatch {
-                println!("{MARKER}");
+                println!("\n{MARKER}");
                 std::io::stdout().flush().unwrap();
                 let mut byte = [0];
                 std::io::stdin()
@@ -391,7 +406,12 @@ fn run_child(path: &Path) {
             }
         }),
         || {
-            for _ in 0..MAX_MAINTENANCE_CYCLES {
+            for _ in 0..maintenance_cycles(
+                (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + LEGACY.end - LEGACY.start
+                    + 300) as usize,
+                BATCH as usize,
+                10,
+            ) {
                 db.run_maintenance_cycle().unwrap();
             }
         },
@@ -485,7 +505,12 @@ fn a_replacement_due_while_legacy_entries_are_remapped_waits_for_the_remap_to_fi
     fixture.committed.extend(4_000..4_300);
 
     let mut deferred = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + LEGACY.end - LEGACY.start + 300)
+            as usize,
+        BATCH as usize,
+        10,
+    ) {
         bounded_cycle(&db, "with a replacement due during the remap");
         if state(&db).phase == SwitchPhase::Serving {
             break;
@@ -530,7 +555,13 @@ fn a_replacement_due_while_legacy_entries_are_remapped_waits_for_the_remap_to_fi
     );
 
     let mut finished = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES * 2 {
+    for _ in 0..maintenance_cycles(
+        (BUILT.end - BUILT.start + GROWTH.end - GROWTH.start + LEGACY.end - LEGACY.start + 300)
+            as usize,
+        BATCH as usize,
+        10,
+    ) * 2
+    {
         bounded_cycle(&db, "the deferred replacement");
         let now = state(&db);
         if now.phase == SwitchPhase::Serving

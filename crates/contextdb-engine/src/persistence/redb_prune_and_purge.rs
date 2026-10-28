@@ -1745,11 +1745,27 @@ impl RedbPersistence {
         #[cfg(test)]
         let _purge_with_db_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
             "RedbPersistence::commit_authoritative_purge::with_db");
+        let _native_decode = self.writer_decode_scope()?;
+        let native_projection = self.require_decode_original()?;
+        let native_original = native_projection.preparation_original()?;
+        let native_admission =
+            native_storage_admission::StorageAdmissionScope::writer_original(&native_original)?;
+        let native_basis = if projection.vector_partition_identities.is_empty() {
+            None
+        } else {
+            Some((self.paged_root_capture()?)()?)
+        };
         self.with_db(|db| {
             #[cfg(test)]
             let _purge_begin_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
                 "RedbPersistence::commit_authoritative_purge::begin_history_write");
             let write_txn = Self::begin_history_write(db)?;
+            #[cfg(feature="test-seams")]
+            let mut native_observation=native_basis.as_ref().map(|_|crate::vector_ivf_observations::NativeIvfOuterWriteObservation::begin());
+            let mut native_session=if let Some(basis)=&native_basis {
+                let (_,snapshot,source_frontier)=basis.authenticate()?;
+                Some(vector_ivf::write::WriteSession::borrow(&write_txn,&native_admission,native_projection.vector_budget()?,snapshot,source_frontier,frontier)?)
+            } else {None};
             #[cfg(test)]
             drop(_purge_begin_producer);
 
@@ -1782,6 +1798,8 @@ impl RedbPersistence {
                 operation,
                 None,
             )?;
+            if let Some(session)=&mut native_session {session.erase_rows(self,&native_original,&projection.vector_partition_identities)?;session.bind_final()?;}
+            drop(native_session);
             #[cfg(test)]
             drop(_purge_erasure_producer);
             #[cfg(test)]
@@ -1807,9 +1825,13 @@ impl RedbPersistence {
                     "RedbPersistence::commit_authoritative_purge::commit");
                 #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
+                #[cfg(feature="test-seams")]
+                if let Some(observer)=&native_observation {observer.before_commit()?;}
                 let graph_commit_result = write_txn.commit();
                 #[cfg(any(test, feature = "test-seams"))]
                 if graph_commit_result.is_ok() {
+                    #[cfg(feature="test-seams")]
+                    if let Some(observer)=&mut native_observation {observer.committed(frontier);}
                     graph_publication_attempt.committed();
                     graph_observation_checkpoint(11)?;
                 }
@@ -1819,6 +1841,13 @@ impl RedbPersistence {
         })?;
         #[cfg(test)]
         drop(_purge_with_db_producer);
+        for identity in &projection.vector_partition_identities {
+            self.native_ivf_cache
+                .forget_retained_route(vector_ivf::retained::route_identity(
+                    &identity.index,
+                    &identity.partition_key,
+                ));
+        }
         Ok(published_identities)
     }
 

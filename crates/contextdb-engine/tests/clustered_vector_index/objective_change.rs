@@ -117,7 +117,7 @@ fn qualified(root: &std::path::Path) -> Database {
             }
         }),
     );
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     db
 }
 
@@ -159,7 +159,7 @@ fn a_raised_target_keeps_only_the_settings_that_meet_it_until_requalification() 
         "whose stored summaries are exact on every sample",
     );
 
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     assert!(
         !requalification_pending(&db, "objective_items", "embedding", &[]),
         "nothing is pending once a requalified generation publishes"
@@ -203,7 +203,7 @@ fn a_changed_expected_population_keeps_the_covered_settings_with_requalification
         "whose summaries still meet the unchanged target",
     );
 
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     assert!(!requalification_pending(
         &db,
         "objective_items",

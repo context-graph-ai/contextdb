@@ -766,3 +766,27 @@ fn legacy_writer_error(error: redb::NativeBackendError) -> io::Error {
 #[cfg(test)]
 #[path = "writer_native_io_contract_tests.rs"]
 mod native_io_contract_tests;
+
+/// Borrow the real physical owner for synchronous disk-admission tests.
+#[cfg(feature = "test-seams")]
+#[derive(Clone)]
+pub struct NativeIvfPhysicalDiskOwnerForTest(Arc<LockedWriterFile>);
+#[cfg(feature = "test-seams")]
+impl NativeIvfPhysicalDiskOwnerForTest {
+    pub(super) fn new(owner: Arc<LockedWriterFile>) -> Self {
+        Self(owner)
+    }
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+    pub fn ceiling(&self) -> Option<u64> {
+        let limit = self.0.disk_limit.load(std::sync::atomic::Ordering::SeqCst);
+        (limit != 0).then_some(limit)
+    }
+    pub fn set_ceiling(&self, limit: Option<u64>) -> io::Result<()> {
+        self.0.set_disk_limit(limit)
+    }
+    pub fn file_len(&self) -> io::Result<u64> {
+        self.0.file.metadata().map(|m| m.len())
+    }
+}

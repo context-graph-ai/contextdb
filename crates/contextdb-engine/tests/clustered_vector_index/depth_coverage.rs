@@ -22,8 +22,8 @@
 //! own factor.
 
 use super::support::{
-    MAX_MAINTENANCE_CYCLES, ObjectiveStatus, SearchOutcome, SearchRoute, SearchWork,
-    calibration_receipt, drive_until_serving, empty, int_ids, observe_search, open_caller_driven,
+    ObjectiveStatus, SearchOutcome, SearchRoute, SearchWork, calibration_receipt,
+    drive_until_serving, empty, int_ids, maintenance_cycles, observe_search, open_caller_driven,
     params, plant_qualification, prefix_coverage, rewrite_next_calibration_answers, serving,
     unit_vector,
 };
@@ -128,7 +128,7 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
                 }
             }),
         );
-        drive_until_serving(&db);
+        drive_until_serving(&db, ROWS as usize, 1, 10);
     }
 
     let receipt = calibration_receipt(&db, "covered_items", "embedding", &[])
@@ -310,7 +310,7 @@ fn auto_takes_the_index_on_a_qualified_partition() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("qualified.db"));
     store(&db);
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     let generation = serving(&db, "covered_items", "embedding", &[])
         .expect("a generation serves")
         .generation;
@@ -324,7 +324,7 @@ fn auto_takes_the_index_on_a_qualified_partition() {
         100,
         u64::try_from(ROWS).unwrap(),
     );
-    for _ in 0..MAX_MAINTENANCE_CYCLES.min(4) {
+    for _ in 0..maintenance_cycles(ROWS as usize, 1, 10).min(4) {
         assert_eq!(
             serving(&db, "covered_items", "embedding", &[])
                 .unwrap()
@@ -445,7 +445,7 @@ fn near_store(path: &std::path::Path, rows: &[(i64, Vec<f32>)]) -> Database {
             PINNED_PROBES,
             PINNED_FACTOR,
         );
-        drive_until_serving(&db);
+        drive_until_serving(&db, BACKGROUND as usize + rows.len() + 1, 1, 10);
     }
     db
 }

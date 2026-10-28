@@ -9,7 +9,7 @@
 //! reopens cleanly.
 
 use super::support::{
-    IndexCancelPoint, MAX_MAINTENANCE_CYCLES, count, drive_until_serving, empty, int_ids, ivf,
+    IndexCancelPoint, count, drive_until_serving, empty, int_ids, ivf, maintenance_cycles,
     observe_index_cancel_points, observe_search, open_caller_driven, open_with_build_batch_rows,
     outstanding_index_reservations, params, retained_generations,
     run_maintenance_cycle_cancellable, serving, unit_vector,
@@ -130,7 +130,7 @@ fn search_cancelled_at(target: IndexCancelPoint) {
     let db = open_caller_driven(&path);
     create(&db);
     insert_rows(&db, 0..FIRST_ROWS);
-    drive_until_serving(&db);
+    drive_until_serving(&db, 120, 1, 10);
     let ids = (0..FIRST_ROWS).collect::<Vec<_>>();
 
     let session = db
@@ -140,6 +140,9 @@ fn search_cancelled_at(target: IndexCancelPoint) {
     // already the cache's and the reader's settled level is known.
     let reference = int_ids(&session.execute(SQL, &query()).expect("uncancelled search"));
     assert_eq!(reference.len(), 5);
+    // A subsequent search clears the previous trace, so settle that refund
+    // before measuring the reader level for the cancellation.
+    db.__reset_last_query_vector_trace_for_test();
     let settled = db.declared_read_memory_for_test().retained_bytes_for_test();
 
     let cancellation = OwnerReadCancellation::new();
@@ -193,8 +196,8 @@ fn a_search_cancelled_while_scoring_candidates_returns_the_typed_cancellation() 
 
 /// Runs cancellable maintenance cycles until one reaches `target`, where it
 /// is cancelled; every earlier cycle completes normally.
-fn cancel_maintenance_at(db: &Database, target: IndexCancelPoint) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+fn cancel_maintenance_at(db: &Database, target: IndexCancelPoint, batch: usize) {
+    for _ in 0..maintenance_cycles((FIRST_ROWS * 2) as usize, batch, 10) {
         let cancellation = OwnerReadCancellation::new();
         let (observer, hits) = cancel_at(target, &cancellation);
         let result = observe_index_cancel_points(observer, || {
@@ -214,7 +217,10 @@ fn cancel_maintenance_at(db: &Database, target: IndexCancelPoint) {
         );
         return;
     }
-    panic!("maintenance never reached the {target:?} point in {MAX_MAINTENANCE_CYCLES} cycles");
+    panic!(
+        "maintenance never reached the {target:?} point in {} cycles",
+        maintenance_cycles((FIRST_ROWS * 2) as usize, batch, 10)
+    );
 }
 
 #[test]
@@ -224,7 +230,7 @@ fn a_maintenance_cycle_cancelled_inside_a_build_batch_returns_the_typed_cancella
     let db = open_with_build_batch_rows(&path, 16);
     create(&db);
     insert_rows(&db, 0..FIRST_ROWS);
-    drive_until_serving(&db);
+    drive_until_serving(&db, 120, 16, 10);
     let first = serving(&db, "cancel_items", "embedding", &[])
         .expect("the first generation is serving")
         .generation;
@@ -232,7 +238,7 @@ fn a_maintenance_cycle_cancelled_inside_a_build_batch_returns_the_typed_cancella
     insert_rows(&db, SECOND_ROWS);
     let ids = (0..FIRST_ROWS).chain(SECOND_ROWS).collect::<Vec<_>>();
 
-    cancel_maintenance_at(&db, IndexCancelPoint::BuildBatch);
+    cancel_maintenance_at(&db, IndexCancelPoint::BuildBatch, 16);
     assert_eq!(
         serving(&db, "cancel_items", "embedding", &[]).map(|serving| serving.generation),
         Some(first),
@@ -240,7 +246,7 @@ fn a_maintenance_cycle_cancelled_inside_a_build_batch_returns_the_typed_cancella
     );
     assert_every_row_is_served(&db, &ids, "after the cancelled build batch");
 
-    drive_until_serving(&db);
+    drive_until_serving(&db, 240, 16, 10);
     assert_ne!(
         serving(&db, "cancel_items", "embedding", &[])
             .expect("a generation is serving")
@@ -260,7 +266,7 @@ fn a_maintenance_cycle_cancelled_inside_a_reclaim_batch_returns_the_typed_cancel
     let db = open_caller_driven(&path);
     create(&db);
     insert_rows(&db, 0..FIRST_ROWS);
-    drive_until_serving(&db);
+    drive_until_serving(&db, 120, 1, 10);
     let first = serving(&db, "cancel_items", "embedding", &[])
         .expect("the first generation is serving")
         .generation;
@@ -269,7 +275,7 @@ fn a_maintenance_cycle_cancelled_inside_a_reclaim_batch_returns_the_typed_cancel
     // publishes; releasing it leaves the first generation to reclaim.
     let pin = db.pin_snapshot(db.snapshot()).expect("pin a reader");
     insert_rows(&db, SECOND_ROWS);
-    drive_until_serving(&db);
+    drive_until_serving(&db, 240, 1, 10);
     let replacement = serving(&db, "cancel_items", "embedding", &[])
         .expect("a generation is serving")
         .generation;
@@ -281,7 +287,7 @@ fn a_maintenance_cycle_cancelled_inside_a_reclaim_batch_returns_the_typed_cancel
     drop(pin);
     let ids = (0..FIRST_ROWS).chain(SECOND_ROWS).collect::<Vec<_>>();
 
-    cancel_maintenance_at(&db, IndexCancelPoint::ReclaimBatch);
+    cancel_maintenance_at(&db, IndexCancelPoint::ReclaimBatch, 1);
     assert_eq!(
         serving(&db, "cancel_items", "embedding", &[]).map(|serving| serving.generation),
         Some(replacement),
@@ -290,7 +296,7 @@ fn a_maintenance_cycle_cancelled_inside_a_reclaim_batch_returns_the_typed_cancel
     assert_every_row_is_served(&db, &ids, "after the cancelled reclaim batch");
 
     let mut reclaimed = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles((FIRST_ROWS * 2) as usize, 1, 10) {
         db.run_maintenance_cycle().expect("one maintenance cycle");
         if retained_generations(&db, "cancel_items", "embedding", &[]) == vec![replacement] {
             reclaimed = true;

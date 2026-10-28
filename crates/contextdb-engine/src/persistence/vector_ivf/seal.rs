@@ -8,11 +8,27 @@ use super::{
     memory::{MARKER_BYTES, OPERATION_PREFIX_BYTES, SealWorkspace},
     semantic::SealView,
 };
+#[cfg(feature = "test-seams")]
+use crate::vector_ivf_observations::*;
 use contextdb_vector::ivf::storage::PageKey;
 use redb::ReadableTable;
 use std::cell::{Ref, RefCell};
 
 pub(super) trait NativeSealView: SealView {
+    #[cfg(feature = "test-seams")]
+    fn observe_page_write_for_test(
+        &self,
+        key: PageKey,
+        insert: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()>;
+    #[cfg(feature = "test-seams")]
+    fn observed_operation(&self, key: PageKey) -> Result<NativeIvfOperationRef<'_>>;
+    #[cfg(feature = "test-seams")]
+    fn observed_scope(&self) -> NativeIvfScopeRef<'_>;
+    #[cfg(feature = "test-seams")]
+    fn observer(&self) -> &Producer;
+    #[cfg(feature = "test-seams")]
+    fn source_instance(&self) -> NativeIvfSourceInstance;
     fn write(&self) -> &redb::WriteTransaction;
     fn scope_key(&self) -> &[u8; 64];
     fn record(&self) -> Ref<'_, ScopeRecord>;
@@ -215,6 +231,12 @@ pub(super) fn seal_operation(
             let records = semantic::derive(view, key, payload, &mut work.related_metadata)?;
             let record = view.record();
             let family = record.family(key.generation).ok_or_else(corrupt)?;
+            #[cfg(feature = "test-seams")]
+            view.observer()
+                .boundary(NativeIvfFaultBoundary::BeforeHeaderSeal {
+                    operation: view.observed_operation(key)?,
+                    key,
+                })?;
             header::seal_in_place(
                 header::HeaderIdentity {
                     index: &record.index,
@@ -227,11 +249,40 @@ pub(super) fn seal_operation(
             )?;
         }
         view.checkpoint()?;
+        #[cfg(feature = "test-seams")]
+        NativeIo::Borrowed(view.write()).put_using(
+            name.as_str()?,
+            &header::key_bytes(key),
+            &work.native_value,
+            |insert| view.observe_page_write_for_test(key, insert),
+        )?;
+        #[cfg(not(feature = "test-seams"))]
         NativeIo::Borrowed(view.write()).put(
             name.as_str()?,
             &header::key_bytes(key),
             &work.native_value,
         )?;
+        #[cfg(feature = "test-seams")]
+        view.observer().emit(NativeIvfSealEvent::HeaderSealed {
+            operation: view.observed_operation(key)?,
+            key,
+            header: (&work.native_value[..192])
+                .try_into()
+                .map_err(|_| corrupt())?,
+            payload: (&work.native_value[192..])
+                .try_into()
+                .map_err(|_| corrupt())?,
+            first_slot: u64::from_le_bytes(
+                work.native_value[104..112]
+                    .try_into()
+                    .map_err(|_| corrupt())?,
+            ),
+            record_count: u32::from_le_bytes(
+                work.native_value[112..116]
+                    .try_into()
+                    .map_err(|_| corrupt())?,
+            ),
+        });
         view.header_written(key)?;
         {
             let record = view.record();
@@ -251,8 +302,24 @@ pub(super) fn seal_operation(
             .map_err(RedbPersistence::storage_error)?
             .remove(work.marker.as_slice())
             .map_err(RedbPersistence::storage_error)?;
+        #[cfg(feature = "test-seams")]
+        view.observer().emit(NativeIvfSealEvent::MarkerRemoved {
+            operation: view.observed_operation(key)?,
+            key,
+        });
     }
-    require_operation_empty(view.write(), &prefix)?;
+    let checked = require_operation_empty(view.write(), &prefix);
+    #[cfg(feature = "test-seams")]
+    view.observer()
+        .emit(NativeIvfSealEvent::OperationPrefixChecked {
+            source_instance: view.source_instance(),
+            scope_key: view.scope_key(),
+            operation,
+            prefix: &prefix,
+            empty: checked.is_ok(),
+            stage: NativeIvfOperationPrefixStage::AfterDrain,
+        });
+    checked?;
     work.changed_kinds = view.dirty_kinds();
     // A journal-only or visibility-only operation need not publish a manifest.
     // Advance only families with actual sealed mutations, using the real row
@@ -288,6 +355,27 @@ pub(super) fn seal_operation(
             };
             let kind = header::kind_from_tag(tag)?;
             let name = KindTableName::new(storage, kind)?;
+            #[cfg(feature = "test-seams")]
+            {
+                let key = contextdb_vector::ivf::storage::PageKey {
+                    partition: 0,
+                    generation,
+                    kind,
+                    list: 0,
+                    ordinal: 0,
+                    run: 0,
+                };
+                let observed = view.observed_operation(key)?;
+                view.observer().emit(NativeIvfSealEvent::KindHandlesClosed {
+                    operation: observed,
+                    kind,
+                });
+                view.observer()
+                    .boundary(NativeIvfFaultBoundary::BeforeKindFingerprint {
+                        operation: observed,
+                        kind,
+                    })?;
+            }
             let root = NativeIo::Borrowed(view.write())
                 .fingerprint(name.as_str()?)?
                 .ok_or_else(corrupt)?;
@@ -298,6 +386,24 @@ pub(super) fn seal_operation(
             }
             family.kinds.present |= bit;
             family.kinds.roots[usize::from(tag - 1)] = root;
+            drop(record);
+            #[cfg(feature = "test-seams")]
+            {
+                let key = contextdb_vector::ivf::storage::PageKey {
+                    partition: 0,
+                    generation,
+                    kind,
+                    list: 0,
+                    ordinal: 0,
+                    run: 0,
+                };
+                view.observer()
+                    .emit(NativeIvfSealEvent::FamilyFingerprintCaptured {
+                        operation: view.observed_operation(key)?,
+                        kind,
+                        root,
+                    });
+            }
         }
     }
     // The scope table is outside every kind root. This write cannot mutate
@@ -307,10 +413,39 @@ pub(super) fn seal_operation(
         let record = view.record();
         record.encode(view.scope_key(), work.control_payload()?)?;
     }
+    #[cfg(feature = "test-seams")]
+    view.observer()
+        .boundary(NativeIvfFaultBoundary::BeforeScopeWrite {
+            scope: view.observed_scope(),
+            operation: Some(operation),
+        })?;
     NativeIo::Borrowed(view.write()).put(
         SCOPES.name(),
         view.scope_key(),
         &work.native_value[..PAGE_BYTES],
     )?;
+    {
+        let record = view.record();
+        if record.serving.is_some() {
+            let value: &mut [u8; descriptor::BYTES] = (&mut work.native_value[..descriptor::BYTES])
+                .try_into()
+                .map_err(|_| corrupt())?;
+            descriptor::encode(view.scope_key(), &record, value)?;
+            NativeIo::Borrowed(view.write()).put(
+                SCOPES.name(),
+                &descriptor::key(view.scope_key()),
+                value,
+            )?;
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    {
+        let record = view.record();
+        view.observer().emit(NativeIvfSealEvent::ScopeWritten {
+            scope: view.observed_scope(),
+            operation: Some(operation),
+            stored: record.observed(view.scope_key())?,
+        });
+    }
     view.roots_staged()
 }

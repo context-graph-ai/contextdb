@@ -60,7 +60,7 @@ fn commit_one_at_a_time(commits: i64) -> WriteBuffer {
         .expect("stage one seed row");
     }
     db.commit(tx).expect("commit the seed rows");
-    drive_until_serving(&db);
+    drive_until_serving(&db, SEED_ROWS as usize, 1, 10);
 
     for id in SEED_ROWS..SEED_ROWS + commits {
         insert(&db, id);

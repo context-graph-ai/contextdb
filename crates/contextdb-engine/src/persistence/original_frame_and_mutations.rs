@@ -694,6 +694,7 @@ impl RedbPersistence {
         }
         let has_vector_changes = write_set_has_vector_changes
             || partition_mutations.is_some_and(|batch| !batch.is_empty());
+        let has_native_changes=has_vector_changes || options.local_erasure.as_ref().is_some_and(|erasure|!erasure.projection.vector_partition_identities.is_empty());
         let vector_quantization = if has_vector_changes {
             Self::admitted_vector_quantization_map(table_meta, |bytes| frame.reserve(bytes))?
         } else {
@@ -743,6 +744,7 @@ impl RedbPersistence {
                         .flat_map(|ddl| ddl.config_values.iter()),
                 ),
         )?;
+        let native_basis = if has_native_changes { Some((self.paged_root_capture()?)()?) } else { None };
         self.with_db(|db| {
             let prepared_discard = crate::database::discard::take_original_discard_write(self, original, ws)?;
             let has_discard_history = prepared_discard.is_some();
@@ -753,6 +755,13 @@ impl RedbPersistence {
                 Some(write) => discard_history::TerminalWrite::Prepared(write),
                 None => discard_history::TerminalWrite::Fresh(Self::begin_history_write(db)?),
             };
+            #[cfg(feature="test-seams")]
+            let mut native_observation=native_basis.as_ref().map(|_|crate::vector_ivf_observations::NativeIvfOuterWriteObservation::begin());
+            let mut native_session = if let Some(basis) = &native_basis {
+                let (_, snapshot, frontier) = basis.authenticate()?;
+                let owner = crate::memory_accounting::persistence_original_projection(original)?.vector_budget()?;
+                Some(vector_ivf::write::WriteSession::borrow(&write_txn, &storage_scope, owner, snapshot, frontier, ws.commit_lsn.unwrap_or(frontier))?)
+            } else { None };
 #[cfg(any(test, feature = "test-seams"))]
 let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&write_txn);
             let graph_commit_support=Self::capture_graph_commit_support(&write_txn,ws.commit_lsn)?;
@@ -1744,6 +1753,12 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
             {
                 observe_append_stage(AppendStage::RowsIndexesAndLogs, &mut stage_started);
             }
+            if let (Some(session), Some(basis), Some(batch)) = (&mut native_session, &native_basis, partition_mutations) {
+                session.apply_rows(self, basis, original, ws, batch, &write_txn)?;
+            }
+            if let (Some(session),Some(erasure))=(&mut native_session,options.local_erasure.as_ref()) {
+                session.erase_rows(self,original,&erasure.projection.vector_partition_identities)?;
+            }
             Self::apply_owned_content_identity_with_manifests_and_groups_in_write(
                 &write_txn,
                 &identity_mutations,
@@ -1773,14 +1788,22 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                 frame.original, Self::retention_clock_grouping_bytes(ws),
                 "writer_source", "retention_clock_grouping", "Raise MEMORY_LIMIT to decide this commit's retention clocks.",
             )?;
+            if let Some(session) = &mut native_session { session.bind_final()?; }
+            drop(native_session);
             Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
+            #[cfg(feature="test-seams")]
+            if let Some(observer)=&native_observation {observer.before_commit()?;}
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::BeforeRedb);
             { #[cfg(any(test, feature = "test-seams"))]
             graph_observation_checkpoint(10)?;
             let graph_commit_result = write_txn.commit();
 #[cfg(any(test, feature = "test-seams"))]
-if graph_commit_result.is_ok() { graph_publication_attempt.committed(); graph_observation_checkpoint(11)?; }
+if graph_commit_result.is_ok() {
+    #[cfg(feature="test-seams")]
+    if let Some(observer)=&mut native_observation {observer.committed(ws.commit_lsn.unwrap_or(Lsn(0)));}
+    graph_publication_attempt.committed(); graph_observation_checkpoint(11)?;
+}
 graph_commit_result }.map_err(Self::storage_error)?;
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::AfterRedb);

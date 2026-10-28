@@ -241,6 +241,13 @@ fn reserve_original_bootstrap(
     .map_err(|failure| original_storage_error(NativeStorageFailure::Refused(failure)))
 }
 
+/// Space a caller must leave available for the native receipts in its planned
+/// pending directory. This quotes the producer's concrete control layout;
+/// admission still happens once, on the original owner, when each credit exists.
+pub(crate) fn pending_directory_receipt_quote(entries: usize) -> Option<usize> {
+    Layout::new::<StorageReceipt>().size().checked_mul(entries)
+}
+
 struct StorageReceipt {
     owners: AtomicUsize,
     allocation: ManuallyDrop<StorageAllocation>,

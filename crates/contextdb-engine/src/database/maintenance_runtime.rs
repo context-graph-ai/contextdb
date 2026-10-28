@@ -585,6 +585,8 @@ impl MaintenanceContext {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn build_checkpoint(&self) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        crate::vector_ivf_observations::maintenance_cancel_checkpoint()?;
         #[cfg(test)]
         resident_history_test_seams::note_checkpoint();
         #[cfg(any(test, feature = "test-seams"))]
@@ -3718,9 +3720,9 @@ impl MaintenanceContext {
         // An unpublished paged build keeps advancing even when this cycle's
         // sampled inventory does not select its route.
         let unselected_paged_builds = self.unselected_paged_builds(pending_vector_partitions)?;
-        let mut vector = if !pending_vector_partitions.is_empty()
-            || !unselected_paged_builds.is_empty()
-        {
+        let mut vector = if self.persistence.is_some() {
+            self.run_native_vector_cycle(read_memory.clone())?
+        } else if !pending_vector_partitions.is_empty() || !unselected_paged_builds.is_empty() {
             // File-backed construction publishes through the durable catalog
             // first. Building a separate process-only graph here let the
             // writer call the route ready while a reader of the same

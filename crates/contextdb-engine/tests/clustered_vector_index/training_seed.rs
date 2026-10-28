@@ -75,7 +75,7 @@ fn a_training_seed_is_declared_persisted_and_inspected() {
         ),
     );
     populate(&db);
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     let at_zero = training(&db);
     assert_eq!(
         (
@@ -107,7 +107,7 @@ fn a_training_seed_is_declared_persisted_and_inspected() {
         (Some(7), 7, Some(0)),
         "the new seed is declared and effective; the serving generation keeps the seed it was trained with: {declared:?}"
     );
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     let rebuilt = training(&db);
     assert_eq!(
         rebuilt.serving_seed,
@@ -240,7 +240,7 @@ async fn a_training_seed_travels_with_synced_ddl() {
         schema(&source),
         "the receiver holds the sender's declaration"
     );
-    drive_until_serving(&edge);
+    drive_until_serving(&edge, ROWS as usize, 1, 10);
     let received = training(&edge);
     assert_eq!(
         (
@@ -266,7 +266,7 @@ async fn a_training_seed_travels_with_synced_ddl() {
         (Some(0), 0),
         "the transported zero seed is declared on the receiver"
     );
-    drive_until_serving(&edge);
+    drive_until_serving(&edge, ROWS as usize, 1, 10);
     assert_eq!(
         training(&edge).serving_seed,
         Some(0),

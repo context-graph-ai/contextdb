@@ -1,4 +1,4 @@
-//! The accepted 192-byte role header around a 3,904-byte kernel payload.
+//! A 192-byte role header around a 3,904-byte kernel payload.
 //! The native factory authenticates this role's captured expected root first.
 use super::control::Family;
 use super::semantic::Records;

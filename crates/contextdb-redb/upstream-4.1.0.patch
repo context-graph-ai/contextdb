@@ -1,4 +1,97 @@
 --- /dev/null
++++ b/src/allocation_observation.rs
+@@ -0,0 +1,90 @@
++//! Thread-scoped observation of the real allocator, present only in test builds.
++//!
++//! Callers supply attribution by limiting the scope to the operation they observe.
++//! No engine class, ceiling, or allocation policy is retained in this module.
++use std::cell::RefCell;
++use std::sync::Arc;
++
++/// The allocator's actual minimum retry layout before an allocation executes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct AllocationPlanForTest {
++    pub requested_bytes: usize,
++    pub current_store_bytes: u64,
++    pub minimum_growth_bytes: u64,
++    pub reusable_space_withheld: bool,
++}
++
++/// Callbacks run without the allocator state lock. They may inspect the allocator
++/// and change an external backend ceiling, but must not start another write
++/// transaction while the observed write transaction is active.
++pub trait AllocationObserverForTest: Send + Sync {
++    fn before_allocate(&self, plan: AllocationPlanForTest) -> crate::Result;
++    fn allocated(&self, plan: AllocationPlanForTest, page: [u8; 8]);
++    fn before_existing_write(&self, _plan: AllocationPlanForTest) -> crate::Result { Ok(()) }
++    fn before_write(&self, _plan: AllocationPlanForTest, _page: [u8;8], _bytes:usize) -> crate::Result { Ok(()) }
++    fn written(&self, _plan: AllocationPlanForTest, _page: [u8;8], _bytes:usize) {}
++    fn refused(&self, _plan: AllocationPlanForTest, _error:&crate::StorageError) {}
++}
++
++#[derive(Clone)]
++enum Observer {
++    Owned(Arc<dyn AllocationObserverForTest>),
++    Borrowed(&'static dyn AllocationObserverForTest),
++}
++#[derive(Clone)]
++pub(crate) struct Scope {
++    observer: Observer,
++    pub withhold_reusable_space: bool,
++}
++impl Scope {
++    pub(crate) fn observer(&self)->&dyn AllocationObserverForTest {
++        match &self.observer {Observer::Owned(observer)=>observer.as_ref(),Observer::Borrowed(observer)=>*observer}
++    }
++}
++struct Restore(Option<Scope>);
++impl Drop for Restore {
++    fn drop(&mut self) { OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take()); }
++}
++
++thread_local! {
++    static OBSERVER: RefCell<Option<Scope>> = const { RefCell::new(None) };
++}
++
++/// Observe allocations made by `operation`, restoring the previous scope on
++/// return or unwind. Withholding excludes every preexisting free block for each
++/// allocation in this scope; other operations retain ordinary reuse.
++pub fn observe_allocations_for_test<T>(
++    observer: Arc<dyn AllocationObserverForTest>,
++    withhold_reusable_space: bool,
++    operation: impl FnOnce() -> T,
++) -> T {
++    let _restore = Restore(OBSERVER.with(|slot| {
++        slot.replace(Some(Scope {
++            observer:Observer::Owned(observer),
++            withhold_reusable_space,
++        }))
++    }));
++    operation()
++}
++
++pub(crate) fn current() -> Option<Scope> {
++    OBSERVER.with(|slot| slot.borrow().clone())
++}
++
++
++/// Borrow a calling-thread observer without allocating a control for each
++/// operation. Callbacks are synchronous; no page or returned value retains it.
++/// The previous observer is restored on return and unwind.
++pub fn with_borrowed_allocation_observer_for_test<T>(
++    observer:&dyn AllocationObserverForTest,
++    withhold_reusable_space:bool,
++    operation:impl FnOnce()->T,
++)->T {
++    // SAFETY: only synchronous page-manager callbacks use the private slot.
++    // They never store its Scope in pages or returned objects or send it to a
++    // different thread. Restore removes this reference before the borrow ends,
++    // including on unwind; nested scopes restore their still-live parent.
++    let observer=unsafe {std::mem::transmute::<&dyn AllocationObserverForTest,&'static dyn AllocationObserverForTest>(observer)};
++    let _restore=Restore(OBSERVER.with(|slot|slot.replace(Some(Scope{observer:Observer::Borrowed(observer),withhold_reusable_space}))));
++    operation()
++}
+--- /dev/null
 +++ b/src/atomic_compat.rs
 @@ -0,0 +1,35 @@
 +//! Atomic conditional updates supported by the minimum Rust version.
@@ -2166,7 +2259,7 @@
      fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
          // Make a new quick-repair commit to update the allocator state table
          #[cfg(feature = "logging")]
-@@ -1056,16 +2552,183 @@
+@@ -1056,16 +2552,195 @@
  
          Ok(())
      }
@@ -2294,6 +2387,18 @@
 +        self.mem.growth_step(usable, required)
 +    }
 +
++    /// Observe the actual allocator's minimum retry layout without allocating.
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn allocation_plan_for_test(
++        &self,
++        allocation_size: usize,
++        withhold_reusable_space: bool,
++    ) -> Result<crate::allocation_observation::AllocationPlanForTest, StorageError> {
++        self.mem
++            .allocation_plan_for_test(allocation_size, withhold_reusable_space)
++    }
++
 +    /// Finish writable housekeeping while the caller still owns its writer
 +    /// lock, then allow read-only opens over the committed root during a
 +    /// graceful drain. The caller must prevent all later writes. Drop releases
@@ -2352,7 +2457,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +2769,8 @@
+@@ -1106,6 +2781,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -2361,7 +2466,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +2790,8 @@
+@@ -1125,6 +2802,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -2370,7 +2475,7 @@
          }
      }
  
-@@ -1157,13 +2824,37 @@
+@@ -1157,13 +2836,37 @@
          self
      }
  
@@ -2409,7 +2514,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +2866,7 @@
+@@ -1175,6 +2878,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -2417,7 +2522,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +2875,75 @@
+@@ -1183,26 +2887,75 @@
              .open(path)?;
  
          Database::new(
@@ -2495,7 +2600,7 @@
          )
      }
  
-@@ -1222,6 +2963,58 @@
+@@ -1222,6 +2975,58 @@
              self.page_size,
              None,
              self.cache_size,
@@ -2554,7 +2659,7 @@
          )
      }
  
-@@ -1236,6 +3029,70 @@
+@@ -1236,6 +3041,70 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2625,7 +2730,7 @@
          )
      }
  
-@@ -1251,6 +3108,9 @@
+@@ -1251,6 +3120,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2635,7 +2740,7 @@
          )
      }
  }
-@@ -1262,16 +3122,214 @@
+@@ -1262,16 +3134,214 @@
  }
  
  #[cfg(test)]
@@ -2852,7 +2957,7 @@
  
      #[derive(Debug)]
      struct FailingBackend {
-@@ -1298,7 +3356,7 @@
+@@ -1298,7 +3368,7 @@
          fn decrement_countdown(&self) -> Result<(), std::io::Error> {
              if self
                  .countdown
@@ -2988,7 +3093,7 @@
  };
  pub use error::{
      CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
-@@ -79,19 +92,61 @@
+@@ -79,19 +92,64 @@
      ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
      Table, TableStats,
  };
@@ -3012,6 +3117,9 @@
  
  pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
  
++#[cfg(feature = "test-seams")]
++#[doc(hidden)]
++pub mod allocation_observation;
  pub mod backends;
 +#[cfg(feature = "test-seams")]
 +pub mod commit_work;
@@ -3050,7 +3158,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +161,71 @@
+@@ -106,3 +164,71 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -8933,7 +9041,37 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,57 +3769,27 @@
+@@ -2009,6 +3741,29 @@
+     }
+ 
+     /// Retrieves information about storage usage in the database
++    /// Quote the actual native dirty backing for a fresh variable-byte leaf
++    /// entry. This uses the producer's serialization and the live file's page
++    /// geometry, then its concrete PageAllocation layout. It allocates and
++    /// admits nothing; callers must still fund the genuine storage receipt.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn native_dirty_byte_entry_layout(
++        &self,
++        key_bytes: usize,
++        value_bytes: usize,
++    ) -> Option<std::alloc::Layout> {
++        let body = key_bytes.checked_add(value_bytes)?;
++        // Check the fixed one-entry header arithmetic before calling the
++        // same serializer's required_bytes calculation used by LeafBuilder.
++        body.checked_add(3 * size_of::<u32>())?;
++        let serialized = crate::tree_store::RawLeafBuilder::required_bytes(1, body, None, None);
++        let pages = serialized
++            .div_ceil(self.mem.get_page_size())
++            .checked_next_power_of_two()?;
++        let bytes = pages.checked_mul(self.mem.get_page_size())?;
++        crate::tree_store::native_dirty_page_layout(bytes)
++    }
++
+     pub fn stats(&self) -> Result<DatabaseStats> {
+         let tables = self.tables.lock().unwrap();
+         let table_tree = &tables.table_tree;
+@@ -2037,57 +3792,27 @@
          })
      }
  
@@ -9003,7 +9141,7 @@
              }
          } else if !self.completed && self.mem.storage_failure() {
              self.tables
-@@ -2107,18 +3809,148 @@
+@@ -2107,18 +3832,148 @@
      tree: TableTree,
  }
  
@@ -9153,7 +9291,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3967,69 @@
+@@ -2135,12 +3990,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -9224,7 +9362,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +4050,7 @@
+@@ -2161,7 +4073,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -9233,7 +9371,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +4078,7 @@
+@@ -2189,7 +4101,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -9242,7 +9380,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +4106,7 @@
+@@ -2217,7 +4129,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -9251,7 +9389,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +4152,15 @@
+@@ -2263,7 +4175,15 @@
  
  #[cfg(test)]
  mod test {
@@ -9268,7 +9406,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4181,1144 @@
+@@ -2284,4 +4204,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -14851,7 +14989,7 @@
  mod table_tree;
  mod table_tree_base;
  
-@@ -22,4 +30,25 @@
+@@ -22,4 +30,28 @@
  };
  pub use page_store::{InMemoryBackend, Savepoint, file_backend};
  pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut};
@@ -14878,6 +15016,9 @@
 +
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +pub use page_store::CachePressureFixtureForTest;
++
++#[cfg(feature = "contextdb-internal")]
++pub(crate) use page_store::native_dirty_page_layout;
 --- /dev/null
 +++ b/src/tree_store/page_store/allocator_pager.rs
 @@ -0,0 +1,733 @@
@@ -21289,7 +21430,7 @@
  pub(crate) use header::PAGE_SIZE;
  pub(crate) use page_manager::{
      FILE_FORMAT_VERSION3, ShrinkPolicy, TransactionalMemory, xxh3_checksum,
-@@ -28,3 +33,20 @@
+@@ -28,3 +33,27 @@
  
  pub(super) use base::{PageImpl, PageMut};
  pub(super) use xxh3::hash128_with_seed;
@@ -21310,6 +21451,13 @@
 +
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +pub use cached_file::CachePressureFixtureForTest;
++
++#[cfg(feature = "contextdb-internal")]
++pub(crate) fn native_dirty_page_layout(bytes: usize) -> Option<std::alloc::Layout> {
++    page_allocation::PageAllocation::layout(bytes)
++        .ok()
++        .map(|(layout, _)| layout)
++}
 --- /dev/null
 +++ b/src/tree_store/page_store/page_allocation.rs
 @@ -0,0 +1,879 @@
@@ -23853,10 +24001,60 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -824,6 +2010,44 @@
+@@ -799,20 +1985,40 @@
+         let len: usize = (address_range.end - address_range.start)
+             .try_into()
+             .unwrap();
+-        let mem = self.storage.write(address_range.start, len, false)?;
++        #[cfg(feature="test-seams")]
++        let observation=crate::allocation_observation::current();
++        #[cfg(feature="test-seams")]
++        let plan=if let Some(scope)=&observation {
++            let plan=crate::allocation_observation::AllocationPlanForTest {
++                requested_bytes:len,current_store_bytes:self.storage.raw_file_len()?,minimum_growth_bytes:0,
++                reusable_space_withheld:scope.withhold_reusable_space,
++            };
++            scope.observer().before_existing_write(plan)?;
++            scope.observer().before_write(plan,page_number.to_le_bytes(),len)?;
++            Some(plan)
++        } else {None};
++        let mem=match self.storage.write(address_range.start,len,false) {
++            Ok(mem)=>mem,
++            Err(error)=>{
++                #[cfg(feature="test-seams")]
++                if let (Some(scope),Some(plan))=(&observation,plan) {scope.observer().refused(plan,&error);}
++                return Err(error);
++            }
++        };
+ 
+         #[cfg(debug_assertions)]
+         {
+             assert!(self.open_dirty_pages.lock().unwrap().insert(page_number));
          }
+ 
+-        Ok(PageMut {
+-            mem,
+-            page_number,
+-            _lifetime: PhantomData,
++        let page=PageMut {
++            mem,page_number,_lifetime:PhantomData,
+             #[cfg(debug_assertions)]
+-            open_pages: self.open_dirty_pages.clone(),
+-        })
++            open_pages:self.open_dirty_pages.clone(),
++        };
++        #[cfg(feature="test-seams")]
++        if let (Some(scope),Some(plan))=(observation,plan) {scope.observer().written(plan,page_number.to_le_bytes(),len);}
++        Ok(page)
      }
  
+     pub(crate) fn get_version(&self) -> u8 {
+@@ -822,6 +2028,44 @@
+         } else {
+             state.header.primary_slot().version
+         }
++    }
++
 +    /// A crashed store's two commit candidates, in the order a writer's
 +    /// repair tries them: the header is read again (one charged page) and
 +    /// the slot is chosen by repair's own routine on that copy, which never
@@ -23893,12 +24091,10 @@
 +            state.header.primary_slot()
 +        };
 +        Ok((slot.transaction_id, slot.user_root))
-+    }
-+
+     }
+ 
      pub(crate) fn get_data_root(&self) -> Option<BtreeHeader> {
-         let state = self.state.lock().unwrap();
-         if self.read_from_secondary.load(Ordering::Acquire) {
-@@ -871,7 +2095,9 @@
+@@ -871,7 +2115,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -23909,7 +24105,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -881,6 +2107,7 @@
+@@ -881,6 +2127,7 @@
          state
              .get_region_mut(region_index)
              .free(page.page_index, page.page_order);
@@ -23917,7 +24113,97 @@
          // Ensure that the region is marked as having free space
          state
              .get_region_tracker_mut()
-@@ -953,12 +2180,32 @@
+@@ -936,6 +2183,51 @@
+         self.unpersisted.lock().unwrap().contains(&page)
+     }
+ 
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn allocation_plan_for_test(
++        &self,
++        allocation_size: usize,
++        withhold_reusable_space: bool,
++    ) -> Result<crate::allocation_observation::AllocationPlanForTest> {
++        let required_order = ceil_log2(allocation_size.div_ceil(self.get_page_size()));
++        let mut state = self.state.lock().unwrap();
++        let layout = state.header.layout();
++        let mut reusable = false;
++        if !withhold_reusable_space {
++            for region in 0..layout.num_regions() {
++                if state
++                    .get_region(region)
++                    .highest_free_order()
++                    .is_some_and(|order| order >= required_order)
++                {
++                    reusable = true;
++                    break;
++                }
++            }
++        }
++        if let Some(error) = state
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
++        let current_store_bytes = self.storage.raw_file_len()?;
++        let minimum_growth_bytes = if reusable {
++            0
++        } else {
++            self.minimum_growth_layout(&state, required_order)
++                .len()
++                .saturating_sub(current_store_bytes)
++        };
++        Ok(crate::allocation_observation::AllocationPlanForTest {
++            requested_bytes: allocation_size,
++            current_store_bytes,
++            minimum_growth_bytes,
++            reusable_space_withheld: withhold_reusable_space,
++        })
++    }
++
+     pub(crate) fn allocate_helper<'txn>(
+         &self,
+         allocation_size: usize,
+@@ -945,20 +2237,82 @@
+         let required_pages = allocation_size.div_ceil(self.get_page_size());
+         let required_order = ceil_log2(required_pages);
+ 
++        #[cfg(feature = "test-seams")]
++        let observation = crate::allocation_observation::current();
++        #[cfg(feature = "test-seams")]
++        let plan = if let Some(scope) = &observation {
++            let plan =
++                self.allocation_plan_for_test(allocation_size, scope.withhold_reusable_space)?;
++            // The plan's state guard has been released before external code runs.
++            scope.observer().before_allocate(plan)?;
++            Some(plan)
++        } else {
++            None
++        };
+         let mut state = self.state.lock().unwrap();
+-
+-        let page_number = if let Some(page_number) =
++        #[cfg(feature = "test-seams")]
++        let withheld = observation
++            .as_ref()
++            .is_some_and(|scope| scope.withhold_reusable_space);
++        #[cfg(not(feature = "test-seams"))]
++        let withheld = false;
++
++        let placement=(||->Result<PageNumber> {
++        let page_number = if withheld {
++            #[cfg(feature = "test-seams")]
++            {
++                self.allocate_after_growth_for_test(&mut state, required_order)?
++            }
++            #[cfg(not(feature = "test-seams"))]
++            {
++                unreachable!()
++            }
++        } else if let Some(page_number) =
+             Self::allocate_helper_retry(&mut state, required_order, lowest)?
+         {
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -23933,7 +24219,7 @@
 +            page.ok_or_else(|| {
 +                StorageError::Corrupted("allocator growth yielded no free page".into())
 +            })?
-         };
++        };
 +
 +        if let Some(error) = state
 +            .allocators
@@ -23942,6 +24228,20 @@
 +        {
 +            return Err(error);
 +        }
++
++            Ok(page_number)
++        })();
++        let page_number=match placement {
++            Ok(page)=>page,
++            Err(error)=>{
++                #[cfg(feature="test-seams")]
++                if let (Some(scope),Some(plan))=(&observation,plan) {
++                    drop(state);
++                    scope.observer().refused(plan,&error);
++                }
++                return Err(error);
++            }
+         };
  
          #[cfg(debug_assertions)]
          {
@@ -23952,15 +24252,53 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -987,7 +2234,6 @@
+@@ -987,8 +2341,19 @@
              .try_into()
              .unwrap();
  
 -        #[allow(unused_mut)]
-         let mut mem = self.storage.write(address_range.start, len, true)?;
+-        let mut mem = self.storage.write(address_range.start, len, true)?;
++        #[cfg(feature="test-seams")]
++        if let (Some(scope),Some(plan))=(&observation,plan) {
++            drop(state);
++            scope.observer().before_write(plan,page_number.to_le_bytes(),len)?;
++        }
++        let mut mem=match self.storage.write(address_range.start,len,true) {
++            Ok(mem)=>mem,
++            Err(error)=>{
++                #[cfg(feature="test-seams")]
++                if let (Some(scope),Some(plan))=(&observation,plan) {scope.observer().refused(plan,&error);}
++                return Err(error);
++            }
++        };
          debug_assert!(mem.mem().len() >= allocation_size);
  
-@@ -1024,7 +2270,28 @@
+         #[cfg(debug_assertions)]
+@@ -999,13 +2364,21 @@
+             mem.mem_mut().fill(0xFF);
+         }
+ 
+-        Ok(PageMut {
++        let page = PageMut {
+             mem,
+             page_number,
+             _lifetime: PhantomData,
+             #[cfg(debug_assertions)]
+             open_pages: self.open_dirty_pages.clone(),
+-        })
++        };
++        #[cfg(feature = "test-seams")]
++        if let (Some(scope), Some(plan)) = (observation, plan) {
++            // All allocator bookkeeping and physical page backing succeeded.
++            scope.observer().allocated(plan, page_number.to_le_bytes());
++            scope.observer().written(plan,page_number.to_le_bytes(),len);
++        }
++
++        Ok(page)
+     }
+ 
+     fn allocate_helper_retry(
+@@ -1024,7 +2397,28 @@
              } else {
                  region.alloc(required_order)
              };
@@ -23989,7 +24327,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +2328,7 @@
+@@ -1061,11 +2455,52 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -23998,7 +24336,52 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1093,27 +2360,52 @@
+         Ok(true)
++    }
++
++    // Shared by ordinary quota retry and the read-only test observation.
++    fn minimum_growth_layout(&self, state: &InMemoryState, required_order: u8) -> DatabaseLayout {
++        let layout = state.header.layout();
++        let required_growth = 2u64.pow(required_order.into()) * u64::from(state.header.page_size());
++        DatabaseLayout::calculate(
++            layout.usable_bytes() + required_growth * 2,
++            layout.full_region_layout().num_pages(),
++            layout.full_region_layout().get_header_pages(),
++            self.page_size,
++        )
++    }
++
++    #[cfg(feature = "test-seams")]
++    fn allocate_after_growth_for_test(
++        &self,
++        state: &mut InMemoryState,
++        order: u8,
++    ) -> Result<PageNumber> {
++        let old_layout = state.header.layout();
++        let last_region = old_layout.num_regions() - 1;
++        let old_pages = state.get_region(last_region).len();
++        self.grow(state, order)?;
++        let block_pages = 1u32 << order;
++        let aligned_page = old_pages.div_ceil(block_pages) * block_pages;
++        let (region, page) = if aligned_page
++            .checked_add(block_pages)
++            .is_some_and(|end| end <= state.get_region(last_region).len())
++        {
++            (last_region, aligned_page)
++        } else {
++            (last_region + 1, 0)
++        };
++        // Only the newly added suffix is eligible. Existing reusable blocks
++        // remain free, including after this scope ends or the transaction aborts.
++        state
++            .get_region_mut(region)
++            .record_alloc(page >> order, order);
++        state.allocators.note_allocated(order);
++        Ok(PageNumber::new(region, page >> order, order))
+     }
+ 
+     fn grow(&self, state: &mut InMemoryState, required_order_allocation: u8) -> Result<()> {
+@@ -1093,27 +2528,52 @@
                  layout.usable_bytes() + required_growth * 2,
              )
          };
@@ -24041,7 +24424,7 @@
 +        let mut result = self.storage.resize(new_layout.len());
 +        // Storage refused the preferred growth for quota: retry once at the
 +        // smallest growth that still guarantees this allocation's block.
-+        let minimal_layout = calculate(layout.usable_bytes() + required_growth * 2);
++        let minimal_layout = self.minimum_growth_layout(state, required_order_allocation);
 +        if minimal_layout.len() < new_layout.len()
 +            && result.as_ref().is_err_and(crate::db::backend_quota_refused)
 +        {
@@ -24063,7 +24446,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1123,7 +2415,12 @@
+@@ -1123,7 +2583,12 @@
          allocation_size: usize,
          allocated: &mut PageTrackerPolicy,
      ) -> Result<PageMut<'txn>> {
@@ -24077,7 +24460,7 @@
          if let Ok(ref page) = result {
              allocated.insert(page.get_page_number());
          }
-@@ -1135,7 +2432,7 @@
+@@ -1135,7 +2600,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -24086,7 +24469,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +2442,7 @@
+@@ -1145,7 +2610,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -24095,7 +24478,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +2455,41 @@
+@@ -1158,8 +2623,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -24138,7 +24521,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +2558,469 @@
+@@ -1228,4 +2726,469 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }

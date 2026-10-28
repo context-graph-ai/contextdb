@@ -9,8 +9,8 @@
 //! unpublished list runs.
 
 use super::support::{
-    MAX_MAINTENANCE_CYCLES, PhysicalPage, build_progress, contains_bytes, cosine_distance, count,
-    drive_until_serving, empty, int_ids, ivf, little_endian_bytes, observe_search,
+    PhysicalPage, build_progress, contains_bytes, cosine_distance, count, drive_until_serving,
+    empty, int_ids, ivf, little_endian_bytes, maintenance_cycles, observe_search,
     open_caller_driven, open_with_build_batch_rows, params, physical_pages, quantized_record,
     serving, unit_vector,
 };
@@ -48,7 +48,7 @@ fn a_deleted_vector_never_appears_on_a_snapshot_that_cannot_see_it() {
     for id in 0..ROWS {
         insert(&db, "deleted_items", id, unit_vector(id as u64, DIMENSIONS));
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
 
     let query = unit_vector(7, DIMENSIONS);
     let mut by_distance = (0..ROWS)
@@ -112,10 +112,10 @@ fn a_deleted_vector_never_appears_on_a_snapshot_that_cannot_see_it() {
         7,
         "the pinned snapshot still sees the row it was opened with"
     );
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     check("after list maintenance with a reader pinned");
     drop(pin);
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     check("after list maintenance with no reader");
 }
 
@@ -158,7 +158,7 @@ fn purge_erases_vector_bytes_from_every_index_page_buffer_generation_and_export(
         };
         insert(&db, "purged_items", id, vector);
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     // A second victim committed after the build lives in the write buffer or
     // the committed delta, not in the built lists.
     insert(&db, "purged_items", 1_000, victim(1_000));
@@ -221,7 +221,7 @@ fn purge_erases_vector_bytes_from_every_index_page_buffer_generation_and_export(
             "an export taken after PURGE holds none of the erased bytes"
         );
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, ROWS as usize, 1, 10);
     db.close().expect("close the purged store");
     drop(db);
 
@@ -284,7 +284,7 @@ fn purge_during_a_multi_cycle_build_abandons_it_and_leaves_no_sampled_vector() {
     // Advance the build one bounded cycle at a time until its persisted
     // state holds the victim, while it is still unpublished.
     let mut needles = Vec::new();
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(200, 16, 10) {
         db.run_maintenance_cycle().expect("one bounded build cycle");
         if !build_progress(&db, "building_items", "embedding", &[]).in_flight {
             assert_eq!(
@@ -343,7 +343,7 @@ fn purge_during_a_multi_cycle_build_abandons_it_and_leaves_no_sampled_vector() {
         "no training reservoir, accumulator, unpublished run or other page holds the victim"
     );
 
-    drive_until_serving(&db);
+    drive_until_serving(&db, 200, 16, 10);
     assert!(
         serving(&db, "building_items", "embedding", &[]).is_some(),
         "a fresh build publishes after the abandoned one"

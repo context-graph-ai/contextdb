@@ -4538,6 +4538,9 @@ enum SnapshotPinSlot {
 /// once the window has passed -- see [`CursorIdleWindow`].
 struct RegisteredSnapshot {
     snapshot: SnapshotId,
+    /// An explicit pin's existing physical root. The pin keeps the strong
+    /// holder; this weak counted reference adds no second page ownership.
+    native_root: Option<crate::persistence::WriterSnapshotWeak>,
     /// SQL statements own the rows they scan before completing the rest of
     /// their read, so retention does not let a continuous stream of those
     /// short-lived registrations pin every expired row. Reader-held

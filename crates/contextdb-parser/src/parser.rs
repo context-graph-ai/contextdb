@@ -2365,9 +2365,9 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     let mut max_partitions = None;
     let mut search_mode = None;
     let mut auto_index_at = None;
-    let mut auto_expansion_ceiling = None;
-    let mut flat_below = None;
-    let mut hnsw = None;
+    let auto_expansion_ceiling = None;
+    let flat_below = None;
+    let hnsw = None;
     let mut consolidation = None;
 
     for part in pair.into_inner() {
@@ -2411,45 +2411,10 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
                 });
             }
             Rule::alter_column_set_auto_expansion_ceiling => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| {
-                        Error::ParseError(
-                            "ALTER COLUMN SET AUTO_EXPANSION_CEILING missing value".to_string(),
-                        )
-                    })?;
-                auto_expansion_ceiling = Some(match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                });
+                return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
-            Rule::alter_column_set_flat_below => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| {
-                        Error::ParseError("ALTER COLUMN SET FLAT_BELOW missing value".to_string())
-                    })?;
-                flat_below = Some(match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                });
-            }
-            Rule::alter_column_set_hnsw => {
-                let text = part.as_str();
-                let options = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::hnsw_options)
-                    .map(build_vector_hnsw_options)
-                    .transpose()?;
-                if options.is_none() && !text.to_ascii_uppercase().ends_with("DEFAULT") {
-                    return Err(Error::ParseError(
-                        "ALTER COLUMN SET HNSW missing policy or DEFAULT".to_string(),
-                    ));
-                }
-                hnsw = Some(options);
-            }
+            Rule::alter_column_set_flat_below => return Err(removed_vector_clause("FLAT_BELOW")),
+            Rule::alter_column_set_hnsw => return Err(removed_vector_clause("HNSW")),
             Rule::alter_column_set_consolidation => {
                 let text = part.as_str();
                 let mut disabled = false;
@@ -3401,34 +3366,10 @@ fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVe
                 };
             }
             Rule::vector_auto_expansion_ceiling_clause => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| {
-                        Error::ParseError("AUTO_EXPANSION_CEILING missing value".to_string())
-                    })?;
-                options.auto_expansion_ceiling = match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                };
+                return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
-            Rule::vector_flat_below_clause => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| Error::ParseError("FLAT_BELOW missing value".to_string()))?;
-                options.flat_below = match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                };
-            }
-            Rule::vector_hnsw_clause => {
-                let options_pair = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::hnsw_options)
-                    .ok_or_else(|| Error::ParseError("HNSW missing policy group".to_string()))?;
-                options.hnsw = build_vector_hnsw_options(options_pair)?;
-            }
+            Rule::vector_flat_below_clause => return Err(removed_vector_clause("FLAT_BELOW")),
+            Rule::vector_hnsw_clause => return Err(removed_vector_clause("HNSW")),
             Rule::vector_consolidation_clause => {
                 let declaration = part.into_inner().next().ok_or_else(|| {
                     Error::ParseError("CONSOLIDATION missing policy group".to_string())
@@ -3467,56 +3408,10 @@ fn build_vector_policy_value(pair: Pair<'_, Rule>) -> VectorPolicyValue {
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn build_vector_hnsw_options(pair: Pair<'_, Rule>) -> Result<VectorHnswOptions> {
-    let mut options = VectorHnswOptions::default();
-    for option in pair.into_inner() {
-        if option.as_rule() != Rule::hnsw_option {
-            return Err(unexpected_rule(
-                option.as_rule(),
-                "build_vector_hnsw_options",
-            ));
-        }
-        let mut parts = option.into_inner();
-        let name = parts
-            .next()
-            .ok_or_else(|| Error::ParseError("HNSW member missing name".to_string()))?;
-        let value = parts
-            .next()
-            .ok_or_else(|| Error::ParseError("HNSW member missing value".to_string()))?;
-        let member = name.as_str().to_ascii_uppercase();
-        if value.as_rule() == Rule::vector_policy_decimal && member != "SEARCH_RADIUS" {
-            return Err(Error::ParseError(format!(
-                "HNSW {} takes an integer",
-                name.as_str()
-            )));
-        }
-        let slot = match member.as_str() {
-            "M" => &mut options.m,
-            "EF_CONSTRUCTION" => &mut options.ef_construction,
-            "EF_SEARCH" => &mut options.ef_search,
-            "SEARCH_RADIUS" => &mut options.search_radius,
-            _ => {
-                return Err(Error::ParseError("unknown HNSW policy member".to_string()));
-            }
-        };
-        if slot.is_some() {
-            return Err(Error::ParseError(format!(
-                "duplicate HNSW policy member {}",
-                name.as_str()
-            )));
-        }
-        *slot = Some(build_vector_policy_value(value));
-    }
-    if options == VectorHnswOptions::default() {
-        return Err(Error::ParseError(
-            "HNSW requires at least one policy member".to_string(),
-        ));
-    }
-    Ok(options)
+fn removed_vector_clause(keyword: &str) -> Error {
+    Error::ParseError(format!(
+        "Remove the {keyword} clause: the default search policy applies; to declare a target use SEARCH (TARGET_ACCURACY = n, EXPECTED_VECTORS = n)"
+    ))
 }
 
 #[expect(
@@ -4985,6 +4880,7 @@ fn build_vector_search_objectives(pair: Pair<'_, Rule>) -> Result<VectorSearchOb
     let mut result = VectorSearchObjectives::default();
     for (name, value) in vector_group_members(pair)? {
         match name.as_str() {
+            "search_radius" => return Err(removed_vector_clause("SEARCH_RADIUS")),
             "target_accuracy" => result.target_accuracy = Some(vector_raw_value(value)),
             "expected_vectors" => result.expected_vectors = Some(vector_raw_value(value)),
             _ => {
@@ -5001,6 +4897,7 @@ fn build_vector_ivf_options(pair: Pair<'_, Rule>) -> Result<VectorIvfOptions> {
     let mut result = VectorIvfOptions::default();
     for (name, value) in vector_group_members(pair)? {
         match name.as_str() {
+            "search_radius" => return Err(removed_vector_clause("SEARCH_RADIUS")),
             "lists" => result.lists = Some(vector_raw_value(value)),
             "probes" => result.probes = Some(vector_raw_value(value)),
             "refine_factor" => result.refine_factor = Some(vector_raw_value(value)),

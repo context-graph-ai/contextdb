@@ -9,6 +9,9 @@ use super::{
 };
 use crate::MemoryBudgetOwner;
 use contextdb_core::Result;
+
+mod erasure;
+mod publication;
 // Two fixed coalesce inputs plus a distinct append/join target.
 pub(crate) const MIN_LIVE_RUN_DESCRIPTORS: u64 = 2 + 1;
 pub(crate) const CONTROL_PAGES: usize = 15;
@@ -153,6 +156,10 @@ impl<S: PageStore> ClusteredIndex<S> {
             buffer_record_bytes,
             _workspace_invoice: invoice,
         };
+        #[cfg(feature = "test-seams")]
+        super::layout_observation::constructed(
+            super::IvfConstructorAllocationForTest::WriterWorkspace(layouts),
+        );
         let mut after = None;
         while let Some(partition) = out.store.next_partition(after)? {
             let manifest = out.store.manifest(partition)?.ok_or_else(corrupt)?;
@@ -417,12 +424,25 @@ impl<S: PageStore> ClusteredIndex<S> {
     }
     /// One admitted persisted training/assignment batch; caller drives maintenance.
     pub fn advance_build(&mut self, state: &mut BuildState) -> Result<bool> {
+        self.advance_build_inner(state, true)
+    }
+    /// Run the ordinary bounded build batches, stopping before publication so
+    /// maintenance can qualify the candidate while readers keep the serving root.
+    /// True means preparation is complete; it does not publish a manifest.
+    pub fn advance_build_preparation(&mut self, state: &mut BuildState) -> Result<bool> {
+        self.advance_build_inner(state, false)
+    }
+    fn advance_build_inner(&mut self, state: &mut BuildState, publish: bool) -> Result<bool> {
         self.check_build_cursor(state)?;
         if state.phase == BuildPhase::Ready {
             return Ok(true);
         }
         if state.phase == BuildPhase::Publish {
-            return self.publish_ready(state);
+            return if publish {
+                self.publish_ready(state)
+            } else {
+                Ok(true)
+            };
         }
         if state.phase == BuildPhase::Ingest {
             return Err(phase(
@@ -485,7 +505,11 @@ impl<S: PageStore> ClusteredIndex<S> {
                 next.manifest.codebook = book.store(&mut tx, manifest)?;
                 if end == u64::from(manifest.active_lists) {
                     next.phase = if manifest.slots == 0 {
-                        BuildPhase::Ready
+                        if publish {
+                            BuildPhase::Ready
+                        } else {
+                            BuildPhase::Publish
+                        }
                     } else {
                         BuildPhase::Train
                     };
@@ -548,7 +572,11 @@ impl<S: PageStore> ClusteredIndex<S> {
         tx.commit()?;
         *state = next;
         if next.phase == BuildPhase::Publish || next.phase == BuildPhase::Ready {
-            self.publish_ready(state)
+            if publish {
+                self.publish_ready(state)
+            } else {
+                Ok(true)
+            }
         } else {
             Ok(false)
         }
@@ -562,7 +590,7 @@ impl<S: PageStore> ClusteredIndex<S> {
         }
         Ok(())
     }
-    fn publish_ready(&mut self, state: &mut BuildState) -> Result<bool> {
+    fn publication_coalescing_ready(&mut self, state: &BuildState) -> Result<bool> {
         let partition = state.manifest.partition;
         if let Some((generation, blocking)) = state.publication_coalesce
             && let Some(old) = self.store.manifest(partition)?
@@ -579,38 +607,49 @@ impl<S: PageStore> ClusteredIndex<S> {
                 return Ok(false);
             }
         }
+        Ok(true)
+    }
+    /// Stage a physically searchable candidate catalog without publishing it.
+    /// None means an existing bounded coalescing operation still blocks capture.
+    /// The caller pins the returned generation's native root for calibration;
+    /// final publication captures the then-current tail again to include writes.
+    pub fn prepare_publication_view(&mut self, state: &BuildState) -> Result<Option<Manifest>> {
+        self.check_build_cursor(state)?;
+        if state.phase != BuildPhase::Publish {
+            return Err(phase(
+                "clustered calibration view requires the Publish phase",
+            ));
+        }
+        if !self.publication_coalescing_ready(state)? {
+            return Ok(None);
+        }
+        let mut tx = self.store.begin()?;
+        publication::stage_catalog(
+            &mut tx,
+            &self.owner,
+            state,
+            &mut self.raw,
+            &mut self.values,
+            &mut self.encoded,
+        )?;
+        tx.commit()?;
+        Ok(Some(state.manifest))
+    }
+    fn publish_ready(&mut self, state: &mut BuildState) -> Result<bool> {
+        let partition = state.manifest.partition;
+        if !self.publication_coalescing_ready(state)? {
+            return Ok(false);
+        }
         let mut next = *state;
         let mut tx = self.store.begin()?;
-        // F1 seals the admitted tail and freezes the finite old catalog atomically.
-        let mut new_catalog = Catalog::new(next.manifest.slots);
-        if let Some(mut old) = tx.manifest(partition)? {
-            let mut old_catalog = Catalog::load(&tx, old)?;
-            // Later coalesces cannot delay F1. Their prepared directories remain registered scratch.
-            old_catalog.coalesce_left = 0;
-            old_catalog.coalesce_right = 0;
-            old_catalog.coalesce_output = 0;
-            old_catalog.coalesce_list = 0;
-            seal_tail(
-                &mut tx,
-                &self.owner,
-                old,
-                &mut old_catalog,
-                &mut self.raw,
-                &mut self.values,
-                &mut self.encoded,
-            )?;
-            old.sealed_slots = old.slots;
-            old_catalog.store(&mut tx, old)?;
-            if old_catalog.runs != 0 {
-                new_catalog.legacy = Some(old);
-                new_catalog.legacy_first = old_catalog.first;
-                new_catalog.legacy_runs = old_catalog.runs;
-                new_catalog.frontier = state.source_lsn;
-                new_catalog.switch_lsn = tx.commit_lsn()?;
-                new_catalog.legacy_unserviceable = old_catalog.unserviceable.is_some();
-            }
-        }
-        new_catalog.store(&mut tx, next.manifest)?;
+        publication::stage_catalog(
+            &mut tx,
+            &self.owner,
+            state,
+            &mut self.raw,
+            &mut self.values,
+            &mut self.encoded,
+        )?;
         next.phase = BuildPhase::Ready;
         tx.stage_build(next)?;
         tx.publish_manifest(next.manifest)?;
@@ -983,23 +1022,7 @@ impl<S: PageStore> ClusteredIndex<S> {
     /// Verify unmarked derived objects and persist the first corruption verdict.
     /// Subsequent inspections read that flag; read-only SHOW never re-verifies.
     pub fn inspect_catalog(&mut self, partition: u64) -> Result<Option<catalog::CatalogState>> {
-        self.store.check_cancel()?;
-        let Some(state) = catalog::inspect(&self.store, partition, self.policy.max_delta_runs)?
-        else {
-            return Ok(None);
-        };
-        if let Some(key) = state.unserviceable
-            && !state.verdict_recorded
-        {
-            let m = self.store.manifest(partition)?.ok_or_else(corrupt)?;
-            let mut c = Catalog::load(&self.store, m)?;
-            c.unserviceable.get_or_insert(key);
-            let mut tx = self.store.begin()?;
-            c.store(&mut tx, m)?;
-            tx.commit()?;
-            return catalog::inspect(&self.store, partition, self.policy.max_delta_runs);
-        }
-        Ok(Some(state))
+        catalog::inspect_and_record(&mut self.store, partition, self.policy.max_delta_runs)
     }
 
     /// At most entry_limit source entries, with a durable entry cursor. Prepared

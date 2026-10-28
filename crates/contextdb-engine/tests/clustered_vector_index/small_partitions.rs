@@ -71,7 +71,7 @@ fn default_probes_keep_probing_until_k_eligible_candidates_are_found() {
         .expect("stage one row");
     }
     db.commit(tx).expect("commit 128 rows");
-    drive_until_serving(&db);
+    drive_until_serving(&db, 128, 1, 10);
     let lists = serving(&db, "small_items", "embedding", &[])
         .expect("a generation serves")
         .lists;
@@ -139,7 +139,7 @@ fn explicit_indexed_on_a_150_row_partition_is_served_complete_from_its_generatio
         }
     }
     db.commit(tx).expect("commit both partitions");
-    drive_until_serving(&db);
+    drive_until_serving(&db, 300, 1, 10);
     let generation = serving(&db, "small_items", "embedding", &[Value::Uuid(context(0))])
         .expect("the 150-row partition has a published generation")
         .generation;

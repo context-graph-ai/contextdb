@@ -284,6 +284,7 @@ pub(crate) struct WriterSnapshot {
     pub(crate) lsn: Lsn,
     accountant: crate::memory_accounting::AccountantHandle,
     _control: WriterSnapshotControl,
+    pub(crate) native_ivf_cache: super::vector_ivf::NativeIvfCache,
     erasure: parking_lot::RwLock<WriterErasure>,
     schema: Arc<WriterSchema>,
     registry: Arc<parking_lot::Mutex<Vec<WriterSnapshotWeak>>>,
@@ -694,7 +695,30 @@ impl RedbPersistence {
 
     pub(crate) fn complete_writer_schema_change(&self, schema: Option<Arc<WriterSchema>>) {
         if let Some(schema) = schema {
-            let prior = self.writer_schema.lock().replace(schema);
+            let prior = self.writer_schema.lock().replace(schema.clone());
+            if let Some(prior) = &prior {
+                for (table, old) in &prior.tables {
+                    for column in &old.meta.columns {
+                        if !matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) {
+                            continue;
+                        }
+                        let successor = schema.tables.get(table).and_then(|next| {
+                            next.meta
+                                .columns
+                                .iter()
+                                .find(|next| next.name == column.name)
+                        });
+                        if successor.is_none_or(|next| {
+                            next.column_type != column.column_type
+                                || next.quantization != column.quantization
+                                || next.partition_key_columns != column.partition_key_columns
+                        }) {
+                            self.native_ivf_cache
+                                .forget_retained_index_name(table, &column.name);
+                        }
+                    }
+                }
+            }
             drop(prior);
         }
     }
@@ -942,6 +966,7 @@ impl RedbPersistence {
                 lsn,
                 accountant,
                 _control: WriterSnapshotControl::empty(),
+                native_ivf_cache: self.native_ivf_cache.fork(),
                 erasure: parking_lot::RwLock::new(WriterErasure::default()),
                 schema,
                 registry: Arc::clone(&self.writer_snapshots),
@@ -1209,6 +1234,7 @@ impl RedbPersistence {
                 lsn,
                 accountant,
                 _control: WriterSnapshotControl::from_owned(control),
+                native_ivf_cache: self.native_ivf_cache.fork(),
                 erasure: parking_lot::RwLock::new(WriterErasure::default()),
                 schema,
                 registry: Arc::clone(&self.writer_snapshots),
@@ -1269,6 +1295,7 @@ impl RedbPersistence {
                     lsn,
                     accountant,
                     _control: WriterSnapshotControl::empty(),
+                    native_ivf_cache: self.native_ivf_cache.fork(),
                     erasure: parking_lot::RwLock::new(WriterErasure::default()),
                     schema,
                     registry: Arc::clone(&self.writer_snapshots),

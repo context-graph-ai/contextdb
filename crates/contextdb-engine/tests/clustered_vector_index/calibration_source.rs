@@ -7,9 +7,9 @@
 //! one pinned at the new frontier.
 
 use super::support::{
-    CalibrationBasis, MAX_MAINTENANCE_CYCLES, ObjectiveStatus, SearchRoute, calibration_receipt,
-    declare_calibration_queries, drive_until_serving, empty, observe_search, open_caller_driven,
-    params, plant_qualification, requalification_pending, serving, unit_vector,
+    CalibrationBasis, ObjectiveStatus, SearchRoute, calibration_receipt,
+    declare_calibration_queries, drive_until_serving, empty, maintenance_cycles, observe_search,
+    open_caller_driven, params, plant_qualification, requalification_pending, serving, unit_vector,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -74,6 +74,11 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
     }
     insert(&db, "sourced_items", 0..2_000, 0);
     insert(&db, "sourced_questions", 0..50, 900_000);
+    db.execute(
+        "ALTER TABLE sourced_items ALTER COLUMN embedding SET WITH (calibration_samples = 50)",
+        &empty(),
+    )
+    .expect("declare the fifty-question calibration threshold");
     declare_calibration_queries(
         &db,
         "sourced_items",
@@ -81,7 +86,7 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
         "sourced_questions",
         "embedding",
     );
-    drive_until_serving(&db);
+    drive_until_serving(&db, 2050, 1, 10);
     // A deterministic qualified baseline: depth 10 qualified on the
     // source-calibrated generation at a twentieth of EXACT's work.
     plant_qualification(&db, "sourced_items", "embedding", &[], &[10], 100, 2_000);
@@ -116,7 +121,7 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
         "a change to the calibration source marks requalification pending"
     );
     let mut requalified = false;
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(2070, 1, 10) {
         if !requalification_pending(&db, "sourced_items", "embedding", &[]) {
             requalified = true;
             break;
@@ -160,4 +165,37 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
         }
         other => panic!("requalification stays on the declared source: {other:?}"),
     }
+}
+
+#[test]
+fn fifty_source_questions_use_stored_vectors_under_the_default_two_hundred_sample_threshold() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_caller_driven(&root.path().join("sourced-default.db"));
+    for table in ["sourced_items", "sourced_questions"] {
+        db.execute(
+            &format!(
+                "CREATE TABLE {table} (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}))"
+            ),
+            &empty(),
+        )
+        .expect("declare the table");
+    }
+    insert(&db, "sourced_items", 0..2_000, 0);
+    insert(&db, "sourced_questions", 0..50, 900_000);
+    declare_calibration_queries(
+        &db,
+        "sourced_items",
+        "embedding",
+        "sourced_questions",
+        "embedding",
+    );
+    drive_until_serving(&db, 2050, 1, 10);
+
+    assert_eq!(
+        calibration_receipt(&db, "sourced_items", "embedding", &[])
+            .expect("the serving generation has a receipt")
+            .basis,
+        CalibrationBasis::StoredVectors,
+        "fifty source questions do not meet the default two-hundred-sample threshold"
+    );
 }

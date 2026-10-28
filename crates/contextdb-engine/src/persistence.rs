@@ -65,9 +65,9 @@ mod schema_binding;
 mod transaction_repair;
 pub(crate) mod vector_current_identity;
 pub(crate) mod vector_identity_range;
+pub(crate) mod vector_ivf;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
-pub(crate) mod vector_ivf;
 pub(crate) mod vector_paged;
 mod vector_saved;
 #[cfg(unix)]
@@ -1138,6 +1138,7 @@ pub(crate) struct RetainedReadSourceData {
     content_proof: Mutex<content_identity::ReadAuthenticationNodes>,
     physical_rows: Mutex<Option<RetainedPhysicalRowScan>>,
     image_config_cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
+    pub(crate) native_ivf_cache: vector_ivf::NativeIvfCache,
     verified_ordered_runs: VerifiedOrderedRunCache,
     _source_memory: SourceShared<SourceMemoryReservation>,
 }
@@ -6593,7 +6594,7 @@ struct CacheInstallation {
 /// cannot work.
 pub(crate) const REDB_CACHE_FLOOR_BYTES: usize = 256 * 1024;
 
-const STORAGE_MAINTENANCE_PAGE_BATCH: usize = 64;
+pub(crate) const STORAGE_MAINTENANCE_PAGE_BATCH: usize = 64;
 /// Per-commit reclaim limits of a maintenance reclaim step. Ordinary commits keep
 /// `STORAGE_MAINTENANCE_PAGE_BATCH`; a reclaim-only maintenance commit has no foreground write to
 /// delay, and 4,096 measured the same worst single-commit latency as 64.
@@ -6794,6 +6795,7 @@ pub struct RedbPersistence {
     /// Catalog/base records staged for the publishing batch of a paged
     /// vector build, keyed by its partition route. Taken by that batch.
     paged_publications: parking_lot::Mutex<HashMap<Vec<u8>, vector_paged::PagedPublication>>,
+    pub(crate) native_ivf_cache: vector_ivf::NativeIvfCache,
     /// Captures the writer's published root for paged generation readers.
     paged_root_capture: std::sync::OnceLock<vector_paged::PagedRootCapture>,
     scoped_vector_root_capture: std::sync::OnceLock<vector_paged::ScopedWriterRootCapture>,

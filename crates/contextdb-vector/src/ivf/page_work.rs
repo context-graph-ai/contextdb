@@ -31,6 +31,9 @@ impl<'a, S> Tracked<'a, S> {
     }
 }
 impl<S: ReadPages> ReadPages for Tracked<'_, S> {
+    fn retained_codebook(&self, manifest: Manifest) -> Option<&super::RetainedCodebook> {
+        self.source.retained_codebook(manifest)
+    }
     fn inspection_verdict(&self, p: u64, g: u64) -> Option<Verdict> {
         self.source.inspection_verdict(p, g)
     }

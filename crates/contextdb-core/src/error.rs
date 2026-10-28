@@ -1002,6 +1002,11 @@ pub enum Error {
     BfsDepthExceeded(u32),
     #[error("BFS visited set exceeded limit ({0})")]
     BfsVisitedExceeded(usize),
+    #[error("vector {index:?} contains a non-finite component at position {position}")]
+    InvalidVectorValue {
+        index: VectorIndexRef,
+        position: usize,
+    },
     #[error("vector index dimension mismatch on {index}: expected {expected}, got {actual}")]
     VectorIndexDimensionMismatch {
         index: VectorIndexRef,
@@ -1018,6 +1023,11 @@ pub enum Error {
         expected_lsn: crate::types::Lsn,
         actual_created_tx: Option<TxId>,
         actual_lsn: Option<crate::types::Lsn>,
+    },
+    #[error("vector index {index} is corrupted: {reason}")]
+    IndexCorrupted {
+        index: VectorIndexRef,
+        reason: DiagnosticText,
     },
     #[error("unknown vector index {index}")]
     UnknownVectorIndex { index: VectorIndexRef },

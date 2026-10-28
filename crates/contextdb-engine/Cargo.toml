@@ -843,3 +843,23 @@ required-features = ["test-seams"]
 name = "import_persistence_without_observer"
 path = "tests/import_persistence_without_observer.rs"
 required-features = ["test-seams"]
+
+[[test]]
+name = "native_query_precision"
+path = "tests/native_query_precision.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_initial_reclaim"
+path = "tests/native_initial_reclaim.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_query_overrides"
+path = "tests/native_query_overrides.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_page_damage"
+path = "tests/native_page_damage.rs"
+required-features = ["test-seams"]

@@ -11,11 +11,11 @@
 //! the ceiling is lifted the build finishes and the store reopens cleanly.
 
 use super::support::{
-    AdmissionBoundary, BuildWriteClass, BuildWriteEvent, MAX_MAINTENANCE_CYCLES, PhysicalPage,
-    build_progress, count, declare_ceiling_at_next_admission, drive_until_serving, empty, int_ids,
-    ivf, last_build_refusal, observe_build_writes, observe_search, open_caller_driven,
-    open_with_build_batch_rows, outstanding_index_reservations, params, physical_pages, serving,
-    unit_vector, withhold_reusable_space_from,
+    AdmissionBoundary, BuildWriteClass, BuildWriteEvent, PhysicalPage, build_progress, count,
+    declare_ceiling_at_next_admission, drive_until_serving, empty, int_ids, ivf,
+    last_build_refusal, maintenance_cycles, observe_build_writes, observe_search,
+    open_caller_driven, open_with_build_batch_rows, outstanding_index_reservations, params,
+    physical_pages, serving, unit_vector, withhold_reusable_space_from,
 };
 use contextdb_core::{Error, Value, Wallclock};
 use contextdb_engine::Database;
@@ -62,7 +62,12 @@ fn store_with_due_replacement(path: &Path) -> (Database, u64) {
     )
     .expect("declare the clustered index");
     insert_rows(&db, FIRST_ROWS);
-    drive_until_serving(&db);
+    drive_until_serving(
+        &db,
+        (FIRST_ROWS.end - FIRST_ROWS.start) as usize,
+        BUILD_BATCH_ROWS as usize,
+        10,
+    );
     let first = serving(&db, "ceiling_items", "embedding", &[])
         .expect("the first generation is serving")
         .generation;
@@ -215,7 +220,12 @@ fn assert_still_serving(db: &Database, first: u64, stage: &str) {
 
 fn assert_finishes_once_lifted(db: Database, path: &Path, first: u64, stage: &str) {
     db.set_disk_limit(None).expect("lift the disk ceiling");
-    drive_until_serving(&db);
+    drive_until_serving(
+        &db,
+        (FIRST_ROWS.end - FIRST_ROWS.start + SECOND_ROWS.end - SECOND_ROWS.start) as usize,
+        BUILD_BATCH_ROWS as usize,
+        10,
+    );
     assert_ne!(
         serving(&db, "ceiling_items", "embedding", &[])
             .expect("a generation is serving")
@@ -277,7 +287,11 @@ fn a_replacement_build_under_an_exhausted_ceiling_is_refused_and_writes_nothing(
 /// Drives `db`'s replacement, cycle by cycle with no ceiling, until its next
 /// step writes `class`.
 fn drive_until_next_write(db: &Database, class: BuildWriteClass) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
+    for _ in 0..maintenance_cycles(
+        (FIRST_ROWS.end - FIRST_ROWS.start + SECOND_ROWS.end - SECOND_ROWS.start) as usize,
+        BUILD_BATCH_ROWS as usize,
+        10,
+    ) {
         if build_progress(db, "ceiling_items", "embedding", &[]).next_write == Some(class) {
             return;
         }

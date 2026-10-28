@@ -447,7 +447,7 @@ fn a_query_raises_its_own_target_accuracy_and_an_out_of_range_target_is_refused(
         )
         .expect("commit one row");
     }
-    drive_until_serving(&db);
+    drive_until_serving(&db, 200, 1, 10);
     let query = params([("query", Value::Vector(unit_vector(7, 8)))]);
     for target in ["99", "95.5"] {
         let answer = db

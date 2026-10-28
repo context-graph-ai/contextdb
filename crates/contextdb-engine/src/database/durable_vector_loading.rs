@@ -88,6 +88,7 @@ impl SnapshotFloorRegistry {
             token,
             RegisteredSnapshot {
                 snapshot,
+                native_root: None,
                 class: SnapshotRegistrationClass::ReaderHeld,
                 idle_window: None,
             },
@@ -242,6 +243,7 @@ impl SnapshotFloorRegistry {
             token,
             RegisteredSnapshot {
                 snapshot,
+                native_root: None,
                 class,
                 idle_window,
             },

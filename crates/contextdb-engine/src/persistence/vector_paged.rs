@@ -33,7 +33,7 @@ pub(super) const CLEANUP: TableDefinition<u64, &[u8]> =
 const SCRATCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_paged_search_scratch");
 const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("vector_paged_counters");
 /// Frontier of an in-flight whole (resident) build, per partition route.
-const FLOORS: TableDefinition<&[u8], u64> = TableDefinition::new("vector_build_floors");
+pub(super) const FLOORS: TableDefinition<&[u8], u64> = TableDefinition::new("vector_build_floors");
 /// A source cursor cannot have this length/value. Incomplete resident exports
 /// are discarded on restart; their pages remain owned by BUILDS until queued
 /// for cleanup. Complete exports clear it before native publication.
@@ -1904,7 +1904,7 @@ impl CapturedPagedRoot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn from_writer(root: WriterSnapshotHandle) -> Result<Self> {
+    pub(crate) fn from_writer(root: WriterSnapshotHandle) -> Result<Self> {
         let read = root.owner_read()?;
         Ok(Self {
             read,
@@ -6511,6 +6511,16 @@ mod single_authentication_tests {
                 2,
                 "authenticate each immutable fetched frame exactly once"
             );
+        }
+    }
+}
+
+impl CapturedPagedRoot {
+    pub(crate) fn native_ivf_cache(&self) -> &super::vector_ivf::NativeIvfCache {
+        match &self.holder {
+            PagedRootHolder::Writer(root) => &root.native_ivf_cache,
+            PagedRootHolder::Image(source) => &source.native_ivf_cache,
+            PagedRootHolder::Captured(lease) => lease.native_ivf_cache(),
         }
     }
 }

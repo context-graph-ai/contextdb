@@ -14,7 +14,7 @@ const MANIFEST_WIRE_BYTES: usize = 3 * 8 + 2 * 4 + 2 * 8 + 32 + 8;
 const BUILD_WIRE_BYTES: usize =
     MANIFEST_WIRE_BYTES + 1 + 8 + 2 * 4 + 4 * 8 + 1 + MANIFEST_WIRE_BYTES + 8 + 1 + 2 * 8;
 const FAMILY_WIRE_BYTES: usize =
-    2 * 8 + 2 + 16 * 32 + 3 * 8 + 32 + 1 + MANIFEST_WIRE_BYTES + 8 + 1 + 8 + 2 * 8;
+    2 * 8 + 2 + 16 * 32 + 1 + 32 + 3 * 8 + 32 + 1 + MANIFEST_WIRE_BYTES + 8 + 1 + 8 + 2 * 8 + 1 + 8;
 pub(super) const MAX_SCOPE_WIRE_BYTES: usize = 16
     + 2 * 32
     + 1
@@ -31,8 +31,12 @@ pub(super) const MAX_SCOPE_WIRE_BYTES: usize = 16
     + 3 * 8
     + 32
     + 2 * 8
-    + 1;
-const _: () = assert!(MAX_SCOPE_WIRE_BYTES == 2790);
+    + 1
+    + 2 * 8
+    + 2 * 8
+    + 1
+    + 40;
+const _: () = assert!(MAX_SCOPE_WIRE_BYTES == 2989);
 const _: () = assert!(12 + MAX_SCOPE_WIRE_BYTES + 32 <= PAGE_BYTES);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +67,7 @@ pub(super) struct Family {
     pub generation: u64,
     pub storage: u64,
     pub kinds: KindRoots,
+    pub qualification_root: Option<[u8; 32]>,
     pub policy_revision: u64,
     pub source_frontier: u64,
     pub source_snapshot: u64,
@@ -71,6 +76,7 @@ pub(super) struct Family {
     /// Current applied delta/run frontier; never the immutable header basis.
     pub committed_through_lsn: u64,
     pub reservoir_samples: Option<u64>,
+    pub training_seed: Option<u64>,
     pub basis_entries: u64,
     pub basis_live_entries: u64,
 }
@@ -216,6 +222,12 @@ pub(super) struct SourceCursor {
     pub membership: [u8; 24],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct SourceEnd {
+    pub first: [u8; 32],
+    pub last: [u8; 8],
+}
+
 /// Successful authoritative metadata changes applied to native deltas after
 /// a held build frontier. Separate monotone counts avoid a signed range cap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +248,7 @@ pub(super) struct ScopeRecord {
     pub build: Option<BuildRecord>,
     pub families: [Option<Family>; ROOTS],
     pub source_cursor: Option<SourceCursor>,
+    pub source_end: Option<SourceEnd>,
     pub source_identity: [u8; 32],
     pub source_entries: u64,
     pub ingested_vectors: u64,
@@ -248,6 +261,10 @@ pub(super) struct ScopeRecord {
     pub current_membership_entries: u64,
     pub current_membership_live_entries: u64,
     pub canonical_complete: bool,
+    pub training_evaluations: u64,
+    pub assignment_evaluations: u64,
+    pub aborted_builds: u64,
+    pub legacy_entries_prepared: u64,
 }
 impl ScopeRecord {
     pub fn empty(
@@ -266,6 +283,7 @@ impl ScopeRecord {
             build: None,
             families: [None; ROOTS],
             source_cursor: None,
+            source_end: None,
             source_identity: [0; 32],
             source_entries: 0,
             ingested_vectors: 0,
@@ -277,6 +295,10 @@ impl ScopeRecord {
             current_membership_entries: 0,
             current_membership_live_entries: 0,
             canonical_complete: false,
+            training_evaluations: 0,
+            assignment_evaluations: 0,
+            aborted_builds: 0,
+            legacy_entries_prepared: 0,
         })
     }
     pub fn family(&self, generation: u64) -> Option<&Family> {
@@ -307,6 +329,9 @@ impl ScopeRecord {
         for (at, family) in self.families.iter().enumerate() {
             if let Some(f) = family {
                 f.kinds.validate()?;
+                if f.qualification_root == Some([0; 32]) {
+                    return Err(corrupt());
+                }
                 if f.basis_live_entries > f.basis_entries
                     || f.source_frontier > f.committed_through_lsn
                 {
@@ -456,6 +481,38 @@ pub(super) fn encode_retired_family(
     digest.update(&out[..end]);
     out[end..].copy_from_slice(digest.finalize().as_bytes());
     Ok(())
+}
+
+pub(super) fn decode_retired_family(key: &[u8], bytes: &[u8]) -> Result<Family> {
+    if key.len() != 73 || key[64] != b'R' || bytes.len() != PAGE_BYTES || &bytes[..8] != b"CDBIVFR1"
+    {
+        return Err(corrupt());
+    }
+    let end = PAGE_BYTES - 32;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"contextdb.clustered.retired.family.v1");
+    hash.update(key);
+    hash.update(&bytes[..end]);
+    if bytes[end..] != *hash.finalize().as_bytes() {
+        return Err(corrupt());
+    }
+    let length = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| corrupt())?) as usize;
+    if length > FAMILY_WIRE_BYTES
+        || 12 + length > end
+        || bytes[12 + length..end].iter().any(|b| *b != 0)
+    {
+        return Err(corrupt());
+    }
+    let (family, consumed): (Family, usize) = bincode::serde::decode_from_slice(
+        &bytes[12..12 + length],
+        bincode::config::standard().with_fixed_int_encoding(),
+    )
+    .map_err(|_| corrupt())?;
+    if consumed != length || key[65..] != family.storage.to_be_bytes() {
+        return Err(corrupt());
+    }
+    family.kinds.validate()?;
+    Ok(family)
 }
 
 pub(super) fn index_digest(index: &VectorIndexRef, schema: VectorSchemaBinding) -> [u8; 32] {

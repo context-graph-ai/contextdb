@@ -45,7 +45,7 @@ fn built(path: &Path, rows: i64, seed: u64) -> Database {
         .expect("stage one row");
     }
     db.commit(tx).expect("commit the rows");
-    drive_until_serving(&db);
+    drive_until_serving(&db, rows as usize, 1, 10);
     db
 }
 
