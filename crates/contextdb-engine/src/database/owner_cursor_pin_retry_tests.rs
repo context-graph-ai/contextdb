@@ -210,8 +210,8 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         cursor_page_rows: 1,
         ..ReadLimits::default()
     };
-    struct RequestFinished(std::sync::mpsc::Sender<()>);
-    impl crate::owner_read::OwnerBoundedExecutionObserver for RequestFinished {
+    struct RequestRetired(std::sync::mpsc::Sender<()>);
+    impl crate::owner_read::OwnerBoundedExecutionObserver for RequestRetired {
         fn before_operation(
             &self,
             _: crate::owner_read::OwnerBoundedOperation,
@@ -224,13 +224,13 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
             _: u64,
         ) {}
         fn cancellation_observed(&self, _: u64) {}
-        fn request_finished(&self) {
+        fn carrier_request_retired(&self) {
             let _ = self.0.send(());
         }
     }
     let (finished_owner, owner_finished) = std::sync::mpsc::channel();
     let db = crate::owner_read::OwnerServiceSpec::with_execution_observer_during_start_for_test(
-        Arc::new(RequestFinished(finished_owner)),
+        Arc::new(RequestRetired(finished_owner)),
         || {
             Database::open_with_options(
                 &path,
@@ -384,7 +384,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
             if matches!(outcome, RegistryWaitOutcome::Cancelled) {
                 owner_finished
                     .recv_timeout(Duration::from_secs(30))
-                    .expect("cancelled owner request terminal event was not delivered");
+                    .expect("cancelled owner worker retirement event never delivered");
             }
             assert!(db.snapshot_registry.state.lock().active.is_empty());
         }
