@@ -1,6 +1,6 @@
 use contextdb_core::Value;
 use contextdb_engine::{Database, SearchResult, SemanticQuery};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
 use std::collections::HashMap;
 use std::hint::black_box;
 use uuid::Uuid;
@@ -229,4 +229,16 @@ fn mv11_recall_bench(c: &mut Criterion) {
 }
 
 criterion_group!(benches, mv11_recall_bench);
-criterion_main!(benches);
+
+fn main() {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        // Let Criterion implement libtest-compatible listing, including its
+        // ignored and exact filters, without constructing the benchmark data.
+        let mut criterion = Criterion::default().configure_from_args();
+        criterion.bench_function("mv11_recall_bench", |_| {});
+        criterion.final_summary();
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
