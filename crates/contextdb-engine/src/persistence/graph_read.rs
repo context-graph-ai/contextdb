@@ -1092,13 +1092,6 @@ struct VerifiedGraphCreation<'a> {
     digest: [u8; 32],
     _credit: ReadCredit,
 }
-// This witness is created and consumed inside one captured-read proof closure.
-struct VerifiedGraphMaximum<'a> {
-    read: &'a redb::ReadTransaction,
-    snapshot: redb::StorageSnapshotIdentity,
-    lsn: Lsn,
-    maximum: TxId,
-}
 impl<'a> GraphProofContext<'a> {
     fn image(
         source: &'a RetainedReadSource,
@@ -1152,23 +1145,19 @@ impl<'a> GraphProofContext<'a> {
                 .verify_with_read_memory(mutation, self.proof_memory.clone()),
         }
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     fn graph_window_memory(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<crate::read_image_memory::ImageMemoryHandle> {
+    ) -> crate::read_image_memory::ImageMemoryHandle {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
         match self.image {
-            Some(source) => Ok(source.graph_window_memory(memory)),
+            Some(source) => source.graph_window_memory(memory),
             None => self
                 .scratch
                 .as_ref()
                 .expect("graph proof scratch owner")
-                .funded_reader_scratch(memory),
+                .clone(),
         }
     }
     #[expect(
@@ -1179,7 +1168,6 @@ impl<'a> GraphProofContext<'a> {
         &self,
         read: &redb::ReadTransaction,
         edge: &AdjEntry,
-        raw: &[u8],
         reverse: bool,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<[u8; 32]>> {
@@ -1193,7 +1181,8 @@ impl<'a> GraphProofContext<'a> {
                 ),
             )
         };
-        (|| {
+        let scratch = self.graph_window_memory(memory.clone());
+        scratch.scope(|| {
             let owner = writer_source::SourceWindowOwner::Read(memory.clone());
             let (first, second) = if reverse {
                 (edge.source, edge.target)
@@ -1232,17 +1221,9 @@ impl<'a> GraphProofContext<'a> {
                 .get(key.key.as_ref())
                 .map_err(|error| diagnosis(self, read_storage_error(error)))?
                 .ok_or_else(mismatch)?;
-            // The original edge was decoded and checked against its physical
-            // key. Equal authenticated bytes prove the opposite projection
-            // without allocating another copy of every property. Nonidentical
-            // encodings keep the complete semantic comparison.
-            if value.value() != raw {
-                let scratch = self.graph_window_memory(memory.clone())?;
-                let counterpart =
-                    scratch.scope(|| decode_edge(self, &key.key, value.value(), !reverse))?;
-                if !same_edge(edge, &counterpart) {
-                    return Err(mismatch());
-                }
+            let counterpart = decode_edge(self, &key.key, value.value(), !reverse)?;
+            if !same_edge(edge, &counterpart) {
+                return Err(mismatch());
             }
             if reverse {
                 Ok(Some(graph_history_record::contribution_digest(
@@ -1253,7 +1234,7 @@ impl<'a> GraphProofContext<'a> {
             } else {
                 Ok(None)
             }
-        })()
+        })
     }
     /// Shared-LSN siblings may be below the maximum. The committed metadata
     /// bound, not a scan or a fabricated per-edge equality, proves admission.
@@ -1536,20 +1517,17 @@ impl<'a> GraphProofContext<'a> {
                 }) {
                     self.graph_digest_value(Some(value.value()), verified.digest)?;
                 } else {
-                    let scratch = self.graph_window_memory(memory.clone())?;
-                    scratch.scope(|| {
-                        self.graph_bytes(read, GRAPH_FWD_TABLE, p, |raw| {
-                            let raw = raw.ok_or_else(|| {
-                                self.content_identity_corruption("creation maximum payload missing")
-                            })?;
-                            let edge = decode_edge(self, p, raw, false)?;
-                            self.verify_graph_creation(&edge)?;
-                            self.verify_graph_counterpart(read, &edge, raw, false, memory.clone())?;
-                            self.graph_digest_value(
-                                Some(value.value()),
-                                graph_history_record::contribution_digest(true, p, raw)?,
-                            )
-                        })
+                    self.graph_bytes(read, GRAPH_FWD_TABLE, p, |raw| {
+                        let raw = raw.ok_or_else(|| {
+                            self.content_identity_corruption("creation maximum payload missing")
+                        })?;
+                        let edge = decode_edge(self, p, raw, false)?;
+                        self.verify_graph_creation(&edge)?;
+                        self.verify_graph_counterpart(read, &edge, false, memory.clone())?;
+                        self.graph_digest_value(
+                            Some(value.value()),
+                            graph_history_record::contribution_digest(true, p, raw)?,
+                        )
                     })?;
                 }
                 (a, true)
@@ -1661,29 +1639,12 @@ impl<'a> GraphProofContext<'a> {
         reverse: bool,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
-        self.verify_graph_edge_proof_with_maximum(read, key, raw, edge, reverse, memory, None)
-    }
-    #[allow(clippy::too_many_arguments)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Preserve the existing inline native refusal."
-    )]
-    fn verify_graph_edge_proof_with_maximum(
-        &self,
-        read: &redb::ReadTransaction,
-        key: &[u8],
-        raw: &[u8],
-        edge: &AdjEntry,
-        reverse: bool,
-        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        verified_maximum: Option<&VerifiedGraphMaximum<'_>>,
-    ) -> Result<()> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         self.verify_graph_creation(edge)?;
         let counterpart_digest =
-            self.verify_graph_counterpart(read, edge, raw, reverse, memory.clone())?;
+            self.verify_graph_counterpart(read, edge, reverse, memory.clone())?;
         let owner = writer_source::SourceWindowOwner::Read(memory.clone());
         let p = if reverse {
             owner.endpoint(&[&key[16..32], &key[..16], &key[32..]], "graph_forward_key")?
@@ -1720,25 +1681,7 @@ impl<'a> GraphProofContext<'a> {
                 },
             )
         })?;
-        let maximum = match verified_maximum {
-            Some(verified) => {
-                assert!(
-                    std::ptr::eq(read, verified.read),
-                    "maximum belongs to this captured read"
-                );
-                assert_eq!(
-                    read.storage_snapshot_identity(),
-                    verified.snapshot,
-                    "maximum belongs to this exact storage snapshot"
-                );
-                assert_eq!(
-                    edge.lsn, verified.lsn,
-                    "maximum belongs to the selected edge group"
-                );
-                verified.maximum
-            }
-            None => self.graph_maximum(read, edge.lsn, memory, verified_creation.as_ref())?,
-        };
+        let maximum = self.graph_maximum(read, edge.lsn, memory, verified_creation.as_ref())?;
         if edge.created_tx > maximum {
             return Err(self.content_identity_corruption("edge exceeds physical graph maximum"));
         }
@@ -1833,61 +1776,52 @@ impl<'a> GraphProofContext<'a> {
         )?;
         let owner = writer_source::SourceWindowOwner::Read(memory.clone());
         let reverse = owner.endpoint(&[&p[16..32], &p[..16], &p[32..]], "history_reverse_key")?;
-        let scratch = self.graph_window_memory(memory.clone())?;
-        scratch.scope(|| {
-            self.graph_bytes(read, GRAPH_FWD_TABLE, p, |fwd| {
-                self.graph_bytes(read, GRAPH_REV_TABLE, &reverse.key, |rev| {
-                    if state == 1 {
-                        if fwd.is_some()
-                            || rev.is_some()
-                            || creation_lsn.0 > self.graph_retirement_frontier
-                        {
-                            return Err(self.content_identity_corruption(
-                                "retired predecessor lacks exact absence/frontier proof",
-                            ));
-                        }
-                        return Ok(());
-                    }
-                    let fwd = fwd.ok_or_else(|| {
-                        self.content_identity_corruption(
-                            "present predecessor forward projection missing",
-                        )
-                    })?;
-                    let rev = rev.ok_or_else(|| {
-                        self.content_identity_corruption(
-                            "present predecessor reverse projection missing",
-                        )
-                    })?;
-                    let edge = decode_edge(self, p, fwd, false)?;
-                    let projections_agree = if fwd == rev {
-                        true
-                    } else {
-                        let counterpart = decode_edge(self, &reverse.key, rev, true)?;
-                        same_edge(&edge, &counterpart)
-                    };
-                    if !projections_agree || edge.deleted_tx != Some(d) {
+        self.graph_bytes(read, GRAPH_FWD_TABLE, p, |fwd| {
+            self.graph_bytes(read, GRAPH_REV_TABLE, &reverse.key, |rev| {
+                if state == 1 {
+                    if fwd.is_some()
+                        || rev.is_some()
+                        || creation_lsn.0 > self.graph_retirement_frontier
+                    {
                         return Err(self.content_identity_corruption(
-                            "present predecessor projections disagree with receipt",
+                            "retired predecessor lacks exact absence/frontier proof",
                         ));
                     }
-                    self.verify_graph_creation(&edge)?;
-                    let creation = graph_history_record::creation_contribution_key(p)?;
-                    self.graph_bytes(
-                        read,
-                        graph_history_record::GRAPH_CONTRIBUTIONS,
-                        &creation,
-                        |v| {
-                            self.graph_digest_value(
-                                v,
-                                graph_history_record::contribution_digest(true, p, fwd)?,
-                            )
-                        },
-                    )?;
-                    self.graph_commit(read, creation_lsn, created, true, "predecessor")
-                })
+                    return Ok(());
+                }
+                let fwd = fwd.ok_or_else(|| {
+                    self.content_identity_corruption(
+                        "present predecessor forward projection missing",
+                    )
+                })?;
+                let rev = rev.ok_or_else(|| {
+                    self.content_identity_corruption(
+                        "present predecessor reverse projection missing",
+                    )
+                })?;
+                let edge = decode_edge(self, p, fwd, false)?;
+                let counterpart = decode_edge(self, &reverse.key, rev, true)?;
+                if !same_edge(&edge, &counterpart) || edge.deleted_tx != Some(d) {
+                    return Err(self.content_identity_corruption(
+                        "present predecessor projections disagree with receipt",
+                    ));
+                }
+                self.verify_graph_creation(&edge)?;
+                let creation = graph_history_record::creation_contribution_key(p)?;
+                self.graph_bytes(
+                    read,
+                    graph_history_record::GRAPH_CONTRIBUTIONS,
+                    &creation,
+                    |v| {
+                        self.graph_digest_value(
+                            v,
+                            graph_history_record::contribution_digest(true, p, fwd)?,
+                        )
+                    },
+                )?;
+                self.graph_commit(read, creation_lsn, created, true, "predecessor")
             })
         })?;
-        drop(scratch);
         let maximum = self.graph_maximum(read, stored_lsn, memory.clone(), None)?;
         if d > maximum {
             return Err(self.content_identity_corruption("history exceeds physical graph maximum"));
@@ -2009,36 +1943,16 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn decode_and_verify_graph_edge_at_root(
+    pub(crate) fn verify_graph_edge_at_root(
         &self,
         key: &[u8],
         bytes: &[u8],
+        edge: &AdjEntry,
         reverse: bool,
         owner: &writer_source::SourceWindowOwner,
-        decode: impl FnOnce() -> Result<AdjEntry>,
-    ) -> Result<AdjEntry> {
+    ) -> Result<()> {
         self.with_graph_proof_at_root(owner, |context, read, memory| {
-            let (_, _, _, _, lsn) = graph_history_record::parse_physical_predecessor(key)?;
-            // The maximum's temporary body is destroyed before the selected
-            // edge is decoded; both proofs still use this exact captured read.
-            let maximum = context.graph_maximum(read, lsn, memory.clone(), None)?;
-            let verified = VerifiedGraphMaximum {
-                read,
-                snapshot: read.storage_snapshot_identity(),
-                lsn,
-                maximum,
-            };
-            let edge = decode()?;
-            context.verify_graph_edge_proof_with_maximum(
-                read,
-                key,
-                bytes,
-                &edge,
-                reverse,
-                memory,
-                Some(&verified),
-            )?;
-            Ok(edge)
+            context.verify_graph_edge_proof(read, key, bytes, edge, reverse, memory)
         })
     }
 }

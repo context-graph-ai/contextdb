@@ -3460,24 +3460,6 @@ impl ImageMemoryHandle {
     pub(crate) fn row_owner(&self) -> Result<ImageMemoryHandle> {
         self.row_owner_for(self.subsystem, self.operation, self.hint)
     }
-    /// A temporary reader decode keeps its exact labels and original funder.
-    /// Its external native control invoice settles after physical free.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn funded_reader_scratch(
-        &self,
-        reader: ReadMemoryOwner,
-    ) -> Result<ImageMemoryHandle> {
-        ImageMemory::admitted_reader_for(
-            self.accountant.clone(),
-            reader,
-            self.subsystem,
-            self.operation,
-            self.hint,
-        )
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
