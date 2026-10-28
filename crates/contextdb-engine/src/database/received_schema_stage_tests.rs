@@ -4251,14 +4251,14 @@ fn an_authenticated_unit_that_declares_a_vector_table_installs_its_vectors_in_th
 }
 
 /// A mixed schema + rows + vectors unit installs whole on
-/// a file-backed hub, at ONE commit LSN, with a durable per-unit receipt.
+/// a file-backed hub, with ordered authored positions and one final acceptance receipt.
 /// The author declares a vector table and writes rows into it; the unit
 /// is pushed exactly as sync sends it. The proof reads the receipt back
 /// from the hub's durable store after a restart -- the whole-unit schema
 /// record naming the author's identity, the exact request's stored
 /// outcome, and the author's delivery frontier -- rather than trusting
 /// the apply call's own answer, and it checks that the schema, every row
-/// and every vector carry the one LSN the hub advanced by.
+/// and every vector retain their authored order within the atomic unit.
 #[test]
 fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receipt() {
     let root = tempfile::TempDir::new().expect("scratch peer directory");
@@ -4298,6 +4298,23 @@ fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receip
     assert!(pushed.result.conflicts.is_empty(), "{:?}", pushed.result);
     assert_eq!(pushed.result.applied_rows, 2, "both rows applied");
     let unit_lsn = pushed.result.new_lsn;
+    let authored_positions = served
+        .ddl_lsn
+        .iter()
+        .copied()
+        .chain(served.rows.iter().map(|row| row.lsn))
+        .chain(served.vectors.iter().map(|vector| vector.lsn))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let receiver_position = |source: Lsn| {
+        Lsn(lsn_before.0
+            + 1
+            + authored_positions
+                .binary_search(&source)
+                .expect("the member belongs to an authored commit in this unit")
+                as u64)
+    };
     assert_eq!(
         hub.db.current_lsn(),
         unit_lsn,
@@ -4305,8 +4322,8 @@ fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receip
     );
     assert_eq!(
         unit_lsn,
-        Lsn(lsn_before.0 + 1),
-        "schema, rows and vectors consumed exactly one commit LSN"
+        Lsn(lsn_before.0 + authored_positions.len() as u64),
+        "the atomic unit preserves one ordered position per authored commit"
     );
     let installed = hub
         .db
@@ -4322,13 +4339,30 @@ fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receip
         "the hub holds the whole unit"
     );
     assert!(
-        installed.ddl_lsn.iter().all(|lsn| *lsn == unit_lsn)
-            && installed.rows.iter().all(|row| row.lsn == unit_lsn)
-            && installed
-                .vectors
+        installed.ddl_lsn
+            == served
+                .ddl_lsn
                 .iter()
-                .all(|vector| vector.lsn == unit_lsn),
-        "every DDL record, row and vector carries the one unit LSN {unit_lsn:?}: {:?} / {:?} \
+                .copied()
+                .map(receiver_position)
+                .collect::<Vec<_>>()
+            && installed.rows.iter().all(|row| {
+                served
+                    .rows
+                    .iter()
+                    .find(|source| {
+                        source.table == row.table && source.values.get("id") == row.values.get("id")
+                    })
+                    .is_some_and(|source| row.lsn == receiver_position(source.lsn))
+            })
+            && installed.vectors.iter().all(|vector| {
+                served
+                    .vectors
+                    .iter()
+                    .find(|source| source.index == vector.index && source.vector == vector.vector)
+                    .is_some_and(|source| vector.lsn == receiver_position(source.lsn))
+            }),
+        "every member preserves its authored commit's ordered position inside the atomic unit ending at {unit_lsn:?}: {:?} / {:?} \
              / {:?}",
         installed.ddl_lsn,
         installed.rows.iter().map(|row| row.lsn).collect::<Vec<_>>(),
