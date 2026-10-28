@@ -893,3 +893,8 @@ required-features = ["test-seams"]
 name = "checked_backend_read_faults"
 path = "tests/checked_backend_read_faults.rs"
 required-features = ["test-seams"]
+
+[[test]]
+name = "shared_native_cache_capacity"
+path = "tests/shared_native_cache_capacity.rs"
+required-features = ["test-seams"]
