@@ -25828,6 +25828,17 @@ impl VectorStore {
             receipt.typed_partition_keys = receipt
                 .typed_partition_keys
                 .saturating_add(directory.typed_partition_keys);
+            // The failed-partition index owns charged keys independently of
+            // each partition's inline maintenance failure marker.
+            receipt.vector_partition_controls = receipt.vector_partition_controls.saturating_add(
+                column
+                    .failed_partitions
+                    .lock()
+                    .keys
+                    .iter()
+                    .map(VectorColumnState::failed_partition_entry_bytes)
+                    .fold(0usize, usize::saturating_add),
+            );
             let partitions = column.partitions.read();
             for state in partitions.values() {
                 // Pending builders/reclaimers own their partition-name copy and
