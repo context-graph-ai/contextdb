@@ -6047,8 +6047,11 @@ fn integrity_02_upsert_noop_does_not_leak_memory() {
 #[test]
 #[cfg(feature = "test-seams")]
 fn integrity_03_retain_pruning_releases_memory() {
-    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
-    let db = Database::open_memory_with_accountant(accountant.clone());
+    let db = Database::open_with_options(":memory:", contextdb_engine::DatabaseOpenOptions {
+        memory_limit: Some(256 * 1024),
+        ..Default::default()
+    }).unwrap();
+    let accountant = db.accountant();
     db.execute(
         "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
         &empty(),
