@@ -134,6 +134,68 @@ impl RequestFunding {
     }
 }
 
+/// A provisional ceiling claim rolls back unless an original credit succeeds.
+pub(super) struct OccupancyClaim {
+    funding: RequestFunding,
+    bytes: usize,
+}
+impl OccupancyClaim {
+    pub(super) fn commit(mut self) {
+        self.bytes = 0;
+    }
+}
+impl Drop for OccupancyClaim {
+    fn drop(&mut self) {
+        self.funding.subtract(self.bytes);
+    }
+}
+
+/// Declared after the original ledger, so its residual shadow retires last.
+#[derive(Debug)]
+pub(super) struct KernelOccupancy {
+    funding: Option<RequestFunding>,
+    bytes: usize,
+}
+impl KernelOccupancy {
+    pub(super) fn new(funding: Option<RequestFunding>) -> Self {
+        Self { funding, bytes: 0 }
+    }
+    pub(super) fn grow(&mut self, bytes: usize) {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .expect("admitted kernel occupancy");
+    }
+    pub(super) fn detach(&mut self, bytes: usize, live: bool) {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .expect("original kernel credit owns its shadow");
+        if !live && let Some(funding) = &self.funding {
+            funding.subtract(bytes);
+        }
+    }
+}
+impl Drop for KernelOccupancy {
+    fn drop(&mut self) {
+        if let Some(funding) = &self.funding {
+            funding.subtract(self.bytes);
+        }
+    }
+}
+impl RequestFunding {
+    pub(super) fn claim(&self, bytes: usize) -> Result<OccupancyClaim> {
+        self.0.admit(bytes).map_err(|_| self.0.limit_error())?;
+        Ok(OccupancyClaim {
+            funding: self.clone(),
+            bytes,
+        })
+    }
+    pub(super) fn subtract(&self, bytes: usize) {
+        self.0.subtract(bytes);
+    }
+}
+
 #[derive(Debug)]
 struct PublicationBudget {
     funding: RequestFunding,

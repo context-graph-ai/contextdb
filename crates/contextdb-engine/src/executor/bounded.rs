@@ -336,6 +336,7 @@ struct RequestState {
     release_fault: Option<BoundedExecutionError>,
     // Last: every state allocation is physically freed before this invoice.
     memory: ReadCredit,
+    kernel_occupancy: publication_funding::KernelOccupancy,
 }
 
 /// Whether the read this context governs can hand an operator back its own
@@ -617,12 +618,16 @@ pub(crate) struct SourcePageCharge {
     _credit: ReadCredit,
     live: ControlArc<std::sync::atomic::AtomicUsize>,
     bytes: usize,
+    funding: Option<RequestFunding>,
 }
 
 impl Drop for SourcePageCharge {
     fn drop(&mut self) {
         self.live
             .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+        if let Some(funding) = &self.funding {
+            funding.subtract(self.bytes);
+        }
     }
 }
 
@@ -632,10 +637,15 @@ impl Drop for SourcePageCharge {
 pub(crate) struct CursorPageInvoice {
     credit: ReadCredit,
     live: Option<ControlArc<std::sync::atomic::AtomicUsize>>,
+    funding: Option<RequestFunding>,
 }
 impl CursorPageInvoice {
     pub(crate) fn new(credit: ReadCredit) -> Self {
-        Self { credit, live: None }
+        Self {
+            credit,
+            live: None,
+            funding: None,
+        }
     }
     pub(crate) fn bytes(&self) -> usize {
         self.credit.bytes()
@@ -650,6 +660,9 @@ impl Drop for CursorPageInvoice {
     fn drop(&mut self) {
         if let Some(live) = &self.live {
             live.fetch_sub(self.credit.bytes(), std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(funding) = &self.funding {
+            funding.subtract(self.credit.bytes());
         }
         // ReadShared has already destroyed the payload and physically freed
         // its cell. Only now may this original credit and counter alias retire.
@@ -973,30 +986,45 @@ impl RequestContext {
         } else {
             None
         };
-        let reader_budget = request_funding
-            .as_ref()
-            .map_or(reader_budget, RequestFunding::owner);
         let funding_owner = native_operation
             .as_ref()
             .map(|operation| operation.owner())
             .unwrap_or_else(|| reader_budget.clone());
-        let counter_invoice =
-            ControlArc::<std::sync::atomic::AtomicUsize>::admit_owned(funding_owner.clone())?;
-        let weak_invoice =
-            ControlArc::<WeakSourceDecodeBudget>::admit_owned(funding_owner.clone())?;
+        let control_owner = request_funding
+            .as_ref()
+            .map_or_else(|| funding_owner.clone(), RequestFunding::owner);
+        let counter_invoice = ControlArc::<std::sync::atomic::AtomicUsize>::admit_owned_observing(
+            control_owner.clone(),
+            &funding_owner,
+        )?;
+        let weak_invoice = ControlArc::<WeakSourceDecodeBudget>::admit_owned_observing(
+            control_owner.clone(),
+            &funding_owner,
+        )?;
         let vector_invoice =
-            ControlArc::<crate::vector_read_memory::ReaderVectorBudget>::admit_owned(
-                funding_owner.clone(),
+            ControlArc::<crate::vector_read_memory::ReaderVectorBudget>::admit_owned_observing(
+                control_owner.clone(),
+                &funding_owner,
             )?;
-        let request_invoice = ControlArc::<Self>::admit_owned(funding_owner.clone())?;
-        let ledger = ReadCredit::from_prepaid_owned(funding_owner, 0);
-        let live_source_pages =
-            ControlArc::from_prepaid(std::sync::atomic::AtomicUsize::new(0), counter_invoice);
+        let request_invoice =
+            ControlArc::<Self>::admit_owned_observing(control_owner, &funding_owner)?;
+        let ledger = ReadCredit::from_prepaid_owned(funding_owner.clone(), 0);
+        let kernel_occupancy = publication_funding::KernelOccupancy::new(request_funding.clone());
+        let live_source_pages = ControlArc::from_prepaid_observing(
+            std::sync::atomic::AtomicUsize::new(0),
+            counter_invoice,
+            &funding_owner,
+        );
+        #[cfg(feature = "test-seams")]
+        crate::vector_read_memory::statement_child_proof::funding_next(&funding_owner);
         let context = ControlArc::cyclic_from_prepaid(request_invoice, |context| {
-            let vector_decode_budget = ControlArc::from_prepaid(
+            let vector_decode_budget = ControlArc::from_prepaid_observing(
                 WeakSourceDecodeBudget(context.clone(), weak_invoice.clone()),
                 weak_invoice,
+                &funding_owner,
             );
+            #[cfg(feature = "test-seams")]
+            crate::vector_read_memory::statement_child_proof::funding_next(&funding_owner);
             let copies = crate::vector_read_memory::admission_prepaid(
                 (*vector_decode_budget).clone(),
                 vector_decode_budget.original_invoice(),
@@ -1026,6 +1054,7 @@ impl RequestContext {
                     group_publication_generation: 0,
                     next_group_descriptor: 0,
                     memory: ledger,
+                    kernel_occupancy,
                     membership_bytes: 0,
                     rows_so_far: 0,
                     bytes_so_far: 0,
@@ -1073,12 +1102,13 @@ impl RequestContext {
             "terminal trace owners",
         )?;
         self.reserve(BoundedWorkSource::TableScan, bytes)?;
-        let credit = self.state().memory.try_split_off(bytes)?;
+        let credit = self.split_kernel_credit(bytes, true)?;
         self.live_source_pages
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
         let charge = Arc::new(SourcePageCharge {
             _credit: credit,
             live: self.live_source_pages.clone(),
+            funding: self.request_funding.clone(),
             bytes,
         });
         let mut state = self.state();
@@ -1538,12 +1568,13 @@ impl RequestContext {
             "group page return owners",
         )?;
         self.reserve(BoundedWorkSource::TableScan, bytes)?;
-        let credit = self.state().memory.try_split_off(bytes)?;
+        let credit = self.split_kernel_credit(bytes, true)?;
         self.live_source_pages
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
         let charge = Arc::new(SourcePageCharge {
             _credit: credit,
             live: self.live_source_pages.clone(),
+            funding: self.request_funding.clone(),
             bytes,
         });
         let mut storage = Box::<[Option<GroupBinding>]>::new_uninit_slice(len);
@@ -2094,10 +2125,7 @@ impl RequestContext {
                 destination,
                 bytes,
             );
-            let split = {
-                let mut state = self.state();
-                state.memory.try_split_off(bytes)?
-            };
+            let split = self.split_kernel_credit(bytes, false)?;
             if prepaid {
                 // transfer sets the credit to zero before invoking its Drop
                 // observer. The destination owns cleanup if that observer unwinds.
@@ -2501,6 +2529,11 @@ impl RequestContext {
         }
         let held_after = {
             let mut state = self.state();
+            let claim = self
+                .request_funding
+                .as_ref()
+                .map(|funding| funding.claim(requested))
+                .transpose()?;
             // Named, so a store-budget refusal tells the operator WHICH part of
             // the statement wanted the memory rather than only how much.
             state
@@ -2512,6 +2545,10 @@ impl RequestContext {
                     "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.",
                 )
                 .map_err(BoundedExecutionError::from)?;
+            state.kernel_occupancy.grow(requested);
+            if let Some(claim) = claim {
+                claim.commit();
+            }
             let held_after = u64::try_from(self.held_memory_bytes(&state))
                 .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
             state.telemetry.peak_temporary_bytes =
@@ -2565,10 +2602,17 @@ impl RequestContext {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn release(&self, bytes: usize) -> std::result::Result<(), BoundedExecutionError> {
-        self.state()
-            .memory
-            .try_shrink(bytes)
-            .map_err(BoundedExecutionError::from)
+        let mut state = self.state();
+        state.memory.try_shrink(bytes)?;
+        state.kernel_occupancy.detach(bytes, false);
+        Ok(())
+    }
+
+    fn split_kernel_credit(&self, bytes: usize, live: bool) -> Result<ReadCredit> {
+        let mut state = self.state();
+        let credit = state.memory.try_split_off(bytes)?;
+        state.kernel_occupancy.detach(bytes, live);
+        Ok(credit)
     }
 
     /// The final result adopts already admitted payload credit from this
@@ -2622,7 +2666,7 @@ impl RequestContext {
             );
         }
         // capture969 end
-        let credit = self.state().memory.try_split_off(bytes)?;
+        let credit = self.split_kernel_credit(bytes, false)?;
         // capture969 begin
         #[cfg(all(test, feature = "test-seams"))]
         {
@@ -2697,7 +2741,7 @@ impl RequestContext {
             query_trace_capacity_bytes(&result.trace)?,
             "answer trace",
         )?;
-        let credit = self.state().memory.try_split_off(bytes)?;
+        let credit = self.split_kernel_credit(bytes, false)?;
         result.answer_charge = crate::read_image_memory::QueryAnswerCharge::holding_reader(credit)?;
         result.retained_read_memory = Some(self.reader_budget.clone());
         Ok(())
@@ -2759,6 +2803,11 @@ impl RequestContext {
         if !within {
             return Err(self.memory_limit_failure(held, bytes, operation));
         }
+        let claim = self
+            .request_funding
+            .as_ref()
+            .map(|funding| funding.claim(bytes))
+            .transpose()?;
         let credit = ReadCredit::try_new(
             self.reader_budget.clone(),
             bytes,
@@ -2769,6 +2818,9 @@ impl RequestContext {
         .map_err(BoundedExecutionError::from)?;
         self.live_source_pages
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        if let Some(claim) = claim {
+            claim.commit();
+        }
         let held_after = u64::try_from(held.saturating_add(bytes)).unwrap_or(u64::MAX);
         state.telemetry.peak_temporary_bytes = state.telemetry.peak_temporary_bytes.max(held_after);
         state
@@ -2780,6 +2832,7 @@ impl RequestContext {
         Ok(SourcePageCharge {
             _credit: credit,
             live: self.live_source_pages.clone(),
+            funding: self.request_funding.clone(),
             bytes,
         })
     }
@@ -16616,6 +16669,7 @@ fn funded_graph_credit_transfer(
         SourcePageCharge {
             _credit: ReadCredit::new(context.reader_budget.clone()),
             live: context.live_source_pages.clone(),
+            funding: context.request_funding.clone(),
             bytes: 0,
         },
     );
@@ -17232,6 +17286,9 @@ fn copy_vector_row_filter(
     charge
         .live
         .fetch_sub(unused, std::sync::atomic::Ordering::SeqCst);
+    if let Some(funding) = &charge.funding {
+        funding.subtract(unused);
+    }
     charge.bytes = actual;
     Ok((value, charge))
 }
@@ -20307,13 +20364,14 @@ impl CursorState {
                 self.context
                     .reserve_metadata(BoundedWorkSource::TableScan, bytes)?;
             }
-            let credit = self.context.state().memory.try_split_off(bytes)?;
+            let credit = self.context.split_kernel_credit(bytes, true)?;
             self.context
                 .live_source_pages
                 .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
             let charge = Arc::new(SourcePageCharge {
                 _credit: credit,
                 live: self.context.live_source_pages.clone(),
+                funding: self.context.request_funding.clone(),
                 bytes,
             });
             let mut trace = self.root.trace.clone();
@@ -20378,13 +20436,14 @@ impl CursorState {
         let public_carrier = if public_page {
             let bytes = CursorPage::public_carrier_bytes();
             self.context.reserve(BoundedWorkSource::TableScan, bytes)?;
-            let credit = self.context.state().memory.try_split_off(bytes)?;
+            let credit = self.context.split_kernel_credit(bytes, true)?;
             self.context
                 .live_source_pages
                 .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
             let invoice = CursorPageInvoice {
                 credit,
                 live: Some(self.context.live_source_pages.clone()),
+                funding: self.context.request_funding.clone(),
             };
             Some(CursorPage::prepare_publication(invoice)?)
         } else {
@@ -20726,11 +20785,10 @@ impl CursorState {
             "published immutable page root",
         )?;
         let owner_bytes = 0; // Credit moves inline; no credit Arc allocation.
-        let credit = self.context.state().memory.try_split_off(checked_size_add(
-            page_bytes,
-            owner_bytes,
-            "published cursor credit owner",
-        )?)?;
+        let credit = self.context.split_kernel_credit(
+            checked_size_add(page_bytes, owner_bytes, "published cursor credit owner")?,
+            false,
+        )?;
         page = page.with_credit(credit)?;
         self.context.publish_group_returns()?;
         drop(retained);
@@ -22676,6 +22734,11 @@ impl ControlArc<RequestContext> {
                 return Err(self.memory_limit_failure(held, bytes, "source_page_callback"));
             }
         }
+        let claim = self
+            .request_funding
+            .as_ref()
+            .map(|funding| funding.claim(bytes))
+            .transpose()?;
         self.live_source_pages
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
         // This zero-credit guard only tracks live request occupancy. The
@@ -22683,8 +22746,12 @@ impl ControlArc<RequestContext> {
         let _live = SourcePageCharge {
             _credit: ReadCredit::new(self.reader_budget.clone()),
             live: self.live_source_pages.clone(),
+            funding: self.request_funding.clone(),
             bytes,
         };
+        if let Some(claim) = claim {
+            claim.commit();
+        }
         let admission = ControlArc::try_new(self.reader_budget.clone(), callback)?;
         // redb retains this alias only inside its synchronous admission scope;
         // its ResetAdmission destroys it before returning or unwinding here.
