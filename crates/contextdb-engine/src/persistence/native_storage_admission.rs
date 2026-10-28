@@ -88,8 +88,18 @@ unsafe fn inspect_scope_allocation_funding(raw: NonNull<()>) -> Option<(usize, u
             original_handle, ..
         } => Some(original_handle.as_handle().as_ptr() as usize),
         StorageFunding::Read(reader) | StorageFunding::ReadUnqualified(reader) => {
+            use contextdb_core::coordination_test_observation::FundingCounter;
             use contextdb_core::read_memory::ReadMemoryBudget;
-            reader.funding_accountant_identity_for_test()
+            reader.funding_accountant_identity_for_test().or_else(|| {
+                // A declared reader charges its own genuine retained counter,
+                // rather than a writer accountant. Borrow that counter only
+                // through the existing retained original-provider capability.
+                let original = reader.original_native_owner_for_test()?;
+                match original.coordination_counter_for_test()? {
+                    FundingCounter::Usize(counter) => Some(counter as *const _ as usize),
+                    FundingCounter::U64(counter) => Some(counter as *const _ as usize),
+                }
+            })
         }
     }?;
     Some((owner, Layout::new::<StorageReceipt>().size()))
