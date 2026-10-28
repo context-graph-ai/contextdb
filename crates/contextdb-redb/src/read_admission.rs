@@ -600,6 +600,17 @@ pub(crate) fn prepare_cache_allocation(layout: std::alloc::Layout) -> Result<(),
 /// to test-seams. These methods allocate nothing and retain no owner or TLS slot.
 #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
 impl ScanAllowance {
+    /// The existing legacy Arc/counter only; this observation retains no token.
+    #[doc(hidden)]
+    pub fn legacy_growth_for_test(&self) -> Option<(usize, usize)> {
+        match &self.0 {
+            ScanState::Legacy(remaining) => Some((
+                Arc::as_ptr(remaining) as usize,
+                remaining.load(std::sync::atomic::Ordering::SeqCst),
+            )),
+            _ => None,
+        }
+    }
     #[doc(hidden)]
     pub fn node_layout_for_test() -> std::alloc::Layout {
         std::alloc::Layout::new::<ScanScopeNode>()

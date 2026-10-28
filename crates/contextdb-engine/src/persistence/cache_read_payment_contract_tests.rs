@@ -272,3 +272,87 @@ fn cache_capacity_refusal_precedes_unpaid_allocation_and_backend_io() {
         drop(fixture);
     });
 }
+
+/// A failed legacy scan read owes its unchanged growth allowance to retry;
+/// a completed miss consumes the actual backing quote once, including when
+/// the scan is resumed through a clone of the same existing allowance.
+#[test]
+#[serial]
+fn failed_legacy_scan_read_preserves_growth_and_success_consumes_once() {
+    with_fixture(|fixture, controls, state| {
+        let allowance = redb::ScanAllowance::new();
+        let before = allowance
+            .legacy_growth_for_test()
+            .expect("actual legacy allowance");
+        let resumed = allowance.clone();
+        assert_eq!(resumed.legacy_growth_for_test(), Some(before));
+        {
+            let _scan = allowance.enter();
+            state.fail.store(true, Ordering::SeqCst);
+            assert!(
+                fixture.read_one_for_test(1).is_err(),
+                "the real backend failure is returned"
+            );
+            assert_eq!(state.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                allowance.legacy_growth_for_test(),
+                Some(before),
+                "failed I/O leaves the exact original growth allowance intact"
+            );
+            assert_eq!(
+                controls.observation_for_test()[0].1,
+                0,
+                "failed I/O leaves no cache occupancy"
+            );
+        }
+        state.fail.store(false, Ordering::SeqCst);
+        let consumed;
+        {
+            let _scan = resumed.enter();
+            let page = fixture
+                .read_one_for_test(1)
+                .expect("retry succeeds under the same allowance");
+            consumed = page.allocation().1;
+            assert!(
+                consumed <= before.1,
+                "the actual allowance funds this one miss"
+            );
+            let expected = Some((before.0, before.1 - consumed));
+            assert_eq!(
+                allowance.legacy_growth_for_test(),
+                expected,
+                "one successful miss consumes its actual backing quote once"
+            );
+            let hit = fixture.read_one_for_test(1).expect("read the cached page");
+            assert_eq!(
+                hit.allocation(),
+                page.allocation(),
+                "the second read is the same cached backing"
+            );
+            assert_eq!(
+                state.reads.load(Ordering::SeqCst),
+                2,
+                "only failed read and successful retry reached I/O"
+            );
+            assert_eq!(
+                allowance.legacy_growth_for_test(),
+                expected,
+                "cache hits do not consume again"
+            );
+            drop(hit);
+            drop(page);
+        }
+        fixture.invalidate_one_for_test(1);
+        assert_eq!(
+            allowance.legacy_growth_for_test(),
+            Some((before.0, before.1 - consumed)),
+            "a completed read's growth remains consumed across scan exit and physical free"
+        );
+        eprintln!(
+            "LEGACY_SCAN_RETRY original={before:?} consumed={consumed} after={:?}",
+            allowance.legacy_growth_for_test()
+        );
+        drop(controls);
+        drop(fixture);
+    });
+}
