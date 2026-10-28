@@ -10034,6 +10034,8 @@ pub(crate) mod original_writer {
         OwnedMemoryReservation, detach_preparation_original, grow_preparation_from_original,
         release_preparation_original, reserve_preparation_from_original,
     };
+    use redb::{ReadableTableMetadata, TableDefinition};
+    use std::ops::Bound;
 
     pub(crate) struct ProofAdmission {
         pub(super) original: OwnedMemoryReservation,
@@ -10613,10 +10615,29 @@ pub(crate) mod original_writer {
             groups: Option<&super::super::custody_groups::GroupPlan>,
             lineage: &mut LineageWriteTable<'txn>,
         ) -> Result<DirectTypedImageDigest> {
-            #[cfg(test)]
-            let _capture_apply =
-                crate::memory_accounting::compaction_admission_capture::Phase::apply();
-            Self::reconcile_owned_ddl_selectors_in_write(write_txn, mutations, admission)?;
+            Self::apply_owned_content_identity_stream_in_write(
+                write_txn, mutations, manifests, admission, groups, lineage, None,
+            )
+        }
+
+        pub(super) fn apply_original_ordered_effects<'txn>(
+            write_txn: &'txn redb::WriteTransaction,
+            mutations: &[ContentIdentityMutation],
+            admission: &mut ProofAdmission,
+            groups: Option<&super::super::custody_groups::GroupPlan>,
+            lineage: &mut LineageWriteTable<'txn>,
+            selector_roots: Option<&mut [[u8; 32]; 2]>,
+        ) -> Result<()> {
+            if let Some(expected) = selector_roots {
+                Self::reconcile_owned_ddl_selectors_with_expected_in_write(
+                    write_txn,
+                    mutations,
+                    admission,
+                    Some(expected),
+                )?;
+            } else {
+                Self::reconcile_owned_ddl_selectors_in_write(write_txn, mutations, admission)?;
+            }
             super::super::content_size::reconcile_row_heads(write_txn, mutations, admission)?;
             Self::apply_writer_row_heads_in_write(write_txn, mutations, admission)?;
             for (ordinal, mutation) in mutations.iter().enumerate() {
@@ -10736,6 +10757,31 @@ pub(crate) mod original_writer {
                 }
             }
 
+            Ok(())
+        }
+
+        fn apply_owned_content_identity_stream_in_write<'txn>(
+            write_txn: &'txn redb::WriteTransaction,
+            mutations: &[ContentIdentityMutation],
+            manifests: &[ContentIdentityMutation],
+            admission: &mut ProofAdmission,
+            groups: Option<&super::super::custody_groups::GroupPlan>,
+            lineage: &mut LineageWriteTable<'txn>,
+            streamed: Option<&OriginalIdentityBatch<'_, '_>>,
+        ) -> Result<DirectTypedImageDigest> {
+            #[cfg(test)]
+            let _capture_apply =
+                crate::memory_accounting::compaction_admission_capture::Phase::apply();
+            let mut selector_roots = streamed.map(|batch| batch.selector_roots);
+            Self::apply_original_ordered_effects(
+                write_txn,
+                mutations,
+                admission,
+                groups,
+                lineage,
+                selector_roots.as_mut(),
+            )?;
+
             let roots_table = write_txn
                 .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
                 .map_err(Self::storage_error)?;
@@ -10831,6 +10877,10 @@ pub(crate) mod original_writer {
             };
             let coalescing_admission_start = admission.held();
             let coalescing_result = (|| -> Result<Option<Box<MutationKeyNode>>> {
+                if let Some(streamed) = streamed {
+                    streamed.publish_families(write_txn, admission, &mut roots, &mut tails)?;
+                    return Ok(None);
+                }
                 // Retain only unique-key boxes. Every input still receives the
                 // original parser validation, including entries later overwritten.
                 let mut unique = None;
@@ -11126,6 +11176,470 @@ pub(crate) mod original_writer {
                 roots[family].hash
             })))
         }
+    }
+
+    /// Unpublished coalescing and merge-sort tables; only two decoded keys are live.
+    pub(crate) struct OriginalIdentityBatch<'w, 'o> {
+        write: &'w redb::WriteTransaction,
+        original: &'o OwnedMemoryReservation,
+        raw: TableDefinition<'static, &'static [u8], &'static [u8]>,
+        lineage: LineageWriteTable<'w>,
+        // Authenticated unpublished selector transitions; never a population directory.
+        selector_roots: [[u8; 32]; 2],
+        scratch_owner: Option<std::sync::Weak<crate::persistence::writer_file::LockedWriterFile>>,
+    }
+    const SORT_A: TableDefinition<u64, &[u8]> = TableDefinition::new("__received_identity_sort_a");
+    const SORT_B: TableDefinition<u64, &[u8]> = TableDefinition::new("__received_identity_sort_b");
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserve inline native refusal at original-funded private boundaries."
+    )]
+    impl<'w, 'o> OriginalIdentityBatch<'w, 'o> {
+        pub(crate) fn new(
+            persistence: &RedbPersistence,
+            original: &'o OwnedMemoryReservation,
+            write: &'w redb::WriteTransaction,
+            name: &'static str,
+        ) -> Result<Self> {
+            crate::memory_accounting::clone_persistence_original_writer(original)?;
+            let raw = TableDefinition::new(name);
+            if !write
+                .open_table(raw)
+                .map_err(RedbPersistence::storage_error)?
+                .is_empty()
+                .map_err(RedbPersistence::storage_error)?
+            {
+                return Err(Error::Other(
+                    "unpublished identity edits survived a transaction".into(),
+                ));
+            }
+            let selector_roots = ddl_selector_roots_in_write(write)?;
+            Ok(Self {
+                write,
+                original,
+                raw,
+                lineage: None,
+                selector_roots,
+                scratch_owner: persistence.proof_scratch_owner(),
+            })
+        }
+
+        pub(in crate::persistence) fn push(
+            &mut self,
+            mutation: &ContentIdentityMutation,
+            groups: Option<&super::super::custody_groups::GroupPlan>,
+        ) -> Result<()> {
+            let mut admission = ProofAdmission::new(self.original, self.scratch_owner.clone())?;
+            RedbPersistence::apply_original_ordered_effects(
+                self.write,
+                std::slice::from_ref(mutation),
+                &mut admission,
+                groups,
+                &mut self.lineage,
+                Some(&mut self.selector_roots),
+            )?;
+            let window = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
+            let bytes = mutation_key_capacity(mutation, &admission)?;
+            window.reserve(
+                bytes
+                    .checked_add(mutation.logical_key.len())
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(|| proof_allocation_overflow(&admission))?,
+            )?;
+            // Validate every input, including inputs later overwritten, just as slice coalescing does.
+            let tree_key = mutation_tree_key(mutation)?;
+            let value = mutation.value_digest()?;
+            let mut raw_key = Vec::with_capacity(mutation.logical_key.len() + 1);
+            raw_key.push(mutation.family as u8);
+            raw_key.extend_from_slice(&mutation.logical_key);
+            let encoded = window.encode(&(tree_key, value))?;
+            self.write
+                .open_table(self.raw)
+                .map_err(RedbPersistence::storage_error)?
+                .insert(raw_key.as_slice(), encoded.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
+            Ok(())
+        }
+
+        fn manifest_prefix() -> Vec<u8> {
+            // Caller admits this exact fixed namespace before constructing it.
+            let mut key = Vec::with_capacity(ORDERED_HISTORY_MAGIC.len() + 2);
+            key.push(LogicalFamily::ChangeAndDdl as u8);
+            key.extend_from_slice(ORDERED_HISTORY_MAGIC);
+            key.push(HistoryKind::RelationalVersion as u8);
+            key
+        }
+
+        pub(super) fn manifest_state(&self, coordinate: &[u8]) -> Result<Option<bool>> {
+            let window = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
+            window.reserve((ORDERED_HISTORY_MAGIC.len() + 2) * 2 + coordinate.len())?;
+            let key = Self::manifest_prefix();
+            // Reserve the full exact key before replacing the fixed-capacity prefix.
+            let mut full = Vec::with_capacity(key.len() + coordinate.len());
+            full.extend_from_slice(&key);
+            full.extend_from_slice(coordinate);
+            drop(key);
+            let table = self
+                .write
+                .open_table(self.raw)
+                .map_err(RedbPersistence::storage_error)?;
+            let value = table
+                .get(full.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
+            value
+                .map(|value| {
+                    let (_, hash): (Vec<u8>, Option<[u8; 32]>) = window.decode(value.value())?;
+                    Ok(hash.is_some())
+                })
+                .transpose()
+        }
+
+        pub(super) fn manifest_candidate(
+            &self,
+            start: &[u8],
+            exclusive: bool,
+            before: Option<&[u8]>,
+            admission: &mut ProofAdmission,
+        ) -> Result<Option<Vec<u8>>> {
+            let window = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
+            let prefix_len = ORDERED_HISTORY_MAGIC.len() + 2;
+            window.reserve(prefix_len * 2 + start.len())?;
+            let prefix = Self::manifest_prefix();
+            let mut low = Vec::with_capacity(prefix_len + start.len());
+            low.extend_from_slice(&prefix);
+            low.extend_from_slice(start);
+            let table = self
+                .write
+                .open_table(self.raw)
+                .map_err(RedbPersistence::storage_error)?;
+            let low = if exclusive {
+                Bound::Excluded(low.as_slice())
+            } else {
+                Bound::Included(low.as_slice())
+            };
+            for entry in table
+                .range::<&[u8]>((low, Bound::Unbounded))
+                .map_err(RedbPersistence::storage_error)?
+            {
+                let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+                if !key.value().starts_with(&prefix) {
+                    break;
+                }
+                let coordinate = &key.value()[prefix_len..];
+                if before.is_some_and(|limit| coordinate >= limit) {
+                    break;
+                }
+                let record = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
+                let (_, hash): (Vec<u8>, Option<[u8; 32]>) = record.decode(value.value())?;
+                if hash.is_some() {
+                    admission.admit(coordinate.len())?;
+                    return Ok(Some(coordinate.to_vec()));
+                }
+            }
+            Ok(None)
+        }
+
+        fn read_sorted(
+            &self,
+            table: TableDefinition<'static, u64, &'static [u8]>,
+            ordinal: u64,
+        ) -> Result<StreamedEdit> {
+            let window = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
+            let source = self
+                .write
+                .open_table(table)
+                .map_err(RedbPersistence::storage_error)?;
+            let encoded = source
+                .get(ordinal)
+                .map_err(RedbPersistence::storage_error)?
+                .ok_or_else(|| Error::Other("sorted identity edit is missing".into()))?;
+            let (key, value): (Vec<u8>, Option<[u8; 32]>) = window.decode(encoded.value())?;
+            Ok(StreamedEdit {
+                key,
+                value,
+                _owner: window.into_reservation(),
+            })
+        }
+
+        fn sorted_family(
+            &self,
+            family: LogicalFamily,
+        ) -> Result<(TableDefinition<'static, u64, &'static [u8]>, u64)> {
+            self.write
+                .delete_table(SORT_A)
+                .map_err(RedbPersistence::storage_error)?;
+            self.write
+                .delete_table(SORT_B)
+                .map_err(RedbPersistence::storage_error)?;
+            let mut count = 0u64;
+            {
+                let source = self
+                    .write
+                    .open_table(self.raw)
+                    .map_err(RedbPersistence::storage_error)?;
+                let mut destination = self
+                    .write
+                    .open_table(SORT_A)
+                    .map_err(RedbPersistence::storage_error)?;
+                let low = [family as u8];
+                let high = [family as u8 + 1];
+                for entry in source
+                    .range(low.as_slice()..high.as_slice())
+                    .map_err(RedbPersistence::storage_error)?
+                {
+                    let (_, value) = entry.map_err(RedbPersistence::storage_error)?;
+                    destination
+                        .insert(count, value.value())
+                        .map_err(RedbPersistence::storage_error)?;
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Other("identity edit count overflow".into()))?;
+                }
+            }
+            let mut source = SORT_A;
+            let mut destination = SORT_B;
+            let mut width = 1u64;
+            while width < count {
+                self.write
+                    .delete_table(destination)
+                    .map_err(RedbPersistence::storage_error)?;
+                let mut target = self
+                    .write
+                    .open_table(destination)
+                    .map_err(RedbPersistence::storage_error)?;
+                let mut begin = 0u64;
+                while begin < count {
+                    let middle = begin.saturating_add(width).min(count);
+                    let end = middle.saturating_add(width).min(count);
+                    let (mut left, mut right, mut out) = (begin, middle, begin);
+                    let mut l = if left < middle {
+                        Some(self.read_sorted(source, left)?)
+                    } else {
+                        None
+                    };
+                    let mut r = if right < end {
+                        Some(self.read_sorted(source, right)?)
+                    } else {
+                        None
+                    };
+                    while l.is_some() || r.is_some() {
+                        let take_left = match (&l, &r) {
+                            (Some(l), Some(r)) => {
+                                identity_key_cmp(&l.key, &r.key)?.then_with(|| l.key.cmp(&r.key))
+                                    != Ordering::Greater
+                            }
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+                        let record = if take_left {
+                            l.take().expect("left record")
+                        } else {
+                            r.take().expect("right record")
+                        };
+                        let window =
+                            crate::persistence::OriginalPersistenceFrame::new(self.original)?;
+                        let encoded = window.encode(&(&record.key, record.value))?;
+                        target
+                            .insert(out, encoded.as_slice())
+                            .map_err(RedbPersistence::storage_error)?;
+                        out += 1;
+                        // Free both the record and encoding before reading their successor.
+                        drop(encoded);
+                        drop(window);
+                        drop(record);
+                        if take_left {
+                            left += 1;
+                            l = if left < middle {
+                                Some(self.read_sorted(source, left)?)
+                            } else {
+                                None
+                            };
+                        } else {
+                            right += 1;
+                            r = if right < end {
+                                Some(self.read_sorted(source, right)?)
+                            } else {
+                                None
+                            };
+                        }
+                    }
+                    begin = end;
+                }
+                drop(target);
+                std::mem::swap(&mut source, &mut destination);
+                width = width.saturating_mul(2);
+            }
+            Ok((source, count))
+        }
+
+        fn publish_families(
+            &self,
+            write: &redb::WriteTransaction,
+            admission: &mut ProofAdmission,
+            roots: &mut [FamilyRoot; 11],
+            tails: &mut [RootTail; 11],
+        ) -> Result<()> {
+            let mut nodes = crate::persistence::content_identity::payloads::open(write)
+                .map_err(RedbPersistence::storage_error)?;
+            for family in LogicalFamily::ALL {
+                let (source, count) = self.sorted_family(family)?;
+                if count == 0 {
+                    continue;
+                }
+                let mut history = tails[family as usize].history_open;
+                let mut refresh = [false; 3];
+                if let Some(publication) = history.as_mut() {
+                    for ordinal in 0..count {
+                        let edit = self.read_sorted(source, ordinal)?;
+                        let key = &edit.key;
+                        if key
+                            .starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::CommitIndex as u8])
+                        {
+                            let raw: [u8; 8] = key[2..].try_into().map_err(|_| {
+                                history_control_damage("invalid changed commit coordinate")
+                            })?;
+                            let lsn = Lsn(u64::from_be_bytes(raw));
+                            let old = writer_window::history_member(
+                                &nodes,
+                                admission,
+                                &roots[family as usize],
+                                key,
+                            )?;
+                            publication.control.commit_count =
+                                match (old.is_some(), edit.value.is_some()) {
+                                    (false, true) => {
+                                        publication.control.commit_count.checked_add(1)
+                                    }
+                                    (true, false) => {
+                                        publication.control.commit_count.checked_sub(1)
+                                    }
+                                    _ => Some(publication.control.commit_count),
+                                }
+                                .ok_or_else(|| {
+                                    history_control_damage("history member count overflow")
+                                })?;
+                            if let Some(hash) = edit.value {
+                                if publication.control.first.is_none_or(|p| lsn <= p.0) {
+                                    publication.control.first = Some((lsn, hash));
+                                }
+                                if publication.control.last.is_none_or(|p| lsn >= p.0) {
+                                    publication.control.last = Some((lsn, hash));
+                                }
+                            } else {
+                                refresh[0] |= publication.control.first.is_some_and(|p| p.0 == lsn);
+                                refresh[1] |= publication.control.last.is_some_and(|p| p.0 == lsn);
+                            }
+                        } else if key
+                            .starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::DdlLog as u8])
+                        {
+                            writer_window::history_member(
+                                &nodes,
+                                admission,
+                                &roots[family as usize],
+                                key,
+                            )?;
+                            refresh[2] = true;
+                        }
+                    }
+                }
+                let mut ordinal = 0;
+                roots[family as usize] = writer_window::update_family_sorted_stream(
+                    &mut nodes,
+                    admission,
+                    family,
+                    &roots[family as usize],
+                    || {
+                        if ordinal == count {
+                            return Ok(None);
+                        }
+                        let record = self.read_sorted(source, ordinal)?;
+                        ordinal += 1;
+                        Ok(Some(record))
+                    },
+                )?;
+                if let Some(publication) = history.as_mut() {
+                    let root = &roots[family as usize];
+                    publication.control.tree = root.root;
+                    publication.control.tree_hash = root.hash;
+                    if refresh[0] {
+                        publication.control.first =
+                            writer_window::history_commit_extreme(&nodes, admission, root, false)?;
+                    }
+                    if refresh[1] {
+                        publication.control.last =
+                            writer_window::history_commit_extreme(&nodes, admission, root, true)?;
+                    }
+                    if refresh[2] {
+                        publication.control.ddl =
+                            writer_window::history_ddl_extreme(&nodes, admission, root)?;
+                    }
+                    if publication.control.commit_count == 0 {
+                        publication.control.first = None;
+                        publication.control.last = None;
+                    }
+                    publication.control.validate()?;
+                    publication.control_hash = publication.control.digest();
+                    tails[family as usize].history_open = history;
+                }
+            }
+            #[cfg(feature = "test-seams")]
+            if crate::append_work::coalesced_mutation_observer_is_active() {
+                let table = self
+                    .write
+                    .open_table(self.raw)
+                    .map_err(RedbPersistence::storage_error)?;
+                for entry in table.iter().map_err(RedbPersistence::storage_error)? {
+                    let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+                    let window = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
+                    let (_, present): (Vec<u8>, Option<[u8; 32]>) = window.decode(value.value())?;
+                    crate::append_work::observe_coalesced_mutation(
+                        family_name_for_tag(key.value()[0]),
+                        &key.value()[1..],
+                        present.is_some(),
+                    );
+                }
+            }
+            drop(nodes);
+            self.write
+                .delete_table(SORT_A)
+                .map_err(RedbPersistence::storage_error)?;
+            self.write
+                .delete_table(SORT_B)
+                .map_err(RedbPersistence::storage_error)?;
+            Ok(())
+        }
+
+        pub(in crate::persistence) fn apply(
+            mut self,
+            persistence: &RedbPersistence,
+            groups: Option<&super::super::custody_groups::GroupPlan>,
+        ) -> Result<()> {
+            let mut admission =
+                ProofAdmission::new(self.original, persistence.proof_scratch_owner())?;
+            let mut lineage = self.lineage.take();
+            RedbPersistence::apply_owned_content_identity_stream_in_write(
+                self.write,
+                &[],
+                &[],
+                &mut admission,
+                groups,
+                &mut lineage,
+                Some(&self),
+            )?;
+            drop(lineage);
+            self.write
+                .delete_table(self.raw)
+                .map_err(RedbPersistence::storage_error)?;
+            Ok(())
+        }
+    }
+
+    /// One original-funded semantic edit transferred into disposable proof scratch.
+    pub(super) struct StreamedEdit {
+        key: Vec<u8>,
+        value: Option<[u8; 32]>,
+        _owner: crate::memory_accounting::OwnedMemoryReservation,
     }
 
     mod writer_window {
@@ -12468,6 +12982,12 @@ pub(crate) mod original_writer {
                                 Error::Other("original key locator out of bounds".into())
                             })?)
                     }
+                    3 => {
+                        let _operand = OperandBorrow::enter(&self.operand_borrows)?;
+                        let mut bytes = self.workspace.array(len, |_| 0u8)?;
+                        self.scratch.read(loc.start, &mut bytes.entries)?;
+                        f(&bytes.entries)
+                    }
                     _ => Err(Error::Other("invalid proof key locator".into())),
                 }
             }
@@ -13390,48 +13910,122 @@ pub(crate) mod original_writer {
                 }
                 Ok(())
             }
+            fn stage_wide_input(
+                scratch: &Scratch,
+                journal: &mut Journal,
+                retirements: &mut Journal,
+                family: LogicalFamily,
+                key: &[u8],
+                value: Option<[u8; 32]>,
+            ) -> Result<()> {
+                if key.len() <= INLINE_SEPARATOR_BYTES {
+                    return Ok(());
+                }
+                let hash = key_hash(key);
+                let stored = node_storage_key(family, &hash);
+                if value.is_some() {
+                    let len = key.len().checked_add(1).ok_or_else(overflow)?;
+                    let body = scratch.reserve(len)?;
+                    scratch.write(body, &[0])?;
+                    scratch.write(body + 1, key)?;
+                    journal.push(
+                        scratch,
+                        Action {
+                            key: stored,
+                            hash,
+                            body,
+                            len: len as u64,
+                            kind: 1,
+                            next: NONE,
+                        },
+                    )?;
+                } else {
+                    retirements.push(
+                        scratch,
+                        Action {
+                            key: stored,
+                            hash: [0; 32],
+                            body: NONE,
+                            len: 0,
+                            kind: 2,
+                            next: NONE,
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+
+            fn stage_sorted_stream(
+                &mut self,
+                next: &mut impl FnMut() -> Result<Option<StreamedEdit>>,
+            ) -> Result<()> {
+                let mut edits = Stream::new();
+                let mut previous: Option<Key> = None;
+                while let Some(edit) = next()? {
+                    // The source owns the exact key until both scratch copies finish.
+                    if let Some(previous) = previous {
+                        self.with_semantic(previous, |key| {
+                            let order =
+                                identity_key_cmp(key, &edit.key)?.then_with(|| key.cmp(&edit.key));
+                            if order != Ordering::Less {
+                                return Err(Error::Other(
+                                    "streamed identity edits are not distinct and ordered".into(),
+                                ));
+                            }
+                            Ok(())
+                        })?;
+                    } else {
+                        identity_key_cmp(&edit.key, &edit.key)?;
+                    }
+                    Self::stage_wide_input(
+                        &self.scratch,
+                        &mut self.journal,
+                        &mut self.retirements,
+                        self.family,
+                        &edit.key,
+                        edit.value,
+                    )?;
+                    let offset = self.scratch.append(&edit.key)?;
+                    let locator = Locator {
+                        kind: 3,
+                        id: [0; 32],
+                        hash: [0; 32],
+                        start: offset,
+                        len: edit.key.len() as u64,
+                    };
+                    let key = Key {
+                        encoded: locator,
+                        raw: locator,
+                        inline: [0; INLINE_SEPARATOR_BYTES],
+                    };
+                    edits.push(
+                        &self.scratch,
+                        Edit {
+                            key,
+                            value: edit.value,
+                        },
+                    )?;
+                    previous = Some(key);
+                    // edit.key is physically freed before its original invoice.
+                }
+                self.edits = Edits::Stream(edits.reader());
+                Ok(())
+            }
+
             #[expect(
                 clippy::result_large_err,
                 reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
             )]
             fn plan(&mut self, root: &FamilyRoot) -> Result<FamilyRoot> {
-                // The full admitted input keys remain borrowed; wide bodies are
-                // sequentially spooled before any durable table mutation is allowed.
                 for (key, value) in &self.inputs {
-                    if key.len() <= INLINE_SEPARATOR_BYTES {
-                        continue;
-                    }
-                    let hash = key_hash(key);
-                    let stored = node_storage_key(self.family, &hash);
-                    if value.is_some() {
-                        let len = key.len().checked_add(1).ok_or_else(overflow)?;
-                        let body = self.scratch.reserve(len)?;
-                        self.scratch.write(body, &[0])?;
-                        self.scratch.write(body + 1, key)?;
-                        self.journal.push(
-                            &self.scratch,
-                            Action {
-                                key: stored,
-                                hash,
-                                body,
-                                len: len as u64,
-                                kind: 1,
-                                next: NONE,
-                            },
-                        )?;
-                    } else {
-                        self.retirements.push(
-                            &self.scratch,
-                            Action {
-                                key: stored,
-                                hash: [0; 32],
-                                body: NONE,
-                                len: 0,
-                                kind: 2,
-                                next: NONE,
-                            },
-                        )?;
-                    }
+                    Self::stage_wide_input(
+                        &self.scratch,
+                        &mut self.journal,
+                        &mut self.retirements,
+                        self.family,
+                        key,
+                        *value,
+                    )?;
                 }
                 let height = self.initialize(root)?;
                 #[cfg(any(test, feature = "test-seams"))]
@@ -13689,6 +14283,38 @@ pub(crate) mod original_writer {
             observe_proof_memory(scratch._charge.bytes, 0);
             Ok(result)
         }
+        pub(super) fn update_family_sorted_stream(
+            table: &mut NodeWriteTable<'_>,
+            admission: &mut ProofAdmission,
+            family: LogicalFamily,
+            root: &FamilyRoot,
+            mut next: impl FnMut() -> Result<Option<StreamedEdit>>,
+        ) -> Result<FamilyRoot> {
+            let scratch = Scratch::open(admission)?;
+            let base = admission
+                .held
+                .checked_add(scratch._charge.bytes)
+                .ok_or_else(|| proof_allocation_overflow(admission))?;
+            let ledger = Ledger {
+                live: Cell::new(0),
+                base,
+                caller_peak: &admission.peak,
+            };
+            let workspace = Workspace {
+                admission: RefCell::new(admission.fork()?),
+                ledger: &ledger,
+            };
+            let mut window = Window::open(table, family, Vec::new(), scratch, &workspace);
+            window.stage_sorted_stream(&mut next)?;
+            let (result, scratch, first) = window.plan_for_replay(root)?;
+            drop(workspace);
+            debug_assert_eq!(ledger.live.get(), 0);
+            drop(ledger);
+            replay(&scratch, first, table, family)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            observe_proof_memory(scratch._charge.bytes, 0);
+            Ok(result)
+        }
     }
 }
 
@@ -13881,6 +14507,21 @@ mod original_ddl_occurrences {
             mutations: &[content_identity::ContentIdentityMutation],
             admission: &mut content_identity::original_writer::ProofAdmission,
         ) -> Result<()> {
+            Self::reconcile_owned_ddl_selectors_with_expected_in_write(
+                write, mutations, admission, None,
+            )
+        }
+
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error retains inline native refusal diagnostics."
+        )]
+        pub(super) fn reconcile_owned_ddl_selectors_with_expected_in_write(
+            write: &redb::WriteTransaction,
+            mutations: &[content_identity::ContentIdentityMutation],
+            admission: &mut content_identity::original_writer::ProofAdmission,
+            expected: Option<&mut [[u8; 32]; 2]>,
+        ) -> Result<()> {
             // Retain the exact held original on the stack without copying any debit.
             // The frame borrows this local owner, so accounting can mutate admission;
             // both locals stay inside this call and drop after the frame's values.
@@ -13898,7 +14539,11 @@ mod original_ddl_occurrences {
                     .checked_mul(32)
                     .ok_or_else(|| Error::Other("DDL coordinate work overflow".into()))?,
             )?;
-            Self::owned_validate_ddl_selectors_in_write(write)?;
+            if let Some(expected) = expected.as_deref() {
+                Self::owned_validate_ddl_selectors_against_in_write(write, *expected)?;
+            } else {
+                Self::owned_validate_ddl_selectors_in_write(write)?;
+            }
             let mut affected = BTreeMap::<(Lsn, u32), Option<&str>>::new();
             let mut charged = 0;
             for mutation in mutations {
@@ -14100,20 +14745,139 @@ mod original_ddl_occurrences {
                 admission.release(body_bytes + old_bytes + key_bytes);
             }
             admission.release(charged);
+            drop(primary);
+            drop(config);
+            drop(selectors);
+            drop(counts);
+            if let Some(expected) = expected {
+                *expected = Self::owned_ddl_selector_fingerprints_in_write(write)?;
+            }
             Ok(())
         }
 
         #[expect(
             clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            reason = "Public Error retains inline native refusal diagnostics."
         )]
         fn owned_validate_ddl_selectors_in_write(write: &redb::WriteTransaction) -> Result<()> {
+            Self::owned_validate_ddl_selectors_against_in_write(
+                write,
+                content_identity::ddl_selector_roots_in_write(write)?,
+            )
+        }
+
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error retains inline native refusal diagnostics."
+        )]
+        fn owned_validate_ddl_selectors_against_in_write(
+            write: &redb::WriteTransaction,
+            expected: [[u8; 32]; 2],
+        ) -> Result<()> {
             let actual = Self::owned_ddl_selector_fingerprints_in_write(write)?;
-            let expected = content_identity::ddl_selector_roots_in_write(write)?;
             if actual != expected {
                 return Err(damage("declaration selector root binding mismatch"));
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod selector_transition_tests {
+        use super::*;
+
+        #[test]
+        fn pending_selector_chain_accepts_successors_and_refuses_unwitnessed_changes() {
+            let directory = tempfile::tempdir().unwrap();
+            let database = content_identity::ProofFixtureDatabase::create(
+                directory.path().join("selector-chain.db"),
+            )
+            .unwrap();
+            let write = database.begin_write().unwrap();
+            RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
+            drop(write.open_table(DDL_LOG_TABLE).unwrap());
+            drop(write.open_table(CONFIG_TABLE).unwrap());
+            let writer = crate::memory_accounting::MemoryAccountant::writer_no_limit().unwrap();
+            let funder = writer.prepare_source_funder().unwrap();
+            let original = writer.reserve_assembly_original(&funder).unwrap();
+            let mut admission = content_identity::original_writer::ProofAdmission::new(
+                &original,
+                Some(std::sync::Arc::downgrade(&database.owner)),
+            )
+            .unwrap();
+            let initial = content_identity::ddl_selector_roots_in_write(&write).unwrap();
+            let mut expected = initial;
+            for ordinal in 1..=2 {
+                let key = format!("{ordinal:020}");
+                let change = DdlChange::DropTable {
+                    name: format!("table_{ordinal}"),
+                };
+                let encoded = RedbPersistence::encode(&change).unwrap();
+                {
+                    let mut primary = write.open_table(DDL_LOG_TABLE).unwrap();
+                    primary.insert(key.as_str(), encoded.as_slice()).unwrap();
+                }
+                let mutation = content_identity::ContentIdentityMutation::put(
+                    content_identity::LogicalFamily::ChangeAndDdl,
+                    content_identity::history_logical_key(
+                        content_identity::HistoryKind::DdlLog,
+                        key.as_bytes(),
+                    ),
+                    encoded,
+                );
+                RedbPersistence::reconcile_owned_ddl_selectors_with_expected_in_write(
+                    &write,
+                    &[mutation],
+                    &mut admission,
+                    Some(&mut expected),
+                )
+                .unwrap();
+                assert_eq!(
+                    expected,
+                    RedbPersistence::owned_ddl_selector_fingerprints_in_write(&write).unwrap()
+                );
+                assert_ne!(expected, initial);
+            }
+            // The unchanged ordinary entrance still requires the published root tail.
+            assert!(
+                RedbPersistence::reconcile_owned_ddl_selectors_in_write(
+                    &write,
+                    &[],
+                    &mut admission,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("declaration selector root binding mismatch")
+            );
+            // An empty final transition authenticates the exact unpublished chain.
+            RedbPersistence::reconcile_owned_ddl_selectors_with_expected_in_write(
+                &write,
+                &[],
+                &mut admission,
+                Some(&mut expected),
+            )
+            .unwrap();
+            let before_damage = expected;
+            {
+                let mut counts = write.open_table(COUNTS).unwrap();
+                counts.insert(99, 1).unwrap();
+            }
+            assert!(
+                RedbPersistence::reconcile_owned_ddl_selectors_with_expected_in_write(
+                    &write,
+                    &[],
+                    &mut admission,
+                    Some(&mut expected),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("declaration selector root binding mismatch")
+            );
+            assert_eq!(
+                expected, before_damage,
+                "a rejected transition cannot advance the witness"
+            );
+            write.abort().unwrap();
         }
     }
 }
@@ -15905,40 +16669,75 @@ pub(crate) mod original_version_manifest {
         fn coordinate(mutation: &ContentIdentityMutation) -> &[u8] {
             &mutation.logical_key[ORDERED_HISTORY_MAGIC.len() + 1..]
         }
-        let latest = |key: &[u8]| {
-            pending
-                .iter()
-                .rev()
-                .find(|mutation| coordinate(mutation) == key)
-        };
+        let latest = |key: &[u8]| pending.iter().rev().find(|m| coordinate(m) == key);
+        writer_manifest_next_overlay(
+            write,
+            start,
+            exclusive,
+            admission,
+            |key| Ok(latest(key).map(|m| m.logical_value.is_some())),
+            |before, admission| {
+                let mut selected: Option<&[u8]> = None;
+                for mutation in pending {
+                    let key = coordinate(mutation);
+                    if mutation.logical_value.is_none()
+                        || !std::ptr::eq(latest(key).expect("overlay member"), mutation)
+                        || key < start
+                        || (exclusive && key == start)
+                        || before.is_some_and(|limit| key >= limit)
+                        || selected.is_some_and(|selected| key >= selected)
+                    {
+                        continue;
+                    }
+                    selected = Some(key);
+                }
+                selected
+                    .map(|key| {
+                        admission.admit(key.len())?;
+                        Ok(key.to_vec())
+                    })
+                    .transpose()
+            },
+        )
+    }
+
+    pub(crate) fn writer_manifest_next_paged(
+        write: &redb::WriteTransaction,
+        start: &[u8],
+        exclusive: bool,
+        admission: &mut ProofAdmission,
+        pending: &original_writer::OriginalIdentityBatch<'_, '_>,
+    ) -> Result<Option<Vec<u8>>> {
+        writer_manifest_next_overlay(
+            write,
+            start,
+            exclusive,
+            admission,
+            |key| pending.manifest_state(key),
+            |before, admission| pending.manifest_candidate(start, exclusive, before, admission),
+        )
+    }
+
+    fn writer_manifest_next_overlay(
+        write: &redb::WriteTransaction,
+        start: &[u8],
+        exclusive: bool,
+        admission: &mut ProofAdmission,
+        mut state: impl FnMut(&[u8]) -> Result<Option<bool>>,
+        mut next: impl FnMut(Option<&[u8]>, &mut ProofAdmission) -> Result<Option<Vec<u8>>>,
+    ) -> Result<Option<Vec<u8>>> {
         let mut stored = writer_manifest_next(write, start, exclusive, admission)?;
-        while stored
-            .as_deref()
-            .is_some_and(|key| latest(key).is_some_and(|mutation| mutation.logical_value.is_none()))
-        {
+        while let Some(key) = stored.as_deref() {
+            if state(key)? != Some(false) {
+                break;
+            }
             let key = stored.take().expect("selected predecessor");
             stored = writer_manifest_next(write, &key, true, admission)?;
             let bytes = key.capacity();
             drop(key);
             admission.release(bytes);
         }
-        let mut selected: Option<&[u8]> = None;
-        for mutation in pending {
-            let key = coordinate(mutation);
-            if mutation.logical_value.is_none()
-                || !std::ptr::eq(latest(key).expect("overlay member"), mutation)
-                || key < start
-                || (exclusive && key == start)
-                || stored.as_deref().is_some_and(|stored| key >= stored)
-                || selected.is_some_and(|selected| key >= selected)
-            {
-                continue;
-            }
-            selected = Some(key);
-        }
-        if let Some(key) = selected {
-            admission.admit(key.len())?;
-            let selected = key.to_vec();
+        if let Some(selected) = next(stored.as_deref(), admission)? {
             if let Some(stored) = stored {
                 let bytes = stored.capacity();
                 drop(stored);

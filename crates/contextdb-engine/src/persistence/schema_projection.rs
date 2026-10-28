@@ -322,6 +322,12 @@ impl<'f, 'o, 'w> OriginalMutationLog<'f, 'o, 'w> {
         persistence: &RedbPersistence,
         groups: Option<&custody_groups::GroupPlan>,
     ) -> Result<()> {
+        let mut batch = content_identity::original_writer::OriginalIdentityBatch::new(
+            persistence,
+            self.frame.original,
+            self.write,
+            "__received_canonical_log_edits",
+        )?;
         for ordinal in 0..self.log.next {
             let window = OriginalPersistenceFrame::new(self.frame.original)?;
             let (family, logical_key, logical_value, row_head): EncodedRetirement = {
@@ -347,32 +353,12 @@ impl<'f, 'o, 'w> OriginalMutationLog<'f, 'o, 'w> {
                 logical_value,
                 row_head,
             };
-            RedbPersistence::apply_owned_content_identity_with_manifests_and_groups_in_write(
-                self.write,
-                &[mutation],
-                &[],
-                &mut content_identity::original_writer::ProofAdmission::new(
-                    self.frame.original,
-                    persistence.proof_scratch_owner(),
-                )?,
-                groups,
-            )?;
+            batch.push(&mutation, groups)?;
         }
         self.write
             .delete_table(self.log.table)
             .map_err(RedbPersistence::storage_error)?;
-        // Every custody mutation borrows the same complete prepaid plan.
-        // Finish the root bindings even when the logical log was empty.
-        RedbPersistence::apply_owned_content_identity_with_manifests_and_groups_in_write(
-            self.write,
-            &[],
-            &[],
-            &mut content_identity::original_writer::ProofAdmission::new(
-                self.frame.original,
-                persistence.proof_scratch_owner(),
-            )?,
-            groups,
-        )?;
+        batch.apply(persistence, groups)?;
         Ok(())
     }
 }

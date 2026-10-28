@@ -49,6 +49,84 @@ impl OriginalPendingManifestPublication {
 }
 
 impl RedbPersistence {
+    pub(super) fn retire_relational_manifests_batch_in_write_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        pending: &mut content_identity::original_writer::OriginalIdentityBatch<'_, '_>,
+    ) -> Result<()> {
+        let names = OriginalPersistenceFrame::new(original)?;
+        names.reserve(table.len().saturating_mul(2).saturating_add(256))?;
+        let name = Self::rel_table_name(table);
+        let relation = write
+            .open_table(TableDefinition::<&[u8], &[u8]>::new(name.as_str()))
+            .map_err(Self::storage_error)?;
+        let mut physical = relation.iter().map_err(Self::storage_error)?;
+        let prefix = manifest::manifest_prefix(table)?;
+        struct Coordinate {
+            bytes: Vec<u8>,
+            _admission: content_identity::original_writer::ProofAdmission,
+        }
+        let mut after: Option<Coordinate> = None;
+        loop {
+            let mut admission = content_identity::original_writer::ProofAdmission::new(
+                original,
+                self.proof_scratch_owner(),
+            )?;
+            let next = manifest::writer_manifest_next_paged(
+                write,
+                after
+                    .as_ref()
+                    .map_or(prefix.as_slice(), |at| at.bytes.as_slice()),
+                after.is_some(),
+                &mut admission,
+                pending,
+            )
+            .map_err(|e| self.relational_manifest_error(e))?;
+            let Some(coordinate) = next.filter(|key| key.starts_with(&prefix)) else {
+                if physical
+                    .next()
+                    .transpose()
+                    .map_err(Self::storage_error)?
+                    .is_some()
+                {
+                    return Err(
+                        self.relational_manifest_damage("unwitnessed physical table suffix")
+                    );
+                }
+                return Ok(());
+            };
+            let witness = manifest::parse_manifest(&coordinate)
+                .map_err(|e| self.relational_manifest_error(e))?;
+            let Some((key, body)) = physical.next().transpose().map_err(Self::storage_error)?
+            else {
+                return Err(
+                    self.relational_manifest_damage("rooted table version is physically missing")
+                );
+            };
+            if key.value() != witness.identity {
+                return Err(
+                    self.relational_manifest_damage("table version order or membership disagrees")
+                );
+            }
+            self.replace_relational_manifest_batch_in_write_original(
+                original,
+                write,
+                table,
+                key.value(),
+                Some(body.value()),
+                None,
+                pending,
+            )?;
+            // The exact coordinate allocation dies before its own original debit.
+            after = Some(Coordinate {
+                bytes: coordinate,
+                _admission: admission,
+            });
+        }
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -78,7 +156,45 @@ impl RedbPersistence {
         physical: &[u8],
         old: Option<&[u8]>,
         new: Option<&[u8]>,
+        pending: Option<&mut OriginalPendingManifestPublication>,
+    ) -> Result<()> {
+        self.replace_relational_manifest_with_overlay_in_write_original(
+            original, write, table, physical, old, new, pending, None,
+        )
+    }
+
+    pub(super) fn replace_relational_manifest_batch_in_write_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        physical: &[u8],
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+        pending: &mut content_identity::original_writer::OriginalIdentityBatch<'_, '_>,
+    ) -> Result<()> {
+        self.replace_relational_manifest_with_overlay_in_write_original(
+            original,
+            write,
+            table,
+            physical,
+            old,
+            new,
+            None,
+            Some(pending),
+        )
+    }
+
+    pub(super) fn replace_relational_manifest_with_overlay_in_write_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        write: &redb::WriteTransaction,
+        table: &str,
+        physical: &[u8],
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
         mut pending: Option<&mut OriginalPendingManifestPublication>,
+        mut paged: Option<&mut content_identity::original_writer::OriginalIdentityBatch<'_, '_>>,
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         let _family_scope =
@@ -95,13 +211,17 @@ impl RedbPersistence {
         )?;
         let mut prefix = manifest::manifest_prefix(table)?;
         prefix.extend_from_slice(physical);
-        let expected = manifest::writer_manifest_next_pending(
-            write,
-            &prefix,
-            false,
-            &mut admission,
-            pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
-        )
+        let expected = if let Some(paged) = paged.as_deref() {
+            manifest::writer_manifest_next_paged(write, &prefix, false, &mut admission, paged)
+        } else {
+            manifest::writer_manifest_next_pending(
+                write,
+                &prefix,
+                false,
+                &mut admission,
+                pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+            )
+        }
         .map_err(|e| self.relational_manifest_error(e))?;
         let old_coordinate = old
             .map(|body| manifest::manifest_for_body(table, physical, body, &mut admission))
@@ -114,13 +234,17 @@ impl RedbPersistence {
             ));
         }
         if let Some(coordinate) = &old_coordinate {
-            let next = manifest::writer_manifest_next_pending(
-                write,
-                coordinate,
-                true,
-                &mut admission,
-                pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
-            )
+            let next = if let Some(paged) = paged.as_deref() {
+                manifest::writer_manifest_next_paged(write, coordinate, true, &mut admission, paged)
+            } else {
+                manifest::writer_manifest_next_pending(
+                    write,
+                    coordinate,
+                    true,
+                    &mut admission,
+                    pending.as_ref().map_or(&[], |p| p.mutations.as_slice()),
+                )
+            }
             .map_err(|e| self.relational_manifest_error(e))?;
             if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
                 return Err(self.relational_manifest_damage("duplicate physical version member"));
@@ -131,6 +255,18 @@ impl RedbPersistence {
             .transpose()
             .map_err(|e| self.relational_manifest_error(e))?;
         if old_coordinate == new_coordinate {
+            return Ok(());
+        }
+        if let Some(paged) = paged.as_deref_mut() {
+            for (coordinate, present) in old_coordinate
+                .iter()
+                .map(|k| (k, false))
+                .chain(new_coordinate.iter().map(|k| (k, true)))
+            {
+                admission.admit(manifest::manifest_mutation_bytes(coordinate, present)?)?;
+                let mutation = manifest::manifest_mutation(coordinate, present)?;
+                paged.push(&mutation, None)?;
+            }
             return Ok(());
         }
         if let Some(pending) = pending.as_mut() {

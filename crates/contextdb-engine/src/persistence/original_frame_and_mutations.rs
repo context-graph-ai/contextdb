@@ -2007,6 +2007,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     &write_txn,
                     &stage.authored_pending_rows,
                 )?;
+                let mut pending_manifests =
+                    content_identity::original_writer::OriginalIdentityBatch::new(
+                        self,
+                        frame.original,
+                        &write_txn,
+                        "__received_version_manifest_edits",
+                    )?;
                 let mut relational_tables =
                     stage.affected_tables.iter().cloned().collect::<Vec<_>>();
                 relational_tables.sort();
@@ -2018,7 +2025,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     let table_def: TableDefinition<&[u8], &[u8]> =
                         TableDefinition::new(table_name.as_str());
                     self.retain_received_authored_rows_in_write(&write_txn, &table, stage)?;
-                    self.retire_relational_manifests_in_write(&write_txn, &table)?;
+                    self.retire_relational_manifests_batch_in_write_original(
+                        frame.original,
+                        &write_txn,
+                        &table,
+                        &mut pending_manifests,
+                    )?;
                     content_size::reset_rows(&write_txn, &table)?;
                     match write_txn.delete_table(table_def) {
                         Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -2118,13 +2130,14 @@ graph_commit_result }.map_err(Self::storage_error)?;
                                 let predecessor = redb_table
                                     .get(key.as_slice())
                                     .map_err(Self::storage_error)?;
-                                self.replace_relational_manifest_in_write_original(
+                                self.replace_relational_manifest_batch_in_write_original(
                                     frame.original,
                                     &write_txn,
                                     table,
                                     key.as_slice(),
                                     predecessor.as_ref().map(|body| body.value()),
                                     Some(encoded.as_slice()),
+                                    &mut pending_manifests,
                                 )?;
                             }
                             let keys =
@@ -2179,6 +2192,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                         indexes.finish(self, &write_txn, table, meta)?;
                     }
                 }
+                // Publish the complete rooted manifest overlay before operational
+                // row verifiers consume the replacement physical tables.
+                pending_manifests.apply(self, None)?;
                 // The replacement is complete here: its commitments are checked
                 // and published before the operational rows fold their own.
                 let (replacement_commitments, _replacement_commitment_credit) =
