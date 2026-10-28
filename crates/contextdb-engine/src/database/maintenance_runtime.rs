@@ -41,10 +41,7 @@ impl DatabaseAssemblyBudget {
                 let (accountant, writer_use, vector_accountant) = budget.into_parts();
                 Ok((accountant, Some(writer_use), vector_accountant))
             }
-            Self::ReadImage(accountant) => {
-                let vector = accountant.vector_budget_for_original_reader()?;
-                Ok((accountant, None, vector))
-            }
+            Self::ReadImage(accountant, vector) => Ok((accountant, None, vector)),
         }
     }
 }

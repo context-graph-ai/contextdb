@@ -4769,7 +4769,10 @@ struct MetadataAuthorizedCandidates {
 // image. A raw accountant cannot assemble a writable database.
 enum DatabaseAssemblyBudget {
     Writer(WriterBudget),
-    ReadImage(crate::memory_accounting::AccountantHandle),
+    ReadImage(
+        crate::memory_accounting::AccountantHandle,
+        contextdb_vector::MemoryBudgetOwner,
+    ),
 }
 
 // Linux x86-64 glibc 2.39 census, 1/4/16 workers and three waves: max joined
