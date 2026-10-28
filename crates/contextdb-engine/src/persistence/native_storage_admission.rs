@@ -1250,3 +1250,7 @@ mod coexistence_native_writer_cap_guard;
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "native_scope_precedence_tests.rs"]
 mod native_scope_precedence_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "native_callback_mode_tests.rs"]
+mod native_callback_mode_tests;
