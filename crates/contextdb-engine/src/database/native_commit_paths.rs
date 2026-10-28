@@ -877,8 +877,8 @@ pub(super) fn initialized_received_access_for_test() {
         last_request_for_test, last_request_pointer_for_test, measured,
         registry_free_observation_for_test, watch_registry_free_for_test,
     };
-    let owner = Arc::new(MemoryAccountant::no_limit());
-    let source = Database::open_memory_with_accountant(owner.clone());
+    let source = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let owner = source.accountant.clone();
     source
         .execute(
             "CREATE TABLE received_access_table (id INTEGER PRIMARY KEY)",
@@ -893,7 +893,7 @@ pub(super) fn initialized_received_access_for_test() {
     let arc_pointer = last_request_pointer_for_test();
     assert_eq!((request.0, request.1), (layout.size(), layout.align()));
     assert_eq!(owner.usage().used, baseline + 256 + layout.size());
-    assert_eq!(access.accountant.as_ptr(), Arc::as_ptr(&owner));
+    assert_eq!(access.accountant.as_ptr(), owner.as_ptr());
     let alias = access.clone();
     drop(access);
     assert_eq!(owner.usage().used, baseline + 256 + layout.size());
@@ -922,10 +922,19 @@ pub(super) fn initialized_received_access_for_test() {
     assert_eq!(owner.usage().used, baseline);
     owner.set_budget(None).unwrap();
     drop(source);
-    assert_eq!(owner.usage().used, 0);
+    assert_eq!(
+        owner.usage().used,
+        owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>(),
+        "native accountant survives with only its original backing"
+    );
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!(
-        "CDB127_R1_ROW received_access_initialized actual_size={} actual_align={} actual_arc_pointer={} original_funder=true clone_single_debit=true miss_physical_free_before_refund=true refusal_before_arc=true final_zero=true",
+        "CDB127_R1_ROW received_access_initialized actual_size={} actual_align={} actual_arc_pointer={} original_funder=true clone_single_debit=true miss_physical_free_before_refund=true refusal_before_arc=true final_native_backing_only=true",
         layout.size(),
         layout.align(),
         arc_pointer
