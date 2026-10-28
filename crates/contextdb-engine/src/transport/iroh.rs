@@ -1329,6 +1329,10 @@ pub struct IrohClientTestController {
 
 #[cfg(feature = "test-seams")]
 struct IrohClientTestControlState {
+    #[cfg(test)]
+    force_next_admitted_timeout: AtomicBool,
+    #[cfg(test)]
+    admitted_timeout_notice: Arc<Notify>,
     pause_after_response_chunk_failure: Mutex<Option<u64>>,
     response_chunk_retry_paused: AtomicBool,
     response_chunk_retry_released: AtomicBool,
@@ -1340,6 +1344,10 @@ struct IrohClientTestControlState {
 impl Default for IrohClientTestControlState {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            force_next_admitted_timeout: AtomicBool::new(false),
+            #[cfg(test)]
+            admitted_timeout_notice: Arc::new(Notify::new()),
             pause_after_response_chunk_failure: Mutex::new(None),
             response_chunk_retry_paused: AtomicBool::new(false),
             response_chunk_retry_released: AtomicBool::new(false),
@@ -1351,6 +1359,14 @@ impl Default for IrohClientTestControlState {
 
 #[cfg(feature = "test-seams")]
 impl IrohClientTestController {
+    #[cfg(test)]
+    pub(crate) fn next_admitted_timeout_signal_for_test(&self) -> Arc<Notify> {
+        self.control
+            .force_next_admitted_timeout
+            .store(true, Ordering::SeqCst);
+        self.control.admitted_timeout_notice.clone()
+    }
+
     pub fn pause_after_response_chunk_failure_before_retry_for_test(&self, sequence: u64) {
         *self
             .control
@@ -3756,6 +3772,34 @@ impl IrohClientTransport {
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> super::WireResult<AdmittedFrameReply> {
         let connection = self.connected_state().await?;
+        #[cfg(all(test, feature = "test-seams"))]
+        let result = if self
+            .test_control
+            .force_next_admitted_timeout
+            .swap(false, Ordering::SeqCst)
+        {
+            tokio::select! {
+                biased;
+                () = self.test_control.admitted_timeout_notice.notified() => {
+                    Err(super::WireError::Transport(TransportError::Timeout))
+                }
+                result = tokio::time::timeout(
+                    timeout,
+                    exchange_frame_admitted(&connection, subject, request_bytes, owner),
+                ) => result
+                    .map_err(|_| super::WireError::Transport(TransportError::Timeout))
+                    .and_then(|result| result),
+            }
+        } else {
+            tokio::time::timeout(
+                timeout,
+                exchange_frame_admitted(&connection, subject, request_bytes, owner),
+            )
+            .await
+            .map_err(|_| super::WireError::Transport(TransportError::Timeout))
+            .and_then(|result| result)
+        };
+        #[cfg(not(all(test, feature = "test-seams")))]
         let result = tokio::time::timeout(
             timeout,
             exchange_frame_admitted(&connection, subject, request_bytes, owner),
