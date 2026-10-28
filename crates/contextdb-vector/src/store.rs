@@ -852,6 +852,7 @@ impl VectorMaintenanceFailureDetails {
             "clustered_source_range" => "clustered_source_range",
             "clustered_writer_workspace" => "clustered_writer_workspace",
             "maintenance_route_output" => "maintenance_route_output",
+            "exact_byte_read" => "exact_byte_read",
             "materialize" => "materialize",
             "native_canonical_merge" => "native_canonical_merge",
             "native_explain_scope" => "native_explain_scope",
