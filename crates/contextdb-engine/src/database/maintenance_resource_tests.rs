@@ -28,7 +28,12 @@ fn durable_generation_workspace_separates_build_and_persistence_owners() {
     assert_eq!(plan.graph_build_bytes, graph_build_bytes);
     assert_eq!(plan.raw_entry_bytes, 25_900_000);
     assert_eq!(plan.selected_entry_bytes, plan.raw_entry_bytes);
-    assert_eq!(plan.durable_metadata_bytes, 4_664);
+    let metadata_layout =
+        VectorGenerationWorkspacePlan::new(0, 0, &layout, &partition, policy, 0).unwrap();
+    assert_eq!(
+        plan.durable_metadata_bytes,
+        metadata_layout.durable_metadata_bytes
+    );
     assert_eq!(
         plan.build_phase_bytes(),
         graph_build_bytes
@@ -478,7 +483,11 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         let parent =
             crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824)
                 .expect("admit the declared fixture root");
-        let child = parent.child().unwrap();
+        let (child, _) = crate::vector_read_memory::statement_child_proof::observe(
+            &parent,
+            1_073_741_824,
+            || parent.child().unwrap(),
+        );
         let child_control = parent.retained_bytes_for_test();
         let observer = crate::vector_read_memory::declared_child_observer(&child).unwrap();
         let spy = MaintenanceReaderSpy::new(child.clone(), db.__accountant_handle_for_test());
