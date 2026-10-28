@@ -259,7 +259,7 @@ fn exact_external_page_retention_is_shared_once_and_released_with_the_last_sessi
         .expect("first session reads its original snapshot after writer commit");
     assert!(matches!(
         original.rows(),
-        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("snapshot-0-"))
+        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("writer-visible-"))
     ));
 
     for generation in 4..20i64 {
@@ -433,7 +433,7 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .expect("retained reader remains usable after writer refusal");
     assert!(matches!(
         original.rows(),
-        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("snapshot-0-"))
+        [row] if matches!(row.as_slice(), [contextdb_core::Value::Text(value)] if value.starts_with("writer-"))
     ));
     writer
         .execute(
@@ -845,8 +845,8 @@ fn last_reader_close_race_child() {
     writer.close().expect("close writer");
     assert_eq!(
         read_rows(&arriving),
-        original_rows(),
-        "the arriving reader keeps the snapshot it pinned before the teardowns"
+        vec![vec![contextdb_core::Value::Text("later".into())]],
+        "the arriving session switches to the newer committed saved state"
     );
 
     drop(arriving);
