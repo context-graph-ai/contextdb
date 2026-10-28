@@ -1015,7 +1015,12 @@ impl PagedCachedFile {
     }
 
     // Admit the concrete complete allocation before allocation and backend I/O.
-    fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
+    fn read_direct_into_page(
+        &self,
+        offset: u64,
+        len: usize,
+        scan_replace: bool,
+    ) -> Result<PageAllocation> {
         PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
         #[cfg(feature = "contextdb-internal")]
         if crate::native_storage_admission::control_write_active() {
@@ -1032,8 +1037,30 @@ impl PagedCachedFile {
                 .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
             return Ok(page);
         }
-        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
-        let mut page = PageAllocation::zeroed(len, charge)?;
+        // Without an executing source invoice, this read belongs to the
+        // store's genuine fixed cache reserve. Claim its complete layout
+        // before allocating; publication carries this same payment forward.
+        let payment = if !crate::read_admission::has_read_memory_admission()
+            && self.read_cache_bytes.has_fixed_reserve()
+        {
+            let cache_lock = self.write_buffer.lock().unwrap();
+            Some(
+                self.reserve_read_cache_backing(len, scan_replace, &cache_lock)?
+                    .ok_or_else(|| {
+                        crate::native_storage_admission::native_storage_error(
+                            crate::native_storage_admission::NativeColdReadError::AdmissionRefused,
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut page = if let Some(payment) = payment {
+            PageAllocation::zeroed_cached(len, payment)?
+        } else {
+            let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
+            PageAllocation::zeroed(len, charge)?
+        };
         #[cfg(feature = "test-seams")]
         page.observe_payment(crate::page_payer_observation::Phase::BeforeIo);
         self.file
@@ -1069,33 +1096,36 @@ impl PagedCachedFile {
             }
         }
 
-        let buffer = self.read_direct_into_page(offset, len)?;
-        let scan_replace = crate::read_admission::scan_reads_active()
-            && !crate::read_admission::declared_scan_reads_active()
-            && !crate::read_admission::take_scan_growth(cached_page_bytes(len));
+        let fallback_scan = crate::read_admission::scan_reads_active()
+            && !crate::read_admission::declared_scan_reads_active();
+        let growth = if fallback_scan {
+            crate::read_admission::claim_scan_growth(cached_page_bytes(len))
+        } else {
+            None
+        };
+        let scan_replace = fallback_scan && growth.is_none();
+        let buffer = self.read_direct_into_page(offset, len, scan_replace)?;
+        if let Some(growth) = growth {
+            growth.commit();
+        }
         self.cache_loaded_page(offset, len, buffer, scan_replace)
     }
 
-    fn cache_loaded_page(
+    /// Admission and publication use the same cache-capacity policy. A
+    /// successful claim owns the backing before any allocation or backend I/O.
+    fn reserve_read_cache_backing(
         &self,
-        offset: u64,
         len: usize,
-        buffer: PageAllocation,
         scan_replace: bool,
-    ) -> Result<PageMemory> {
-        #[cfg(feature = "test-seams")]
-        buffer.observe_payment(crate::page_payer_observation::Phase::Handoff);
-        // Serialize publication with read-capacity changes. Release this lock
-        // before transferring an opaque source receipt or dropping displacement.
-        let cache_lock = self.write_buffer.lock().unwrap();
+        cache_lock: &MutexGuard<'_, LRUWriteCache>,
+    ) -> Result<Option<CachePayment>> {
         let page_bytes = cached_page_bytes(len);
-        let cache_slot = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
         if scan_replace {
             let before = self.read_cache_bytes.load(Ordering::Acquire);
-            self.evict_from_read_cache(page_bytes, &cache_lock);
+            self.evict_from_read_cache(page_bytes, cache_lock);
             let after = self.read_cache_bytes.load(Ordering::Acquire);
             if before.saturating_sub(after) < page_bytes {
-                return Ok(Self::uncached(buffer));
+                return Ok(None);
             }
         } else {
             let write_bytes = self.write_buffer_bytes.fixed_bytes();
@@ -1110,13 +1140,13 @@ impl PagedCachedFile {
                         .saturating_add(page_bytes)
                         .saturating_add(write_bytes)
                         - self.max_cache_size.load(Ordering::Acquire),
-                    &cache_lock,
+                    cache_lock,
                 );
             }
         }
         let Ok((previous, payment)) = CachePayment::reserve(&self.read_cache_bytes, page_bytes)
         else {
-            return Ok(Self::uncached(buffer));
+            return Ok(None);
         };
         let write_bytes = self.write_buffer_bytes.fixed_bytes();
         if previous
@@ -1125,8 +1155,34 @@ impl PagedCachedFile {
             > self.max_cache_size.load(Ordering::Acquire)
         {
             drop(payment);
-            return Ok(Self::uncached(buffer));
+            return Ok(None);
         }
+        Ok(Some(payment))
+    }
+
+    fn cache_loaded_page(
+        &self,
+        offset: u64,
+        len: usize,
+        buffer: PageAllocation,
+        scan_replace: bool,
+    ) -> Result<PageMemory> {
+        #[cfg(feature = "test-seams")]
+        buffer.observe_payment(crate::page_payer_observation::Phase::Handoff);
+        // Serialize publication with read-capacity changes. Release this lock
+        // before transferring an opaque source receipt or dropping displacement.
+        let cache_lock = self.write_buffer.lock().unwrap();
+        let cache_slot = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
+        let payment = if buffer.fixed_counted_by(&self.read_cache_bytes) {
+            // The provisional page already owns this exact reserve claim.
+            // Reserving again would invoice its same physical backing twice.
+            None
+        } else {
+            match self.reserve_read_cache_backing(len, scan_replace, &cache_lock)? {
+                Some(payment) => Some(payment),
+                None => return Ok(Self::uncached(buffer)),
+            }
+        };
         debug_assert!(
             len >= usize::try_from(self.page_size).unwrap()
                 || (offset == 0 && len == DB_HEADER_SIZE)
@@ -1139,12 +1195,15 @@ impl PagedCachedFile {
         };
         match inserted {
             Ok(displaced) => {
-                // All new holders retain this same source payer until transfer.
+                // Every alias retains the original payment until an optional
+                // source-to-cache transfer; prepaid cache pages keep their loan.
                 // Drop the stripe guard before running the opaque receipt's
                 // destructor; no byte/control allocation occurs at transfer.
                 drop(write_lock);
                 drop(cache_lock);
-                buffer.transfer(payment);
+                if let Some(payment) = payment {
+                    buffer.transfer(payment);
+                }
                 drop(displaced);
                 Ok(PageMemory::Cached(buffer))
             }

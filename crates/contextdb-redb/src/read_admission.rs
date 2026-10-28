@@ -184,7 +184,6 @@ pub fn with_owned_read_page_charge_storage<R>(
     operation()
 }
 
-#[cfg(feature = "contextdb-internal")]
 pub(crate) fn has_read_memory_admission() -> bool {
     ACTIVE.with(|active| !active.borrow().is_empty())
 }
@@ -466,6 +465,48 @@ pub(crate) fn declared_scan_reads_active() -> bool {
 
 pub(crate) fn scan_reads_active() -> bool {
     SCAN_TAIL.with(|tail| tail.get().is_some())
+}
+
+/// A provisional use of the existing legacy scan allowance. Backend failure
+/// returns it to that same counter even if scope links change during the read.
+pub(crate) struct ScanGrowthClaim {
+    remaining: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+impl ScanGrowthClaim {
+    pub(crate) fn commit(mut self) {
+        self.bytes = 0;
+    }
+}
+impl Drop for ScanGrowthClaim {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.remaining
+                .fetch_add(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+pub(crate) fn claim_scan_growth(bytes: usize) -> Option<ScanGrowthClaim> {
+    let remaining = SCAN_TAIL.with(|tail| {
+        tail.get().and_then(|node| {
+            #[allow(
+                clippy::infallible_destructuring_match,
+                reason = "Internal builds also match native admission without a legacy counter."
+            )]
+            let remaining = match &unsafe { node.as_ref() }.allowance.0 {
+                ScanState::Legacy(remaining) => remaining,
+                #[cfg(feature = "contextdb-internal")]
+                ScanState::Native { .. } => return None,
+            };
+            Some(Arc::clone(remaining))
+        })
+    })?;
+    if take_scan_growth(bytes) {
+        Some(ScanGrowthClaim { remaining, bytes })
+    } else {
+        None
+    }
 }
 
 /// Take `bytes` of the innermost legacy scan's finite fallback allowance.

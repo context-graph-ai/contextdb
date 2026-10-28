@@ -410,6 +410,14 @@ impl PageAllocation {
             charge.map_or(PagePayer::Unscoped, PagePayer::Source),
         )
     }
+    /// The cache already claimed this complete backing from its genuine fixed
+    /// reserve. Keep that same payment live before allocation and through free.
+    pub(super) fn zeroed_cached(len: usize, payment: CachePayment) -> Result<Self> {
+        let (layout, offset) = Self::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
+        debug_assert!(payment.has_fixed_reserve());
+        debug_assert_eq!(payment.bytes, layout.size());
+        Self::allocate(len, layout, offset, PagePayer::Cache(payment))
+    }
     #[cfg(feature = "contextdb-internal")]
     pub(super) fn zeroed_native(
         len: usize,

@@ -1,4 +1,4 @@
---- /dev/null
+--- a/src/atomic_compat.rs
 +++ b/src/atomic_compat.rs
 @@ -0,0 +1,35 @@
 +//! Atomic conditional updates supported by the minimum Rust version.
@@ -36,7 +36,7 @@
 +}
 +conditional_update!(AtomicUsize, usize);
 +conditional_update!(AtomicU64, u64);
---- /dev/null
+--- a/src/commit_work.rs
 +++ b/src/commit_work.rs
 @@ -0,0 +1,300 @@
 +//! What one durable commit had to list, compiled only for tests.
@@ -338,82 +338,6 @@
 +#[doc(hidden)]
 +pub fn take_commit_spans_for_test() -> CommitSpansForTest {
 +    COMMIT_SPANS.with(|spans| spans.replace(CommitSpansForTest::ZERO))
-+}
---- /dev/null
-+++ b/src/db/allocator_metadata_test_seams.rs
-@@ -0,0 +1,73 @@
-+//! Retained allocator capacity for `writer_reopen_and_doubling_keep_a_fixed_resident_envelope`.
-+
-+use super::Database;
-+
-+impl Database {
-+    /// Observe the retained native floor without registering another reader.
-+    #[doc(hidden)]
-+    pub fn oldest_native_read_transaction_for_test(&self) -> Option<u64> {
-+        self.transaction_tracker
-+            .oldest_live_read_transaction()
-+            .map(|id| id.raw_id())
-+    }
-+
-+    /// Existing native read ownership count for one actual storage transaction id.
-+    /// Does not retain a transaction, allocate, or read storage pages.
-+    #[doc(hidden)]
-+    pub fn native_read_transaction_count_for_test(&self, transaction_id: u64) -> u64 {
-+        self.transaction_tracker
-+            .native_read_transaction_count_for_test(transaction_id)
-+    }
-+
-+    #[doc(hidden)]
-+    pub fn allocator_regions_for_test(&self) -> usize {
-+        self.mem.allocator_regions_for_test()
-+    }
-+
-+    /// Return retained allocator metadata heap payload bytes from actual vector capacities.
-+    ///
-+    /// Counts `Allocators::region_allocators`, each `BuddyAllocator::free`, each
-+    /// `BtreeBitmap::heights`, every `U64GroupedBitmap::data`, and the same bitmap
-+    /// owners reached through `RegionTracker::order_trackers`. Outer vector capacities
-+    /// include inline element bookkeeping and spare slots; nested allocations are
-+    /// counted only for initialized elements, so no owner is counted twice.
-+    ///
-+    /// This is a lower bound on heap residency: allocator rounding/headers are unknown.
-+    /// It excludes fixed inline `TransactionalMemory` state, page caches, commit page
-+    /// sets, debug-only page tracking, temporary serialization/open buffers, and any
-+    /// old/new allocation overlap inside a vector reallocation. Those owners require
-+    /// separate observations; this settled snapshot is not complete reconciliation.
-+    ///
-+    /// Takes only the allocator state mutex, allocates nothing, and reads no storage
-+    /// pages. It can observe retained state after open or file growth without starting
-+    /// a transaction or hydrating history. The seam is absent from normal builds.
-+    #[doc(hidden)]
-+    pub fn allocator_metadata_bytes_for_test(&self) -> usize {
-+        self.mem.allocator_metadata_bytes_for_test()
-+    }
-+}
-+
-+thread_local! {
-+    static REGION_LOADS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-+}
-+pub(crate) fn note_loaded_regions(regions: usize) {
-+    REGION_LOADS.with(|slot| {
-+        if let Some(count) = slot.get() {
-+            slot.set(Some(count + regions as u64));
-+        }
-+    });
-+}
-+/// Observe the actual allocator state's region count after its durable load.
-+pub fn observe_allocator_region_loads_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
-+    struct Restore(Option<u64>);
-+    impl Drop for Restore {
-+        fn drop(&mut self) {
-+            REGION_LOADS.with(|slot| slot.set(self.0));
-+        }
-+    }
-+    let restore = Restore(REGION_LOADS.with(|slot| slot.replace(Some(0))));
-+    let value = operation();
-+    let count = REGION_LOADS.with(|slot| slot.get().unwrap());
-+    drop(restore);
-+    (value, count)
 +}
 --- a/src/db.rs
 +++ b/src/db.rs
@@ -2861,6 +2785,82 @@
                      if x > 0 { Some(x - 1) } else { None }
                  })
                  .is_err()
+--- a/src/db/allocator_metadata_test_seams.rs
++++ b/src/db/allocator_metadata_test_seams.rs
+@@ -0,0 +1,73 @@
++//! Retained allocator capacity for `writer_reopen_and_doubling_keep_a_fixed_resident_envelope`.
++
++use super::Database;
++
++impl Database {
++    /// Observe the retained native floor without registering another reader.
++    #[doc(hidden)]
++    pub fn oldest_native_read_transaction_for_test(&self) -> Option<u64> {
++        self.transaction_tracker
++            .oldest_live_read_transaction()
++            .map(|id| id.raw_id())
++    }
++
++    /// Existing native read ownership count for one actual storage transaction id.
++    /// Does not retain a transaction, allocate, or read storage pages.
++    #[doc(hidden)]
++    pub fn native_read_transaction_count_for_test(&self, transaction_id: u64) -> u64 {
++        self.transaction_tracker
++            .native_read_transaction_count_for_test(transaction_id)
++    }
++
++    #[doc(hidden)]
++    pub fn allocator_regions_for_test(&self) -> usize {
++        self.mem.allocator_regions_for_test()
++    }
++
++    /// Return retained allocator metadata heap payload bytes from actual vector capacities.
++    ///
++    /// Counts `Allocators::region_allocators`, each `BuddyAllocator::free`, each
++    /// `BtreeBitmap::heights`, every `U64GroupedBitmap::data`, and the same bitmap
++    /// owners reached through `RegionTracker::order_trackers`. Outer vector capacities
++    /// include inline element bookkeeping and spare slots; nested allocations are
++    /// counted only for initialized elements, so no owner is counted twice.
++    ///
++    /// This is a lower bound on heap residency: allocator rounding/headers are unknown.
++    /// It excludes fixed inline `TransactionalMemory` state, page caches, commit page
++    /// sets, debug-only page tracking, temporary serialization/open buffers, and any
++    /// old/new allocation overlap inside a vector reallocation. Those owners require
++    /// separate observations; this settled snapshot is not complete reconciliation.
++    ///
++    /// Takes only the allocator state mutex, allocates nothing, and reads no storage
++    /// pages. It can observe retained state after open or file growth without starting
++    /// a transaction or hydrating history. The seam is absent from normal builds.
++    #[doc(hidden)]
++    pub fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.mem.allocator_metadata_bytes_for_test()
++    }
++}
++
++thread_local! {
++    static REGION_LOADS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
++}
++pub(crate) fn note_loaded_regions(regions: usize) {
++    REGION_LOADS.with(|slot| {
++        if let Some(count) = slot.get() {
++            slot.set(Some(count + regions as u64));
++        }
++    });
++}
++/// Observe the actual allocator state's region count after its durable load.
++pub fn observe_allocator_region_loads_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
++    struct Restore(Option<u64>);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            REGION_LOADS.with(|slot| slot.set(self.0));
++        }
++    }
++    let restore = Restore(REGION_LOADS.with(|slot| slot.replace(Some(0))));
++    let value = operation();
++    let count = REGION_LOADS.with(|slot| slot.get().unwrap());
++    drop(restore);
++    (value, count)
++}
 --- a/src/error.rs
 +++ b/src/error.rs
 @@ -12,6 +12,13 @@
@@ -3172,7 +3172,7 @@
      }
  
      /// Add the given value to the mapping of the key
---- /dev/null
+--- a/src/native_storage_admission.rs
 +++ b/src/native_storage_admission.rs
 @@ -0,0 +1,1308 @@
 +//! Internal owned admission for exact byte reads; no host or engine dependency.
@@ -4483,7 +4483,7 @@
 +            .map_or(0, |(_, bytes)| bytes)
 +    })
 +}
---- /dev/null
+--- a/src/open_with_backend_region_override_tests.rs
 +++ b/src/open_with_backend_region_override_tests.rs
 @@ -0,0 +1,103 @@
 +//! Fork-local, crate-internal coverage for `Builder::open_with_backend`'s
@@ -4589,7 +4589,7 @@
 +    assert_eq!(table.get(0).unwrap().unwrap().value(), vec![7_u8; 512]);
 +    assert_eq!(table.get(512).unwrap().unwrap().value(), vec![9_u8; 512]);
 +}
---- /dev/null
+--- a/src/page_payer_observation.rs
 +++ b/src/page_payer_observation.rs
 @@ -0,0 +1,53 @@
 +//! Test-only scalar observations of the actual page payer; no funding or allocation.
@@ -4645,9 +4645,9 @@
 +        observer(observation);
 +    }
 +}
---- /dev/null
+--- a/src/read_admission.rs
 +++ b/src/read_admission.rs
-@@ -0,0 +1,806 @@
+@@ -0,0 +1,847 @@
 +//! Operation-scoped admission before allocating a source page. The caller
 +//! keeps admitted bytes owned until its read handles have been released.
 +use crate::StorageError;
@@ -4834,7 +4834,6 @@
 +    operation()
 +}
 +
-+#[cfg(feature = "contextdb-internal")]
 +pub(crate) fn has_read_memory_admission() -> bool {
 +    ACTIVE.with(|active| !active.borrow().is_empty())
 +}
@@ -5116,6 +5115,48 @@
 +
 +pub(crate) fn scan_reads_active() -> bool {
 +    SCAN_TAIL.with(|tail| tail.get().is_some())
++}
++
++/// A provisional use of the existing legacy scan allowance. Backend failure
++/// returns it to that same counter even if scope links change during the read.
++pub(crate) struct ScanGrowthClaim {
++    remaining: Arc<std::sync::atomic::AtomicUsize>,
++    bytes: usize,
++}
++impl ScanGrowthClaim {
++    pub(crate) fn commit(mut self) {
++        self.bytes = 0;
++    }
++}
++impl Drop for ScanGrowthClaim {
++    fn drop(&mut self) {
++        if self.bytes != 0 {
++            self.remaining
++                .fetch_add(self.bytes, std::sync::atomic::Ordering::AcqRel);
++        }
++    }
++}
++
++pub(crate) fn claim_scan_growth(bytes: usize) -> Option<ScanGrowthClaim> {
++    let remaining = SCAN_TAIL.with(|tail| {
++        tail.get().and_then(|node| {
++            #[allow(
++                clippy::infallible_destructuring_match,
++                reason = "Internal builds also match native admission without a legacy counter."
++            )]
++            let remaining = match &unsafe { node.as_ref() }.allowance.0 {
++                ScanState::Legacy(remaining) => remaining,
++                #[cfg(feature = "contextdb-internal")]
++                ScanState::Native { .. } => return None,
++            };
++            Some(Arc::clone(remaining))
++        })
++    })?;
++    if take_scan_growth(bytes) {
++        Some(ScanGrowthClaim { remaining, bytes })
++    } else {
++        None
++    }
 +}
 +
 +/// Take `bytes` of the innermost legacy scan's finite fallback allowance.
@@ -5687,7 +5728,7 @@
 +            }))
 +    }
 +}
---- /dev/null
+--- a/src/table_registry.rs
 +++ b/src/table_registry.rs
 @@ -0,0 +1,403 @@
 +//! The write transaction's set of open tables.
@@ -6093,7 +6134,7 @@
 +        )
 +    }
 +}
---- /dev/null
+--- a/src/table_write_observer.rs
 +++ b/src/table_write_observer.rs
 @@ -0,0 +1,71 @@
 +//! Instance-scoped observation of actual user-table mutations, compiled only for tests.
@@ -10485,7 +10526,7 @@
 +            .next_native_u64_bytes_range(name, lower, exclusive, before)
 +    }
 +}
---- /dev/null
+--- a/src/tree_store/bounded_bytes.rs
 +++ b/src/tree_store/bounded_bytes.rs
 @@ -0,0 +1,2115 @@
 +//! Reject-only inspection for byte tables. Selected records use ordinary pages.
@@ -14949,7 +14990,7 @@
 +
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +pub use page_store::CachePressureFixtureForTest;
---- /dev/null
+--- a/src/tree_store/page_store/allocator_pager.rs
 +++ b/src/tree_store/page_store/allocator_pager.rs
 @@ -0,0 +1,733 @@
 +//! Windowed, non-durable backing for allocator bitmap words.
@@ -16720,7 +16761,7 @@
  
      #[test]
      fn record_alloc_buddy() {
---- /dev/null
+--- a/src/tree_store/page_store/cache_owner_contract_rows.rs
 +++ b/src/tree_store/page_store/cache_owner_contract_rows.rs
 @@ -0,0 +1,315 @@
 +//! Independent rows of the existing page-lifetime contract. These exercise the
@@ -17979,7 +18020,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +1014,36 @@
+@@ -416,18 +1014,63 @@
          Ok(buffer)
      }
  
@@ -17991,7 +18032,12 @@
 -        self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
 -        Ok(arc)
 +    // Admit the concrete complete allocation before allocation and backend I/O.
-+    fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
++    fn read_direct_into_page(
++        &self,
++        offset: u64,
++        len: usize,
++        scan_replace: bool,
++    ) -> Result<PageAllocation> {
 +        PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
 +        #[cfg(feature = "contextdb-internal")]
 +        if crate::native_storage_admission::control_write_active() {
@@ -18008,8 +18054,30 @@
 +                .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
 +            return Ok(page);
 +        }
-+        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
-+        let mut page = PageAllocation::zeroed(len, charge)?;
++        // Without an executing source invoice, this read belongs to the
++        // store's genuine fixed cache reserve. Claim its complete layout
++        // before allocating; publication carries this same payment forward.
++        let payment = if !crate::read_admission::has_read_memory_admission()
++            && self.read_cache_bytes.has_fixed_reserve()
++        {
++            let cache_lock = self.write_buffer.lock().unwrap();
++            Some(
++                self.reserve_read_cache_backing(len, scan_replace, &cache_lock)?
++                    .ok_or_else(|| {
++                        crate::native_storage_admission::native_storage_error(
++                            crate::native_storage_admission::NativeColdReadError::AdmissionRefused,
++                        )
++                    })?,
++            )
++        } else {
++            None
++        };
++        let mut page = if let Some(payment) = payment {
++            PageAllocation::zeroed_cached(len, payment)?
++        } else {
++            let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
++            PageAllocation::zeroed(len, charge)?
++        };
 +        #[cfg(feature = "test-seams")]
 +        page.observe_payment(crate::page_payer_observation::Phase::BeforeIo);
 +        self.file
@@ -18024,7 +18092,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1054,7 @@
+@@ -438,7 +1081,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -18033,7 +18101,7 @@
              }
          }
  
-@@ -449,54 +1065,143 @@
+@@ -449,54 +1092,175 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -18047,33 +18115,36 @@
 +            }
 +        }
 +
-+        let buffer = self.read_direct_into_page(offset, len)?;
-+        let scan_replace = crate::read_admission::scan_reads_active()
-+            && !crate::read_admission::declared_scan_reads_active()
-+            && !crate::read_admission::take_scan_growth(cached_page_bytes(len));
++        let fallback_scan = crate::read_admission::scan_reads_active()
++            && !crate::read_admission::declared_scan_reads_active();
++        let growth = if fallback_scan {
++            crate::read_admission::claim_scan_growth(cached_page_bytes(len))
++        } else {
++            None
++        };
++        let scan_replace = fallback_scan && growth.is_none();
++        let buffer = self.read_direct_into_page(offset, len, scan_replace)?;
++        if let Some(growth) = growth {
++            growth.commit();
++        }
 +        self.cache_loaded_page(offset, len, buffer, scan_replace)
 +    }
 +
-+    fn cache_loaded_page(
++    /// Admission and publication use the same cache-capacity policy. A
++    /// successful claim owns the backing before any allocation or backend I/O.
++    fn reserve_read_cache_backing(
 +        &self,
-+        offset: u64,
 +        len: usize,
-+        buffer: PageAllocation,
 +        scan_replace: bool,
-+    ) -> Result<PageMemory> {
-+        #[cfg(feature = "test-seams")]
-+        buffer.observe_payment(crate::page_payer_observation::Phase::Handoff);
-+        // Serialize publication with read-capacity changes. Release this lock
-+        // before transferring an opaque source receipt or dropping displacement.
-+        let cache_lock = self.write_buffer.lock().unwrap();
++        cache_lock: &MutexGuard<'_, LRUWriteCache>,
++    ) -> Result<Option<CachePayment>> {
 +        let page_bytes = cached_page_bytes(len);
-+        let cache_slot = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
 +        if scan_replace {
 +            let before = self.read_cache_bytes.load(Ordering::Acquire);
-+            self.evict_from_read_cache(page_bytes, &cache_lock);
++            self.evict_from_read_cache(page_bytes, cache_lock);
 +            let after = self.read_cache_bytes.load(Ordering::Acquire);
 +            if before.saturating_sub(after) < page_bytes {
-+                return Ok(Self::uncached(buffer));
++                return Ok(None);
 +            }
 +        } else {
 +            let write_bytes = self.write_buffer_bytes.fixed_bytes();
@@ -18088,13 +18159,13 @@
 +                        .saturating_add(page_bytes)
 +                        .saturating_add(write_bytes)
 +                        - self.max_cache_size.load(Ordering::Acquire),
-+                    &cache_lock,
++                    cache_lock,
 +                );
 +            }
 +        }
 +        let Ok((previous, payment)) = CachePayment::reserve(&self.read_cache_bytes, page_bytes)
 +        else {
-+            return Ok(Self::uncached(buffer));
++            return Ok(None);
 +        };
 +        let write_bytes = self.write_buffer_bytes.fixed_bytes();
 +        if previous
@@ -18103,8 +18174,34 @@
 +            > self.max_cache_size.load(Ordering::Acquire)
 +        {
 +            drop(payment);
-+            return Ok(Self::uncached(buffer));
++            return Ok(None);
 +        }
++        Ok(Some(payment))
++    }
++
++    fn cache_loaded_page(
++        &self,
++        offset: u64,
++        len: usize,
++        buffer: PageAllocation,
++        scan_replace: bool,
++    ) -> Result<PageMemory> {
++        #[cfg(feature = "test-seams")]
++        buffer.observe_payment(crate::page_payer_observation::Phase::Handoff);
++        // Serialize publication with read-capacity changes. Release this lock
++        // before transferring an opaque source receipt or dropping displacement.
++        let cache_lock = self.write_buffer.lock().unwrap();
++        let cache_slot = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
++        let payment = if buffer.fixed_counted_by(&self.read_cache_bytes) {
++            // The provisional page already owns this exact reserve claim.
++            // Reserving again would invoice its same physical backing twice.
++            None
++        } else {
++            match self.reserve_read_cache_backing(len, scan_replace, &cache_lock)? {
++                Some(payment) => Some(payment),
++                None => return Ok(Self::uncached(buffer)),
++            }
++        };
 +        debug_assert!(
 +            len >= usize::try_from(self.page_size).unwrap()
 +                || (offset == 0 && len == DB_HEADER_SIZE)
@@ -18137,7 +18234,17 @@
 -                    removed += v.len();
 -                } else {
 -                    break;
--                }
++        match inserted {
++            Ok(displaced) => {
++                // Every alias retains the original payment until an optional
++                // source-to-cache transfer; prepaid cache pages keep their loan.
++                // Drop the stripe guard before running the opaque receipt's
++                // destructor; no byte/control allocation occurs at transfer.
++                drop(write_lock);
++                drop(cache_lock);
++                if let Some(payment) = payment {
++                    buffer.transfer(payment);
+                 }
 -            }
 -        }
 -        if removed > 0 {
@@ -18145,14 +18252,6 @@
 -        }
 -
 -        Ok(buffer)
-+        match inserted {
-+            Ok(displaced) => {
-+                // All new holders retain this same source payer until transfer.
-+                // Drop the stripe guard before running the opaque receipt's
-+                // destructor; no byte/control allocation occurs at transfer.
-+                drop(write_lock);
-+                drop(cache_lock);
-+                buffer.transfer(payment);
 +                drop(displaced);
 +                Ok(PageMemory::Cached(buffer))
 +            }
@@ -18217,7 +18316,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1212,213 @@
+@@ -507,104 +1271,213 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -18517,7 +18616,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1428,383 @@
+@@ -614,13 +1487,383 @@
  }
  
  #[cfg(test)]
@@ -18903,7 +19002,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1837,936 @@
+@@ -653,4 +1896,936 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -21411,9 +21510,9 @@
 +
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +pub use cached_file::CachePressureFixtureForTest;
---- /dev/null
+--- a/src/tree_store/page_store/page_allocation.rs
 +++ b/src/tree_store/page_store/page_allocation.rs
-@@ -0,0 +1,999 @@
+@@ -0,0 +1,1007 @@
 +//! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 +//! escape independently of the payer. Native copies retain their separate owner.
 +use crate::atomic_compat::AtomicUpdate as _;
@@ -21825,6 +21924,14 @@
 +            offset,
 +            charge.map_or(PagePayer::Unscoped, PagePayer::Source),
 +        )
++    }
++    /// The cache already claimed this complete backing from its genuine fixed
++    /// reserve. Keep that same payment live before allocation and through free.
++    pub(super) fn zeroed_cached(len: usize, payment: CachePayment) -> Result<Self> {
++        let (layout, offset) = Self::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
++        debug_assert!(payment.has_fixed_reserve());
++        debug_assert_eq!(payment.bytes, layout.size());
++        Self::allocate(len, layout, offset, PagePayer::Cache(payment))
 +    }
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(super) fn zeroed_native(
@@ -25906,7 +26013,7 @@
  #[cfg(test)]
  mod test {
      use crate::tree_store::page_store::xxh3::hash64_with_seed;
---- /dev/null
+--- a/src/tree_store/random_state_override.rs
 +++ b/src/tree_store/random_state_override.rs
 @@ -0,0 +1,24 @@
 +use std::cell::RefCell;

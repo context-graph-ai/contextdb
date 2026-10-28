@@ -1210,3 +1210,22 @@ writer's `zeroed_for_write` construction point.
 `src/page_payer_observation.rs` (added), `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs` and `src/tree_store/page_store/cached_file.rs` expose allocation-free, thread-scoped scalar observations only under `test-seams`. Events borrow the actual constructor payer, fixed-reserve receipt identity, occupancy counters, installed handoff payer and payer retained outside physical free. They never fund, retain or replace a page. The existing cache-pressure fixture gains test-only arbitrary-backend, read and invalidation drives over the production path for I/O/refusal guards. No production behavior, policy, default or wire change is included. The engine's physical oracle uses genuine fixed-reserve binding at allocation to attribute cached backing; an Unscoped constructor still fails. The source patch is regenerated against the pinned archive.
 
 The test-seams legacy ScanAllowance observation returns only the existing Arc identity and atomic remaining growth, without allocating, cloning a claim or changing the allowance. Independent failed-I/O/retry tests use the genuine fixed cache and production legacy scan path.
+
+## Exact read page prepayment (CDB-168)
+
+Reads without a source admission now claim their complete PageAllocation layout
+from the installed genuine fixed cache reserve before allocation and backend I/O.
+The PageBlock retains that same payment through cache publication, detached
+aliases and physical free; publication does not reserve its backing again.
+Existing source-funded reads retain their original admission and transfer path.
+An exhausted fixed reserve refuses before page allocation. No cache capacity,
+reader debit, budget counter or page layout is added.
+
+The existing admission-presence query in `src/read_admission.rs` is available in default builds as well as internal builds, so the fixed-cache preallocation path can preserve every active source-admission mode without relying on an internal-only symbol. This changes no admission-stack behavior or budget.
+
+Legacy scan growth uses a provisional claim on its existing allowance counter while cache backing is admitted before I/O. Successful reads commit that claim; failed reads restore it to the same original counter, preserving the prior successful-read-only consumption rule. The claim allocates no backing and introduces no counter or limit.
+
+| Changed source | Reason |
+|---|---|
+| `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/page_allocation.rs` | Bind a genuine fixed-cache payment to otherwise unscoped page construction before allocation and I/O. Reuse the existing capacity/eviction decision and carry one payment through publication, allocation failure, I/O failure and physical free. Source-funded and standalone unqualified reads retain their paths. Upstream proposal: prepaid cache-page construction using its existing owned reserve (not submitted). |
+| `src/read_admission.rs` | Keep the admission-presence query available in default builds and preserve the existing legacy scan allowance through provisional I/O claims. |
