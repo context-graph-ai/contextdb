@@ -622,6 +622,10 @@ fn embedded_graph_reader_scratch_rows() {
             } else {
                 &control
             };
+            // The existing observer registry is opt-in. Enable it for the
+            // actual fixture children, then stop its allocating ledger before
+            // the physical search census; the real children stay unchanged.
+            crate::vector_read_memory::watch_reader_budget_ledger_for_test();
             let parent = DeclaredReadMemory::from_reader_limit(8 * 1024 * 1024).unwrap();
             let root_baseline = parent.retained_bytes_for_test();
             let ((child, sibling), _) = crate::vector_read_memory::statement_child_proof::observe(
@@ -630,12 +634,14 @@ fn embedded_graph_reader_scratch_rows() {
                 || (parent.child().unwrap(), parent.child().unwrap()),
             );
             let observer = declared_child_observer(&child).unwrap();
+            let sibling_observer = declared_child_observer(&sibling).unwrap();
+            drop(crate::vector_read_memory::take_reader_budget_ledger_for_test());
             let standing = parent.retained_bytes_for_test();
             let distances = Arc::new(Distances(AtomicUsize::new(0)));
             let spy = Arc::new(ReaderSpy {
                 inner: crate::vector_read_memory::budget(child.clone()),
                 child: observer.clone(),
-                sibling: declared_child_observer(&sibling).unwrap(),
+                sibling: sibling_observer,
                 parent: parent.clone(),
                 graph_calls: AtomicUsize::new(0),
                 debit: AtomicUsize::new(0),
@@ -693,6 +699,20 @@ fn embedded_graph_reader_scratch_rows() {
                 let result = crate::persistence::content_identity::proof_allocation_oracle_tests::reader_requests_for_test(
                 observer.physical_funding_counter_for_test(), operation);
                 let physical = crate::persistence::content_identity::proof_allocation_oracle_tests::source_unfunded_peak_for_test();
+                let payers = crate::persistence::content_identity::proof_allocation_oracle_tests::reader_payer_receipt_for_test();
+                assert_eq!(
+                    payers.child_live, 0,
+                    "the child owns no physical blocks after search: {payers:?}"
+                );
+                assert_eq!(
+                    payers.unscoped_allocations, 0,
+                    "every page has a payer before allocation: {payers:?}"
+                );
+                let ownership = db.writer_memory_ownership_receipt_for_test();
+                assert!(
+                    ownership.persistence_cache >= payers.cache_peak.max(payers.cache_live),
+                    "the real fixed cache reserve is named by its persistence owner: {payers:?}"
+                );
                 assert_eq!(
                     physical.0, 0,
                     "actual operation allocations stay paid through physical free (file={file_backed}, mode={mode:?}): {physical:?}"

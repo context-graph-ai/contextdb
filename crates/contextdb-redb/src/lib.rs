@@ -229,3 +229,7 @@ pub use tree_store::CachePressureFixtureForTest;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub use read_admission::{PageAllocationWorkForTest, observe_page_allocations_for_test};
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod page_payer_observation;

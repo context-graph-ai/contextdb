@@ -50,6 +50,9 @@ thread_local! {
     static FUNDING_READER: std::cell::RefCell<Option<crate::vector_read_memory::DeclaredReadRoot>> = const { std::cell::RefCell::new(None) };
     static FUNDING_CENSUS: std::cell::Cell<(usize, usize, usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0, 0, 0)) };
     static READER_STANDING_FUNDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The actual PageAllocation producer supplies its payer before this one
+    // concrete allocator call. Scalar TLS neither pays nor retains the page.
+    static NEXT_PAGE_PAYMENT: std::cell::Cell<(usize, usize, u8, usize)> = const { std::cell::Cell::new((0,0,0,0)) };
     static SOURCE_COUNTER_IS_READER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SOURCE_REQUEST_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LAST_SOURCE_REQUEST_CREDIT: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0,0,0)) };
@@ -786,9 +789,83 @@ pub(crate) fn reader_requests_for_test<T>(counter: usize, action: impl FnOnce() 
     let guard = Guard;
     // Funding is sampled for every actual allocation; this path consumes no
     // request census and does not qualify the bounded request prefix.
-    let (value, _, _) = source_request_prefix_for_test(counter, action);
+    let (value, _, _) = redb::page_payer_observation::observe(observe_real_page_payer, || {
+        source_request_prefix_for_test(counter, action)
+    });
     drop(guard);
     value
+}
+// Authenticate the real fixed reserve, rather than inferring a payer from
+// cache capacity or from the fact that a block will eventually enter a cache.
+fn genuine_cache_payment(event: redb::page_payer_observation::Observation) -> bool {
+    use redb::page_payer_observation::Payer;
+    event.payer == Payer::Cache
+        && event.fixed
+        && event.reserve_identity != 0
+        && event.counter_value != 0
+        && event.occupancy >= event.bytes
+        && event.fixed_occupancy >= event.bytes
+}
+fn observe_real_page_payer(event: redb::page_payer_observation::Observation) {
+    use redb::page_payer_observation::{Payer, Phase};
+    if event.phase == Phase::BeforeAllocation {
+        let kind = if genuine_cache_payment(event) {
+            1
+        } else if matches!(event.payer, Payer::Source | Payer::SourceCounted) {
+            2
+        } else {
+            3
+        };
+        NEXT_PAGE_PAYMENT.with(|slot| {
+            slot.set((
+                event.bytes,
+                event.alignment,
+                kind,
+                if kind == 1 { event.counter_value } else { 0 },
+            ))
+        });
+    } else if event.phase == Phase::Handoff && event.pointer != 0 {
+        // The actual page is still held by this producer at the transition.
+        // The global allocator's header is outside its immutable body.
+        let header = unsafe {
+            &*((event.pointer as *const u8)
+                .sub(std::mem::size_of::<Header>())
+                .cast::<Header>())
+        };
+        let next = if genuine_cache_payment(event) {
+            event.counter_value
+        } else {
+            0
+        };
+        let previous = header.cache_funding.swap(next, AtomicOrdering::SeqCst);
+        let mut measurement = MEASUREMENT.lock().unwrap();
+        if header.window != 0 && header.window == measurement.active_window {
+            if previous == 0 && next != 0 {
+                measurement.cache_payload_live += event.bytes;
+                measurement.cache_payload_peak = measurement
+                    .cache_payload_peak
+                    .max(measurement.cache_payload_live);
+            } else if previous != 0 && next == 0 {
+                measurement.cache_payload_live -= event.bytes;
+            }
+        }
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReaderPayerReceiptForTest {
+    pub cache_live: usize,
+    pub cache_peak: usize,
+    pub child_live: usize,
+    pub unscoped_allocations: usize,
+}
+pub(crate) fn reader_payer_receipt_for_test() -> ReaderPayerReceiptForTest {
+    let measurement = MEASUREMENT.lock().unwrap();
+    ReaderPayerReceiptForTest {
+        cache_live: measurement.cache_payload_live,
+        cache_peak: measurement.cache_payload_peak,
+        child_live: measurement.payload_live - measurement.cache_payload_live,
+        unscoped_allocations: measurement.unscoped_page_allocations,
+    }
 }
 fn observed_source_funding(counter: usize) -> usize {
     if SOURCE_COUNTER_IS_READER.with(std::cell::Cell::get) {
@@ -851,10 +928,9 @@ pub(crate) fn append_source_free_for_test(requests: &[(usize, usize, usize)], co
 
         assert_ne!(request.0, 0);
         let header = unsafe {
-            (request.0 as *const u8)
+            &*((request.0 as *const u8)
                 .sub(std::mem::size_of::<Header>())
-                .cast::<Header>()
-                .read()
+                .cast::<Header>())
         };
         assert_ne!(header.window, 0);
         watch.bytes.store(request.1, AtomicOrdering::SeqCst);
@@ -925,10 +1001,9 @@ pub(crate) fn watch_native_free_for_test(requests: [(usize, usize, usize); 3], c
         // Pair address with its unique window so address reuse on a contender
         // thread cannot manufacture an extra free for a previous owner.
         let header = unsafe {
-            (requests[index].0 as *const u8)
+            &*((requests[index].0 as *const u8)
                 .sub(std::mem::size_of::<Header>())
-                .cast::<Header>()
-                .read()
+                .cast::<Header>())
         };
         watch.window.store(header.window, AtomicOrdering::SeqCst);
         watch.before.store(0, AtomicOrdering::SeqCst);
@@ -1216,6 +1291,9 @@ struct Measurement {
     live: usize,
     peak: usize,
     payload_live: usize,
+    cache_payload_live: usize,
+    cache_payload_peak: usize,
+    unscoped_page_allocations: usize,
     source_unfunded_peak: usize,
     source_unfunded_request: (usize, usize, usize, bool),
 }
@@ -1231,6 +1309,9 @@ static MEASUREMENT: Mutex<Measurement> = Mutex::new(Measurement {
     live: 0,
     peak: 0,
     payload_live: 0,
+    cache_payload_live: 0,
+    cache_payload_peak: 0,
+    unscoped_page_allocations: 0,
     source_unfunded_peak: 0,
     source_unfunded_request: (0, 0, 0, false),
 });
@@ -1244,8 +1325,21 @@ struct Header {
     declaration_epoch: usize,
     window: usize,
     bytes: usize,
+    cache_funding: AtomicUsize,
 }
 
+impl Header {
+    fn snapshot(&self) -> Self {
+        Self {
+            #[cfg(feature = "test-seams")]
+            coordination_generation: self.coordination_generation,
+            declaration_epoch: self.declaration_epoch,
+            window: self.window,
+            bytes: self.bytes,
+            cache_funding: AtomicUsize::new(self.cache_funding.load(AtomicOrdering::SeqCst)),
+        }
+    }
+}
 pub(crate) fn allocation_layout(layout: Layout) -> (Layout, usize) {
     let alignment = layout.align().max(std::mem::align_of::<Header>());
     let offset = std::mem::size_of::<Header>().next_multiple_of(alignment);
@@ -1257,6 +1351,17 @@ pub(crate) fn allocation_layout(layout: Layout) -> (Layout, usize) {
 
 unsafe impl GlobalAlloc for MeasuredAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let page_payment = NEXT_PAGE_PAYMENT
+            .try_with(|slot| slot.replace((0, 0, 0, 0)))
+            .unwrap_or((0, 0, 0, 0));
+        let page_kind = if page_payment.0 == layout.size() && page_payment.1 == layout.align() {
+            page_payment.2
+        } else if page_payment.2 != 0 {
+            3
+        } else {
+            0
+        };
+        let cache_funding = if page_kind == 1 { page_payment.3 } else { 0 };
         crate::vector_read_memory::root_observations::install_physical_observer();
         #[cfg(feature = "test-seams")]
         let coordination_allocation =
@@ -1377,6 +1482,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                     declaration_epoch,
                     window,
                     bytes: allocation.size(),
+                    cache_funding: AtomicUsize::new(cache_funding),
                 });
         }
         #[cfg(feature = "test-seams")]
@@ -1408,6 +1514,20 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 measurement.live += allocation.size();
                 measurement.peak = measurement.peak.max(measurement.live);
                 measurement.payload_live += layout.size();
+                if cache_funding != 0 {
+                    measurement.cache_payload_live += layout.size();
+                    measurement.cache_payload_peak = measurement
+                        .cache_payload_peak
+                        .max(measurement.cache_payload_live);
+                }
+                if page_kind == 3 && source_counter != 0 {
+                    measurement.unscoped_page_allocations += 1;
+                    if layout.size() > measurement.source_unfunded_peak {
+                        measurement.source_unfunded_peak = layout.size();
+                        measurement.source_unfunded_request =
+                            (layout.size(), measurement.payload_live, 0, false);
+                    }
+                }
                 if measurement.purge_active {
                     let request = (pointer as usize, layout.size(), layout.align(), offset);
                     if let Some(index) = measurement.purge_live.iter().position(|slot| slot.0 == 0)
@@ -1448,7 +1568,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 }
                 if source_counter != 0 {
                     let funded = observed_source_funding(source_counter);
-                    let gap = measurement.payload_live.saturating_sub(funded);
+                    let gap = measurement
+                        .payload_live
+                        .saturating_sub(measurement.cache_payload_live)
+                        .saturating_sub(funded);
                     if gap > measurement.source_unfunded_peak {
                         measurement.source_unfunded_peak = gap;
                         measurement.source_unfunded_request =
@@ -1467,12 +1590,8 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         let (allocation, offset) = allocation_layout(layout);
-        let header = unsafe {
-            pointer
-                .sub(std::mem::size_of::<Header>())
-                .cast::<Header>()
-                .read()
-        };
+        let header =
+            unsafe { &*(pointer.sub(std::mem::size_of::<Header>()).cast::<Header>()) }.snapshot();
         if header.window != 0 {
             let mut measurement = MEASUREMENT.lock().unwrap();
             if measurement.active_window == header.window {
@@ -1481,7 +1600,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                     .unwrap_or(0);
                 if source_counter != 0 {
                     let funded = observed_source_funding(source_counter);
-                    let gap = measurement.payload_live.saturating_sub(funded);
+                    let gap = measurement
+                        .payload_live
+                        .saturating_sub(measurement.cache_payload_live)
+                        .saturating_sub(funded);
                     if gap > measurement.source_unfunded_peak {
                         measurement.source_unfunded_peak = gap;
                         measurement.source_unfunded_request =
@@ -1504,6 +1626,9 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                     } else {
                         measurement.purge_receipt.complete = false;
                     }
+                }
+                if header.cache_funding.load(AtomicOrdering::SeqCst) != 0 {
+                    measurement.cache_payload_live -= layout.size();
                 }
                 measurement.payload_live -= layout.size();
                 measurement.live -= header.bytes;
@@ -1719,6 +1844,9 @@ pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
             measurement.live = 0;
             measurement.peak = 0;
             measurement.payload_live = 0;
+            measurement.cache_payload_live = 0;
+            measurement.cache_payload_peak = 0;
+            measurement.unscoped_page_allocations = 0;
             measurement.source_unfunded_peak = 0;
             measurement.source_unfunded_request = (0, 0, 0, false);
             Some(measurement.active_window)
@@ -5367,10 +5495,9 @@ pub(crate) fn watch_exact_frees_for_test(requests: &[(usize, usize, usize)], cou
     for (request, watch) in requests.iter().zip(NATIVE_FREE.iter()) {
         assert_ne!(request.0, 0);
         let header = unsafe {
-            (request.0 as *const u8)
+            &*((request.0 as *const u8)
                 .sub(std::mem::size_of::<Header>())
-                .cast::<Header>()
-                .read()
+                .cast::<Header>())
         };
         watch.window.store(header.window, AtomicOrdering::SeqCst);
         watch.bytes.store(request.1, AtomicOrdering::SeqCst);
@@ -5423,6 +5550,9 @@ impl SourceRequestsWindow {
                 measurement.live = 0;
                 measurement.peak = 0;
                 measurement.payload_live = 0;
+                measurement.cache_payload_live = 0;
+                measurement.cache_payload_peak = 0;
+                measurement.unscoped_page_allocations = 0;
                 measurement.source_unfunded_peak = 0;
                 measurement.source_unfunded_request = (0, 0, 0, false);
                 (measurement.active_window, true)

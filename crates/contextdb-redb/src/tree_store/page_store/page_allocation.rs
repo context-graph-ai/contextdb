@@ -206,6 +206,35 @@ pub(super) struct CachePayment {
     fixed: bool,
 }
 impl CachePayment {
+    #[cfg(feature = "test-seams")]
+    fn observe(
+        &self,
+        phase: crate::page_payer_observation::Phase,
+        pointer: usize,
+        alignment: usize,
+    ) {
+        use crate::page_payer_observation::{Observation, Payer};
+        let block = unsafe { self.counter.block.as_ref() };
+        let reserve_identity = block
+            .reserve
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |reserve| reserve.identity_for_test());
+        crate::page_payer_observation::emit(Observation {
+            phase,
+            pointer,
+            bytes: self.bytes,
+            alignment,
+            payer: Payer::Cache,
+            counter_identity: self.counter.block.as_ptr() as usize,
+            counter_value: &block.value as *const AtomicUsize as usize,
+            occupancy: block.value.load(Ordering::SeqCst),
+            fixed_occupancy: block.fixed.load(Ordering::SeqCst),
+            reserve_identity,
+            fixed: self.fixed,
+        });
+    }
     /// Caller reserves the complete Layout under the existing cache locks.
     pub(super) fn reserve(counter: &CacheCounter, bytes: usize) -> Result<(usize, Self)> {
         // Clone before changing the count; a strong-count overflow cannot
@@ -229,14 +258,14 @@ impl CachePayment {
             counter.fetch_sub(bytes, Ordering::AcqRel);
             return Err(StorageError::ValueTooLarge(bytes));
         }
-        Ok((
-            previous,
-            Self {
-                counter: owner,
-                bytes,
-                fixed: true,
-            },
-        ))
+        let payment = Self {
+            counter: owner,
+            bytes,
+            fixed: true,
+        };
+        #[cfg(feature = "test-seams")]
+        payment.observe(crate::page_payer_observation::Phase::Reserved, 0, 0);
+        Ok((previous, payment))
     }
     pub(super) fn counter_is(&self, counter: &CacheCounter) -> bool {
         self.counter.block == counter.block
@@ -256,6 +285,8 @@ impl CachePayment {
 }
 impl Drop for CachePayment {
     fn drop(&mut self) {
+        #[cfg(feature = "test-seams")]
+        self.observe(crate::page_payer_observation::Phase::BeforeRefund, 0, 0);
         if self.fixed {
             unsafe { self.counter.block.as_ref() }
                 .fixed
@@ -263,6 +294,8 @@ impl Drop for CachePayment {
         }
         self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
         self.counter.settle_after_free();
+        #[cfg(feature = "test-seams")]
+        self.observe(crate::page_payer_observation::Phase::AfterRefund, 0, 0);
     }
 }
 
@@ -281,6 +314,53 @@ enum PagePayer {
     // Legacy non-retaining admission / unscoped standalone backing remains
     // explicitly unqualified; it never masquerades as a genuine source receipt.
     Unscoped,
+}
+#[cfg(feature = "test-seams")]
+fn observe_payer(
+    payer: Option<&PagePayer>,
+    phase: crate::page_payer_observation::Phase,
+    pointer: usize,
+    layout: Layout,
+) {
+    use crate::page_payer_observation::{Observation, Payer};
+    match payer {
+        Some(PagePayer::Cache(payment)) => payment.observe(phase, pointer, layout.align()),
+        Some(PagePayer::SourceCounted { occupancy, .. }) => {
+            // SourceCounted retains the source invoice; it is never excluded
+            // from a child's physical census as a fixed-reserve payment.
+            crate::page_payer_observation::emit(Observation {
+                phase,
+                pointer,
+                bytes: layout.size(),
+                alignment: layout.align(),
+                payer: Payer::SourceCounted,
+                counter_identity: occupancy.counter.block.as_ptr() as usize,
+                counter_value: 0,
+                occupancy: occupancy.counter.load(Ordering::SeqCst),
+                fixed_occupancy: occupancy.counter.fixed_bytes(),
+                reserve_identity: 0,
+                fixed: false,
+            });
+        }
+        other => crate::page_payer_observation::emit(Observation {
+            phase,
+            pointer,
+            bytes: layout.size(),
+            alignment: layout.align(),
+            payer: match other {
+                Some(PagePayer::Source(_)) => Payer::Source,
+                Some(PagePayer::Unscoped) => Payer::Unscoped,
+                None => Payer::Missing,
+                _ => unreachable!(),
+            },
+            counter_identity: 0,
+            counter_value: 0,
+            occupancy: 0,
+            fixed_occupancy: 0,
+            reserve_identity: 0,
+            fixed: false,
+        }),
+    }
 }
 struct PageBlock {
     owners: AtomicUsize,
@@ -361,6 +441,13 @@ impl PageAllocation {
     }
 
     fn allocate(len: usize, layout: Layout, offset: usize, payer: PagePayer) -> Result<Self> {
+        #[cfg(feature = "test-seams")]
+        observe_payer(
+            Some(&payer),
+            crate::page_payer_observation::Phase::BeforeAllocation,
+            0,
+            layout,
+        );
         let Some(block) = NonNull::new(unsafe { alloc(layout) }).map(NonNull::cast::<PageBlock>)
         else {
             return Err(allocation_failed("cache page allocation", layout));
@@ -377,7 +464,19 @@ impl PageAllocation {
             });
             std::ptr::write_bytes(block.as_ptr().cast::<u8>().add(offset), 0, len);
         }
-        Ok(Self { block })
+        let page = Self { block };
+        #[cfg(feature = "test-seams")]
+        page.observe_payment(crate::page_payer_observation::Phase::Allocated);
+        Ok(page)
+    }
+    #[cfg(feature = "test-seams")]
+    pub(super) fn observe_payment(&self, phase: crate::page_payer_observation::Phase) {
+        let layout = Self::layout(self.len()).unwrap().0;
+        let payer = unsafe { self.block.as_ref() }
+            .payer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        observe_payer(payer.as_ref(), phase, self.block.as_ptr() as usize, layout);
     }
     // Snapshot the CURRENT payment under its real transition lock. This is
     // observation only: it retains no payer and changes no cache state.
@@ -507,6 +606,13 @@ impl PageAllocation {
                 previous
             }
         };
+        #[cfg(feature = "test-seams")]
+        observe_payer(
+            slot.as_ref(),
+            crate::page_payer_observation::Phase::Handoff,
+            self.block.as_ptr() as usize,
+            Self::layout(self.len()).unwrap().0,
+        );
         drop(slot);
         drop(refund);
     }
@@ -580,7 +686,21 @@ struct PageFree {
 }
 impl Drop for PageFree {
     fn drop(&mut self) {
+        #[cfg(feature = "test-seams")]
+        observe_payer(
+            self._payer.as_ref(),
+            crate::page_payer_observation::Phase::BeforeFree,
+            self.block.as_ptr() as usize,
+            self.layout,
+        );
         unsafe { dealloc(self.block.as_ptr().cast(), self.layout) };
+        #[cfg(feature = "test-seams")]
+        observe_payer(
+            self._payer.as_ref(),
+            crate::page_payer_observation::Phase::AfterFree,
+            self.block.as_ptr() as usize,
+            self.layout,
+        );
         // Only after physical free does Rust drop the actual source receipt or
         // refund occupancy and release its counter owner. Also runs on unwind.
     }

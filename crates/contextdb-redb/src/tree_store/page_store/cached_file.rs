@@ -1026,12 +1026,16 @@ impl PagedCachedFile {
             && crate::native_storage_admission::native_storage_active()
         {
             let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
+            #[cfg(feature = "test-seams")]
+            page.observe_payment(crate::page_payer_observation::Phase::BeforeIo);
             self.file
                 .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
             return Ok(page);
         }
         let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
         let mut page = PageAllocation::zeroed(len, charge)?;
+        #[cfg(feature = "test-seams")]
+        page.observe_payment(crate::page_payer_observation::Phase::BeforeIo);
         self.file
             .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
         Ok(page)
@@ -1079,6 +1083,8 @@ impl PagedCachedFile {
         buffer: PageAllocation,
         scan_replace: bool,
     ) -> Result<PageMemory> {
+        #[cfg(feature = "test-seams")]
+        buffer.observe_payment(crate::page_payer_observation::Phase::Handoff);
         // Serialize publication with read-capacity changes. Release this lock
         // before transferring an opaque source receipt or dropping displacement.
         let cache_lock = self.write_buffer.lock().unwrap();
@@ -2679,6 +2685,30 @@ pub struct CachePressureFixtureForTest {
 }
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 impl CachePressureFixtureForTest {
+    pub fn with_backend_for_test(
+        backend: Box<dyn crate::StorageBackend>,
+    ) -> std::result::Result<Self, DatabaseError> {
+        let capacity = 8 * cached_page_bytes(4096);
+        let file = PagedCachedFile::new(backend, 4096, capacity)?;
+        Ok(Self {
+            file,
+            pages: 8,
+            capacity,
+        })
+    }
+    pub fn read_one_for_test(&self, page: usize) -> Result<CachePageForTest> {
+        self.file
+            .read(page as u64 * 4096, 4096, PageHint::Clean)
+            .map(CachePageForTest)
+    }
+    pub fn read_extent_for_test(&self, pages: usize) -> Result<CachePageForTest> {
+        self.file
+            .read(4096, pages * 4096, PageHint::Clean)
+            .map(CachePageForTest)
+    }
+    pub fn invalidate_one_for_test(&self, page: usize) {
+        self.file.invalidate_cache(page as u64 * 4096, 4096);
+    }
     pub fn new() -> std::result::Result<Self, DatabaseError> {
         let backend = crate::backends::InMemoryBackend::new();
         crate::StorageBackend::set_len(&backend, 64 * 4096)?;

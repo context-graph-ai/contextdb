@@ -1200,3 +1200,7 @@ unsafe fn observe_allocation_funding(admission: NativeStorageAdmission) -> Nativ
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "coexistence_native_writer_cap_guard.rs"]
 mod coexistence_native_writer_cap_guard;
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "cache_read_payment_contract_tests.rs"]
+mod cache_read_payment_contract_tests;

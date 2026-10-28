@@ -1204,3 +1204,7 @@ writer's `zeroed_for_write` construction point.
 | Changed source | Reason |
 |---|---|
 | `src/db.rs`, `src/transactions.rs` | Remove three expectations for the unknown `clippy::assert_is_empty` lint. The existing const-constructor assertions need no exception on Rust 1.94.0; constructor behavior and the minimum supported Rust version are unchanged. |
+
+## Independent cache-page payer observations
+
+`src/page_payer_observation.rs` (added), `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs` and `src/tree_store/page_store/cached_file.rs` expose allocation-free, thread-scoped scalar observations only under `test-seams`. Events borrow the actual constructor payer, fixed-reserve receipt identity, occupancy counters, installed handoff payer and payer retained outside physical free. They never fund, retain or replace a page. The existing cache-pressure fixture gains test-only arbitrary-backend, read and invalidation drives over the production path for I/O/refusal guards. No production behavior, policy, default or wire change is included. The engine's physical oracle uses genuine fixed-reserve binding at allocation to attribute cached backing; an Unscoped constructor still fails. The source patch is regenerated against the pinned archive.

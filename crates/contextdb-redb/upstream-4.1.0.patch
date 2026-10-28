@@ -3050,7 +3050,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +161,71 @@
+@@ -106,3 +161,75 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -3122,6 +3122,10 @@
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
 +pub use read_admission::{PageAllocationWorkForTest, observe_page_allocations_for_test};
++
++#[cfg(feature = "test-seams")]
++#[doc(hidden)]
++pub mod page_payer_observation;
 --- a/src/multimap_table.rs
 +++ b/src/multimap_table.rs
 @@ -212,12 +212,12 @@
@@ -4584,6 +4588,62 @@
 +        .expect("open table for durability check");
 +    assert_eq!(table.get(0).unwrap().unwrap().value(), vec![7_u8; 512]);
 +    assert_eq!(table.get(512).unwrap().unwrap().value(), vec![9_u8; 512]);
++}
+--- /dev/null
++++ b/src/page_payer_observation.rs
+@@ -0,0 +1,53 @@
++//! Test-only scalar observations of the actual page payer; no funding or allocation.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Phase {
++    Reserved,
++    BeforeAllocation,
++    Allocated,
++    BeforeIo,
++    Handoff,
++    BeforeFree,
++    AfterFree,
++    BeforeRefund,
++    AfterRefund,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Payer {
++    Missing,
++    Unscoped,
++    Source,
++    SourceCounted,
++    Cache,
++}
++#[derive(Clone, Copy, Debug)]
++pub struct Observation {
++    pub phase: Phase,
++    pub pointer: usize,
++    pub bytes: usize,
++    pub alignment: usize,
++    pub payer: Payer,
++    pub counter_identity: usize,
++    pub counter_value: usize,
++    pub occupancy: usize,
++    pub fixed_occupancy: usize,
++    pub reserve_identity: usize,
++    pub fixed: bool,
++}
++thread_local! {
++    static OBSERVER: std::cell::Cell<Option<fn(Observation)>> = const { std::cell::Cell::new(None) };
++}
++pub fn observe<T>(observer: fn(Observation), action: impl FnOnce() -> T) -> T {
++    struct Restore(Option<fn(Observation)>);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            OBSERVER.with(|slot| slot.set(self.0));
++        }
++    }
++    let _restore = Restore(OBSERVER.with(|slot| slot.replace(Some(observer))));
++    action()
++}
++pub(crate) fn emit(observation: Observation) {
++    if let Ok(Some(observer)) = OBSERVER.try_with(std::cell::Cell::get) {
++        observer(observation);
++    }
 +}
 --- /dev/null
 +++ b/src/read_admission.rs
@@ -17908,7 +17968,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +1014,32 @@
+@@ -416,18 +1014,36 @@
          Ok(buffer)
      }
  
@@ -17931,12 +17991,16 @@
 +            && crate::native_storage_admission::native_storage_active()
 +        {
 +            let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
++            #[cfg(feature = "test-seams")]
++            page.observe_payment(crate::page_payer_observation::Phase::BeforeIo);
 +            self.file
 +                .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
 +            return Ok(page);
 +        }
 +        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
 +        let mut page = PageAllocation::zeroed(len, charge)?;
++        #[cfg(feature = "test-seams")]
++        page.observe_payment(crate::page_payer_observation::Phase::BeforeIo);
 +        self.file
 +            .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
 +        Ok(page)
@@ -17949,7 +18013,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1050,7 @@
+@@ -438,7 +1054,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17958,7 +18022,7 @@
              }
          }
  
-@@ -449,54 +1061,141 @@
+@@ -449,54 +1065,143 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17986,6 +18050,8 @@
 +        buffer: PageAllocation,
 +        scan_replace: bool,
 +    ) -> Result<PageMemory> {
++        #[cfg(feature = "test-seams")]
++        buffer.observe_payment(crate::page_payer_observation::Phase::Handoff);
 +        // Serialize publication with read-capacity changes. Release this lock
 +        // before transferring an opaque source receipt or dropping displacement.
 +        let cache_lock = self.write_buffer.lock().unwrap();
@@ -18140,7 +18206,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1206,213 @@
+@@ -507,104 +1212,213 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -18440,7 +18506,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1422,383 @@
+@@ -614,13 +1428,383 @@
  }
  
  #[cfg(test)]
@@ -18826,7 +18892,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1831,912 @@
+@@ -653,4 +1837,936 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -19679,6 +19745,30 @@
 +}
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +impl CachePressureFixtureForTest {
++    pub fn with_backend_for_test(
++        backend: Box<dyn crate::StorageBackend>,
++    ) -> std::result::Result<Self, DatabaseError> {
++        let capacity = 8 * cached_page_bytes(4096);
++        let file = PagedCachedFile::new(backend, 4096, capacity)?;
++        Ok(Self {
++            file,
++            pages: 8,
++            capacity,
++        })
++    }
++    pub fn read_one_for_test(&self, page: usize) -> Result<CachePageForTest> {
++        self.file
++            .read(page as u64 * 4096, 4096, PageHint::Clean)
++            .map(CachePageForTest)
++    }
++    pub fn read_extent_for_test(&self, pages: usize) -> Result<CachePageForTest> {
++        self.file
++            .read(4096, pages * 4096, PageHint::Clean)
++            .map(CachePageForTest)
++    }
++    pub fn invalidate_one_for_test(&self, page: usize) {
++        self.file.invalidate_cache(page as u64 * 4096, 4096);
++    }
 +    pub fn new() -> std::result::Result<Self, DatabaseError> {
 +        let backend = crate::backends::InMemoryBackend::new();
 +        crate::StorageBackend::set_len(&backend, 64 * 4096)?;
@@ -21312,7 +21402,7 @@
 +pub use cached_file::CachePressureFixtureForTest;
 --- /dev/null
 +++ b/src/tree_store/page_store/page_allocation.rs
-@@ -0,0 +1,879 @@
+@@ -0,0 +1,999 @@
 +//! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 +//! escape independently of the payer. Native copies retain their separate owner.
 +use crate::atomic_compat::AtomicUpdate as _;
@@ -21521,6 +21611,35 @@
 +    fixed: bool,
 +}
 +impl CachePayment {
++    #[cfg(feature = "test-seams")]
++    fn observe(
++        &self,
++        phase: crate::page_payer_observation::Phase,
++        pointer: usize,
++        alignment: usize,
++    ) {
++        use crate::page_payer_observation::{Observation, Payer};
++        let block = unsafe { self.counter.block.as_ref() };
++        let reserve_identity = block
++            .reserve
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .as_ref()
++            .map_or(0, |reserve| reserve.identity_for_test());
++        crate::page_payer_observation::emit(Observation {
++            phase,
++            pointer,
++            bytes: self.bytes,
++            alignment,
++            payer: Payer::Cache,
++            counter_identity: self.counter.block.as_ptr() as usize,
++            counter_value: &block.value as *const AtomicUsize as usize,
++            occupancy: block.value.load(Ordering::SeqCst),
++            fixed_occupancy: block.fixed.load(Ordering::SeqCst),
++            reserve_identity,
++            fixed: self.fixed,
++        });
++    }
 +    /// Caller reserves the complete Layout under the existing cache locks.
 +    pub(super) fn reserve(counter: &CacheCounter, bytes: usize) -> Result<(usize, Self)> {
 +        // Clone before changing the count; a strong-count overflow cannot
@@ -21544,14 +21663,14 @@
 +            counter.fetch_sub(bytes, Ordering::AcqRel);
 +            return Err(StorageError::ValueTooLarge(bytes));
 +        }
-+        Ok((
-+            previous,
-+            Self {
-+                counter: owner,
-+                bytes,
-+                fixed: true,
-+            },
-+        ))
++        let payment = Self {
++            counter: owner,
++            bytes,
++            fixed: true,
++        };
++        #[cfg(feature = "test-seams")]
++        payment.observe(crate::page_payer_observation::Phase::Reserved, 0, 0);
++        Ok((previous, payment))
 +    }
 +    pub(super) fn counter_is(&self, counter: &CacheCounter) -> bool {
 +        self.counter.block == counter.block
@@ -21571,6 +21690,8 @@
 +}
 +impl Drop for CachePayment {
 +    fn drop(&mut self) {
++        #[cfg(feature = "test-seams")]
++        self.observe(crate::page_payer_observation::Phase::BeforeRefund, 0, 0);
 +        if self.fixed {
 +            unsafe { self.counter.block.as_ref() }
 +                .fixed
@@ -21578,6 +21699,8 @@
 +        }
 +        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
 +        self.counter.settle_after_free();
++        #[cfg(feature = "test-seams")]
++        self.observe(crate::page_payer_observation::Phase::AfterRefund, 0, 0);
 +    }
 +}
 +
@@ -21596,6 +21719,53 @@
 +    // Legacy non-retaining admission / unscoped standalone backing remains
 +    // explicitly unqualified; it never masquerades as a genuine source receipt.
 +    Unscoped,
++}
++#[cfg(feature = "test-seams")]
++fn observe_payer(
++    payer: Option<&PagePayer>,
++    phase: crate::page_payer_observation::Phase,
++    pointer: usize,
++    layout: Layout,
++) {
++    use crate::page_payer_observation::{Observation, Payer};
++    match payer {
++        Some(PagePayer::Cache(payment)) => payment.observe(phase, pointer, layout.align()),
++        Some(PagePayer::SourceCounted { occupancy, .. }) => {
++            // SourceCounted retains the source invoice; it is never excluded
++            // from a child's physical census as a fixed-reserve payment.
++            crate::page_payer_observation::emit(Observation {
++                phase,
++                pointer,
++                bytes: layout.size(),
++                alignment: layout.align(),
++                payer: Payer::SourceCounted,
++                counter_identity: occupancy.counter.block.as_ptr() as usize,
++                counter_value: 0,
++                occupancy: occupancy.counter.load(Ordering::SeqCst),
++                fixed_occupancy: occupancy.counter.fixed_bytes(),
++                reserve_identity: 0,
++                fixed: false,
++            });
++        }
++        other => crate::page_payer_observation::emit(Observation {
++            phase,
++            pointer,
++            bytes: layout.size(),
++            alignment: layout.align(),
++            payer: match other {
++                Some(PagePayer::Source(_)) => Payer::Source,
++                Some(PagePayer::Unscoped) => Payer::Unscoped,
++                None => Payer::Missing,
++                _ => unreachable!(),
++            },
++            counter_identity: 0,
++            counter_value: 0,
++            occupancy: 0,
++            fixed_occupancy: 0,
++            reserve_identity: 0,
++            fixed: false,
++        }),
++    }
 +}
 +struct PageBlock {
 +    owners: AtomicUsize,
@@ -21676,6 +21846,13 @@
 +    }
 +
 +    fn allocate(len: usize, layout: Layout, offset: usize, payer: PagePayer) -> Result<Self> {
++        #[cfg(feature = "test-seams")]
++        observe_payer(
++            Some(&payer),
++            crate::page_payer_observation::Phase::BeforeAllocation,
++            0,
++            layout,
++        );
 +        let Some(block) = NonNull::new(unsafe { alloc(layout) }).map(NonNull::cast::<PageBlock>)
 +        else {
 +            return Err(allocation_failed("cache page allocation", layout));
@@ -21692,7 +21869,19 @@
 +            });
 +            std::ptr::write_bytes(block.as_ptr().cast::<u8>().add(offset), 0, len);
 +        }
-+        Ok(Self { block })
++        let page = Self { block };
++        #[cfg(feature = "test-seams")]
++        page.observe_payment(crate::page_payer_observation::Phase::Allocated);
++        Ok(page)
++    }
++    #[cfg(feature = "test-seams")]
++    pub(super) fn observe_payment(&self, phase: crate::page_payer_observation::Phase) {
++        let layout = Self::layout(self.len()).unwrap().0;
++        let payer = unsafe { self.block.as_ref() }
++            .payer
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        observe_payer(payer.as_ref(), phase, self.block.as_ptr() as usize, layout);
 +    }
 +    // Snapshot the CURRENT payment under its real transition lock. This is
 +    // observation only: it retains no payer and changes no cache state.
@@ -21822,6 +22011,13 @@
 +                previous
 +            }
 +        };
++        #[cfg(feature = "test-seams")]
++        observe_payer(
++            slot.as_ref(),
++            crate::page_payer_observation::Phase::Handoff,
++            self.block.as_ptr() as usize,
++            Self::layout(self.len()).unwrap().0,
++        );
 +        drop(slot);
 +        drop(refund);
 +    }
@@ -21895,7 +22091,21 @@
 +}
 +impl Drop for PageFree {
 +    fn drop(&mut self) {
++        #[cfg(feature = "test-seams")]
++        observe_payer(
++            self._payer.as_ref(),
++            crate::page_payer_observation::Phase::BeforeFree,
++            self.block.as_ptr() as usize,
++            self.layout,
++        );
 +        unsafe { dealloc(self.block.as_ptr().cast(), self.layout) };
++        #[cfg(feature = "test-seams")]
++        observe_payer(
++            self._payer.as_ref(),
++            crate::page_payer_observation::Phase::AfterFree,
++            self.block.as_ptr() as usize,
++            self.layout,
++        );
 +        // Only after physical free does Rust drop the actual source receipt or
 +        // refund occupancy and release its counter owner. Also runs on unwind.
 +    }
