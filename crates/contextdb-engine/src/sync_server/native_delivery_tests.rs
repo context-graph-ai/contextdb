@@ -4329,3 +4329,120 @@ async fn a_lost_custody_marker_refuses_over_iroh_with_the_typed_owner_route_refu
     within(task).await.expect("restarted hub stops");
     }
 }
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_iroh_resource_memory_refusal_encodes_without_allocating_on_its_actual_sender() {
+    use crate::persistence::content_identity::proof_allocation_oracle_tests::SourceRequestsWindow;
+    use crate::transport::iroh::REFUSAL_ENCODING_PROBE;
+    use std::sync::atomic::AtomicUsize;
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let root_bytes = crate::vector_read_memory::native_control_layouts_for_test()
+        .0
+        .size() as u64;
+    let child_bytes = crate::vector_read_memory::native_control_layouts_for_test()
+        .1
+        .size();
+    let roomy = DeclaredReadMemory::from_reader_limit(LIMIT).unwrap();
+    let tight = DeclaredReadMemory::from_reader_limit(root_bytes).unwrap();
+    let wire = DeclaredReadMemory::from_reader_limit(LIMIT).unwrap();
+    let provider = Arc::new(SwitchableProvider {
+        roomy: roomy.clone(),
+        tight: std::sync::Mutex::new(tight.clone()),
+        use_tight: AtomicBool::new(false),
+    });
+    let hub = IrohHub::start_with(
+        crate::vector_read_memory::ReadRequestProvider::native(provider.clone()),
+        None,
+    )
+    .await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let ends = Arc::new(AtomicUsize::new(0));
+    let allocations = Arc::new(AtomicUsize::new(usize::MAX));
+    let invalid = Arc::new(AtomicBool::new(false));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *REFUSAL_ENCODING_PROBE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+        }
+    }
+    let reset = Reset;
+    *REFUSAL_ENCODING_PROBE.lock().unwrap() = Some(Box::new({
+        let starts = starts.clone();
+        let ends = ends.clone();
+        let allocations = allocations.clone();
+        let invalid = invalid.clone();
+        let mut window: Option<SourceRequestsWindow> = None;
+        let mut thread = None;
+        move |begin| {
+            if begin {
+                if window.is_some() {
+                    invalid.store(true, Ordering::SeqCst);
+                    return;
+                }
+                thread = Some(std::thread::current().id());
+                window = Some(SourceRequestsWindow::begin(0));
+                starts.fetch_add(1, Ordering::SeqCst);
+            } else if let Some(observation) = window.take() {
+                if thread != Some(std::thread::current().id()) {
+                    invalid.store(true, Ordering::SeqCst);
+                }
+                let count = observation.receipt().2;
+                drop(observation);
+                allocations.store(count, Ordering::SeqCst);
+                ends.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }));
+    provider.use_tight.store(true, Ordering::SeqCst);
+    let client = crate::transport::client_transport(&crate::transport::peer_dial_spec(
+        &hub.ticket,
+        &hub.dir.path().join("encoding-guard-edge.key"),
+    ));
+    let body = crate::transport::BoundedWireBody::from_legacy_reply(vec![0], wire.child().unwrap())
+        .unwrap();
+    let refused = within(
+        client
+            .request_stream_admitted(&delivery_outcomes_subject(TENANT), body, Duration::MAX)
+            .unwrap(),
+    )
+    .await;
+    drop(reset);
+    assert!(
+        matches!(&refused,
+            Err(crate::transport::WireError::Resource(contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint
+            })) if subsystem == "reader" && operation == "request_owner"
+                && *requested_bytes == child_bytes && *available_bytes == 0 && *budget_limit_bytes == root_bytes as usize
+                && hint == "Reduce simultaneous requests or raise the declared reader memory limit."
+        ),
+        "the client receives the sender's unchanged Resource memory refusal fields: {refused:?}"
+    );
+    assert!(!invalid.load(Ordering::SeqCst));
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "the actual refusal sender was observed"
+    );
+    assert_eq!(
+        ends.load(Ordering::SeqCst),
+        1,
+        "encoding ended before either reply writer performed I/O"
+    );
+    assert_eq!(
+        allocations.load(Ordering::SeqCst),
+        0,
+        "the actual Resource dispatch/encoder allocated"
+    );
+    drop(refused);
+    provider.use_tight.store(false, Ordering::SeqCst);
+    within(client.shutdown()).await.ok();
+    drop(client);
+    hub.stop().await;
+    drop(provider);
+    roomy.assert_final_root_free_for_test();
+    tight.assert_final_root_free_for_test();
+    wire.assert_final_root_free_for_test();
+}

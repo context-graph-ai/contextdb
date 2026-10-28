@@ -4922,6 +4922,24 @@ fn native_reply_probe(event: NativeReplyEvent) {
     }
 }
 
+// The probe brackets only synchronous refusal selection/encoding. Both reply
+// writers close it before any transport operation, so a dispatch-only revert
+// remains observed through the Legacy writer as well.
+#[cfg(test)]
+type RefusalEncodingProbe = Box<dyn FnMut(bool) + Send>;
+#[cfg(test)]
+pub(crate) static REFUSAL_ENCODING_PROBE: Mutex<Option<RefusalEncodingProbe>> = Mutex::new(None);
+#[cfg(test)]
+fn refusal_encoding_probe(begin: bool) {
+    if let Some(probe) = REFUSAL_ENCODING_PROBE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_mut()
+    {
+        probe(begin);
+    }
+}
+
 /// Answer a request that ended without a success body: a typed refusal keeps
 /// its kind and details; any other failure keeps its status text.
 async fn answer_native_refusal(
@@ -4931,6 +4949,8 @@ async fn answer_native_refusal(
 ) {
     #[cfg(test)]
     super::native_pause::at(super::native_pause::Point::BeforeTerminal).await;
+    #[cfg(test)]
+    refusal_encoding_probe(true);
     // A native terminal is encoded borrowed into this fixed buffer: a typed
     // refusal keeps its kind and details, anything else answers its static
     // class. Nothing here allocates.
@@ -6324,6 +6344,8 @@ async fn write_reply(
     status: u8,
     payload: &[u8],
 ) -> TransportResult<()> {
+    #[cfg(test)]
+    refusal_encoding_probe(false);
     write_all(send, &[status]).await?;
     let len = u32::try_from(payload.len())
         .map_err(|_| TransportError::Other("reply exceeds the frame ceiling".to_string()))?;
@@ -6367,6 +6389,8 @@ async fn write_reply_native(
     status: u8,
     payload: &[u8],
 ) -> std::result::Result<(), &'static str> {
+    #[cfg(test)]
+    refusal_encoding_probe(false);
     const LOST: &str = super::terminal_class::CONNECTION_LOST;
     let len = u32::try_from(payload.len()).map_err(|_| "reply exceeds the frame ceiling")?;
     send.write_all(&[status]).await.map_err(|_| LOST)?;
