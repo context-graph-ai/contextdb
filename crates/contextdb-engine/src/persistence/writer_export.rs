@@ -81,6 +81,14 @@ impl WriterSnapshotHandle {
                         reason: "export retirement has no authenticated projection".into(),
                     });
                 }
+                if record
+                    .owned
+                    .entry
+                    .deleted_tx
+                    .is_some_and(|tx| tx > watermark)
+                {
+                    return Ok(None);
+                }
             }
             Ok(Some(bytes.to_vec()))
         })? {

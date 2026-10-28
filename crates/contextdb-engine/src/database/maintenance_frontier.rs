@@ -730,6 +730,47 @@ impl<'a> MaintenanceFrontier<'a> {
 
     #[expect(
         clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn was_retention_expired(&self, table: &str, row: &VersionedRow) -> Result<bool> {
+        let Some(root) = &self.root else {
+            return Ok(self
+                .store
+                .is_retention_expired(table, row.row_id, row.created_tx));
+        };
+        let decimal = (u64::MAX.ilog10() as usize).saturating_add(1);
+        crate::read_image_memory::reserve(
+            crate::composite_store::RETENTION_EXPIRY_PREFIX
+                .len()
+                .saturating_add(table.len())
+                .saturating_add(3 * (decimal + 1)),
+        )?;
+        let key = crate::composite_store::retention_expiry_key(table, row.row_id, row.created_tx);
+        let mut cursor = root.config_cursor(self.owner.clone(), &key)?;
+        let marked = cursor.next(|stored_key, bytes| {
+            if stored_key != key.as_bytes() {
+                return Ok(false);
+            }
+            let identity: (String, RowId, TxId, Lsn) =
+                RedbPersistence::decode_config_value_exact(bytes)?;
+            if identity.0 != table
+                || identity.1 != row.row_id
+                || identity.2 != row.created_tx
+                || row.deleted_tx.is_none()
+            {
+                return Err(Error::StoreCorrupted {
+                    path: "retention expiry".into(),
+                    reason: "expiry record does not identify the selected expired row version"
+                        .into(),
+                });
+            }
+            Ok(true)
+        })?;
+        Ok(marked.is_some_and(|window| window.value))
+    }
+
+    #[expect(
+        clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn sync_source_kind(

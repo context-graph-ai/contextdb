@@ -1499,7 +1499,7 @@ impl Database {
             DatabaseAssemblyBudget::Writer(writer_budget),
         )?;
         finalization.defer_loaded_state_owner();
-        let composite = CompositeStore::new_with_apply_phase_pause(
+        let mut composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
             vector.clone(),
@@ -1511,6 +1511,8 @@ impl Database {
             accountant.clone(),
             apply_phase_pause.clone(),
         );
+        composite.memory_row_retirements = false;
+        let retention_deferred_edge_nodes = composite.row_retirements.clone();
         let local_erasure_stages = composite.local_erasure_stages.clone();
         let received_arriving_table_meta = composite.received_arriving_table_meta.clone();
         let trigger = Arc::new(TriggerState::new());
@@ -1597,6 +1599,7 @@ impl Database {
             local_schema_stages,
             snapshot_registry,
             vector_partition_snapshot_stages,
+            retention_deferred_edge_nodes,
             Some(persistence),
             blob_repository,
             Some(registry_reservation.disarm()),
@@ -1941,6 +1944,7 @@ impl Database {
             accountant.clone(),
             apply_phase_pause.clone(),
         );
+        let retention_deferred_edge_nodes = composite.row_retirements.clone();
         let local_erasure_stages = composite.local_erasure_stages.clone();
         let received_arriving_table_meta = composite.received_arriving_table_meta.clone();
         let store: DynStore = AdmittedDynStore::prepare(composite, &accountant)?;
@@ -1988,6 +1992,7 @@ impl Database {
             local_schema_stages,
             snapshot_registry,
             vector_partition_snapshot_stages,
+            retention_deferred_edge_nodes,
             None,
             BlobRepository::absent(),
             None,
@@ -2207,6 +2212,7 @@ impl Database {
         } else {
             composite
         };
+        let retention_deferred_edge_nodes = composite.row_retirements.clone();
         let local_erasure_stages = composite.local_erasure_stages.clone();
         let received_arriving_table_meta = composite.received_arriving_table_meta.clone();
         let tx_mgr = match owned_assembly {
@@ -2254,6 +2260,7 @@ impl Database {
             local_schema_stages,
             snapshot_registry,
             vector_partition_snapshot_stages,
+            retention_deferred_edge_nodes,
             None,
             blob_repository,
             None,

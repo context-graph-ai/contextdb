@@ -672,12 +672,7 @@ impl RetainedGraphCursor {
                                 value.value(),
                             )?;
                         super::row_graph::validate(&owned)?;
-                        if RedbPersistence::row_retirement_in_read(read, &owned)? {
-                            return Err(Error::StoreCorrupted {
-                                path: "row-derived adjacency".into(),
-                                reason: "live graph witness conflicts with exact retirement".into(),
-                            });
-                        }
+                        let _retired = RedbPersistence::row_retirement_in_read(read, &owned)?;
 
                         if used != value.value().len()
                             || RedbPersistence::row_graph_key(&owned, self.reverse)? != key.value()

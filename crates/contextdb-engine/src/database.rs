@@ -4797,16 +4797,16 @@ struct VectorGenerationWorkspacePlan {
 }
 
 #[derive(Default)]
-struct RetentionDeferredEdges {
+pub(crate) struct RetentionDeferredEdges {
     nodes: HashSet<NodeId>,
-    retired: BTreeMap<String, MemoryRowRetirement>,
+    pub(crate) retired: BTreeMap<String, MemoryRowRetirement>,
     // The published carry-over owns its hash buckets until replacement/drop.
     _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
 }
 
-struct MemoryRowRetirement {
-    owned: contextdb_tx::OwnedAdjEntry,
-    memory: crate::memory_accounting::OwnedMemoryReservation,
+pub(crate) struct MemoryRowRetirement {
+    pub(crate) owned: contextdb_tx::OwnedAdjEntry,
+    pub(crate) memory: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl Drop for RetentionDeferredEdges {
     fn drop(&mut self) {
@@ -5334,6 +5334,7 @@ impl Database {
         local_schema_stages: LocalSchemaStageRegistry,
         snapshot_registry: Arc<SnapshotFloorRegistry>,
         vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
+        retention_deferred_edge_nodes: Arc<Mutex<RetentionDeferredEdges>>,
         persistence: Option<Arc<RedbPersistence>>,
         blob_repository: Arc<BlobRepository>,
         open_registry_path: Option<PathBuf>,
@@ -6163,7 +6164,7 @@ impl Database {
 
                 {
                     std::ptr::addr_of_mut!((*construction.source).retention_deferred_edge_nodes)
-                        .write(Arc::new(Mutex::new(RetentionDeferredEdges::default())));
+                        .write(retention_deferred_edge_nodes);
                     construction.initialized[98] = true;
                     #[cfg(test)]
                     r1_database_field_for_test(98);

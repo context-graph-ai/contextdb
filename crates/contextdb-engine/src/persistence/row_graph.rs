@@ -63,6 +63,7 @@ pub(crate) fn validate_retirement(record: &Retirement, expected: &OwnedAdjEntry)
     let a = &record.owned.entry;
     let b = &expected.entry;
     if record.version != 1
+        || record.owned.entry.deleted_tx.is_none()
         || record.owned.owner != expected.owner
         || a.source != b.source
         || a.target != b.target
@@ -528,6 +529,26 @@ impl RedbPersistence {
         removed_rows: &[(String, RowId, TxId, Lsn)],
         identities: &mut Vec<content_identity::ContentIdentityMutation>,
     ) -> Result<()> {
+        // Authenticate the pre-removal state while both directions still exist.
+        for owned in selected {
+            if Self::row_retirement_in_write(write, owned)? {
+                // A published retirement must identify this exact tombstone.
+                let config = write
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = retirement_key(&owned.owner)?;
+                let value = config
+                    .get(key.as_str())
+                    .map_err(Self::storage_error)?
+                    .ok_or_else(|| corruption("retirement disappeared during reclamation"))?;
+                let record = decode_retirement(value.value())?;
+                if record.owned != *owned {
+                    return Err(corruption(
+                        "reclamation does not match the retired tombstone",
+                    ));
+                }
+            }
+        }
         Self::erase_row_graph_in_write(write, selected)?;
         for owned in selected {
             if removed_rows.iter().any(|(table, row, created, lsn)| {
@@ -537,6 +558,14 @@ impl RedbPersistence {
                     && *lsn == owned.owner.lsn
             }) {
                 continue;
+            }
+            if Self::row_retirement_in_write(write, owned)? {
+                continue;
+            }
+            if owned.entry.deleted_tx.is_none() {
+                return Err(corruption(
+                    "physical retention cannot retire an unstamped row binding",
+                ));
             }
             let key = retirement_key(&owned.owner)?;
             crate::read_image_memory::reserve(owned.estimated_bytes())?;
@@ -641,6 +670,24 @@ impl RedbPersistence {
         };
         let record = decode_retirement(value.value())?;
         validate_retirement(&record, owned)?;
+        let expected = encode_row_graph(&record.owned)?;
+        let mut present = 0;
+        for (definition, reverse) in [(FORWARD, false), (REVERSE, true)] {
+            Self::verify_history_root(read, definition.name())?;
+            let physical = read.open_table(definition).map_err(Self::storage_error)?;
+            let key = Self::row_graph_key(&record.owned, reverse)?;
+            if let Some(bytes) = physical.get(key.as_slice()).map_err(Self::storage_error)? {
+                if bytes.value() != expected.as_slice() {
+                    return Err(corruption(
+                        "retirement conflicts with its exact physical tombstone",
+                    ));
+                }
+                present += 1;
+            }
+        }
+        if present == 1 {
+            return Err(corruption("retirement has only one reciprocal direction"));
+        }
         Ok(true)
     }
 

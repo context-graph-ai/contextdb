@@ -1385,6 +1385,61 @@ impl MaintenanceContext {
                         },
                         maintenance_read_memory.clone(),
                     )?;
+                    // Endpoint expiry retires the exact SQL-owned binding at
+                    // this commit, independently of later physical reclamation.
+                    writer_read::visit_graph_versions_for_nodes_with_owner(
+                        &self.graph,
+                        writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?,
+                        &expired_nodes,
+                        |entry, owner| {
+                            let Some(owner) = owner else {
+                                return Ok(());
+                            };
+                            if entry.deleted_tx.is_some()
+                                || !(expired_nodes.contains(&entry.source)
+                                    || expired_nodes.contains(&entry.target))
+                            {
+                                return Ok(());
+                            }
+                            let bytes = owner
+                                .estimated_bytes()
+                                .saturating_add(entry.estimated_bytes());
+                            workspace.borrow_mut().try_grow_for(
+                                bytes.saturating_mul(4).saturating_add(512),
+                                "retention",
+                                "prepare_logical_row_expiry",
+                                "Raise MEMORY_LIMIT to publish the exact row retirement.",
+                            )?;
+                            let owned = contextdb_tx::OwnedAdjEntry {
+                                owner: owner.clone(),
+                                entry: entry.clone(),
+                            };
+                            let image = crate::read_image_memory::ImageMemory::charging_reader(
+                                crate::memory_accounting::AccountantHandle::clone(
+                                    &self.finalization.accountant,
+                                ),
+                                maintenance_read_memory.clone(),
+                            );
+                            let (key, value) = image.scope(|| -> Result<_> {
+                                let key = crate::persistence::row_graph::retirement_key(owner)?;
+                                let mut retired = owned.clone();
+                                retired.entry.deleted_tx = Some(tx);
+                                Ok((
+                                    key,
+                                    RedbPersistence::encode_config_value(
+                                        &crate::persistence::row_graph::Retirement {
+                                            version: 1,
+                                            owned: retired,
+                                        },
+                                    )?,
+                                ))
+                            })?;
+                            ws.row_adj_deletes.push((owned, tx));
+                            ws.config_writes.push((key, value));
+                            Ok(())
+                        },
+                        maintenance_read_memory.clone(),
+                    )?;
                     Ok(())
                 })?
             },
@@ -1591,6 +1646,39 @@ impl MaintenanceContext {
                         },
                         maintenance_read_memory.clone(),
                     )?;
+                    // Endpoint expiry retires the exact SQL-owned binding at
+                    // this commit, independently of later physical reclamation.
+                    writer_read::visit_graph_versions_for_nodes_with_owner(
+                        &self.graph,
+                        writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?,
+                        &expired_nodes,
+                        |entry, owner| {
+                            let Some(owner) = owner else { return Ok(()); };
+                            if entry.deleted_tx.is_some() || !(expired_nodes.contains(&entry.source)
+                                || expired_nodes.contains(&entry.target)) { return Ok(()); }
+                            let bytes = owner.estimated_bytes().saturating_add(entry.estimated_bytes());
+                            workspace.borrow_mut().try_grow_for(bytes.saturating_mul(4).saturating_add(512),
+                                "retention", "prepare_logical_row_expiry",
+                                "Raise MEMORY_LIMIT to publish the exact row retirement.")?;
+                            let owned = contextdb_tx::OwnedAdjEntry { owner: owner.clone(), entry: entry.clone() };
+                            let image = crate::read_image_memory::ImageMemory::charging_reader(
+                                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                                maintenance_read_memory.clone());
+                            let (key, value) = image.scope(|| -> Result<_> {
+                                let key = crate::persistence::row_graph::retirement_key(owner)?;
+                                let mut retired = owned.clone();
+                                retired.entry.deleted_tx = Some(tx);
+                                Ok((key, RedbPersistence::encode_config_value(
+                                    &crate::persistence::row_graph::Retirement { version: 1, owned: retired })?))
+                            })?;
+                            self.stage_retention_aux(host, guard, bytes, ||
+                                Ok(contextdb_tx::staged_source::AuxBody::RowAdjDelete((owned, tx))))?;
+                            self.stage_retention_aux(host, guard, key.len().saturating_add(value.len()), ||
+                                Ok(contextdb_tx::staged_source::AuxBody::ConfigWrite((key, value))))?;
+                            Ok(())
+                        },
+                        maintenance_read_memory.clone(),
+                    )?;
                     Ok(())
                 }))
             },
@@ -1666,6 +1754,7 @@ impl MaintenanceContext {
             }
             contextdb_tx::staged_source::AuxBody::VectorDelete(_) => read.vector_deletes.len(),
             contextdb_tx::staged_source::AuxBody::AdjDelete(_) => read.adj_deletes.len(),
+            contextdb_tx::staged_source::AuxBody::RowAdjDelete(_) => read.row_adj_deletes.len(),
             contextdb_tx::staged_source::AuxBody::ConfigWrite(_) => read.config_writes.len(),
             _ => return Err(Error::Other("unsupported retention mutation".into())),
         };

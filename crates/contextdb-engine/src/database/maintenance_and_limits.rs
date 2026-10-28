@@ -3475,6 +3475,10 @@ impl Database {
                 let _copy = contextdb_core::read_memory::ReadCredit::try_new(read_memory.clone(),
                     entry.estimated_bytes().saturating_add(owner.estimated_bytes()),
                     "storage", "export_row_edge", "Raise MEMORY_LIMIT to export this row witness.")?;
+                let owned = contextdb_tx::OwnedAdjEntry { owner: owner.clone(), entry: entry.clone() };
+                if self.row_graph_retirement_tx(&owned, read_memory.clone())?.is_some_and(|tx| tx <= watermark) {
+                    return Ok(());
+                }
                 if let Some(edge) = export_edge_at_snapshot(entry, watermark) {
                     if edge.deleted_tx.is_none() { edge_count += 1; }
                     artifact.append_row_graph_edge(&contextdb_tx::OwnedAdjEntry { owner: owner.clone(), entry: edge })?;
@@ -3699,7 +3703,8 @@ impl Database {
                     {
                         let carry = self.retention_deferred_edge_nodes.lock();
                         for (key, record) in &carry.retired {
-                            if record.owned.owner.created_tx.0 > watermark.0 { continue; }
+                            if record.owned.owner.created_tx.0 > watermark.0
+                                || record.owned.entry.deleted_tx.is_some_and(|tx| tx > watermark) { continue; }
                             let credit = contextdb_core::read_memory::ReadCredit::try_new(
                                 read_memory.clone(), record.owned.estimated_bytes(),
                                 "storage", "export_row_retirement", "Raise MEMORY_LIMIT to export row retirements.")?;

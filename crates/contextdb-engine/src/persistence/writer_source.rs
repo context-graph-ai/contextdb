@@ -3315,12 +3315,7 @@ impl WriterReadCursor {
                 )?;
                 let owned: contextdb_tx::OwnedAdjEntry = decode_window_exact(value)?;
                 super::row_graph::validate(&owned)?;
-                if RedbPersistence::row_retirement_in_read(read.as_ref(), &owned)? {
-                    return Err(Error::StoreCorrupted {
-                        path: "row-derived adjacency".into(),
-                        reason: "live graph witness conflicts with exact retirement".into(),
-                    });
-                }
+                let _retired = RedbPersistence::row_retirement_in_read(read.as_ref(), &owned)?;
 
                 if RedbPersistence::row_graph_key(&owned, reverse)? != key {
                     return Err(Error::StoreCorrupted {

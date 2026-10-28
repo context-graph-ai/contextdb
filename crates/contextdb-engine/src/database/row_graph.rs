@@ -503,7 +503,7 @@ impl Database {
                 lsn: row.lsn,
             },
         };
-        let retired = if let Some(root) = self.writer_read_root()? {
+        let retirement_tx = if let Some(root) = self.writer_read_root()? {
             let mut cursor = root.lineage_cursor_from(
                 crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
                 &retirement_key,
@@ -514,23 +514,11 @@ impl Database {
                     if key != retirement_key.as_bytes() {
                         return Ok(None);
                     }
-                    RedbPersistence::decode_config_value_exact::<
-                        crate::persistence::row_graph::Retirement,
-                    >(bytes)
-                    .map(Some)
+                    let record = crate::persistence::row_graph::decode_retirement(bytes)?;
+                    crate::persistence::row_graph::validate_retirement(&record, &expected)?;
+                    Ok(record.owned.entry.deleted_tx)
                 })?
-                .map(|window| {
-                    window
-                        .value
-                        .as_ref()
-                        .map(|record| {
-                            crate::persistence::row_graph::validate_retirement(record, &expected)
-                        })
-                        .transpose()
-                })
-                .transpose()?
-                .flatten()
-                .is_some()
+                .and_then(|window| window.value)
         } else {
             let carry = self.retention_deferred_edge_nodes.lock();
             if let Some(stored) = carry.retired.get(&retirement_key) {
@@ -545,11 +533,14 @@ impl Database {
                     owned: stored.owned.clone(),
                 };
                 crate::persistence::row_graph::validate_retirement(&record, &expected)?;
-                true
+                record.owned.entry.deleted_tx
             } else {
-                false
+                None
             }
         };
+        let retired = retirement_tx.is_some();
+        let snapshot = self.snapshot_for_read();
+        let mut forward_seen = false;
         let root = self.graph_snapshot(self.snapshot_for_read(), read_memory)?;
         let mut callback = Some(use_witness);
         let mut result = None;
@@ -562,10 +553,11 @@ impl Database {
             },
             &owner,
             |edge| {
-                if retired {
+                forward_seen = true;
+                if retired && edge.deleted_tx != retirement_tx {
                     return Err(Error::StoreCorrupted {
                         path: "row-derived adjacency".into(),
-                        reason: "live graph witness conflicts with exact retirement".into(),
+                        reason: "graph witness differs from its exact retired tombstone".into(),
                     });
                 }
 
@@ -574,12 +566,15 @@ impl Database {
                     || edge.edge_type != *kind
                     || edge.created_tx != row.created_tx
                     || edge.lsn != row.lsn
-                    || edge.deleted_tx != row.deleted_tx
+                    || (!retired && edge.deleted_tx != row.deleted_tx)
                     || !edge.properties.is_empty()
                 {
                     return Err(Error::SyncError(
                         "row-derived graph witness disagrees with its owning row".into(),
                     ));
+                }
+                if retirement_tx.is_some_and(|tx| snapshot.0 >= tx.0) {
+                    return Ok(true);
                 }
                 let f = callback
                     .take()
@@ -589,6 +584,7 @@ impl Database {
             },
         )?;
         if retired {
+            let mut reverse_seen = false;
             self.graph_store.visit_row_edges(
                 root.as_ref(),
                 GraphQuery {
@@ -597,13 +593,31 @@ impl Database {
                     identity: Some((*source, kind)),
                 },
                 &owner,
-                |_| {
-                    Err(Error::StoreCorrupted {
-                        path: "row-derived adjacency".into(),
-                        reason: "reverse graph witness conflicts with exact retirement".into(),
-                    })
+                |edge| {
+                    if reverse_seen
+                        || edge.source != *source
+                        || edge.target != *target
+                        || edge.edge_type != *kind
+                        || edge.created_tx != row.created_tx
+                        || edge.lsn != row.lsn
+                        || edge.deleted_tx != retirement_tx
+                        || !edge.properties.is_empty()
+                    {
+                        return Err(Error::StoreCorrupted {
+                            path: "row-derived adjacency".into(),
+                            reason: "reverse graph witness differs from exact retirement".into(),
+                        });
+                    }
+                    reverse_seen = true;
+                    Ok(true)
                 },
             )?;
+            if forward_seen != reverse_seen {
+                return Err(Error::StoreCorrupted {
+                    path: "row-derived adjacency".into(),
+                    reason: "retired row binding has only one reciprocal direction".into(),
+                });
+            }
         }
         if callback.is_some() && !retired {
             return Err(Error::SyncError(
@@ -633,6 +647,57 @@ impl Database {
         let generation = self.durable_lineage_table_generation(table, read_memory.clone())?;
         self.with_row_graph_witness(table, generation, row, read_memory, |_, _| Ok(()))?;
         Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn row_graph_retirement_tx(
+        &self,
+        owned: &OwnedAdjEntry,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<Option<TxId>> {
+        let image = crate::read_image_memory::ImageMemory::charging_reader(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            read_memory.clone(),
+        );
+        let key = image.scope(|| crate::persistence::row_graph::retirement_key(&owned.owner))?;
+        if let Some(root) = self.writer_read_root()? {
+            let mut cursor = root.lineage_cursor_from(
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+                &key,
+                &key,
+            )?;
+            Ok(cursor
+                .next(|stored_key, bytes| {
+                    if stored_key != key.as_bytes() {
+                        return Ok(None);
+                    }
+                    let record = crate::persistence::row_graph::decode_retirement(bytes)?;
+                    crate::persistence::row_graph::validate_retirement(&record, owned)?;
+                    Ok(record.owned.entry.deleted_tx)
+                })?
+                .and_then(|window| window.value))
+        } else {
+            let carry = self.retention_deferred_edge_nodes.lock();
+            let Some(stored) = carry.retired.get(&key) else {
+                return Ok(None);
+            };
+            let _credit = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory,
+                stored.owned.estimated_bytes(),
+                "storage",
+                "export_retirement_lookup",
+                "Raise MEMORY_LIMIT to validate retirement controls.",
+            )?;
+            let record = crate::persistence::row_graph::Retirement {
+                version: 1,
+                owned: stored.owned.clone(),
+            };
+            crate::persistence::row_graph::validate_retirement(&record, owned)?;
+            Ok(record.owned.entry.deleted_tx)
+        }
     }
 
     #[expect(

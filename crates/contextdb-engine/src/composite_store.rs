@@ -107,6 +107,7 @@ pub(crate) struct PreparedVectorPartitionMutationBatch {
     _deferred_copy_owner: Option<contextdb_vector::VectorCopyAdmission>,
     memberships: contextdb_relational::store::PreparedMembershipBatch,
     retention_expiries: Vec<contextdb_relational::store::PreparedRetentionExpiry>,
+    row_retirements: Vec<(String, crate::database::MemoryRowRetirement)>,
     // The engine projection can outlive vector publication within apply.
     // Keep its copied inputs funded until every projection payload is gone.
     _vector_copy_owner: contextdb_vector::VectorCopyAdmission,
@@ -550,6 +551,8 @@ pub(crate) fn publish_prepared_change_log_entries(
 
 pub struct CompositeStore {
     private_working_graph: bool,
+    pub(crate) row_retirements: Arc<Mutex<crate::database::RetentionDeferredEdges>>,
+    pub(crate) memory_row_retirements: bool,
     pub(crate) local_erasure_stages: crate::database::discard::StageRegistry,
     pub(crate) received_arriving_table_meta: ReceivedArrivingTableMetaRegistry,
     pub relational: Arc<RelationalStore>,
@@ -699,6 +702,10 @@ impl CompositeStore {
     ) -> Self {
         Self {
             private_working_graph: false,
+            row_retirements: Arc::new(Mutex::new(
+                crate::database::RetentionDeferredEdges::default(),
+            )),
+            memory_row_retirements: true,
             local_erasure_stages: Arc::new(Mutex::new(HashMap::new())),
             received_arriving_table_meta: Arc::new(Mutex::new(HashMap::new())),
             relational,
@@ -1806,9 +1813,72 @@ impl CompositeStore {
         let retention_expiries = self
             .relational
             .prepare_retention_expiries(retention_identities, self.accountant.read_budget()?)?;
+        let mut row_retirements = Vec::new();
+        if self.memory_row_retirements {
+            let count = ws
+                .config_writes
+                .iter()
+                .filter(|(key, _)| key.starts_with(crate::persistence::row_graph::RETIRED_PREFIX))
+                .count();
+            insert_copy_owner.reserve_for(
+                count.saturating_mul(std::mem::size_of::<(
+                    String,
+                    crate::database::MemoryRowRetirement,
+                )>()),
+                "retention",
+                "prepare_retirement_vector",
+                "Raise MEMORY_LIMIT to prepare retirement controls.",
+            )?;
+            row_retirements.reserve_exact(count);
+            for (key, bytes) in &ws.config_writes {
+                if !key.starts_with(crate::persistence::row_graph::RETIRED_PREFIX) {
+                    continue;
+                }
+                let mut credit = crate::memory_accounting::OwnedMemoryReservation::new(
+                    self.accountant.as_handle(),
+                );
+                let node = 2
+                    * (11 * std::mem::size_of::<(String, crate::database::MemoryRowRetirement)>()
+                        + 16 * std::mem::size_of::<usize>()
+                        + crate::sync_types::held::ALLOCATION_BYTES);
+                credit.try_grow_for(
+                    bytes
+                        .len()
+                        .saturating_mul(4)
+                        .saturating_add(key.len())
+                        .saturating_add(node),
+                    "retention",
+                    "prepare_memory_retirement",
+                    "Raise MEMORY_LIMIT to retain exact retirement controls.",
+                )?;
+                let image = crate::read_image_memory::ImageMemory::charging_reader(
+                    self.accountant.as_handle(),
+                    read_memory.clone(),
+                );
+                let record =
+                    image.scope(|| crate::persistence::row_graph::decode_retirement(bytes))?;
+                let expected_key = image
+                    .scope(|| crate::persistence::row_graph::retirement_key(&record.owned.owner))?;
+                crate::persistence::row_graph::validate_retirement(&record, &record.owned)?;
+                if expected_key != *key {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "retirement key differs from its exact owner".into(),
+                    });
+                }
+                row_retirements.push((
+                    expected_key,
+                    crate::database::MemoryRowRetirement {
+                        owned: record.owned,
+                        memory: credit,
+                    },
+                ));
+            }
+        }
         Ok(PreparedVectorPartitionMutationBatch {
             memberships,
             retention_expiries,
+            row_retirements,
             commit_lsn,
             vector_source: (ws.vector_inserts.as_ptr() as usize, ws.vector_inserts.len()),
             mutations,
@@ -2047,6 +2117,17 @@ impl CompositeStore {
         );
         self.relational
             .publish_retention_expiries(partition_mutations.retention_expiries);
+        // Prepared controls and their writer invoices publish under the same commit
+        // frontier as rows and reciprocal tombstones; this phase cannot refuse.
+        {
+            let mut retired = self.row_retirements.lock();
+            for (key, value) in partition_mutations.row_retirements {
+                if let Some(old) = retired.retired.insert(key, value) {
+                    drop(old.owned);
+                    drop(old.memory);
+                }
+            }
+        }
         self.apply_phase_pause.maybe_pause();
         if let Some(source) = &working_graph {
             source.apply_private_graph(ws)?;
@@ -2601,6 +2682,17 @@ impl CompositeStore {
         );
         self.relational
             .publish_retention_expiries(partition_mutations.retention_expiries);
+        // Prepared controls and their writer invoices publish under the same commit
+        // frontier as rows and reciprocal tombstones; this phase cannot refuse.
+        {
+            let mut retired = self.row_retirements.lock();
+            for (key, value) in partition_mutations.row_retirements {
+                if let Some(old) = retired.retired.insert(key, value) {
+                    drop(old.owned);
+                    drop(old.memory);
+                }
+            }
+        }
         self.apply_phase_pause.maybe_pause();
         self.graph.apply_deletes_ref(&ws.adj_deletes);
         self.graph.apply_inserts_ref(&ws.adj_inserts);

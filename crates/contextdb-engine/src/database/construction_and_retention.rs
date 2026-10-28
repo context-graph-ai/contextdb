@@ -2755,11 +2755,12 @@ pub(super) fn prune_expired_rows(
                 "prepare_prune",
                 "Raise MEMORY_LIMIT to admit the retention reclamation workspace.",
             )?;
-            // Removing the current expired version expires this endpoint
-            // even when an older version is still owed to a reader. Keep
+            // Expiry stamps its current row before this physical pass. That
+            // exact stamped version expires this endpoint even when an older
+            // version is still owed to a reader. Keep
             // graph reclamation independent of whole-row-history cleanup;
             // the edge's own snapshot visibility below decides deferral.
-            if row.deleted_tx.is_none()
+            if (row.deleted_tx.is_none() || frontier.was_retention_expired(table_name, row)?)
                 && let Some(Value::Uuid(id)) = row.values.get("id")
             {
                 pruned_node_ids.insert(*id);
@@ -2977,6 +2978,60 @@ pub(super) fn prune_expired_rows(
             && !any_registered_snapshot_sees_edge(active_removal_pass.registered_snapshots(), entry)
     };
     let graph_root = writer_read::durable_root(tx_mgr.capture_published_read().handle)?;
+    // A carried endpoint id is only a retry key. It cannot retire a new owner
+    // life that was created after that endpoint's expiry transaction.
+    let is_expiry_tombstone = |entry: &AdjEntry,
+                               owner: &contextdb_tx::RowEdgeOwner|
+     -> Result<bool> {
+        if entry.deleted_tx.is_none() {
+            return Ok(false);
+        }
+        let image = crate::read_image_memory::ImageMemory::charging_reader(
+            crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant),
+            maintenance_read_memory.clone(),
+        );
+        image.scope(|| -> Result<bool> {
+            let key = crate::persistence::row_graph::retirement_key(owner)?;
+            if let Some(root) = &graph_root {
+                let mut cursor = root.lineage_cursor_from(
+                    crate::persistence::writer_source::SourceWindowOwner::Read(
+                        maintenance_read_memory.clone(),
+                    ),
+                    &key,
+                    &key,
+                )?;
+                Ok(cursor
+                    .next(|stored_key, bytes| {
+                        if stored_key != key.as_bytes() {
+                            return Ok(false);
+                        }
+                        let record = crate::persistence::row_graph::decode_retirement(bytes)?;
+                        if record.owned.owner != *owner || record.owned.entry != *entry {
+                            return Err(Error::StoreCorrupted {
+                                path: "row-derived adjacency".into(),
+                                reason: "retention retry does not match the exact expiry tombstone"
+                                    .into(),
+                            });
+                        }
+                        Ok(true)
+                    })?
+                    .is_some_and(|window| window.value))
+            } else {
+                let carry = ctx.retention_deferred_edge_nodes.lock();
+                let Some(record) = carry.retired.get(&key) else {
+                    return Ok(false);
+                };
+                if record.owned.owner != *owner || record.owned.entry != *entry {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "memory retention retry does not match exact expiry tombstone"
+                            .into(),
+                    });
+                }
+                Ok(true)
+            }
+        })
+    };
     let mut removed_edges = Vec::new();
     let mut removed_owned_edges = Vec::new();
     if !reclaimable_edge_nodes.is_empty() {
@@ -2985,6 +3040,11 @@ pub(super) fn prune_expired_rows(
             graph_root.clone(),
             &reclaimable_edge_nodes,
             |entry, owner| {
+                if let Some(owner) = owner {
+                    if !is_expiry_tombstone(entry, owner)? {
+                        return Ok(());
+                    }
+                }
                 if !edge_is_reclaimable(entry) {
                     return Ok(());
                 }
@@ -3063,7 +3123,12 @@ pub(super) fn prune_expired_rows(
             graph_store,
             graph_root.clone(),
             &reclaimable_edge_nodes,
-            |entry, _owner| {
+            |entry, owner| {
+                if let Some(owner) = owner {
+                    if !is_expiry_tombstone(entry, owner)? {
+                        return Ok(());
+                    }
+                }
                 if edge_is_reclaimable(entry) {
                     return Ok(());
                 }
@@ -3221,6 +3286,15 @@ pub(super) fn prune_expired_rows(
             "Raise MEMORY_LIMIT to prepare memory retirement controls.",
         )?;
         for owned in &removed_owned_edges {
+            let key = crate::persistence::row_graph::retirement_key(&owned.owner)?;
+            if ctx
+                .retention_deferred_edge_nodes
+                .lock()
+                .retired
+                .contains_key(&key)
+            {
+                continue;
+            }
             if row_keys.iter().any(|(table, row, created, lsn)| {
                 table == &owned.owner.table
                     && *row == owned.owner.row_id
@@ -3371,7 +3445,14 @@ pub(super) fn prune_expired_rows(
         let mut forward = graph_store.forward_adj.write();
         for entries in forward.values_mut() {
             entries.retain(|entry| {
-                if edge_is_reclaimable(entry) {
+                if entry.row_owner.as_ref().map_or_else(
+                    || edge_is_reclaimable(entry),
+                    |owner| {
+                        removed_owned_edges
+                            .iter()
+                            .any(|selected| selected.owner == *owner)
+                    },
+                ) {
                     released_edge_bytes =
                         released_edge_bytes.saturating_add(entry.estimated_bytes());
                     accounted_edge_bytes =
@@ -3387,7 +3468,16 @@ pub(super) fn prune_expired_rows(
     {
         let mut reverse = graph_store.reverse_adj.write();
         for entries in reverse.values_mut() {
-            entries.retain(|entry| !edge_is_reclaimable(entry));
+            entries.retain(|entry| {
+                !entry.row_owner.as_ref().map_or_else(
+                    || edge_is_reclaimable(entry),
+                    |owner| {
+                        removed_owned_edges
+                            .iter()
+                            .any(|selected| selected.owner == *owner)
+                    },
+                )
+            });
         }
         reverse.retain(|_, entries| !entries.is_empty());
     }
