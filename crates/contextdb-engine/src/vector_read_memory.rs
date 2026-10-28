@@ -3989,7 +3989,7 @@ pub(crate) fn ordinary_native_child_layout_for_test() -> std::alloc::Layout {
     ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>()
 }
 
-#[cfg(all(test, feature = "test-seams"))]
+#[cfg(test)]
 impl DeclaredReadMemory {
     pub(crate) fn ordinary_parent_counter_for_test(&self) -> usize {
         &self.retained as *const std::sync::atomic::AtomicU64 as usize

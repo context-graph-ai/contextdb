@@ -1713,6 +1713,13 @@ impl Drop for AnswerImageMode {
     }
 }
 impl QueryAnswerCharge {
+    #[cfg(test)]
+    pub(crate) fn retained_image_pointer_for_test(&self) -> usize {
+        match self {
+            Self::Image(charge) => &*charge.image.value as *const ImageMemory as usize,
+            _ => 0,
+        }
+    }
     /// The bounded kernel owns its returned capacities through its ReadCredit.
     /// Source decode scratch is released at this execution boundary.
     #[expect(
