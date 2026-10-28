@@ -965,3 +965,174 @@ fn fresh_file_forward_hides_expiry_while_reader_pins() {
 fn fresh_file_reverse_hides_expiry_while_reader_pins() {
     fresh_statement_hides_expiry_while_old_reader_is_pinned(true, false);
 }
+
+fn replay_while_old_reader_pins(use_schema_rebuild: bool) {
+    use crate::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
+    let _clock = Wallclock::test_clock_guard(|| 1_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retired-replay.db");
+    let db = writer(&path);
+    seed(&db, false, false, false);
+    let mut replay = db.changes_since(Lsn(0)).unwrap();
+    replay.rows.retain(|row| {
+        row.table == "edges"
+            && row.values.get("id") == Some(&Value::Uuid(uuid::Uuid::from_u128(EDGE)))
+    });
+    assert_eq!(
+        replay.rows.len(),
+        1,
+        "capture the original exact owner row for replay"
+    );
+    replay.ddl.clear();
+    replay.ddl_lsn.clear();
+    replay.edges.clear();
+    replay.vectors.clear();
+    let snapshot = db.snapshot();
+    let pin = db.pin_snapshot(snapshot).unwrap();
+    let persistence = db.replay_guard_persistence_for_test();
+    let image_memory = crate::read_image_memory::ImageMemory::new(None).unwrap();
+    let _scope = image_memory.enter();
+    db.execute(
+        "UPDATE retained SET expires_at = $expires WHERE id = $id",
+        &HashMap::from([
+            ("id".into(), Value::Uuid(uuid::Uuid::from_u128(EXPIRED))),
+            ("expires".into(), Value::Timestamp(-1)),
+        ]),
+    )
+    .unwrap();
+    db.run_pruning_cycle_checked().unwrap();
+    assert_eq!(
+        db.execute_at_snapshot(&graph_sql(false, "LINKS"), &params(), snapshot)
+            .unwrap()
+            .rows(),
+        nodes(&[EXPIRED, OTHER])
+    );
+    assert_eq!(
+        db.execute(&graph_sql(false, "LINKS"), &params())
+            .unwrap()
+            .rows(),
+        nodes(&[OTHER])
+    );
+    let read_controls = || {
+        persistence
+            .dump_config_raw()
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| is_retirement_key(key))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let read_owned = |reverse: bool| {
+        persistence
+            .with_db(|inner| {
+                let read = inner.begin_read().map_err(RedbPersistence::storage_error)?;
+                let table = read
+                    .open_table(if reverse {
+                        row_graph::REVERSE
+                    } else {
+                        row_graph::FORWARD
+                    })
+                    .map_err(RedbPersistence::storage_error)?;
+                let mut result = Vec::new();
+                for item in table.iter().map_err(RedbPersistence::storage_error)? {
+                    let (_, value) = item.map_err(RedbPersistence::storage_error)?;
+                    let (entry, _): (OwnedAdjEntry, usize) = bincode::serde::decode_from_slice(
+                        value.value(),
+                        bincode::config::standard(),
+                    )
+                    .unwrap();
+                    result.push(entry);
+                }
+                Ok(result)
+            })
+            .unwrap()
+    };
+    let before_control = read_controls();
+    assert_eq!(
+        before_control.len(),
+        1,
+        "expiry publishes exact retirement while pinned"
+    );
+    let forward = read_owned(false);
+    let reverse = read_owned(true);
+    let select = |entries: Vec<OwnedAdjEntry>| {
+        entries
+            .into_iter()
+            .find(|e| {
+                e.entry.source == uuid::Uuid::from_u128(SURVIVOR)
+                    && e.entry.target == uuid::Uuid::from_u128(EXPIRED)
+            })
+            .expect("pinned pair remains physically present")
+    };
+    let before = select(forward);
+    assert_eq!(
+        select(reverse),
+        before,
+        "paired tombstones match before replay"
+    );
+    assert!(
+        before.entry.deleted_tx.is_some(),
+        "the old binding is logically retired"
+    );
+    let changes = if use_schema_rebuild {
+        ChangeSet {
+            ddl: vec![DdlChange::AlterTable {
+                name: "edges".into(),
+                columns: vec![("note".into(), "TEXT".into())],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            }],
+            ddl_lsn: vec![Lsn(100_000)],
+            ..ChangeSet::default()
+        }
+    } else {
+        replay
+    };
+    db.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .expect("replay or received schema rebuild accepts the already retired exact owner");
+    assert_eq!(
+        db.execute_at_snapshot(&graph_sql(false, "LINKS"), &params(), snapshot)
+            .unwrap()
+            .rows(),
+        nodes(&[EXPIRED, OTHER]),
+        "pinned snapshot survives replay"
+    );
+    assert_eq!(
+        db.execute(&graph_sql(false, "LINKS"), &params())
+            .unwrap()
+            .rows(),
+        nodes(&[OTHER]),
+        "fresh view remains retired"
+    );
+    assert_eq!(
+        read_controls(),
+        before_control,
+        "replay preserves exact retirement control"
+    );
+    assert_eq!(
+        select(read_owned(false)),
+        before,
+        "replay preserves the forward tombstone"
+    );
+    assert_eq!(
+        select(read_owned(true)),
+        before,
+        "replay preserves the reverse tombstone"
+    );
+    drop(pin);
+    close(db);
+}
+
+#[test]
+fn replay_of_old_owner_keeps_pinned_retirement_and_paired_tombstones() {
+    replay_while_old_reader_pins(false);
+}
+
+#[test]
+fn received_schema_rebuild_keeps_pinned_retirement_and_paired_tombstones() {
+    replay_while_old_reader_pins(true);
+}

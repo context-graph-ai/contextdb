@@ -1628,3 +1628,14 @@ impl Database {
         Ok((keys, credit))
     }
 }
+
+#[cfg(test)]
+impl Database {
+    pub(crate) fn replay_guard_persistence_for_test(&self) -> Arc<RedbPersistence> {
+        Arc::clone(
+            self.persistence
+                .as_ref()
+                .expect("file-backed Legacy writer"),
+        )
+    }
+}
