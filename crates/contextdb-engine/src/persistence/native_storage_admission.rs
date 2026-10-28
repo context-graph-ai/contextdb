@@ -21,6 +21,20 @@ const SUBSYSTEM: &str = "redb";
 const OPERATION: &str = "exact_byte_read";
 const HINT: &str = "Reduce the selected read or raise its declared memory limit.";
 
+thread_local! {
+    // Keep a genuine native producer's scalar typed until its private callback
+    // returns. Public egress still uses original_storage_error exactly once.
+    static CALLBACK_NATIVE_SCALARS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn callback_storage_refusal(refusal: NativeRefusal) -> Error {
+    if CALLBACK_NATIVE_SCALARS.with(std::cell::Cell::get) {
+        Error::NativeEngineOther(refusal)
+    } else {
+        original_storage_error(NativeStorageFailure::Refused(refusal))
+    }
+}
+
 /// Native admission failures own no diagnostic bytes. Allocating body and
 /// legacy reader bootstrap errors retain their explicit unqualified route.
 #[derive(Debug)]
@@ -717,10 +731,17 @@ impl StorageAdmissionScope {
         operation: impl FnOnce() -> Result<R>,
     ) -> std::result::Result<R, NativeStorageFailure> {
         let (result, original) = self.run_scoped(false, operation);
-        if let Some(original) = original {
-            return Err(original);
+        match result {
+            Err(Error::NativeEngineOther(NativeRefusal::AllocatorFailed { site, layout })) => {
+                Err(NativeStorageFailure::AllocatorFailed { site, layout })
+            }
+            Err(Error::NativeEngineOther(refusal)) => Err(NativeStorageFailure::Refused(refusal)),
+            Err(error) => Err(NativeStorageFailure::Unqualified(error)),
+            Ok(value) => match original {
+                Some(original) => Err(original),
+                None => Ok(value),
+            },
         }
-        result.map_err(NativeStorageFailure::Unqualified)
     }
     fn run_scoped<R, E>(
         &self,
@@ -739,7 +760,15 @@ impl StorageAdmissionScope {
                 .with_failure_inspector(inspect_scope_failure),
             )
         };
+        struct CallbackMode(bool);
+        impl Drop for CallbackMode {
+            fn drop(&mut self) {
+                CALLBACK_NATIVE_SCALARS.with(|slot| slot.set(self.0));
+            }
+        }
+        let mode = CallbackMode(CALLBACK_NATIVE_SCALARS.with(|slot| slot.replace(!retain_refusal)));
         let result = redb::with_native_storage_admission(admission, operation);
+        drop(mode);
         let scope = &unsafe { self.pointer.as_ref() }.payload;
         let mut failure = scope.failure.lock().unwrap_or_else(|e| e.into_inner());
         let original = failure.original.take();
@@ -1200,3 +1229,7 @@ unsafe fn observe_allocation_funding(admission: NativeStorageAdmission) -> Nativ
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "coexistence_native_writer_cap_guard.rs"]
 mod coexistence_native_writer_cap_guard;
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "native_scope_precedence_tests.rs"]
+mod native_scope_precedence_tests;

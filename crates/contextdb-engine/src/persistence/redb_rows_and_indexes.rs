@@ -6912,9 +6912,7 @@ impl RedbPersistence {
         }
         // Native markers lend only their prepaid scalar diagnosis here.
         if let Some(refusal) = Self::scalar_storage_refusal(&err) {
-            return native_storage_admission::original_storage_error(
-                native_storage_admission::NativeStorageFailure::Refused(refusal),
-            );
+            return native_storage_admission::callback_storage_refusal(refusal);
         }
         if let redb::Error::AdmissionRefused(error) = err {
             return match error.downcast::<Error>() {
