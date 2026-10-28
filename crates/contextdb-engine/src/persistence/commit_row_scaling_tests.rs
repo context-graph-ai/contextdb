@@ -422,14 +422,18 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
             held >= 2 * HELD_TABLES * 200,
             "holding a relation per written table is admitted to the writer budget: {held} bytes charged as {HOLD_RELATIONS}"
         );
-        let mut high = 0;
+        let mut peak_before = 0;
+        let mut seen_hold = false;
         let mut tight = None;
         for entry in ledger {
-            if entry.what == HOLD_RELATIONS && entry.used_after > high {
-                tight = Some(entry.used_after - 1);
-                break;
+            if entry.what == HOLD_RELATIONS {
+                seen_hold = true;
+                if tight.is_none() && entry.used_after > peak_before {
+                    tight = Some(entry.used_after - 1);
+                }
+            } else if !seen_hold {
+                peak_before = peak_before.max(entry.used_after);
             }
-            high = high.max(entry.used_after);
         }
         let tight = tight.expect("some relation charge raises the commit's peak");
         let held_requests: Vec<usize> = ledger
@@ -450,6 +454,8 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
     db.commit(tx).expect("an ample limit commits every table");
     let ledger = take_budget_ledger_for_test();
     let (mut tight, mut held_requests, mut pending_requests) = derive_tight_from_ledger(&ledger);
+    let hold_admission_count = held_requests.len();
+    eprintln!("MANY_TABLE_HOLD count={hold_admission_count}");
     db.close().expect("close the measured store");
 
     // Re-measure successful commits under their actual smaller dirty-buffer
@@ -464,6 +470,12 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
         match outcome {
             Ok(()) => {
                 let (next_tight, next_held, next_pending) = derive_tight_from_ledger(&ledger);
+                assert_eq!(
+                    next_held.len(),
+                    hold_admission_count,
+                    "every completed step charges the same held relations"
+                );
+                eprintln!("MANY_TABLE_HOLD step={step} count={}", next_held.len());
                 assert!(
                     next_tight < tight,
                     "successful fixed-point step must lower the derived limit: {tight} -> {next_tight}"
