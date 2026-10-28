@@ -974,3 +974,72 @@ fn process_death_releases_the_registration_lock_and_writer_reaps_the_record() {
         }
     }
 }
+
+#[test]
+fn lowered_disk_limit_bounds_its_own_metadata_and_preserves_failed_setting() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("atomic-disk-limit.redb");
+    seed_page_fixture(&path);
+    let reader = ReadSession::open_with_clock_for_test(
+        &path,
+        Default::default(),
+        Arc::new(contextdb_engine::local_transport::ManualDeadlineClock::at(0)),
+    )
+    .unwrap();
+    let writer = Database::open(&path).unwrap();
+    let high = u64::MAX / 2;
+    writer.set_disk_limit(Some(high)).unwrap();
+    let mut refused = false;
+    for _ in 0..128 {
+        let before = std::fs::metadata(&path).unwrap().len();
+        match writer.set_disk_limit(Some(before)) {
+            Ok(()) => {
+                let after = std::fs::metadata(&path).unwrap().len();
+                assert!(
+                    after <= before,
+                    "metadata write crossed the new ceiling: before={before}, after={after}"
+                );
+                assert_eq!(writer.disk_limit(), Some(before));
+                let result = writer.execute(
+                    "INSERT INTO page_items VALUES (10000, $value)",
+                    &HashMap::from([(
+                        "value".into(),
+                        contextdb_core::Value::Text("x".repeat(1024 * 1024)),
+                    )]),
+                );
+                assert!(
+                    result.is_err(),
+                    "the next growing write must obey the new ceiling"
+                );
+                assert!(std::fs::metadata(&path).unwrap().len() <= before);
+                writer.set_disk_limit(Some(high)).unwrap();
+            }
+            Err(_) => {
+                assert_eq!(
+                    writer.disk_limit(),
+                    Some(high),
+                    "refusal must preserve the previous limit"
+                );
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().len(),
+                    before,
+                    "refusal must not grow the file"
+                );
+                writer
+                    .execute(
+                        "INSERT INTO page_items VALUES (10001, 'after-refusal')",
+                        &HashMap::new(),
+                    )
+                    .expect("old ceiling remains usable after refusal");
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        refused,
+        "retained snapshots must eventually force the setting metadata to grow"
+    );
+    drop(reader);
+    writer.close().unwrap();
+}
