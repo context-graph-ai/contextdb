@@ -833,6 +833,23 @@ impl RedbPersistence {
 
 #[cfg(feature = "test-seams")]
 impl RedbPersistence {
+    /// Authenticate the real captured writer root, then borrow its read under
+    /// the caller's genuine reader admission for physical extent guards.
+    pub(crate) fn with_native_ivf_fixture_reader_for_test<T>(
+        &self,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+        run: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
+    ) -> Result<T> {
+        self.with_native_ivf_fixture_read_for_test(|read| {
+            use super::super::native_storage_admission::{
+                StorageAdmissionScope, original_storage_error,
+            };
+            let admission =
+                StorageAdmissionScope::reader_operation(memory).map_err(original_storage_error)?;
+            admission.run_original_unqualified(|| run(read))
+        })
+    }
+
     /// Borrow an authenticated captured transaction under this writer's genuine
     /// native admission. The caller uses the ordinary byte/cursor read APIs.
     pub(crate) fn with_native_ivf_fixture_read_for_test<T>(

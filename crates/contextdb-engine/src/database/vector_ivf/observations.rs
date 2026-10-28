@@ -739,6 +739,23 @@ impl Database {
         })
     }
 
+    /// Authenticate a registered writer snapshot, then borrow the same read
+    /// using the caller's reader memory for independent extent/refusal guards.
+    #[doc(hidden)]
+    pub fn with_native_ivf_fixture_reader_for_test<T>(
+        &self,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+        run: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
+    ) -> Result<T> {
+        let _operation = self.assert_open_operation();
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("native fixture read requires a file-backed writer".into())
+            })?
+            .with_native_ivf_fixture_reader_for_test(memory, run)
+    }
+
     /// Borrow a real registered writer snapshot and its original native
     /// admission for independent physical read and custody guards.
     #[doc(hidden)]
