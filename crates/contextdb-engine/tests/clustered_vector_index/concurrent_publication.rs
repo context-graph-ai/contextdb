@@ -23,14 +23,17 @@ fn insert(db: &Database, id: i64, vector_id: u64) {
     .unwrap();
 }
 fn ids(db: &Database, snapshot: SnapshotId) -> Vec<i64> {
-    let result = db
-        .execute_at_snapshot(
-            "SELECT id FROM items ORDER BY embedding <=> $v USE VECTOR INDEXED LIMIT 1",
-            &params([("v", Value::Vector(unit_vector(7, DIM)))]),
-            snapshot,
-        )
-        .unwrap();
-    int_ids(&result)
+    let result = db.execute_at_snapshot(
+        "SELECT id FROM items ORDER BY embedding <=> $v USE VECTOR INDEXED LIMIT 1",
+        &params([("v", Value::Vector(unit_vector(7, DIM)))]),
+        snapshot,
+    );
+    assert!(
+        result.is_ok(),
+        "a pinned or current snapshot must remain searchable on the indexed route: {:?}",
+        result.as_ref().err()
+    );
+    int_ids(&result.unwrap())
 }
 
 fn complete_rows(db: &Database, snapshot: SnapshotId) -> Result<Vec<i64>, String> {
@@ -100,13 +103,15 @@ fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers()
         .expect("native pre-publication event was never delivered");
     let (attempt_tx, attempt_rx) = mpsc::channel();
     let second_db = db.clone();
+    let (done_tx, done_rx) = mpsc::channel();
     let second_worker = std::thread::spawn(move || {
-        Database::observe_maintenance_pruning_mutex_for_test(
+        let result = Database::observe_maintenance_pruning_mutex_for_test(
             Arc::new(move |event| {
                 attempt_tx.send(event).unwrap();
             }),
             || second_db.run_maintenance_cycle(),
-        )
+        );
+        done_tx.send(result).unwrap();
     });
     let event = attempt_rx.recv_timeout(WATCHDOG);
     let (answers_tx, answers_rx) = mpsc::channel();
@@ -120,9 +125,14 @@ fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers()
             .unwrap();
     });
     let during = answers_rx.recv_timeout(WATCHDOG);
+    let second_pending = matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
     release_tx.send(()).unwrap();
     first_worker.join().unwrap();
-    let second_result = second_worker.join().unwrap().unwrap();
+    second_worker.join().unwrap();
+    let second_result = done_rx
+        .recv_timeout(WATCHDOG)
+        .expect("second maintenance result was never delivered")
+        .unwrap();
     reader.join().unwrap();
     let (during_old, during_new) =
         during.expect("complete reader answers during publication were never delivered");
@@ -157,6 +167,10 @@ fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers()
         "the second maintenance call must reach the held, real pruning mutex"
     );
     assert!(
+        second_pending,
+        "second maintenance must remain incomplete until the first publication is released"
+    );
+    assert!(
         second_result.vector.first_failure.is_none(),
         "second maintenance refused: {second_result:?}"
     );
@@ -186,8 +200,12 @@ fn a_paused_native_reader_keeps_its_answer_while_vector_writes_commit() {
     drive_until_serving(&db, 40, 1, 10);
     let old = db.snapshot();
     let pin = db.pin_snapshot(old).unwrap();
+    println!("READER_STAGE: before writer commit");
     let expected = ids(&db, old);
     assert_eq!(expected, vec![7]);
+    let old_expected: Vec<i64> = (0..40).collect();
+    let current_expected: Vec<i64> = (0..40).filter(|id| *id != 7).chain([1000]).collect();
+    assert_eq!(complete_rows(&db, old), Ok(old_expected.clone()));
     let (reached_tx, reached_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
@@ -216,7 +234,20 @@ fn a_paused_native_reader_keeps_its_answer_while_vector_writes_commit() {
     insert(&db, 1000, 7);
     release_tx.send(()).unwrap();
     assert_eq!(worker.join().unwrap(), expected);
+    println!("READER_STAGE: pinned answer after writer commit");
     assert_eq!(ids(&db, old), expected);
-    assert_eq!(ids(&db, db.snapshot()), vec![1000]);
+    assert_eq!(
+        complete_rows(&db, old),
+        Ok(old_expected),
+        "the pinned reader sees every original row exactly once"
+    );
+    println!("READER_STAGE: current answer after writer commit");
+    let current = db.snapshot();
+    assert_eq!(ids(&db, current), vec![1000]);
+    assert_eq!(
+        complete_rows(&db, current),
+        Ok(current_expected),
+        "the current reader sees every committed row exactly once"
+    );
     drop(pin);
 }
