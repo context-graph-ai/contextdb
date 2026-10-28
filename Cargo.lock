@@ -734,6 +734,7 @@ dependencies = [
  "contextdb-engine",
  "contextdb-parser",
  "contextdb-server",
+ "libc",
  "rustyline",
  "serde",
  "serde_json",

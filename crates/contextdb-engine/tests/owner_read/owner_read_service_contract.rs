@@ -39,24 +39,18 @@ const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn wait_bounded<'a, T, F>(
     changed: &Condvar,
-    mut guard: std::sync::MutexGuard<'a, T>,
+    guard: std::sync::MutexGuard<'a, T>,
     name: &str,
     mut satisfied: F,
 ) -> std::sync::MutexGuard<'a, T>
 where
     F: FnMut(&T) -> bool,
 {
-    let deadline = std::time::Instant::now() + WAIT_BOUND;
-    while !satisfied(&guard) {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            panic!("{name} did not complete within {WAIT_BOUND:?}");
-        }
-        let (next_guard, timed_out) = changed.wait_timeout(guard, remaining).expect(name);
-        guard = next_guard;
-        if timed_out.timed_out() && !satisfied(&guard) {
-            panic!("{name} did not complete within {WAIT_BOUND:?}");
-        }
+    let (guard, timed_out) = changed
+        .wait_timeout_while(guard, WAIT_BOUND, |state| !satisfied(state))
+        .expect(name);
+    if timed_out.timed_out() && !satisfied(&guard) {
+        panic!("{name} never delivered");
     }
     guard
 }
@@ -202,6 +196,16 @@ impl OwnerRequestHandler for GatedHandler {
         request: &[u8],
         cancellation: &OwnerReadCancellation,
     ) -> Result<Vec<u8>> {
+        let _cancellation_listener = if namespace == "proof.hold" {
+            let shared = self.state.clone();
+            Some(cancellation.tell_on_cancel(move || {
+                let (lock, changed) = &*shared;
+                let _state = lock.lock().expect("custom handler state");
+                changed.notify_all();
+            }))
+        } else {
+            None
+        };
         let (lock, changed) = &*self.state;
         let mut state = lock.lock().expect("custom handler state");
         state.invocations += 1;
@@ -217,25 +221,19 @@ impl OwnerRequestHandler for GatedHandler {
             state.entered += 1;
             changed.notify_all();
             let mut reported_cancellation = false;
-            let release_deadline = std::time::Instant::now() + WAIT_BOUND;
-            while !state.released {
-                if cancellation.is_cancelled() && !reported_cancellation {
-                    state.cancellation_observed += 1;
-                    reported_cancellation = true;
-                    changed.notify_all();
-                }
-                let remaining =
-                    release_deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    panic!("custom handler release wait did not complete within {WAIT_BOUND:?}");
-                }
-                let (next_state, timed_out) = changed
-                    .wait_timeout(state, remaining)
-                    .expect("custom handler release wait");
-                state = next_state;
-                if timed_out.timed_out() && !state.released {
-                    panic!("custom handler release wait did not complete within {WAIT_BOUND:?}");
-                }
+            let (next_state, timed_out) = changed
+                .wait_timeout_while(state, WAIT_BOUND, |state| {
+                    if cancellation.is_cancelled() && !reported_cancellation {
+                        state.cancellation_observed += 1;
+                        reported_cancellation = true;
+                        changed.notify_all();
+                    }
+                    !state.released
+                })
+                .expect("custom handler release wait");
+            state = next_state;
+            if timed_out.timed_out() && !state.released {
+                panic!("custom handler release never delivered");
             }
             if cancellation.is_cancelled() && !reported_cancellation {
                 state.cancellation_observed += 1;
