@@ -62,6 +62,7 @@ pub(crate) struct ReadPublicationScope {
     pub(crate) inspection: bool,
     pub(crate) budget: ReadPublicationBudget,
     pub(crate) read_memory: Option<contextdb_core::read_memory::ReadMemoryOwner>,
+    pub(crate) publication_funding: Option<bounded::PublicationFunding>,
 }
 
 #[derive(Clone)]
@@ -207,6 +208,7 @@ impl ReadPublicationScope {
             tables,
             inspection: false,
             read_memory: None,
+            publication_funding: None,
             budget: ReadPublicationBudget {
                 clock,
                 cancellation,
@@ -220,6 +222,9 @@ impl ReadPublicationScope {
         let mut refreshed = self.clone();
         refreshed.budget.started_ms = refreshed.budget.clock.now_ms();
         refreshed.budget.cancellation = cancellation;
+        if let Some(funding) = &refreshed.publication_funding {
+            funding.refresh(refreshed.budget.clone());
+        }
         refreshed
     }
 }

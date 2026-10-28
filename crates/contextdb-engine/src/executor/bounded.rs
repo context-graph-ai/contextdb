@@ -27,8 +27,11 @@ mod vector_search_receipt;
 
 mod control_memory;
 mod grouped_count;
+mod publication_funding;
 pub(crate) use control_memory::NativeTraceRefund;
 use control_memory::{ControlArc, ControlWeak, NativeKernelBudget, QueryVectorDecode};
+pub(crate) use publication_funding::PublicationFunding;
+use publication_funding::RequestFunding;
 
 #[cfg(all(test, feature = "test-seams"))]
 pub(crate) fn ordinary_native_control_layouts_for_test() -> [std::alloc::Layout; 3] {
@@ -316,7 +319,6 @@ struct RequestState {
     group_publication_generation: u64,
     /// Next private descriptor ordinal; retained inline with the request.
     next_group_descriptor: u64,
-    memory: ReadCredit,
     membership_bytes: usize,
     // What the answer being assembled holds right now, and how much work had
     // been done when its progress was last reported. These describe the
@@ -332,6 +334,8 @@ struct RequestState {
     // underflowing the live charge, so that fault is parked here and raised
     // by the next boundary check instead of being dropped.
     release_fault: Option<BoundedExecutionError>,
+    // Last: every state allocation is physically freed before this invoice.
+    memory: ReadCredit,
 }
 
 /// Whether the read this context governs can hand an operator back its own
@@ -584,7 +588,6 @@ struct RequestContext {
     /// answers `None` and the read silently drops to committed state.
     transaction: Option<TxId>,
     clock: Arc<dyn DeadlineClock>,
-    state: Mutex<RequestState>,
     /// Storage pages this read was admitted to hold that are still alive
     /// outside the store's page cache. Each such page carries its own charge
     /// (`SourcePageCharge`) and gives these bytes back when its last holder
@@ -600,6 +603,9 @@ struct RequestContext {
     index_ranges: crate::executor::IndexRangeMemo,
     #[cfg(any(test, feature = "test-seams"))]
     probe: Mutex<Option<Arc<dyn BoundedExecutionProbe>>>,
+    request_funding: Option<RequestFunding>,
+    // Last: its aggregate credit outlives every kernel allocation above.
+    state: Mutex<RequestState>,
 }
 
 /// The charge one storage page carries for as long as it lives outside the
@@ -961,6 +967,15 @@ impl RequestContext {
         if u64::try_from(fixed_control_bytes).unwrap_or(u64::MAX) > limits.memory {
             return Err(Self::limit_failure(ReadFailureLimit::Memory, limits.memory));
         }
+        let native_budget_control = reader_budget.control_invoice();
+        let request_funding = if matches!(&cancellation, RequestCancellation::Legacy(_)) {
+            Some(RequestFunding::new(reader_budget.clone(), limits.memory)?)
+        } else {
+            None
+        };
+        let reader_budget = request_funding
+            .as_ref()
+            .map_or(reader_budget, RequestFunding::owner);
         let funding_owner = native_operation
             .as_ref()
             .map(|operation| operation.owner())
@@ -975,7 +990,6 @@ impl RequestContext {
             )?;
         let request_invoice = ControlArc::<Self>::admit_owned(funding_owner.clone())?;
         let ledger = ReadCredit::from_prepaid_owned(funding_owner, 0);
-        let native_budget_control = reader_budget.control_invoice();
         let live_source_pages =
             ControlArc::from_prepaid(std::sync::atomic::AtomicUsize::new(0), counter_invoice);
         let context = ControlArc::cyclic_from_prepaid(request_invoice, |context| {
@@ -990,6 +1004,7 @@ impl RequestContext {
             );
             Self {
                 fixed_control_bytes,
+                request_funding,
                 native_operation,
                 vector_decode_budget: vector_decode_budget.clone(),
                 index_ranges: Default::default(),
@@ -2692,6 +2707,9 @@ impl RequestContext {
     /// plus the storage pages it read that are still alive outside the page
     /// cache.
     fn held_memory_bytes(&self, state: &RequestState) -> usize {
+        if let Some(funding) = &self.request_funding {
+            return funding.held();
+        }
         state
             .memory
             .bytes()
@@ -22840,7 +22858,16 @@ impl ControlArc<RequestContext> {
         );
         drop(state);
         scope.inspection = inspection;
-        scope.read_memory = Some(self.source_read_memory(BoundedWorkSource::AccessControl)?);
+        self.check_final_boundary()?;
+        let funding = PublicationFunding::new(
+            self.request_funding
+                .as_ref()
+                .expect("Legacy request funding")
+                .clone(),
+            scope.budget.clone(),
+        )?;
+        scope.read_memory = Some(funding.owner());
+        scope.publication_funding = Some(funding);
         Ok(scope)
     }
 }
