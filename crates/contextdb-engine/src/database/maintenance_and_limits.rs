@@ -7367,27 +7367,20 @@ impl Database {
 
         if let Some(persistence) = &self.persistence {
             let previous = self.disk_limit();
-            let raises_limit = match (previous, limit) {
-                (_, None) => true,
-                (Some(previous), Some(next)) => next > previous,
-                (None, Some(_)) => false,
-            };
-            if raises_limit {
+            self.publish_direct_metadata(|| {
+                // The metadata write itself must obey the requested ceiling,
+                // including a write deferred into an enclosing publication.
                 persistence.set_disk_limit(limit)?;
-            }
-            let persisted = self.publish_direct_metadata(|| match limit {
-                Some(limit) => persistence.flush_config_value("disk_limit", &limit),
-                None => persistence.remove_config_value("disk_limit"),
-            });
-            if let Err(error) = persisted {
-                if raises_limit {
+                let persisted = match limit {
+                    Some(limit) => persistence.flush_config_value("disk_limit", &limit),
+                    None => persistence.remove_config_value("disk_limit"),
+                };
+                if let Err(error) = persisted {
                     persistence.set_disk_limit(previous)?;
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            if !raises_limit {
-                persistence.set_disk_limit(limit)?;
-            }
+                Ok(())
+            })?;
         }
         self.disk_limit.store(limit.unwrap_or(0), Ordering::SeqCst);
         Ok(())
