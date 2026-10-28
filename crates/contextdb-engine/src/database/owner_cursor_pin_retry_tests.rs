@@ -177,7 +177,6 @@ enum RegistryWaitOutcome {
 #[derive(Clone, Copy)]
 enum RegistryWaitPhase {
     Registration,
-    ProviderScan,
     FirstRoot,
     SecondRoot,
 }
@@ -273,12 +272,6 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         db.snapshot_registry.owner_cursor_busy_test_pause.clone(),
     );
     let (finished, completed) = std::sync::mpsc::sync_channel(1);
-    let scan_pause = matches!(phase, RegistryWaitPhase::ProviderScan).then(|| {
-        crate::persistence::read_persistence_test_scaffold::pause_reader_snapshot_registry_scan_for_test(
-            &path,
-        )
-        .unwrap()
-    });
     let start_reader = || {
         std::thread::spawn(move || {
             let result = executor.block_on(client.request_watching(
@@ -295,12 +288,6 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
             finished.send(result).unwrap();
         })
     };
-    let mut start_reader = Some(start_reader);
-    let scan_reader = scan_pause.as_ref().map(|scan| {
-        let reader = start_reader.take().unwrap()();
-        scan.wait_until_inspected_for_test();
-        reader
-    });
     let persistence = db.persistence.as_ref().unwrap();
     let registry_paths = persistence.owner_cursor_registry_paths_for_test();
     let root_index = match phase {
@@ -329,13 +316,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         root
     });
     let wait_while_contended = || {
-        let reader = match scan_reader {
-            Some(reader) => {
-                scan_pause.as_ref().unwrap().resume_for_test();
-                reader
-            }
-            None => start_reader.take().unwrap()(),
-        };
+        let reader = start_reader();
         assert!(
             pause.wait_until_reached(Duration::from_secs(30)),
             "the actual owner request meets the held registry"
@@ -391,9 +372,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
     if matches!(outcome, RegistryWaitOutcome::Released) {
         let expected_first = if matches!(
             phase,
-            RegistryWaitPhase::ProviderScan
-                | RegistryWaitPhase::FirstRoot
-                | RegistryWaitPhase::SecondRoot
+            RegistryWaitPhase::FirstRoot | RegistryWaitPhase::SecondRoot
         ) {
             // The failed scan releases every pin and the commit boundary.
             // Retry must capture the whole root after this intervening commit.
@@ -421,9 +400,6 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         assert!(page.has_more);
     }
     reader.join().unwrap();
-    if let Some(scan) = scan_pause {
-        scan.finish_for_test();
-    }
     db.close().unwrap();
     if root_index.is_some() {
         let inventory = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -482,28 +458,19 @@ fn owner_channel_cursor_registry_contention_obeys_cancellation() {
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_retries_registry_scan_contention_until_release() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Released,
-        RegistryWaitPhase::FirstRoot,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Released, RegistryWaitPhase::FirstRoot);
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_registry_scan_contention_obeys_active_deadline() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Deadline,
-        RegistryWaitPhase::FirstRoot,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Deadline, RegistryWaitPhase::FirstRoot);
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_registry_scan_contention_obeys_cancellation() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Cancelled,
-        RegistryWaitPhase::FirstRoot,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Cancelled, RegistryWaitPhase::FirstRoot);
 }
 
 #[test]
