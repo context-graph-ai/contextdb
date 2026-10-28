@@ -1,3 +1,5 @@
+## close1-accounting (297f6454)
+
 Read-only bounded byte cursors admit branch-navigation backing before growing
 their Vec, using the same original read-admission source as authenticated cursors.
 The replacement invoice is admitted before reserve_exact, retained alongside the
