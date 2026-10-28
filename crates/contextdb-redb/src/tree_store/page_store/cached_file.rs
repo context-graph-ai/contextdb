@@ -306,9 +306,7 @@ impl CheckedBackend {
             };
         #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
         let result = self.file.read(offset, out);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
-        } else {
+        if result.is_ok() {
             crate::read_admission::record_backend_read(out.len());
         }
         #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
@@ -1657,7 +1655,6 @@ impl PagedCachedFile {
                 .read_cause(offset, output)
                 .map_err(|error| error.into_native());
             if let Err(error) = result {
-                self.file.io_failed.store(true, Ordering::Release);
                 #[cfg(feature = "test-seams")]
                 observation.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt });
                 #[cfg(feature = "test-seams")]

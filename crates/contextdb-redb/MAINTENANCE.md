@@ -4,7 +4,8 @@ The `test-seams` cold-read observation also borrows the actual admitted native
 backing at `read_direct_into_page` and at the cached-none fallthrough of
 `read_native_prepared`. Both call the same checked-backend read implementation
 as ordinary reads. The borrowed injector supplies a failure inside its existing
-read-result/latch branch; the baseline sticky-read behavior is retained here.
+read-result branch. A failed read returns its original error without setting
+the sticky I/O latch. An already-latched write or durability failure stays latched.
 Backend-read counting, error payloads and cache/payment ordering are unchanged.
 The existing bounded custody ring records the failed backing before it is freed.
 No observation allocation, page alias or payer is created by this borrowed hook.
@@ -26,7 +27,9 @@ backings/payments make capture incomplete. Occupancy release is distinct from
 source receipt refund; a counter is never certified as a funder. Native aliases
 expose the existing allocation and its genuine receipt. The cold-read injector
 runs only at the actual cache-miss backend read and uses its existing failure
-branch, including sticky I/O failure. A test-only cache lease reports actual
+branch. Failed direct and prepared native reads release their failed backing and
+original invoice; the next read on the same backend may try again. A test-only
+cache lease reports actual
 limit/occupancy and invokes existing unpinned-victim eviction for cold setup.
 Fixed-reserve events distinguish the genuine process aggregate from a writer
 accountant. The engine's receipt producer exposes held bytes without its internal
@@ -195,7 +198,7 @@ private cache tests still require the independently owned real-handle adoption.
 
 | Changed source | Reason |
 |---|---|
-| `src/native_page_observations.rs` (added), `src/native_storage_admission.rs`, `src/tree_store/page_store/{page_allocation,cached_file,page_manager}.rs`, `src/db.rs`, `src/lib.rs` | Test-seams-only bounded scalar custody capture at actual allocation/transfer/free/receipt finish, native-capable real aliases, separate occupancy events, installed-limit observations and existing unpinned eviction; inject cold failures at the real cached-none backend branch without clearing sticky I/O failure. No production cache/admission/payer policy changes. |
+| `src/native_page_observations.rs` (added), `src/native_storage_admission.rs`, `src/tree_store/page_store/{page_allocation,cached_file,page_manager}.rs`, `src/db.rs`, `src/lib.rs` | Test-seams-only bounded scalar custody capture at actual allocation/transfer/free/receipt finish, native-capable real aliases, separate occupancy events, installed-limit observations and existing unpinned eviction; inject cold failures at the real cached-none backend branch. Read failures propagate without setting the sticky I/O latch; write and durability handling is unchanged. No cache/admission/payer policy changes. |
 | `src/native_storage_admission.rs`, `src/lib.rs` | The test-seams-only pending-name observer borrows the real combined allocation Layout and native invoice after name construction. It admits or retains nothing and lets the engine allocator witness bind the exact original invoice to physical key teardown. |
 | `src/read_admission.rs` | Feature-internal captured native admission and prepaid thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the unscoped fallback allowance; declared scans retain their working set under the original reader admission. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
 | `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/tree_store/bounded_bytes.rs` | Feature-internal concrete movable source-credit owner and a distinct internal legacy/owned carrier. Preserve authentic credit through actual control deallocation, source-page/counter teardown and cache handoff. Keep legacy Box wrappers and the public backend trait unchanged; exact actual Layout prepayment remains with the engine factory. Upstream proposal remains unsubmitted. |

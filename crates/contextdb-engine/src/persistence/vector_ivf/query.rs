@@ -44,11 +44,7 @@ pub(crate) fn search<E: From<Error>>(
                     error: &error,
                 },
             );
-            if mode == VectorSearchMode::Indexed {
-                return Err(E::from(error));
-            } else {
-                return Ok(None);
-            }
+            return Err(E::from(error));
         }
         Err(error) => return Err(E::from(error)),
     };
@@ -64,11 +60,7 @@ pub(crate) fn search<E: From<Error>>(
                     error: &error,
                 },
             );
-            if mode == VectorSearchMode::Indexed {
-                return Err(E::from(error));
-            } else {
-                return Ok(None);
-            }
+            return Err(E::from(error));
         }
         Err(error) => return Err(E::from(error)),
     };

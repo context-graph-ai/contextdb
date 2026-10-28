@@ -17853,7 +17853,7 @@
              io_failed: AtomicBool::new(false),
              closed: AtomicBool::new(false),
          }
-@@ -157,25 +274,83 @@
+@@ -157,25 +274,81 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -17890,11 +17890,11 @@
 +            };
 +        #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
          let result = self.file.read(offset, out);
-         if result.is_err() {
-             self.io_failed.store(true, Ordering::Release);
+-        if result.is_err() {
+-            self.io_failed.store(true, Ordering::Release);
 -        }
 -        result.map_err(StorageError::from)
-+        } else {
++        if result.is_ok() {
 +            crate::read_admission::record_backend_read(out.len());
 +        }
 +        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
@@ -17942,7 +17942,7 @@
      }
  
      fn sync_data(&self) -> Result<()> {
-@@ -184,7 +359,7 @@
+@@ -184,7 +357,7 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -17951,7 +17951,7 @@
      }
  
      fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-@@ -193,11 +368,34 @@
+@@ -193,11 +366,34 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -17987,7 +17987,7 @@
      file: CheckedBackend,
      page_size: u64,
      // Dynamic cache partitioning.  Three invariants:
-@@ -218,9 +416,7 @@
+@@ -218,9 +414,7 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -17998,7 +17998,7 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,27 +429,201 @@
+@@ -233,27 +427,201 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
@@ -18209,7 +18209,7 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -266,8 +636,130 @@
+@@ -266,8 +634,130 @@
              #[cfg(feature = "cache_metrics")]
              evictions: Default::default(),
              read_cache,
@@ -18341,7 +18341,7 @@
      }
  
      #[allow(clippy::unused_self)]
-@@ -303,6 +795,115 @@
+@@ -303,6 +793,115 @@
          }
      }
  
@@ -18457,7 +18457,7 @@
      pub(crate) fn close(&self) -> Result {
          self.file.close()
      }
-@@ -329,28 +930,52 @@
+@@ -329,28 +928,52 @@
          bytes_needed: usize,
          _write_lock: &MutexGuard<'_, LRUWriteCache>,
      ) {
@@ -18514,7 +18514,7 @@
      }
  
      fn flush_write_buffer(&self) -> Result {
-@@ -359,30 +984,51 @@
+@@ -359,30 +982,51 @@
          for (offset, buffer) in write_buffer.cache.iter() {
              self.file.write(*offset, buffer.as_ref().unwrap())?;
          }
@@ -18587,7 +18587,7 @@
          write_buffer.clear();
  
          Ok(())
-@@ -390,10 +1036,28 @@
+@@ -390,10 +1034,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -18618,7 +18618,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -409,6 +1073,20 @@
+@@ -409,6 +1071,20 @@
          self.flush_write_buffer()
      }
  
@@ -18639,7 +18639,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +1094,54 @@
+@@ -416,18 +1092,54 @@
          Ok(buffer)
      }
  
@@ -18702,7 +18702,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1152,7 @@
+@@ -438,7 +1150,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -18711,7 +18711,7 @@
              }
          }
  
-@@ -449,54 +1163,181 @@
+@@ -449,54 +1161,181 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -18931,7 +18931,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1348,213 @@
+@@ -507,104 +1346,213 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -19231,7 +19231,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1564,439 @@
+@@ -614,13 +1562,438 @@
  }
  
  #[cfg(test)]
@@ -19328,7 +19328,6 @@
 +                .read_cause(offset, output)
 +                .map_err(|error| error.into_native());
 +            if let Err(error) = result {
-+                self.file.io_failed.store(true, Ordering::Release);
 +                #[cfg(feature = "test-seams")]
 +                observation.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt });
 +                #[cfg(feature = "test-seams")]
@@ -19673,7 +19672,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +2029,948 @@
+@@ -653,4 +2026,948 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }

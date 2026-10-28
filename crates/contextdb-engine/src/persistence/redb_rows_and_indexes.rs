@@ -6907,6 +6907,23 @@ impl RedbPersistence {
 
     pub(crate) fn storage_error(err: impl Into<redb::Error>) -> Error {
         let err: redb::Error = err.into();
+        // Native structural damage keeps its typed public category. These
+        // borrowed diagnostics need no allocation under a failing read budget.
+        let corruption = match &err {
+            redb::Error::Native(redb::NativeColdReadError::Corrupt(fault)) => Some(fault.reason),
+            redb::Error::Native(redb::NativeColdReadError::Io(error)) | redb::Error::Io(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                Some("native storage extent is truncated")
+            }
+            _ => None,
+        };
+        if let Some(reason) = corruption {
+            return Error::StoreCorrupted {
+                path: "storage".into(),
+                reason: reason.into(),
+            };
+        }
         // Preserve the actual native allocator facts before any owning formatter.
         if let redb::Error::Native(redb::NativeColdReadError::AllocatorFailed { site, layout }) =
             err
