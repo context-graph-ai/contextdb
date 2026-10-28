@@ -10410,6 +10410,16 @@ mod general_checkpoint_native_fixture {
         assert_eq!(allocations, 0);
         assert_eq!(owner.admitted_bytes_for_test(), admission_at_abort.get());
         assert_eq!(snapshot(&t, tx), expected);
+        // The unwinder itself allocates even for an already boxed payload.
+        // Measure that exact runtime path separately; rollback may add nothing.
+        let runtime_payload: Box<dyn std::any::Any + Send> = Box::new("runtime unwind control");
+        let (runtime_unwind, runtime_requests, runtime_count) =
+            oracle::native_requests_for_test(|| {
+                catch_unwind(AssertUnwindSafe(|| {
+                    std::panic::resume_unwind(runtime_payload)
+                }))
+            });
+        assert!(runtime_unwind.is_err());
         let panic_payload: Box<dyn std::any::Any + Send> = Box::new("inner callback unwind");
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -10426,7 +10436,18 @@ mod general_checkpoint_native_fixture {
             .is_err()
         );
         let allocations = oracle::disarm_inverse_window();
-        assert_eq!(allocations, 0);
+        assert_eq!(
+            allocations, runtime_count,
+            "rollback adds no request to the unwinder"
+        );
+        let layouts = oracle::inverse_request_layouts_for_test();
+        assert!(
+            layouts[..allocations]
+                .iter()
+                .zip(&runtime_requests[..runtime_count])
+                .all(|(layout, request)| *layout == (request.1, request.2)),
+            "rollback requests match only the independently observed unwind runtime layouts"
+        );
         assert_eq!(owner.admitted_bytes_for_test(), admission_at_abort.get());
         assert_eq!(snapshot(&t, tx), expected);
 
@@ -10596,8 +10617,9 @@ mod general_checkpoint_native_fixture {
         let counter = owner.used.as_ptr() as usize;
         let template = row(TxId(17), 19, 23);
         let before = owner.usage().used;
-        let (body, requests, count) =
-            oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
+        let (body, requests, count) = oracle::retained_source_requests_for_test(owner, || {
+            funder.copy_row(&template).unwrap()
+        });
         assert!(count > 1 && count <= 32);
         let held = owner.usage().used;
         assert_eq!(
@@ -10619,8 +10641,9 @@ mod general_checkpoint_native_fixture {
 
         let payload: Box<dyn std::any::Any + Send> = Box::new("positive native cleanup unwind");
         let before = owner.usage().used;
-        let (body, requests, count) =
-            oracle::source_requests_for_test(counter, || funder.copy_row(&template).unwrap());
+        let (body, requests, count) = oracle::retained_source_requests_for_test(owner, || {
+            funder.copy_row(&template).unwrap()
+        });
         assert!(count > 1 && count <= 32);
         let held = owner.usage().used;
         oracle::watch_source_free_for_test(&requests[..count], counter);
@@ -10637,7 +10660,7 @@ mod general_checkpoint_native_fixture {
             ($operation:expr) => {{
                 let before = owner.usage().used;
                 let (copy, requests, count) =
-                    oracle::source_requests_for_test(counter, || $operation.unwrap());
+                    oracle::retained_source_requests_for_test(owner, || $operation.unwrap());
                 assert!(count > 1 && count <= 32);
                 let held = owner.usage().used;
                 assert_eq!(

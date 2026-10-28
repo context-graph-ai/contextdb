@@ -712,6 +712,42 @@ pub(crate) fn source_requests_for_test<T>(
     assert_native_request_receipt_complete();
     receipt
 }
+
+// Copy construction can allocate and free a temporary admission control before
+// returning its retained body. Observe every allocation/free for funding, then
+// give the lifetime assertions only the blocks that are still physically live.
+pub(crate) fn retained_source_requests_for_test<T>(
+    owner: &MemoryAccountant,
+    operation: impl FnOnce() -> T,
+) -> (T, [(usize, usize, usize); 256], usize) {
+    let ((value, requests, credits, count), gap) = funded_requests(owner, || {
+        let observation = declaration_observation();
+        let value = operation();
+        let evidence = observation.evidence();
+        assert!(evidence.complete, "{evidence:?}");
+        let mut requests = [(0, 0, 0); 256];
+        let mut credits = [0; 256];
+        let mut count = 0;
+        for request in evidence
+            .requests
+            .iter()
+            .filter(|r| r.generation != 0 && r.frees == 0)
+        {
+            requests[count] = (request.pointer, request.bytes, request.align);
+            credits[count] = request.used_at_alloc;
+            count += 1;
+        }
+        assert_eq!(count, evidence.active);
+        (value, requests, credits, count)
+    });
+    assert_eq!(
+        gap, 0,
+        "every transient and retained copy allocation stays funded through physical free"
+    );
+    SOURCE_REQUEST_CREDIT.with(|slot| slot.set(credits));
+    (value, requests, count)
+}
+
 // Selected-constructor proofs check each consumed slot themselves. Later
 // query allocations do not belong to that prefix and are not a complete census.
 pub(crate) fn source_request_prefix_for_test<T>(
@@ -3398,6 +3434,10 @@ pub(crate) fn disarm_source_free_watch() {
         watch.pointer.store(0, AtomicOrdering::SeqCst);
         watch.counter.store(0, AtomicOrdering::SeqCst);
     }
+}
+
+pub(crate) fn inverse_request_layouts_for_test() -> [(usize, usize); 256] {
+    NATIVE_REQUESTS.with(|requests| requests.get().map(|(_, bytes, align)| (bytes, align)))
 }
 
 pub(crate) fn arm_inverse_window() {
