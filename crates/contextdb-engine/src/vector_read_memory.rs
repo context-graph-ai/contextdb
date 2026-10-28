@@ -1950,7 +1950,7 @@ fn native_child_identity(
             record.counter = address;
             record.payload_identity = fallback;
             statement_child_proof::native_forwarder(
-                parent,
+                parent as *const DeclaredReadMemory as usize,
                 identity,
                 fallback,
                 address,
