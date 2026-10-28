@@ -7118,6 +7118,9 @@ fn staged_accepted_delete_restamps_only_its_tombstone_and_durable_lineage() {
             .delete_lsn,
         Lsn(1)
     );
+    let _fixture_decode_scope =
+        crate::read_image_memory::ImageMemory::enter_writer_operation(db.accountant.clone())
+            .unwrap();
     let records = stage
         .persistence
         .config_values
@@ -7309,6 +7312,9 @@ fn staged_terminal_refusal_override_clears_only_matching_marker_and_scan() {
             received_schema_read_memory_27,
         )
         .unwrap();
+    let _fixture_decode_scope =
+        crate::read_image_memory::ImageMemory::enter_writer_operation(db.accountant.clone())
+            .unwrap();
     let inactive = stage
         .persistence
         .terminal_values
