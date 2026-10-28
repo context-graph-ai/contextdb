@@ -244,6 +244,10 @@ fn sql_insert_throughput(c: &mut Criterion) {
 }
 
 fn sql_query_throughput(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("sql_query/select_after_1k_rows", |_| {});
+        return;
+    }
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE items (id UUID PRIMARY KEY, category TEXT, seq INTEGER, name TEXT)",

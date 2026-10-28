@@ -80,6 +80,12 @@ fn hot_selects(
 }
 
 fn bench_acl_overhead(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("tier1_acl_overhead/ungated", |_| {});
+        c.bench_function("tier1_acl_overhead/ratio_guard", |_| {});
+        c.bench_function("tier1_acl_overhead/gated", |_| {});
+        return;
+    }
     let tmp = TempDir::new().unwrap();
     let admin_path = tmp.path().join("acl-admin.redb");
     let gated_path = tmp.path().join("acl-gated.redb");

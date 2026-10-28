@@ -53,6 +53,10 @@ fn timed_distinct_and_assert(db: &Database) {
 }
 
 fn bench_sql_distinct_not_quadratic(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("sql_distinct_not_quadratic", |_| {});
+        return;
+    }
     seed_and_assert();
     c.bench_function("sql_distinct_not_quadratic", |b| {
         b.iter_batched(

@@ -194,6 +194,10 @@ async fn run_drain_iteration(bind_spec: &str, ticket: &str) -> Duration {
 }
 
 fn bench_sigterm_drain_in_flight_persistence(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("sigterm_drain/drain_4096_rows", |_| {});
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let sync = rt.block_on(start_sync_fixture());
     let bind_spec = sync.bind_spec.clone();

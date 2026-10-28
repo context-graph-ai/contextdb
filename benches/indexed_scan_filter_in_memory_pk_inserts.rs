@@ -51,6 +51,10 @@ fn timed_seed_and_assert() {
 }
 
 fn bench_in_memory_100k_pk_inserts_sublinear(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("in_memory_100k_pk_inserts_sublinear", |_| {});
+        return;
+    }
     seed_and_assert();
     c.bench_function("in_memory_100k_pk_inserts_sublinear", |b| {
         b.iter(timed_seed_and_assert)

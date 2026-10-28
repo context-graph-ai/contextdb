@@ -1116,6 +1116,13 @@ fn report_wall_time_distribution() {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "version_cleanup_scaling/steady_state_cycle/cycle_after_64_upserts",
+            |_| {},
+        );
+        return;
+    }
     let mut gate = Gate::default();
     let scope = run_scope_gates(&mut gate);
     run_scope_vector_bearing_arm(&mut gate);

@@ -113,6 +113,16 @@ fn assert_insert_counter_gates() {
 }
 
 fn bench_insert_cost_by_index_count(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        for slots in [1, 5, 20] {
+            c.bench_function(&format!("storage_scale_insert_index_count/{slots}"), |_| {});
+        }
+        c.bench_function(
+            "storage_scale_insert_index_count/cross_table_sibling_20_indexes",
+            |_| {},
+        );
+        return;
+    }
     assert_insert_counter_gates();
 
     let mut group = c.benchmark_group("storage_scale_insert_index_count");

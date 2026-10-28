@@ -218,6 +218,12 @@ async fn run_one_transfer(size: usize, iteration: u64) -> Duration {
 }
 
 fn blob_transfer_bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        for size in [64 * 1024, 4 * MB, 64 * MB + 4096, 512 * MB, 1024 * MB] {
+            c.bench_function(&format!("blob_transfer/{size}"), |_| {});
+        }
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

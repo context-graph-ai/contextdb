@@ -335,6 +335,15 @@ fn route_scales() -> Vec<(usize, Duration)> {
 }
 
 fn bench_context_graph_route(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        for (rows, _) in route_scales() {
+            c.bench_function(
+                &format!("composite_index_context_graph_route/{rows}"),
+                |_| {},
+            );
+        }
+        return;
+    }
     let mut group = c.benchmark_group("composite_index_context_graph_route");
     for (rows, budget) in route_scales() {
         let case = seed_context_graph_route_case(rows);
@@ -348,6 +357,10 @@ fn bench_context_graph_route(c: &mut Criterion) {
 }
 
 fn bench_inlist_10k_param_peak_rss(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("composite_index_inlist_10k_params_peak_rss", |_| {});
+        return;
+    }
     let case = seed_inlist_10k_param_case();
     let stats = measure_inlist_probe(&case);
     assert_inlist_memory_under_budget(stats);
@@ -369,6 +382,10 @@ fn bench_inlist_10k_param_peak_rss(c: &mut Criterion) {
 }
 
 fn bench_concurrent_write_route(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("composite_index_route_concurrent_writes", |_| {});
+        return;
+    }
     let case = seed_context_graph_route_case(10_000);
     run_concurrent_write_probe(&case, 0);
     let mut batch = 1usize;

@@ -240,6 +240,10 @@ fn run_non_id_start_probe(db: &Database, expected: &BTreeSet<Uuid>) {
 }
 
 fn bench_forward_probe_10k(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("bench_forward_probe_10k", |_| {});
+        return;
+    }
     let (db, start, expected) = seed_forward_probe_10k();
     run_forward_probe(&db, start, &expected);
     assert_p95_under_budget(
@@ -258,6 +262,10 @@ fn bench_forward_probe_10k(c: &mut Criterion) {
 }
 
 fn bench_reverse_probe_100k(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("bench_reverse_probe_100k", |_| {});
+        return;
+    }
     let (db, anchor, expected) = seed_reverse_probe_100k();
     run_reverse_probe(&db, anchor, &expected);
     assert_p95_under_budget(
@@ -276,6 +284,10 @@ fn bench_reverse_probe_100k(c: &mut Criterion) {
 }
 
 fn bench_non_id_start_resolution_100k(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("bench_non_id_start_resolution_100k", |_| {});
+        return;
+    }
     let (db, expected) = seed_non_id_start_resolution_100k();
     run_non_id_start_probe(&db, &expected);
     assert_p95_under_budget(

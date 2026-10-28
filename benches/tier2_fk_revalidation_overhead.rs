@@ -164,6 +164,13 @@ fn assert_report(report: &FkReport) {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "tier2_fk_revalidation_overhead/100k_seeded_1k_mixed_fk_commits",
+            |_| {},
+        );
+        return;
+    }
     let (db, parents) = setup_seeded_db();
     let pre_gate = run_fk_commits(&db, &parents);
     assert_report(&pre_gate);
