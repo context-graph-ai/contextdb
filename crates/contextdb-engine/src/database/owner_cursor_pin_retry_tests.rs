@@ -484,7 +484,7 @@ fn owner_channel_cursor_registry_contention_obeys_cancellation() {
 fn owner_channel_cursor_retries_registry_scan_contention_until_release() {
     owner_channel_registry_wait(
         RegistryWaitOutcome::Released,
-        RegistryWaitPhase::ProviderScan,
+        RegistryWaitPhase::FirstRoot,
     );
 }
 
@@ -493,7 +493,7 @@ fn owner_channel_cursor_retries_registry_scan_contention_until_release() {
 fn owner_channel_cursor_registry_scan_contention_obeys_active_deadline() {
     owner_channel_registry_wait(
         RegistryWaitOutcome::Deadline,
-        RegistryWaitPhase::ProviderScan,
+        RegistryWaitPhase::FirstRoot,
     );
 }
 
@@ -502,7 +502,7 @@ fn owner_channel_cursor_registry_scan_contention_obeys_active_deadline() {
 fn owner_channel_cursor_registry_scan_contention_obeys_cancellation() {
     owner_channel_registry_wait(
         RegistryWaitOutcome::Cancelled,
-        RegistryWaitPhase::ProviderScan,
+        RegistryWaitPhase::FirstRoot,
     );
 }
 
