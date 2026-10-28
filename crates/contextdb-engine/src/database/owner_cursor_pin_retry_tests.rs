@@ -210,34 +210,58 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         cursor_page_rows: 1,
         ..ReadLimits::default()
     };
-    let db = Database::open_with_options(
-        &path,
-        DatabaseOpenOptions {
-            owner_reads: OwnerReadConfig {
-                runtime_dir: Some(runtime_dir.clone()),
-                limits: OwnerReadLimits {
-                    limits,
-                    ..OwnerReadLimits::default()
+    struct RequestFinished(std::sync::mpsc::Sender<()>);
+    impl crate::owner_read::OwnerBoundedExecutionObserver for RequestFinished {
+        fn before_operation(
+            &self,
+            _: crate::owner_read::OwnerBoundedOperation,
+            _: ReadLimits,
+            _: OwnerReadCancellation,
+        ) {}
+        fn before_work(
+            &self,
+            _: crate::executor::bounded_read_test_support::TestWorkSource,
+            _: u64,
+        ) {}
+        fn cancellation_observed(&self, _: u64) {}
+        fn request_finished(&self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (finished_owner, owner_finished) = std::sync::mpsc::channel();
+    let db = crate::owner_read::OwnerServiceSpec::with_execution_observer_during_start_for_test(
+        Arc::new(RequestFinished(finished_owner)),
+        || {
+            Database::open_with_options(
+                &path,
+                DatabaseOpenOptions {
+                    owner_reads: OwnerReadConfig {
+                        runtime_dir: Some(runtime_dir.clone()),
+                        limits: OwnerReadLimits {
+                            limits,
+                            ..OwnerReadLimits::default()
+                        },
+                        timeouts: OwnerServiceTimeouts {
+                            request_ms: 600_000,
+                            ..OwnerServiceTimeouts::default()
+                        },
+                        test_hooks: Some(crate::OwnerReadTestHooks {
+                            clock: clock.clone(),
+                            drain_started,
+                            active_request_registered: None,
+                            accept_thread_exited: None,
+                            accept_thread_joined: None,
+                            service_dropped: None,
+                            quiescent_stop: None,
+                        }),
+                        ..OwnerReadConfig::default()
+                    },
+                    ..DatabaseOpenOptions::default()
                 },
-                timeouts: OwnerServiceTimeouts {
-                    request_ms: 600_000,
-                    ..OwnerServiceTimeouts::default()
-                },
-                test_hooks: Some(crate::OwnerReadTestHooks {
-                    clock: clock.clone(),
-                    drain_started,
-                    active_request_registered: None,
-                    accept_thread_exited: None,
-                    accept_thread_joined: None,
-                    service_dropped: None,
-                    quiescent_stop: None,
-                }),
-                ..OwnerReadConfig::default()
-            },
-            ..DatabaseOpenOptions::default()
+            )
+            .unwrap()
         },
-    )
-    .unwrap();
+    );
     db.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY)",
         &HashMap::new(),
@@ -356,6 +380,11 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
                     "typed cancellation refusal: {result:?}"
                 ),
                 RegistryWaitOutcome::Released => unreachable!(),
+            }
+            if matches!(outcome, RegistryWaitOutcome::Cancelled) {
+                owner_finished
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("cancelled owner request terminal event was not delivered");
             }
             assert!(db.snapshot_registry.state.lock().active.is_empty());
         }
