@@ -1,4 +1,10 @@
 use super::*;
+
+macro_rules! with_received_fixture_commit_boundary {
+    ($database:expr => $body:block) => {
+        ($database).tx_mgr.with_commit_lock(|| $body)
+    };
+}
 include!("durable_test_observations.rs");
 
 fn create_table() -> DdlChange {
@@ -7023,6 +7029,7 @@ fn staged_accepted_delete_restamps_only_its_tombstone_and_durable_lineage() {
     let mut received_schema_copy_owner_25 =
         contextdb_engine::vector_read_memory::admission(received_schema_read_memory_25.clone());
 
+    with_received_fixture_commit_boundary!(db => {
     let stage = db
         .prepare_received_schema_stage_with_adjudication(
             Lsn(99),
@@ -7111,6 +7118,7 @@ fn staged_accepted_delete_restamps_only_its_tombstone_and_durable_lineage() {
         .unwrap();
     assert_eq!(preserved.created_tx, unaffected_row.created_tx);
     assert_eq!(preserved.deleted_tx, unaffected_row.deleted_tx);
+    });
 }
 
 #[test]
@@ -7200,6 +7208,7 @@ fn staged_terminal_refusal_override_clears_only_matching_marker_and_scan() {
     let mut received_schema_copy_owner_26 =
         contextdb_engine::vector_read_memory::admission(received_schema_read_memory_26.clone());
 
+    with_received_fixture_commit_boundary!(db => {
     assert!(
         db.prepare_received_schema_stage_with_adjudication(
             Lsn(99),
@@ -7314,6 +7323,7 @@ fn staged_terminal_refusal_override_clears_only_matching_marker_and_scan() {
             .read()
             .contains_key(&matching_marker_key)
     );
+    });
 }
 
 include!("authored_occurrence_delivery_tests.rs");
