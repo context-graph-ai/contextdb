@@ -126,6 +126,20 @@ fn is_retirement_key(key: &str) -> bool {
             .strip_prefix("sync_lineage.v1.")
             .is_some_and(|key| key.starts_with("row_graph_retired_v1"))
 }
+fn fixture_retirement_key(owner: &contextdb_tx::RowEdgeOwner) -> String {
+    use std::fmt::Write;
+    let mut key = String::from("row_graph_retired_v1.");
+    for byte in owner.table.as_bytes() {
+        write!(&mut key, "{byte:02x}").unwrap();
+    }
+    write!(
+        &mut key,
+        ".{:020}.{:020}.{:020}.{:020}",
+        owner.row_id.0, owner.created_tx.0, owner.lsn.0, owner.table_generation
+    )
+    .unwrap();
+    key
+}
 fn inspect<R>(path: &Path, action: impl FnOnce(&RedbPersistence) -> R) -> R {
     let persistence = RedbPersistence::open(path).unwrap();
     let memory = crate::read_image_memory::ImageMemory::new(None).unwrap();
@@ -664,6 +678,31 @@ fn damage_witness(path: &Path, selected: &OwnedAdjEntry) {
         .unwrap()
     });
 }
+// Fixture-only bypass: sanctioned append rejects resurrection of a retired owner.
+fn inject_live_witness_pair(path: &Path, selected: &OwnedAdjEntry) {
+    assert!(selected.entry.deleted_tx.is_none());
+    inspect(path, |p| {
+        p.with_db(|db| {
+            let write = RedbPersistence::begin_history_write(db)?;
+            let bytes =
+                bincode::serde::encode_to_vec(selected, bincode::config::standard()).unwrap();
+            for reverse in [false, true] {
+                let key = RedbPersistence::row_graph_key(selected, reverse)?;
+                write
+                    .open_table(if reverse {
+                        row_graph::REVERSE
+                    } else {
+                        row_graph::FORWARD
+                    })
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(key.as_slice(), bytes.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
+            }
+            write.commit().map_err(RedbPersistence::storage_error)
+        })
+        .unwrap()
+    });
+}
 fn assert_corruption(result: Result<()>, fault: Fault, door: Door) {
     match result {
         Err(Error::StoreCorrupted { .. }) => {}
@@ -724,34 +763,6 @@ fn control_fault(fault: Fault) {
         let db = writer(&path);
         seed(&db, false, false, false);
         close(db);
-        let pin_session = if matches!(
-            fault,
-            Fault::MalformedRetirement | Fault::WrongOwnerRetirement
-        ) {
-            Some(
-                ReadSession::open_with_clock_for_test(
-                    &path,
-                    crate::ReadSessionOptions {
-                        limits: contextdb_core::read_contract::ReadLimits {
-                            cursor_page_rows: 1,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                    Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
-                )
-                .unwrap(),
-            )
-        } else {
-            None
-        };
-        let pin_cursor = pin_session.as_ref().map(|session| {
-            let cursor = session
-                .open_cursor(&graph_sql(false, "LINKS"), &params())
-                .unwrap();
-            assert!(cursor.first_page().has_more());
-            cursor
-        });
         let selected = owned(&path, false)
             .into_iter()
             .find(|owned| owned.entry.target == uuid::Uuid::from_u128(EXPIRED))
@@ -774,6 +785,8 @@ fn control_fault(fault: Fault) {
             Fault::WitnessMismatch => damage_witness(&path, &selected),
             _ => {
                 let db = writer(&path);
+                let snapshot = db.snapshot();
+                let pin = db.pin_snapshot(snapshot).unwrap();
                 db.execute(
                     "UPDATE retained SET expires_at = $expires WHERE id = $id",
                     &HashMap::from([
@@ -783,19 +796,34 @@ fn control_fault(fault: Fault) {
                 )
                 .unwrap();
                 db.run_pruning_cycle_checked().unwrap();
+                if matches!(fault, Fault::WrongOwnerRetirement) {
+                    retire_other_endpoint(&db);
+                }
+                drop(pin);
                 close(db);
+                for reverse in [false, true] {
+                    let physical = owned(&path, reverse);
+                    let tombstone = physical
+                        .iter()
+                        .find(|entry| entry.owner == selected.owner)
+                        .expect("the selected exact owner remains physically present");
+                    assert!(
+                        tombstone.entry.deleted_tx.is_some(),
+                        "the selected physical witness is a tombstone"
+                    );
+                }
                 let first = controls(&path);
                 assert_eq!(
                     first.len(),
-                    1,
+                    if matches!(fault, Fault::WrongOwnerRetirement) {
+                        2
+                    } else {
+                        1
+                    },
                     "the selected exact owner really retires before control damage"
                 );
-                let key = first.first_key_value().unwrap().0;
-                if matches!(fault, Fault::WrongOwnerRetirement) {
-                    let db = writer(&path);
-                    retire_other_endpoint(&db);
-                    close(db);
-                }
+                let key = fixture_retirement_key(&selected.owner);
+                assert!(first.contains_key(&key));
                 let records = controls(&path);
                 assert_eq!(
                     records.len(),
@@ -807,22 +835,28 @@ fn control_fault(fault: Fault) {
                     "real retirement produces exact-owner control before deliberate damage"
                 );
                 match fault {
-                    Fault::MalformedRetirement => rewrite_control(&path, key, Some(&[0xff])),
+                    Fault::MalformedRetirement => rewrite_control(&path, &key, Some(&[0xff])),
                     Fault::WrongOwnerRetirement => rewrite_control(
                         &path,
-                        key,
-                        Some(records.iter().find(|(other, _)| *other != key).unwrap().1),
+                        &key,
+                        Some(records.iter().find(|(other, _)| *other != &key).unwrap().1),
                     ),
                     Fault::LiveAndRetired => {
-                        inspect(&path, |p| p.append_row_graph_edge(&selected).unwrap())
+                        inject_live_witness_pair(&path, &selected);
+                        for reverse in [false, true] {
+                            let physical = owned(&path, reverse);
+                            let live = physical
+                                .iter()
+                                .find(|entry| entry.owner == selected.owner)
+                                .expect("the injected exact owner is physically present");
+                            assert_eq!(live, &selected, "the fixture contains the live witness");
+                        }
                     }
                     _ => unreachable!(),
                 }
             }
         }
         probe(&path, &directory.path().join("must-refuse.db"), fault, door);
-        drop(pin_cursor);
-        drop(pin_session);
     }
 }
 // Manager ruling 2026-10-29: fully absent pairs with re-authenticated roots
