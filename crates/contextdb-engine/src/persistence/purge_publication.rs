@@ -1351,16 +1351,16 @@ impl Fence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn publish_with_budget<T>(
+    pub(crate) fn publish_with_budget<'a, T>(
         &mut self,
         snapshot_lsn: Lsn,
-        tables: &BTreeSet<String>,
+        tables: impl IntoIterator<Item = &'a String>,
         value: T,
         budget: Option<&crate::executor::ReadPublicationBudget>,
     ) -> Result<T> {
         self.publish_tables_with_budget(
             snapshot_lsn,
-            tables.iter().map(String::as_str),
+            tables.into_iter().map(String::as_str),
             value,
             budget,
             true,

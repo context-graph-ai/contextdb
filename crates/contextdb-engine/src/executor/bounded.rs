@@ -22910,12 +22910,11 @@ impl ControlArc<RequestContext> {
         &self,
         plan: &PhysicalPlan,
     ) -> std::result::Result<PublicationTables, BoundedExecutionError> {
+        let Some(funding) = self.request_funding.as_ref() else {
+            return Err(BoundedExecutionError::Unimplemented);
+        };
         self.check_final_boundary()?;
-        let owner = self
-            .request_funding
-            .as_ref()
-            .expect("Legacy request funding")
-            .owner();
+        let owner = funding.owner();
         Ok(PublicationTables::try_from_visitor(owner, |visit| {
             visit_publication_tables(plan, visit)
         })?)
@@ -22923,7 +22922,7 @@ impl ControlArc<RequestContext> {
 
     #[expect(
         clippy::result_large_err,
-        reason = Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn publication_scope(
         &self,
