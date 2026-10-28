@@ -164,7 +164,17 @@ impl std::error::Error for WireError {
 }
 impl From<NativeTerminal> for WireError {
     fn from(terminal: NativeTerminal) -> Self {
-        Self::Native(terminal)
+        use contextdb_core::read_memory::NativeRefusal;
+        match terminal {
+            terminal @ (NativeTerminal::Refused(
+                NativeRefusal::MemoryBudgetExceeded { .. }
+                | NativeRefusal::ProcessMemoryBudgetExceeded { .. },
+            )
+            | NativeTerminal::Kernel(contextdb_core::Error::MemoryBudgetExceeded { .. })) => {
+                Self::Resource(terminal.into_error())
+            }
+            other => Self::Native(other),
+        }
     }
 }
 
