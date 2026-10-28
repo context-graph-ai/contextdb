@@ -144,8 +144,6 @@ impl CacheCounter {
                 reserve: Mutex::new(None),
             });
         }
-        #[cfg(feature = "test-seams")]
-        crate::read_admission::record_page_lifetime_for_test(layout.size(), true);
         Ok(Self { block })
     }
 }
@@ -379,6 +377,8 @@ impl PageAllocation {
             });
             std::ptr::write_bytes(block.as_ptr().cast::<u8>().add(offset), 0, len);
         }
+        #[cfg(feature = "test-seams")]
+        crate::read_admission::record_page_lifetime_for_test(layout.size(), true);
         Ok(Self { block })
     }
     // Snapshot the CURRENT payment under its real transition lock. This is
