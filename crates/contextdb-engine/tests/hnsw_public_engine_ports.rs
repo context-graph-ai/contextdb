@@ -287,3 +287,102 @@ fn predicate_search_for_every_canonical_encoding() {
         db.close().unwrap();
     }
 }
+
+fn canonical_body_score(vector: &[f32], query: &[f32]) -> f32 {
+    let (dot, aa, bb) =
+        vector
+            .iter()
+            .zip(query)
+            .fold((0.0_f64, 0.0_f64, 0.0_f64), |(dot, aa, bb), (&a, &b)| {
+                let (a, b) = (f64::from(a), f64::from(b));
+                (dot + a * b, aa + a * a, bb + b * b)
+            });
+    if aa == 0.0 || bb == 0.0 {
+        0.0
+    } else {
+        (dot / (aa.sqrt() * bb.sqrt())) as f32
+    }
+}
+
+/// Every public route publishes the canonical stored-body F64 rerank rounded
+/// to F32. This companion makes the frozen checkpoint's Rust divergence RED.
+#[test]
+fn public_sql_and_rust_scores_publish_the_canonical_body_rerank() {
+    use contextdb_core::VectorSearchMode;
+    use contextdb_engine::SemanticQuery;
+    let root = tempfile::tempdir().unwrap();
+    let db = open(&root.path().join("canonical-public-score.db"));
+    let dimensions = 96;
+    create(&db, dimensions, "F32");
+    for id in 1..=5 {
+        insert(
+            &db,
+            id,
+            (0..dimensions)
+                .map(|c| (((c as u64 * 31 + id as u64 * 17) % 1021) as f32 / 1021.) - 0.5)
+                .collect(),
+        );
+    }
+    ready(&db);
+    let stored = db
+        .execute("SELECT id, embedding FROM items ORDER BY id", &empty())
+        .unwrap();
+    let query = (0..dimensions)
+        .map(|c| (((c * 23 + 5) % 1013) as f32 / 1013.) - 0.5)
+        .collect::<Vec<_>>();
+    let expected = stored
+        .rows()
+        .iter()
+        .map(|row| {
+            let (Value::Int64(id), Value::Vector(vector)) = (&row[0], &row[1]) else {
+                panic!("stored canonical body and identity")
+            };
+            (*id, canonical_body_score(vector, &query).to_bits())
+        })
+        .collect::<HashMap<_, _>>();
+    let mut failures = Vec::new();
+    for (name, mode) in [
+        ("EXACT", VectorSearchMode::Exact),
+        ("AUTO", VectorSearchMode::Auto),
+        ("INDEXED", VectorSearchMode::Indexed),
+    ] {
+        let result = db.execute(&format!("SELECT id, score FROM items ORDER BY embedding <=> $q USE VECTOR {name} LIMIT {}",expected.len()),&HashMap::from([("q".into(),Value::Vector(query.clone()))])).unwrap();
+        assert_eq!(result.rows().len(), expected.len());
+        for row in result.rows() {
+            let (Value::Int64(id), Value::Float64(score)) = (&row[0], &row[1]) else {
+                panic!("SQL publishes identity and score")
+            };
+            if (*score as f32).to_bits() != expected[id] {
+                failures.push(format!(
+                    "SQL {name} row={id} actual={} expected={}",
+                    (*score as f32).to_bits(),
+                    expected[id]
+                ));
+            }
+        }
+        let mut request = SemanticQuery::new("items", "embedding", query.clone(), expected.len());
+        request.search_mode = Some(mode);
+        match db.semantic_search(request) {
+            Ok(rows) => {
+                assert_eq!(rows.len(), expected.len());
+                for row in rows {
+                    let Some(Value::Int64(id)) = row.values.get("id") else {
+                        panic!("Rust publishes identity")
+                    };
+                    if row.vector_score.to_bits() != expected[id] {
+                        failures.push(format!(
+                            "Rust {name} row={id} actual={} expected={}",
+                            row.vector_score.to_bits(),
+                            expected[id]
+                        ));
+                    }
+                }
+            }
+            Err(error) => failures.push(format!(
+                "Rust {name} must publish canonical score, refused: {error:?}"
+            )),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    db.close().unwrap();
+}

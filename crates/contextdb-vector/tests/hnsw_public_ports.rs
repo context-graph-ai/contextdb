@@ -958,7 +958,14 @@ fn a_page_scored_vector_matches_the_score_its_own_body_gives() {
         .0;
         for hit in answer {
             let vector = &vectors.iter().find(|(id, _)| *id == hit.row).unwrap().1;
-            let from_body = contextdb_vector::cosine_similarity(vector, &q);
+            let (dot, aa, bb) = vector.iter().zip(&q).fold(
+                (0.0_f64, 0.0_f64, 0.0_f64),
+                |(dot, aa, bb), (&a, &b)| {
+                    let (a, b) = (f64::from(a), f64::from(b));
+                    (dot + a * b, aa + a * a, bb + b * b)
+                },
+            );
+            let from_body = (dot / (aa.sqrt() * bb.sqrt())) as f32;
             let from_pages = (1. - hit.distance) as f32;
             assert_eq!(
                 from_pages.to_bits(),
@@ -1249,8 +1256,26 @@ fn a_selective_filter_does_not_cost_the_graph_its_answer() {
                     failures.push(format!("route={route} population={population} every={every} recall={matched}/{possible}"));
                 }
             }
+            let measured = Controlled::new(pages);
+            run(
+                &measured,
+                p,
+                &payer,
+                &selective_spread(2, 0, 32),
+                10,
+                Mode::Indexed,
+                |id| (id as usize - 1).is_multiple_of(50),
+            )
+            .unwrap();
+            let measured_distances = measured.distances.get();
+            let tight = measured_distances
+                .checked_sub(1)
+                .expect("the native query performs distance work");
+            println!(
+                "derived_tight_work route={route} population={population} measured={measured_distances} limit={tight}"
+            );
             let mut source = Controlled::new(pages);
-            source.distance_limit = Some(200);
+            source.distance_limit = Some(tight);
             let answer = run(
                 &source,
                 p,
