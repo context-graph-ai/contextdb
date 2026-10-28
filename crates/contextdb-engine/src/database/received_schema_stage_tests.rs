@@ -2730,7 +2730,7 @@ fn detached_stage_restamps_only_affected_row_edge_and_vector_mvcc() {
         lsn: Lsn(12),
     };
     db.accountant
-        .try_allocate(old_edge.estimated_bytes())
+        .try_allocate(contextdb_graph::GraphAdjEntry::from(old_edge.clone()).estimated_bytes())
         .expect("fund the graph fixture that finalization refunds");
     db.graph_store.apply_inserts(vec![old_edge.clone()]);
     let ddl = DdlChange::AlterTable {
@@ -3302,7 +3302,7 @@ fn staged_publication_moves_complete_replacements_across_derived_handles() {
         lsn: Lsn(1),
     };
     db.accountant
-        .try_allocate(graph_entry.estimated_bytes())
+        .try_allocate(contextdb_graph::GraphAdjEntry::from(graph_entry.clone()).estimated_bytes())
         .expect("fund the graph fixture that finalization refunds");
     db.graph_store.apply_inserts(vec![graph_entry]);
     let vector_index = VectorIndexRef::new("kept", "embedding");
