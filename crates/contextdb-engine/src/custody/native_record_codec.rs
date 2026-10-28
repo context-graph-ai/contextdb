@@ -206,6 +206,8 @@ pub(crate) fn verify_signature(
     signature.copy_into(&mut sig)?;
     let sig = ed25519_dalek::Signature::from_bytes(&sig);
     let bytes = finite_bytes(owner, walk)?;
+    #[cfg(test)]
+    crate::identity::PAGING_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     key.verify(bytes.bytes(), &sig)
         .map_err(|_| Failure::Invalid(Invalid::Signature))
 }

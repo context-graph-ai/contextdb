@@ -1494,6 +1494,12 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
             .accepted
     };
     let before = accepted();
+    // Count actual Ed25519 operations only during the lost-page and resume
+    // exchanges, after fixture seeding has completed.
+    let signature_start =
+        crate::identity::PAGING_SIGNATURES.load(std::sync::atomic::Ordering::Relaxed);
+    let verification_start =
+        crate::identity::PAGING_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
 
     let lossy = SyncClient::with_authenticated_transport_and_identity_for_test(
         world.edge_db.clone(),
@@ -1530,6 +1536,25 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
     assert_eq!(fetched.len(), backlog);
     assert_eq!(accepted(), backlog as u64);
     assert_eq!(served, (1 + backlog.div_ceil(page), 0));
+    let delivered_records = backlog + usize::try_from(after_loss).unwrap();
+    // Each delivered packet carries a terminal and certificate signature.
+    // At most one verification per signed component at each of the two ends.
+    let signed_components = ["terminal", "certificate"];
+    let verification_ends = ["server", "client"];
+    let verification_limit =
+        delivered_records * signed_components.len() * verification_ends.len();
+    let signatures = crate::identity::PAGING_SIGNATURES
+        .load(std::sync::atomic::Ordering::Relaxed) - signature_start;
+    let verifications = crate::identity::PAGING_VERIFICATIONS
+        .load(std::sync::atomic::Ordering::Relaxed) - verification_start;
+    assert!(
+        signatures <= delivered_records,
+        "one certificate signing per delivered record: {signatures} for {delivered_records}"
+    );
+    assert!(
+        verifications <= verification_limit,
+        "bounded signed-component verifications: {verifications} > {verification_limit}"
+    );
     hub.stop();
     assert_eq!(settled(&requests, native_root_bytes_for_test()), native_root_bytes_for_test());
     }

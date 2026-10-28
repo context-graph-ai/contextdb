@@ -111,6 +111,8 @@ impl FabricIdentity {
     pub(crate) fn sign_lineage(&self, bytes: &[u8]) -> Vec<u8> {
         use ed25519_dalek::Signer as _;
 
+        #[cfg(test)]
+        PAGING_SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ed25519_dalek::SigningKey::from_bytes(&self.seed)
             .sign(bytes)
             .to_bytes()
@@ -120,6 +122,8 @@ impl FabricIdentity {
     /// Native sibling: the original fabric seed, with a stack-only signature.
     pub(crate) fn sign_lineage_fixed(&self, bytes: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer as _;
+        #[cfg(test)]
+        PAGING_SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ed25519_dalek::SigningKey::from_bytes(&self.seed)
             .sign(bytes)
             .to_bytes()
@@ -154,6 +158,8 @@ impl FabricIdentity {
         let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|err| {
             Error::SyncError((format!("invalid lineage signature encoding: {err}")).into())
         })?;
+        #[cfg(test)]
+        PAGING_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         verifying.verify(bytes, &signature).map_err(|_| {
             Error::SyncError(
                 ("wire row lineage signature does not verify for its author".to_string()).into(),
@@ -193,3 +199,10 @@ fn hex_node_id(node_id: &str) -> contextdb_core::Result<[u8; 32]> {
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+pub(crate) static PAGING_SIGNATURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static PAGING_VERIFICATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
