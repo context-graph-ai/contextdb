@@ -2073,29 +2073,27 @@ fn open_direct_route(
     config.read_cache_share = resources.current_read_cache_share();
     config.runtime_dir = coordination_runtime;
     let opened = match handover {
-        Some(handover) => crate::direct_file_reader::DirectFileReader::open_with_route_deadline(
-            path,
-            config,
-            handover.cancellation,
-            handover.deadline_ms,
-        ),
+        Some(handover) => {
+            // Native saved-file capture spends the caller's opening budget,
+            // independently of the allowance spent discovering this route.
+            let opening_deadline = resources
+                .expiry
+                .clock
+                .now_ms()
+                .saturating_add(options.limits.active_ms);
+            crate::direct_file_reader::DirectFileReader::open_with_route_deadline(
+                path,
+                config,
+                handover.cancellation,
+                opening_deadline,
+            )
+        }
         None => crate::direct_file_reader::DirectFileReader::open(path, config),
     };
     match opened {
         Ok(reader) => {
             observe(ReadSessionEvent::DirectBackendOpen);
             Ok(SelectedRoute::File(Box::new(reader)))
-        }
-        Err(crate::direct_file_reader::DirectFileReaderError::ReadFailure(failure))
-            if handover.is_some()
-                && matches!(failure.detail(),
-                contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
-                    if detail.limit == contextdb_core::read_contract::ReadFailureLimit::ActiveMs) =>
-        {
-            Err(RouteOpenRefusal {
-                failure: ReadRouteOpenFailure::OwnerHeldWithoutDecision,
-                error: Error::ReadFailure(owner_not_serving()),
-            })
         }
         Err(error) => Err(classify_direct_open_failure(path, error)),
     }
@@ -2662,10 +2660,10 @@ impl ReadSession {
             let budget = crate::executor::ReadPublicationBudget {
                 clock: Arc::clone(&clock),
                 cancellation: cancellation.clone(),
-                started_ms,
-                // Publication expires strictly after active_ms; use the
-                // handover's original absolute routing deadline here too.
-                active_ms: self.options.timeouts.routing_retry_ms.saturating_sub(1),
+                // This source check has the caller's read budget. Time spent
+                // finding a replacement route cannot expire the saved image.
+                started_ms: clock.now_ms(),
+                active_ms: self.options.limits.active_ms,
             };
             match reader.check_turnover_with_budget(&budget) {
                 Ok(()) => Ok(None),
@@ -2676,20 +2674,6 @@ impl ReadSession {
                     // reads let the kernel decide which tables are affected;
                     // owner-only requests preserve this exact erasure answer.
                     Ok(Some(failure))
-                }
-                Err(Error::ReadFailure(failure))
-                    if matches!(failure.detail(),
-                        contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
-                            if detail.limit == contextdb_core::read_contract::ReadFailureLimit::ActiveMs) =>
-                {
-                    Err(Error::ReadFailure(
-                        contextdb_core::read_contract::ReadFailure::new(
-                            contextdb_core::read_contract::ReadFailureKind::OwnerNotServing,
-                            contextdb_core::read_contract::ReadFailureDetail::Reason {
-                                reason: "the caller's routing deadline expired while checking authoritative erasure before changing read routes".to_owned(),
-                            },
-                        ).expect("owner-not-serving refusal carries a reason"),
-                    ))
                 }
                 Err(other) => Err(other),
             }
