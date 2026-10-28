@@ -7361,3 +7361,5 @@ include!("received_closeout_guards.rs");
 include!("received_restatement_public_guards.rs");
 
 include!("received_native_alias_guards.rs");
+
+include!("received_legacy_growth_guards.rs");
