@@ -111,6 +111,8 @@ pub struct BlobStore {
     db: Arc<Database>,
     policy: MovementPolicy,
     identity_path: PathBuf,
+    #[cfg(any(test, feature = "test-seams"))]
+    reclaim_sweep_observer: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Lazily opened content-addressed store (under the identity's
     /// directory); an open failure surfaces typed at the first use.
     store: OnceLock<std::result::Result<Arc<BlobStoreHandle>, String>>,
@@ -347,6 +349,8 @@ impl BlobStore {
             db,
             policy,
             identity_path,
+            #[cfg(any(test, feature = "test-seams"))]
+            reclaim_sweep_observer: Mutex::new(None),
             store: OnceLock::new(),
             test_clock: Arc::new(Mutex::new(None)),
             claim_refresh: Arc::new(Mutex::new(None)),
@@ -354,6 +358,17 @@ impl BlobStore {
             fetch_policy: Mutex::new(BlobFetchPolicy::default()),
             wedge_next_fetch_for_test: AtomicBool::new(false),
         }
+    }
+
+    /// Observe the next completed owned-driver sweep.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn observe_next_reclaim_sweep_for_test(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self
+            .reclaim_sweep_observer
+            .lock()
+            .expect("reclaim observer lock") = Some(sender);
+        receiver
     }
 
     /// Declare the whole-fetch-attempt bound this instance's
@@ -1127,6 +1142,15 @@ impl BlobStore {
                 });
                 if let Err(err) = result {
                     tracing::warn!("blob reclaim sweep failed: {err}");
+                }
+                #[cfg(any(test, feature = "test-seams"))]
+                if let Some(observer) = self
+                    .reclaim_sweep_observer
+                    .lock()
+                    .expect("reclaim observer lock")
+                    .take()
+                {
+                    let _ = observer.send(());
                 }
             }
         })
