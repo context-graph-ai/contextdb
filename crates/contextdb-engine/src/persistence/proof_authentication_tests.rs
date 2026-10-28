@@ -92,6 +92,11 @@ fn damage_leaf_key(
     )
 )]
 fn read_failure(database: &redb::Database, records: &[ContentIdentityMutation]) -> Error {
+    // Raw proof verification has no public request to supply its decode owner.
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     let read = database.begin_read().unwrap();
     let verifier =
         ContentIdentityReadVerifier::open(&read, std::path::Path::new("proofs.db"), None).unwrap();

@@ -520,6 +520,11 @@ fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identic
     )
 )]
 fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
+    // Raw proof verification has no public request to supply its decode owner.
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("oversized-damage.db")).unwrap();
     let write = db.begin_write().unwrap();
