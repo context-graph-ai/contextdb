@@ -4,6 +4,12 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Behavior change.** `VECTOR(0)` declarations are refused with a typed error;
+  vector dimensions must be at least 1.
+- **Behavior change.** SQL and Rust vector search in `INDEXED`, `AUTO`, and
+  `EXACT` modes publish the same score: the stored vector's double-precision
+  rerank rounded to the public `f32` representation.
+
 - **Added.** `Database::register_transactional_trigger_callback` is the documented
   name for transactional trigger handlers; `register_trigger_callback` remains available.
 - **Added.** Post-commit sink delivery reports uncertain outcomes through

@@ -305,6 +305,12 @@ pub(crate) fn reset_with(table: &str, col: &mut ColumnDef, members: &[String]) -
     validate(table, col)
 }
 pub(crate) fn validate(table: &str, col: &ColumnDef) -> Result<()> {
+    if matches!(col.column_type, contextdb_core::ColumnType::Vector(0)) {
+        return Err(Error::InvalidVectorPolicyDeclaration {
+            index: VectorIndexRef::new(table, &col.name),
+            issue: contextdb_core::VectorPolicyDeclarationIssue::DimensionsNotPositive,
+        });
+    }
     let p = &col.vector_engine_policy;
     if col
         .search_target_accuracy_hundredths

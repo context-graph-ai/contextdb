@@ -554,6 +554,10 @@ CREATE TABLE media (
 
 Valid quantization values are `F32`, `SQ8`, and `SQ4`; the default is `F32`.
 
+A `VECTOR(n)` declaration requires `n` to be at least 1. `VECTOR(0)` is refused before
+publishing the schema with `InvalidVectorPolicyDeclaration` and the
+`DimensionsNotPositive` issue: "vector dimensions must be at least 1".
+
 A `VECTOR(n)` column holds embeddings and nothing else. Every write door — `INSERT`, `UPDATE`, a
 conditional `UPDATE`, `ON CONFLICT ... DO UPDATE`, and a column default — accepts an embedding of
 the declared dimension, the text spelling of one (`'[0.1, 0.2, 0.3]'`), or `NULL` where the column

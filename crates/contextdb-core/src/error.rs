@@ -861,6 +861,8 @@ pub enum VectorPartitionDeclarationIssue {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum VectorPolicyDeclarationIssue {
+    #[error("vector dimensions must be at least 1")]
+    DimensionsNotPositive,
     #[error("unknown WITH member {member}")]
     UnknownMember { member: String },
     #[error("{member} has an invalid vector policy value")]
