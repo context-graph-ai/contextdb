@@ -706,6 +706,24 @@ impl Database {
 
 #[cfg(feature = "test-seams")]
 impl Database {
+    /// Publish private fixture bytes through the original writer's ordinary
+    /// native transaction, root binding and recovery publication sequence.
+    #[doc(hidden)]
+    pub fn with_native_ivf_fixture_write_for_test<T>(
+        &self,
+        run: impl FnOnce(&redb::WriteTransaction) -> Result<T>,
+    ) -> Result<T> {
+        let _operation = self.assert_open_operation();
+        self.with_commit_lock(|| {
+            self.persistence
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Other("native fixture write requires a file-backed writer".into())
+                })?
+                .with_native_ivf_fixture_write_for_test(run)
+        })
+    }
+
     /// Borrow a real registered writer snapshot and its original native
     /// admission for independent physical read and custody guards.
     #[doc(hidden)]

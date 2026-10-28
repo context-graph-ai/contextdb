@@ -763,13 +763,6 @@ impl RedbPersistence {
     /// container publication sequence as descriptor corruption. The closure
     /// may leave a value's own checksum invalid while the container is rebound.
     #[cfg(feature = "test-seams")]
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: native fixture writer is called by independently authored engine unit guards under cfg(test)"
-        )
-    )]
     pub(crate) fn with_native_ivf_fixture_write_for_test<T>(
         &self,
         run: impl FnOnce(&redb::WriteTransaction) -> Result<T>,
