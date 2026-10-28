@@ -9315,7 +9315,7 @@ mod read_authentication_batch_tests {
             .unwrap();
             drop(roots);
             let stored_key = node_storage_key(LogicalFamily::Relational, &root);
-            let mut pages = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+            let mut pages = crate::persistence::content_identity::payloads::open(&write).unwrap();
             let mut encoded = pages
                 .get(stored_key.as_slice())
                 .unwrap()
@@ -9351,8 +9351,7 @@ mod read_authentication_batch_tests {
             .root
             .unwrap();
             drop(roots);
-            write
-                .open_table(CONTENT_IDENTITY_NODES_TABLE)
+            crate::persistence::content_identity::payloads::open(&write)
                 .unwrap()
                 .remove(node_storage_key(LogicalFamily::Relational, &root).as_slice())
                 .unwrap();
@@ -9594,8 +9593,7 @@ pub(super) mod test_access {
     )]
     pub(crate) fn damage_one_leaf_chunk_in_write(write: &redb::WriteTransaction) -> bool {
         let family = LogicalFamily::Relational;
-        let mut nodes = write
-            .open_table(CONTENT_IDENTITY_NODES_TABLE)
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write)
             .expect("the proof node table exists");
         let mut target = None;
         for row in nodes.iter().expect("iterate stored chunks") {
