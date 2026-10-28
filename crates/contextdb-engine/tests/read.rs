@@ -230,3 +230,7 @@ mod a_companionless_reader_adopts_an_unchanged_first_writer;
 mod an_erased_reader_keeps_its_erasure_answer_when_asking_for_its_owner;
 #[path = "read/read_cache_share_cancelled_statement.rs"]
 mod read_cache_share_cancelled_statement;
+
+#[cfg(unix)]
+#[path = "read/turnover_routing_expiry_preserves_saved_reads.rs"]
+mod turnover_routing_expiry_preserves_saved_reads;
