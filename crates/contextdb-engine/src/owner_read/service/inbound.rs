@@ -144,8 +144,12 @@ pub(super) fn receive(
         else {
             return Err(crate::local_transport::invalid_channel_data());
         };
-        let node = node_credit(reading.query_request_provider().original_owner())
-            .map_err(|error| query_funding::transport_error(error, prefix.limits.memory))?;
+        let node = node_credit(
+            boundary
+                .query_funding()
+                .unwrap_or_else(|| reading.query_request_provider().original_owner()),
+        )
+        .map_err(|error| query_funding::transport_error(error, prefix.limits.memory))?;
         return Ok(ConnectionEvent::Request(ReceivedRequest {
             envelope,
             query: None,

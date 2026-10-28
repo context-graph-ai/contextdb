@@ -1432,6 +1432,8 @@ pub struct OwnerReadService {
     channel_source_items: Arc<AtomicU64>,
     #[cfg(any(test, feature = "test-seams"))]
     live_service_counted: AtomicBool,
+    #[cfg(any(test, feature = "test-seams"))]
+    resource_observation: crate::vector_read_memory::service_observation::ServiceObservation,
 }
 
 impl OwnerReadService {
@@ -1445,6 +1447,11 @@ impl OwnerReadService {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_owner_service_start();
         spec.validate()?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let resource_observation =
+            crate::vector_read_memory::service_observation::ServiceObservation::new();
+        #[cfg(any(test, feature = "test-seams"))]
+        let _resource_scope = resource_observation.enter();
         let admission = OwnerAdmission::new(spec.config.limits)?;
         #[cfg(unix)]
         let channel = spec.listener.bind()?;
@@ -1467,6 +1474,8 @@ impl OwnerReadService {
         #[cfg(unix)]
         let workers = Arc::new(OwnerServiceWorkers::new(accept_wake_writer));
         let service = Arc::new(Self {
+            #[cfg(any(test, feature = "test-seams"))]
+            resource_observation,
             spec,
             #[cfg(unix)]
             channel,
@@ -1721,8 +1730,7 @@ impl OwnerReadService {
         };
 
         let reading = self.reading_handle(connection_id);
-        let connection_parent: contextdb_core::read_memory::ReadMemoryOwner =
-            reading.query_request_provider().original_owner();
+        let connection_parent = connection_owner.clone();
         // The final-free native cell keeps the original parent invoice
         // through reader and concurrent shutdown-notifier aliases.
         let _reader_control = ReadCredit::try_new(
@@ -1779,9 +1787,13 @@ impl OwnerReadService {
         #[cfg(any(test, feature = "test-seams"))]
         let reader_received = Arc::clone(&self.received_requests);
         let reader_owner = connection_owner.clone();
+        #[cfg(any(test, feature = "test-seams"))]
+        let reader_resource_observation = self.resource_observation.clone();
         let reader_thread = std::thread::Builder::new()
             .name("contextdb-owner-reader".to_owned())
             .spawn(move || {
+                #[cfg(any(test, feature = "test-seams"))]
+                let _resource_scope = reader_resource_observation.enter();
                 let mut reader_stream = reader_stream;
                 let boundary = LocalProtocolBoundary::with_effective_limits(owner_limits);
                 boundary.set_query_funding(Some(reader_owner.clone()));
@@ -1986,6 +1998,8 @@ impl OwnerReadService {
             }
             _ => unreachable!("only requests enter the request pipeline"),
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        let _resource_scope = self.resource_observation.enter();
         let request_owner = if let Some(query) = query_keeper.as_ref() {
             query.budget.clone()
         } else if let Some(inbound::DeferredCause::Acquired { _owner, .. }) = deferred.as_ref() {
@@ -2079,10 +2093,7 @@ impl OwnerReadService {
                 controls.registration.clone(),
             )
         } else {
-            let parent: contextdb_core::read_memory::ReadMemoryOwner = self
-                .reading_handle(connection_id)
-                .query_request_provider()
-                .original_owner();
+            let parent = request_owner.clone();
             let owner = parent.clone();
             let invoice = ReadCredit::try_new(
                 parent,
@@ -2112,6 +2123,8 @@ impl OwnerReadService {
         let request_worker = std::thread::Builder::new()
             .name("contextdb-owner-request".to_owned())
             .spawn(move || {
+                #[cfg(any(test, feature = "test-seams"))]
+                let _resource_scope = worker_service.resource_observation.enter();
                 #[cfg(any(test, feature = "test-seams"))]
                 let _graph_observation = crate::read_work_probe::enter_owner_graph_scope(
                     &worker_service.spec.database,
@@ -2379,6 +2392,8 @@ impl OwnerReadService {
     )]
     pub fn resources(&self) -> OwnerReadResourceSnapshot {
         let usage = self.spec.database.accountant().usage();
+        #[cfg(any(test, feature = "test-seams"))]
+        let (reader_used_bytes, reader_control_bytes) = self.resource_observation.snapshot();
         OwnerReadResourceSnapshot {
             active_slots: self.admission.counters().active_readers,
             cursor_count: self.cursor_count.load(Ordering::SeqCst),
@@ -2393,18 +2408,9 @@ impl OwnerReadService {
             .unwrap_or(u64::MAX),
             accountant_used_bytes: u64::try_from(usage.used).unwrap_or(u64::MAX),
             #[cfg(any(test, feature = "test-seams"))]
-            reader_used_bytes: self
-                .spec
-                .database
-                .declared_read_memory_for_test()
-                .retained_bytes_for_test(),
+            reader_used_bytes,
             #[cfg(any(test, feature = "test-seams"))]
-            reader_control_bytes: self
-                .spec
-                .database
-                .declared_read_memory_for_test()
-                .standing_control_bytes()
-                .0,
+            reader_control_bytes,
         }
     }
 
@@ -4335,6 +4341,8 @@ impl OwnerReadService {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn shutdown_and_drain(&self) -> OwnerReadScaffoldResult<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _resource_scope = self.resource_observation.enter();
         let deadline_ms = self
             .spec
             .clock
@@ -4795,6 +4803,8 @@ fn run_owner_accept_loop(
             let spawned = std::thread::Builder::new()
                 .name("contextdb-owner-connection".to_owned())
                 .spawn(move || {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    let _resource_scope = connection_service.resource_observation.enter();
                     let owner = connection_service
                         .reading_handle(connection_id)
                         .declared_read_request_provider()

@@ -6,6 +6,9 @@ use contextdb_core::{
 use contextdb_vector::{MemoryBudget, VectorCopyAdmission};
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) mod service_observation;
+
 #[derive(Debug)]
 pub(crate) struct ReaderVectorBudget {
     reader: Arc<dyn ReadMemoryBudget>,
@@ -601,6 +604,8 @@ impl DeclaredReadRoot {
     ) -> std::result::Result<NativeReadChildReceipt, NativeRefusal> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
+        #[cfg(any(test, feature = "test-seams"))]
+        let service_observation = service_observation::ChildControl::prepare();
         self.try_reserve_native(
             control_bytes,
             "reader",
@@ -612,7 +617,16 @@ impl DeclaredReadRoot {
         let invoice = NativeChildInvoice {
             parent: self.clone(),
             bytes: control_bytes,
+            #[cfg(any(test, feature = "test-seams"))]
+            observation: service_observation,
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        let service_ticket = invoice
+            .observation
+            .as_ref()
+            .map(service_observation::ChildControl::id);
+        #[cfg(any(test, feature = "test-seams"))]
+        service_observation::controls(service_ticket, control_bytes);
         let payload = NativeDeclaredChild {
             parent: self.clone(),
             operation_limit: std::sync::atomic::AtomicU64::new(self.limit),
@@ -623,6 +637,8 @@ impl DeclaredReadRoot {
         #[cfg(any(test, feature = "test-seams"))]
         let initial_held = payload.retained.load(std::sync::atomic::Ordering::SeqCst);
         ReadMemoryOwner::try_native_typed(payload, invoice).map(|child| {
+            #[cfg(any(test, feature = "test-seams"))]
+            service_observation::bind(service_ticket, &child.retained);
             let owner = child.owner();
             #[cfg(all(test, feature = "test-seams"))]
             crate::database::ordinary_native_owner_tests::child_allocated(
@@ -648,6 +664,8 @@ impl DeclaredReadRoot {
     ) -> std::result::Result<(NativeReadChildReceipt, ReadCredit), NativeRefusal> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
+        #[cfg(any(test, feature = "test-seams"))]
+        let service_observation = service_observation::ChildControl::prepare();
         self.try_reserve_native(
             control_bytes,
             "reader",
@@ -659,7 +677,16 @@ impl DeclaredReadRoot {
         let invoice = NativeChildInvoice {
             parent: self.clone(),
             bytes: control_bytes,
+            #[cfg(any(test, feature = "test-seams"))]
+            observation: service_observation,
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        let service_ticket = invoice
+            .observation
+            .as_ref()
+            .map(service_observation::ChildControl::id);
+        #[cfg(any(test, feature = "test-seams"))]
+        service_observation::controls(service_ticket, control_bytes);
         let payload = NativeDeclaredChild {
             parent: self.clone(),
             operation_limit: std::sync::atomic::AtomicU64::new(self.limit),
@@ -676,10 +703,15 @@ impl DeclaredReadRoot {
         // retained counter intact; it does not refund or reserve again.
         let rollback = ReadCredit::from_prepaid_owned(self.original_owner(), bytes);
         #[cfg(any(test, feature = "test-seams"))]
+        let rollback =
+            service_observation::PendingPayloadCredit::new(rollback, service_ticket, bytes);
+        #[cfg(any(test, feature = "test-seams"))]
         let request_before = statement_child_proof::constructor_ordinal();
         #[cfg(any(test, feature = "test-seams"))]
         let initial_held = payload.retained.load(std::sync::atomic::Ordering::SeqCst);
         let child = ReadMemoryOwner::try_native_typed(payload, invoice)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        service_observation::bind(service_ticket, &child.retained);
         let owner = child.owner();
         #[cfg(any(test, feature = "test-seams"))]
         register_native_child_observer(self, &owner, &child, request_before, initial_held);
@@ -726,6 +758,8 @@ impl DeclaredReadRoot {
     ) -> Result<NativeReadChildReceipt> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
+        #[cfg(any(test, feature = "test-seams"))]
+        let service_observation = service_observation::ChildControl::prepare();
         self.try_reserve(
             control_bytes,
             "reader",
@@ -737,7 +771,16 @@ impl DeclaredReadRoot {
         let invoice = NativeChildInvoice {
             parent: self.clone(),
             bytes: control_bytes,
+            #[cfg(any(test, feature = "test-seams"))]
+            observation: service_observation,
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        let service_ticket = invoice
+            .observation
+            .as_ref()
+            .map(service_observation::ChildControl::id);
+        #[cfg(any(test, feature = "test-seams"))]
+        service_observation::controls(service_ticket, control_bytes);
         let payload = NativeDeclaredChild {
             parent: self.clone(),
             operation_limit: std::sync::atomic::AtomicU64::new(self.limit),
@@ -748,6 +791,8 @@ impl DeclaredReadRoot {
         #[cfg(any(test, feature = "test-seams"))]
         let initial_held = payload.retained.load(std::sync::atomic::Ordering::SeqCst);
         ReadMemoryOwner::try_native_typed_unqualified(payload, invoice).map(|child| {
+            #[cfg(any(test, feature = "test-seams"))]
+            service_observation::bind(service_ticket, &child.retained);
             let owner = child.owner();
             #[cfg(all(test, feature = "test-seams"))]
             crate::database::ordinary_native_owner_tests::child_allocated(
@@ -853,6 +898,8 @@ impl Drop for DeclaredReadMemory {
 struct NativeChildInvoice {
     parent: DeclaredReadRoot,
     bytes: usize,
+    #[cfg(any(test, feature = "test-seams"))]
+    observation: Option<service_observation::ChildControl>,
 }
 impl Drop for NativeChildInvoice {
     fn drop(&mut self) {
@@ -911,6 +958,7 @@ impl NativeDeclaredChild {
 #[cfg(any(test, feature = "test-seams"))]
 impl Drop for NativeDeclaredChild {
     fn drop(&mut self) {
+        service_observation::payload_dropped(&self.retained);
         native_child_identity(&self.parent, &self.retained, self as *const Self as usize);
         let identity = unregister_native_child_observer(&self.retained);
         if let Some(identity) = identity {
@@ -1028,6 +1076,8 @@ impl ReadMemoryBudget for NativeDeclaredChild {
             .file_child_high_water
             .fetch_max(held, std::sync::atomic::Ordering::SeqCst);
         #[cfg(any(test, feature = "test-seams"))]
+        service_observation::admitted(&self.retained, bytes);
+        #[cfg(any(test, feature = "test-seams"))]
         self.note_reader_budget_event(subsystem, operation, bytes, held);
         Ok(())
     }
@@ -1114,6 +1164,8 @@ impl ReadMemoryBudget for NativeDeclaredChild {
             .file_child_high_water
             .fetch_max(held, std::sync::atomic::Ordering::SeqCst);
         #[cfg(any(test, feature = "test-seams"))]
+        service_observation::admitted(&self.retained, bytes);
+        #[cfg(any(test, feature = "test-seams"))]
         self.note_reader_budget_event(subsystem, operation, bytes, held);
         Ok(())
     }
@@ -1147,6 +1199,8 @@ impl ReadMemoryBudget for NativeDeclaredChild {
             payload_before >= bytes as u64,
             "reader payload observation underflow"
         );
+        #[cfg(any(test, feature = "test-seams"))]
+        service_observation::released(&self.retained, bytes);
         #[cfg(any(test, feature = "test-seams"))]
         self.note_reader_budget_event("", "release", bytes, _before - bytes as u64);
         #[cfg(any(test, feature = "test-seams"))]
