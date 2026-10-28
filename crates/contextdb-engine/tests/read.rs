@@ -234,3 +234,7 @@ mod read_cache_share_cancelled_statement;
 #[cfg(unix)]
 #[path = "read/turnover_routing_expiry_preserves_saved_reads.rs"]
 mod turnover_routing_expiry_preserves_saved_reads;
+
+#[cfg(unix)]
+#[path = "read/graph_cancel_drain_guard.rs"]
+mod graph_cancel_drain_guard;
