@@ -84,20 +84,34 @@ mod received_legacy_growth_guards {
             ),
         };
         try_pushed_to_with_atomicity(&receiver, &author, served_by(&author, Lsn(0)), true).unwrap();
-        // Fixture seeding is outside the migration window. Fixed N-sized
-        // commits avoid making one enormous seed transaction the subject.
+        // Seed graph through the persistence bulk writer outside the measured
+        // migration. Entries use a committed seed transaction and LSN.
+        let mut seed_tx = None;
         for first in (0..count).step_by(N) {
             let tx = receiver.db.begin().unwrap();
             for i in first..(first + N).min(count) {
                 receiver.db.insert_row(tx, TABLE, row(i, 'a')).unwrap();
-                receiver
-                    .db
-                    .insert_edge(tx, source(i), target(i), KIND.into(), properties(i))
-                    .unwrap();
             }
             receiver.db.commit(tx).unwrap();
+            seed_tx = Some(tx);
         }
         let retained_at = receiver.db.current_lsn();
+        for first in (0..count).step_by(256) {
+            let edges: Vec<_> = (first..(first + 256).min(count))
+                .map(|i| contextdb_core::types::AdjEntry {
+                    source: source(i),
+                    target: target(i),
+                    edge_type: KIND.into(),
+                    properties: properties(i),
+                    created_tx: seed_tx.unwrap(),
+                    deleted_tx: None,
+                    lsn: retained_at,
+                })
+                .collect();
+            receiver.db.persistence.as_ref().unwrap()
+                .append_graph_edges_batch(&edges).unwrap();
+        }
+        let receiver = reopen(receiver, SEED);
         for first in (0..count).step_by(N) {
             let tx = receiver.db.begin().unwrap();
             for i in first..(first + N).min(count) {
