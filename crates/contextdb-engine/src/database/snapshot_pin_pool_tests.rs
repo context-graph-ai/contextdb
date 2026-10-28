@@ -1,8 +1,8 @@
 use super::*;
 
-fn open_db() -> (Database, Arc<MemoryAccountant>, usize) {
-    let accountant = Arc::new(MemoryAccountant::no_limit());
-    let db = Database::open_memory_with_accountant(accountant.clone());
+fn open_db() -> (Database, crate::memory_accounting::AccountantHandle, usize) {
+    let db = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let accountant = db.accountant.clone();
     let open_time_used = accountant.usage().used;
     (db, accountant, open_time_used)
 }
