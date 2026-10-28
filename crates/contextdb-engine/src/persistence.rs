@@ -7604,6 +7604,9 @@ mod search_page_reuse_tests;
 mod coordination_error_tests;
 
 #[cfg(all(test, target_os = "linux"))]
+mod reader_contention_test_helper;
+
+#[cfg(all(test, target_os = "linux"))]
 mod owner_cursor_admission_tests;
 
 #[cfg(all(test, target_os = "linux", feature = "test-seams"))]

@@ -1250,7 +1250,7 @@ fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention(
     let snapshot = pin.storage_identity();
 
     // A real unrelated store's leave holds its lifetime lock and store exclusion.
-    let (outcome, _) = super::reader_handoff_tests::during_unrelated_reader_leave(|| {
+    let (outcome, _) = super::reader_contention_test_helper::during_unrelated_reader_leave(|| {
         owner.audit_reader_snapshots_under_hold()
     });
 
