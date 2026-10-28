@@ -697,6 +697,7 @@ mod tests {
                 Some((TxId(1), Lsn(1))),
                 "old COW capture stays complete"
             );
+            drop(refusal);
             drop((old, damaged));
             drop(persistence);
             assert_eq!(writer.usage().used, 0);
