@@ -2577,30 +2577,26 @@ pub mod read_persistence_test_scaffold {
         /// `attempt` times, counting from one. Returns false if it has not
         /// within `limit` -- a registration that gave up never arrives again.
         pub fn wait_for_attempt_for_test(&self, attempt: u64, limit: std::time::Duration) -> bool {
-            let deadline = std::time::Instant::now() + limit;
             let (state, changed) = reader_registration_lock_pauses();
-            let mut state = state
+            let state = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            loop {
-                let arrivals = state
-                    .active
-                    .get(&self.identity)
-                    .filter(|run| run.token == self.token)
-                    .expect("reader registration pause was cancelled")
-                    .arrivals;
-                if arrivals >= attempt {
-                    return true;
-                }
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    return false;
-                }
-                state = changed
-                    .wait_timeout(state, deadline - now)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .0;
-            }
+            let (state, _) = changed
+                .wait_timeout_while(state, limit, |state| {
+                    state
+                        .active
+                        .get(&self.identity)
+                        .filter(|run| run.token == self.token)
+                        .expect("reader registration pause was cancelled")
+                        .arrivals < attempt
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .active
+                .get(&self.identity)
+                .filter(|run| run.token == self.token)
+                .expect("reader registration pause was cancelled")
+                .arrivals >= attempt
         }
 
         /// Let the paused registration continue from every arrival so far.

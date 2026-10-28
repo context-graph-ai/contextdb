@@ -749,7 +749,10 @@ fn last_reader_close_race_child() {
             .join()
             .expect("leave completes before join publication");
     }
-    assert!(pause.wait_for_attempt_for_test(1, std::time::Duration::from_secs(30)));
+    assert!(
+        pause.wait_for_attempt_for_test(1, std::time::Duration::from_secs(30)),
+        "reader registration pause never delivered"
+    );
     // Joining owns the stable runtime root before opening its registry
     // descriptor. A last leaver cannot unlink that descriptor at either
     // checkpoint; inspect the actual cross-process lock, not a retry counter.
