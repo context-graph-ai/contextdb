@@ -279,13 +279,14 @@ fn cache_capacity_refusal_precedes_unpaid_allocation_and_backend_io() {
 #[test]
 #[serial]
 fn failed_legacy_scan_read_preserves_growth_and_success_consumes_once() {
+    let allowance = redb::ScanAllowance::new();
+    let before = allowance
+        .legacy_growth_for_test()
+        .expect("actual legacy allowance");
+    let resumed = allowance.clone();
+    assert_eq!(resumed.legacy_growth_for_test(), Some(before));
+    let mut failed_reads = 0;
     with_fixture(|fixture, controls, state| {
-        let allowance = redb::ScanAllowance::new();
-        let before = allowance
-            .legacy_growth_for_test()
-            .expect("actual legacy allowance");
-        let resumed = allowance.clone();
-        assert_eq!(resumed.legacy_growth_for_test(), Some(before));
         {
             let _scan = allowance.enter();
             state.fail.store(true, Ordering::SeqCst);
@@ -305,7 +306,14 @@ fn failed_legacy_scan_read_preserves_growth_and_success_consumes_once() {
                 "failed I/O leaves no cache occupancy"
             );
         }
-        state.fail.store(false, Ordering::SeqCst);
+        failed_reads = state.reads.load(Ordering::SeqCst);
+        drop(controls);
+        drop(fixture);
+    });
+    // A real I/O error permanently poisons that CachedFile. Continue through
+    // a fresh authenticated backend/cache, retaining the SAME allowance Arc.
+    with_fixture(|fixture, controls, state| {
+        assert_eq!(resumed.legacy_growth_for_test(), Some(before));
         let consumed;
         {
             let _scan = resumed.enter();
@@ -330,7 +338,7 @@ fn failed_legacy_scan_read_preserves_growth_and_success_consumes_once() {
                 "the second read is the same cached backing"
             );
             assert_eq!(
-                state.reads.load(Ordering::SeqCst),
+                failed_reads + state.reads.load(Ordering::SeqCst),
                 2,
                 "only failed read and successful retry reached I/O"
             );
