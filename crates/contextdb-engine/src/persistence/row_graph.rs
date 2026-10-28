@@ -330,7 +330,16 @@ impl RedbPersistence {
         stage: &ReceivedSchemaPersistenceProjection,
         original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
     ) -> Result<()> {
+        Self::erase_row_graph_in_write(write, &stage.dropped_row_graph)?;
         for table in &stage.affected_tables {
+            if stage
+                .retired_row_graph_tables
+                .iter()
+                .any(|retired| retired == table)
+            {
+                self.retire_row_graph_table_in_write(write, table, original)?;
+                continue;
+            }
             if stage
                 .table_meta
                 .get(table)

@@ -7259,6 +7259,9 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     pub(crate) row_adj_inserts: Vec<contextdb_tx::OwnedAdjEntry>,
     pub(crate) row_adj_deletes: Vec<(contextdb_tx::OwnedAdjEntry, TxId)>,
     pub(crate) dropped_row_graph: Vec<contextdb_tx::OwnedAdjEntry>,
+    /// Every graph ownership lifetime ended by this unit, even if a later
+    /// declaration restores the table's graph shape.
+    pub(crate) retired_row_graph_tables: Vec<String>,
     /// The optional SAME public write opened during native received preparation.
     pub(crate) working_write: parking_lot::Mutex<Option<received_working::ReceivedWorkingWrite>>,
     /// A data-empty received declaration whose row/column projection stays

@@ -2969,6 +2969,57 @@ impl Database {
         Ok(changed.into_iter().collect())
     }
 
+    /// An old CREATE can describe the current table only as part of its
+    /// complete, exactly matched local history. Rebuild the arriving table
+    /// image independently; applying CREATE over the live image would preserve
+    /// later local columns and falsely certify a partial historical echo.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn received_schema_restatement_is_complete(
+        &self,
+        changes: &ChangeSet,
+        all_occurrences_match: bool,
+    ) -> Result<bool> {
+        if !all_occurrences_match
+            || !changes
+                .ddl
+                .iter()
+                .any(|ddl| matches!(ddl, DdlChange::CreateTable { .. }))
+        {
+            return Ok(false);
+        }
+        let (_live_charge, current) =
+            self.selected_received_catalog(changes, std::iter::empty())?;
+        let (_incoming_charge, mut incoming) =
+            self.selected_received_catalog(changes, std::iter::empty())?;
+        for ddl in &changes.ddl {
+            if let DdlChange::CreateTable { name, .. } = ddl {
+                incoming.remove(name);
+            }
+        }
+        for ddl in &changes.ddl {
+            Self::apply_sync_table_ddl_to_projected_meta(&mut incoming, ddl);
+        }
+        let comparison_bytes = current
+            .iter()
+            .chain(incoming.iter())
+            .map(|(table, meta)| {
+                table.len() + meta.metadata_bytes() + std::mem::size_of::<(String, TableMeta)>() * 2
+            })
+            .sum();
+        let _comparison_charge = StagedCopyCharge::admit_for_host(
+            &self.tx_mgr,
+            &self.finalization.accountant,
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+            comparison_bytes,
+            "compare_received_bootstrap_catalog",
+        )?;
+        Ok(Self::canonical_received_schema_tables(&current)
+            == Self::canonical_received_schema_tables(&incoming))
+    }
+
     /// Whether a schema-only unit with no signed provenance would change
     /// nothing here. Such a unit has no replay identity or receipt to record,
     /// so installing it would only allocate a local commit position for work
@@ -3013,6 +3064,7 @@ impl Database {
             &side_semantic,
             &live_event_bus,
             &live_trigger,
+            false,
         ))
     }
 
@@ -3024,6 +3076,7 @@ impl Database {
         side_semantic: &ReceivedSchemaSemanticProjection,
         live_event_bus: &event_bus::EventBusDefinitions,
         live_trigger: &BTreeMap<String, TriggerDeclaration>,
+        restates_complete_local_history: bool,
     ) -> bool {
         // A CREATE that restates a table the receiver already has, but with a
         // different column list or structured descriptors that CONTRADICT it,
@@ -3035,26 +3088,30 @@ impl Database {
         // come back `Ok` with no conflict, silently accepting a peer whose
         // table disagrees with this node's. The unit is not a no-op; let it
         // reach the apply that reports it.
-        let restated_shape_disagrees = changes.ddl.iter().any(|ddl| match ddl {
-            DdlChange::CreateTable {
-                name,
-                columns,
-                constraints,
-                foreign_keys,
-                composite_foreign_keys,
-                composite_unique,
-            } => live_tables.get(name).is_some_and(|local| {
-                !sync_table_shape_matches(
-                    local,
+        // Exact complete local occurrence matches prove an authored CREATE
+        // followed by ALTER already happened here. Its initial CREATE need
+        // not match the current, later shape; the final projection still must.
+        let restated_shape_disagrees = !restates_complete_local_history
+            && changes.ddl.iter().any(|ddl| match ddl {
+                DdlChange::CreateTable {
+                    name,
                     columns,
                     constraints,
                     foreign_keys,
                     composite_foreign_keys,
                     composite_unique,
-                ) || !sync_table_columns_match(local, columns)
-            }),
-            _ => false,
-        });
+                } => live_tables.get(name).is_some_and(|local| {
+                    !sync_table_shape_matches(
+                        local,
+                        columns,
+                        constraints,
+                        foreign_keys,
+                        composite_foreign_keys,
+                        composite_unique,
+                    ) || !sync_table_columns_match(local, columns)
+                }),
+                _ => false,
+            });
         // Dropping a table the receiver holds is never nothing, even when a
         // later CREATE in the same unit restores the same shape: the table's
         // rows go, and the recreated table is a new incarnation with a new
@@ -3364,12 +3421,21 @@ impl Database {
                 RedbPersistence::encode_config_value(occurrence)?,
             ));
         }
+        // Matching historical statements alone is insufficient: an old
+        // CREATE without its later ALTER must not bless a different current
+        // shape. Reconstruct the arriving table declarations independently,
+        // using the same admitted, dependency-selected catalog owner.
+        let restates_complete_local_history = self.received_schema_restatement_is_complete(
+            changes,
+            superseded_occurrences.len() == changes.ddl.len(),
+        )?;
         let schema_projection_noop = Self::received_schema_unit_is_projection_noop(
             changes,
             &live_tables,
             &side_semantic,
             &live_event_bus,
             &live_trigger,
+            restates_complete_local_history,
         );
         // Lets a test see whether vector rows reached this received schema
         // unit or arrived in a separate data unit.
@@ -3623,6 +3689,7 @@ impl Database {
                     row_adj_inserts: Vec::new(),
                     row_adj_deletes: Vec::new(),
                     dropped_row_graph: Vec::new(),
+                    retired_row_graph_tables: Vec::new(),
                     working_write: parking_lot::Mutex::new(None),
                     schema_noop: true,
                     affected_tables: HashSet::new(),
@@ -4016,6 +4083,47 @@ impl Database {
                 })
                 .transpose()?;
             let mut refused_result = None;
+            // Replay declaration lifetimes separately from the final schema image.
+            // The list and its strings are admitted before allocating and retained
+            // with the stage; the scratch catalog has its own existing owner.
+            let retired_graph_bytes = stage_shape_changes
+                .ddl
+                .iter()
+                .filter_map(Self::ddl_affected_table)
+                .map(|table| table.len().saturating_add(std::mem::size_of::<String>()))
+                .sum();
+            let retired_graph_charge = StagedCopyCharge::admit_for_host(
+                &self.tx_mgr,
+                &self.finalization.accountant,
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+                retired_graph_bytes,
+                "received_row_graph_lifetimes",
+            )?;
+            let mut retired_row_graph_tables = Vec::with_capacity(
+                stage_shape_changes
+                    .ddl
+                    .iter()
+                    .filter_map(Self::ddl_affected_table)
+                    .count(),
+            );
+            {
+                let (_catalog_charge, mut catalog) =
+                    self.selected_received_catalog(&stage_shape_changes, std::iter::empty())?;
+                for ddl in &stage_shape_changes.ddl {
+                    let before = Self::ddl_affected_table(ddl)
+                        .and_then(|table| catalog.get(table))
+                        .is_some_and(has_graph_edge_table_shape);
+                    Self::apply_sync_table_ddl_to_projected_meta(&mut catalog, ddl);
+                    if let Some(table) = Self::ddl_affected_table(ddl) {
+                        if before
+                            && !catalog.get(table).is_some_and(has_graph_edge_table_shape)
+                            && !retired_row_graph_tables.iter().any(|name| name == table)
+                        {
+                            retired_row_graph_tables.push(table.to_owned());
+                        }
+                    }
+                }
+            }
             let prepare_attempt = || -> Result<Option<ReceivedSchemaStage>> {
                 if let Some(catalog) = &working_vectors {
                     catalog.activate(&working.vector_store, vector_copy_owner)?;
@@ -5509,6 +5617,7 @@ impl Database {
                     row_adj_inserts: finalized_write_set.row_adj_inserts.clone(),
                     row_adj_deletes: finalized_write_set.row_adj_deletes.clone(),
                     dropped_row_graph,
+                    retired_row_graph_tables,
                     working_write: parking_lot::Mutex::new(None),
                     schema_noop: false,
                     affected_tables: affected_tables.clone(),
@@ -5593,6 +5702,7 @@ impl Database {
                             .into(),
                     ));
                 }
+                metadata_copy_charges.push(retired_graph_charge)?;
                 metadata_copy_charges.push(
                     side_metadata_charge
                         .take()

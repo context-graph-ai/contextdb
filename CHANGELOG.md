@@ -4,6 +4,12 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Behavior change.** An atomic received sync unit can retain several ordered
+  replay positions and commits at one final acceptance position. Apply results
+  and acknowledgements identify that final position; one apply can advance the
+  position by more than one. Resuming inside a unit replays the complete unit
+  without duplicating its committed effects.
+
 - **Added.** `Database::register_transactional_trigger_callback` is the documented
   name for transactional trigger handlers; `register_trigger_callback` remains available.
 - **Added.** Post-commit sink delivery reports uncertain outcomes through

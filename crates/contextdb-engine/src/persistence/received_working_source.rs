@@ -205,22 +205,6 @@ impl WorkingReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn remove_private_graph_identity(
-        &self,
-        source: NodeId,
-        kind: &str,
-        target: NodeId,
-    ) -> Result<()> {
-        self.context(|context| {
-            context
-                .write
-                .remove_graph_identity(context.original, source, kind, target)
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn rewrite_private_graph(
         &self,
         transform: impl FnMut(&mut AdjEntry) -> Result<super::received_working_graph::GraphRewrite>,

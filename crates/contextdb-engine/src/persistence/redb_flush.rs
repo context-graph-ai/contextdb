@@ -1686,13 +1686,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let graph_commit_support =
                 Self::capture_graph_commit_support(&write_txn, ws.commit_lsn)?;
             self.graph_writer_window(|| {
+                self.retire_received_shape_losses_in_write(&write_txn, stage, None)?;
                 Self::apply_received_row_graph_parts_in_write(
                     &write_txn,
                     &stage.row_adj_inserts,
                     &stage.row_adj_deletes,
-                    &stage.dropped_row_graph,
-                )?;
-                self.retire_received_shape_losses_in_write(&write_txn, stage, None)
+                    &[],
+                )
             })?;
             let indexes_to_rebuild = {
                 let stored_meta = write_txn
@@ -2907,13 +2907,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
             let graph_commit_support =
                 Self::capture_graph_commit_support(&write_txn, ws.commit_lsn)?;
             self.graph_writer_window(|| {
+                self.retire_received_shape_losses_in_write(&write_txn, stage, None)?;
                 Self::apply_received_row_graph_parts_in_write(
                     &write_txn,
                     &stage.row_adj_inserts,
                     &stage.row_adj_deletes,
-                    &stage.dropped_row_graph,
-                )?;
-                self.retire_received_shape_losses_in_write(&write_txn, stage, None)
+                    &[],
+                )
             })?;
             #[cfg(any(test, feature = "test-seams"))]
             crate::database::record_received_schema_persistence_profile_for_test(
