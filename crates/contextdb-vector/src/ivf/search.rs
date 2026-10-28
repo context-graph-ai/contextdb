@@ -271,6 +271,7 @@ fn search_impl<E>(
                                     snapshot_lsn,
                                     row,
                                 );
+                                source.check_cancel()?;
                                 if !eligible(identity).map_err(QueryError::Consumer)? {
                                     continue;
                                 }
