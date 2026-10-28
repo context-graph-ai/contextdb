@@ -322,7 +322,19 @@ impl ReadMemoryBudget for QueryOperationBudget {
                 && let Err(stop) = checkpoint.check()
             {
                 *self.pending_stop.lock().unwrap_or_else(|p| p.into_inner()) = Some(stop);
-                return Err(stop.into_error());
+                // The request is already on the wire. A cancelled client's
+                // response must reach its terminal before this channel can
+                // serve another request; abandoning a frame after its prefix
+                // would leave its body to be read as the next frame header.
+                // Preserve the cancellation for the public terminal while
+                // charging the drain to the same memory and response limits.
+                // Owner execution still stops at its cancellation checkpoint.
+                if !matches!(
+                    (&checkpoint, stop),
+                    (QueryCheckpoint::Client { .. }, QueryStop::Cancelled)
+                ) {
+                    return Err(stop.into_error());
+                }
             }
         }
         if self
