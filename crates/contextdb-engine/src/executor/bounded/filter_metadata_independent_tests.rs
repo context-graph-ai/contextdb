@@ -13,7 +13,7 @@ impl DeadlineClock for Clock {
         0
     }
     fn wait_until(&self, _: u64) -> DeadlineWait<'_> {
-        Box::pin(async {})
+        Box::pin(std::future::pending())
     }
 }
 fn limits() -> ReadLimits {

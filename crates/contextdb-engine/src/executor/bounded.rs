@@ -21966,7 +21966,7 @@ mod paged_vector_accounting_tests {
         }
 
         fn wait_until(&self, _: u64) -> DeadlineWait<'_> {
-            Box::pin(async {})
+            Box::pin(std::future::pending())
         }
     }
 
@@ -22108,16 +22108,18 @@ mod paged_vector_accounting_tests {
         ));
         let baseline = accountant.usage().used;
 
-        let mut opened = open_cursor(
-            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
-            &statement(rows),
-            &params(),
-            accountant.clone(),
-            limits(),
-            Arc::new(FrozenClock),
-            OwnerReadCancellation::new(),
-            None,
-        )
+        let mut opened = crate::owned_cursor_page::with_public_page(|| {
+            open_cursor(
+                Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+                &statement(rows),
+                &params(),
+                accountant.clone(),
+                limits(),
+                Arc::new(FrozenClock),
+                OwnerReadCancellation::new(),
+                None,
+            )
+        })
         .expect("open a paged vector cursor");
         let first_page = opened
             .first_page
@@ -22134,12 +22136,14 @@ mod paged_vector_accounting_tests {
         let mut more = first_page.has_more();
         let page = NonZeroUsize::new(8).expect("a non-zero page");
         while more {
-            let fetched = fetch_cursor(
-                &mut opened.cursor,
-                Some(page),
-                OwnerReadCancellation::new(),
-                None,
-            )
+            let fetched = crate::owned_cursor_page::with_public_page(|| {
+                fetch_cursor(
+                    &mut opened.cursor,
+                    Some(page),
+                    OwnerReadCancellation::new(),
+                    None,
+                )
+            })
             .expect("a paged vector cursor fetches its next page");
             let fetched_page = fetched
                 .page
@@ -22168,16 +22172,18 @@ mod paged_vector_accounting_tests {
             original_trace_credit,
         );
 
-        let mut replacement = open_cursor(
-            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
-            &statement(rows),
-            &params(),
-            accountant.clone(),
-            limits(),
-            Arc::new(FrozenClock),
-            OwnerReadCancellation::new(),
-            None,
-        )
+        let mut replacement = crate::owned_cursor_page::with_public_page(|| {
+            open_cursor(
+                Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+                &statement(rows),
+                &params(),
+                accountant.clone(),
+                limits(),
+                Arc::new(FrozenClock),
+                OwnerReadCancellation::new(),
+                None,
+            )
+        })
         .expect("a second query replaces the retained last-query trace");
         let replacement_first_page = replacement
             .first_page
@@ -22284,16 +22290,18 @@ mod paged_vector_accounting_tests {
         ));
         let baseline = accountant.usage().used;
 
-        let mut opened = open_cursor(
-            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
-            &statement(rows),
-            &params(),
-            accountant.clone(),
-            limits(),
-            Arc::new(FrozenClock),
-            OwnerReadCancellation::new(),
-            None,
-        )
+        let mut opened = crate::owned_cursor_page::with_public_page(|| {
+            open_cursor(
+                Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+                &statement(rows),
+                &params(),
+                accountant.clone(),
+                limits(),
+                Arc::new(FrozenClock),
+                OwnerReadCancellation::new(),
+                None,
+            )
+        })
         .expect("open a paged vector cursor");
         let first_page = opened
             .first_page
@@ -22301,12 +22309,14 @@ mod paged_vector_accounting_tests {
             .expect("publish the admitted fixture answer");
         assert!(first_page.has_more(), "this cursor has more pages to give");
         let page = NonZeroUsize::new(8).expect("a non-zero page");
-        let _ = fetch_cursor(
-            &mut opened.cursor,
-            Some(page),
-            OwnerReadCancellation::new(),
-            None,
-        )
+        let _ = crate::owned_cursor_page::with_public_page(|| {
+            fetch_cursor(
+                &mut opened.cursor,
+                Some(page),
+                OwnerReadCancellation::new(),
+                None,
+            )
+        })
         .expect("one more page");
         let held = accountant.usage().used;
         assert!(held > baseline, "the part-drained cursor is holding state");
