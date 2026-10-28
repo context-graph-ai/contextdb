@@ -1,5 +1,45 @@
 use super::*;
 
+/// Outcome of the actual maintenance pruning-mutex acquisition attempt.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenancePruningMutexEventForTest {
+    Acquired,
+    Contended,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+type MaintenancePruningMutexObserverForTest =
+    Arc<dyn Fn(MaintenancePruningMutexEventForTest) + Send + Sync>;
+
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static MAINTENANCE_PRUNING_MUTEX_OBSERVER: std::cell::RefCell<Option<MaintenancePruningMutexObserverForTest>> = const { std::cell::RefCell::new(None) };
+}
+
+impl Database {
+    /// Observe this worker's maintenance pruning-mutex attempt. Restores the
+    /// enclosing observer on return or unwind. Contention is reported before
+    /// the ordinary blocking acquisition; Acquired means try_lock succeeded.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn observe_maintenance_pruning_mutex_for_test<T>(
+        observer: Arc<dyn Fn(MaintenancePruningMutexEventForTest) + Send + Sync>,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<MaintenancePruningMutexObserverForTest>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MAINTENANCE_PRUNING_MUTEX_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore =
+            Restore(MAINTENANCE_PRUNING_MUTEX_OBSERVER.with(|slot| slot.replace(Some(observer))));
+        operation()
+    }
+}
+
 impl Database {
     pub(super) fn vector_schema_refs_for_state_propagation_from_table(
         &self,
@@ -471,6 +511,24 @@ impl Database {
 
         let mut operation = self.assert_open_operation();
         operation.release_schema_publication_for_online_maintenance();
+        #[cfg(any(test, feature = "test-seams"))]
+        let observer = MAINTENANCE_PRUNING_MUTEX_OBSERVER.with(|slot| slot.borrow().clone());
+        #[cfg(any(test, feature = "test-seams"))]
+        let _guard = if let Some(observer) = observer {
+            let identity = Arc::as_ptr(&self.pruning_guard) as usize;
+            let guard = if let Some(guard) = self.pruning_guard.try_lock() {
+                observer(MaintenancePruningMutexEventForTest::Acquired);
+                guard
+            } else {
+                note_writer_receipt_contention(identity);
+                observer(MaintenancePruningMutexEventForTest::Contended);
+                self.pruning_guard.lock()
+            };
+            MaintenanceReceiptGuard::from_locked(&self.pruning_guard, guard)
+        } else {
+            MaintenanceReceiptGuard::lock(&self.pruning_guard)
+        };
+        #[cfg(not(any(test, feature = "test-seams")))]
         let _guard = MaintenanceReceiptGuard::lock(&self.pruning_guard);
         #[cfg(any(test, feature = "test-seams"))]
         let _held = crate::persistence::PruningGuardHeldForTest::enter();

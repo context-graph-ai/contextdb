@@ -10471,6 +10471,9 @@ mod authoritative_purge_kernel;
 mod bounded_reads;
 
 mod maintenance_and_limits;
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use maintenance_and_limits::MaintenancePruningMutexEventForTest;
 
 mod sync_outbound;
 

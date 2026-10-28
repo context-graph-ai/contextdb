@@ -1664,6 +1664,14 @@ impl<'a> MaintenanceReceiptGuard<'a> {
         });
         #[cfg(not(any(test, feature = "test-seams")))]
         let guard = mutex.lock();
+        Self::from_locked(mutex, guard)
+    }
+    pub(super) fn from_locked(
+        _mutex: &'a Arc<parking_lot::Mutex<()>>,
+        guard: parking_lot::MutexGuard<'a, ()>,
+    ) -> Self {
+        #[cfg(any(test, feature = "test-seams"))]
+        let identity = Arc::as_ptr(_mutex) as usize;
         #[cfg(any(test, feature = "test-seams"))]
         HELD_MAINTENANCE_RECEIPT_GUARDS.with(|held| held.borrow_mut().push(identity));
         Self {
