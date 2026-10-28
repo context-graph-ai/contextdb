@@ -418,6 +418,22 @@ pub(crate) fn returned_loader_rows_for_test() {
             answer
         }
     }
+    // A normal public close retains its native accountant's standing credit.
+    // Measure that same store without an escaped candidate, independently of
+    // the candidate's payload and adapter lifetime.
+    let baseline_database =
+        Database::open_with_options(&path, crate::read_session::DatabaseOpenOptions::default())
+            .unwrap();
+    let baseline_owner = baseline_database.accountant.clone();
+    baseline_database.close().unwrap();
+    drop(baseline_database);
+    assert_eq!(
+        baseline_owner.writer_registration_observation_for_test().2,
+        0
+    );
+    let closed_owner_bytes = baseline_owner.usage().used;
+    drop(baseline_owner);
+
     for owner_drop in [false, true] {
         let runtime = temporary.path().join(if owner_drop {
             "drop-runtime"
@@ -455,11 +471,7 @@ pub(crate) fn returned_loader_rows_for_test() {
         });
         // Real database writer + production whole capture returns the loader.
         // The real accepted handler opens and retires its scan before shutdown drains.
-        let mut database =
-            Database::open_with_config(&path, Arc::new(CorePlugin), owner.clone()).unwrap();
-        // The existing internal opener keeps the original writer accountant;
-        // configure and start its normal owner service before any read opens.
-        database.owner_read_config = Arc::new(OwnerReadConfig {
+        let owner_reads = OwnerReadConfig {
             runtime_dir: Some(runtime.clone()),
             handler: Some(handler.clone()),
             test_hooks: Some(OwnerReadTestHooks {
@@ -472,14 +484,30 @@ pub(crate) fn returned_loader_rows_for_test() {
                 quiescent_stop: Some(stop_observer),
             }),
             ..OwnerReadConfig::default()
-        });
-        database.owner_read_service = database.start_owner_read_service(&path).unwrap();
+        };
+        let database = Database::open_with_options(
+            &path,
+            crate::read_session::DatabaseOpenOptions {
+                owner_reads,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let owner = database.accountant.clone();
+        let (native, native_controls) = owner.native_backing_for_test();
+        assert!(
+            native,
+            "the production opener supplies its native original writer"
+        );
+        let backing_bytes = native_controls
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>();
+        assert_eq!(closed_owner_bytes, backing_bytes);
         assert!(
             database.owner_read_service.is_some(),
             "the scan uses the real owner channel"
         );
-        database.record_owner_read_status();
-        database.close_claim_window();
         let source = database.persistence.as_ref().unwrap().clone();
         let caller = Arc::new(MemoryAccountant::no_limit());
         let captured = Arc::new(contextdb_vector::VectorCopyAdmission::new(caller.clone()));
@@ -487,7 +515,7 @@ pub(crate) fn returned_loader_rows_for_test() {
             persistence: std::mem::ManuallyDrop::new(source.clone()),
             captured_owner: std::mem::ManuallyDrop::new(captured.clone()),
             accountant: std::mem::ManuallyDrop::new(
-                crate::memory_accounting::StoreAccountantHandle::new(owner.clone().into()),
+                crate::memory_accounting::StoreAccountantHandle::new(owner.clone()),
             ),
         };
         let layout = VectorIndexLayout {
@@ -520,14 +548,34 @@ pub(crate) fn returned_loader_rows_for_test() {
         // source/use capability from any nonzero payload/metadata credit.
         let zero_metadata = DurableRawVectorPartitionLoader {
             source: DurableRawVectorSource::Writable(source.clone()),
-            accountant: owner.clone().into(),
+            accountant: owner.clone(),
             partition: partition.clone(),
             dimension: 1,
             quantization: VectorQuantization::F32,
             metadata_copy_owner: None,
         };
+        let before_probe = owner.usage().used;
+        let (probe, requests, request_count) =
+            crate::persistence::content_identity::proof_allocation_oracle_tests::native_requests_for_test(|| {
+                zero_metadata.source.vector_budget(&owner).unwrap()
+            });
+        assert_eq!(request_count, 2, "adapter invoice control and Arc");
+        let arc_layout = MemoryAccountant::writer_vector_adapter_type_layout_for_test();
+        let arc_request = requests[request_count - 1];
+        assert_eq!(
+            (arc_request.1, arc_request.2),
+            (arc_layout.size(), arc_layout.align())
+        );
+        let adapter_control_bytes = requests[..request_count]
+            .iter()
+            .map(|request| request.1)
+            .sum::<usize>();
+        assert_eq!(owner.usage().used, before_probe + adapter_control_bytes);
+        drop(probe);
+        assert_eq!(owner.usage().used, before_probe);
         let epoch = owner.writer_registration_observation_for_test().2;
         let mut candidate_pointer = 0;
+        let before_candidate = owner.usage().used;
         let escaped = zero_metadata
             .load_candidate_via(&identity, false, &mut |_| true, &mut |_| {
                 let entry = VectorEntry {
@@ -542,6 +590,11 @@ pub(crate) fn returned_loader_rows_for_test() {
                 Ok(entry)
             })
             .unwrap();
+        let candidate_payload_bytes = owner.usage().used - before_candidate - adapter_control_bytes;
+        assert!(
+            candidate_payload_bytes > 0,
+            "the candidate body and metadata have an original debit"
+        );
         drop((callback, captured));
         let handler_owner = owner.clone();
         let handler_caller = caller.clone();
@@ -553,6 +606,11 @@ pub(crate) fn returned_loader_rows_for_test() {
             let caller = handler_caller;
             let identity = handler_identity;
             let _caller_read_memory = read_memory;
+            let _caller_decode_scope =
+                crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    caller.clone().into(),
+                )
+                .unwrap();
             let mut scan = returned.open_body_scan().unwrap().unwrap();
             entered
                 .send(())
@@ -573,7 +631,7 @@ pub(crate) fn returned_loader_rows_for_test() {
             drop(accepted);
             drop(caller_credit);
             let reopen =
-                crate::memory_accounting::WriterBudget::from_accountant(owner.clone()).unwrap();
+                crate::memory_accounting::WriterBudget::from_handle(owner.clone()).unwrap();
             assert_eq!(owner.writer_registration_observation_for_test().2, epoch);
             drop(reopen);
             drop((scan, returned));
@@ -674,20 +732,22 @@ pub(crate) fn returned_loader_rows_for_test() {
         );
         let registration = owner.writer_registration_observation_for_test();
         assert_eq!(
-            registration.3, 1,
-            "candidate is the sole counted original-epoch holder"
+            registration.3, 3,
+            "candidate retains its payload, wait capability and external invoice"
         );
         let adapter_bytes = owner.writer_fixed_ownership().2;
-        assert_eq!(
-            adapter_bytes,
-            MemoryAccountant::writer_vector_adapter_type_layout_for_test().size()
-        );
+        assert_eq!(adapter_bytes, adapter_control_bytes);
         crate::persistence::content_identity::proof_allocation_oracle_tests::watch_candidate_payload_for_test(candidate_pointer, &owner);
         drop(escaped);
         let (free_census, payload_free, node_free) = crate::persistence::content_identity::proof_allocation_oracle_tests::candidate_payload_free_observation_for_test();
         assert_eq!(
             free_census,
-            (epoch, 1, adapter_bytes, registration.1 + adapter_bytes),
+            (
+                epoch,
+                3,
+                adapter_bytes,
+                closed_owner_bytes + registration.1 + adapter_bytes + candidate_payload_bytes
+            ),
             "original epoch and adapter survive actual Vec System.dealloc"
         );
         assert_eq!(
@@ -698,8 +758,8 @@ pub(crate) fn returned_loader_rows_for_test() {
         assert_eq!(
             node_free,
             (
-                registration.1 + adapter_bytes,
-                registration.1 + adapter_bytes,
+                closed_owner_bytes + registration.1,
+                closed_owner_bytes + registration.1,
                 true
             )
         );
@@ -708,11 +768,11 @@ pub(crate) fn returned_loader_rows_for_test() {
             candidate_pointer, epoch, free_census.1, adapter_bytes, registration.1
         );
         assert_eq!(owner.writer_registration_observation_for_test().2, 0);
-        assert_eq!(owner.usage().used, 0);
+        assert_eq!(owner.usage().used, closed_owner_bytes);
         assert_eq!(caller.usage().used, 0);
         assert_eq!(owner.underflow_count_for_test(), 0);
         println!(
-            "CDB127_A_ROW callback_returned_loader_only original_epoch=true zero_metadata_source=true accepted_scan_after_close=true candidate_outlives_source=true final_zero=true"
+            "returned_loader original_epoch=true zero_metadata_source=true accepted_scan_after_close=true candidate_outlives_source=true final_public_close_baseline=true"
         );
     }
 }
