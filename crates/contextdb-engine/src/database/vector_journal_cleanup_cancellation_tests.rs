@@ -289,14 +289,14 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
     assert_eq!(
         released.non_vector_total,
         baseline.non_vector_total
-            + 2 * MemoryAccountant::writer_vector_adapter_type_layout_for_test().size(),
+            + 2 * MemoryAccountant::writer_vector_adapter_full_size_for_test(),
         "only the newly installed paged change's standing adapters remain"
     );
     let released_writer = db.writer_memory_ownership_receipt_for_test();
     assert_eq!(released_writer.reconciliation_gap, 0);
     assert_eq!(
         released_writer.writer_adapter_controls - baseline_writer.writer_adapter_controls,
-        2 * MemoryAccountant::writer_vector_adapter_type_layout_for_test().size()
+        2 * MemoryAccountant::writer_vector_adapter_full_size_for_test()
     );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
     drop(context);
