@@ -1977,7 +1977,7 @@ impl RedbPersistence {
                     Some(physical.admission_hold()),
                 );
                 #[cfg(not(target_os = "linux"))]
-                let serializer = serialize_runtime_root(runtime.root(), true).map(Some);
+                let serializer = hold_runtime_root(runtime.root(), true).map(Some);
                 let _serializer =
                     serializer.map_err(|error| Error::ReaderCoordinationUnavailable {
                         operation: "authoritative purge".to_owned(),

@@ -3159,7 +3159,7 @@ impl ReaderBreadcrumbGuard {
         // Publication joins the runtime root's registries: under its
         // serializer no leaver can remove the `contextdb` child between
         // creating it and using it, so nothing here retries.
-        let _serializer = serialize_runtime_root(runtime.root(), false)?;
+        let _serializer = hold_runtime_root(runtime.root(), false)?;
         recreate_created_runtime_root(runtime);
         let mut guard = Self::create(database_path, runtime.path(), breadcrumb)?;
         if runtime.root() != runtime.path() {
@@ -3182,7 +3182,7 @@ impl ReaderBreadcrumbGuard {
         context: &crate::executor::bounded::ReadOpenContext,
     ) -> std::result::Result<Option<Self>, LoadReadImageError> {
         context.checkpoint().map_err(LoadReadImageError::Memory)?;
-        let serializer = serialize_runtime_root(runtime.root(), true);
+        let serializer = hold_runtime_root(runtime.root(), true);
         context.checkpoint().map_err(LoadReadImageError::Memory)?;
         let Ok(_serializer) = serializer else {
             return Ok(None);
@@ -3296,13 +3296,19 @@ impl ReaderBreadcrumbGuard {
     /// Remove this breadcrumb's emptied store directory and, only while the
     /// runtime root's serializer is held, the `contextdb` child it created.
     pub(super) fn remove_directories(&self, nonblocking: bool) {
-        let serializer = self
+        let lifetime = self
             .serializer_root
             .as_deref()
-            .and_then(|root| serialize_runtime_root(root, nonblocking).ok());
-        let created_root = serializer.as_ref().and(self.created_root.as_deref());
-        remove_empty_breadcrumb_directories(&self.path, created_root);
-        drop(serializer);
+            .and_then(|root| hold_runtime_root(root, nonblocking).ok());
+        remove_empty_breadcrumb_directories(&self.path, None);
+        drop(lifetime);
+        if let (Some(root), Some(created)) = (
+            self.serializer_root.as_deref(),
+            self.created_root.as_deref(),
+        ) && let Ok(_exclusive) = serialize_runtime_root(root, true)
+        {
+            let _ = std::fs::remove_dir(created);
+        }
     }
 
     /// No caller may read through the handoff after this release begins.
@@ -3432,9 +3438,20 @@ impl ReaderSnapshotRegistryLock {
         runtime_root: &Path,
         identity: (u64, u64),
     ) -> std::io::Result<Self> {
+        Self::acquire_for_registration_with_wait(runtime_root, identity, None)
+    }
+
+    fn acquire_for_registration_with_wait(
+        runtime_root: &Path,
+        identity: (u64, u64),
+        mut checkpoint: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> std::io::Result<Self> {
         #[cfg(any(test, feature = "test-seams"))]
         let mut attempt = 0_u64;
         loop {
+            if let Some(checkpoint) = checkpoint.as_mut() {
+                checkpoint()?;
+            }
             #[cfg(any(test, feature = "test-seams"))]
             {
                 read_persistence_test_scaffold::count_registration_attempt_for_test(
@@ -3448,19 +3465,9 @@ impl ReaderSnapshotRegistryLock {
                 );
                 attempt += 1;
             }
-            // A runtime root that is itself missing or unsafe is refused
-            // outright; only what a departing reader removes below it retries.
             validate_reader_runtime_directory(runtime_root)?;
-            let (file, path) = match Self::create_descriptor(runtime_root, identity) {
-                Ok(opened) => opened,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            #[cfg(any(test, feature = "test-seams"))]
-            read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
-                identity,
-                read_persistence_test_scaffold::ReaderRegistrationLockPhase::DescriptorOpened,
-            );
+            let (file, path) = Self::create_descriptor(runtime_root, identity)?;
+            // Refuse an untrusted descriptor before any blocking wait.
             let metadata = match Self::validate_open_file(&file, &path) {
                 Ok(metadata) => metadata,
                 Err(_) if registry_lock_descriptor_departed(&file) => continue,
@@ -3472,12 +3479,31 @@ impl ReaderSnapshotRegistryLock {
                 metadata,
                 locked: false,
             };
-            #[cfg(any(test, feature = "test-seams"))]
-            read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
-                identity,
-                read_persistence_test_scaffold::ReaderRegistrationLockPhase::Validated,
-            );
-            fs2::FileExt::lock_exclusive(&lock.file)?;
+            let first = fs2::FileExt::try_lock_exclusive(&lock.file);
+            match first {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if read_persistence_test_scaffold::reader_join_wait_hook_installed_for_test() {
+                        read_persistence_test_scaffold::run_reader_join_wait_hook_for_test();
+                    }
+                    if let Some(checkpoint) = checkpoint.as_mut() {
+                        loop {
+                            checkpoint()?;
+                            match fs2::FileExt::try_lock_exclusive(&lock.file) {
+                                Ok(()) => break,
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::yield_now();
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    } else {
+                        fs2::FileExt::lock_exclusive(&lock.file)?;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
             lock.locked = true;
             #[cfg(any(test, feature = "test-seams"))]
             read_persistence_test_scaffold::count_registration_attempt_for_test(
@@ -3486,16 +3512,38 @@ impl ReaderSnapshotRegistryLock {
                     counts.l0_takes += 1;
                 },
             );
-            if reader_snapshot_registry_lock_path_still_names(&lock.path, &lock.metadata) {
-                return Ok(lock);
-            }
-            let departed = registry_lock_descriptor_departed(&lock.file);
-            lock.unlock()?;
-            if !departed {
+            // A last leave may have unlinked this inode while we waited. A
+            // reopen is justified only by that completed removal, never Busy.
+            if !reader_snapshot_registry_lock_path_still_names(&lock.path, &lock.metadata) {
+                let departed = registry_lock_descriptor_departed(&lock.file);
+                lock.unlock()?;
+                if departed {
+                    continue;
+                }
                 return Err(std::io::Error::other(
                     "reader snapshot registry lock changed while it was acquired",
                 ));
             }
+            #[cfg(any(test, feature = "test-seams"))]
+            read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
+                identity,
+                read_persistence_test_scaffold::ReaderRegistrationLockPhase::DescriptorOpened,
+            );
+            // These observations are inside the exclusion that prevents a
+            // normal leave from unlinking the descriptor; replacement is still
+            // authenticated after either adversarial checkpoint.
+            Self::validate_open_file(&lock.file, &lock.path)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            read_persistence_test_scaffold::reader_registration_lock_checkpoint_for_test(
+                identity,
+                read_persistence_test_scaffold::ReaderRegistrationLockPhase::Validated,
+            );
+            if reader_snapshot_registry_lock_path_still_names(&lock.path, &lock.metadata) {
+                return Ok(lock);
+            }
+            return Err(std::io::Error::other(
+                "reader snapshot registry lock changed while it was acquired",
+            ));
         }
     }
 
@@ -3625,6 +3673,39 @@ impl ReaderSnapshotRegistryLock {
         Ok(())
     }
 
+    fn acquire_for_teardown(
+        &mut self,
+        identity: (u64, u64),
+        nonblocking: bool,
+    ) -> std::io::Result<()> {
+        loop {
+            if !self.locked {
+                if nonblocking {
+                    fs2::FileExt::try_lock_exclusive(&self.file)?;
+                } else {
+                    fs2::FileExt::lock_exclusive(&self.file)?;
+                }
+                self.locked = true;
+            }
+            if reader_snapshot_registry_lock_path_still_names(&self.path, &self.metadata) {
+                return Ok(());
+            }
+            let departed = registry_lock_descriptor_departed(&self.file);
+            self.unlock()?;
+            if !departed {
+                return Err(std::io::Error::other(
+                    "reader snapshot registry lock changed during teardown",
+                ));
+            }
+            // Only a completed unlink permits another open. Missing or
+            // untrusted replacement coordination leaves the old record stale;
+            // inventory reclaims it after this guard closes its descriptor.
+            let root = self.path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+            let replacement = Self::open(root, identity)?;
+            *self = replacement;
+        }
+    }
+
     pub(super) fn unlock(&mut self) -> std::io::Result<()> {
         if self.locked {
             fs2::FileExt::unlock(&self.file)?;
@@ -3641,30 +3722,12 @@ impl Drop for ReaderSnapshotRegistryLock {
 }
 
 impl ReaderSnapshotFileGuard {
-    pub(super) fn create(
-        target: &ReaderRegistrationTarget<'_>,
-        snapshot: &RegisteredReaderSnapshot,
-        transaction: Option<
-            contextdb_core::read_memory::ReadShared<read_coordination::RegistrationTransaction>,
-        >,
-    ) -> std::io::Result<Self> {
-        let registry_lock = ReaderSnapshotRegistryLock::acquire_for_registration(
-            target.runtime.path(),
-            snapshot.physical_identity,
-        )?;
-        let mut result = Self::create_locked(target, snapshot, registry_lock, false, transaction)?;
-        result.registry_lock.unlock()?;
-        Ok(result)
-    }
-
     /// The caller holds every publication registry lock until all records are
     /// installed. Partial publication can therefore roll back without waiting.
     ///
-    /// The fence this registration answers to was opened before the registry
-    /// lock, as it always has been, so a last departing reader may have removed
-    /// it in between. Under the registry lock the fence must still be the one
-    /// its path names; otherwise this returns `NotFound` holding nothing, and
-    /// the caller reopens the fence with no registry lock held.
+    /// The registry lock is acquired before opening the fence and retained
+    /// through publication. Its pathname is authenticated again here so a
+    /// same-user replacement cannot substitute another publication fence.
     pub(super) fn create_locked(
         target: &ReaderRegistrationTarget<'_>,
         snapshot: &RegisteredReaderSnapshot,
@@ -3794,21 +3857,24 @@ impl Drop for ReaderSnapshotFileGuard {
                     .is_some_and(|transaction| transaction.is_staging()),
         )
         .ok();
-        #[cfg(any(test, feature = "test-seams"))]
-        if serializer.is_some() {
-            read_persistence_test_scaffold::reader_leave_holding_serializer_for_test();
-        }
+        let nonblocking = self.try_only_teardown
+            || self
+                .opening_transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.is_staging());
         let coordinated = serializer.is_some()
-            && if self.try_only_teardown
-                || self
-                    .opening_transaction
-                    .as_ref()
-                    .is_some_and(|transaction| transaction.is_staging())
-            {
-                self.registry_lock.try_lock_exclusive().is_ok()
-            } else {
-                self.registry_lock.lock_exclusive().is_ok()
-            };
+            && self
+                .registry_lock
+                .acquire_for_teardown(self.physical_identity, nonblocking)
+                .is_ok();
+        #[cfg(any(test, feature = "test-seams"))]
+        if coordinated {
+            read_persistence_test_scaffold::reader_leave_holding_serializer_for_test();
+            read_persistence_test_scaffold::pause_reader_at_physical(
+                self.physical_identity,
+                read_persistence_test_scaffold::ReaderPausePoint::LeavingWithRegistryExclusion,
+            );
+        }
         if let Some(file) = self.file.take() {
             // The record is identified by the descriptor this guard still
             // holds, as it is now: an in-place rewrite of the record changes
@@ -3880,6 +3946,15 @@ pub(super) fn with_last_reader_gate<T>(
     else {
         return remove(false);
     };
+    if physical_admission::held_against(
+        &data,
+        physical_admission::READER_HOLD_OFFSET,
+        physical_admission::ByteLock::Exclusive,
+    )
+    .unwrap_or(true)
+    {
+        return remove(false);
+    }
     match physical_admission::admit_through_reader_gate(&data, physical_identity) {
         Ok(hold) => {
             let removed = remove(true);
@@ -4773,6 +4848,7 @@ impl ReadSnapshotRegistrationGuard {
             runtime_dir,
             owner_cursor,
             owner_cursor,
+            None,
         )
     }
 
@@ -4787,22 +4863,17 @@ impl ReadSnapshotRegistrationGuard {
         runtime_dir: Option<&Path>,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> std::result::Result<(), LoadReadImageError> {
-        loop {
-            checkpoint().map_err(LoadReadImageError::Memory)?;
-            let attempted =
-                self.publish_once(database_path, storage_snapshot, runtime_dir, false, true);
-            checkpoint().map_err(LoadReadImageError::Memory)?;
-            match attempted {
-                Err(LoadReadImageError::RegistryContention { .. }) => {
-                    #[cfg(any(test, feature = "test-seams"))]
-                    if read_persistence_test_scaffold::reader_join_wait_hook_installed_for_test() {
-                        read_persistence_test_scaffold::run_reader_join_wait_hook_for_test();
-                    }
-                    std::thread::yield_now();
-                }
-                result => return result,
-            }
-        }
+        checkpoint().map_err(LoadReadImageError::Memory)?;
+        let result = self.publish_once(
+            database_path,
+            storage_snapshot,
+            runtime_dir,
+            false,
+            true,
+            Some(checkpoint),
+        );
+        checkpoint().map_err(LoadReadImageError::Memory)?;
+        result
     }
 
     #[expect(
@@ -4816,6 +4887,7 @@ impl ReadSnapshotRegistrationGuard {
         runtime_dir: Option<&Path>,
         _owner_cursor: bool,
         nonblocking: bool,
+        checkpoint: Option<&dyn Fn() -> Result<()>>,
     ) -> std::result::Result<(), LoadReadImageError> {
         self.snapshot.storage_snapshot = storage_snapshot;
         if self.snapshot.database_identity.is_none() {
@@ -4933,37 +5005,70 @@ impl ReadSnapshotRegistrationGuard {
                         self.snapshot.physical_identity,
                         read_persistence_test_scaffold::ReaderPausePoint::BeforeRegistration,
                     );
-                    let serializer =
-                        hold_runtime_root(runtime.root(), nonblocking).map_err(|error| {
-                            if error.kind() == std::io::ErrorKind::WouldBlock {
-                                contention(runtime, error)
-                            } else {
-                                io_failure(runtime, error)
+                    let serializer = loop {
+                        if let Some(checkpoint) = checkpoint {
+                            checkpoint().map_err(LoadReadImageError::Memory)?;
+                        }
+                        match hold_runtime_root(runtime.root(), nonblocking) {
+                            Ok(hold) => break hold,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && checkpoint.is_some() =>
+                            {
+                                #[cfg(any(test, feature = "test-seams"))]
+                                if read_persistence_test_scaffold::reader_join_wait_hook_installed_for_test() {
+                                    read_persistence_test_scaffold::run_reader_join_wait_hook_for_test();
+                                }
+                                std::thread::yield_now();
                             }
-                        })?;
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                return Err(contention(runtime, error));
+                            }
+                            Err(error) => return Err(io_failure(runtime, error)),
+                        }
+                    };
                     recreate_created_runtime_root(runtime);
                     #[cfg(any(test, feature = "test-seams"))]
                     read_persistence_test_scaffold::pause_reader_at_physical(
                         self.snapshot.physical_identity,
                         read_persistence_test_scaffold::ReaderPausePoint::AfterRuntimeRootLifetimeHold,
                     );
-                    let owner_registry_lock = if nonblocking {
-                        Some(
-                            ReaderSnapshotRegistryLock::try_acquire_for_registration(
-                                runtime.path(),
-                                self.snapshot.physical_identity,
-                            )
-                            .map_err(|error| {
-                                if error.kind() == std::io::ErrorKind::WouldBlock {
-                                    contention(runtime, error)
-                                } else {
-                                    io_failure(runtime, error)
-                                }
-                            })?,
+                    let registry_lock = if _owner_cursor {
+                        ReaderSnapshotRegistryLock::try_acquire_for_registration(
+                            runtime.path(),
+                            self.snapshot.physical_identity,
                         )
+                    } else if let Some(checkpoint) = checkpoint {
+                        let mut failure = None;
+                        let mut wait = || match checkpoint() {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                failure = Some(error);
+                                Err(std::io::ErrorKind::Interrupted.into())
+                            }
+                        };
+                        let locked = ReaderSnapshotRegistryLock::acquire_for_registration_with_wait(
+                            runtime.path(),
+                            self.snapshot.physical_identity,
+                            Some(&mut wait),
+                        );
+                        if let Some(error) = failure {
+                            return Err(LoadReadImageError::Memory(error));
+                        }
+                        locked
                     } else {
-                        None
-                    };
+                        ReaderSnapshotRegistryLock::acquire_for_registration(
+                            runtime.path(),
+                            self.snapshot.physical_identity,
+                        )
+                    }
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            contention(runtime, error)
+                        } else {
+                            io_failure(runtime, error)
+                        }
+                    })?;
                     let fence = open_fence(runtime).transpose()?;
                     #[cfg(any(test, feature = "test-seams"))]
                     read_persistence_test_scaffold::reader_fences_opened_for_test(
@@ -4978,23 +5083,15 @@ impl ReadSnapshotRegistrationGuard {
                             .is_some_and(|supplied| supplied == runtime.path()),
                         fence: fence.as_ref(),
                     };
-                    let created = match owner_registry_lock {
-                        Some(registry_lock) => ReaderSnapshotFileGuard::create_locked(
-                            &target,
-                            &self.snapshot,
-                            registry_lock,
-                            true,
-                            self.opening_transaction.clone(),
-                        ),
-                        None => ReaderSnapshotFileGuard::create(
-                            &target,
-                            &self.snapshot,
-                            self.opening_transaction.clone(),
-                        ),
-                    };
-                    // Under the serializer nothing of this root departs, so a
-                    // missing fence or directory is a coordination failure the
-                    // reader is told about retryably, never retried here.
+                    let created = ReaderSnapshotFileGuard::create_locked(
+                        &target,
+                        &self.snapshot,
+                        registry_lock,
+                        _owner_cursor,
+                        self.opening_transaction.clone(),
+                    );
+                    // The acquired registry lock spans the fence open and
+                    // registration, excluding same-store last-reader removal.
                     let mut registration = created.map_err(|error| {
                         if matches!(
                             error.kind(),
@@ -5005,12 +5102,10 @@ impl ReadSnapshotRegistrationGuard {
                             io_failure(runtime, error)
                         }
                     })?;
-                    if nonblocking {
-                        registration
-                            .registry_lock
-                            .unlock()
-                            .map_err(|error| io_failure(runtime, error))?;
-                    }
+                    registration
+                        .registry_lock
+                        .unlock()
+                        .map_err(|error| io_failure(runtime, error))?;
                     drop(serializer);
                     fences.push(fence);
                     registrations.push(Arc::new(registration));

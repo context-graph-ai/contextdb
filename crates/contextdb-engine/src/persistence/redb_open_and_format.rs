@@ -491,7 +491,7 @@ impl RedbPersistence {
             for runtime in existing_reader_registry_roots(self.runtime_dir.as_deref()) {
                 // By try only: a writer never waits on a runtime root's
                 // serializer, and a join or leave in progress keeps its root.
-                let Ok(serializer) = serialize_runtime_root(runtime.root(), true) else {
+                let Ok(serializer) = hold_runtime_root(runtime.root(), true) else {
                     continue;
                 };
                 let Ok(mut registry_lock) =
@@ -512,10 +512,15 @@ impl RedbPersistence {
                     &reader_snapshot_directory(runtime.path(), identity),
                     &registry_lock.path,
                     true,
-                    created_root.as_deref(),
+                    None,
                 );
                 let _ = registry_lock.unlock();
                 drop(serializer);
+                if let Some(root) = created_root.as_deref()
+                    && let Ok(_exclusive) = serialize_runtime_root(runtime.root(), true)
+                {
+                    let _ = std::fs::remove_dir(root);
+                }
             }
         }
     }

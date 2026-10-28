@@ -2785,6 +2785,9 @@ pub mod read_persistence_test_scaffold {
         /// The runtime root is held alive, before this store creates its
         /// registry descriptor or authoritative fence. Physical, as above.
         AfterRuntimeRootLifetimeHold,
+        /// A real departing reader owns its store's registry exclusion,
+        /// before removing its record. Physical, as above.
+        LeavingWithRegistryExclusion,
     }
 
     impl ReaderPausePoint {
@@ -2795,6 +2798,7 @@ pub mod read_persistence_test_scaffold {
                     | Self::AfterGate
                     | Self::BeforeRegistration
                     | Self::AfterRuntimeRootLifetimeHold
+                    | Self::LeavingWithRegistryExclusion
             )
         }
     }
