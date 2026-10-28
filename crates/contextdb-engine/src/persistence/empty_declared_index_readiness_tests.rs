@@ -5601,9 +5601,9 @@ fn assert_graph_authorization_and_cancellation_rows(directory: &Path) {
                         {
                             let mut table = write
                                 .open_table(if malformed_projection == Some(true) {
-                                    GRAPH_REV_TABLE
+                                    row_graph::REVERSE
                                 } else {
-                                    GRAPH_FWD_TABLE
+                                    row_graph::FORWARD
                                 })
                                 .map_err(RedbPersistence::storage_error)?;
                             let (key, mut raw) = {
