@@ -1691,6 +1691,13 @@ pub(crate) struct QueryImageCharge {
         crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
 }
 impl QueryAnswerCharge {
+    #[cfg(test)]
+    pub(crate) fn retained_image_pointer_for_test(&self) -> usize {
+        match self {
+            Self::Image(charge) => &*charge.image.value as *const ImageMemory as usize,
+            _ => 0,
+        }
+    }
     /// Passive pointers and the existing invoice of the actual retained image.
     #[cfg(all(test, feature = "test-seams"))]
     pub(crate) fn control_receipts_for_test(&self) -> [(usize, usize, usize, usize); 2] {
