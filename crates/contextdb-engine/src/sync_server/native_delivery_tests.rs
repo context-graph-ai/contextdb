@@ -201,11 +201,15 @@ impl World {
     /// transaction, and have the hub record one terminal outcome for each of
     /// them. Returns the new roots' keys.
     async fn seed_outcomes(&self, count: usize) -> Vec<NaturalKey> {
+        self.seed_outcomes_in_batches(count, 100).await
+    }
+
+    async fn seed_outcomes_in_batches(&self, count: usize, batch_size: usize) -> Vec<NaturalKey> {
         let started = std::time::Instant::now();
         let mut all = Vec::with_capacity(count);
         let mut remaining = count;
         while remaining > 0 {
-            let batch = remaining.min(100);
+            let batch = remaining.min(batch_size);
             remaining -= batch;
             let tx = self.edge_db.begin().expect("begin");
             let mut keys = Vec::with_capacity(batch);
@@ -1485,7 +1489,7 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
         .limits
         .cursor_page_rows as usize;
     let backlog = page * 2 + page / 2;
-    world.seed_outcomes(backlog).await;
+    world.seed_outcomes_in_batches(backlog, backlog).await;
     let accepted = || {
         world
             .edge_db
