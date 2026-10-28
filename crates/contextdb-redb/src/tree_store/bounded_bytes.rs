@@ -2126,4 +2126,98 @@ mod tests {
             disk.sync_data().unwrap();
         }
     }
+    #[test]
+    fn readonly_cursor_navigation_has_an_owned_navigation_invoice() {
+        struct Charge(Arc<AtomicUsize>, usize);
+        impl Drop for Charge {
+            fn drop(&mut self) {
+                self.0.fetch_sub(self.1, AtomicOrdering::SeqCst);
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-navigation-owner.db");
+        {
+            let db = Builder::new().set_cache_size(0).create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(VALUES).unwrap();
+                for key in 0u64..1024 {
+                    table
+                        .insert(key.to_be_bytes().as_slice(), [7u8; 64].as_slice())
+                        .unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        let db = Builder::new().set_cache_size(0).open(&path).unwrap();
+        let read = db.begin_read().unwrap();
+        let table = read.open_byte_table_bounded(VALUES).unwrap();
+        let page_bytes = table.cursor_bounded().mem.get_page_size();
+        let refused = Arc::new(AtomicUsize::new(0));
+        let refusal_observer = refused.clone();
+        crate::with_read_page_charge(
+            Arc::new(move |bytes| {
+                if bytes < page_bytes {
+                    refusal_observer.fetch_add(1, AtomicOrdering::SeqCst);
+                    return Err(std::io::ErrorKind::OutOfMemory.into());
+                }
+                Ok(Box::new(()))
+            }),
+            || {
+                let mut cursor = table.cursor_bounded();
+                assert!(matches!(
+                    cursor.next(),
+                    Some(Err(StorageError::Io(error)))
+                        if error.kind() == std::io::ErrorKind::OutOfMemory
+                ));
+                assert_eq!(refused.load(AtomicOrdering::SeqCst), 1);
+                assert_eq!(
+                    cursor.navigation_memory_ownership_for_test(),
+                    (0, 0, false, false),
+                    "refused navigation must not allocate or retain backing"
+                );
+            },
+        );
+        let held = Arc::new(AtomicUsize::new(0));
+        let nav_held = Arc::new(AtomicUsize::new(0));
+        let payer = held.clone();
+        let nav_payer = nav_held.clone();
+        crate::with_read_page_charge(
+            Arc::new(move |bytes| {
+                // Source page requests include at least one complete page;
+                // this fixture's navigation vector is strictly sub-page.
+                let payer = if bytes < page_bytes {
+                    &nav_payer
+                } else {
+                    &payer
+                };
+                payer.fetch_add(bytes, AtomicOrdering::SeqCst);
+                Ok(Box::new(Charge(payer.clone(), bytes)))
+            }),
+            || {
+                let mut cursor = table.cursor_bounded();
+                assert_eq!(
+                    cursor.navigation_memory_ownership_for_test(),
+                    (0, 0, false, false)
+                );
+                let handle = cursor.next().unwrap().unwrap();
+                let (_, bytes, invoice, _) = cursor.navigation_memory_ownership_for_test();
+                assert!(
+                    bytes > 0,
+                    "this guard must reach a real branch navigation backing"
+                );
+                assert!(
+                    invoice,
+                    "readonly navigation backing of {bytes} bytes requires its actual owned invoice"
+                );
+                assert!(bytes < page_bytes, "navigation must be a sub-page charge");
+                assert_eq!(nav_held.load(AtomicOrdering::SeqCst), bytes);
+                drop(handle);
+                assert_eq!(nav_held.load(AtomicOrdering::SeqCst), bytes);
+                drop(cursor);
+                assert_eq!(nav_held.load(AtomicOrdering::SeqCst), 0);
+                assert_eq!(held.load(AtomicOrdering::SeqCst), 0);
+            },
+        );
+    }
 }
