@@ -3061,7 +3061,7 @@ pub(super) fn serialize_runtime_root(
 /// Keep the shared publication directory alive while this store's registry
 /// lock serializes its own join/leave. Other stores may publish concurrently.
 #[cfg(unix)]
-fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
+pub(super) fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
     lock_runtime_root(root, nonblocking, true)
 }
 
@@ -3126,7 +3126,7 @@ pub(super) fn serialize_runtime_root(
 }
 
 #[cfg(not(unix))]
-fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
+pub(super) fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
     serialize_runtime_root(root, nonblocking)
 }
 
