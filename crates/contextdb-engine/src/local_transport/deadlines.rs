@@ -241,7 +241,28 @@ impl ManualDeadlineClock {
         )
     )]
     pub fn registered_waiter_count(&self) -> usize {
-        Self::locked(&self.state).waiters.len()
+        let state = Self::locked(&self.state);
+        let count = state.waiters.len();
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            let mut count = count;
+            // This explicit observation is the only consumer of the test tag.
+            // The same mutex pins every linked registration until this walk
+            // ends; a caller-driver park is not an operation deadline waiter.
+            let mut node = state.native_parked.head;
+            while !node.is_null() {
+                // SAFETY: linked nodes remain pinned and are unlinked under
+                // this exact state mutex before their storage can be freed.
+                unsafe {
+                    let links = &*(*node).links.get();
+                    count = count.saturating_add(usize::from(links.operation_deadline));
+                    node = links.next;
+                }
+            }
+            count
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        count
     }
 
     #[doc(hidden)]
@@ -298,6 +319,8 @@ impl DeadlineClock for ManualDeadlineClock {
                     links: std::cell::UnsafeCell::new(NativeParkLinks {
                         next: std::ptr::null(),
                         linked: false,
+                        #[cfg(any(test, feature = "test-seams"))]
+                        operation_deadline: true,
                     }),
                     _pin: std::marker::PhantomPinned,
                 },
@@ -384,6 +407,9 @@ unsafe impl Send for NativeParkList {}
 struct NativeParkLinks {
     next: *const NativeParkNode,
     linked: bool,
+    // Inert metadata for the explicitly invoked clock-observation seam.
+    #[cfg(any(test, feature = "test-seams"))]
+    operation_deadline: bool,
 }
 #[cfg_attr(
     not(feature = "test-seams"),
@@ -476,6 +502,8 @@ impl contextdb_core::read_contract::NativeDeadlineSource for ManualNativeSource 
             links: std::cell::UnsafeCell::new(NativeParkLinks {
                 next: std::ptr::null(),
                 linked: false,
+                #[cfg(any(test, feature = "test-seams"))]
+                operation_deadline: false,
             }),
             _pin: std::marker::PhantomPinned,
         });
