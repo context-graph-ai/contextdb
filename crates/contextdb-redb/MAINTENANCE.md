@@ -1204,3 +1204,21 @@ writer's `zeroed_for_write` construction point.
 | Changed source | Reason |
 |---|---|
 | `src/db.rs`, `src/transactions.rs` | Remove three expectations for the unknown `clippy::assert_is_empty` lint. The existing const-constructor assertions need no exception on Rust 1.94.0; constructor behavior and the minimum supported Rust version are unchanged. |
+
+
+## Scalar physical page lifecycle observation
+
+The test-seams-only `observe_page_lifetimes_for_test` counts successful physical
+`PageAllocation::allocate` constructions and releases after `PageFree` calls
+`dealloc`, independently of admission and payer transitions. Cloning a page is
+not a construction. Thread-local scalar totals retain no allocation, pointer,
+invoice or page owner; nested windows merge exact deltas. Current page/byte
+counts are signed so freeing a pre-window allocation remains visible rather
+than being invented as an in-window construction. A zero-live lifecycle proof
+starts before open and closes every captured handle within the same thread's
+window; cross-thread work is outside the receipt. Production builds contain
+neither hooks nor counters and PageBlock Layout is unchanged.
+
+| Changed source | Reason |
+|---|---|
+| `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs` | Expose allocation-free scalar physical page construction/free/current/peak observations under test-seams; observe the actual backing constructor and post-deallocation release, with clone, earlier-free and nesting controls. |
