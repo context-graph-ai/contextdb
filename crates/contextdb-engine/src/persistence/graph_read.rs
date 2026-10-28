@@ -1174,6 +1174,7 @@ impl<'a> GraphProofContext<'a> {
         &self,
         read: &redb::ReadTransaction,
         edge: &AdjEntry,
+        raw: &[u8],
         reverse: bool,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<[u8; 32]>> {
@@ -1227,9 +1228,11 @@ impl<'a> GraphProofContext<'a> {
                 .get(key.key.as_ref())
                 .map_err(|error| diagnosis(self, read_storage_error(error)))?
                 .ok_or_else(mismatch)?;
-            let counterpart = decode_edge(self, &key.key, value.value(), !reverse)?;
-            if !same_edge(edge, &counterpart) {
-                return Err(mismatch());
+            if value.value() != raw {
+                let counterpart = decode_edge(self, &key.key, value.value(), !reverse)?;
+                if !same_edge(edge, &counterpart) {
+                    return Err(mismatch());
+                }
             }
             if reverse {
                 Ok(Some(graph_history_record::contribution_digest(
@@ -1529,7 +1532,7 @@ impl<'a> GraphProofContext<'a> {
                         })?;
                         let edge = decode_edge(self, p, raw, false)?;
                         self.verify_graph_creation(&edge)?;
-                        self.verify_graph_counterpart(read, &edge, false, memory.clone())?;
+                        self.verify_graph_counterpart(read, &edge, raw, false, memory.clone())?;
                         self.graph_digest_value(
                             Some(value.value()),
                             graph_history_record::contribution_digest(true, p, raw)?,
@@ -1650,7 +1653,7 @@ impl<'a> GraphProofContext<'a> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         self.verify_graph_creation(edge)?;
         let counterpart_digest =
-            self.verify_graph_counterpart(read, edge, reverse, memory.clone())?;
+            self.verify_graph_counterpart(read, edge, raw, reverse, memory.clone())?;
         let owner = writer_source::SourceWindowOwner::Read(memory.clone());
         let p = if reverse {
             owner.endpoint(&[&key[16..32], &key[..16], &key[32..]], "graph_forward_key")?
@@ -1806,8 +1809,13 @@ impl<'a> GraphProofContext<'a> {
                     )
                 })?;
                 let edge = decode_edge(self, p, fwd, false)?;
-                let counterpart = decode_edge(self, &reverse.key, rev, true)?;
-                if !same_edge(&edge, &counterpart) || edge.deleted_tx != Some(d) {
+                let projections_agree = if fwd == rev {
+                    true
+                } else {
+                    let counterpart = decode_edge(self, &reverse.key, rev, true)?;
+                    same_edge(&edge, &counterpart)
+                };
+                if !projections_agree || edge.deleted_tx != Some(d) {
                     return Err(self.content_identity_corruption(
                         "present predecessor projections disagree with receipt",
                     ));
