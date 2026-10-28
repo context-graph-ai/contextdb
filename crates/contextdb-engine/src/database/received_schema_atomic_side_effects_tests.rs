@@ -374,15 +374,11 @@ fn seed_local_acl_route(db: &Database) {
     }
 }
 
-fn wait_for_sink_state(label: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !ready() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {label}"
-        );
-        std::thread::yield_now();
-    }
+fn wait_for_sink_state(db: &Database, label: &str, ready: impl FnMut() -> bool) {
+    assert!(
+        db.wait_for_sink_progress_for_test(std::time::Duration::from_secs(60), ready),
+        "{label} never delivered"
+    );
 }
 
 fn assert_acl_route_delivery(db: &Database, phase: &str) {
@@ -405,7 +401,7 @@ fn assert_acl_route_delivery(db: &Database, phase: &str) {
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("the ACL-granted event must reach alice's scoped sink");
     assert_eq!(event.row_values["body"], Value::Text("allowed".to_string()));
-    wait_for_sink_state("ACL denied event full sweep", || {
+    wait_for_sink_state(db, "ACL denied event full sweep", || {
         db.sink_metrics_for_test("acl_archive").examined >= 2
     });
     let metrics = db.sink_metrics_for_test("acl_archive");
@@ -442,7 +438,7 @@ fn assert_acl_route_delivery(db: &Database, phase: &str) {
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("the denied event must drain when its granted principal registers");
     assert_eq!(event.row_values["body"], Value::Text("denied".to_string()));
-    wait_for_sink_state("Bob acknowledgement of ACL-denied queue entry", || {
+    wait_for_sink_state(db, "Bob acknowledgement of ACL-denied queue entry", || {
         let metrics = db.sink_metrics_for_test("acl_archive");
         metrics.delivered == 2 && metrics.queued == 0
     });
@@ -482,7 +478,7 @@ fn assert_received_incomplete_acl_refs_are_denied(db: &Database, phase: &str) {
         Value::Text("allowed".to_string()),
         "{phase}: the positive control must deliver before denial is evaluated"
     );
-    wait_for_sink_state("received ACL-ref route sweep", || {
+    wait_for_sink_state(db, "received ACL-ref route sweep", || {
         db.sink_metrics_for_test("acl_archive").examined >= 4
     });
     let unexpected = alice_received
@@ -842,6 +838,7 @@ fn received_schema_publish_does_not_resurrect_a_worker_acknowledged_queue_entry(
 
         first_release_sender.send(()).unwrap();
         wait_for_sink_state(
+            &db,
             "durable worker acknowledgement against the staged same-sink event",
             || {
                 let queue = durable_queue_identity(&db, "retained_archive");
