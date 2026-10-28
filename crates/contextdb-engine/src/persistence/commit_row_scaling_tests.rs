@@ -508,18 +508,24 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
 /// replay is the positive control for the producer-derived success ceiling.
 #[test]
 fn a_many_table_append_fits_the_shallow_history_workspace() {
+    // Row stamps enter proof hashes; one clock keeps all replay page layouts identical.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
     let ample = 1 << 32;
-    let (_root, db, tx) = many_table_commit_with_history(ample, 0);
-    watch_budget_ledger_for_test();
-    db.commit(tx).expect("measure the complete shallow append");
-    let ledger = take_budget_ledger_for_test();
-    let ceiling = ledger
-        .iter()
-        .map(|entry| entry.used_after)
-        .max()
-        .expect("the real producer records its full peak");
-    db.close().expect("close the measured shallow store");
+    let mut ceiling = None;
+    for history in [0, 16] {
+        let (_root, db, tx) = many_table_commit_with_history(ample, history);
+        let baseline = db.accountant().usage().used;
+        watch_budget_ledger_for_test();
+        db.commit(tx).expect("measure the complete ample append");
+        let ledger = take_budget_ledger_for_test();
+        if history == 0 {
+            ceiling = ledger.iter().map(|entry| entry.used_after).max();
+        }
+        record_many_table_ledger(history, baseline, db.accountant().usage().used, &ledger);
+        db.close().expect("close the measured ample store");
+    }
+    let ceiling = ceiling.expect("the shallow producer records its full peak");
 
     for history in [0, 16] {
         let (root, db, tx) = many_table_commit_with_history(ceiling, history);
@@ -548,6 +554,61 @@ fn a_many_table_append_fits_the_shallow_history_workspace() {
             result.is_ok(),
             "the same 32-table append must fit the history-0 producer peak at history {history}: {result:?}"
         );
+    }
+}
+
+// Record outside the observed commit. No allowance or admission is derived
+// from these totals; the success ceiling remains the history-0 actual peak.
+fn record_many_table_ledger(
+    history: usize,
+    baseline: usize,
+    used_after: usize,
+    ledger: &[crate::memory_accounting::BudgetLedgerEntry],
+) {
+    let mut families = std::collections::BTreeMap::<String, (usize, usize, usize, usize)>::new();
+    for entry in ledger {
+        if entry.what == "release" {
+            continue;
+        }
+        let family = families.entry(entry.what.clone()).or_default();
+        family.0 += 1;
+        family.1 += entry.bytes;
+        family.2 = family.2.max(entry.bytes);
+        family.3 = family.3.max(entry.used_after);
+    }
+    let summary = serde_json::json!({
+        "history": history,
+        "tables_written": HELD_TABLES,
+        "rows_written": HELD_TABLES,
+        "writer_baseline_after_staging": baseline,
+        "writer_used_after_commit": used_after,
+        "global_ledger_peak": ledger.iter().map(|entry| entry.used_after).max(),
+        "families_count_sum_max_request_peak_used": families,
+    });
+    eprintln!("MANY_TABLE_MEASURE_JSON {summary}");
+    if let Some(directory) = std::env::var_os("CONTEXTDB_MANY_TABLE_MEASUREMENT_DIR") {
+        let entries: Vec<_> = ledger
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "what": entry.what,
+                    "bytes": entry.bytes,
+                    "used_after": entry.used_after,
+                    "owner_identity": entry.owner_identity,
+                    "parent_identity": entry.parent_identity,
+                    "allocation": entry.allocation,
+                })
+            })
+            .collect();
+        let path = std::path::PathBuf::from(directory).join(format!("history-{history}.json"));
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "summary": summary, "ledger": entries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 }
 
