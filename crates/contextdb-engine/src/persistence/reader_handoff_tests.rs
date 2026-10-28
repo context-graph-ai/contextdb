@@ -453,7 +453,7 @@ fn a_join_holding_the_runtime_lifetime_lock_never_registers_into_a_removed_root(
     let (_directory_a, path_a, channel_runtime) = fixture();
     let (_directory_b, path_b, _) = fixture();
     assert_ne!(identity(&path_a), identity(&path_b));
-    let earlier = crate::ReadSession::open_in_runtime_dir(
+    let earlier = open_with_frozen_request_clock(
         &path_a,
         crate::ReadSessionOptions::default(),
         Some(channel_runtime.clone()),
@@ -468,7 +468,7 @@ fn a_join_holding_the_runtime_lifetime_lock_never_registers_into_a_removed_root(
     let (answer_tx, answer_rx) = mpsc::channel();
     let joining_path = path_b.clone();
     let joiner = std::thread::spawn(move || {
-        let result = crate::ReadSession::open_in_runtime_dir(
+        let result = open_with_frozen_request_clock(
             &joining_path,
             crate::ReadSessionOptions::default(),
             Some(channel_runtime),
@@ -617,7 +617,7 @@ fn an_entering_reader_keeps_a_skipped_registry_and_cleans_every_root_when_it_lea
     let private_base = platform_reader_runtime_base().unwrap();
     std::fs::set_permissions(&private_base, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_directory, path, supplied) = fixture();
-    let earlier = crate::ReadSession::open_in_runtime_dir(
+    let earlier = open_with_frozen_request_clock(
         &path,
         crate::ReadSessionOptions::default(),
         Some(supplied.clone()),
@@ -648,7 +648,7 @@ fn an_entering_reader_keeps_a_skipped_registry_and_cleans_every_root_when_it_lea
                 .recv_timeout(WATCHDOG)
                 .expect("the guard releases the waiting join");
         }));
-        let result = crate::ReadSession::open_in_runtime_dir(
+        let result = open_with_frozen_request_clock(
             &joining_path,
             crate::ReadSessionOptions::default(),
             Some(joining_runtime),
@@ -755,12 +755,9 @@ pub(super) fn during_unrelated_reader_leave<R: Send>(
     let private_base = platform_reader_runtime_base().unwrap();
     std::fs::set_permissions(&private_base, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_directory, path, supplied) = fixture();
-    let earlier = crate::ReadSession::open_in_runtime_dir(
-        &path,
-        crate::ReadSessionOptions::default(),
-        Some(supplied),
-    )
-    .unwrap();
+    let earlier =
+        open_with_frozen_request_clock(&path, crate::ReadSessionOptions::default(), Some(supplied))
+            .unwrap();
     let pause = pause_readers_at_for_test(&path, ReaderPausePoint::LeavingWithRegistryExclusion);
     std::thread::scope(|scope| {
         let leaving = scope.spawn(move || drop(earlier));
@@ -866,7 +863,7 @@ fn unrelated_leave_keeps_other_store_inventory_complete() {
         return;
     }
     let (_directory, path, supplied) = fixture();
-    let reader = crate::ReadSession::open_in_runtime_dir(
+    let reader = open_with_frozen_request_clock(
         &path,
         crate::ReadSessionOptions::default(),
         Some(supplied.clone()),
@@ -940,4 +937,17 @@ fn unrelated_leave_does_not_skip_other_writer_idle_registry_cleanup() {
         remaining.is_empty(),
         "B removes its own idle registries while unrelated A leaves: {remaining:?}"
     );
+}
+
+fn open_with_frozen_request_clock(
+    path: impl AsRef<std::path::Path>,
+    options: crate::ReadSessionOptions,
+    runtime_dir: Option<std::path::PathBuf>,
+) -> Result<crate::ReadSession> {
+    crate::ReadSession::open_in_runtime_dir_with_clock_for_test(
+        path,
+        options,
+        runtime_dir,
+        std::sync::Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )
 }
