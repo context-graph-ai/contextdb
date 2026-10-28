@@ -178,6 +178,15 @@ fn assert_empty(session: &ReadSession, reverse: bool) {
     );
 }
 
+fn open_with_frozen_request_clock(path: &Path, options: ReadSessionOptions) -> Result<ReadSession> {
+    ReadSession::open_in_runtime_dir_with_clock_for_test(
+        path,
+        options,
+        None,
+        Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )
+}
+
 fn hidden_payload_case(reverse: bool, owner: bool) {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let dir = tempfile::tempdir().unwrap();
@@ -193,7 +202,7 @@ fn hidden_payload_case(reverse: bool, owner: bool) {
             },
         )
         .unwrap();
-        let reader = ReadSession::open_owner_only(&path, options()).unwrap();
+        let reader = open_with_frozen_request_clock(&path, options()).unwrap();
         assert_eq!(
             reader.route(),
             contextdb_core::read_contract::ReadRoute::Owner
@@ -202,7 +211,7 @@ fn hidden_payload_case(reverse: bool, owner: bool) {
         drop(reader);
         database.close().unwrap();
     } else {
-        let reader = ReadSession::open_with_options(&path, options()).unwrap();
+        let reader = open_with_frozen_request_clock(&path, options()).unwrap();
         assert_eq!(
             reader.route(),
             contextdb_core::read_contract::ReadRoute::File
@@ -290,9 +299,9 @@ fn public_refusal(path: &Path, owner: bool, empty: bool, reverse: bool) {
         .unwrap()
     });
     let result = if owner {
-        ReadSession::open_owner_only(path, ReadSessionOptions::default())
+        open_with_frozen_request_clock(path, ReadSessionOptions::default())
     } else {
-        ReadSession::open(path)
+        open_with_frozen_request_clock(path, ReadSessionOptions::default())
     };
     let outcome = result.and_then(|reader| {
         reader
