@@ -124,7 +124,8 @@ fn change_fixture(
 fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
     let (_directory, persistence, record) = change_fixture(oversized_base);
     let accountant = Arc::new(MemoryAccountant::with_budget(128 * 1024 * 1024));
-    accountant.try_allocate(CACHE_BYTES).unwrap();
+    let (cache_owner, fixed_invoice) = persistence
+        .install_source_fixture_cache_reserve_for_test(&accountant.clone().into(), CACHE_BYTES);
     let load = || {
         persistence.load_vector_partition_change_generation(
             &record.index,
@@ -151,9 +152,9 @@ fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
         root_bytes > GRAPH_BYTES,
         "the probe read the oversized cold root"
     );
-    assert_eq!(accountant.usage().used, CACHE_BYTES);
+    assert_eq!(accountant.usage().used, fixed_invoice);
     accountant.try_allocate(DECODE_BYTES).unwrap();
-    let held = CACHE_BYTES + DECODE_BYTES;
+    let held = fixed_invoice + DECODE_BYTES;
     let limit = held + SOURCE_HEADROOM;
     accountant.set_budget(Some(limit)).unwrap();
     let largest_read = Arc::new(AtomicUsize::new(0));
@@ -200,10 +201,10 @@ fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
         "all scoped source owners released"
     );
     accountant.release(DECODE_BYTES);
-    accountant.release(CACHE_BYTES);
+    persistence.close();
+    drop(cache_owner);
     assert_eq!(accountant.usage().used, 0);
     assert_eq!(accountant.underflow_count_for_test(), 0);
-    persistence.close();
 }
 
 #[test]
@@ -226,4 +227,44 @@ fn change_loader_cold_change_root_preserves_typed_source_refusal_and_retry() {
     .unwrap();
 
     prove_change_loader_cold_root_refusal(false);
+}
+
+#[test]
+fn raw_change_loader_cache_keeps_source_invoices_until_store_drop_and_unwind() {
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+    for oversized_base in [false, true] {
+        for unwind in [false, true] {
+            let accountant = Arc::new(MemoryAccountant::with_budget(128 * 1024 * 1024));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (_directory, persistence, record) = change_fixture(oversized_base);
+                assert_eq!(accountant.usage().used, 0);
+                let loaded = with_source_page_admission(accountant.clone().into(), || {
+                    persistence.load_vector_partition_change_generation(
+                        &record.index,
+                        &record.partition_key,
+                        record.base_generation_id,
+                        record.change_generation_id,
+                    )
+                })
+                .unwrap();
+                assert_eq!(loaded, record);
+                drop(loaded);
+                assert!(
+                    accountant.usage().used > 0,
+                    "raw cache pages retain their genuine source invoices without a fixed reserve"
+                );
+                if unwind {
+                    panic!("exercise raw cache source-owner unwind");
+                }
+                persistence.close();
+                assert_eq!(accountant.usage().used, 0);
+            }));
+            assert_eq!(result.is_err(), unwind);
+            assert_eq!(accountant.usage().used, 0);
+            assert_eq!(accountant.underflow_count_for_test(), 0);
+        }
+    }
 }
