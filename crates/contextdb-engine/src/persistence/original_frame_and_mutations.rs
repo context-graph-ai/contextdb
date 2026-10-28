@@ -3039,6 +3039,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             dropped_row_graph: Vec::new(),
             retired_row_graph_tables: Vec::new(),
             working_write: parking_lot::Mutex::new(None),
+            preparation_owner: None,
             schema_noop: true,
             affected_tables: HashSet::new(),
             replace_graph: false,

@@ -7319,6 +7319,9 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     /// row/vector entries must leave the durable log in the same transaction
     /// that installs the replacement schema image.
     pub(crate) structurally_dropped_tables: HashSet<String>,
+    /// Last: the same Original survives private writes, projection payloads and
+    /// their physical cleanup, including a failed terminal flush.
+    pub(crate) preparation_owner: Option<received_working::ReceivedPreparationOwner>,
 }
 
 pub(crate) enum ReceivedRowsGuard<'a> {

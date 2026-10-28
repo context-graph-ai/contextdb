@@ -2969,6 +2969,70 @@ impl Database {
         Ok(changed.into_iter().collect())
     }
 
+    /// Production file receivers use the same unpublished paged source as
+    /// original-funded preparation, retaining the live Legacy writer identity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Private preparation preserves the received interval's distinct authenticated inputs."
+    )]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline typed admission details without allocating on refusal."
+    )]
+    fn prepare_legacy_file_received_schema_stage(
+        &self,
+        local_lsn: Lsn,
+        coordinates: Option<&ConnectedCoordinates>,
+        changes: &ChangeSet,
+        received: Option<&crate::protocol::ReceivedDdlContext>,
+        validated_lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
+        inputs: ReceivedSchemaAdjudicationInputs<'_>,
+        delivery_prepare: Option<&mut dyn crate::custody::preparation::CommitPreparation>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<ReceivedSchemaStage> {
+        self.with_writer_preparation_original(|original| {
+            let owner =
+                crate::persistence::received_working::ReceivedPreparationOwner::prepare(original)?;
+            let original = owner.original();
+            let store = self.persistence.as_ref().ok_or_else(|| {
+                Error::Other("file received preparation lost its persistence owner".into())
+            })?;
+            let mut write =
+                crate::persistence::received_working::ReceivedWorkingWrite::begin(store, original)?;
+            write.retain_preparation_owner(&owner)?;
+            let loan = ReceivedWorkingPreparation {
+                write: &write,
+                original,
+                funder: owner.funder(),
+                store,
+            };
+            let mut stage = self.prepare_received_schema_stage_with_interval(
+                local_lsn,
+                coordinates,
+                changes,
+                received,
+                validated_lineages,
+                inputs,
+                delivery_prepare,
+                vector_copy_owner,
+                read_memory,
+                Some(original),
+                Some(&loan),
+            )?;
+            if !stage.trigger_audits.is_empty() {
+                stage.native_audit_memory = Some(self.prepare_original_audit_memory_iter(
+                    original,
+                    stage.trigger_audits.iter().map(|(_, entry)| entry),
+                )?);
+            }
+            *stage.durable_projection.working_write.get_mut() = Some(write);
+            stage.durable_projection.preparation_owner = Some(owner.clone());
+            stage._received_preparation_owner = Some(owner);
+            Ok(stage)
+        })
+    }
+
     /// An old CREATE can describe the current table only as part of its
     /// complete, exactly matched local history. Rebuild the arriving table
     /// image independently; applying CREATE over the live image would preserve
@@ -3691,6 +3755,7 @@ impl Database {
                     dropped_row_graph: Vec::new(),
                     retired_row_graph_tables: Vec::new(),
                     working_write: parking_lot::Mutex::new(None),
+                    preparation_owner: None,
                     schema_noop: true,
                     affected_tables: HashSet::new(),
                     replace_graph: false,
@@ -3741,6 +3806,7 @@ impl Database {
                 _private_prefix_effects: parking_lot::Mutex::new(None),
                 _native_trigger_config_fee: None,
                 _received_edge_input_original: None,
+                _received_preparation_owner: None,
             });
         }
         let live_vector_layouts = vector_layouts_from_meta(&live_tables)
@@ -5619,6 +5685,7 @@ impl Database {
                     dropped_row_graph,
                     retired_row_graph_tables,
                     working_write: parking_lot::Mutex::new(None),
+                    preparation_owner: None,
                     schema_noop: false,
                     affected_tables: affected_tables.clone(),
                     replace_graph: !affected_graph_edge_types.is_empty(),
@@ -5834,6 +5901,7 @@ impl Database {
                     _private_prefix_effects: parking_lot::Mutex::new(private_prefix_effects),
                     _native_trigger_config_fee: native_trigger_config_fee.take(),
                     _received_edge_input_original: received_edge_input_original,
+                    _received_preparation_owner: None,
                 }))
             };
             let prepared = if let Some(loan) = working_preparation {
@@ -6675,6 +6743,21 @@ impl Database {
                             vector_copy_owner,
                             read_memory.clone(),
                         )?,
+                        None if self.persistence.is_some()
+                            && self.relational_store.uses_disk_backed_committed_bodies() =>
+                        {
+                            self.prepare_legacy_file_received_schema_stage(
+                                lsn,
+                                coordinates.as_ref(),
+                                changes,
+                                received,
+                                validated_lineages,
+                                inputs,
+                                delivery_prepare.take(),
+                                vector_copy_owner,
+                                read_memory.clone(),
+                            )?
+                        }
                         None => self.prepare_received_schema_stage_with_interval(
                             lsn,
                             coordinates.as_ref(),
@@ -6778,6 +6861,9 @@ impl Database {
                                         empty_vector,
                                     ),
                                     _connected_credits: stage._connected_credits.take(),
+                                    _received_preparation_owner: stage
+                                        ._received_preparation_owner
+                                        .take(),
                                 });
                             *moved_retired_custody_keys.borrow_mut() =
                                 std::mem::take(&mut *stage.retired_custody_keys.lock());
