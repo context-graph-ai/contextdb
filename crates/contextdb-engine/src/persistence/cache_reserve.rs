@@ -49,19 +49,6 @@ unsafe fn finish(raw: NonNull<()>) {
     }
     fence(Ordering::Acquire);
     let block = unsafe { pointer.as_mut() };
-    #[cfg(feature = "test-seams")]
-    if let Some(observation) = &mut block.observation {
-        observation.actual_release_bytes(
-            block
-                .reserve
-                .as_ref()
-                .map_or(0, |credit| credit.observation_for_test().1)
-                + block
-                    .control
-                    .as_ref()
-                    .map_or(0, |credit| credit.observation_for_test().1),
-        );
-    }
     let _free = ReserveFree {
         pointer,
         _reserve: block.reserve.take(),
@@ -106,6 +93,31 @@ pub(super) fn original(
     } else {
         ControlCredit::retained_startup(accountant, layout.size())
     };
+    #[cfg(feature = "test-seams")]
+    let observation_facts = {
+        let bytes = reserve
+            .observation_for_test()
+            .1
+            .checked_add(control.observation_for_test().1)
+            .ok_or_else(|| {
+                Error::NativeEngineOther(contextdb_core::read_memory::NativeRefusal::Other(
+                    "fixed cache reserve observation byte total overflow",
+                ))
+            })?;
+        let funding = reserve.funding_for_test().ok_or_else(|| {
+            Error::NativeEngineOther(contextdb_core::read_memory::NativeRefusal::Other(
+                "fixed cache reserve has no genuine funder",
+            ))
+        })?;
+        if control.funding_for_test() != Some(funding) {
+            return Err(Error::NativeEngineOther(
+                contextdb_core::read_memory::NativeRefusal::Other(
+                    "fixed cache reserve and control have different funders",
+                ),
+            ));
+        }
+        (bytes, funding.0, funding.1)
+    };
     let writer = WriterUse::retain_if_writer(accountant);
     let Some(pointer) = NonNull::new(unsafe { alloc(layout) }.cast::<ReserveBlock>()) else {
         return Err(Error::Other(
@@ -124,26 +136,12 @@ pub(super) fn original(
     };
     #[cfg(feature = "test-seams")]
     unsafe {
-        let block = &mut *pointer.as_ptr();
-        let bytes = block
-            .reserve
-            .as_ref()
-            .map_or(0, |credit| credit.observation_for_test().1)
-            + block
-                .control
-                .as_ref()
-                .map_or(0, |credit| credit.observation_for_test().1);
-        let funder = block
-            .reserve
-            .as_ref()
-            .expect("live original reserve")
-            .observation_for_test()
-            .0;
-        block.observation = Some(
+        (*pointer.as_ptr()).observation = Some(
             redb::native_page_observations::observe_fixed_reserve_for_test(
                 pointer.as_ptr() as usize,
-                funder,
-                bytes,
+                observation_facts.1,
+                observation_facts.2,
+                observation_facts.0,
                 layout,
             ),
         );

@@ -3416,8 +3416,24 @@ impl ControlCredit {
             self.accountant
                 .as_ref()
                 .map_or(0, |a| std::ptr::from_ref(a.as_ref()) as usize),
-            self.bytes,
+            self.bytes & !OPEN_RESIDUE_TAG,
         )
+    }
+
+    /// Identify the genuine monetary source, separately from the carrier
+    /// accountant. Process-only residue is refunded to this actual aggregate.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn funding_for_test(&self) -> Option<(usize, bool)> {
+        if self.bytes & OPEN_RESIDUE_TAG != 0 {
+            Some((
+                &PROCESS_WRITER_AGGREGATE as *const AtomicUsize as usize,
+                true,
+            ))
+        } else {
+            self.accountant
+                .as_ref()
+                .map(|accountant| (std::ptr::from_ref(accountant.as_ref()) as usize, false))
+        }
     }
 
     #[expect(

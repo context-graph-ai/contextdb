@@ -13,6 +13,11 @@ expose the existing allocation and its genuine receipt. The cold-read injector
 runs only at the actual cache-miss backend read and uses its existing failure
 branch, including sticky I/O failure. A test-only cache lease reports actual
 limit/occupancy and invokes existing unpinned-victim eviction for cold setup.
+Fixed-reserve events distinguish the genuine process aggregate from a writer
+accountant. The engine's receipt producer exposes held bytes without its internal
+process-residue tag; observed totals use checked arithmetic before allocation.
+The final notification retains that unchanging admitted amount and runs after the
+real receipts settle; it never adds tagged words during Drop.
 These observations add no default-build fields, cache policy, payer or admission.
 Independent behavioral guards certify the lifecycle and refusal requirements.
 

@@ -69,6 +69,7 @@ pub enum NativePageCustodyEventForTest {
         allocation: usize,
         receipt: usize,
         original_funder: Option<usize>,
+        process_only: bool,
         bytes: usize,
     },
     OccupancyReleased {
@@ -81,6 +82,7 @@ pub enum NativePageCustodyEventForTest {
     FixedReserveAdmitted {
         receipt: usize,
         original_funder: usize,
+        process_only: bool,
         bytes: usize,
         control: Layout,
     },
@@ -307,6 +309,7 @@ pub(crate) struct PaymentObservation {
     allocation: usize,
     receipt: usize,
     pub(crate) original_funder: Option<usize>,
+    process_only: bool,
     bytes: usize,
 }
 impl PaymentObservation {
@@ -323,6 +326,7 @@ impl PaymentObservation {
             allocation,
             receipt,
             original_funder,
+            process_only: false,
             bytes,
         }
     }
@@ -333,6 +337,7 @@ impl PaymentObservation {
                 allocation: self.allocation,
                 receipt: self.receipt,
                 original_funder: self.original_funder,
+                process_only: self.process_only,
                 bytes: self.bytes,
             });
         self.observation.payment_closed();
@@ -360,11 +365,6 @@ impl PaymentObservation {
 /// Held after the original producer's actual reserve/control receipts, so its
 /// Drop reports their completed refund, never an occupancy estimate.
 pub struct NativeFixedReserveObservationForTest(PaymentObservation);
-impl NativeFixedReserveObservationForTest {
-    pub fn actual_release_bytes(&mut self, bytes: usize) {
-        self.0.bytes = bytes;
-    }
-}
 impl Drop for NativeFixedReserveObservationForTest {
     fn drop(&mut self) {
         self.0
@@ -373,6 +373,7 @@ impl Drop for NativeFixedReserveObservationForTest {
                 allocation: self.0.allocation,
                 receipt: self.0.receipt,
                 original_funder: self.0.original_funder,
+                process_only: self.0.process_only,
                 bytes: self.0.bytes,
             });
         self.0.observation.payment_closed();
@@ -383,6 +384,7 @@ impl Drop for NativeFixedReserveObservationForTest {
 pub fn observe_fixed_reserve_for_test(
     receipt: usize,
     original_funder: usize,
+    process_only: bool,
     bytes: usize,
     control: Layout,
 ) -> NativeFixedReserveObservationForTest {
@@ -390,16 +392,14 @@ pub fn observe_fixed_reserve_for_test(
     observation.emit(NativePageCustodyEventForTest::FixedReserveAdmitted {
         receipt,
         original_funder,
+        process_only,
         bytes,
         control,
     });
-    NativeFixedReserveObservationForTest(PaymentObservation::new(
-        observation,
-        receipt,
-        receipt,
-        Some(original_funder),
-        bytes,
-    ))
+    let mut payment =
+        PaymentObservation::new(observation, receipt, receipt, Some(original_funder), bytes);
+    payment.process_only = process_only;
+    NativeFixedReserveObservationForTest(payment)
 }
 
 #[derive(Clone, Copy, Debug)]
