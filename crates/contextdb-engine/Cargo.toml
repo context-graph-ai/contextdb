@@ -883,3 +883,8 @@ required-features = ["test-seams"]
 name = "first_saved_search_owned_worker"
 path = "tests/first_saved_search_owned_worker.rs"
 required-features = ["test-seams"]
+
+[[test]]
+name = "checked_backend_read_faults"
+path = "tests/checked_backend_read_faults.rs"
+required-features = ["test-seams"]
