@@ -410,6 +410,15 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     );
 }
 
+// Keep the physical reader obligation independently runnable. The surrounding
+// distinct-funder proof has its own pre-existing terminal-root assertion;
+// neither that assertion nor this shared reader matrix is weakened here.
+#[test]
+#[serial]
+fn embedded_reader_physical_pages_use_their_actual_payer() {
+    embedded_graph_reader_scratch_rows();
+}
+
 // Public embedding ruling: a search uses its operation child, even with no
 // writer headroom. This row belongs to the existing distinct-funder proof;
 // integration tests cannot call the private explicit-owner entry point.
