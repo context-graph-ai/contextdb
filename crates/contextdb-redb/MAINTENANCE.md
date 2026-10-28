@@ -1204,13 +1204,3 @@ writer's `zeroed_for_write` construction point.
 | Changed source | Reason |
 |---|---|
 | `src/db.rs`, `src/transactions.rs` | Remove three expectations for the unknown `clippy::assert_is_empty` lint. The existing const-constructor assertions need no exception on Rust 1.94.0; constructor behavior and the minimum supported Rust version are unchanged. |
-
-## Authenticated external snapshot test helper
-
-The test-only retained-page helper uses the same authenticated external snapshot
-selection as production retention statistics. Process-local writer roots are
-therefore excluded from its page inventory.
-
-| Changed source | Reason |
-|---|---|
-| `src/transactions.rs` | Use the authenticated external snapshot selector in the test-only retained-page helper. |

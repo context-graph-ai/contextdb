@@ -3578,7 +3578,7 @@ impl WriteTransaction {
     pub fn external_snapshot_retained_pages_for_test(&self) -> Result<Vec<[u8; 8]>> {
         let protected = self
             .transaction_tracker
-            .authenticated_external_snapshot_page_sets(&self.mem)?
+            .external_snapshot_page_sets(&self.mem)?
             .into_iter()
             .flat_map(|(_, pages)| pages)
             .collect::<HashSet<_>>();
