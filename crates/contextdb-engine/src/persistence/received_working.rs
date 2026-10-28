@@ -1303,8 +1303,8 @@ impl ReceivedWorkingWrite {
         let declaration = OriginalPersistenceFrame::new(original)?;
         declaration.reserve(
             previous
-                .estimated_bytes()
-                .saturating_add(arriving.estimated_bytes())
+                .metadata_bytes()
+                .saturating_add(arriving.metadata_bytes())
                 .saturating_add(
                     ddl.iter()
                         .map(DdlChange::estimated_bytes)
@@ -1343,7 +1343,7 @@ impl ReceivedWorkingWrite {
             let window = OriginalPersistenceFrame::new(original)?;
             window.reserve(
                 crate::memory_accounting::preparation_row_copy_bytes(source.value())?
-                    .saturating_add(arriving.estimated_bytes().saturating_mul(8))
+                    .saturating_add(arriving.metadata_bytes().saturating_mul(8))
                     .saturating_add(4096),
             )?;
             let mut row = crate::memory_accounting::preparation_copy_row(source.value())?;
@@ -1462,8 +1462,10 @@ impl WorkingSchema {
         meta: &TableMeta,
     ) -> Result<Self> {
         let frame = OriginalPersistenceFrame::new(original)?;
+        // TableMeta cloning copies declarations, not the separate exact-probe
+        // filters allocated by index storage.
         frame.reserve(
-            meta.estimated_bytes()
+            meta.metadata_bytes()
                 .saturating_mul(8)
                 .saturating_add(table.len())
                 .saturating_add(std::mem::size_of::<Self>())
