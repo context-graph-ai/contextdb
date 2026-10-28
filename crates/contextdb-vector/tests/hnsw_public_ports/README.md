@@ -2,7 +2,6 @@
 
 These guards belong to `close1-index-ports`, independently of the production index implementer. They port public portions of the frozen 53-name HNSW inventory to the native kernel and public SEARCH/IVF engine path. Production code and the existing independent guard estate are unchanged.
 
-The complete assertion map, original source bodies/hashes, receipts and explicit private-counterpart gaps are at `/home/lucid/build/evidence/contextdb-bounded-storage/closeout/fable-close-1/index-ports/`. The originating inventory is `../index/engine-stage/hnsw-unit-inventory237.json` within that evidence campaign.
 
 There are 45 original-named public-portion guards: 41 kernel guards in this target and four original-named engine companions in `hnsw_public_engine_ports`. Two additional engine companions exercise SQ8/SQ4 insertion and all-encoding predicate results. These are not 53 complete replacement receipts: eight names lack a valid native counterpart, and the assertion map explicitly lists missing private and public observations inside partial ports. No name is retired.
 

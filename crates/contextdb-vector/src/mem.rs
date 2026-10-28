@@ -9764,7 +9764,7 @@ mod route_cost_tests {
     /// frozen multi-Context cell selects three Contexts of 1,250 live rows,
     /// half of them current: there the walk scored 1,866.9 of the 1,875
     /// current rows per query (mean) and answered at 44.7 ms p95 against
-    /// EXACT's 22.8 ms, paired and interleaved (debug build, ms-a2,
+    /// EXACT's 22.8 ms, paired and interleaved (debug build,
     /// `indexed_route_does_less_work_than_exact`). AUTO must compare those
     /// rows outright, while the same three partitions with no filter are
     /// still walked.
