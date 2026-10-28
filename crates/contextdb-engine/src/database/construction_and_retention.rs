@@ -2969,12 +2969,13 @@ pub(super) fn prune_expired_rows(
     };
     let graph_root = writer_read::durable_root(tx_mgr.capture_published_read().handle)?;
     let mut removed_edges = Vec::new();
+    let mut removed_owned_edges = Vec::new();
     if !reclaimable_edge_nodes.is_empty() {
-        writer_read::visit_graph_versions_for_nodes(
+        writer_read::visit_graph_versions_for_nodes_with_owner(
             graph_store,
             graph_root.clone(),
             &reclaimable_edge_nodes,
-            |entry| {
+            |entry, owner| {
                 if !edge_is_reclaimable(entry) {
                     return Ok(());
                 }
@@ -2986,7 +2987,7 @@ pub(super) fn prune_expired_rows(
                 )?;
                 // Persistence removes by identity; properties are not needed and
                 // must never be cloned just to delete the edge that owns them.
-                removed_edges.push(AdjEntry {
+                let selected = AdjEntry {
                     source: entry.source,
                     target: entry.target,
                     edge_type: entry.edge_type.clone(),
@@ -2994,7 +2995,21 @@ pub(super) fn prune_expired_rows(
                     created_tx: entry.created_tx,
                     deleted_tx: entry.deleted_tx,
                     lsn: entry.lsn,
-                });
+                };
+                if let Some(owner) = owner {
+                    workspace.try_grow_for(
+                        owner.estimated_bytes(),
+                        "retention",
+                        "prepare_prune",
+                        "Raise MEMORY_LIMIT to retain exact row-owned retirement coordinates.",
+                    )?;
+                    removed_owned_edges.push(contextdb_tx::OwnedAdjEntry {
+                        owner: owner.clone(),
+                        entry: selected,
+                    });
+                } else {
+                    removed_edges.push(selected);
+                }
                 Ok(())
             },
             maintenance_read_memory.clone(),
@@ -3035,11 +3050,11 @@ pub(super) fn prune_expired_rows(
         crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant),
     );
     {
-        writer_read::visit_graph_versions_for_nodes(
+        writer_read::visit_graph_versions_for_nodes_with_owner(
             graph_store,
             graph_root.clone(),
             &reclaimable_edge_nodes,
-            |entry| {
+            |entry, _owner| {
                 if edge_is_reclaimable(entry) {
                     return Ok(());
                 }
@@ -3162,6 +3177,78 @@ pub(super) fn prune_expired_rows(
         row_keys.iter().map(|(_, row, _, lsn)| (*row, *lsn)),
         ctx.finalization.accountant.read_budget()?,
     )?;
+    let mut memory_retirement_removals = Vec::new();
+    if persistence.is_none() {
+        let carry = ctx.retention_deferred_edge_nodes.lock();
+        for (table, row, created, lsn) in &row_keys {
+            let prefix = crate::persistence::row_graph::retirement_version_prefix(
+                table, *row, *created, *lsn,
+            )?;
+            for (key, _) in carry.retired.range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            )) {
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                workspace.try_grow_for(
+                    key.len().saturating_add(2 * std::mem::size_of::<String>()),
+                    "retention",
+                    "prepare_prune",
+                    "Raise MEMORY_LIMIT to prepare retirement cleanup keys.",
+                )?;
+                memory_retirement_removals.push(key.clone());
+            }
+        }
+    }
+    let mut memory_retirements = Vec::new();
+    if persistence.is_none() {
+        workspace.try_grow_for(
+            removed_owned_edges
+                .len()
+                .saturating_mul(std::mem::size_of::<(String, MemoryRowRetirement)>()),
+            "retention",
+            "prepare_prune",
+            "Raise MEMORY_LIMIT to prepare memory retirement controls.",
+        )?;
+        for owned in &removed_owned_edges {
+            if row_keys.iter().any(|(table, row, created, lsn)| {
+                table == &owned.owner.table
+                    && *row == owned.owner.row_id
+                    && *created == owned.owner.created_tx
+                    && *lsn == owned.owner.lsn
+            }) {
+                continue;
+            }
+            let mut memory = crate::memory_accounting::OwnedMemoryReservation::new(
+                crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant),
+            );
+            let node = 2
+                * (11 * std::mem::size_of::<(String, MemoryRowRetirement)>()
+                    + 12 * std::mem::size_of::<usize>()
+                    + 4 * std::mem::size_of::<usize>()
+                    + crate::sync_types::held::ALLOCATION_BYTES);
+            memory.try_grow_for(
+                owned
+                    .estimated_bytes()
+                    .saturating_add(node)
+                    .saturating_add(crate::persistence::row_graph::RETIRED_PREFIX.len())
+                    .saturating_add(owned.owner.table.len().saturating_mul(2))
+                    .saturating_add(84),
+                "retention",
+                "row_graph_retirement",
+                "Raise MEMORY_LIMIT to retain exact memory retirement controls.",
+            )?;
+            let key = crate::persistence::row_graph::retirement_key(&owned.owner)?;
+            memory_retirements.push((
+                key,
+                MemoryRowRetirement {
+                    owned: owned.clone(),
+                    memory,
+                },
+            ));
+        }
+    }
     let mut publication_watch = None;
     if let Some(persistence) = persistence {
         publication.reserve()?;
@@ -3174,12 +3261,17 @@ pub(super) fn prune_expired_rows(
         // The same commit removes vectors and adjacency and retains retry
         // identities for edges still owed to registered readers, including a
         // pass that only revisits adjacency after its row is already gone.
-        let persisted = persistence.prune_retention_scoped(
+        let persisted = persistence.prune_retention_with_owned_scoped(
             &metas,
             &row_keys,
             &pruned_change_keys_vec,
             &orphaned_source_lsn_rows,
-            Some((&removed_vectors, &removed_edges, &deferred_edge_nodes)),
+            Some((
+                &removed_vectors,
+                &removed_edges,
+                &removed_owned_edges,
+                &deferred_edge_nodes,
+            )),
             &commit_index_candidates,
             &generation_cleanup,
             &retention_progress,
@@ -3293,10 +3385,24 @@ pub(super) fn prune_expired_rows(
     // A deferred entry is still charged and still physically present; it is
     // released and handed back to the accountant on the pass that finally
     // removes it, which is the same one release every other entry gets.
-    *ctx.retention_deferred_edge_nodes.lock() = RetentionDeferredEdges {
-        nodes: deferred_edge_nodes,
-        _memory: Some(deferred_edge_memory),
-    };
+    {
+        let mut carry = ctx.retention_deferred_edge_nodes.lock();
+        carry.nodes = deferred_edge_nodes;
+        carry._memory = Some(deferred_edge_memory);
+        for (key, value) in memory_retirements {
+            if let Some(old) = carry.retired.insert(key, value) {
+                drop(old.owned);
+                drop(old.memory);
+            }
+        }
+        for key in memory_retirement_removals {
+            if let Some((key, value)) = carry.retired.remove_entry(&key) {
+                drop(key);
+                drop(value.owned);
+                drop(value.memory);
+            }
+        }
+    }
 
     // Reclaimed physical bytes are reported in full below; only the versions
     // that still held a charge are returned to the accountant.

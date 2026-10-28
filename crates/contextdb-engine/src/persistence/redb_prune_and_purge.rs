@@ -996,6 +996,45 @@ impl RedbPersistence {
         generations: &VectorGenerationCleanup,
         selection_progress: &[(String, Vec<u8>)],
     ) -> Result<PruneScopedStats> {
+        self.prune_retention_with_owned_scoped(
+            table_meta,
+            row_keys,
+            pruned_change_keys,
+            orphaned_source_lsn_rows,
+            auxiliary.map(|(vectors, edges, deferred)| {
+                (
+                    vectors,
+                    edges,
+                    &[] as &[contextdb_tx::OwnedAdjEntry],
+                    deferred,
+                )
+            }),
+            commit_index_lsns,
+            generations,
+            selection_progress,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(crate) fn prune_retention_with_owned_scoped(
+        &self,
+        table_meta: &HashMap<String, TableMeta>,
+        row_keys: &[(String, RowId, TxId, Lsn)],
+        pruned_change_keys: &[(String, RowId, Lsn)],
+        orphaned_source_lsn_rows: &[(String, RowId)],
+        auxiliary: Option<(
+            &[contextdb_vector::VectorVersionIdentity],
+            &[AdjEntry],
+            &[contextdb_tx::OwnedAdjEntry],
+            &HashSet<NodeId>,
+        )>,
+        commit_index_lsns: &[Lsn],
+        generations: &VectorGenerationCleanup,
+        selection_progress: &[(String, Vec<u8>)],
+    ) -> Result<PruneScopedStats> {
         self.prepare_proof_owner()?;
         if row_keys.is_empty()
             && pruned_change_keys.is_empty()
@@ -1036,13 +1075,19 @@ impl RedbPersistence {
 
             #[cfg(any(test, feature = "test-seams"))]
             retention_reclaim_checkpoint_for_test(1);
-            if let Some((vectors, edges, deferred_nodes)) = auxiliary {
+            if let Some((vectors, edges, owned_edges, deferred_nodes)) = auxiliary {
                 self.prune_vector_versions_in_write(
                     &write_txn,
                     vectors,
                     rewrite_workspace.as_mut(),
                 )?;
                 self.prune_edges_in_write(&write_txn, edges)?;
+                Self::retire_owned_edges_in_write(
+                    &write_txn,
+                    owned_edges,
+                    row_keys,
+                    &mut identity_mutations,
+                )?;
                 identity_mutations.extend(vectors.iter().map(|entry| {
                     content_identity::remove_vector_version_mutation(
                         &entry.index,
@@ -1154,9 +1199,10 @@ impl RedbPersistence {
             Ok(PruneScopedStats {
                 row_keys_removed: row_keys.len() as u64,
                 change_log_keys_removed,
-                vector_keys_removed: auxiliary.map_or(0, |(vectors, _, _)| vectors.len() as u64),
-                edge_keys_removed: auxiliary
-                    .map_or(0, |(_, edges, _)| (edges.len() as u64).saturating_mul(2)),
+                vector_keys_removed: auxiliary.map_or(0, |(vectors, _, _, _)| vectors.len() as u64),
+                edge_keys_removed: auxiliary.map_or(0, |(_, edges, owned, _)| {
+                    ((edges.len() + owned.len()) as u64).saturating_mul(2)
+                }),
                 proof_admission_refused: None,
             })
         })
@@ -1191,6 +1237,16 @@ impl RedbPersistence {
                 config.remove(key.as_str()).map_err(Self::storage_error)?;
                 identity_mutations.extend(content_identity::config_mutations(&key, None));
             }
+        }
+        for (table, row, created, lsn) in row_keys {
+            Self::erase_row_retirements_in_write(
+                write_txn,
+                table,
+                *row,
+                *created,
+                *lsn,
+                identity_mutations,
+            )?;
         }
         let mut change_log_keys_removed = 0u64;
 
@@ -2532,6 +2588,16 @@ impl RedbPersistence {
             }
         }
 
+        for (table, row, created, lsn) in &projection.row_versions {
+            Self::erase_row_retirements_in_write(
+                write_txn,
+                table,
+                *row,
+                *created,
+                *lsn,
+                &mut identity_mutations,
+            )?;
+        }
         self.graph_writer_window(|| {
             Self::erase_row_graph_in_write(write_txn, &projection.row_graph_entries)
         })?;

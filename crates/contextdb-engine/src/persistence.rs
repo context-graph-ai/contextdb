@@ -60,7 +60,7 @@ mod relational_posting_prune;
 mod relational_version_manifest;
 #[cfg(any(test, feature = "test-seams"))]
 mod resident_history_test_seams;
-mod row_graph;
+pub(crate) mod row_graph;
 mod schema_binding;
 mod transaction_repair;
 pub(crate) mod vector_current_identity;

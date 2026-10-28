@@ -12,8 +12,9 @@ impl WriterSnapshotHandle {
         &self,
         owner: SourceWindowOwner,
         artifact: &RedbPersistence,
+        watermark: TxId,
     ) -> Result<()> {
-        let mut cursor = self.config_cursor(owner, "")?;
+        let mut cursor = self.config_cursor(owner.clone(), "")?;
         while let Some(window) = cursor.next(|key, bytes| {
             crate::read_image_memory::reserve(
                 bytes
@@ -22,14 +23,75 @@ impl WriterSnapshotHandle {
                     .saturating_add(key.len())
                     .saturating_add(256),
             )?;
-            Ok(bytes.to_vec())
+            let key = std::str::from_utf8(key).map_err(|_| Error::StoreCorrupted {
+                path: "config".into(),
+                reason: "configuration key is not UTF-8".into(),
+            })?;
+            if key.starts_with(super::row_graph::RETIRED_PREFIX) {
+                // Decode and nested point checks stay inside this original
+                // source window's admission; nothing borrows a new decoder.
+                let record = super::row_graph::decode_retirement(bytes)?;
+                if super::row_graph::retirement_key(&record.owned.owner)? != key {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "export retirement key does not match its exact owner".into(),
+                    });
+                }
+                if record.owned.owner.created_tx > watermark {
+                    return Ok(None);
+                }
+                crate::read_image_memory::reserve(
+                    crate::database::Database::DURABLE_LINEAGE_TABLE_GENERATION_PREFIX
+                        .len()
+                        .saturating_add(record.owned.owner.table.len().saturating_mul(4)),
+                )?;
+                let generation_key =
+                    crate::database::Database::durable_lineage_table_generation_key(
+                        &record.owned.owner.table,
+                    );
+                let generation = self.config_point::<u64>(owner.clone(), &generation_key)?;
+                if !generation.as_ref().is_some_and(|value| {
+                    value.value != 0 && value.value == record.owned.owner.table_generation
+                }) {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason:
+                            "export retirement disagrees with the authoritative table generation"
+                                .into(),
+                    });
+                }
+                let mut row_key = [0_u8; 24];
+                row_key[..8].copy_from_slice(&record.owned.owner.row_id.0.to_be_bytes());
+                row_key[8..16].copy_from_slice(&record.owned.owner.created_tx.0.to_be_bytes());
+                row_key[16..].copy_from_slice(&record.owned.owner.lsn.0.to_be_bytes());
+                let mut rows =
+                    self.exact_row(owner.clone(), &record.owned.owner.table, &row_key)?;
+                if rows.next_row()?.is_none() {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "export retirement has no exact owning SQL row".into(),
+                    });
+                }
+                if !RedbPersistence::row_retirement_in_read(
+                    self.owner_read()?.as_ref(),
+                    &record.owned,
+                )? {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "export retirement has no authenticated projection".into(),
+                    });
+                }
+            }
+            Ok(Some(bytes.to_vec()))
         })? {
-            let key =
-                std::str::from_utf8(window.position()).map_err(|_| Error::StoreCorrupted {
-                    path: "config".into(),
-                    reason: "configuration key is not UTF-8".into(),
-                })?;
-            artifact.append_encoded_config_occurrence(key, &window.value)?;
+            if let Some(bytes) = &window.value {
+                let key =
+                    std::str::from_utf8(window.position()).map_err(|_| Error::StoreCorrupted {
+                        path: "config".into(),
+                        reason: "configuration key is not UTF-8".into(),
+                    })?;
+                artifact.append_encoded_config_occurrence(key, bytes)?;
+            }
         }
         Ok(())
     }

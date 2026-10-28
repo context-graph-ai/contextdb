@@ -1967,6 +1967,7 @@ impl MaintenanceContext {
                     &self.snapshot_registry,
                     publication,
                     &self.publication_interrupted,
+                    &self.retention_deferred_edge_nodes,
                     &tables,
                     read_memory.clone(),
                 )?;
@@ -2016,6 +2017,7 @@ impl MaintenanceContext {
                     &self.snapshot_registry,
                     publication,
                     &self.publication_interrupted,
+                    &self.retention_deferred_edge_nodes,
                     tables,
                     read_memory.clone(),
                 )?;

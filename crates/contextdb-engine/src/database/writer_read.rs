@@ -3325,6 +3325,65 @@ pub(super) fn visit_graph_versions_for_nodes(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve typed inline storage errors."
+)]
+pub(super) fn visit_graph_versions_for_nodes_with_owner(
+    store: &GraphStore,
+    root: Option<WriterSnapshotHandle>,
+    nodes: &HashSet<NodeId>,
+    mut visit: impl FnMut(&AdjEntry, Option<&contextdb_tx::RowEdgeOwner>) -> Result<()>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<()> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    for node in nodes {
+        for reverse in [false, true] {
+            let mut consume =
+                |edge: &AdjEntry, owner: Option<&contextdb_tx::RowEdgeOwner>| -> Result<()> {
+                    #[cfg(feature = "test-seams")]
+                    resident_history_test_seams::note(|work| work.graph_keys_examined += 1);
+                    if !reverse || !nodes.contains(&edge.source) {
+                        visit(edge, owner)?;
+                    }
+                    Ok(())
+                };
+            if let Some(root) = &root {
+                let graph =
+                    crate::persistence::graph_read::EngineGraphReadRoot::Writer(root.clone());
+                let lower = node.as_bytes();
+                let upper = node.as_u128().checked_add(1).map(u128::to_be_bytes);
+                for row_owned in [false, true] {
+                    let mut cursor = graph.cursor_lane(
+                        reverse,
+                        row_owned,
+                        std::ops::Bound::Included(lower.as_slice()),
+                        upper.as_ref().map_or(std::ops::Bound::Unbounded, |upper| {
+                            std::ops::Bound::Excluded(upper.as_slice())
+                        }),
+                        read_memory.clone(),
+                    )?;
+                    while let Some(window) = cursor.next_edge_with(&|| Ok(()))? {
+                        consume(window.edge(), window.row_owner())?;
+                    }
+                }
+            } else {
+                let adjacency = if reverse {
+                    &store.reverse_adj
+                } else {
+                    &store.forward_adj
+                };
+                if let Some(edges) = adjacency.read().get(node) {
+                    for edge in edges {
+                        consume(&edge.entry, edge.row_owner.as_ref())?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Database {
     /// A durable store, writer or retained reader, keeps every relational
     /// posting, automatic or declared, in one ordered family, so a bounded

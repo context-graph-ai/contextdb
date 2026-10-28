@@ -4799,8 +4799,25 @@ struct VectorGenerationWorkspacePlan {
 #[derive(Default)]
 struct RetentionDeferredEdges {
     nodes: HashSet<NodeId>,
+    retired: BTreeMap<String, MemoryRowRetirement>,
     // The published carry-over owns its hash buckets until replacement/drop.
     _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+}
+
+struct MemoryRowRetirement {
+    owned: contextdb_tx::OwnedAdjEntry,
+    memory: crate::memory_accounting::OwnedMemoryReservation,
+}
+impl Drop for RetentionDeferredEdges {
+    fn drop(&mut self) {
+        // Remove first, so a final B-tree node is freed before its external
+        // invoice. Other entries continue paying for any shared live node.
+        while let Some((key, value)) = self.retired.pop_first() {
+            drop(key);
+            drop(value.owned);
+            drop(value.memory);
+        }
+    }
 }
 
 /// The engine-owned pieces one maintenance cycle needs, cloned out of the

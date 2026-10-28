@@ -2740,6 +2740,8 @@ impl Database {
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        let (memory_retirement_keys, memory_retirement_credit) =
+            self.prepare_memory_table_retirement_cleanup(table, read_memory.clone())?;
         let current = self.trigger.declarations.lock().clone();
         let mut projected = self.apply_trigger_ddl_batch_projection(prefix_trigger_ddl)?;
         let implicit_trigger_drops = projected
@@ -2795,6 +2797,10 @@ impl Database {
                 &row_graph_edges,
             )?;
         }
+        self.retention_deferred_edge_nodes
+            .lock()
+            .discard_prepared_retirements(memory_retirement_keys);
+        drop(memory_retirement_credit);
         self.apply_graph_edges_after_table_drop(graph_edges);
         self.remove_rank_formulas_for_table(table);
         self.vector_store_deregister_table(table);

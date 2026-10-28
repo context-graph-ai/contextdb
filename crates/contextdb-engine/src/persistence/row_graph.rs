@@ -3,6 +3,105 @@
 use super::*;
 use contextdb_tx::OwnedAdjEntry;
 
+pub(crate) const RETIRED_PREFIX: &str = "row_graph_retired_v1.";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Retirement {
+    pub(crate) version: u8,
+    pub(crate) owned: OwnedAdjEntry,
+}
+
+// The exact row-version prefix precedes the generation, so deleting that
+// version can remove its controls without scanning another row's history.
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve typed inline storage errors."
+)]
+pub(crate) fn retirement_version_prefix(
+    table: &str,
+    row: RowId,
+    created: TxId,
+    lsn: Lsn,
+) -> Result<String> {
+    use std::fmt::Write;
+    let bytes = RETIRED_PREFIX
+        .len()
+        .saturating_add(table.len().saturating_mul(2))
+        .saturating_add(64);
+    crate::read_image_memory::reserve(bytes)?;
+    let mut key = String::with_capacity(bytes);
+    key.push_str(RETIRED_PREFIX);
+    for byte in table.as_bytes() {
+        write!(&mut key, "{byte:02x}").map_err(|_| corruption("retirement key encoding failed"))?;
+    }
+    write!(&mut key, ".{:020}.{:020}.{:020}.", row.0, created.0, lsn.0)
+        .map_err(|_| corruption("retirement coordinates encoding failed"))?;
+    Ok(key)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve typed inline storage errors."
+)]
+pub(crate) fn retirement_key(owner: &contextdb_tx::RowEdgeOwner) -> Result<String> {
+    use std::fmt::Write;
+    let mut key =
+        retirement_version_prefix(&owner.table, owner.row_id, owner.created_tx, owner.lsn)?;
+    crate::read_image_memory::reserve(20)?;
+    key.reserve_exact(20);
+    write!(&mut key, "{:020}", owner.table_generation)
+        .map_err(|_| corruption("retirement generation encoding failed"))?;
+    Ok(key)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve typed inline storage errors."
+)]
+pub(crate) fn validate_retirement(record: &Retirement, expected: &OwnedAdjEntry) -> Result<()> {
+    validate(&record.owned)?;
+    let a = &record.owned.entry;
+    let b = &expected.entry;
+    if record.version != 1
+        || record.owned.owner != expected.owner
+        || a.source != b.source
+        || a.target != b.target
+        || a.edge_type != b.edge_type
+        || a.created_tx != b.created_tx
+        || a.lsn != b.lsn
+        || !a.properties.is_empty()
+    {
+        return Err(corruption(
+            "retirement does not authorize this exact owning edge row",
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve typed inline storage errors."
+)]
+pub(crate) fn decode_retirement(bytes: &[u8]) -> Result<Retirement> {
+    // The leading u8 is the version tag in this private bincode record.
+    // Reject it before any owned body field can request an allocation.
+    if bytes.first() != Some(&1) {
+        return Err(corruption(
+            "missing or unsupported row graph retirement version",
+        ));
+    }
+    let record: Retirement =
+        RedbPersistence::decode_config_value_exact(bytes).map_err(|error| match error {
+            Error::Other(_) => corruption("malformed exact row graph retirement"),
+            other => other,
+        })?;
+    if record.version != 1 {
+        return Err(corruption("unknown row graph retirement version"));
+    }
+    validate(&record.owned)?;
+    Ok(record)
+}
+
 pub(super) const FORWARD: TableDefinition<&[u8], &[u8]> = TableDefinition::new("row_graph_fwd");
 pub(super) const REVERSE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("row_graph_rev");
 
@@ -184,6 +283,10 @@ impl RedbPersistence {
                 let write = Self::begin_history_write(db)?;
                 {
                     validate(owned)?;
+                    if Self::row_retirement_in_write(&write, owned)? {
+                        return Ok(());
+                    }
+
                     let fwd = Self::row_graph_key(owned, false)?;
                     let rev = Self::row_graph_key(owned, true)?;
                     let encoded = encode_row_graph(owned)?;
@@ -317,6 +420,30 @@ impl RedbPersistence {
                 frame.map(OriginalPersistenceFrame::into_reservation),
             ));
         }
+        let frame = original.map(OriginalPersistenceFrame::new).transpose()?;
+        let memory = match frame.as_ref() {
+            Some(frame) => crate::memory_accounting::image_memory_for_original_record(frame)?,
+            None => crate::read_image_memory::ImageMemory::operation_writer(
+                self.require_decode_accountant()?,
+            )?,
+        };
+        memory.scope(|| -> Result<()> {
+            let mut prefix = retirement_version_prefix(table, RowId(0), TxId(0), Lsn(0))?;
+            prefix.truncate(
+                RETIRED_PREFIX
+                    .len()
+                    .saturating_add(table.len().saturating_mul(2))
+                    .saturating_add(1),
+            );
+            let mut identities = Vec::new();
+            Self::erase_retirement_prefix_in_write(write, &prefix, &mut identities)?;
+            Self::apply_content_identity_mutations_in_write(
+                write,
+                &identities,
+                &mut self.proof_admission(),
+            )
+            .map(|_| ())
+        })?;
         Ok(())
     }
 
@@ -387,5 +514,153 @@ impl RedbPersistence {
             }
             Ok(entries)
         })
+    }
+}
+
+impl RedbPersistence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn retire_owned_edges_in_write(
+        write: &redb::WriteTransaction,
+        selected: &[OwnedAdjEntry],
+        removed_rows: &[(String, RowId, TxId, Lsn)],
+        identities: &mut Vec<content_identity::ContentIdentityMutation>,
+    ) -> Result<()> {
+        Self::erase_row_graph_in_write(write, selected)?;
+        for owned in selected {
+            if removed_rows.iter().any(|(table, row, created, lsn)| {
+                table == &owned.owner.table
+                    && *row == owned.owner.row_id
+                    && *created == owned.owner.created_tx
+                    && *lsn == owned.owner.lsn
+            }) {
+                continue;
+            }
+            let key = retirement_key(&owned.owner)?;
+            crate::read_image_memory::reserve(owned.estimated_bytes())?;
+            let value = Self::encode_config_value(&Retirement {
+                version: 1,
+                owned: owned.clone(),
+            })?;
+            {
+                let mut canonical = write
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                if canonical
+                    .get(key.as_str())
+                    .map_err(Self::storage_error)?
+                    .is_some()
+                {
+                    return Err(corruption(
+                        "live row graph binding conflicts with retirement",
+                    ));
+                }
+                canonical
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            identities.extend(content_identity::config_mutations(&key, Some(&value)));
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn erase_row_retirements_in_write(
+        write: &redb::WriteTransaction,
+        table: &str,
+        row: RowId,
+        created: TxId,
+        lsn: Lsn,
+        identities: &mut Vec<content_identity::ContentIdentityMutation>,
+    ) -> Result<()> {
+        let prefix = retirement_version_prefix(table, row, created, lsn)?;
+        Self::erase_retirement_prefix_in_write(write, &prefix, identities)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn erase_retirement_prefix_in_write(
+        write: &redb::WriteTransaction,
+        prefix: &str,
+        identities: &mut Vec<content_identity::ContentIdentityMutation>,
+    ) -> Result<()> {
+        loop {
+            let key = {
+                let config = write
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let next = config
+                    .range(prefix..)
+                    .map_err(Self::storage_error)?
+                    .next()
+                    .transpose()
+                    .map_err(Self::storage_error)?;
+                match next {
+                    Some((key, _)) if key.value().starts_with(prefix) => {
+                        crate::read_image_memory::reserve(key.value().len())?;
+                        Some(key.value().to_owned())
+                    }
+                    _ => None,
+                }
+            };
+            let Some(key) = key else { break };
+            write
+                .open_table(CONFIG_TABLE)
+                .map_err(Self::storage_error)?
+                .remove(key.as_str())
+                .map_err(Self::storage_error)?;
+            identities.extend(content_identity::config_mutations(&key, None));
+        }
+        Ok(())
+    }
+}
+
+impl RedbPersistence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn row_retirement_in_read(
+        read: &redb::ReadTransaction,
+        owned: &OwnedAdjEntry,
+    ) -> Result<bool> {
+        let key = retirement_key(&owned.owner)?;
+        Self::verify_history_root(read, READ_LINEAGE_CONFIG_TABLE.name())?;
+        let table = read
+            .open_table(READ_LINEAGE_CONFIG_TABLE)
+            .map_err(Self::storage_error)?;
+        let Some(value) = table.get(key.as_str()).map_err(Self::storage_error)? else {
+            return Ok(false);
+        };
+        let record = decode_retirement(value.value())?;
+        validate_retirement(&record, owned)?;
+        Ok(true)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn row_retirement_in_write(
+        write: &redb::WriteTransaction,
+        owned: &OwnedAdjEntry,
+    ) -> Result<bool> {
+        let key = retirement_key(&owned.owner)?;
+        let table = write
+            .open_table(CONFIG_TABLE)
+            .map_err(Self::storage_error)?;
+        let Some(value) = table.get(key.as_str()).map_err(Self::storage_error)? else {
+            return Ok(false);
+        };
+        let record = decode_retirement(value.value())?;
+        validate_retirement(&record, owned)?;
+        Ok(true)
     }
 }

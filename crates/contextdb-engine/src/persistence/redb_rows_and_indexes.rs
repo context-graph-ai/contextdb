@@ -6292,16 +6292,19 @@ impl RedbPersistence {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(error) => return Err(Self::storage_error(error)),
         };
-        let start = crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX
-            .min(crate::database::Database::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX)
-            .min("sync_lineage.v1.pending.");
-        for entry in config.range(start..).map_err(Self::storage_error)? {
-            let (key, value) = entry.map_err(Self::storage_error)?;
-            if !key.value().starts_with("sync_lineage.v1.") {
-                break;
-            }
-            if read_image_lineage_config_key(key.value()) {
-                Self::write_read_lineage_config_entry(write_txn, key.value(), Some(value.value()))?;
+        for prefix in [super::row_graph::RETIRED_PREFIX, "sync_lineage.v1."] {
+            for entry in config.range(prefix..).map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                if !key.value().starts_with(prefix) {
+                    break;
+                }
+                if read_image_lineage_config_key(key.value()) {
+                    Self::write_read_lineage_config_entry(
+                        write_txn,
+                        key.value(),
+                        Some(value.value()),
+                    )?;
+                }
             }
         }
         Ok(())

@@ -3237,6 +3237,10 @@ impl Database {
                                 &admission,
                                 true,
                             )?;
+                            let exported_deleted = row.deleted_tx;
+                            row.deleted_tx = window.value.deleted_tx;
+                            self.verify_export_row_graph(name, &row, read_memory.clone())?;
+                            row.deleted_tx = exported_deleted;
                             artifact.append_table_rows_batch(
                                 name,
                                 Some(meta),
@@ -3282,6 +3286,9 @@ impl Database {
                         let mut batch = Vec::with_capacity(end - offset);
                         let mut source_provenance = Vec::new();
                         for row in &stored[offset..end] {
+                            // Validate the physical interval before watermark
+                            // clipping changes its exported tombstone.
+                            self.verify_export_row_graph(name, row, read_memory.clone())?;
                             let Some(row) = export_row_at_snapshot(row, watermark) else {
                                 continue;
                             };
@@ -3656,6 +3663,7 @@ impl Database {
                             read_memory.clone(),
                         ),
                         artifact,
+                        watermark,
                     )?;
                     for sink in persistence.sink_queue_names()? {
                         let entries = persistence.dump_sink_queue_raw(&sink)?;
@@ -3688,6 +3696,19 @@ impl Database {
                     config_values.extend(self.export_event_bus_config_values()?);
                     config_values.extend(self.export_trigger_config_values()?);
                     artifact.flush_encoded_config_values(config_values)?;
+                    {
+                        let carry = self.retention_deferred_edge_nodes.lock();
+                        for (key, record) in &carry.retired {
+                            if record.owned.owner.created_tx.0 > watermark.0 { continue; }
+                            let credit = contextdb_core::read_memory::ReadCredit::try_new(
+                                read_memory.clone(), record.owned.estimated_bytes(),
+                                "storage", "export_row_retirement", "Raise MEMORY_LIMIT to export row retirements.")?;
+                            let encoded = RedbPersistence::encode_config_value(&crate::persistence::row_graph::Retirement {
+                                version: 1, owned: record.owned.clone() })?;
+                            artifact.flush_encoded_config_values(vec![(key.as_str(), encoded)])?;
+                            drop(credit);
+                        }
+                    }
                     let custody = self
                         .custody_metadata
                         .lock()

@@ -3190,7 +3190,8 @@ pub fn refuse_next_lineage_scratch_admission_for_test() {
 
 /// Per-row lineage keys: one per row life that ever carried sync lineage.
 pub(crate) fn read_image_lineage_config_key(key: &str) -> bool {
-    key.starts_with(crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX)
+    key.starts_with(super::row_graph::RETIRED_PREFIX)
+        || key.starts_with(crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX)
         || key.starts_with(crate::database::Database::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX)
         || key.starts_with("sync_lineage.v1.pending.")
 }

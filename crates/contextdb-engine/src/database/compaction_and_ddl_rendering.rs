@@ -33,6 +33,7 @@ pub(super) fn compact_currency_versions_inner(
     snapshot_registry: &Arc<SnapshotFloorRegistry>,
     publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
     publication_interrupted: &Arc<AtomicBool>,
+    row_retirements: &Arc<Mutex<RetentionDeferredEdges>>,
     tables: &[&str],
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<CurrencyCompactionReport> {
@@ -444,6 +445,13 @@ pub(super) fn compact_currency_versions_inner(
         row_keys.iter().map(|(_, row, _, lsn)| (*row, *lsn)),
         accountant.read_budget()?,
     )?;
+    let memory_retirement_keys = if persistence.is_none() {
+        row_retirements
+            .lock()
+            .prepare_version_retirement_cleanup(&row_keys, &mut workspace)?
+    } else {
+        Vec::new()
+    };
     let mut publication_watch = None;
     if let Some(persistence) = persistence {
         // Fail before any durable or in-memory removal. The same selected
@@ -524,6 +532,9 @@ pub(super) fn compact_currency_versions_inner(
         }
         removed
     };
+    row_retirements
+        .lock()
+        .discard_prepared_retirements(memory_retirement_keys);
     relational_store.publish_schema_history_erasure(schema_history);
     for (table, versions) in &pruned_versions_by_table {
         relational_store.remove_row_versions(table, versions);

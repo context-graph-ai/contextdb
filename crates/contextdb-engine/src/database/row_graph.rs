@@ -476,6 +476,80 @@ impl Database {
             created_tx: row.created_tx,
             lsn: row.lsn,
         };
+        let image = crate::read_image_memory::ImageMemory::charging_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        );
+        let retirement_key =
+            image.scope(|| crate::persistence::row_graph::retirement_key(&owner))?;
+        memory.try_grow_for(
+            owner
+                .estimated_bytes()
+                .saturating_add(std::mem::size_of::<AdjEntry>())
+                .saturating_add(kind.len()),
+            "graph",
+            "row_retirement_lookup",
+            "Raise MEMORY_LIMIT to verify this row retirement.",
+        )?;
+        let expected = contextdb_tx::OwnedAdjEntry {
+            owner: owner.clone(),
+            entry: AdjEntry {
+                source: *source,
+                target: *target,
+                edge_type: kind.clone(),
+                properties: HashMap::new(),
+                created_tx: row.created_tx,
+                deleted_tx: row.deleted_tx,
+                lsn: row.lsn,
+            },
+        };
+        let retired = if let Some(root) = self.writer_read_root()? {
+            let mut cursor = root.lineage_cursor_from(
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+                &retirement_key,
+                &retirement_key,
+            )?;
+            cursor
+                .next(|key, bytes| {
+                    if key != retirement_key.as_bytes() {
+                        return Ok(None);
+                    }
+                    RedbPersistence::decode_config_value_exact::<
+                        crate::persistence::row_graph::Retirement,
+                    >(bytes)
+                    .map(Some)
+                })?
+                .map(|window| {
+                    window
+                        .value
+                        .as_ref()
+                        .map(|record| {
+                            crate::persistence::row_graph::validate_retirement(record, &expected)
+                        })
+                        .transpose()
+                })
+                .transpose()?
+                .flatten()
+                .is_some()
+        } else {
+            let carry = self.retention_deferred_edge_nodes.lock();
+            if let Some(stored) = carry.retired.get(&retirement_key) {
+                memory.try_grow_for(
+                    stored.owned.estimated_bytes(),
+                    "graph",
+                    "row_retirement_lookup",
+                    "Raise MEMORY_LIMIT to validate this retired memory row.",
+                )?;
+                let record = crate::persistence::row_graph::Retirement {
+                    version: 1,
+                    owned: stored.owned.clone(),
+                };
+                crate::persistence::row_graph::validate_retirement(&record, &expected)?;
+                true
+            } else {
+                false
+            }
+        };
         let root = self.graph_snapshot(self.snapshot_for_read(), read_memory)?;
         let mut callback = Some(use_witness);
         let mut result = None;
@@ -488,6 +562,13 @@ impl Database {
             },
             &owner,
             |edge| {
+                if retired {
+                    return Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "live graph witness conflicts with exact retirement".into(),
+                    });
+                }
+
                 if edge.source != *source
                     || edge.target != *target
                     || edge.edge_type != *kind
@@ -507,12 +588,51 @@ impl Database {
                 Ok(true)
             },
         )?;
-        if callback.is_some() {
+        if retired {
+            self.graph_store.visit_row_edges(
+                root.as_ref(),
+                GraphQuery {
+                    node: *target,
+                    direction: Direction::Incoming,
+                    identity: Some((*source, kind)),
+                },
+                &owner,
+                |_| {
+                    Err(Error::StoreCorrupted {
+                        path: "row-derived adjacency".into(),
+                        reason: "reverse graph witness conflicts with exact retirement".into(),
+                    })
+                },
+            )?;
+        }
+        if callback.is_some() && !retired {
             return Err(Error::SyncError(
                 "owning edge row has no exact graph witness".into(),
             ));
         }
         Ok(result)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn verify_export_row_graph(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<()> {
+        if !self
+            .table_meta(table)
+            .as_ref()
+            .is_some_and(crate::executor::has_edge_columns)
+        {
+            return Ok(());
+        }
+        let generation = self.durable_lineage_table_generation(table, read_memory.clone())?;
+        self.with_row_graph_witness(table, generation, row, read_memory, |_, _| Ok(()))?;
+        Ok(())
     }
 
     #[expect(
@@ -1343,5 +1463,103 @@ impl Database {
             self.graph_store.publish_prepared_received_schema(graph);
             self.finalization.accountant.release(bytes);
         }
+    }
+}
+
+impl RetentionDeferredEdges {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn prepare_version_retirement_cleanup(
+        &self,
+        rows: &[(String, RowId, TxId, Lsn)],
+        workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for (table, row, created, lsn) in rows {
+            let prefix = crate::persistence::row_graph::retirement_version_prefix(
+                table, *row, *created, *lsn,
+            )?;
+            for (key, _) in self.retired.range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            )) {
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                workspace.try_grow_for(
+                    key.len().saturating_add(2 * std::mem::size_of::<String>()),
+                    "retention",
+                    "prepare_cleanup",
+                    "Raise MEMORY_LIMIT to prepare exact retirement cleanup keys.",
+                )?;
+                keys.push(key.clone());
+            }
+        }
+        Ok(keys)
+    }
+
+    pub(super) fn discard_prepared_retirements(&mut self, keys: Vec<String>) {
+        for key in keys {
+            if let Some((key, record)) = self.retired.remove_entry(&key) {
+                drop(key);
+                drop(record.owned);
+                drop(record.memory);
+            }
+        }
+    }
+}
+
+impl Database {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn prepare_memory_table_retirement_cleanup(
+        &self,
+        table: &str,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<(Vec<String>, contextdb_core::read_memory::ReadCredit)> {
+        let mut credit = contextdb_core::read_memory::ReadCredit::new(memory);
+        if self.persistence.is_some() {
+            return Ok((Vec::new(), credit));
+        }
+        let prefix_len = crate::persistence::row_graph::RETIRED_PREFIX
+            .len()
+            .saturating_add(table.len().saturating_mul(2))
+            .saturating_add(1);
+        credit.try_grow_for(
+            prefix_len,
+            "graph",
+            "retirement_table_cleanup",
+            "Raise MEMORY_LIMIT to prepare dropped-table retirement cleanup.",
+        )?;
+        let mut prefix = String::with_capacity(prefix_len);
+        prefix.push_str(crate::persistence::row_graph::RETIRED_PREFIX);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in table.as_bytes() {
+            prefix.push(HEX[(byte >> 4) as usize] as char);
+            prefix.push(HEX[(byte & 15) as usize] as char);
+        }
+        prefix.push('.');
+        let carry = self.retention_deferred_edge_nodes.lock();
+        let mut keys = Vec::new();
+        for (key, _) in carry.retired.range::<str, _>((
+            std::ops::Bound::Included(prefix.as_str()),
+            std::ops::Bound::Unbounded,
+        )) {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            credit.try_grow_for(
+                key.len().saturating_add(2 * std::mem::size_of::<String>()),
+                "graph",
+                "retirement_table_cleanup",
+                "Raise MEMORY_LIMIT to prepare exact dropped-table retirement keys.",
+            )?;
+            keys.push(key.clone());
+        }
+        Ok((keys, credit))
     }
 }

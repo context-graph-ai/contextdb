@@ -92,6 +92,24 @@ impl RedbPersistence {
         }
         for owned in inserts {
             row_graph::validate(owned)?;
+            if Self::row_retirement_in_write(write, owned)? {
+                let fwd = Self::row_graph_key(owned, false)?;
+                let rev = Self::row_graph_key(owned, true)?;
+                if forward
+                    .get(fwd.as_slice())
+                    .map_err(Self::storage_error)?
+                    .is_some()
+                    || reverse
+                        .get(rev.as_slice())
+                        .map_err(Self::storage_error)?
+                        .is_some()
+                {
+                    return Err(corruption(
+                        "retired insertion conflicts with live graph bytes",
+                    ));
+                }
+                continue;
+            }
             if dropped_index
                 .binary_search_by(|e| e.owner.cmp(&owned.owner))
                 .is_ok()
