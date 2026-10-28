@@ -806,6 +806,19 @@ fn genuine_cache_payment(event: redb::page_payer_observation::Observation) -> bo
         && event.occupancy >= event.bytes
         && event.fixed_occupancy >= event.bytes
 }
+fn note_cache_payer(
+    measurement: &mut Measurement,
+    event: redb::page_payer_observation::Observation,
+) {
+    if measurement.cache_counter_identity == 0 {
+        measurement.cache_counter_identity = event.counter_identity;
+        measurement.cache_reserve_identity = event.reserve_identity;
+    } else if measurement.cache_counter_identity != event.counter_identity
+        || measurement.cache_reserve_identity != event.reserve_identity
+    {
+        measurement.cache_payer_mismatch = true;
+    }
+}
 fn observe_real_page_payer(event: redb::page_payer_observation::Observation) {
     use redb::page_payer_observation::{Payer, Phase};
     if event.phase == Phase::BeforeAllocation {
@@ -816,6 +829,12 @@ fn observe_real_page_payer(event: redb::page_payer_observation::Observation) {
         } else {
             3
         };
+        if kind == 1 {
+            let mut measurement = MEASUREMENT.lock().unwrap();
+            if measurement.active_window != 0 {
+                note_cache_payer(&mut measurement, event);
+            }
+        }
         NEXT_PAGE_PAYMENT.with(|slot| {
             slot.set((
                 event.bytes,
@@ -840,6 +859,9 @@ fn observe_real_page_payer(event: redb::page_payer_observation::Observation) {
         let previous = header.cache_funding.swap(next, AtomicOrdering::SeqCst);
         let mut measurement = MEASUREMENT.lock().unwrap();
         if header.window != 0 && header.window == measurement.active_window {
+            if next != 0 {
+                note_cache_payer(&mut measurement, event);
+            }
             if previous == 0 && next != 0 {
                 measurement.cache_payload_live += event.bytes;
                 measurement.cache_payload_peak = measurement
@@ -857,6 +879,9 @@ pub(crate) struct ReaderPayerReceiptForTest {
     pub cache_peak: usize,
     pub child_live: usize,
     pub unscoped_allocations: usize,
+    pub cache_counter_identity: usize,
+    pub cache_reserve_identity: usize,
+    pub cache_payer_mismatch: bool,
 }
 pub(crate) fn reader_payer_receipt_for_test() -> ReaderPayerReceiptForTest {
     let measurement = MEASUREMENT.lock().unwrap();
@@ -865,6 +890,9 @@ pub(crate) fn reader_payer_receipt_for_test() -> ReaderPayerReceiptForTest {
         cache_peak: measurement.cache_payload_peak,
         child_live: measurement.payload_live - measurement.cache_payload_live,
         unscoped_allocations: measurement.unscoped_page_allocations,
+        cache_counter_identity: measurement.cache_counter_identity,
+        cache_reserve_identity: measurement.cache_reserve_identity,
+        cache_payer_mismatch: measurement.cache_payer_mismatch,
     }
 }
 fn observed_source_funding(counter: usize) -> usize {
@@ -1293,6 +1321,9 @@ struct Measurement {
     payload_live: usize,
     cache_payload_live: usize,
     cache_payload_peak: usize,
+    cache_counter_identity: usize,
+    cache_reserve_identity: usize,
+    cache_payer_mismatch: bool,
     unscoped_page_allocations: usize,
     source_unfunded_peak: usize,
     source_unfunded_request: (usize, usize, usize, bool),
@@ -1311,6 +1342,9 @@ static MEASUREMENT: Mutex<Measurement> = Mutex::new(Measurement {
     payload_live: 0,
     cache_payload_live: 0,
     cache_payload_peak: 0,
+    cache_counter_identity: 0,
+    cache_reserve_identity: 0,
+    cache_payer_mismatch: false,
     unscoped_page_allocations: 0,
     source_unfunded_peak: 0,
     source_unfunded_request: (0, 0, 0, false),
@@ -1846,6 +1880,9 @@ pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
             measurement.payload_live = 0;
             measurement.cache_payload_live = 0;
             measurement.cache_payload_peak = 0;
+            measurement.cache_counter_identity = 0;
+            measurement.cache_reserve_identity = 0;
+            measurement.cache_payer_mismatch = false;
             measurement.unscoped_page_allocations = 0;
             measurement.source_unfunded_peak = 0;
             measurement.source_unfunded_request = (0, 0, 0, false);
@@ -5552,6 +5589,9 @@ impl SourceRequestsWindow {
                 measurement.payload_live = 0;
                 measurement.cache_payload_live = 0;
                 measurement.cache_payload_peak = 0;
+                measurement.cache_counter_identity = 0;
+                measurement.cache_reserve_identity = 0;
+                measurement.cache_payer_mismatch = false;
                 measurement.unscoped_page_allocations = 0;
                 measurement.source_unfunded_peak = 0;
                 measurement.source_unfunded_request = (0, 0, 0, false);

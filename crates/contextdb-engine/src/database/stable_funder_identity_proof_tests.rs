@@ -603,11 +603,15 @@ fn embedded_graph_reader_scratch_rows() {
         let mut exact_query = query.clone();
         exact_query.search_mode = Some(contextdb_core::VectorSearchMode::Exact);
         let exact_control = db.semantic_search(exact_query).unwrap();
-        // Owner reporting needs its own writer cursor. Capture the named
-        // reserve before the test deliberately removes all writer headroom.
-        let named_cache_reserve = db
-            .writer_memory_ownership_receipt_for_test()
-            .persistence_cache;
+        // Observe the existing genuine payer: undeclared-at-open stores bill
+        // their cache to process open residue, not the writer-only inventory.
+        let named_cache = db.writer_cache_for_test();
+        let named_cache_counters = db.persistence.as_ref().map_or([0; 2], |persistence| {
+            persistence
+                .original_cache_controls_for_test()
+                .observation_for_test()
+                .map(|entry| entry.0)
+        });
         let writer = db.accountant.usage().used;
         db.set_memory_limit(Some(writer)).unwrap();
         assert_eq!(
@@ -713,10 +717,32 @@ fn embedded_graph_reader_scratch_rows() {
                     payers.unscoped_allocations, 0,
                     "every page has a payer before allocation: {payers:?}"
                 );
-                assert!(
-                    named_cache_reserve >= payers.cache_peak.max(payers.cache_live),
-                    "the real fixed cache reserve is named by its persistence owner: {payers:?}"
+                eprintln!(
+                    "EXACT_CACHE_PAYER file={file_backed} mode={mode:?} named={named_cache:?} counters={named_cache_counters:?} observed={payers:?}"
                 );
+                assert!(
+                    named_cache.1.saturating_add(named_cache.2)
+                        >= payers.cache_peak.max(payers.cache_live),
+                    "actual writer/process cache owner funds the physical pages: {payers:?}"
+                );
+                if payers.cache_peak != 0 {
+                    assert!(
+                        named_cache.4 >= payers.cache_peak,
+                        "the installed genuine reserve covers the observed pages"
+                    );
+                    assert!(
+                        named_cache_counters.contains(&payers.cache_counter_identity),
+                        "the observed payment belongs to this actual cache owner"
+                    );
+                    assert_ne!(
+                        payers.cache_reserve_identity, 0,
+                        "the original fixed invoice is bound"
+                    );
+                    assert!(
+                        !payers.cache_payer_mismatch,
+                        "all pages retain that same actual cache payer"
+                    );
+                }
                 assert_eq!(
                     physical.0, 0,
                     "actual operation allocations stay paid through physical free (file={file_backed}, mode={mode:?}): {physical:?}"
