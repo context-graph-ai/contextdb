@@ -1645,3 +1645,225 @@ fn assert_saved_retry_publication(db: &Database) {
         blake3::hash(&fixture.base.manifest)
     );
 }
+
+
+type RouteOutputHookForTest =
+    Box<dyn FnMut(usize, usize, usize, &mut dyn FnMut() -> Result<()>) -> Result<()>>;
+thread_local! {
+    static ROUTE_OUTPUT_HOOK_FOR_TEST: std::cell::RefCell<Option<RouteOutputHookForTest>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn with_route_output_for_test(
+    output_len: usize,
+    output_pointer: usize,
+    output_capacity: usize,
+    action: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let hook = ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| slot.borrow_mut().take());
+    let Some(mut hook) = hook else {
+        return action();
+    };
+    let mut pending = Some(action);
+    let result = hook(output_len, output_pointer, output_capacity, &mut || {
+        pending
+            .take()
+            .expect("the real route-output action runs once")()
+    });
+    assert!(
+        pending.is_none(),
+        "the observation runs the real output action"
+    );
+    ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(hook));
+    result
+}
+
+struct RouteOutputHookScopeForTest;
+impl Drop for RouteOutputHookScopeForTest {
+    fn drop(&mut self) {
+        ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| *slot.borrow_mut() = None);
+        crate::persistence::content_identity::proof_allocation_oracle_tests::disarm_source_free_watch();
+    }
+}
+
+#[test]
+fn native_route_output_refusal_releases_partial_output_preserves_serving_and_closes() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "native_route_output_refusal_releases_partial_output_preserves_serving_and_closes",
+        &[],
+    ) {
+        return;
+    }
+    use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+    use crate::vector_read_memory::{DeclaredReadMemory, statement_child_proof};
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::open_with_options(
+        directory.path().join("native-route-output.db"),
+        DatabaseOpenOptions {
+            memory_limit: Some(64 * 1024 * 1024),
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let names = ["route_first", "route_second"];
+    let routes = names.map(|table| {
+        VectorPartitionRef::new(
+            VectorIndexRef::new(table, "v"),
+            VectorPartitionKey::unpartitioned(),
+        )
+    });
+    for table in names {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 2) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 2, training_iterations = 1, calibration_samples = 1, calibration_depths = [1]))"),
+            &HashMap::new(),
+        ).unwrap();
+        db.execute(
+            &format!("INSERT INTO {table} VALUES (0, '[1,0,0]'), (1, '[0,1,0]')"),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+    let bound: usize = routes
+        .iter()
+        .map(|route| {
+            let resolved = db
+                .native_ivf_resolved_policy_for_test(&route.index, &route.partition_key)
+                .unwrap();
+            let rows = 2usize.max(resolved.population as usize);
+            let ingest = rows.div_ceil(resolved.training.ingest_batch_keys.max(1));
+            let phase = rows.div_ceil(resolved.training.phase_batch_entries.max(1));
+            ingest + (phase + 1) * (resolved.training.iterations as usize + 4) + rows + 6
+        })
+        .sum();
+    let mut ready = false;
+    for _ in 0..bound {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        assert!(
+            report.first_failure.is_none(),
+            "native setup refused: {report:?}"
+        );
+        if report.ready_partitions == routes.len() && report.remaining_partitions == 0 {
+            ready = true;
+            break;
+        }
+    }
+    assert!(
+        ready,
+        "declared native phases converge within their derived bound"
+    );
+    let descriptors = routes.each_ref().map(|route| {
+        db.native_ivf_serving_descriptor_for_test(&route.index, &route.partition_key)
+            .unwrap()
+            .unwrap()
+            .bytes
+    });
+    let assert_serving = || {
+        for (index, table) in names.iter().enumerate() {
+            let reader = db
+                .read_session_with_clock_for_test(
+                    contextdb_core::read_contract::ReadLimits::default(),
+                    Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+                )
+                .unwrap();
+            let answer = reader
+                .execute(
+                    &format!(
+                        "SELECT id FROM {table} ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2"
+                    ),
+                    &HashMap::new(),
+                )
+                .unwrap();
+            assert_eq!(answer.rows().len(), 2);
+            assert!(answer.rows().contains(&vec![Value::Int64(0)]));
+            assert!(answer.rows().contains(&vec![Value::Int64(1)]));
+            assert_eq!(
+                db.native_ivf_serving_descriptor_for_test(
+                    &routes[index].index,
+                    &routes[index].partition_key
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
+                descriptors[index],
+            );
+        }
+    };
+    assert_serving();
+    let parent = DeclaredReadMemory::from_reader_limit(64 * 1024 * 1024).unwrap();
+    let memory = parent.child().unwrap();
+    let baseline = parent.retained_bytes_for_test();
+    let state = std::rc::Rc::new(std::cell::RefCell::new((0usize, false, false, 0usize)));
+    let observed = std::rc::Rc::clone(&state);
+    let narrowed = parent.clone();
+    let hook: RouteOutputHookForTest = Box::new(move |len, pointer, capacity, action| {
+        observed.borrow_mut().0 += 1;
+        if len == 0 || observed.borrow().1 {
+            return action();
+        }
+        assert!(
+            capacity >= len && pointer != 0,
+            "the prefix is a real live output Vec"
+        );
+        observed.borrow_mut().1 = true;
+        observed.borrow_mut().3 = len;
+        oracle::watch_exact_free_for_test(
+            (
+                pointer,
+                capacity * std::mem::size_of::<VectorPartitionRef>(),
+                std::mem::align_of::<VectorPartitionRef>(),
+            ),
+            0,
+        );
+        let current = narrowed.retained_bytes_for_test();
+        let (result, _) = statement_child_proof::observe(&narrowed, current, action);
+        observed.borrow_mut().2 = result.as_ref().err().is_some_and(|error| {
+            VectorMaintenanceFailureDetails::from_error(error).failure
+                == VectorMaintenanceFailure::MemoryLimit
+        });
+        result
+    });
+    ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| {
+        assert!(slot.borrow_mut().replace(hook).is_none());
+    });
+    let _hook_scope = RouteOutputHookScopeForTest;
+    db.clear_maintenance_cycle_stamp_for_test();
+    let outcome = db.run_maintenance_cycle_with_read_memory(memory.clone());
+    assert!(
+        state.borrow().0 >= 2 && state.borrow().1,
+        "the real partial-output admission event is delivered"
+    );
+    assert!(
+        state.borrow().3 > 0,
+        "a prior route output stays live at the refused next output"
+    );
+    assert!(
+        state.borrow().2,
+        "route output must refuse on its real original reader counter before allocating"
+    );
+    let report = outcome.unwrap();
+    assert_eq!(
+        report.vector.first_failure,
+        Some(VectorMaintenanceFailure::MemoryLimit)
+    );
+    assert!(
+        db.maintenance_cycle_stamp_is_set_for_test(),
+        "refusal still closes the maintenance cycle"
+    );
+    drop(report);
+    assert_eq!(
+        oracle::source_free_for_test(1)[0].2,
+        1,
+        "the actual partial output backing is physically freed once"
+    );
+    assert_eq!(
+        parent.retained_bytes_for_test(),
+        baseline,
+        "partial output and its inputs release the original caller's credits"
+    );
+    drop(_hook_scope);
+    assert_serving();
+    db.close().unwrap();
+}
