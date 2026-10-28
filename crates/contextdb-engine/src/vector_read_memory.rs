@@ -4629,3 +4629,57 @@ pub(crate) mod root_observations {
         println!("PROVENANCE_NEGATIVES payer reuse duplicate_free capacity PASS");
     }
 }
+
+// Non-owning view of the existing physical root observation. It never keeps
+// the native root or any child alive and never changes its invoice.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct NativeRootMemoryOwnershipForTest {
+    token: root_observations::Token,
+    root_bytes: usize,
+}
+#[cfg(test)]
+impl NativeRootMemoryOwnershipForTest {
+    pub(crate) fn memory_ownership_snapshot(&self) -> (Option<(&'static str, usize)>, u64) {
+        let (alive, _, held) = root_observations::sample(self.token);
+        let native = alive.then_some(("declared_native_root", self.root_bytes));
+        let named = native.map_or(0, |(_, bytes)| bytes as u64);
+        (
+            native,
+            held.checked_sub(named).expect("native root remains funded"),
+        )
+    }
+
+    pub(crate) fn assert_only_original_root(&self) {
+        let bytes = native_control_layouts_for_test().0.size();
+        assert_eq!(self.root_bytes, bytes);
+        assert_eq!(
+            self.memory_ownership_snapshot(),
+            (Some(("declared_native_root", bytes)), 0),
+            "only the named native root remains; no unnamed charge survives"
+        );
+    }
+
+    pub(crate) fn assert_final_free(&self) {
+        root_observations::assert_terminal_free(self.token);
+        assert_eq!(self.memory_ownership_snapshot(), (None, 0));
+    }
+}
+#[cfg(test)]
+impl DeclaredReadRoot {
+    pub(crate) fn native_memory_ownership_for_test(&self) -> NativeRootMemoryOwnershipForTest {
+        NativeRootMemoryOwnershipForTest {
+            token: self
+                .observation
+                .expect("original physical root observation"),
+            root_bytes: self.root_control_bytes(),
+        }
+    }
+
+    pub(crate) fn assert_only_original_root_and_free_for_test(self) {
+        let witness = self.native_memory_ownership_for_test();
+        witness.assert_only_original_root();
+        drop(self);
+        witness.assert_final_free();
+    }
+}

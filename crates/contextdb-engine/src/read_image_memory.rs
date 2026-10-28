@@ -3829,7 +3829,7 @@ mod native_decode_tests {
         drop(second);
         assert_eq!(parent.retained_bytes_for_test(), baseline);
         drop(owner);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
     }
 
     // A refusal inside the decode is kept by value, with no owned diagnostic,
@@ -3868,7 +3868,7 @@ mod native_decode_tests {
         assert_eq!(parent.retained_bytes_for_test(), child + block);
         drop(memory);
         drop(owner);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
     }
 
     // Malformed input answers the static codec class; nothing stays admitted.
@@ -3883,7 +3883,7 @@ mod native_decode_tests {
         assert_eq!(memory.held(), 0);
         drop(memory);
         drop(owner);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
     }
 }
 
