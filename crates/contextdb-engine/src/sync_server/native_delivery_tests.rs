@@ -4418,7 +4418,8 @@ async fn an_iroh_resource_memory_refusal_encodes_without_allocating_on_its_actua
                 && *requested_bytes == child_bytes && *available_bytes == 0 && *budget_limit_bytes == root_bytes as usize
                 && hint == "Reduce simultaneous requests or raise the declared reader memory limit."
         ),
-        "the client receives the sender's unchanged Resource memory refusal fields: {refused:?}"
+        "the client receives the sender's unchanged Resource memory refusal fields: {:?}",
+        refused.as_ref().err()
     );
     assert!(!invalid.load(Ordering::SeqCst));
     assert_eq!(
