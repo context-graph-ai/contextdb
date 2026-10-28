@@ -1536,24 +1536,29 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
     assert_eq!(fetched.len(), backlog);
     assert_eq!(accepted(), backlog as u64);
     assert_eq!(served, (1 + backlog.div_ceil(page), 0));
-    let delivered_records = backlog + usize::try_from(after_loss).unwrap();
-    // Each delivered packet carries a terminal and certificate signature.
-    // At most one verification per signed component at each of the two ends.
-    let signed_components = ["terminal", "certificate"];
+    // Count the records actually delivered on the first page before loss
+    // and again across the resumed pages, including the replay.
+    let delivered_records = usize::try_from(after_loss).unwrap() + fetched.len();
+    // Every record can carry a signed terminal and certificate. Each page can
+    // also authenticate a manifest and row lineage for each record it carries.
+    // Price each signed component once at each endpoint, including replay.
+    let record_components = ["terminal", "certificate"];
+    let page_record_components = ["manifest", "row lineage"];
     let verification_ends = ["server", "client"];
-    let verification_limit =
-        delivered_records * signed_components.len() * verification_ends.len();
+    let verification_limit = delivered_records
+        * (record_components.len() + page_record_components.len())
+        * verification_ends.len();
     let signatures = crate::identity::PAGING_SIGNATURES
         .load(std::sync::atomic::Ordering::Relaxed) - signature_start;
     let verifications = crate::identity::PAGING_VERIFICATIONS
         .load(std::sync::atomic::Ordering::Relaxed) - verification_start;
     assert!(
-        signatures <= delivered_records,
-        "one certificate signing per delivered record: {signatures} for {delivered_records}"
-    );
-    assert!(
         verifications <= verification_limit,
         "bounded signed-component verifications: {verifications} > {verification_limit}"
+    );
+    assert!(
+        signatures <= delivered_records,
+        "one certificate signing per delivered record: {signatures} for {delivered_records}"
     );
     hub.stop();
     assert_eq!(settled(&requests, native_root_bytes_for_test()), native_root_bytes_for_test());
