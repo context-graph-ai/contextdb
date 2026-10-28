@@ -88,6 +88,11 @@ pub(crate) fn r1_database_cleanup_rows_for_test() {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(crate) fn returned_loader_rows_for_test() {
+    // This raw loader fixture has no public request to supply its decode owner.
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     use std::mem::{align_of, offset_of, size_of};
     struct Pre2RawLoader {
         source: DurableRawVectorSource,

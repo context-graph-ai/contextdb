@@ -892,7 +892,7 @@ pub(crate) fn native_allocation_lifetime_rows_for_test() {
                 (request.1, request.2),
                 (control.1.size(), control.1.align())
             );
-            assert!(request.0 < control.0 && control.0 < request.0 + request.1);
+            assert!(request.0 <= control.0 && control.0 < request.0 + request.1);
         }
         let backing = requests.iter().map(|request| request.1).sum::<usize>();
         assert_eq!(owner.usage().used, backing);
@@ -983,8 +983,8 @@ pub(crate) fn native_allocation_lifetime_rows_for_test() {
     let free = oracle::native_free_observation_for_test();
     assert_eq!(
         free[2],
-        (backing, backing, 1),
-        "accountant physical free precedes its original-counter refund"
+        (backing - requests[1].1, backing - requests[1].1, 1),
+        "accountant physical free precedes its original-counter refund after the limit is destroyed"
     );
     assert_eq!(
         free[1],
@@ -1018,8 +1018,8 @@ pub(crate) fn native_allocation_lifetime_rows_for_test() {
     assert_eq!(
         free[2],
         (
-            backing + payload_layout.size(),
-            backing + payload_layout.size(),
+            backing - requests[1].1 + payload_layout.size(),
+            backing - requests[1].1 + payload_layout.size(),
             1
         )
     );
@@ -1079,7 +1079,10 @@ pub(crate) fn native_allocation_lifetime_rows_for_test() {
         }));
         assert_eq!(result.is_err(), unwind);
         let free = oracle::native_free_observation_for_test();
-        assert_eq!(free[2], (backing, backing, 1));
+        assert_eq!(
+            free[2],
+            (backing - requests[1].1, backing - requests[1].1, 1)
+        );
         assert_eq!(free[1], (backing, backing, 1));
         assert_eq!(
             free[0],

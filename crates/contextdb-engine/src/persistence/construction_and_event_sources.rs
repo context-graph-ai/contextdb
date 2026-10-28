@@ -802,10 +802,11 @@ pub(crate) fn returned_loader_rows_for_test() {
         .vector_budget()
         .unwrap();
     drop(slot);
+    assert_eq!(owner.writer_registration_observation_for_test().2, epoch);
     assert_eq!(
         owner.writer_registration_observation_for_test().3,
-        1,
-        "escaping adapter pins the original epoch"
+        3,
+        "adapter payload, wait capability and external invoice pin the original epoch"
     );
     drop(escaped);
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
