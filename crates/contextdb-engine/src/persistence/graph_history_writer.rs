@@ -351,8 +351,8 @@ impl RedbPersistence {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
 
-        let edge: AdjEntry = Self::decode(encoded)?;
-        if Self::graph_fwd_key(&edge).as_slice() != p {
+        let edge = super::graph_reclaim_decode::decode(encoded)?;
+        if !edge.matches_forward_key(p) {
             return Err(corrupt("reclaimed predecessor key and payload disagree"));
         }
         let ck = creation_contribution_key(p)?;
