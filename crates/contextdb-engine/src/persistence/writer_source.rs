@@ -3302,6 +3302,17 @@ impl WriterReadCursor {
         self.next_before_handoff(
             checkpoint,
             |key, value| {
+                // This closure runs only for an accessed entry. Authenticate
+                // its producer roots before decoding any supplied body.
+                let read = root.owner_read()?;
+                RedbPersistence::verify_history_root(
+                    read.as_ref(),
+                    super::row_graph::FORWARD.name(),
+                )?;
+                RedbPersistence::verify_history_root(
+                    read.as_ref(),
+                    super::row_graph::REVERSE.name(),
+                )?;
                 let owned: contextdb_tx::OwnedAdjEntry = decode_window_exact(value)?;
                 super::row_graph::validate(&owned)?;
                 if RedbPersistence::row_graph_key(&owned, reverse)? != key {
@@ -3313,15 +3324,6 @@ impl WriterReadCursor {
                 root.erasure
                     .read()
                     .check_scope(Some(&owned.owner.table), "row-derived adjacency")?;
-                let read = root.owner_read()?;
-                RedbPersistence::verify_history_root(
-                    read.as_ref(),
-                    super::row_graph::FORWARD.name(),
-                )?;
-                RedbPersistence::verify_history_root(
-                    read.as_ref(),
-                    super::row_graph::REVERSE.name(),
-                )?;
                 let peer_key = RedbPersistence::row_graph_key(&owned, !reverse)?;
                 let peer_table = read
                     .open_table(if reverse {
