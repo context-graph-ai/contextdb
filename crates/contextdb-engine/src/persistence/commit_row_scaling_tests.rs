@@ -349,6 +349,13 @@ const HOLD_RELATIONS: &str = "content_identity/hold_row_head_relations";
 /// A store with `HELD_TABLES` long-named tables and one staged transaction
 /// writing one row to each, under a declared memory limit.
 fn many_table_commit(limit: usize) -> (tempfile::TempDir, Database, contextdb_core::TxId) {
+    many_table_commit_with_history(limit, 0)
+}
+
+fn many_table_commit_with_history(
+    limit: usize,
+    history: usize,
+) -> (tempfile::TempDir, Database, contextdb_core::TxId) {
     let root = tempfile::tempdir().expect("fixture directory");
     let db = Database::open(root.path().join("tables.db")).expect("open the database");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -361,6 +368,25 @@ fn many_table_commit(limit: usize) -> (tempfile::TempDir, Database, contextdb_co
             &HashMap::new(),
         )
         .expect("declare one table");
+    }
+    // Grow history in the same 32 relations, without changing the write's
+    // table set, row count, key widths or payload widths.
+    for generation in 0..history {
+        let tx = db.begin().expect("begin one historical generation");
+        for (n, table) in tables.iter().enumerate() {
+            db.execute_in_tx(
+                tx,
+                &format!("INSERT INTO {table} VALUES ($id, 'one row')"),
+                &HashMap::from([(
+                    "id".into(),
+                    Value::Uuid(uuid::Uuid::from_u128(
+                        0x5e1d << 112 | ((generation * HELD_TABLES + n) as u128),
+                    )),
+                )]),
+            )
+            .expect("stage a historical row");
+        }
+        db.commit(tx).expect("commit one historical generation");
     }
     db.set_memory_limit(Some(limit)).expect("declare the limit");
     let tx = db.begin().expect("one transaction for every table");
@@ -412,6 +438,13 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
         high = high.max(entry.used_after);
     }
     let tight = tight.expect("some relation charge raises the commit's peak");
+    // The producer's actual native requests define the allowed size classes.
+    // A changed map layout can make map growth precede its receipt refusal.
+    let pending_requests: Vec<usize> = ledger
+        .iter()
+        .filter(|entry| entry.what == "redb/pending_directory")
+        .map(|entry| entry.bytes)
+        .collect();
     db.close().expect("close the measured store");
 
     let (_root, db, tx) = many_table_commit(tight);
@@ -427,10 +460,9 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
             budget_limit_bytes,
             ..
         } => {
-            let receipt = crate::persistence::native_storage_admission::StorageAdmissionScope::receipt_layout_for_scan_test();
             assert_eq!(*subsystem, "redb");
             assert_eq!(*operation, "pending_directory");
-            assert_eq!(*requested_bytes, receipt.size());
+            assert!(pending_requests.contains(requested_bytes));
             assert!(*available_bytes < *requested_bytes);
             assert_eq!(*budget_limit_bytes, tight);
             assert_eq!(
@@ -469,6 +501,86 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
     )
     .expect("the store keeps committing after the refusal");
     db.close().expect("close the refused store");
+}
+
+/// The same 32-table append must fit the workspace measured at shallow
+/// history, however much history those tables already contain. A history-0
+/// replay is the positive control for the producer-derived success ceiling.
+#[test]
+fn a_many_table_append_fits_the_shallow_history_workspace() {
+    use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
+    let ample = 1 << 32;
+    let (_root, db, tx) = many_table_commit_with_history(ample, 0);
+    watch_budget_ledger_for_test();
+    db.commit(tx).expect("measure the complete shallow append");
+    let ledger = take_budget_ledger_for_test();
+    let ceiling = ledger
+        .iter()
+        .map(|entry| entry.used_after)
+        .max()
+        .expect("the real producer records its full peak");
+    db.close().expect("close the measured shallow store");
+
+    for history in [0, 16] {
+        let (root, db, tx) = many_table_commit_with_history(ceiling, history);
+        let before = db.current_lsn();
+        let result = db.commit(tx);
+        let after = db.current_lsn();
+        eprintln!(
+            "MANY_TABLE_SHALLOW_CEILING history={history} tables={HELD_TABLES} ceiling={ceiling} result={result:?}"
+        );
+        if result.is_err() {
+            assert_eq!(after, before, "a refusal publishes no partial commit");
+        }
+        db.set_memory_limit(Some(ample))
+            .expect("fund verification reads");
+        assert_many_table_committed_rows(&db, history, result.is_ok());
+        db.close().expect("close the append store");
+        let reopened = Database::open(root.path().join("tables.db")).expect("reopen after append");
+        assert_eq!(
+            reopened.current_lsn(),
+            after,
+            "the published position survives reopen"
+        );
+        assert_many_table_committed_rows(&reopened, history, result.is_ok());
+        reopened.close().expect("close the recovered append store");
+        assert!(
+            result.is_ok(),
+            "the same 32-table append must fit the history-0 producer peak at history {history}: {result:?}"
+        );
+    }
+}
+
+fn assert_many_table_committed_rows(db: &Database, history: usize, appended: bool) {
+    for n in 0..HELD_TABLES {
+        let rows = db
+            .execute(
+                &format!(
+                    "SELECT id, payload FROM held_{n:02}_{} ORDER BY id",
+                    "x".repeat(200)
+                ),
+                &HashMap::new(),
+            )
+            .expect("read the complete committed table");
+        let mut expected: Vec<_> = (0..history)
+            .map(|generation| {
+                uuid::Uuid::from_u128(0x5e1d << 112 | ((generation * HELD_TABLES + n) as u128))
+            })
+            .collect();
+        if appended {
+            expected.push(uuid::Uuid::from_u128(0x4e1d << 112 | n as u128));
+        }
+        expected.sort();
+        assert_eq!(rows.rows().len(), expected.len(), "no partial publication");
+        for (row, id) in rows.rows().iter().zip(expected) {
+            assert_eq!(
+                row.first(),
+                Some(&Value::Uuid(id)),
+                "committed keys stay intact"
+            );
+            assert_eq!(row.get(1), Some(&Value::Text("one row".into())));
+        }
+    }
 }
 
 /// A commit writing one row into one table opens, closes and witnesses only
