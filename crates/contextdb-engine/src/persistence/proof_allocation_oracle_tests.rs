@@ -1210,7 +1210,7 @@ struct Header {
     bytes: usize,
 }
 
-fn allocation_layout(layout: Layout) -> (Layout, usize) {
+pub(crate) fn allocation_layout(layout: Layout) -> (Layout, usize) {
     let alignment = layout.align().max(std::mem::align_of::<Header>());
     let offset = std::mem::size_of::<Header>().next_multiple_of(alignment);
     (

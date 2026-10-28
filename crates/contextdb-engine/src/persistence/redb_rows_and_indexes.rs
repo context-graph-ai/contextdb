@@ -1646,62 +1646,74 @@ impl RedbPersistence {
         f32_overlay: Option<&F32RowOverlay<'_>>,
         encoded: &mut Vec<u8>,
     ) -> Result<()> {
-        // Each owned buffer also carries native allocation bookkeeping.
-        // Keep the pointer/size pair with the buffer's admission; the native
-        // allocation oracle includes that bookkeeping in its physical peak.
-        let allocation_control = std::mem::size_of::<[usize; 2]>();
-        let retained =
-            crate::memory_accounting::native_map_plan::<String, PersistedValue>(row.values.len())?
-                .layout
-                .size()
-                .saturating_add(if row.values.is_empty() {
-                    0
-                } else {
-                    allocation_control
-                })
-                .saturating_add(
-                    row.values
-                        .iter()
-                        .map(|(column, value)| {
-                            column
-                                .len()
-                                .saturating_add(if column.is_empty() {
-                                    0
-                                } else {
-                                    allocation_control
-                                })
-                                .saturating_add(value.estimated_bytes())
-                                .saturating_add(match value {
-                                    Value::Vector(vector)
-                                        if !vector.is_empty()
-                                            && matches!(
-                                                Self::column_quantization(meta, column),
-                                                VectorQuantization::F32
-                                            ) =>
-                                    {
-                                        allocation_control
-                                    }
-                                    Value::Text(text) if !text.is_empty() => allocation_control,
-                                    _ => 0,
-                                })
-                        })
-                        .sum::<usize>(),
-                )
-                .saturating_add(f32_overlay.map_or(0, |vectors| {
-                    vectors
-                        .values()
-                        .map(|vector| {
-                            vector
-                                .len()
-                                .saturating_mul(std::mem::size_of::<f32>())
-                                .saturating_add(if vector.is_empty() {
-                                    0
-                                } else {
-                                    allocation_control
-                                })
-                        })
-                        .sum::<usize>()
-                }));
+        // Each buffer admits its aligned native bookkeeping before allocation.
+        // Unit tests interpose an observer header, whose layout is shared with
+        // the allocator rather than duplicated as a fixed byte allowance.
+        let allocation_control = |layout: std::alloc::Layout| {
+            #[cfg(test)]
+            {
+                content_identity::proof_allocation_oracle_tests::allocation_layout(layout).1
+            }
+            #[cfg(not(test))]
+            {
+                std::mem::size_of::<[usize; 2]>().next_multiple_of(layout.align())
+            }
+        };
+        let map_plan =
+            crate::memory_accounting::native_map_plan::<String, PersistedValue>(row.values.len())?;
+        let retained = map_plan
+            .layout
+            .size()
+            .saturating_add(if row.values.is_empty() {
+                0
+            } else {
+                allocation_control(map_plan.layout)
+            })
+            .saturating_add(
+                row.values
+                    .iter()
+                    .map(|(column, value)| {
+                        column
+                            .len()
+                            .saturating_add(if column.is_empty() {
+                                0
+                            } else {
+                                allocation_control(std::alloc::Layout::new::<u8>())
+                            })
+                            .saturating_add(value.estimated_bytes())
+                            .saturating_add(match value {
+                                Value::Vector(vector)
+                                    if !vector.is_empty()
+                                        && matches!(
+                                            Self::column_quantization(meta, column),
+                                            VectorQuantization::F32
+                                        ) =>
+                                {
+                                    allocation_control(std::alloc::Layout::new::<f32>())
+                                }
+                                Value::Text(text) if !text.is_empty() => {
+                                    allocation_control(std::alloc::Layout::new::<u8>())
+                                }
+                                _ => 0,
+                            })
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(f32_overlay.map_or(0, |vectors| {
+                vectors
+                    .values()
+                    .map(|vector| {
+                        vector
+                            .len()
+                            .saturating_mul(std::mem::size_of::<f32>())
+                            .saturating_add(if vector.is_empty() {
+                                0
+                            } else {
+                                allocation_control(std::alloc::Layout::new::<f32>())
+                            })
+                    })
+                    .sum::<usize>()
+            }));
         crate::read_image_memory::reserve(retained)?;
         let values = row
             .values
@@ -1755,7 +1767,7 @@ impl RedbPersistence {
         crate::read_image_memory::reserve_output(measured.0.saturating_add(if measured.0 == 0 {
             0
         } else {
-            allocation_control
+            allocation_control(std::alloc::Layout::new::<u8>())
         }))?;
         // The row-local output is empty; one exact buffer avoids geometric growth.
         *encoded = vec![0; measured.0];
