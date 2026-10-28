@@ -1,5 +1,21 @@
 # contextdb-redb maintenance
 
+The `test-seams` native page observations in `native_page_observations.rs` use a
+bounded test-owned scalar event ring. Real page allocation, payer transfer,
+cache installation/rejection/map eviction, physical deallocation and original
+source receipt finish enqueue their facts at those producer boundaries. Guard
+callbacks drain outside storage locks. A retained token owns only the observer
+and ring, so cross-thread last-alias release does not depend on a live TLS scope.
+Overflow, lost events after close, undelivered events and outstanding real
+backings/payments make capture incomplete. Occupancy release is distinct from
+source receipt refund; a counter is never certified as a funder. Native aliases
+expose the existing allocation and its genuine receipt. The cold-read injector
+runs only at the actual cache-miss backend read and uses its existing failure
+branch, including sticky I/O failure. A test-only cache lease reports actual
+limit/occupancy and invokes existing unpinned-victim eviction for cold setup.
+These observations add no default-build fields, cache policy, payer or admission.
+Independent behavioral guards certify the lifecycle and refusal requirements.
+
 The `test-seams` native receipt observations in `native_storage_admission.rs`,
 `tree_store/page_store/page_allocation.rs` and `cached_file.rs` copy the real
 `NativePageCharge` receipt identity while borrowing the current page payer under
@@ -159,6 +175,7 @@ private cache tests still require the independently owned real-handle adoption.
 
 | Changed source | Reason |
 |---|---|
+| `src/native_page_observations.rs` (added), `src/native_storage_admission.rs`, `src/tree_store/page_store/{page_allocation,cached_file,page_manager}.rs`, `src/db.rs`, `src/lib.rs` | Test-seams-only bounded scalar custody capture at actual allocation/transfer/free/receipt finish, native-capable real aliases, separate occupancy events, installed-limit observations and existing unpinned eviction; inject cold failures at the real cached-none backend branch without clearing sticky I/O failure. No production cache/admission/payer policy changes. |
 | `src/native_storage_admission.rs`, `src/lib.rs` | The test-seams-only pending-name observer borrows the real combined allocation Layout and native invoice after name construction. It admits or retains nothing and lets the engine allocator witness bind the exact original invoice to physical key teardown. |
 | `src/read_admission.rs` | Feature-internal captured native admission and prepaid thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the unscoped fallback allowance; declared scans retain their working set under the original reader admission. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
 | `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/tree_store/bounded_bytes.rs` | Feature-internal concrete movable source-credit owner and a distinct internal legacy/owned carrier. Preserve authentic credit through actual control deallocation, source-page/counter teardown and cache handoff. Keep legacy Box wrappers and the public backend trait unchanged; exact actual Layout prepayment remains with the engine factory. Upstream proposal remains unsubmitted. |

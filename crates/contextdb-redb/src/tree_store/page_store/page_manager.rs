@@ -1985,23 +1985,31 @@ impl TransactionalMemory {
         let len: usize = (address_range.end - address_range.start)
             .try_into()
             .unwrap();
-        #[cfg(feature="test-seams")]
-        let observation=crate::allocation_observation::current();
-        #[cfg(feature="test-seams")]
-        let plan=if let Some(scope)=&observation {
-            let plan=crate::allocation_observation::AllocationPlanForTest {
-                requested_bytes:len,current_store_bytes:self.storage.raw_file_len()?,minimum_growth_bytes:0,
-                reusable_space_withheld:scope.withhold_reusable_space,
+        #[cfg(feature = "test-seams")]
+        let observation = crate::allocation_observation::current();
+        #[cfg(feature = "test-seams")]
+        let plan = if let Some(scope) = &observation {
+            let plan = crate::allocation_observation::AllocationPlanForTest {
+                requested_bytes: len,
+                current_store_bytes: self.storage.raw_file_len()?,
+                minimum_growth_bytes: 0,
+                reusable_space_withheld: scope.withhold_reusable_space,
             };
             scope.observer().before_existing_write(plan)?;
-            scope.observer().before_write(plan,page_number.to_le_bytes(),len)?;
+            scope
+                .observer()
+                .before_write(plan, page_number.to_le_bytes(), len)?;
             Some(plan)
-        } else {None};
-        let mem=match self.storage.write(address_range.start,len,false) {
-            Ok(mem)=>mem,
-            Err(error)=>{
-                #[cfg(feature="test-seams")]
-                if let (Some(scope),Some(plan))=(&observation,plan) {scope.observer().refused(plan,&error);}
+        } else {
+            None
+        };
+        let mem = match self.storage.write(address_range.start, len, false) {
+            Ok(mem) => mem,
+            Err(error) => {
+                #[cfg(feature = "test-seams")]
+                if let (Some(scope), Some(plan)) = (&observation, plan) {
+                    scope.observer().refused(plan, &error);
+                }
                 return Err(error);
             }
         };
@@ -2011,13 +2019,19 @@ impl TransactionalMemory {
             assert!(self.open_dirty_pages.lock().unwrap().insert(page_number));
         }
 
-        let page=PageMut {
-            mem,page_number,_lifetime:PhantomData,
+        let page = PageMut {
+            mem,
+            page_number,
+            _lifetime: PhantomData,
             #[cfg(debug_assertions)]
-            open_pages:self.open_dirty_pages.clone(),
+            open_pages: self.open_dirty_pages.clone(),
         };
-        #[cfg(feature="test-seams")]
-        if let (Some(scope),Some(plan))=(observation,plan) {scope.observer().written(plan,page_number.to_le_bytes(),len);}
+        #[cfg(feature = "test-seams")]
+        if let (Some(scope), Some(plan)) = (observation, plan) {
+            scope
+                .observer()
+                .written(plan, page_number.to_le_bytes(), len);
+        }
         Ok(page)
     }
 
@@ -2257,23 +2271,35 @@ impl TransactionalMemory {
         #[cfg(not(feature = "test-seams"))]
         let withheld = false;
 
-        let placement=(||->Result<PageNumber> {
-        let page_number = if withheld {
-            #[cfg(feature = "test-seams")]
+        let placement = (|| -> Result<PageNumber> {
+            let page_number = if withheld {
+                #[cfg(feature = "test-seams")]
+                {
+                    self.allocate_after_growth_for_test(&mut state, required_order)?
+                }
+                #[cfg(not(feature = "test-seams"))]
+                {
+                    unreachable!()
+                }
+            } else if let Some(page_number) =
+                Self::allocate_helper_retry(&mut state, required_order, lowest)?
             {
-                self.allocate_after_growth_for_test(&mut state, required_order)?
-            }
-            #[cfg(not(feature = "test-seams"))]
-            {
-                unreachable!()
-            }
-        } else if let Some(page_number) =
-            Self::allocate_helper_retry(&mut state, required_order, lowest)?
-        {
-            page_number
-        } else {
-            self.grow(&mut state, required_order)?;
-            let page = Self::allocate_helper_retry(&mut state, required_order, lowest)?;
+                page_number
+            } else {
+                self.grow(&mut state, required_order)?;
+                let page = Self::allocate_helper_retry(&mut state, required_order, lowest)?;
+                if let Some(error) = state
+                    .allocators
+                    .pager()
+                    .and_then(|pager| pager.storage_failure())
+                {
+                    return Err(error);
+                }
+                page.ok_or_else(|| {
+                    StorageError::Corrupted("allocator growth yielded no free page".into())
+                })?
+            };
+
             if let Some(error) = state
                 .allocators
                 .pager()
@@ -2281,28 +2307,16 @@ impl TransactionalMemory {
             {
                 return Err(error);
             }
-            page.ok_or_else(|| {
-                StorageError::Corrupted("allocator growth yielded no free page".into())
-            })?
-        };
-
-        if let Some(error) = state
-            .allocators
-            .pager()
-            .and_then(|pager| pager.storage_failure())
-        {
-            return Err(error);
-        }
 
             Ok(page_number)
         })();
-        let page_number=match placement {
-            Ok(page)=>page,
-            Err(error)=>{
-                #[cfg(feature="test-seams")]
-                if let (Some(scope),Some(plan))=(&observation,plan) {
+        let page_number = match placement {
+            Ok(page) => page,
+            Err(error) => {
+                #[cfg(feature = "test-seams")]
+                if let (Some(scope), Some(plan)) = (&observation, plan) {
                     drop(state);
-                    scope.observer().refused(plan,&error);
+                    scope.observer().refused(plan, &error);
                 }
                 return Err(error);
             }
@@ -2341,16 +2355,20 @@ impl TransactionalMemory {
             .try_into()
             .unwrap();
 
-        #[cfg(feature="test-seams")]
-        if let (Some(scope),Some(plan))=(&observation,plan) {
+        #[cfg(feature = "test-seams")]
+        if let (Some(scope), Some(plan)) = (&observation, plan) {
             drop(state);
-            scope.observer().before_write(plan,page_number.to_le_bytes(),len)?;
+            scope
+                .observer()
+                .before_write(plan, page_number.to_le_bytes(), len)?;
         }
-        let mut mem=match self.storage.write(address_range.start,len,true) {
-            Ok(mem)=>mem,
-            Err(error)=>{
-                #[cfg(feature="test-seams")]
-                if let (Some(scope),Some(plan))=(&observation,plan) {scope.observer().refused(plan,&error);}
+        let mut mem = match self.storage.write(address_range.start, len, true) {
+            Ok(mem) => mem,
+            Err(error) => {
+                #[cfg(feature = "test-seams")]
+                if let (Some(scope), Some(plan)) = (&observation, plan) {
+                    scope.observer().refused(plan, &error);
+                }
                 return Err(error);
             }
         };
@@ -2375,7 +2393,9 @@ impl TransactionalMemory {
         if let (Some(scope), Some(plan)) = (observation, plan) {
             // All allocator bookkeeping and physical page backing succeeded.
             scope.observer().allocated(plan, page_number.to_le_bytes());
-            scope.observer().written(plan,page_number.to_le_bytes(),len);
+            scope
+                .observer()
+                .written(plan, page_number.to_le_bytes(), len);
         }
 
         Ok(page)
@@ -3190,5 +3210,22 @@ mod allocator_growth_tests {
             "four commits rebuilt {rebuilt} regional views to re-measure the saved table"
         );
         assert!(state.allocators.has_saved_source());
+    }
+}
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl TransactionalMemory {
+    pub(crate) fn native_cache_occupancy_for_test(
+        &self,
+    ) -> crate::native_page_observations::NativeCacheOccupancyForTest {
+        self.storage.native_cache_occupancy_for_test()
+    }
+    pub(crate) fn evict_unpinned_clean_pages_for_test(
+        &self,
+    ) -> (
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+    ) {
+        self.storage.evict_unpinned_clean_pages_for_test()
     }
 }

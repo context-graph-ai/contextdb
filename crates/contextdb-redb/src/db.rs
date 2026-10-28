@@ -3764,3 +3764,20 @@ mod test {
         }
     }
 }
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl ReadCacheObservation {
+    pub fn native_cache_occupancy_for_test(
+        &self,
+    ) -> crate::native_page_observations::NativeCacheOccupancyForTest {
+        self.memory.native_cache_occupancy_for_test()
+    }
+    pub fn evict_unpinned_clean_pages_for_test(
+        &self,
+    ) -> (
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+    ) {
+        self.memory.evict_unpinned_clean_pages_for_test()
+    }
+}

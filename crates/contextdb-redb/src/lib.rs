@@ -165,6 +165,10 @@ fn create_tempfile() -> tempfile::NamedTempFile {
     }
 }
 
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub mod native_page_observations;
+
 mod native_storage_admission;
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
