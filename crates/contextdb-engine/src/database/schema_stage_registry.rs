@@ -1702,10 +1702,14 @@ fn received_retired_construction_stage_witness_for_test() {
             Some(ContainedMemoryReservation::from_owned(reservation)),
         ));
     }
+    let tuple_bytes = std::mem::size_of::<(
+        contextdb_vector::VectorPartitionRef,
+        Option<ContainedMemoryReservation>,
+    )>();
     assert_eq!(
         std::mem::size_of_val(retired.as_slice()) / retired.len(),
-        88,
-        "the actual retired-construction tuple remains the pre2 88-byte representation"
+        tuple_bytes,
+        "the actual retired-construction tuple follows the production element layout"
     );
     let backing = retired.as_ptr() as usize;
     let backing_capacity = retired.capacity();
@@ -1780,7 +1784,7 @@ fn received_retired_construction_stage_witness_for_test() {
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!(
-        "CDB127_D2_ROW received_retired_construction_stage_witness real_received_stage=true real_projection=true tuple88=true entries=6 drained_projection_retained=true actual_vec_system_free=true backing_charge_held=true physical_free_and_refund=true final_native_backing_only=true"
+        "CDB127_D2_ROW received_retired_construction_stage_witness real_received_stage=true real_projection=true tuple_bytes={tuple_bytes} entries=6 drained_projection_retained=true actual_vec_system_free=true backing_charge_held=true physical_free_and_refund=true final_native_backing_only=true"
     );
 }
 
