@@ -6,7 +6,6 @@
 use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -1183,14 +1182,7 @@ fn constraint_rows_refuse_or_accept_as_declared() {
 fn assert_now_is_recent(value: &Value, row: &str) {
     match value {
         Value::Timestamp(ts) => {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            assert!(
-                (now_secs - ts).abs() < 5,
-                "{row}: NOW() should be within 5s of system time, got {ts}"
-            );
+            assert_eq!(*ts, 1_000, "{row}: NOW() should equal the frozen clock")
         }
         other => panic!("{row}: expected Timestamp, got {other:?}"),
     }
@@ -1234,6 +1226,7 @@ fn fn_01_coalesce_first_non_null() {
 
 #[test]
 fn fn_02_now_without_from() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let result = exec(
         &Database::open_memory(),
         "SELECT NOW()",
@@ -1245,6 +1238,7 @@ fn fn_02_now_without_from() {
 
 #[test]
 fn fn_03_now_with_from() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Database::open_memory();
     db.execute("CREATE TABLE dummy (id UUID PRIMARY KEY)", &empty())
         .unwrap();
