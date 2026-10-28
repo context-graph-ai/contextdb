@@ -1078,6 +1078,11 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
 }
 
 impl<K: Key, V: Value> Btree<K, V> {
+    #[cfg(feature = "contextdb-internal")]
+    pub(super) fn release_cached_root(&mut self) {
+        self.cached_root = None;
+    }
+
     pub(crate) fn new(
         root: Option<BtreeHeader>,
         hint: PageHint,

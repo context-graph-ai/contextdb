@@ -316,7 +316,10 @@ pub(crate) struct PreparedWriterSnapshot {
     root: WriterSnapshotHandle,
 }
 impl PreparedWriterSnapshot {
-    pub(crate) fn activate(self, read: Arc<redb::ReadTransaction>) -> WriterSnapshotHandle {
+    pub(crate) fn activate(self, mut read: Arc<redb::ReadTransaction>) -> WriterSnapshotHandle {
+        Arc::get_mut(&mut read)
+            .expect("prepared read remains private until activation")
+            .release_optional_root_cache();
         // The read slot is private and empty until the actual lower receipt is
         // durable. The external invoice is already owned by the paired handle.
         // These moves have no allocation, provider or storage call.
@@ -1212,7 +1215,7 @@ impl RedbPersistence {
         })?;
         self.with_db(|db| {
             db.install_local_snapshot_provider(self.writer_root_provider());
-            let read = Arc::new(db.begin_verified_read().map_err(Self::storage_error)?);
+            let mut read = db.begin_verified_read().map_err(Self::storage_error)?;
             let identity = read.storage_snapshot_identity();
             // The scalar fact is captured from this exact immutable root during
             // publication, never inferred from a newer writer or resident image.
@@ -1225,6 +1228,8 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(error) => return Err(Self::storage_error(error)),
             };
+            read.release_optional_root_cache();
+            let read = Arc::new(read);
             let root = Arc::new(WriterSnapshot {
                 read: parking_lot::RwLock::new(Some(read)),
                 identity,
@@ -1272,7 +1277,7 @@ impl RedbPersistence {
         })?;
         self.with_db(|db| {
             db.install_local_snapshot_provider(self.writer_root_provider());
-            let read = Arc::new(db.begin_verified_read().map_err(Self::storage_error)?);
+            let mut read = db.begin_verified_read().map_err(Self::storage_error)?;
             let identity = read.storage_snapshot_identity();
             // The scalar fact is captured from this exact immutable root during
             // publication, never inferred from a newer writer or resident image.
@@ -1285,6 +1290,8 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(error) => return Err(Self::storage_error(error)),
             };
+            read.release_optional_root_cache();
+            let read = Arc::new(read);
             let root = WriterSnapshotHandle::native(
                 WriterSnapshot {
                     read: parking_lot::RwLock::new(Some(read)),

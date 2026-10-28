@@ -240,7 +240,7 @@ impl Capture {
     ) -> Result<Owner> {
         let memory = original.read_budget()?;
         let owner = original.vector_budget()?;
-        let authority = read::NativeAuthority::open(&root, memory.clone())?;
+        let authority = read::NativeAuthority::open_uncached(&root, memory.clone())?;
         let source = read::PageSource::open(&authority, index, tuple, &|| Ok(()), &|_| Ok(()))?
             .ok_or_else(corrupt)?;
         let manifest = source.select_build_authority()?;

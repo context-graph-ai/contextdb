@@ -68,7 +68,7 @@ pub(in crate::persistence::vector_ivf) fn pending(
     column: &ColumnDef,
     checkpoint: &dyn Fn() -> Result<()>,
 ) -> Result<bool> {
-    let authority = read::NativeAuthority::open(root, memory)?;
+    let authority = read::NativeAuthority::open_uncached(root, memory)?;
     let Some(source) = read::PageSource::open(&authority, index, tuple, checkpoint, &|_| Ok(()))?
     else {
         return Ok(false);

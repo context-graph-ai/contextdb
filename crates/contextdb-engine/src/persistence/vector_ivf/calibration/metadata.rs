@@ -156,7 +156,7 @@ impl RedbPersistence {
         // Only receipt metadata uses this newer authenticated root. Search and
         // query-vector reads always use capture.root.
         let root = (self.paged_root_capture()?)()?;
-        let authority = read::NativeAuthority::open(&root, capture.memory.clone())?;
+        let authority = read::NativeAuthority::open_uncached(&root, capture.memory.clone())?;
         let check = || super::sample::check(capture, index, checkpoint);
         let source = read::PageSource::open(&authority, index, tuple, &check, &|_| Ok(()))?
             .ok_or_else(corrupt)?;

@@ -9651,7 +9651,7 @@
              }
          } else if !self.completed && self.mem.storage_failure() {
              self.tables
-@@ -2107,18 +3832,148 @@
+@@ -2107,18 +3832,162 @@
      tree: TableTree,
  }
  
@@ -9732,10 +9732,24 @@
 +}
 +
  impl ReadTransaction {
++    /// Retire optional setup copies before a verified snapshot escapes.
++    /// Its immutable identity and MVCC pins remain unchanged.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn release_optional_root_cache(&mut self) {
++        self.tree.release_optional_root_cache();
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn installed_cache_capacity(&self) -> usize {
++        self.mem.installed_cache_capacity()
++    }
++
      pub(crate) fn new(
          mem: Arc<TransactionalMemory>,
          guard: TransactionGuard,
-     ) -> Result<Self, TransactionError> {
++    ) -> Result<Self, TransactionError> {
 +        Self::new_with_hint(mem, guard, PageHint::Clean)
 +    }
 +
@@ -9751,7 +9765,7 @@
 +        mem: Arc<TransactionalMemory>,
 +        guard: TransactionGuard,
 +        hint: PageHint,
-+    ) -> Result<Self, TransactionError> {
+     ) -> Result<Self, TransactionError> {
          let root_page = mem.get_data_root();
          let guard = Arc::new(guard);
          Ok(Self {
@@ -9801,7 +9815,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3990,69 @@
+@@ -2135,12 +4004,69 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -9872,7 +9886,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +4073,7 @@
+@@ -2161,7 +4087,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -9881,7 +9895,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +4101,7 @@
+@@ -2189,7 +4115,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -9890,7 +9904,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +4129,7 @@
+@@ -2217,7 +4143,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -9899,7 +9913,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +4175,15 @@
+@@ -2263,7 +4189,15 @@
  
  #[cfg(test)]
  mod test {
@@ -9916,7 +9930,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4204,1144 @@
+@@ -2284,4 +4218,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -13636,7 +13650,7 @@
      }
  
      fn verify_checksum_helper(
-@@ -804,12 +1067,12 @@
+@@ -804,17 +1067,22 @@
  }
  
  pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
@@ -13651,7 +13665,17 @@
      _key_type: PhantomData<K>,
      _value_type: PhantomData<V>,
  }
-@@ -822,7 +1085,16 @@
+ 
+ impl<K: Key, V: Value> Btree<K, V> {
++    #[cfg(feature = "contextdb-internal")]
++    pub(super) fn release_cached_root(&mut self) {
++        self.cached_root = None;
++    }
++
+     pub(crate) fn new(
+         root: Option<BtreeHeader>,
+         hint: PageHint,
+@@ -822,7 +1090,16 @@
          mem: Arc<TransactionalMemory>,
      ) -> Result<Self> {
          let cached_root = if let Some(header) = root {
@@ -13669,7 +13693,7 @@
          } else {
              None
          };
-@@ -837,6 +1109,24 @@
+@@ -837,6 +1114,24 @@
          })
      }
  
@@ -13694,7 +13718,7 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -858,6 +1148,17 @@
+@@ -858,6 +1153,17 @@
              self.hint,
          )
          .verify_checksum()
@@ -13712,7 +13736,7 @@
      }
  
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-@@ -877,6 +1178,10 @@
+@@ -877,6 +1183,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
              self.get_helper(root_page, K::as_bytes(key).as_ref())
@@ -13723,7 +13747,7 @@
          } else {
              Ok(None)
          }
-@@ -898,8 +1203,10 @@
+@@ -898,8 +1208,10 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(page, K::fixed_width());
@@ -13735,7 +13759,7 @@
                  self.get_helper(&child_page, query)
              }
              _ => unreachable!(),
-@@ -911,6 +1218,10 @@
+@@ -911,6 +1223,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.first_helper(root.clone())
@@ -13746,7 +13770,7 @@
          } else {
              Ok(None)
          }
-@@ -932,7 +1243,10 @@
+@@ -932,7 +1248,10 @@
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let child_page = accessor.child_page(0).unwrap();
@@ -13758,7 +13782,7 @@
              }
              _ => unreachable!(),
          }
-@@ -943,6 +1257,10 @@
+@@ -943,6 +1262,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.last_helper(root.clone())
@@ -13769,7 +13793,7 @@
          } else {
              Ok(None)
          }
-@@ -964,8 +1282,12 @@
+@@ -964,8 +1287,12 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
@@ -13784,7 +13808,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,12 +1297,35 @@
+@@ -975,12 +1302,35 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -13822,7 +13846,7 @@
      }
  
      pub(crate) fn len(&self) -> Result<u64> {
-@@ -995,42 +1340,6 @@
+@@ -995,42 +1345,6 @@
              V::fixed_width(),
              self.hint,
          )
@@ -13865,7 +13889,7 @@
      }
  }
  
-@@ -1118,3 +1427,521 @@
+@@ -1118,3 +1432,521 @@
          _ => unreachable!(),
      }
  }
@@ -27111,7 +27135,7 @@
      pub(crate) fn clear(&mut self) {
          self.data[..size_of::<u16>()].fill(0);
      }
-@@ -67,9 +80,29 @@
+@@ -67,9 +80,39 @@
  pub(crate) struct TableTree {
      tree: Btree<&'static str, InternalTableDefinition>,
      mem: Arc<TransactionalMemory>,
@@ -27120,6 +27144,16 @@
  }
  
  impl TableTree {
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn release_optional_root_cache(&mut self) {
++        if self.mem.installed_cache_capacity() == 0 {
++            // The immutable root identity and transaction guard remain held.
++            // Later accesses verify and read that same root on demand.
++            self.tree.release_cached_root();
++            self.prepared_root = None;
++        }
++    }
++
 +    pub(crate) fn root(&self) -> Option<BtreeHeader> {
 +        self.tree.get_root()
 +    }
@@ -27141,7 +27175,7 @@
      pub(crate) fn new(
          master_root: Option<BtreeHeader>,
          page_hint: PageHint,
-@@ -79,9 +112,71 @@
+@@ -79,9 +122,71 @@
          Ok(Self {
              tree: Btree::new(master_root, page_hint, guard, mem.clone())?,
              mem,
@@ -27213,7 +27247,7 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          self.tree.transaction_guard()
      }
-@@ -136,8 +231,19 @@
+@@ -136,8 +241,19 @@
          Ok(true)
      }
  
@@ -27233,7 +27267,7 @@
          let iter = self.tree.range::<RangeFull, &str>(&(..))?;
          let iter = TableNameIter {
              inner: iter,
-@@ -145,7 +251,15 @@
+@@ -145,7 +261,15 @@
          };
          let mut result = vec![];
          for table in iter {
@@ -27250,7 +27284,7 @@
          }
          Ok(result)
      }
-@@ -155,6 +269,13 @@
+@@ -155,6 +279,13 @@
          name: &str,
          table_type: TableType,
      ) -> Result<Option<InternalTableDefinition>, TableError> {
@@ -27264,7 +27298,7 @@
          if let Some(guard) = self.tree.get(&name)? {
              let definition = guard.value();
              definition.check_match_untyped(table_type, name)?;
-@@ -210,12 +331,21 @@
+@@ -210,12 +341,21 @@
  }
  
  pub(crate) struct TableTreeMut<'txn> {
@@ -27287,7 +27321,7 @@
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
      allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
  }
-@@ -228,6 +358,16 @@
+@@ -228,6 +368,16 @@
          freed_pages: Arc<Mutex<Vec<PageNumber>>>,
          allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
      ) -> Self {
@@ -27304,7 +27338,7 @@
          Self {
              tree: BtreeMut::new(
                  master_root,
-@@ -238,7 +378,14 @@
+@@ -238,7 +388,14 @@
              ),
              guard,
              mem,
@@ -27320,7 +27354,7 @@
              freed_pages,
              allocated_pages,
          }
-@@ -250,7 +397,13 @@
+@@ -250,7 +407,13 @@
          self.pending_table_updates.clear();
      }
  
@@ -27335,7 +27369,7 @@
      pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -285,16 +438,65 @@
+@@ -285,16 +448,65 @@
          table_root: Option<BtreeHeader>,
          length: u64,
      ) {
@@ -27403,7 +27437,7 @@
      }
  
      pub(crate) fn flush_and_close(
-@@ -318,62 +520,143 @@
+@@ -318,62 +530,143 @@
      }
  
      fn flush_inner(&mut self) -> Result<Option<BtreeHeader>> {
@@ -27596,7 +27630,7 @@
      }
  
      // Opens a table, calls the provided closure to insert entries into it, and then
-@@ -539,12 +822,28 @@
+@@ -539,12 +832,28 @@
              if self.get_table_untyped(new_name, table_type)?.is_some() {
                  return Err(TableError::TableExists(new_name.to_string()));
              }
@@ -27628,7 +27662,7 @@
          } else {
              return Err(TableError::TableDoesNotExist(name.to_string()));
          }
-@@ -570,6 +869,8 @@
+@@ -570,6 +879,8 @@
              for page in pages {
                  if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                      freed_pages.push(page);
@@ -27637,7 +27671,7 @@
                  }
              }
              drop(allocated_pages);
-@@ -578,6 +879,14 @@
+@@ -578,6 +889,14 @@
              self.pending_table_updates.remove(name);
  
              let found = self.tree.remove(&name)?.is_some();
@@ -27652,7 +27686,7 @@
              return Ok(found);
          }
  
-@@ -594,6 +903,14 @@
+@@ -594,6 +913,14 @@
          } else {
              let table = InternalTableDefinition::new::<K, V>(table_type, None, 0);
              self.tree.insert(&name, &table)?;
@@ -27667,7 +27701,7 @@
              table
          };
  
-@@ -660,21 +977,123 @@
+@@ -660,21 +987,123 @@
                  definition.set_header(*updated_root, *updated_length);
              }
  
@@ -27795,7 +27829,7 @@
          Ok(())
      }
  
-@@ -761,6 +1180,193 @@
+@@ -761,6 +1190,193 @@
      }
  }
  

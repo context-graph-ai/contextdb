@@ -3909,6 +3909,20 @@ impl StorageStatisticsSnapshot {
 }
 
 impl ReadTransaction {
+    /// Retire optional setup copies before a verified snapshot escapes.
+    /// Its immutable identity and MVCC pins remain unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn release_optional_root_cache(&mut self) {
+        self.tree.release_optional_root_cache();
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn installed_cache_capacity(&self) -> usize {
+        self.mem.installed_cache_capacity()
+    }
+
     pub(crate) fn new(
         mem: Arc<TransactionalMemory>,
         guard: TransactionGuard,

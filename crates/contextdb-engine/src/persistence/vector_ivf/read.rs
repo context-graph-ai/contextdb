@@ -40,6 +40,7 @@ pub(super) struct NativeAuthority<'a> {
     pub snapshot_lsn: u64,
     owner: MemoryBudgetOwner,
     memory: contextdb_core::read_memory::ReadMemoryOwner,
+    descriptor_cache: bool,
     pub(super) admission: super::super::native_storage_admission::StorageAdmissionScope,
     _invoice: Invoice,
     #[cfg(feature = "test-seams")]
@@ -52,19 +53,26 @@ impl<'a> NativeAuthority<'a> {
         root: &'a super::super::vector_paged::CapturedPagedRoot,
         memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Self> {
-        Self::open_inner(root, memory, None)
+        Self::open_inner(root, memory, None, true)
+    }
+    pub(super) fn open_uncached(
+        root: &'a super::super::vector_paged::CapturedPagedRoot,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<Self> {
+        Self::open_inner(root, memory, None, false)
     }
     pub(super) fn open_prepared(
         root: &'a super::super::vector_paged::CapturedPagedRoot,
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         prepared: &BuildVerification,
     ) -> Result<Self> {
-        Self::open_inner(root, memory, Some(prepared))
+        Self::open_inner(root, memory, Some(prepared), false)
     }
     fn open_inner(
         root: &'a super::super::vector_paged::CapturedPagedRoot,
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         prepared: Option<&BuildVerification>,
+        descriptor_cache: bool,
     ) -> Result<Self> {
         #[cfg(feature = "test-seams")]
         let observer = Producer::current();
@@ -122,6 +130,7 @@ impl<'a> NativeAuthority<'a> {
             snapshot_lsn,
             owner,
             memory,
+            descriptor_cache: descriptor_cache && root.read.installed_cache_capacity() != 0,
             admission,
             _invoice: invoice,
         })
@@ -274,7 +283,9 @@ impl<'a> PageSource<'a> {
         if let Some(manifest) = self.query_manifest.get() {
             return Ok(Some(manifest));
         }
-        if let Some(window) = self.authority.root.native_ivf_cache().get(&self.scope_key) {
+        if self.authority.descriptor_cache
+            && let Some(window) = self.authority.root.native_ivf_cache().get(&self.scope_key)
+        {
             // The holder is an authenticated immutable storage root. Match its
             // scope's current manifest before borrowing the cached descriptor.
             if descriptor::decode(&self.scope_key, &self.record.borrow(), &window.descriptor)?
@@ -333,14 +344,16 @@ impl<'a> PageSource<'a> {
                         });
                     crate::writer_query_test_seams::note_saved_graph_load(bytes.len());
                 }
-                let stored = bytes.try_into().map_err(|_| corrupt())?;
-                let window = self.authority.root.native_ivf_cache().install(
-                    self.scope_key,
-                    stored,
-                    manifest,
-                    self.authority.memory.clone(),
-                )?;
-                *self.cache.borrow_mut() = Some(window);
+                if self.authority.descriptor_cache {
+                    let stored = bytes.try_into().map_err(|_| corrupt())?;
+                    let window = self.authority.root.native_ivf_cache().install(
+                        self.scope_key,
+                        stored,
+                        manifest,
+                        self.authority.memory.clone(),
+                    )?;
+                    *self.cache.borrow_mut() = Some(window);
+                }
                 Ok(manifest)
             },
         )?;

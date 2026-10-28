@@ -8,7 +8,7 @@ pub(crate) fn selected_generation(
     index: &VectorIndexRef,
     tuple: &VectorPartitionKey,
 ) -> Result<Option<(u64, contextdb_core::SnapshotId)>> {
-    let authority = read::NativeAuthority::open(root, memory)?;
+    let authority = read::NativeAuthority::open_uncached(root, memory)?;
     let Some(source) = read::PageSource::open(&authority, index, tuple, &|| Ok(()), &|_| Ok(()))?
     else {
         return Ok(None);

@@ -34,7 +34,7 @@ pub(crate) fn inspect(
     selection: Option<retained::Selection<'_>>,
     checkpoint: &dyn Fn() -> Result<()>,
 ) -> Result<Option<Inspection>> {
-    let authority = read::NativeAuthority::open(root, memory)?;
+    let authority = read::NativeAuthority::open_uncached(root, memory)?;
     let Some(mut source) =
         read::PageSource::open(&authority, index, tuple, checkpoint, &|_| Ok(()))?
     else {

@@ -1295,3 +1295,13 @@ sizing the writer workspace; actual writes still admit once on the same owner.
 | `src/transactions.rs`, `src/tree_store/mod.rs`, `src/tree_store/page_store/mod.rs` | Pure native dirty-byte-entry backing quote using existing serialization, live page geometry and actual allocation layout; no new payer or admission. |
 
 Upstream proposal remains unsubmitted. Runtime and independent review are required.
+
+At zero installed cache capacity, verified writer snapshot setup can retire its
+optional master-root backing through ReadTransaction::release_optional_root_cache.
+This clears only Btree cached_root and TableTree prepared_root copies after
+verification/setup; the same immutable root identity and MVCC transaction guard
+remain held. Later access reads and verifies that same root on demand. Nonzero
+capacity retains the existing behavior. The engine applies this before legacy,
+native and prepared-exact writer descriptors escape. The source patch is fully
+regenerated from the checksum-verified 4.1.0 archive. Independent runtime and
+isolated producer-site proofs remain required.
