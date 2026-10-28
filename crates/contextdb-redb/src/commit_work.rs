@@ -16,6 +16,90 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+type WriterQueueRegistryForTest = std::sync::Mutex<
+    std::collections::HashMap<std::thread::ThreadId, (u64, std::sync::mpsc::Sender<()>)>,
+>;
+static WRITER_QUEUE_WATCHES_FOR_TEST: std::sync::OnceLock<WriterQueueRegistryForTest> =
+    std::sync::OnceLock::new();
+static NEXT_WRITER_QUEUE_WATCH_FOR_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+static WRITER_QUEUE_WATCH_ACTIVE_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn writer_queue_watches_for_test() -> &'static WriterQueueRegistryForTest {
+    WRITER_QUEUE_WATCHES_FOR_TEST.get_or_init(Default::default)
+}
+
+/// A one-shot observation of a particular thread entering the writer queue.
+#[doc(hidden)]
+pub struct WriterQueueWatchForTest {
+    thread: std::thread::ThreadId,
+    serial: u64,
+    receiver: std::sync::mpsc::Receiver<()>,
+}
+
+#[doc(hidden)]
+pub fn watch_writer_queue_for_test(thread: std::thread::ThreadId) -> WriterQueueWatchForTest {
+    let serial =
+        NEXT_WRITER_QUEUE_WATCH_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut watches = writer_queue_watches_for_test()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(
+        !watches.contains_key(&thread),
+        "writer thread already has a queue watch"
+    );
+    watches.insert(thread, (serial, sender));
+    WRITER_QUEUE_WATCH_ACTIVE_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(watches);
+    WriterQueueWatchForTest {
+        thread,
+        serial,
+        receiver,
+    }
+}
+
+impl WriterQueueWatchForTest {
+    #[doc(hidden)]
+    pub fn wait_for_test(&self, liveness_bound: std::time::Duration) -> bool {
+        self.receiver.recv_timeout(liveness_bound).is_ok()
+    }
+}
+
+impl Drop for WriterQueueWatchForTest {
+    fn drop(&mut self) {
+        let mut watches = writer_queue_watches_for_test()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if watches
+            .get(&self.thread)
+            .is_some_and(|(serial, _)| *serial == self.serial)
+        {
+            watches.remove(&self.thread);
+        }
+        WRITER_QUEUE_WATCH_ACTIVE_FOR_TEST
+            .store(!watches.is_empty(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn note_writer_queued_for_test() {
+    if !WRITER_QUEUE_WATCH_ACTIVE_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let mut watches = writer_queue_watches_for_test()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let watch = watches.remove(&std::thread::current().id());
+    WRITER_QUEUE_WATCH_ACTIVE_FOR_TEST
+        .store(!watches.is_empty(), std::sync::atomic::Ordering::SeqCst);
+    drop(watches);
+    if let Some((_, sender)) = watch {
+        let _ = sender.send(());
+    }
+}
+
 /// Work boundaries for exact root-capture counters and admission-failure proofs.
 /// This entire module is absent without `test-seams`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

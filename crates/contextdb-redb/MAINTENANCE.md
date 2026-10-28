@@ -1204,3 +1204,7 @@ writer's `zeroed_for_write` construction point.
 | Changed source | Reason |
 |---|---|
 | `src/db.rs`, `src/transactions.rs` | Remove three expectations for the unknown `clippy::assert_is_empty` lint. The existing const-constructor assertions need no exception on Rust 1.94.0; constructor behavior and the minimum supported Rust version are unchanged. |
+
+## close1-determinism (77b6bec8)
+
+The `test-seams`-only `commit_work` writer-queue watch registers a one-shot event for a specific writer thread; `transaction_tracker.rs` signals it when that thread actually enters the existing writer wait. A dropped registration removes only its own entry. Ordinary builds contain neither the registry nor the notifier, and writer locking and queue behavior are unchanged. The train regenerates `upstream-4.1.0.patch` from the merged fork; local proof uses a regenerated patch.
