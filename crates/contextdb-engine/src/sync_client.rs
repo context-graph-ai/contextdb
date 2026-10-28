@@ -934,6 +934,8 @@ impl SyncClient {
             let (page, more) = self
                 .fetch_delivery_page(since.take(), &owner, custody_reader.clone(), &mut result)
                 .await?;
+            #[cfg(test)]
+            crate::identity::check_paging_work_limit();
             match (more, page) {
                 (false, _) => return Ok(result.into_outcomes()),
                 (true, 0) => return Err(crate::custody::canonical::invalid()),

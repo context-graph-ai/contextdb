@@ -1504,6 +1504,19 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
         crate::identity::PAGING_SIGNATURES.load(std::sync::atomic::Ordering::Relaxed);
     let verification_start =
         crate::identity::PAGING_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let maximum_delivered_records = backlog + page;
+    let record_components = ["terminal", "certificate"];
+    let page_record_components = ["manifest", "row lineage"];
+    let verification_ends = ["server", "client"];
+    let maximum_verifications = maximum_delivered_records
+        * (record_components.len() + page_record_components.len())
+        * verification_ends.len();
+    let _paging_work_limit = crate::identity::PagingWorkLimit::arm(
+        signature_start,
+        verification_start,
+        maximum_delivered_records,
+        maximum_verifications,
+    );
 
     let lossy = SyncClient::with_authenticated_transport_and_identity_for_test(
         world.edge_db.clone(),

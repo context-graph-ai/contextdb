@@ -206,3 +206,37 @@ pub(crate) static PAGING_SIGNATURES: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub(crate) static PAGING_VERIFICATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static PAGING_WORK_LIMIT: std::sync::Mutex<Option<(usize, usize, usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct PagingWorkLimit;
+#[cfg(test)]
+impl PagingWorkLimit {
+    pub(crate) fn arm(sign_start: usize, verify_start: usize, records: usize, verify_limit: usize) -> Self {
+        let mut limit = PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(limit.is_none(), "only one paging work guard is active");
+        *limit = Some((sign_start, verify_start, records, verify_limit));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for PagingWorkLimit {
+    fn drop(&mut self) {
+        *PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+#[cfg(test)]
+pub(crate) fn check_paging_work_limit() {
+    let limit = *PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((sign_start, verify_start, records, verify_limit)) = limit {
+        let verifications = PAGING_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed) - verify_start;
+        let signatures = PAGING_SIGNATURES.load(std::sync::atomic::Ordering::Relaxed) - sign_start;
+        assert!(verifications <= verify_limit,
+            "bounded signed-component verifications: {verifications} > {verify_limit}");
+        assert!(signatures <= records,
+            "one certificate signing per delivered record: {signatures} for {records}");
+    }
+}
