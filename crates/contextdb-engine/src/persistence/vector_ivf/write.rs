@@ -1907,6 +1907,9 @@ impl WriteScope<'_, '_> {
         if family.kinds.present & bit == 0 {
             return Ok(false);
         }
+        // This journal remains live authority. Authenticate its captured
+        // kind root before removing even an obsolete run from that table.
+        self.prepare_kind_tables(0, &[PageKind::RowCopies])?;
         let name = io::KindTableName::new(family.storage, PageKind::RowCopies)?;
         let definition = redb::TableDefinition::<&[u8], &[u8]>::new(name.as_str()?);
         let mut table = self
