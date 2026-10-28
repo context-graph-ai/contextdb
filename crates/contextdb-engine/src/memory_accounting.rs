@@ -6277,6 +6277,11 @@ impl MemoryAccountant {
     pub(crate) fn writer_vector_adapter_type_layout_for_test() -> Layout {
         writer_adapter_type_layout::<WriterVectorBudget>()
     }
+    #[cfg(test)]
+    pub(crate) fn writer_vector_adapter_full_size_for_test() -> usize {
+        Self::writer_vector_adapter_type_layout_for_test().size()
+            + ReadMemoryOwner::native_layout::<WriterWaitMemory, WriterAdapterInvoice>().size()
+    }
 }
 // The original epoch remains pinned by the external invoice through native
 // payload destruction, physical free, receipt settlement and counter refund.
