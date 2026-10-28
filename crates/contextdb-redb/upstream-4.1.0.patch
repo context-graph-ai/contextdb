@@ -17853,7 +17853,7 @@
              io_failed: AtomicBool::new(false),
              closed: AtomicBool::new(false),
          }
-@@ -157,7 +274,7 @@
+@@ -157,25 +274,83 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -17862,7 +17862,33 @@
      }
  
      fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
-@@ -165,17 +282,25 @@
++        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++        {
++            self.read_inner(offset, out, None)
++        }
++        #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
++        {
++            self.read_inner(offset, out)
++        }
++    }
++
++    fn read_inner(
++        &self,
++        offset: u64,
++        out: &mut [u8],
++        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))] observation: Option<(
++            &crate::native_page_observations::PageObservation,
++            &NativeColdReadAttemptForTest,
++        )>,
++    ) -> Result<()> {
+         self.check_failure()?;
++        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++        let result =
++            match observation.and_then(|(observer, attempt)| observer.before_cold_read(attempt)) {
++                Some(error) => Err(crate::native_storage_admission::native_storage_error(error)),
++                None => self.file.read(offset, out),
++            };
++        #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
          let result = self.file.read(offset, out);
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
@@ -17870,6 +17896,30 @@
 -        result.map_err(StorageError::from)
 +        } else {
 +            crate::read_admission::record_backend_read(out.len());
++        }
++        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++        if let Some((observer, attempt)) = observation {
++            if result.is_err() {
++                observer.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt: *attempt });
++            }
++            return match result {
++                Ok(()) => {
++                    observer.after_cold_read(attempt, Ok(()));
++                    Ok(())
++                }
++                Err(StorageError::Native(error)) => {
++                    observer.after_cold_read(attempt, Err(&error));
++                    Err(StorageError::Native(error))
++                }
++                Err(StorageError::Io(error)) => {
++                    // Borrow and return the identical I/O error; the observation
++                    // never replaces its kind, payload or producer category.
++                    let error = crate::NativeColdReadError::Io(error);
++                    observer.after_cold_read(attempt, Err(&error));
++                    Err(crate::native_storage_admission::native_storage_error(error))
++                }
++                Err(error) => Err(error),
++            };
 +        }
 +        result
      }
@@ -17892,7 +17942,7 @@
      }
  
      fn sync_data(&self) -> Result<()> {
-@@ -184,7 +309,7 @@
+@@ -184,7 +359,7 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -17901,7 +17951,7 @@
      }
  
      fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-@@ -193,11 +318,34 @@
+@@ -193,11 +368,34 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -17937,7 +17987,7 @@
      file: CheckedBackend,
      page_size: u64,
      // Dynamic cache partitioning.  Three invariants:
-@@ -218,9 +366,7 @@
+@@ -218,9 +416,7 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -17948,7 +17998,7 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,27 +379,201 @@
+@@ -233,27 +429,201 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
@@ -18159,7 +18209,7 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -266,8 +586,130 @@
+@@ -266,8 +636,130 @@
              #[cfg(feature = "cache_metrics")]
              evictions: Default::default(),
              read_cache,
@@ -18291,7 +18341,7 @@
      }
  
      #[allow(clippy::unused_self)]
-@@ -303,6 +745,115 @@
+@@ -303,6 +795,115 @@
          }
      }
  
@@ -18407,7 +18457,7 @@
      pub(crate) fn close(&self) -> Result {
          self.file.close()
      }
-@@ -329,28 +880,52 @@
+@@ -329,28 +930,52 @@
          bytes_needed: usize,
          _write_lock: &MutexGuard<'_, LRUWriteCache>,
      ) {
@@ -18464,7 +18514,7 @@
      }
  
      fn flush_write_buffer(&self) -> Result {
-@@ -359,30 +934,51 @@
+@@ -359,30 +984,51 @@
          for (offset, buffer) in write_buffer.cache.iter() {
              self.file.write(*offset, buffer.as_ref().unwrap())?;
          }
@@ -18537,7 +18587,7 @@
          write_buffer.clear();
  
          Ok(())
-@@ -390,10 +986,28 @@
+@@ -390,10 +1036,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -18568,7 +18618,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -409,6 +1023,20 @@
+@@ -409,6 +1073,20 @@
          self.flush_write_buffer()
      }
  
@@ -18589,7 +18639,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +1044,32 @@
+@@ -416,18 +1094,54 @@
          Ok(buffer)
      }
  
@@ -18600,6 +18650,25 @@
 -        let mut arc = zero_filled_arc(len);
 -        self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
 -        Ok(arc)
++    /// Borrow the actual paid native backing at the checked backend call.
++    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++    fn read_native_backend_for_test(&self, offset: u64, page: &mut PageAllocation) -> Result<()> {
++        let observation = page.observation_for_test();
++        let attempt = NativeColdReadAttemptForTest {
++            backend: &self.file.file as *const _ as usize,
++            cache: self.read_cache_bytes.observation_for_test().0,
++            offset,
++            len: page.len(),
++            backing: page.backing_for_test(),
++            source_receipt: page.native_payment_for_test().source_receipt,
++        };
++        self.file.read_inner(
++            offset,
++            PageAllocation::get_mut(page).expect("unpublished native page is unique"),
++            Some((&observation, &attempt)),
++        )
++    }
++
 +    // Admit the concrete complete allocation before allocation and backend I/O.
 +    fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
 +        PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
@@ -18612,6 +18681,9 @@
 +            && crate::native_storage_admission::native_storage_active()
 +        {
 +            let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
++            #[cfg(feature = "test-seams")]
++            self.read_native_backend_for_test(offset, &mut page)?;
++            #[cfg(not(feature = "test-seams"))]
 +            self.file
 +                .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
 +            return Ok(page);
@@ -18630,7 +18702,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1080,7 @@
+@@ -438,7 +1152,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -18639,7 +18711,7 @@
              }
          }
  
-@@ -449,54 +1091,181 @@
+@@ -449,54 +1163,181 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -18859,7 +18931,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1276,213 @@
+@@ -507,104 +1348,213 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -19159,7 +19231,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1492,436 @@
+@@ -614,13 +1564,439 @@
  }
  
  #[cfg(test)]
@@ -19344,6 +19416,9 @@
 +        }
 +        // Preserve CheckedBackend's PreviousIo/DatabaseClosed/I/O value and
 +        // read observer; a prepared read must not invent a corruption instead.
++        #[cfg(feature = "test-seams")]
++        self.read_native_backend_for_test(offset, &mut page)?;
++        #[cfg(not(feature = "test-seams"))]
 +        self.file.read(
 +            offset,
 +            PageAllocation::get_mut(&mut page).expect("unpublished native page is unique"),
@@ -19598,7 +19673,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1954,948 @@
+@@ -653,4 +2029,948 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }

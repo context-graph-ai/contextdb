@@ -1,5 +1,14 @@
 # contextdb-redb maintenance
 
+The `test-seams` cold-read observation also borrows the actual admitted native
+backing at `read_direct_into_page` and at the cached-none fallthrough of
+`read_native_prepared`. Both call the same checked-backend read implementation
+as ordinary reads. The borrowed injector supplies a failure inside its existing
+read-result/latch branch; the baseline sticky-read behavior is retained here.
+Backend-read counting, error payloads and cache/payment ordering are unchanged.
+The existing bounded custody ring records the failed backing before it is freed.
+No observation allocation, page alias or payer is created by this borrowed hook.
+
 The native page capture token can re-enter its original observation scope without
 retaining a page or payer; closed reuse invalidates completeness. Actual failed
 cold reads enqueue their exact backing and source receipt in that same bounded

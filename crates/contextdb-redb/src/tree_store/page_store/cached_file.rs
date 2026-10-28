@@ -278,12 +278,62 @@ impl CheckedBackend {
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        {
+            self.read_inner(offset, out, None)
+        }
+        #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
+        {
+            self.read_inner(offset, out)
+        }
+    }
+
+    fn read_inner(
+        &self,
+        offset: u64,
+        out: &mut [u8],
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))] observation: Option<(
+            &crate::native_page_observations::PageObservation,
+            &NativeColdReadAttemptForTest,
+        )>,
+    ) -> Result<()> {
         self.check_failure()?;
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let result =
+            match observation.and_then(|(observer, attempt)| observer.before_cold_read(attempt)) {
+                Some(error) => Err(crate::native_storage_admission::native_storage_error(error)),
+                None => self.file.read(offset, out),
+            };
+        #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
         let result = self.file.read(offset, out);
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         } else {
             crate::read_admission::record_backend_read(out.len());
+        }
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        if let Some((observer, attempt)) = observation {
+            if result.is_err() {
+                observer.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt: *attempt });
+            }
+            return match result {
+                Ok(()) => {
+                    observer.after_cold_read(attempt, Ok(()));
+                    Ok(())
+                }
+                Err(StorageError::Native(error)) => {
+                    observer.after_cold_read(attempt, Err(&error));
+                    Err(StorageError::Native(error))
+                }
+                Err(StorageError::Io(error)) => {
+                    // Borrow and return the identical I/O error; the observation
+                    // never replaces its kind, payload or producer category.
+                    let error = crate::NativeColdReadError::Io(error);
+                    observer.after_cold_read(attempt, Err(&error));
+                    Err(crate::native_storage_admission::native_storage_error(error))
+                }
+                Err(error) => Err(error),
+            };
         }
         result
     }
@@ -1044,6 +1094,25 @@ impl PagedCachedFile {
         Ok(buffer)
     }
 
+    /// Borrow the actual paid native backing at the checked backend call.
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    fn read_native_backend_for_test(&self, offset: u64, page: &mut PageAllocation) -> Result<()> {
+        let observation = page.observation_for_test();
+        let attempt = NativeColdReadAttemptForTest {
+            backend: &self.file.file as *const _ as usize,
+            cache: self.read_cache_bytes.observation_for_test().0,
+            offset,
+            len: page.len(),
+            backing: page.backing_for_test(),
+            source_receipt: page.native_payment_for_test().source_receipt,
+        };
+        self.file.read_inner(
+            offset,
+            PageAllocation::get_mut(page).expect("unpublished native page is unique"),
+            Some((&observation, &attempt)),
+        )
+    }
+
     // Admit the concrete complete allocation before allocation and backend I/O.
     fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
         PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
@@ -1056,6 +1125,9 @@ impl PagedCachedFile {
             && crate::native_storage_admission::native_storage_active()
         {
             let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
+            #[cfg(feature = "test-seams")]
+            self.read_native_backend_for_test(offset, &mut page)?;
+            #[cfg(not(feature = "test-seams"))]
             self.file
                 .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
             return Ok(page);
@@ -1673,6 +1745,9 @@ impl PagedCachedFile {
         }
         // Preserve CheckedBackend's PreviousIo/DatabaseClosed/I/O value and
         // read observer; a prepared read must not invent a corruption instead.
+        #[cfg(feature = "test-seams")]
+        self.read_native_backend_for_test(offset, &mut page)?;
+        #[cfg(not(feature = "test-seams"))]
         self.file.read(
             offset,
             PageAllocation::get_mut(&mut page).expect("unpublished native page is unique"),
