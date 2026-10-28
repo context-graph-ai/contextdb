@@ -1973,7 +1973,17 @@ impl WriterSnapshotHandle {
         } else {
             table
         };
-        RedbPersistence::verify_history_root(self.owner_read()?.as_ref(), historical)?;
+        if matches!(historical, "row_graph_fwd" | "row_graph_rev") {
+            // Untouched hidden adjacency must not disclose its damage. Keep
+            // control validation here and strict witnesses on consumed entries;
+            // the verified native read also authenticates empty range paths.
+            let _ = RedbPersistence::verify_history_root_canonical(
+                self.owner_read()?.as_ref(),
+                historical,
+            )?;
+        } else {
+            RedbPersistence::verify_history_root(self.owner_read()?.as_ref(), historical)?;
+        }
         let logical = table.strip_prefix("rel_");
         let continuation = owner.reserve(
             table

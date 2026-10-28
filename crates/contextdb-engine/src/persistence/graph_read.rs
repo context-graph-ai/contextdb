@@ -548,8 +548,12 @@ impl RetainedGraphCursor {
             source.with_read(|read| {
                 RedbPersistence::read_authenticated_bounds_in_read(read)?;
                 if row_owned {
-                    RedbPersistence::verify_history_root(read, "row_graph_fwd")?;
-                    RedbPersistence::verify_history_root(read, "row_graph_rev")?;
+                    // A whole-table mismatch can belong to an untouched hidden
+                    // source. Validate the controls here; consumed entries below
+                    // still require the strict producer witness. Native range
+                    // traversal verifies every page, including an empty range.
+                    let _ = RedbPersistence::verify_history_root_canonical(read, "row_graph_fwd")?;
+                    let _ = RedbPersistence::verify_history_root_canonical(read, "row_graph_rev")?;
                 }
                 Ok(())
             })
