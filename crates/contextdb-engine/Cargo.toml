@@ -885,6 +885,11 @@ path = "tests/first_saved_search_owned_worker.rs"
 required-features = ["test-seams"]
 
 [[test]]
+name = "native_page_public_ports"
+path = "tests/native_page_public_ports.rs"
+required-features = ["test-seams"]
+
+[[test]]
 name = "checked_backend_read_faults"
 path = "tests/checked_backend_read_faults.rs"
 required-features = ["test-seams"]
