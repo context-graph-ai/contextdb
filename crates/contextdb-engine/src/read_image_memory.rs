@@ -855,11 +855,17 @@ impl ImageMemory {
             hint,
         );
         payload.query_control = query_control;
+        // This allocation establishes the decoder owner; selected values are
+        // admitted later under the payload's query_decode operation.
+        let control_operation = match operation {
+            "query_decode" => "decode_owner",
+            other => other,
+        };
         let credit = match ReadCredit::try_new_owned(
             reader_budget.clone(),
             bytes,
             subsystem,
-            operation,
+            control_operation,
             hint,
         ) {
             Ok(credit) => credit,
