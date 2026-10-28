@@ -680,12 +680,15 @@ impl Database {
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
         )?;
-        let transient_answer = answer_memory.value.scope(|| -> Result<bool> {
-            Ok(match self.cached_statement(sql) {
-                Some(cached) => matches!(cached.stmt, Statement::Select(_)),
-                None => matches!(contextdb_parser::parse(sql)?, Statement::Select(_)),
-            })
-        })?;
+        // Native trace suppliers retain the original pre-execution image
+        // custody. An explicitly supplied owner needs no native trace keeper.
+        let transient_answer = native_trace_refund.is_none()
+            && answer_memory.value.scope(|| -> Result<bool> {
+                Ok(match self.cached_statement(sql) {
+                    Some(cached) => matches!(cached.stmt, Statement::Select(_)),
+                    None => matches!(contextdb_parser::parse(sql)?, Statement::Select(_)),
+                })
+            })?;
         let execute = |image: &crate::read_image_memory::ImageMemoryHandle| {
             let _decode_scope = image.enter();
             let mut answer_copy = image.vector_copy(0)?;
@@ -3073,12 +3076,15 @@ impl Database {
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             read_memory.clone(),
         )?;
-        let transient_answer = answer_memory.value.scope(|| -> Result<bool> {
-            Ok(match self.cached_statement(sql) {
-                Some(cached) => matches!(cached.stmt, Statement::Select(_)),
-                None => matches!(contextdb_parser::parse(sql)?, Statement::Select(_)),
-            })
-        })?;
+        // Native trace suppliers retain the original pre-execution image
+        // custody. An explicitly supplied owner needs no native trace keeper.
+        let transient_answer = native_trace_refund.is_none()
+            && answer_memory.value.scope(|| -> Result<bool> {
+                Ok(match self.cached_statement(sql) {
+                    Some(cached) => matches!(cached.stmt, Statement::Select(_)),
+                    None => matches!(contextdb_parser::parse(sql)?, Statement::Select(_)),
+                })
+            })?;
         let execute = |image: &crate::read_image_memory::ImageMemoryHandle| {
             let _decode_scope = image.enter();
             let mut answer_copy = image.vector_copy(0)?;
