@@ -2784,13 +2784,16 @@ pub mod read_persistence_test_scaffold {
         /// A reader is about to open or create its registry lock. Physical:
         /// armed by any name of the store.
         BeforeRegistration,
+        /// The runtime root is held alive, before this store creates its
+        /// registry descriptor or authoritative fence. Physical, as above.
+        AfterRuntimeRootLifetimeHold,
     }
 
     impl ReaderPausePoint {
         fn is_physical(self) -> bool {
             matches!(
                 self,
-                Self::AfterPrecheck | Self::AfterGate | Self::BeforeRegistration
+                Self::AfterPrecheck | Self::AfterGate | Self::BeforeRegistration | Self::AfterRuntimeRootLifetimeHold
             )
         }
     }

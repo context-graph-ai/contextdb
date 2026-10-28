@@ -4901,6 +4901,11 @@ impl ReadSnapshotRegistrationGuard {
                             }
                         })?;
                     recreate_created_runtime_root(runtime);
+                    #[cfg(any(test, feature = "test-seams"))]
+                    read_persistence_test_scaffold::pause_reader_at_physical(
+                        self.snapshot.physical_identity,
+                        read_persistence_test_scaffold::ReaderPausePoint::AfterRuntimeRootLifetimeHold,
+                    );
                     let owner_registry_lock = if nonblocking {
                         Some(
                             ReaderSnapshotRegistryLock::try_acquire_for_registration(
