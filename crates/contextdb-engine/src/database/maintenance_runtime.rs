@@ -1239,10 +1239,11 @@ impl MaintenanceContext {
             return handle.with_host(|host| self.stamp_expired_rows_owned(host, now, preparation));
         }
         let tx = self.tx_mgr.begin();
-        let workspace =
-            std::cell::RefCell::new(crate::memory_accounting::OwnedMemoryReservation::new(
-                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-            ));
+        let mut staged = super::legacy_expiry_staging::LegacyExpiryStaging::new(
+            &self.tx_mgr,
+            tx,
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+        );
         // Armed just before the durable apply; see `PublicationInterruptionWatch`.
         // This commit is durable the moment the manager applies it, and the
         // in-memory commit bookkeeping that makes it visible happens after --
@@ -1255,6 +1256,11 @@ impl MaintenanceContext {
             tx,
             maintenance_read_memory.clone(),
             |expiry_lsn| {
+                let workspace = std::cell::RefCell::new(OwnedMemoryReservation::new(
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
+                ));
                 // The reserved-LSN callback holds the commit frontier. Borrow
                 // authoritative rows there; copy only admitted mutation identities.
                 let metas = self.relational.table_meta.read();
@@ -1281,9 +1287,12 @@ impl MaintenanceContext {
                 let cohort = frontier
                     .cohort_progress(|table, key| protected.contains_physical(table, key))?;
                 self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
-                    ws.config_writes
-                        .extend(frontier.retention_progress().iter().cloned());
-                    ws.config_writes.extend(cohort);
+                    for (key, value) in frontier.retention_progress() {
+                        staged.copy_config(&mut ws.config_writes, key, value)?;
+                    }
+                    if let Some((key, value)) = &cohort {
+                        staged.copy_config(&mut ws.config_writes, key, value)?;
+                    }
                     let mut expired_nodes = HashSet::new();
                     for table in metas.keys() {
                         if metas
@@ -1332,30 +1341,43 @@ impl MaintenanceContext {
                                 "prepare_expiry",
                                 "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
                             )?;
-                            ws.relational_deletes.push((table.clone(), row.row_id, tx));
+                            staged.push(&mut ws.relational_deletes, table.len(), || {
+                                Ok((table.clone(), row.row_id, tx))
+                            })?;
                             if let Some(Value::Uuid(id)) = row.values.get("id") {
                                 expired_nodes.insert(*id);
                             }
                             if let Some(meta) = metas.get(table) {
                                 for column in &meta.columns {
                                     if matches!(column.column_type, ColumnType::Vector(_)) {
-                                        ws.vector_deletes.push((
-                                            VectorIndexRef::new(table, &column.name),
-                                            row.row_id,
-                                            tx,
-                                        ));
+                                        staged.push(
+                                            &mut ws.vector_deletes,
+                                            table.len().checked_add(column.name.len()).ok_or_else(
+                                                || {
+                                                    Error::Other(
+                                                        "expiry vector identity size overflow"
+                                                            .into(),
+                                                    )
+                                                },
+                                            )?,
+                                            || {
+                                                Ok((
+                                                    VectorIndexRef::new(table, &column.name),
+                                                    row.row_id,
+                                                    tx,
+                                                ))
+                                            },
+                                        )?;
                                     }
                                 }
                             }
-                            let identity = (table.clone(), row.row_id, row.created_tx, expiry_lsn);
-                            ws.config_writes.push((
-                                crate::composite_store::retention_expiry_key(
-                                    table,
-                                    row.row_id,
-                                    row.created_tx,
-                                ),
-                                RedbPersistence::encode_config_value(&identity)?,
-                            ));
+                            staged.expiry_config(
+                                &mut ws.config_writes,
+                                table,
+                                row.row_id,
+                                row.created_tx,
+                                expiry_lsn,
+                            )?;
                             Ok(true)
                         })?;
                     }
@@ -1374,12 +1396,9 @@ impl MaintenanceContext {
                                     "prepare_expiry",
                                     "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
                                 )?;
-                                ws.adj_deletes.push((
-                                    entry.source,
-                                    entry.edge_type.clone(),
-                                    entry.target,
-                                    tx,
-                                ));
+                                staged.push(&mut ws.adj_deletes, entry.edge_type.len(), || {
+                                    Ok((entry.source, entry.edge_type.clone(), entry.target, tx))
+                                })?;
                             }
                             Ok(())
                         },
@@ -1395,6 +1414,11 @@ impl MaintenanceContext {
                 Ok(())
             },
         );
+        // Disarm rollback before a post-commit fault. The returned result is
+        // declared after staged, so its bodies still free before staged credit.
+        if result.is_ok() {
+            staged.committed();
+        }
         #[cfg(test)]
         take_local_commit_stage_fault_for_test(
             LocalCommitStageFaultPoint::AfterReservedLsnDurableCommit,
@@ -1405,10 +1429,10 @@ impl MaintenanceContext {
                 if let Some(watch) = watch_completed {
                     watch.completed();
                 }
-                // Callback selections are gone; free the returned write-set
-                // payload before its original selection workspace settles.
+                // Selection scratch ended at callback return. This separate
+                // invoice still covers every staged body through physical free.
                 drop(committed);
-                drop(workspace);
+                drop(staged);
                 Ok(())
             }
             Err(failure) => {
@@ -1417,12 +1441,11 @@ impl MaintenanceContext {
                 if let Some(watch) = watch_completed {
                     watch.completed();
                 }
-                let _ = self.tx_mgr.rollback(tx);
+                staged.rollback();
                 Err(retention_source_admission_error(failure.error, preparation))
             }
         }
     }
-
     /// Retention's reserved callback owns every produced body before the
     /// paired terminal extracts the original source and journal nodes.
     #[expect(

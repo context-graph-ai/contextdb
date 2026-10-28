@@ -4746,6 +4746,7 @@ enum DurableVectorGenerationSource {
     CapturedRoot(Arc<vector_captured_serving::CapturedVectorRootLease>),
 }
 
+mod legacy_expiry_staging;
 mod maintenance_runtime;
 pub use maintenance_runtime::*;
 
