@@ -7,6 +7,7 @@ use std::cell::RefCell;
 type BoundaryHook = Box<dyn FnMut(Option<&VectorPartitionGenerationCatalogRecord>)>;
 thread_local! {
     static BOUNDARY_HOOK: RefCell<Option<BoundaryHook>> = const { RefCell::new(None) };
+    static CAPTURED_LAZY_CURSOR: std::cell::Cell<Option<(usize, usize, bool, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 struct BoundaryHookGuard(Option<BoundaryHook>);
@@ -23,7 +24,8 @@ fn on_boundary(
     BoundaryHookGuard(BOUNDARY_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))))
 }
 
-pub(super) fn after_inventory_capture_for_test() {
+pub(super) fn after_inventory_capture_for_test(cursor: Option<(usize, usize, bool, bool)>) {
+    CAPTURED_LAZY_CURSOR.with(|slot| slot.set(cursor));
     BOUNDARY_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().as_mut() {
             hook(None);
@@ -130,9 +132,8 @@ fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservati
     let stop = Arc::new(AtomicBool::new(false));
     let mut context = db.maintenance_context();
     context.worker_stop = Some(Arc::clone(&stop));
-    let captured_workspace = Arc::new(AtomicUsize::new(0));
+    let captured_workspace = Arc::new(AtomicUsize::new(usize::MAX));
     let retry_count = Arc::new(AtomicUsize::new(0));
-    let observed_db = Arc::clone(&db);
     let observed_workspace = Arc::clone(&captured_workspace);
     let observed_retries = Arc::clone(&retry_count);
     let observed_stop = Arc::clone(&stop);
@@ -140,12 +141,13 @@ fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservati
         if catalog.is_some() {
             observed_retries.fetch_add(1, Ordering::SeqCst);
         } else {
-            observed_workspace.store(
-                observed_db
-                    .vector_memory_ownership_receipt_for_test()
-                    .temporary_workspace,
-                Ordering::SeqCst,
+            let lazy = captured_lazy_cursor_memory_for_test();
+            assert_eq!(
+                lazy,
+                (0, 0, false, false),
+                "the captured cursor has no pre-navigation backing"
             );
+            observed_workspace.store(lazy.1, Ordering::SeqCst);
             observed_stop.store(true, Ordering::SeqCst);
         }
     });
@@ -158,7 +160,7 @@ fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservati
     let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_1.clone());
     drop(hook);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
-    assert!(captured_workspace.load(Ordering::SeqCst) > 0);
+    assert_eq!(captured_workspace.load(Ordering::SeqCst), 0);
     assert_eq!(retry_count.load(Ordering::SeqCst), 0);
     assert!(db.last_maintenance_cycle_at.lock().is_none());
     for (partition, expected) in partitions.iter().zip(before) {
@@ -214,8 +216,7 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
     let mut context = db.maintenance_context();
     context.worker_stop = Some(Arc::clone(&stop));
     let completed = Arc::new(Mutex::new(Vec::new()));
-    let captured_workspace = Arc::new(AtomicUsize::new(0));
-    let observed_db = Arc::clone(&db);
+    let captured_workspace = Arc::new(AtomicUsize::new(usize::MAX));
     let observed_completed = Arc::clone(&completed);
     let observed_workspace = Arc::clone(&captured_workspace);
     let hook = on_boundary(move |catalog| {
@@ -226,12 +227,13 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
             ));
             stop.store(true, Ordering::SeqCst);
         } else {
-            observed_workspace.store(
-                observed_db
-                    .vector_memory_ownership_receipt_for_test()
-                    .temporary_workspace,
-                Ordering::SeqCst,
+            let lazy = captured_lazy_cursor_memory_for_test();
+            assert_eq!(
+                lazy,
+                (0, 0, false, false),
+                "the captured cursor has no pre-navigation backing"
             );
+            observed_workspace.store(lazy.1, Ordering::SeqCst);
         }
     });
     *db.last_maintenance_cycle_at.lock() = None;
@@ -243,7 +245,7 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
     let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_2.clone());
     drop(hook);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
-    assert!(captured_workspace.load(Ordering::SeqCst) > 0);
+    assert_eq!(captured_workspace.load(Ordering::SeqCst), 0);
     assert!(db.last_maintenance_cycle_at.lock().is_none());
     let completed = completed.lock().clone();
     assert_eq!(
@@ -707,4 +709,17 @@ fn publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_f
     );
     assert_eq!(reopened.accountant.underflow_count_for_test(), 0);
     reopened.close().unwrap();
+}
+
+fn captured_lazy_cursor_memory_for_test() -> (usize, usize, bool, bool) {
+    CAPTURED_LAZY_CURSOR.with(|slot| slot.get().expect("captured inventory owns its lazy cursor"))
+}
+
+pub(super) fn after_inventory_navigation_for_test(snapshot: (usize, usize, bool, bool)) {
+    if BOUNDARY_HOOK.with(|slot| slot.borrow().is_some()) && snapshot.1 > 0 {
+        assert!(
+            snapshot.2,
+            "the actual navigation backing has an owned original source invoice: {snapshot:?}"
+        );
+    }
 }

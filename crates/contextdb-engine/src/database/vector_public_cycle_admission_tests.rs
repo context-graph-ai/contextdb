@@ -1202,8 +1202,13 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
             "the deleted route needs closing retirement rather than another publication"
         );
     }
+    let admission_site = match slot {
+        "sampled_routes" => "sampled_route_copy",
+        "closing_routes" => "closing_route_copy",
+        other => other,
+    };
     INVENTORY_SLOT_REFUSAL_FOR_TEST.with(|active| {
-        *active.borrow_mut() = Some((db.accountant.as_ptr() as usize, slot, 0));
+        *active.borrow_mut() = Some((db.accountant.as_ptr() as usize, admission_site, 0));
     });
     let refusal = InventorySlotRefusalScopeForTest;
     db.clear_maintenance_cycle_stamp_for_test();

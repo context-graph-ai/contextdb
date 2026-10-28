@@ -768,6 +768,10 @@ impl MaintenanceContext {
                             .map_err(RedbPersistence::storage_error)
                     },
                 );
+                #[cfg(test)]
+                vector_journal_cleanup_cancellation_tests::after_inventory_navigation_for_test(
+                    cursor.navigation_memory_ownership_for_test(),
+                );
                 let handle = match next {
                     Ok(Some(handle)) => handle,
                     Ok(None) => break,
@@ -990,6 +994,12 @@ impl MaintenanceContext {
                                 .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
                                 .saturating_add(index.table.len())
                                 .saturating_add(index.column.len());
+                            #[cfg(all(test, feature = "test-seams"))]
+                            let _fixture_route_copy_budget =
+                                vector_public_cycle_admission_tests::refuse_inventory_slot_for_test(
+                                    &self.finalization.accountant,
+                                    "closing_route_copy",
+                                );
                             let workspace = self.maintenance_workspace(heap, PREPARE)?;
                             route = Some(MaintenanceBuildCandidate {
                                 partition: VectorPartitionRef::new(index.clone(), key.clone()),
@@ -1177,6 +1187,11 @@ impl MaintenanceContext {
                                 .saturating_add(index.column.len());
                             let fixed = route_heap.saturating_mul(2).saturating_add(
                                 RedbPersistence::vector_journal_cleanup_key_reservation(index, key),
+                            );
+                            #[cfg(all(test, feature = "test-seams"))]
+                            let _fixture_route_copy_budget = vector_public_cycle_admission_tests::refuse_inventory_slot_for_test(
+                                &self.finalization.accountant,
+                                "sampled_route_copy",
                             );
                             let workspace = self.maintenance_workspace(fixed, PREPARE)?;
                             sampled_route = Some((
@@ -1473,5 +1488,16 @@ impl MaintenanceContext {
                 _memory: memory,
             })
         })
+    }
+}
+
+#[cfg(test)]
+impl MaintenanceCatalogStream {
+    pub(super) fn lazy_cursor_memory_ownership_for_test(
+        &self,
+    ) -> Option<(usize, usize, bool, bool)> {
+        self.cursor
+            .as_ref()
+            .map(|cursor| cursor.navigation_memory_ownership_for_test())
     }
 }
