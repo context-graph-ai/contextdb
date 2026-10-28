@@ -38,15 +38,20 @@ fn shared_native_cache_stays_inside_its_publicly_reported_capacity() {
         .unwrap();
     assert!(rows.checked_mul(body_bytes).unwrap() > expected);
     let vector = vec![1_f32; dimensions];
-    for id in 0..rows {
-        db.execute(
-            "INSERT INTO items VALUES ($id, $v)",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id as i64)),
-                ("v".into(), Value::Vector(vector.clone())),
-            ]),
-        )
-        .unwrap();
+    for start in (0..rows).step_by(8) {
+        let tx = db.begin_or_panic();
+        for id in start..(start + 8).min(rows) {
+            db.execute_in_tx(
+                tx,
+                "INSERT INTO items VALUES ($id, $v)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id as i64)),
+                    ("v".into(), Value::Vector(vector.clone())),
+                ]),
+            )
+            .unwrap();
+        }
+        db.commit(tx).unwrap();
     }
     // EXACT exercises persisted native bodies independently of qualification.
     // This guard makes no claim about index maintenance or mandatory reclaim.
