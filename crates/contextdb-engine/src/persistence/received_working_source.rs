@@ -147,6 +147,19 @@ pub(super) fn graph_witness_loan(
     })
 }
 impl WorkingReadSource {
+    /// The synchronous private source owns its mutable catalog. Its physical
+    /// root still names the captured committed pages, not newly replayed DDL.
+    pub(crate) fn is_current_for(host: usize) -> bool {
+        ACTIVE.with(|slot| {
+            let pointer = slot.get();
+            if pointer.is_null() {
+                return false;
+            }
+            // SAFETY: the same scoped context and host authentication used by
+            // current_for; only its scalar identity is observed, nothing escapes.
+            unsafe { (*pointer).host == host }
+        })
+    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
