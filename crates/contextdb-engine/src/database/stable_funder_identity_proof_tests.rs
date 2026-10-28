@@ -603,6 +603,11 @@ fn embedded_graph_reader_scratch_rows() {
         let mut exact_query = query.clone();
         exact_query.search_mode = Some(contextdb_core::VectorSearchMode::Exact);
         let exact_control = db.semantic_search(exact_query).unwrap();
+        // Owner reporting needs its own writer cursor. Capture the named
+        // reserve before the test deliberately removes all writer headroom.
+        let named_cache_reserve = db
+            .writer_memory_ownership_receipt_for_test()
+            .persistence_cache;
         let writer = db.accountant.usage().used;
         db.set_memory_limit(Some(writer)).unwrap();
         assert_eq!(
@@ -708,9 +713,8 @@ fn embedded_graph_reader_scratch_rows() {
                     payers.unscoped_allocations, 0,
                     "every page has a payer before allocation: {payers:?}"
                 );
-                let ownership = db.writer_memory_ownership_receipt_for_test();
                 assert!(
-                    ownership.persistence_cache >= payers.cache_peak.max(payers.cache_live),
+                    named_cache_reserve >= payers.cache_peak.max(payers.cache_live),
                     "the real fixed cache reserve is named by its persistence owner: {payers:?}"
                 );
                 assert_eq!(
