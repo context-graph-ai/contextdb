@@ -771,7 +771,7 @@ fn unrelated_leave_does_not_drop_create_for_open_breadcrumb() {
         let context = crate::executor::bounded::ReadOpenContext::new(
             declared.child().unwrap(),
             limits,
-            crate::read_session::read_clock(),
+            std::sync::Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
             OwnerReadCancellation::new(),
         )
         .unwrap();
