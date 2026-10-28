@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+/// Convert the remaining deadline to the duration used by a condition wait.
+pub(crate) const fn deadline_wait_duration_ms(remaining_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(remaining_ms)
+}
+
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// How many timer threads this thread has started since it last reset the
@@ -106,6 +111,8 @@ struct ManualDeadlineState {
     registrations_created: u64,
     waiters: BTreeMap<u64, RegisteredWaiter>,
     native_parked: NativeParkList,
+    #[cfg(any(test, feature = "test-seams"))]
+    waiter_registered: Option<std::sync::mpsc::Sender<WaiterRegistered>>,
 }
 
 #[cfg_attr(
@@ -134,7 +141,38 @@ pub struct ManualDeadlineClock {
     state: Arc<Mutex<ManualDeadlineState>>,
 }
 
+/// A new operation deadline wait is linked to its manual clock.
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaiterRegistered {
+    pub deadline_ms: u64,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl ManualDeadlineState {
+    fn notify_waiter_registered(&mut self, deadline_ms: u64) {
+        if let Some(observer) = &self.waiter_registered {
+            // An unbounded channel never waits for the observer or invokes its
+            // code. The registration remains protected by this state mutex.
+            if observer.send(WaiterRegistered { deadline_ms }).is_err() {
+                self.waiter_registered = None;
+            }
+        }
+    }
+}
+
 impl ManualDeadlineClock {
+    /// Observe future operation-wait registrations on this clock. Arming a new
+    /// observer replaces the previous observer; existing waits are not replayed.
+    /// Re-polls and native driver parks do not emit registration events.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn observe_waiter_registrations(&self) -> std::sync::mpsc::Receiver<WaiterRegistered> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        Self::locked(&self.state).waiter_registered = Some(sender);
+        receiver
+    }
+
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -150,6 +188,8 @@ impl ManualDeadlineClock {
                 registrations_created: 0,
                 waiters: BTreeMap::new(),
                 native_parked: NativeParkList::default(),
+                #[cfg(any(test, feature = "test-seams"))]
+                waiter_registered: None,
             })),
         }
     }
@@ -564,6 +604,8 @@ impl Future for ManualDeadlineWait {
             this.completed = true;
             return Poll::Ready(());
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        let newly_registered = this.registration.is_none();
         let registration = this.registration.unwrap_or_else(|| {
             let registration = state.next_registration;
             state.next_registration = state.next_registration.wrapping_add(1);
@@ -578,6 +620,10 @@ impl Future for ManualDeadlineWait {
                 waker: context.waker().clone(),
             },
         );
+        #[cfg(any(test, feature = "test-seams"))]
+        if newly_registered {
+            state.notify_waiter_registered(this.deadline_ms);
+        }
         Poll::Pending
     }
 }
@@ -1341,6 +1387,8 @@ impl Future for OwnedManualWait {
                 (*this.node.links.get()).next = state.native_parked.head;
                 (*this.node.links.get()).linked = true;
                 state.native_parked.head = &this.node;
+                #[cfg(any(test, feature = "test-seams"))]
+                state.notify_waiter_registered(this.node.deadline_ms);
             }
         }
         Poll::Pending
@@ -2063,5 +2111,57 @@ mod independent_owned_driver_tests {
             std::thread::yield_now();
         }
         assert_eq!(threads(), before);
+    }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod waiter_registration_event_tests {
+    use super::*;
+
+    #[test]
+    fn host_and_native_events_follow_new_operation_links_only() {
+        let clock = ManualDeadlineClock::at(0);
+        let mut host = clock.wait_until(10);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(host.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            ManualDeadlineClock::locked(&clock.state)
+                .waiter_registered
+                .is_none()
+        );
+        let events = clock.observe_waiter_registrations();
+        assert!(host.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            events.try_recv().is_err(),
+            "arming must not replay or count a repoll"
+        );
+        let mut next_host = clock.wait_until(20);
+        assert!(next_host.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            events.try_recv().unwrap(),
+            WaiterRegistered { deadline_ms: 20 }
+        );
+        assert!(next_host.as_mut().poll(&mut cx).is_pending());
+        assert!(events.try_recv().is_err());
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY as usize,
+        ));
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = accountant.into();
+        let mut native = clock.try_owned_wait(30, &owner).unwrap().unwrap();
+        assert!(Pin::new(&mut native).poll(&mut cx).is_pending());
+        assert_eq!(
+            events.try_recv().unwrap(),
+            WaiterRegistered { deadline_ms: 30 }
+        );
+        assert!(Pin::new(&mut native).poll(&mut cx).is_pending());
+        assert!(events.try_recv().is_err());
+        drop(events);
+        let mut last_host = clock.wait_until(40);
+        assert!(last_host.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            ManualDeadlineClock::locked(&clock.state)
+                .waiter_registered
+                .is_none()
+        );
     }
 }
