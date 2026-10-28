@@ -52,3 +52,23 @@ fn every_typed_native_terminal_encodes_without_a_heap_allocation() {
         assert_eq!(allocations, 0, "{name}: the encoder allocated");
     }
 }
+
+#[test]
+fn resource_memory_refusal_keeps_its_wire_fields_without_encoding_allocations() {
+    let mut results = Vec::new();
+    contextdb_engine::transport::measure_resource_memory_refusal_encodings_for_test(
+        &mut |name, encode| {
+            ALLOCATIONS.with(|count| count.set(0));
+            COUNTING.with(|counting| counting.set(true));
+            let length = encode();
+            COUNTING.with(|counting| counting.set(false));
+            let allocations = ALLOCATIONS.with(Cell::get);
+            results.push((name, length, allocations));
+        },
+    );
+    assert_eq!(results.len(), 2);
+    for (name, length, allocations) in results {
+        assert!(length.is_some(), "{name}: encoded");
+        assert_eq!(allocations, 0, "{name}: Resource memory encoding allocated");
+    }
+}
