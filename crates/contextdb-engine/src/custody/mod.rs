@@ -39,3 +39,5 @@ pub(crate) mod native_selection;
 // native value codec uses it on every build.
 pub(crate) mod native_json;
 pub(crate) mod native_record_codec;
+
+pub(crate) mod signature_work;

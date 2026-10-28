@@ -158,12 +158,23 @@ impl FabricIdentity {
         let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|err| {
             Error::SyncError((format!("invalid lineage signature encoding: {err}")).into())
         })?;
+        let proof =
+            crate::custody::signature_work::digest(&public_bytes, bytes, &signature.to_bytes());
+        if crate::custody::signature_work::known(&proof) {
+            return Ok(());
+        }
         #[cfg(test)]
         PAGING_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         verifying.verify(bytes, &signature).map_err(|_| {
             Error::SyncError(
                 ("wire row lineage signature does not verify for its author".to_string()).into(),
             )
+        })?;
+        crate::custody::signature_work::remember(proof).map_err(|failure| match failure {
+            crate::custody::native_selection::Failure::Refused(refusal) => {
+                Error::NativeEngineOther(refusal)
+            }
+            _ => Error::Other("signature proof admission failed".into()),
         })
     }
 
