@@ -2747,8 +2747,11 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
             as usize;
         let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
         assert_eq!(observation.commit_directory_funding(), None);
+        crate::vector_read_memory::watch_reader_budget_ledger_for_test();
+        let open_child = declared_read_memory.child().unwrap();
+        drop(crate::vector_read_memory::take_reader_budget_ledger_for_test());
         let open_context = crate::executor::bounded::ReadOpenContext::new(
-            declared_read_memory.child().unwrap(),
+            open_child,
             limits,
             crate::read_session::read_clock(),
             OwnerReadCancellation::new(),
