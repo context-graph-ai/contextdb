@@ -11,6 +11,8 @@ use contextdb_core::read_memory::ReadMemoryBudget as _;
 #[cfg(feature = "test-seams")]
 pub use custody_store::HeldCustodyRootForTest;
 mod erasure_frontiers;
+mod publication_registration;
+use publication_registration::{ReadPublicationReaders, ReadPublicationRegistration};
 mod schema_history_memory;
 use schema_history_memory::{PreparedSchemaHistory, SchemaHistoryMemory};
 mod graph_cursor_claims;
@@ -4151,7 +4153,7 @@ struct DatabaseOperationGuard<'a> {
 
 #[derive(Default)]
 struct ReadPublicationGateState {
-    readers: BTreeMap<String, usize>,
+    readers: ReadPublicationReaders,
     writer_scope: Option<BTreeSet<String>>,
     writer_active: bool,
     wake_generation: u64,
@@ -4168,7 +4170,7 @@ struct ReadPublicationWake(std::sync::Weak<ReadPublicationGate>);
 
 pub(crate) struct AuthoritativeReadPublicationGuard {
     gate: Arc<ReadPublicationGate>,
-    tables: BTreeSet<String>,
+    registration: Option<ReadPublicationRegistration>,
 }
 
 struct AuthoritativePurgePublicationGuard {

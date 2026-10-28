@@ -19321,11 +19321,14 @@ fn inspection_reads_committed_state(plan: &PhysicalPlan) -> bool {
     )
 }
 
-fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
-    fn collect(plan: &PhysicalPlan, tables: &mut BTreeSet<String>) {
+fn visit_publication_tables(
+    plan: &PhysicalPlan,
+    visit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    fn collect(plan: &PhysicalPlan, visit: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
         match plan {
             PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
-                tables.insert(table.clone());
+                visit(table)?;
             }
             PhysicalPlan::VectorSearch {
                 table,
@@ -19339,12 +19342,12 @@ fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
                 candidates,
                 ..
             } => {
-                tables.insert(table.clone());
+                visit(table)?;
                 if let Expr::RowVectorSource { table, .. } = query_expr {
-                    tables.insert(table.clone());
+                    visit(table)?;
                 }
                 if let Some(candidates) = candidates {
-                    collect(candidates, tables);
+                    collect(candidates, visit)?;
                 }
             }
             PhysicalPlan::Filter { input, .. }
@@ -19354,14 +19357,14 @@ fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::WindowRank { input, .. }
             | PhysicalPlan::Limit { input, .. }
-            | PhysicalPlan::MaterializeCte { input, .. } => collect(input, tables),
+            | PhysicalPlan::MaterializeCte { input, .. } => collect(input, visit)?,
             PhysicalPlan::Join { left, right, .. } => {
-                collect(left, tables);
-                collect(right, tables);
+                collect(left, visit)?;
+                collect(right, visit)?;
             }
             PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
                 for input in inputs {
-                    collect(input, tables);
+                    collect(input, visit)?;
                 }
             }
             // These nodes can resolve sources through aliases no longer
@@ -19369,24 +19372,22 @@ fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
             PhysicalPlan::GraphBfs {
                 start_candidates, ..
             } => {
-                tables.insert("*".to_owned());
+                visit("*")?;
                 if let Some(candidates) = start_candidates {
-                    collect(candidates, tables);
+                    collect(candidates, visit)?;
                 }
             }
             PhysicalPlan::CteRef { .. } => {
-                tables.insert("*".to_owned());
+                visit("*")?;
             }
             // Store-state reads can expose table-bound inventories.
             _ => {
-                tables.insert("*".to_owned());
+                visit("*")?;
             }
         }
+        Ok(())
     }
-
-    let mut tables = BTreeSet::new();
-    collect(plan, &mut tables);
-    tables
+    collect(plan, visit)
 }
 
 fn statement_needs_vector_read(statement: &contextdb_parser::ast::Statement) -> bool {
@@ -19614,7 +19615,7 @@ pub(super) fn execute_with_native_trace_refund(
             enter_vector_read(db, snapshot, &context, plan_needs_vector_read(&plan))?;
         let publication = context.publication_scope(
             publication_lsn,
-            publication_tables(&plan),
+            context.publication_tables(&plan)?,
             inspection_reads_committed_state(&plan),
         )?;
 
@@ -21029,7 +21030,7 @@ pub(super) fn open_cursor_with_native_trace_refund(
         let _vector_plan_read = enter_vector_read(db.as_ref(), snapshot, &context, vector_read)?;
         let publication = context.publication_scope(
             publication_lsn,
-            publication_tables(&plan),
+            context.publication_tables(&plan)?,
             inspection_reads_committed_state(&plan),
         )?;
         context.reserve(
@@ -22905,23 +22906,46 @@ impl ControlArc<RequestContext> {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    fn publication_tables(
+        &self,
+        plan: &PhysicalPlan,
+    ) -> std::result::Result<PublicationTables, BoundedExecutionError> {
+        self.check_final_boundary()?;
+        let owner = self
+            .request_funding
+            .as_ref()
+            .expect("Legacy request funding")
+            .owner();
+        Ok(PublicationTables::try_from_visitor(owner, |visit| {
+            visit_publication_tables(plan, visit)
+        })?)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.
+    )]
     fn publication_scope(
         &self,
         snapshot_lsn: Lsn,
-        tables: BTreeSet<String>,
+        tables: PublicationTables,
         inspection: bool,
     ) -> std::result::Result<ReadPublicationScope, BoundedExecutionError> {
         let state = self.state();
         let RequestCancellation::Legacy(cancellation) = &state.cancellation else {
             return Err(BoundedExecutionError::Unimplemented);
         };
-        let mut scope = ReadPublicationScope::bounded(
+        let mut scope = ReadPublicationScope::funded(
             snapshot_lsn,
             tables,
             self.limits,
             Arc::clone(&self.clock),
             cancellation.clone(),
             state.started_ms,
+            self.request_funding
+                .as_ref()
+                .expect("Legacy request funding")
+                .owner(),
         );
         drop(state);
         scope.inspection = inspection;

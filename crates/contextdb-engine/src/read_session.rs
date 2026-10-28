@@ -4237,14 +4237,17 @@ impl ReadSession {
                 let clock = self.session_clock();
                 let started_ms = clock.now_ms();
                 let read_memory = database.declared_read_request_provider().request_budget()?;
-                let mut publication = database.capture_authoritative_read_publication(
-                    crate::direct_file_reader::metadata_publication_tables(&request),
+                let publication = database.capture_authoritative_read_publication(
+                    crate::direct_file_reader::metadata_publication_tables(
+                        &request,
+                        read_memory.clone(),
+                    )?,
                     self.options.limits,
                     Arc::clone(&clock),
                     cancellation.clone(),
                     started_ms,
+                    read_memory.clone(),
                 );
-                publication.read_memory = Some(read_memory.clone());
                 let answer = crate::read_image::project_metadata_from_database(
                     database,
                     read_memory.clone(),

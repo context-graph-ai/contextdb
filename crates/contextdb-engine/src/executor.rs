@@ -34,6 +34,8 @@ use time::format_description::well_known::Rfc3339;
 const RETRY_LOCAL_SCHEMA_PROJECTION: &str = "__contextdb_internal_retry_local_schema_projection__";
 
 pub(crate) mod bounded;
+mod publication_tables;
+pub(crate) use publication_tables::PublicationTables;
 
 /// One suspended cursor's snapshot pin: the snapshot it reads, the idle
 /// window its registration is judged by, and the registration holding both.
@@ -56,7 +58,7 @@ pub(crate) type BoundedReadSnapshotPin = (
 #[derive(Clone)]
 pub(crate) struct ReadPublicationScope {
     pub(crate) snapshot_lsn: Lsn,
-    pub(crate) tables: BTreeSet<String>,
+    pub(crate) tables: PublicationTables,
     // Committed operator state does not need the maintenance commit mutex.
     // Purge publication and lineage validation still enclose its response.
     pub(crate) inspection: bool,
@@ -195,6 +197,7 @@ impl ReadPublicationScope {
         Err(Error::ReadFailure(failure))
     }
 
+    #[cfg(test)]
     pub(crate) fn bounded(
         snapshot_lsn: Lsn,
         tables: BTreeSet<String>,
@@ -205,9 +208,33 @@ impl ReadPublicationScope {
     ) -> Self {
         Self {
             snapshot_lsn,
-            tables,
+            tables: PublicationTables::Unfunded(tables),
             inspection: false,
             read_memory: None,
+            publication_funding: None,
+            budget: ReadPublicationBudget {
+                clock,
+                cancellation,
+                started_ms,
+                active_ms: limits.active_ms,
+            },
+        }
+    }
+
+    pub(crate) fn funded(
+        snapshot_lsn: Lsn,
+        tables: PublicationTables,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: OwnerReadCancellation,
+        started_ms: u64,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Self {
+        Self {
+            snapshot_lsn,
+            tables,
+            inspection: false,
+            read_memory: Some(read_memory),
             publication_funding: None,
             budget: ReadPublicationBudget {
                 clock,

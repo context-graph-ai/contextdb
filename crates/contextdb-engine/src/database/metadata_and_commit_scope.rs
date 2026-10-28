@@ -3129,11 +3129,15 @@ impl std::task::Wake for ReadPublicationWake {
     }
 }
 
-pub(super) fn publication_scopes_conflict(
-    left: &BTreeSet<String>,
-    right: &BTreeSet<String>,
+pub(super) fn publication_scopes_conflict<'a, 'b>(
+    left: impl IntoIterator<Item = &'a String> + Copy,
+    right: impl IntoIterator<Item = &'b String> + Copy,
 ) -> bool {
-    left.contains("*") || right.contains("*") || left.iter().any(|table| right.contains(table))
+    left.into_iter().any(|table| table == "*")
+        || right.into_iter().any(|table| table == "*")
+        || left
+            .into_iter()
+            .any(|table| right.into_iter().any(|other| other == table))
 }
 
 impl ReadPublicationGate {
@@ -3145,6 +3149,8 @@ impl ReadPublicationGate {
         self: &Arc<Self>,
         scope: &crate::executor::ReadPublicationScope,
     ) -> Result<AuthoritativeReadPublicationGuard> {
+        scope.check_publication_budget()?;
+        let registration = ReadPublicationRegistration::new(scope)?;
         let budget = &scope.budget;
         // Active time expires only after the boundary, not at equality.
         let deadline_ms = budget.deadline_ms();
@@ -3173,13 +3179,15 @@ impl ReadPublicationGate {
                 .as_ref()
                 .is_some_and(|writer| publication_scopes_conflict(&scope.tables, writer));
             if !conflicts {
-                for table in &scope.tables {
-                    *state.readers.entry(table.clone()).or_default() += 1;
-                }
-                return Ok(AuthoritativeReadPublicationGuard {
+                // writer_scope is claimed before a writer waits; a conflicting
+                // late reader cannot pass it while we link this registration.
+                let guard = AuthoritativeReadPublicationGuard {
                     gate: Arc::clone(self),
-                    tables: scope.tables.clone(),
-                });
+                    registration: Some(registration.clone()),
+                };
+                *registration.next.lock() = state.readers.head.take();
+                state.readers.head = Some(registration);
+                return Ok(guard);
             }
             // The timer governs time spent waiting behind an authoritative
             // purge. Polling it on an uncontended publication lets a clock's
@@ -3222,9 +3230,7 @@ impl ReadPublicationGate {
             self.changed.wait(&mut state);
         }
         state.writer_scope = Some(tables.clone());
-        while state.readers.iter().any(|(table, count)| {
-            *count != 0 && (tables.contains("*") || table == "*" || tables.contains(table))
-        }) {
+        while state.conflicts_with_readers(tables) {
             #[cfg(any(test, feature = "test-seams"))]
             crate::writer_commit_test_seams::reached(
                 crate::writer_commit_test_seams::CommitBoundary::ErasureWaitingForReaders,
@@ -3241,17 +3247,16 @@ impl ReadPublicationGate {
 
 impl Drop for AuthoritativeReadPublicationGuard {
     fn drop(&mut self) {
+        let registration = self
+            .registration
+            .take()
+            .expect("live publication registration");
         let mut state = self.gate.state.lock();
-        for table in &self.tables {
-            if let Some(count) = state.readers.get_mut(table) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.readers.remove(table);
-                }
-            }
-        }
+        state.unlink_reader(&registration);
         state.wake_generation = state.wake_generation.wrapping_add(1);
         drop(state);
+        // Unlink the gate alias before the guard releases the final paid node.
+        drop(registration);
         self.gate.changed.notify_all();
     }
 }

@@ -837,16 +837,18 @@ enum PreparedOwnerMetadata {
     CanonicalComplete(crate::local_transport::query_funding::Funded<Vec<u8>>),
 }
 
-fn owner_metadata_publication_tables(request: &LocalMetadataRequest) -> BTreeSet<String> {
-    match request {
+fn owner_metadata_publication_tables(
+    request: &LocalMetadataRequest,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> contextdb_core::Result<crate::executor::PublicationTables> {
+    let name = match request {
         LocalMetadataRequest::DeliveryStatus { root_table, .. }
         | LocalMetadataRequest::DeliveryOutcome { root_table, .. }
         | LocalMetadataRequest::Schema { table: root_table }
-        | LocalMetadataRequest::VerifyHistory { table: root_table } => {
-            BTreeSet::from([root_table.clone()])
-        }
-        _ => BTreeSet::from(["*".to_owned()]),
-    }
+        | LocalMetadataRequest::VerifyHistory { table: root_table } => root_table.as_str(),
+        _ => "*",
+    };
+    crate::executor::PublicationTables::try_one(owner, name)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3000,14 +3002,14 @@ impl OwnerReadService {
             }
             LocalRequest::Metadata { request } => {
                 let started_ms = self.spec.clock.now_ms();
-                let mut publication = self.spec.database.capture_authoritative_read_publication(
-                    owner_metadata_publication_tables(&request),
+                let publication = self.spec.database.capture_authoritative_read_publication(
+                    owner_metadata_publication_tables(&request, read_memory.clone())?,
                     connection.effective_limits(),
                     Arc::clone(&self.spec.clock),
                     connection.cancellation().clone(),
                     started_ms,
+                    read_memory.clone(),
                 );
-                publication.read_memory = Some(read_memory.clone());
                 self.metadata_response(&reading, read_memory.clone(), request, lease)
                     .map(|responses| {
                         CompletedOwnerRequest::authoritative_funded(
@@ -3019,14 +3021,14 @@ impl OwnerReadService {
             }
             LocalRequest::Explain { statement, params } => {
                 let started_ms = self.spec.clock.now_ms();
-                let mut publication = self.spec.database.capture_authoritative_read_publication(
-                    BTreeSet::from(["*".to_owned()]),
+                let publication = self.spec.database.capture_authoritative_read_publication(
+                    crate::executor::PublicationTables::try_one(read_memory.clone(), "*")?,
                     connection.effective_limits(),
                     Arc::clone(&self.spec.clock),
                     connection.cancellation().clone(),
                     started_ms,
+                    read_memory.clone(),
                 );
-                publication.read_memory = Some(read_memory.clone());
                 // Explain is metadata for every statement. In particular, a
                 // vector SELECT must not hydrate a graph, replay a journal, or
                 // spend the caller's read budget merely to predict its route.
