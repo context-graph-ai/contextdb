@@ -8634,3 +8634,6 @@ mod direct_source_contract_rows;
 
 #[cfg(test)]
 mod cache_mutation_funding_tests;
+
+#[cfg(test)]
+mod historical_root_guard_tests;
