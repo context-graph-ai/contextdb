@@ -3835,6 +3835,7 @@ impl RedbPersistence {
         let checkpoint_ratio = state.2;
         let mut next_controls = None;
         let result = redb::with_read_memory_admission_storage(admission.clone(), || {
+            content_identity::payloads::reclaim(&txn, maximum)?;
             txn.compact_step_with_cursor_hook_storage(
                 &mut state.0,
                 maximum,

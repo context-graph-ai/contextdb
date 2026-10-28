@@ -739,8 +739,25 @@ impl StorageAdmissionScope {
                 .with_failure_inspector(inspect_scope_failure),
             )
         };
-        let result = redb::with_native_storage_admission(admission, operation);
         let scope = &unsafe { self.pointer.as_ref() }.payload;
+        let limit = match &scope.funding {
+            StorageFunding::Original(original) => original.accountant().usage().limit,
+            StorageFunding::Writer {
+                original_handle, ..
+            }
+            | StorageFunding::PreparedWriter {
+                original_handle, ..
+            } => original_handle.usage().limit,
+            StorageFunding::Read(_) | StorageFunding::ReadUnqualified(_) => None,
+        };
+        // Keep native's existing half-cache write window, sized from this
+        // operation's current declared budget rather than the startup ceiling.
+        // This scalar is no grant: all pages retain their original admission.
+        let write_window =
+            limit.map(|bytes| super::redb_writer_cache_bytes_for_limit(Some(bytes)) / 2);
+        let result = redb::with_native_storage_write_buffer_limit(write_window, || {
+            redb::with_native_storage_admission(admission, operation)
+        });
         let mut failure = scope.failure.lock().unwrap_or_else(|e| e.into_inner());
         let original = failure.original.take();
         if !retain_refusal {

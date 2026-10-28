@@ -89,7 +89,7 @@ impl Window<'_, '_, '_> {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn with_history_window<T>(
-    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    table: &NodeWriteTable<'_>,
     admission: &mut ProofAdmission,
     root: &FamilyRoot,
     bounds: (&[u8], &[u8], bool),
@@ -141,7 +141,7 @@ fn with_history_window<T>(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(super) fn history_member(
-    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    table: &NodeWriteTable<'_>,
     admission: &mut ProofAdmission,
     root: &FamilyRoot,
     key: &[u8],
@@ -160,7 +160,7 @@ pub(super) fn history_member(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(super) fn history_commit_extreme(
-    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    table: &NodeWriteTable<'_>,
     admission: &mut ProofAdmission,
     root: &FamilyRoot,
     reverse: bool,
@@ -188,7 +188,7 @@ pub(super) fn history_commit_extreme(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(super) fn history_ddl_extreme(
-    table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+    table: &NodeWriteTable<'_>,
     admission: &mut ProofAdmission,
     root: &FamilyRoot,
 ) -> Result<Option<(u64, Lsn, [u8; 32], [u8; 32])>> {
@@ -976,7 +976,7 @@ impl Drop for OperandBorrow<'_> {
 }
 
 struct Window<'a, 'txn, 'mem> {
-    table: &'a redb::Table<'txn, &'static [u8], &'static [u8]>,
+    table: &'a NodeWriteTable<'txn>,
     family: LogicalFamily,
     inputs: EntryEdits,
     scratch: Scratch,
@@ -1002,7 +1002,7 @@ struct Window<'a, 'txn, 'mem> {
 }
 impl<'a, 'txn, 'mem> Window<'a, 'txn, 'mem> {
     fn open(
-        table: &'a redb::Table<'txn, &'static [u8], &'static [u8]>,
+        table: &'a NodeWriteTable<'txn>,
         family: LogicalFamily,
         inputs: EntryEdits,
         scratch: Scratch,
@@ -2428,7 +2428,7 @@ impl Window<'_, '_, '_> {
 fn replay(
     scratch: &Scratch,
     first: u64,
-    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    table: &mut NodeWriteTable<'_>,
     family: LogicalFamily,
 ) -> Result<()> {
     let mut at = first;
@@ -2475,7 +2475,9 @@ fn replay(
                     ));
                 }
             }
-            drop(destination);
+            destination
+                .finish()
+                .map_err(RedbPersistence::storage_error)?;
             #[cfg(any(test, feature = "test-seams"))]
             {
                 observe_node_write(len);
@@ -2490,7 +2492,7 @@ fn replay(
         }
         at = action.next;
     }
-    Ok(())
+    table.seal_pending().map_err(RedbPersistence::storage_error)
 }
 
 #[cfg(test)]
@@ -2506,7 +2508,7 @@ fn replay(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(super) fn update_family(
-    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    table: &mut NodeWriteTable<'_>,
     admission: &mut ProofAdmission,
     family: LogicalFamily,
     root: &FamilyRoot,
@@ -2530,7 +2532,7 @@ pub(super) fn update_family(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(super) fn update_family_consuming_keys(
-    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    table: &mut NodeWriteTable<'_>,
     admission: &mut ProofAdmission,
     family: LogicalFamily,
     root: &FamilyRoot,
@@ -2596,7 +2598,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn with_window<R>(
-        table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+        table: &NodeWriteTable<'_>,
         family: LogicalFamily,
         inputs: EntryEdits,
         admission: &mut ProofAdmission,
@@ -2750,7 +2752,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
         "replacement uses a genuinely different original"
     );
     {
-        let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut table = crate::persistence::content_identity::payloads::open(&write).unwrap();
         for mutation in &mutations {
             let reference = encoded_key(0, &mutation.logical_key);
             let stored = node_storage_key(family, &key_hash(&reference));
@@ -2810,7 +2812,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
             let roots = write.open_table(CONTENT_IDENTITY_ROOTS_TABLE).unwrap();
             decode_root(family, roots.get(family as u8).unwrap().unwrap().value()).unwrap()
         };
-        let table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let table = crate::persistence::content_identity::payloads::open(&write).unwrap();
         with_window(&table, family, inputs, &mut admission, |window| {
             assert_eq!(window.workspace.ledger.live.get(), 0);
             assert_eq!(
@@ -2873,7 +2875,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
         };
         let id = root.root.unwrap();
         {
-            let table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+            let table = crate::persistence::content_identity::payloads::open(&write).unwrap();
             with_window(&table, family, Vec::new(), &mut admission, |window| {
                 let scope = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Commit);
                 window.initialize(&root)?;
@@ -3024,7 +3026,7 @@ fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
         256 * 1024 * 1024,
     ));
     let mut admission = database.admission(Some(Arc::clone(&accountant).into()));
-    let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let mut table = crate::persistence::content_identity::payloads::open(&write).unwrap();
     let original = table
         .get(stored.as_slice())
         .unwrap()

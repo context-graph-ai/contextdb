@@ -339,82 +339,6 @@
 +pub fn take_commit_spans_for_test() -> CommitSpansForTest {
 +    COMMIT_SPANS.with(|spans| spans.replace(CommitSpansForTest::ZERO))
 +}
---- /dev/null
-+++ b/src/db/allocator_metadata_test_seams.rs
-@@ -0,0 +1,73 @@
-+//! Retained allocator capacity for `writer_reopen_and_doubling_keep_a_fixed_resident_envelope`.
-+
-+use super::Database;
-+
-+impl Database {
-+    /// Observe the retained native floor without registering another reader.
-+    #[doc(hidden)]
-+    pub fn oldest_native_read_transaction_for_test(&self) -> Option<u64> {
-+        self.transaction_tracker
-+            .oldest_live_read_transaction()
-+            .map(|id| id.raw_id())
-+    }
-+
-+    /// Existing native read ownership count for one actual storage transaction id.
-+    /// Does not retain a transaction, allocate, or read storage pages.
-+    #[doc(hidden)]
-+    pub fn native_read_transaction_count_for_test(&self, transaction_id: u64) -> u64 {
-+        self.transaction_tracker
-+            .native_read_transaction_count_for_test(transaction_id)
-+    }
-+
-+    #[doc(hidden)]
-+    pub fn allocator_regions_for_test(&self) -> usize {
-+        self.mem.allocator_regions_for_test()
-+    }
-+
-+    /// Return retained allocator metadata heap payload bytes from actual vector capacities.
-+    ///
-+    /// Counts `Allocators::region_allocators`, each `BuddyAllocator::free`, each
-+    /// `BtreeBitmap::heights`, every `U64GroupedBitmap::data`, and the same bitmap
-+    /// owners reached through `RegionTracker::order_trackers`. Outer vector capacities
-+    /// include inline element bookkeeping and spare slots; nested allocations are
-+    /// counted only for initialized elements, so no owner is counted twice.
-+    ///
-+    /// This is a lower bound on heap residency: allocator rounding/headers are unknown.
-+    /// It excludes fixed inline `TransactionalMemory` state, page caches, commit page
-+    /// sets, debug-only page tracking, temporary serialization/open buffers, and any
-+    /// old/new allocation overlap inside a vector reallocation. Those owners require
-+    /// separate observations; this settled snapshot is not complete reconciliation.
-+    ///
-+    /// Takes only the allocator state mutex, allocates nothing, and reads no storage
-+    /// pages. It can observe retained state after open or file growth without starting
-+    /// a transaction or hydrating history. The seam is absent from normal builds.
-+    #[doc(hidden)]
-+    pub fn allocator_metadata_bytes_for_test(&self) -> usize {
-+        self.mem.allocator_metadata_bytes_for_test()
-+    }
-+}
-+
-+thread_local! {
-+    static REGION_LOADS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-+}
-+pub(crate) fn note_loaded_regions(regions: usize) {
-+    REGION_LOADS.with(|slot| {
-+        if let Some(count) = slot.get() {
-+            slot.set(Some(count + regions as u64));
-+        }
-+    });
-+}
-+/// Observe the actual allocator state's region count after its durable load.
-+pub fn observe_allocator_region_loads_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
-+    struct Restore(Option<u64>);
-+    impl Drop for Restore {
-+        fn drop(&mut self) {
-+            REGION_LOADS.with(|slot| slot.set(self.0));
-+        }
-+    }
-+    let restore = Restore(REGION_LOADS.with(|slot| slot.replace(Some(0))));
-+    let value = operation();
-+    let count = REGION_LOADS.with(|slot| slot.get().unwrap());
-+    drop(restore);
-+    (value, count)
-+}
 --- a/src/db.rs
 +++ b/src/db.rs
 @@ -20,12 +20,31 @@
@@ -2166,7 +2090,7 @@
      fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
          // Make a new quick-repair commit to update the allocator state table
          #[cfg(feature = "logging")]
-@@ -1056,16 +2552,183 @@
+@@ -1056,16 +2552,208 @@
  
          Ok(())
      }
@@ -2232,6 +2156,24 @@
 +        extents: usize,
 +        entries: usize,
 +    ) -> Result<ReclaimStep, Error> {
++        self.reclaim_deferred_step_with_hook(boundary, extents, entries, |_, _| Ok(false))
++    }
++
++    /// Join finite caller-owned garbage reclamation to the same durable step.
++    /// The hook must honor its own finite work bound and changes no reader floor.
++    #[cfg(any(test, feature = "contextdb-internal"))]
++    #[doc(hidden)]
++    #[allow(
++        clippy::result_large_err,
++        reason = "Native refusals retain inline diagnostics."
++    )]
++    pub fn reclaim_deferred_step_with_hook(
++        &self,
++        boundary: Option<ReclaimBoundary>,
++        extents: usize,
++        entries: usize,
++        hook: impl FnOnce(&WriteTransaction, u64) -> Result<bool, StorageError>,
++    ) -> Result<ReclaimStep, Error> {
 +        let mut tx = self.begin_write()?;
 +        if self.transaction_tracker.any_savepoint_exists()
 +            || tx.list_persistent_savepoints()?.next().is_some()
@@ -2244,8 +2186,15 @@
 +            .transaction_tracker
 +            .oldest_live_read_transaction()
 +            .map_or(tx.transaction_id(), |id| id.next());
++        let caller_progress = hook(&tx, boundary.raw_id())?;
 +        if !tx.pending_free_pages_before(TransactionId::min(floor, boundary))? {
 +            let held = tx.pending_free_pages_before(boundary)?;
++            if caller_progress {
++                tx.set_deferred_free_budget(extents, entries);
++                tx.set_reclaim_ceiling(boundary);
++                tx.commit()?;
++                return Ok(ReclaimStep::Progressed(ReclaimBoundary(boundary)));
++            }
 +            tx.abort()?;
 +            return Ok(if held {
 +                ReclaimStep::ReaderHeld
@@ -2352,7 +2301,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +2769,8 @@
+@@ -1106,6 +2794,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -2361,7 +2310,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +2790,8 @@
+@@ -1125,6 +2815,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -2370,7 +2319,7 @@
          }
      }
  
-@@ -1157,13 +2824,37 @@
+@@ -1157,13 +2849,37 @@
          self
      }
  
@@ -2409,7 +2358,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +2866,7 @@
+@@ -1175,6 +2891,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -2417,7 +2366,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +2875,75 @@
+@@ -1183,26 +2900,75 @@
              .open(path)?;
  
          Database::new(
@@ -2495,7 +2444,7 @@
          )
      }
  
-@@ -1222,6 +2963,58 @@
+@@ -1222,6 +2988,58 @@
              self.page_size,
              None,
              self.cache_size,
@@ -2554,7 +2503,7 @@
          )
      }
  
-@@ -1236,6 +3029,70 @@
+@@ -1236,6 +3054,70 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2625,7 +2574,7 @@
          )
      }
  
-@@ -1251,6 +3108,9 @@
+@@ -1251,6 +3133,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2635,7 +2584,7 @@
          )
      }
  }
-@@ -1262,16 +3122,214 @@
+@@ -1262,16 +3147,214 @@
  }
  
  #[cfg(test)]
@@ -2852,7 +2801,7 @@
  
      #[derive(Debug)]
      struct FailingBackend {
-@@ -1298,7 +3356,7 @@
+@@ -1298,7 +3381,7 @@
          fn decrement_countdown(&self) -> Result<(), std::io::Error> {
              if self
                  .countdown
@@ -2861,6 +2810,82 @@
                      if x > 0 { Some(x - 1) } else { None }
                  })
                  .is_err()
+--- /dev/null
++++ b/src/db/allocator_metadata_test_seams.rs
+@@ -0,0 +1,73 @@
++//! Retained allocator capacity for `writer_reopen_and_doubling_keep_a_fixed_resident_envelope`.
++
++use super::Database;
++
++impl Database {
++    /// Observe the retained native floor without registering another reader.
++    #[doc(hidden)]
++    pub fn oldest_native_read_transaction_for_test(&self) -> Option<u64> {
++        self.transaction_tracker
++            .oldest_live_read_transaction()
++            .map(|id| id.raw_id())
++    }
++
++    /// Existing native read ownership count for one actual storage transaction id.
++    /// Does not retain a transaction, allocate, or read storage pages.
++    #[doc(hidden)]
++    pub fn native_read_transaction_count_for_test(&self, transaction_id: u64) -> u64 {
++        self.transaction_tracker
++            .native_read_transaction_count_for_test(transaction_id)
++    }
++
++    #[doc(hidden)]
++    pub fn allocator_regions_for_test(&self) -> usize {
++        self.mem.allocator_regions_for_test()
++    }
++
++    /// Return retained allocator metadata heap payload bytes from actual vector capacities.
++    ///
++    /// Counts `Allocators::region_allocators`, each `BuddyAllocator::free`, each
++    /// `BtreeBitmap::heights`, every `U64GroupedBitmap::data`, and the same bitmap
++    /// owners reached through `RegionTracker::order_trackers`. Outer vector capacities
++    /// include inline element bookkeeping and spare slots; nested allocations are
++    /// counted only for initialized elements, so no owner is counted twice.
++    ///
++    /// This is a lower bound on heap residency: allocator rounding/headers are unknown.
++    /// It excludes fixed inline `TransactionalMemory` state, page caches, commit page
++    /// sets, debug-only page tracking, temporary serialization/open buffers, and any
++    /// old/new allocation overlap inside a vector reallocation. Those owners require
++    /// separate observations; this settled snapshot is not complete reconciliation.
++    ///
++    /// Takes only the allocator state mutex, allocates nothing, and reads no storage
++    /// pages. It can observe retained state after open or file growth without starting
++    /// a transaction or hydrating history. The seam is absent from normal builds.
++    #[doc(hidden)]
++    pub fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.mem.allocator_metadata_bytes_for_test()
++    }
++}
++
++thread_local! {
++    static REGION_LOADS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
++}
++pub(crate) fn note_loaded_regions(regions: usize) {
++    REGION_LOADS.with(|slot| {
++        if let Some(count) = slot.get() {
++            slot.set(Some(count + regions as u64));
++        }
++    });
++}
++/// Observe the actual allocator state's region count after its durable load.
++pub fn observe_allocator_region_loads_for_test<T>(operation: impl FnOnce() -> T) -> (T, u64) {
++    struct Restore(Option<u64>);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            REGION_LOADS.with(|slot| slot.set(self.0));
++        }
++    }
++    let restore = Restore(REGION_LOADS.with(|slot| slot.replace(Some(0))));
++    let value = operation();
++    let count = REGION_LOADS.with(|slot| slot.get().unwrap());
++    drop(restore);
++    (value, count)
++}
 --- a/src/error.rs
 +++ b/src/error.rs
 @@ -12,6 +12,13 @@
@@ -3061,7 +3086,7 @@
 +pub use native_storage_admission::{
 +    NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
 +    NativeStorageRefused, PreparedReadError, PreparedTableDefinitionError, native_storage_active,
-+    with_control_write, with_native_storage_admission,
++    with_control_write, with_native_storage_admission, with_native_storage_write_buffer_limit,
 +};
 +
 +mod atomic_compat;
@@ -3170,7 +3195,7 @@
      /// Add the given value to the mapping of the key
 --- /dev/null
 +++ b/src/native_storage_admission.rs
-@@ -0,0 +1,1308 @@
+@@ -0,0 +1,1348 @@
 +//! Internal owned admission for exact byte reads; no host or engine dependency.
 +use crate::atomic_compat::AtomicUpdate as _;
 +use std::alloc::{Layout, alloc, dealloc};
@@ -3483,6 +3508,46 @@
 +    };
 +    operation()
 +}
++// This scalar limits retention only. Native allocations still use the same
++// original admission and keep their invoices through physical release.
++#[cfg(feature = "contextdb-internal")]
++thread_local! {
++    static WRITE_BUFFER_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
++}
++
++#[cfg(feature = "contextdb-internal")]
++struct RestoreWriteBufferLimit {
++    previous: Option<usize>,
++    _thread: PhantomData<*mut ()>,
++}
++#[cfg(feature = "contextdb-internal")]
++impl Drop for RestoreWriteBufferLimit {
++    fn drop(&mut self) {
++        WRITE_BUFFER_LIMIT.with(|slot| slot.set(self.previous));
++    }
++}
++
++/// Bound this writer's buffered pages without changing serving-cache capacity,
++/// page admission, or publication. Nested scopes restore their caller's window.
++#[cfg(feature = "contextdb-internal")]
++#[doc(hidden)]
++pub fn with_native_storage_write_buffer_limit<R>(
++    bytes: Option<usize>,
++    operation: impl FnOnce() -> R,
++) -> R {
++    let previous = WRITE_BUFFER_LIMIT.with(|slot| slot.replace(bytes));
++    let _restore = RestoreWriteBufferLimit {
++        previous,
++        _thread: PhantomData,
++    };
++    operation()
++}
++
++#[cfg(feature = "contextdb-internal")]
++pub(crate) fn native_storage_write_buffer_limit() -> Option<usize> {
++    WRITE_BUFFER_LIMIT.with(std::cell::Cell::get)
++}
++
 +#[cfg_attr(
 +    not(feature = "test-seams"),
 +    allow(
@@ -5465,7 +5530,7 @@
      }
  }
  
-@@ -250,7 +277,66 @@
+@@ -250,7 +277,120 @@
          if value_length + key_len > MAX_PAIR_LENGTH {
              return Err(StorageError::ValueTooLarge(value_length + key_len));
          }
@@ -5491,12 +5556,66 @@
 +}
 +
 +#[cfg(feature = "contextdb-internal")]
++impl Table<'_, u64, &'static [u8]> {
++    /// Read a root-pinned singleton location with its exact native checksum.
++    /// The caller owns and maintains the handle's binding to this table/root.
++    #[doc(hidden)]
++    pub fn singleton_u64_at(
++        &self,
++        handle: [u8; 24],
++        key: u64,
++        value_len: usize,
++    ) -> Result<AccessGuard<'_, &'static [u8]>> {
++        self.tree.singleton_u64_at(handle, key, value_len)
++    }
++}
++#[cfg(feature = "contextdb-internal")]
++impl ReadOnlyTable<u64, &'static [u8]> {
++    pub(crate) fn new_singleton(
++        name: String,
++        root: Option<BtreeHeader>,
++        hint: PageHint,
++        guard: Arc<TransactionGuard>,
++        mem: Arc<TransactionalMemory>,
++    ) -> Self {
++        Self {
++            name,
++            tree: Btree::new_lazy(root, hint, guard.clone(), mem),
++            transaction_guard: guard,
++        }
++    }
++
++    /// Read a root-pinned singleton location with its exact native checksum.
++    /// The retained table keeps the captured read root alive.
++    #[doc(hidden)]
++    pub fn singleton_u64_at(
++        &self,
++        handle: [u8; 24],
++        key: u64,
++        value_len: usize,
++    ) -> Result<AccessGuard<'static, &'static [u8]>> {
++        self.tree.singleton_u64_at(handle, key, value_len)
++    }
++}
++
++#[cfg(feature = "contextdb-internal")]
 +impl<K: Key + 'static> Table<'_, K, &'static [u8]> {
++    /// Exact byte-value capacity of a singleton base-page leaf with this key.
++    #[doc(hidden)]
++    pub fn inline_value_capacity(&self, key_bytes: usize) -> usize {
++        self.tree.inline_value_capacity(key_bytes)
++    }
++
++    /// Largest accepted byte-value length with this key.
++    #[doc(hidden)]
++    pub fn maximum_value_length(&self, key_bytes: usize) -> usize {
++        MAX_VALUE_LENGTH.min(MAX_PAIR_LENGTH.saturating_sub(key_bytes))
++    }
++
 +    /// Reserve a zero-filled byte value without a value-sized temporary buffer.
 +    ///
-+    /// Replaces any existing value, with the same size limits and borrowed mutable
-+    /// destination as `insert_reserve`. The reservation changes the transaction;
-+    /// a caller that fails while filling it must abort the transaction.
++    /// Replaces any existing value, with the same limits as insert_reserve.
++    /// Failure while filling the borrowed destination must abort the transaction.
 +    #[doc(hidden)]
 +    pub fn insert_zeroed_reserve<'a>(
 +        &mut self,
@@ -5533,7 +5652,21 @@
      }
  }
  
-@@ -668,3 +754,82 @@
+@@ -480,6 +620,13 @@
+ }
+ 
+ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
++    /// Exact byte-value capacity of a singleton base-page leaf with this key.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn inline_value_capacity(&self, key_bytes: usize) -> usize {
++        self.tree.inline_value_capacity(key_bytes)
++    }
++
+     pub(crate) fn new(
+         name: String,
+         root_page: Option<BtreeHeader>,
+@@ -668,3 +815,82 @@
          })
      }
  }
@@ -7147,7 +7280,7 @@
  
  /// A read/write transaction
  ///
-@@ -832,9 +1037,253 @@
+@@ -832,9 +1037,255 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
@@ -7161,6 +7294,8 @@
 +    #[cfg(feature = "contextdb-internal")]
 +    table_root_hook: Option<TableRootHook>,
 +    table_root_hook_error: Mutex<Option<StorageError>>,
++    #[cfg(feature = "contextdb-internal")]
++    active_relocations: Mutex<Option<HashMap<PageNumber, PageNumber>>>,
 +}
 +
 +/// Caller-owned observation of one actual write's publication interval.
@@ -7401,7 +7536,7 @@
  }
  
  impl WriteTransaction {
-@@ -850,8 +1299,16 @@
+@@ -850,8 +1301,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -7418,7 +7553,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +1321,181 @@
+@@ -864,9 +1323,243 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -7429,6 +7564,8 @@
 +            #[cfg(feature = "contextdb-internal")]
 +            table_root_hook: None,
 +            table_root_hook_error: Mutex::new(None),
++            #[cfg(feature = "contextdb-internal")]
++            active_relocations: Mutex::new(None),
          })
 +    }
 +
@@ -7572,6 +7709,66 @@
 +        self.reclaim_ceiling = Some(ceiling);
 +    }
 +
++    /// Borrow the actual finite relocation map and each moved singleton leaf.
++    /// Call only for a u64-keyed singleton byte table from its relocation hook.
++    /// Branch pages are skipped; guards cannot escape the callback's borrow.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn visit_relocated_u64_singletons(
++        &self,
++        mut visit: impl for<'a> FnMut(
++            [u8; 8],
++            [u8; 24],
++            u64,
++            AccessGuard<'a, &'static [u8]>,
++        ) -> Result<()>,
++    ) -> Result<()> {
++        if let Some(map) = self.active_relocations.lock().unwrap().as_ref() {
++            for (old, new) in map {
++                let page = self.mem.get_page(*new, PageHint::None)?;
++                let bytes = page.memory();
++                if bytes.first() == Some(&crate::tree_store::BRANCH) {
++                    continue;
++                }
++                if bytes.len() < 16
++                    || bytes[0] != crate::tree_store::LEAF
++                    || u16::from_le_bytes(bytes[2..4].try_into().unwrap()) != 1
++                {
++                    return Err(StorageError::Corrupted(
++                        "relocated payload is not a singleton".into(),
++                    ));
++                }
++                let end = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
++                if end < 16 || end > bytes.len() {
++                    return Err(StorageError::Corrupted(
++                        "relocated singleton offsets are invalid".into(),
++                    ));
++                }
++                let key = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
++                let value = AccessGuard::with_page(page, 16..end);
++                let handle = value.singleton_u64_handle(key)?;
++                visit(old.to_le_bytes(), handle, key, value)?;
++            }
++        }
++        Ok(())
++    }
++
++    /// Preserve a deferred internal operation failure so commit refuses atomically.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn record_internal_operation_error(&self, error: StorageError) {
++        let mut failure = self.table_root_hook_error.lock().unwrap();
++        if failure.is_none() {
++            *failure = Some(error);
++        }
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn native_transaction_id(&self) -> u64 {
++        self.transaction_id.raw_id()
++    }
++
 +    #[cfg(any(test, feature = "contextdb-internal"))]
 +    pub(crate) fn transaction_id(&self) -> TransactionId {
 +        self.transaction_id
@@ -7600,7 +7797,7 @@
      }
  
      pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1521,31 @@
+@@ -892,6 +1585,31 @@
              return Ok(true);
          }
  
@@ -7632,7 +7829,7 @@
          Ok(false)
      }
  
-@@ -1130,6 +1784,10 @@
+@@ -1130,6 +1848,10 @@
              return Err(SavepointError::InvalidSavepoint);
          }
  
@@ -7643,7 +7840,7 @@
          let (id, transaction_id) = self.allocate_savepoint()?;
          #[cfg(feature = "logging")]
          debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
-@@ -1349,7 +2007,225 @@
+@@ -1349,7 +2071,225 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
@@ -7869,7 +8066,7 @@
      }
  
      /// Open the given table
-@@ -1373,6 +2249,13 @@
+@@ -1373,6 +2313,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -7883,7 +8080,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +2267,21 @@
+@@ -1384,10 +2331,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -7906,7 +8103,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +2306,29 @@
+@@ -1412,7 +2370,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -7937,7 +8134,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +2374,159 @@
+@@ -1458,9 +2438,159 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -8097,7 +8294,7 @@
      }
  
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +2535,45 @@
+@@ -1469,11 +2599,45 @@
              self.two_phase_commit = true;
          }
  
@@ -8145,7 +8342,7 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +2584,117 @@
+@@ -1484,6 +2648,117 @@
              InternalDurability::None => self.non_durable_commit(user_root)?,
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
@@ -8263,7 +8460,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1609,7 +2820,7 @@
+@@ -1609,7 +2884,7 @@
          debug!("Aborting transaction id={:?}", self.transaction_id);
          self.tables
              .lock()
@@ -8272,7 +8469,7 @@
              .table_tree
              .clear_root_updates_and_close();
          // Release all transaction-local savepoint state. The on-disk mutations
-@@ -1618,7 +2829,7 @@
+@@ -1618,7 +2893,7 @@
          // in-memory TransactionTracker state that rollback cannot see.
          self.savepoint_state
              .lock()
@@ -8281,7 +8478,7 @@
              .apply_on_abort(&self.transaction_tracker);
          self.mem.rollback_uncommitted_writes()?;
          #[cfg(feature = "logging")]
-@@ -1627,18 +2838,41 @@
+@@ -1627,18 +2902,41 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -8328,7 +8525,7 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2914,17 @@
+@@ -1680,7 +2978,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -8347,7 +8544,7 @@
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2932,11 @@
+@@ -1688,6 +2996,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -8359,7 +8556,7 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2947,148 @@
+@@ -1698,6 +3011,148 @@
              self.mem.free(page, &mut PageTrackerPolicy::Ignore);
          }
  
@@ -8508,7 +8705,7 @@
          Ok(())
      }
  
-@@ -1766,6 +3157,9 @@
+@@ -1766,6 +3221,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -8518,7 +8715,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +3217,384 @@
+@@ -1823,46 +3281,387 @@
          Ok(progress)
      }
  
@@ -8691,7 +8888,10 @@
 +            && !relocation_map.is_empty()
 +            && let Some(name) = target.as_deref()
 +        {
-+            self.call_table_root_hook(name, TableRootEvent::AfterRelocate)?;
++            *self.active_relocations.lock().unwrap() = Some(relocation_map);
++            let result = self.call_table_root_hook(name, TableRootEvent::AfterRelocate);
++            relocation_map = self.active_relocations.lock().unwrap().take().unwrap();
++            result?;
 +        }
 +        #[cfg(all(test, debug_assertions))]
 +        online_relocation_tests::RELOCATIONS.with(|pairs| {
@@ -8933,7 +9133,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,57 +3769,27 @@
+@@ -2037,57 +3836,27 @@
          })
      }
  
@@ -9003,7 +9203,7 @@
              }
          } else if !self.completed && self.mem.storage_failure() {
              self.tables
-@@ -2107,18 +3809,148 @@
+@@ -2107,18 +3876,148 @@
      tree: TableTree,
  }
  
@@ -9153,7 +9353,7 @@
      }
  
      /// Open the given table
-@@ -2135,12 +3967,69 @@
+@@ -2135,12 +4034,93 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -9164,6 +9364,30 @@
              )?),
              InternalTableDefinition::Multimap { .. } => unreachable!(),
          }
++    }
++
++    /// Retain a singleton u64 byte table's captured root without faulting it.
++    /// Exact physical handles still admit and verify their selected native leaf.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn open_singleton_u64_table(
++        &self,
++        definition: TableDefinition<u64, &'static [u8]>,
++    ) -> Result<ReadOnlyTable<u64, &'static [u8]>, TableError> {
++        let header = self
++            .tree
++            .get_table::<u64, &[u8]>(definition.name(), TableType::Normal)?
++            .ok_or_else(|| TableError::TableDoesNotExist(definition.name().to_string()))?;
++        match header {
++            InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new_singleton(
++                definition.name().to_string(),
++                table_root,
++                self.tree.hint(),
++                self.tree.transaction_guard().clone(),
++                self.mem.clone(),
++            )),
++            InternalTableDefinition::Multimap { .. } => unreachable!(),
++        }
 +    }
 +
 +    /// Open a byte table for reject-only bounded inspection. Selected records
@@ -9224,7 +9448,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +4050,7 @@
+@@ -2161,7 +4141,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -9233,7 +9457,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +4078,7 @@
+@@ -2189,7 +4169,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -9242,7 +9466,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +4106,7 @@
+@@ -2217,7 +4197,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -9251,7 +9475,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +4152,15 @@
+@@ -2263,7 +4243,15 @@
  
  #[cfg(test)]
  mod test {
@@ -9268,7 +9492,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4181,1144 @@
+@@ -2284,4 +4272,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -12544,7 +12768,7 @@
  };
  use crate::types::{Key, MutInPlaceValue, Value};
  use crate::{AccessGuard, Result};
-@@ -21,6 +20,125 @@
+@@ -21,6 +20,197 @@
  use std::ops::RangeBounds;
  use std::sync::{Arc, Mutex};
  
@@ -12553,6 +12777,78 @@
 +    AccessGuard<'static, &'static [u8]>,
 +    AccessGuard<'static, &'static [u8]>,
 +);
++
++#[cfg(feature = "contextdb-internal")]
++fn singleton_u64_at(
++    mem: &TransactionalMemory,
++    handle: [u8; 24],
++    key: u64,
++    value_len: usize,
++    hint: PageHint,
++) -> Result<AccessGuard<'static, &'static [u8]>> {
++    let number = PageNumber::validated_from_le_bytes(handle[..8].try_into().unwrap())
++        .filter(|number| number.to_le_bytes() == handle[..8])
++        .ok_or_else(|| crate::StorageError::Corrupted("invalid singleton page handle".into()))?;
++    if value_len > super::MAX_VALUE_LENGTH {
++        return Err(crate::StorageError::Corrupted(
++            "singleton value exceeds native limits".into(),
++        ));
++    }
++    let framing = super::btree_base::RawLeafBuilder::required_bytes(
++        1,
++        8usize
++            .checked_add(value_len)
++            .ok_or_else(|| crate::StorageError::Corrupted("singleton length overflow".into()))?,
++        Some(8),
++        None,
++    );
++    let expected = framing
++        .max(mem.get_page_size())
++        .checked_next_power_of_two()
++        .ok_or_else(|| crate::StorageError::Corrupted("singleton extent overflow".into()))?;
++    if number.page_size_bytes(mem.get_page_size().try_into().unwrap()) != expected as u64 {
++        return Err(crate::StorageError::Corrupted(
++            "singleton extent differs from its producer quote".into(),
++        ));
++    }
++    let page = mem.get_page(number, hint)?;
++    let range = super::btree_base::singleton_u64_range(&page, key)?;
++    if range.len() != value_len {
++        return Err(crate::StorageError::Corrupted(
++            "singleton value differs from its producer quote".into(),
++        ));
++    }
++    let expected = u128::from_le_bytes(handle[8..].try_into().unwrap());
++    if page_checksum(&page, Some(8), None)? != expected {
++        return Err(crate::StorageError::Corrupted(
++            "singleton payload checksum mismatch".into(),
++        ));
++    }
++    Ok(AccessGuard::with_page(page, range))
++}
++
++#[cfg(feature = "contextdb-internal")]
++impl BtreeMut<'_, u64, &'static [u8]> {
++    pub(crate) fn singleton_u64_at(
++        &self,
++        handle: [u8; 24],
++        key: u64,
++        value_len: usize,
++    ) -> Result<AccessGuard<'_, &'static [u8]>> {
++        singleton_u64_at(&self.mem, handle, key, value_len, PageHint::Transient)
++    }
++}
++#[cfg(feature = "contextdb-internal")]
++impl Btree<u64, &'static [u8]> {
++    pub(crate) fn singleton_u64_at(
++        &self,
++        handle: [u8; 24],
++        key: u64,
++        value_len: usize,
++    ) -> Result<AccessGuard<'static, &'static [u8]>> {
++        singleton_u64_at(&self.mem, handle, key, value_len, PageHint::None)
++    }
++}
 +
 +pub(super) fn page_checksum<T: Page>(
 +    page: &T,
@@ -12670,7 +12966,7 @@
  pub(crate) struct BtreeStats {
      pub(crate) tree_height: u32,
      pub(crate) leaf_pages: u64,
-@@ -68,7 +186,7 @@
+@@ -68,7 +258,7 @@
      root: Option<BtreeHeader>,
      hint: PageHint,
      key_width: Option<usize>,
@@ -12679,7 +12975,7 @@
  }
  
  impl UntypedBtree {
-@@ -84,7 +202,7 @@
+@@ -84,7 +274,7 @@
              root,
              hint,
              key_width,
@@ -12688,7 +12984,7 @@
          }
      }
  
-@@ -100,6 +218,106 @@
+@@ -100,6 +290,106 @@
          Ok(())
      }
  
@@ -12795,7 +13091,7 @@
      fn visit_pages_helper<F>(&self, path: PagePath, visitor: &mut F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -124,6 +342,14 @@
+@@ -124,6 +414,14 @@
  
          Ok(())
      }
@@ -12810,7 +13106,7 @@
  }
  
  pub(crate) struct UntypedBtreeMut {
-@@ -179,6 +405,13 @@
+@@ -179,6 +477,13 @@
      fn finalize_dirty_checksums_helper(&mut self, page_number: PageNumber) -> Result<Checksum> {
          assert!(self.mem.uncommitted(page_number));
          let mut page = self.mem.get_page_mut(page_number)?;
@@ -12824,7 +13120,7 @@
  
          match page.memory()[0] {
              LEAF => leaf_checksum(&page, self.key_width, self.value_width),
-@@ -281,12 +514,12 @@
+@@ -281,12 +586,12 @@
          page_number: PageNumber,
          relocation_map: &HashMap<PageNumber, PageNumber>,
      ) -> Result<Option<(PageNumber, Checksum)>> {
@@ -12838,7 +13134,7 @@
          new_page.memory_mut().copy_from_slice(old_page.memory());
  
          let node_mem = old_page.memory();
-@@ -309,12 +542,15 @@
+@@ -309,12 +614,15 @@
              _ => unreachable!(),
          }
  
@@ -12854,7 +13150,7 @@
          }
  
          Ok(Some((new_page.get_page_number(), DEFERRED)))
-@@ -322,7 +558,7 @@
+@@ -322,7 +630,7 @@
  }
  
  pub(crate) struct BtreeMut<'a, K: Key + 'static, V: Value + 'static> {
@@ -12863,7 +13159,7 @@
      transaction_guard: Arc<TransactionGuard>,
      root: Option<BtreeHeader>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-@@ -362,21 +598,6 @@
+@@ -362,21 +670,6 @@
          );
          self.root = tree.finalize_dirty_checksums()?;
          Ok(self.root)
@@ -12885,7 +13181,7 @@
      }
  
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-@@ -454,7 +675,10 @@
+@@ -454,7 +747,10 @@
              fake_allocated_pages,
          );
          operation.insert_inplace(key, value)?;
@@ -12897,7 +13193,7 @@
          Ok(())
      }
  
-@@ -470,11 +694,6 @@
+@@ -470,11 +766,6 @@
          );
          let result = operation.delete(key)?;
          Ok(result)
@@ -12909,7 +13205,7 @@
      }
  
      pub(crate) fn stats(&self) -> Result<BtreeStats> {
-@@ -522,6 +741,8 @@
+@@ -522,6 +813,8 @@
                  new_page.memory_mut().copy_from_slice(old_page.memory());
                  drop(old_page);
                  freed_pages.push(root.root);
@@ -12918,7 +13214,7 @@
  
                  root.root = new_page.get_page_number();
                  root.checksum = DEFERRED;
-@@ -582,6 +803,8 @@
+@@ -582,6 +875,8 @@
                          .copy_from_slice(old_child_page.memory());
                      drop(old_child_page);
                      freed_pages.push(child_page);
@@ -12927,7 +13223,7 @@
  
                      let mut mutator = BranchMutator::new(page.memory_mut());
                      mutator.write_child_page(child_index, new_page.get_page_number(), DEFERRED);
-@@ -672,6 +895,8 @@
+@@ -672,6 +967,8 @@
          for page in freed {
              if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                  freed_pages.push(page);
@@ -12936,7 +13232,7 @@
              }
          }
  
-@@ -711,6 +936,28 @@
+@@ -711,6 +1008,40 @@
      }
  }
  
@@ -12944,6 +13240,18 @@
 +    /// Reserve an allocator-table value without building a value-sized heap buffer.
 +    /// A length-only source zero-fills the allocated B-tree destination. The
 +    /// returned guard borrows that destination; no source buffer or mapping exists.
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn inline_value_capacity(&self, key_bytes: usize) -> usize {
++        self.mem
++            .get_page_size()
++            .saturating_sub(super::btree_base::RawLeafBuilder::required_bytes(
++                1,
++                key_bytes,
++                K::fixed_width(),
++                None,
++            ))
++    }
++
 +    pub(crate) fn insert_zeroed_reserve(
 +        &mut self,
 +        key: &K::SelfType<'_>,
@@ -12965,7 +13273,7 @@
  pub(crate) struct RawBtree {
      mem: Arc<TransactionalMemory>,
      root: Option<BtreeHeader>,
-@@ -760,6 +1007,22 @@
+@@ -760,6 +1091,22 @@
          } else {
              Ok(true)
          }
@@ -12988,7 +13296,7 @@
      }
  
      fn verify_checksum_helper(
-@@ -804,12 +1067,12 @@
+@@ -804,17 +1151,29 @@
  }
  
  pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
@@ -13003,7 +13311,24 @@
      _key_type: PhantomData<K>,
      _value_type: PhantomData<V>,
  }
-@@ -822,7 +1085,16 @@
+ 
+ impl<K: Key, V: Value> Btree<K, V> {
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn inline_value_capacity(&self, key_bytes: usize) -> usize {
++        self.mem
++            .get_page_size()
++            .saturating_sub(super::btree_base::RawLeafBuilder::required_bytes(
++                1,
++                key_bytes,
++                K::fixed_width(),
++                None,
++            ))
++    }
++
+     pub(crate) fn new(
+         root: Option<BtreeHeader>,
+         hint: PageHint,
+@@ -822,7 +1181,16 @@
          mem: Arc<TransactionalMemory>,
      ) -> Result<Self> {
          let cached_root = if let Some(header) = root {
@@ -13021,7 +13346,7 @@
          } else {
              None
          };
-@@ -837,6 +1109,24 @@
+@@ -837,6 +1205,24 @@
          })
      }
  
@@ -13046,7 +13371,7 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -858,6 +1148,17 @@
+@@ -858,6 +1244,17 @@
              self.hint,
          )
          .verify_checksum()
@@ -13064,7 +13389,7 @@
      }
  
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-@@ -877,6 +1178,10 @@
+@@ -877,6 +1274,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
              self.get_helper(root_page, K::as_bytes(key).as_ref())
@@ -13075,7 +13400,7 @@
          } else {
              Ok(None)
          }
-@@ -898,8 +1203,10 @@
+@@ -898,8 +1299,10 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(page, K::fixed_width());
@@ -13087,7 +13412,7 @@
                  self.get_helper(&child_page, query)
              }
              _ => unreachable!(),
-@@ -911,6 +1218,10 @@
+@@ -911,6 +1314,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.first_helper(root.clone())
@@ -13098,7 +13423,7 @@
          } else {
              Ok(None)
          }
-@@ -932,7 +1243,10 @@
+@@ -932,7 +1339,10 @@
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let child_page = accessor.child_page(0).unwrap();
@@ -13110,7 +13435,7 @@
              }
              _ => unreachable!(),
          }
-@@ -943,6 +1257,10 @@
+@@ -943,6 +1353,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.last_helper(root.clone())
@@ -13121,7 +13446,7 @@
          } else {
              Ok(None)
          }
-@@ -964,8 +1282,12 @@
+@@ -964,8 +1378,12 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
@@ -13136,7 +13461,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,12 +1297,35 @@
+@@ -975,12 +1393,35 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -13174,7 +13499,7 @@
      }
  
      pub(crate) fn len(&self) -> Result<u64> {
-@@ -995,42 +1340,6 @@
+@@ -995,42 +1436,6 @@
              V::fixed_width(),
              self.hint,
          )
@@ -13217,7 +13542,7 @@
      }
  }
  
-@@ -1118,3 +1427,521 @@
+@@ -1118,3 +1523,521 @@
          _ => unreachable!(),
      }
  }
@@ -13795,7 +14120,7 @@
          Self {
              page: EitherPage::ArcMemory(page),
              offset: range.start,
-@@ -222,6 +238,26 @@
+@@ -222,9 +238,90 @@
          }
      }
  
@@ -13822,7 +14147,71 @@
      /// Access the stored value
      pub fn value(&self) -> V::SelfType<'_> {
          V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
-@@ -306,7 +342,7 @@
++    }
++}
++
++#[cfg(feature = "contextdb-internal")]
++pub(crate) fn singleton_u64_range(page: &impl Page, key: u64) -> Result<Range<usize>> {
++    let bytes = page.memory();
++    if bytes.len() < 16
++        || bytes[0] != LEAF
++        || u16::from_le_bytes(bytes[2..4].try_into().unwrap()) != 1
++        || bytes[8..16] != key.to_le_bytes()
++    {
++        return Err(StorageError::Corrupted(
++            "invalid singleton u64 payload leaf".into(),
++        ));
++    }
++    let end = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
++    if end < 16 || end > bytes.len() {
++        return Err(StorageError::Corrupted(
++            "singleton value exceeds its native leaf".into(),
++        ));
++    }
++    Ok(16..end)
++}
++
++#[cfg(feature = "contextdb-internal")]
++impl AccessGuard<'_, &'static [u8]> {
++    /// A singleton u64-keyed byte value's native page identity and checksum.
++    /// The opaque scalar handle grants no borrow and copies no backing.
++    #[doc(hidden)]
++    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
++        let EitherPage::Immutable(page) = &self.page else {
++            return Err(StorageError::Corrupted(
++                "singleton handle needs a native page".into(),
++            ));
++        };
++        let range = singleton_u64_range(page, key)?;
++        if self.offset != range.start
++            || self.len != range.len()
++            || !matches!(self.on_drop, OnDrop::None)
++        {
++            return Err(StorageError::Corrupted(
++                "singleton handle needs a whole value".into(),
++            ));
++        }
++        let mut handle = [0; 24];
++        handle[..8].copy_from_slice(&page.get_page_number().to_le_bytes());
++        handle[8..].copy_from_slice(&leaf_checksum(page, Some(8), None)?.to_le_bytes());
++        Ok(handle)
++    }
++
++    /// Retain the original page and select an admitted subrecord without copying it.
++    #[doc(hidden)]
++    pub fn slice_bytes(mut self, range: Range<usize>) -> Result<Self> {
++        if range.start > range.end || range.end > self.len {
++            return Err(StorageError::Corrupted(
++                "payload range exceeds its stored value".into(),
++            ));
++        }
++        self.offset += range.start;
++        self.len = range.len();
++        Ok(self)
+     }
+ }
+ 
+@@ -306,7 +403,7 @@
              self.entry_index,
              self.key_width,
              V::fixed_width(),
@@ -13831,7 +14220,7 @@
          ) {
              let mut mutator =
                  LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
-@@ -361,6 +397,12 @@
+@@ -361,6 +458,37 @@
      }
  }
  
@@ -13841,10 +14230,60 @@
 +    }
 +}
 +
++#[cfg(feature = "contextdb-internal")]
++impl<V: Value + 'static> AccessGuardMut<'_, V> {
++    /// Native identity and checksum after this whole singleton value is filled.
++    #[doc(hidden)]
++    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
++        let range = singleton_u64_range(&self.page, key)?;
++        if self.offset != range.start || self.len != range.len() {
++            return Err(StorageError::Corrupted(
++                "singleton handle needs a whole value".into(),
++            ));
++        }
++        let mut handle = [0; 24];
++        handle[..8].copy_from_slice(&self.page.get_page_number().to_le_bytes());
++        handle[8..].copy_from_slice(&leaf_checksum(&self.page, Some(8), None)?.to_le_bytes());
++        Ok(handle)
++    }
++}
++
++#[cfg(feature = "contextdb-internal")]
++impl<V: MutInPlaceValue + 'static> AsMut<V::BaseRefType> for AccessGuardMut<'_, V> {
++    fn as_mut(&mut self) -> &mut V::BaseRefType {
++        self.value_mut()
++    }
++}
++
  impl<V: Value + 'static> Drop for AccessGuardMut<'_, V> {
      fn drop(&mut self) {
          // no-op. This Drop impl is only here to ensure that self is dropped before the transaction
-@@ -442,17 +484,6 @@
+@@ -383,6 +511,24 @@
+             len,
+             _value_type: Default::default(),
+         }
++    }
++}
++
++#[cfg(feature = "contextdb-internal")]
++impl<V: Value + 'static> AccessGuardMutInPlace<'_, V> {
++    /// Native identity and checksum after this whole singleton value is filled.
++    #[doc(hidden)]
++    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
++        let range = singleton_u64_range(&self.page, key)?;
++        if self.offset != range.start || self.len != range.len() {
++            return Err(StorageError::Corrupted(
++                "singleton handle needs a whole value".into(),
++            ));
++        }
++        let mut handle = [0; 24];
++        handle[..8].copy_from_slice(&self.page.get_page_number().to_le_bytes());
++        handle[8..].copy_from_slice(&leaf_checksum(&self.page, Some(8), None)?.to_le_bytes());
++        Ok(handle)
+     }
+ }
+ 
+@@ -442,17 +588,6 @@
              fixed_key_size,
              fixed_value_size,
              num_pairs,
@@ -13862,7 +14301,7 @@
          }
      }
  
-@@ -618,8 +649,32 @@
+@@ -618,8 +753,32 @@
      }
  }
  
@@ -13896,7 +14335,7 @@
      fixed_key_size: Option<usize>,
      fixed_value_size: Option<usize>,
      total_key_bytes: usize,
-@@ -657,6 +712,10 @@
+@@ -657,6 +816,10 @@
      }
  
      pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
@@ -13907,7 +14346,7 @@
          self.total_key_bytes += key.len();
          self.total_value_bytes += value.len();
          self.pairs.push((key, value));
-@@ -712,7 +771,7 @@
+@@ -712,7 +875,7 @@
              first_split_key_bytes,
          );
          for (key, value) in self.pairs.iter().take(division) {
@@ -13916,7 +14355,7 @@
          }
          drop(builder);
  
-@@ -731,7 +790,7 @@
+@@ -731,7 +894,7 @@
              self.total_key_bytes - first_split_key_bytes,
          );
          for (key, value) in &self.pairs[division..] {
@@ -13925,7 +14364,7 @@
          }
          drop(builder);
  
-@@ -753,7 +812,7 @@
+@@ -753,7 +916,7 @@
              self.total_key_bytes,
          );
          for (key, value) in self.pairs {
@@ -13934,7 +14373,7 @@
          }
          drop(builder);
          Ok(page)
-@@ -877,6 +936,10 @@
+@@ -877,6 +1040,10 @@
      }
  
      pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
@@ -13945,7 +14384,7 @@
          if let Some(key_width) = self.fixed_key_size {
              assert_eq!(key_width, key.len());
          }
-@@ -915,7 +978,7 @@
+@@ -915,7 +1082,7 @@
                      .to_le_bytes(),
              );
          }
@@ -13954,7 +14393,7 @@
          self.pairs_written += 1;
      }
  }
-@@ -959,7 +1022,7 @@
+@@ -959,7 +1126,7 @@
          position: usize,
          fixed_key_size: Option<usize>,
          fixed_value_size: Option<usize>,
@@ -13963,7 +14402,7 @@
      ) -> bool {
          let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
          let remaining = page.memory().len() - accessor.total_length();
-@@ -967,7 +1030,7 @@
+@@ -967,7 +1134,7 @@
              .value_range(position)
              .map(|(s, e)| e - s)
              .unwrap_or_default();
@@ -13972,7 +14411,7 @@
              - isize::try_from(existing_value_len).unwrap();
          required_delta <= isize::try_from(remaining).unwrap()
      }
-@@ -978,7 +1041,7 @@
+@@ -978,7 +1145,7 @@
          fixed_key_size: Option<usize>,
          fixed_value_size: Option<usize>,
          new_key: &[u8],
@@ -13981,7 +14420,7 @@
      ) -> bool {
          let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
          // If this is a large page, only allow in-place appending to avoid write amplification
-@@ -989,7 +1052,7 @@
+@@ -989,7 +1156,7 @@
              return false;
          }
          let remaining = page.memory().len() - accessor.total_length();
@@ -13990,7 +14429,7 @@
          if fixed_key_size.is_none() {
              required_delta += size_of::<u32>();
          }
-@@ -1001,6 +1064,10 @@
+@@ -1001,6 +1168,10 @@
  
      // Replace the value at index `i` with `value`, leaving the key unchanged.
      pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
@@ -14001,7 +14440,7 @@
          let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
          let num_pairs = accessor.num_pairs();
          let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
-@@ -1031,11 +1098,11 @@
+@@ -1031,11 +1202,11 @@
  
          // Write the new value
          dest -= value.len();
@@ -14015,7 +14454,7 @@
          let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
          let required_delta = {
              let mut delta = key.len() + value.len();
-@@ -1093,7 +1160,7 @@
+@@ -1093,7 +1264,7 @@
          // Insert the value
          let inserted_value_end: u32 = dest.try_into().unwrap();
          dest -= value.len();
@@ -14024,7 +14463,7 @@
  
          // Right shift the trailing key data & preceding value data
          let start = shift_key_start;
-@@ -1272,22 +1339,6 @@
+@@ -1272,22 +1443,6 @@
              fixed_key_size,
              _page_lifetime: Default::default(),
          }
@@ -15685,7 +16124,7 @@
      }
  
      fn get_page_number(&self) -> PageNumber {
-@@ -267,14 +279,30 @@
+@@ -267,14 +279,46 @@
  impl Drop for PageMut<'_> {
      fn drop(&mut self) {
          #[cfg(debug_assertions)]
@@ -15707,6 +16146,10 @@
 +#[derive(Copy, Clone, PartialEq, Eq)]
  pub(crate) enum PageHint {
      None,
++    /// Private immutable builder input may use spare cache room without
++    /// promoting historical working pages over serving data.
++    #[cfg(feature = "contextdb-internal")]
++    Transient,
      Clean,
 +    /// This page belongs to a retained external snapshot. B-tree readers
 +    /// validate each page against the checksum carried by its root or parent
@@ -15715,6 +16158,18 @@
 +}
 +
 +impl PageHint {
++    pub(crate) fn is_transient(self) -> bool {
++        #[cfg(feature = "contextdb-internal")]
++        {
++            matches!(self, Self::Transient)
++        }
++        #[cfg(not(feature = "contextdb-internal"))]
++        {
++            let _ = self;
++            false
++        }
++    }
++
 +    pub(crate) fn verifies_path(self) -> bool {
 +        matches!(self, Self::Verified)
 +    }
@@ -17949,7 +18404,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1050,7 @@
+@@ -438,65 +1050,161 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17958,7 +18413,19 @@
              }
          }
  
-@@ -449,54 +1061,141 @@
+         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+         {
+             let read_lock = self.read_cache[cache_slot].read().unwrap();
+-            if let Some(cached) = read_lock.get(offset) {
++            #[cfg(feature = "contextdb-internal")]
++            let cached = if hint.is_transient() {
++                read_lock.peek(offset)
++            } else {
++                read_lock.get(offset)
++            };
++            #[cfg(not(feature = "contextdb-internal"))]
++            let cached = read_lock.get(offset);
++            if let Some(cached) = cached {
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17976,7 +18443,7 @@
 +        let scan_replace = crate::read_admission::scan_reads_active()
 +            && !crate::read_admission::declared_scan_reads_active()
 +            && !crate::read_admission::take_scan_growth(cached_page_bytes(len));
-+        self.cache_loaded_page(offset, len, buffer, scan_replace)
++        self.cache_loaded_page(offset, len, buffer, scan_replace, hint.is_transient())
 +    }
 +
 +    fn cache_loaded_page(
@@ -17985,6 +18452,7 @@
 +        len: usize,
 +        buffer: PageAllocation,
 +        scan_replace: bool,
++        transient: bool,
 +    ) -> Result<PageMemory> {
 +        // Serialize publication with read-capacity changes. Release this lock
 +        // before transferring an opaque source receipt or dropping displacement.
@@ -18037,7 +18505,7 @@
 -            // A race could cause us to replace an existing buffer
 -            self.read_cache_bytes
 -                .fetch_sub(replaced.len(), Ordering::AcqRel)
-+        let inserted = if scan_replace {
++        let inserted = if scan_replace || transient {
 +            write_lock.try_insert_lowest_priority(offset, buffer.clone())
          } else {
 -            cache_size
@@ -18140,7 +18608,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1206,213 @@
+@@ -507,104 +1215,217 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -18237,11 +18705,15 @@
 +            self.retire_control_buffers(lock)?;
 +        }
 +        let (previous, payment) = CachePayment::reserve(&self.write_buffer_bytes, bytes)?;
-+        let half = if control_write {
-+            0
-+        } else {
-+            self.max_cache_size.load(Ordering::Acquire) / 2
-+        };
++        let half = self.max_cache_size.load(Ordering::Acquire) / 2;
++        // Source-funded dirty pages follow the effective writer's existing
++        // cache sizing rule, even if this handle opened before its budget was
++        // declared. This only spills completed buffers; live aliases stay paid.
++        #[cfg(feature = "contextdb-internal")]
++        let half = half.min(
++            crate::native_storage_admission::native_storage_write_buffer_limit().unwrap_or(half),
++        );
++        let half = if control_write { 0 } else { half };
 +        let write_bytes = previous + bytes;
 +        if write_bytes > half {
 +            let excess = write_bytes - half;
@@ -18440,7 +18912,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1422,383 @@
+@@ -614,13 +1435,383 @@
  }
  
  #[cfg(test)]
@@ -18503,15 +18975,15 @@
 +        }
 +        // The shared cache takes custody under its actual fixed reserve; if
 +        // it cannot, the page keeps its genuine original source invoice.
-+        let page =
-+            self.cache_loaded_page(offset, len, page, false)
-+                .map_err(|error| match error {
-+                    StorageError::Native(error) => error,
-+                    StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
-+                        NativeColdFault::new("native cache capacity overflow"),
-+                    ),
-+                    _ => unreachable!("cache insertion retains native allocation failures"),
-+                })?;
++        let page = self
++            .cache_loaded_page(offset, len, page, false, false)
++            .map_err(|error| match error {
++                StorageError::Native(error) => error,
++                StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
++                    NativeColdFault::new("native cache capacity overflow"),
++                ),
++                _ => unreachable!("cache insertion retains native allocation failures"),
++            })?;
 +        let page = match page {
 +            PageMemory::Cached(page)
 +            | PageMemory::Charged(page)
@@ -18826,7 +19298,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1831,912 @@
+@@ -653,4 +1844,912 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -25894,13 +26366,15 @@
          if let Some(guard) = self.tree.get(&name)? {
              let definition = guard.value();
              definition.check_match_untyped(table_type, name)?;
-@@ -210,12 +331,21 @@
+@@ -210,17 +331,28 @@
  }
  
  pub(crate) struct TableTreeMut<'txn> {
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) table_write_observer: crate::table_write_observer::ObserverSlot,
      tree: BtreeMut<'txn, &'static str, InternalTableDefinition>,
++    #[cfg(feature = "contextdb-internal")]
++    cached_master: std::cell::RefCell<Option<TableTree>>,
      guard: Arc<TransactionGuard>,
      mem: Arc<TransactionalMemory>,
      // Cached updates from tables that have been closed. These must be flushed to the btree.
@@ -25917,7 +26391,13 @@
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
      allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
  }
-@@ -228,6 +358,16 @@
+ 
+-impl TableTreeMut<'_> {
++impl<'txn> TableTreeMut<'txn> {
+     pub(crate) fn new(
+         master_root: Option<BtreeHeader>,
+         guard: Arc<TransactionGuard>,
+@@ -228,7 +360,19 @@
          freed_pages: Arc<Mutex<Vec<PageNumber>>>,
          allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
      ) -> Self {
@@ -25932,9 +26412,12 @@
 +            }
 +        };
          Self {
++            #[cfg(feature = "contextdb-internal")]
++            cached_master: std::cell::RefCell::new(None),
              tree: BtreeMut::new(
                  master_root,
-@@ -238,7 +378,14 @@
+                 guard.clone(),
+@@ -238,19 +382,68 @@
              ),
              guard,
              mem,
@@ -25950,7 +26433,48 @@
              freed_pages,
              allocated_pages,
          }
-@@ -250,7 +397,13 @@
+     }
+ 
++    fn mutable_tree(&mut self) -> &mut BtreeMut<'txn, &'static str, InternalTableDefinition> {
++        #[cfg(feature = "contextdb-internal")]
++        self.cached_master.get_mut().take();
++        &mut self.tree
++    }
++
++    fn with_read_master<R>(
++        &self,
++        operation: impl FnOnce(&TableTree) -> Result<R, TableError>,
++    ) -> Result<R, TableError> {
++        #[cfg(feature = "contextdb-internal")]
++        {
++            // One producer-owned root, bounded for this write transaction. Pending
++            // table headers are still overlaid by each caller after its lookup.
++            let mut cached = self.cached_master.borrow_mut();
++            if cached.is_none() {
++                *cached = Some(TableTree::new(
++                    self.tree.get_root(),
++                    PageHint::None,
++                    self.guard.clone(),
++                    self.mem.clone(),
++                )?);
++            }
++            operation(cached.as_ref().unwrap())
++        }
++        #[cfg(not(feature = "contextdb-internal"))]
++        {
++            let tree = TableTree::new(
++                self.tree.get_root(),
++                PageHint::None,
++                self.guard.clone(),
++                self.mem.clone(),
++            )?;
++            operation(&tree)
++        }
++    }
+     pub(crate) fn set_root(&mut self, root: Option<BtreeHeader>) {
+-        self.tree.set_root(root);
++        self.mutable_tree().set_root(root);
+         // Pending updates were staged for the old root and are invalid for the new one
          self.pending_table_updates.clear();
      }
  
@@ -25965,7 +26489,7 @@
      pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -285,16 +438,65 @@
+@@ -285,16 +478,65 @@
          table_root: Option<BtreeHeader>,
          length: u64,
      ) {
@@ -26033,7 +26557,7 @@
      }
  
      pub(crate) fn flush_and_close(
-@@ -318,62 +520,143 @@
+@@ -318,62 +560,155 @@
      }
  
      fn flush_inner(&mut self) -> Result<Option<BtreeHeader>> {
@@ -26116,24 +26640,6 @@
 -                    );
 -                    *table_root = tree.finalize_dirty_checksums()?;
 -                    *table_length = new_length;
--                }
--                InternalTableDefinition::Multimap {
--                    ref mut table_root,
--                    ref mut table_length,
--                    fixed_key_size,
--                    fixed_value_size,
--                    ..
--                } => {
--                    *table_root = finalize_tree_and_subtree_checksums(
--                        new_root,
--                        fixed_key_size,
--                        fixed_value_size,
--                        self.mem.clone(),
--                    )?;
--                    *table_length = new_length;
--                }
--            }
--            self.tree.insert(&name.as_str(), &definition)?;
 +                );
 +                tree.finalize_dirty_checksums()?
 +            }
@@ -26172,24 +26678,55 @@
 +        if let Err(error) = self.flush_table_root_updates_inner() {
 +            self.pending_failed = true;
 +            return Err(error);
-         }
-         Ok(self)
++        }
++        Ok(self)
 +    }
 +
 +    fn flush_table_root_updates_inner(&mut self) -> Result {
 +        while !self.pending_table_updates.is_empty() {
-+            // Move one paid key out, retaining it until publication succeeds.
-+            // Error exits retain this entry and all not-yet-published entries.
++            // Keep the original paid key in the map until publication succeeds.
++            // A bounded stack copy avoids a second allocation for ordinary names;
++            // wider names retain the same fully admitted owned-copy path.
 +            let first = self.pending_table_updates.keys().next().unwrap();
-+            let name = PendingName::try_new(first, self.pending_table_updates.allocator().clone())?;
-+            self.finalize_table_root(&name)?;
-+            let (root, length, _) = self.pending_table_updates[name.as_str()];
-+            let mut definition = {
-+                self.tree
-+                    .get(&name.as_str())?
-+                    .expect("pending table exists")
-+                    .value()
++            let length = first.len();
++            let mut inline_name = [0u8; 128];
++            let owned_name = if length <= inline_name.len() {
++                inline_name[..length].copy_from_slice(first.as_bytes());
++                None
++            } else {
++                Some(PendingName::try_new(
++                    first,
++                    self.pending_table_updates.allocator().clone(),
++                )?)
 +            };
++            let name = match &owned_name {
++                Some(owned) => owned.as_str(),
++                None => {
++                    std::str::from_utf8(&inline_name[..length]).expect("copied table-name UTF-8")
+                 }
+-                InternalTableDefinition::Multimap {
+-                    ref mut table_root,
+-                    ref mut table_length,
+-                    fixed_key_size,
+-                    fixed_value_size,
+-                    ..
+-                } => {
+-                    *table_root = finalize_tree_and_subtree_checksums(
+-                        new_root,
+-                        fixed_key_size,
+-                        fixed_value_size,
+-                        self.mem.clone(),
+-                    )?;
+-                    *table_length = new_length;
+-                }
+-            }
+-            self.tree.insert(&name.as_str(), &definition)?;
+-        }
+-        Ok(self)
++            };
++            self.finalize_table_root(name)?;
++            let (root, length, _) = self.pending_table_updates[name];
++            let mut definition = { self.tree.get(&name)?.expect("pending table exists").value() };
 +            let unchanged = match &definition {
 +                InternalTableDefinition::Normal { table_root, .. }
 +                | InternalTableDefinition::Multimap { table_root, .. } => *table_root == root,
@@ -26199,15 +26736,15 @@
 +                #[cfg(feature = "test-seams")]
 +                crate::commit_work::observe_root_work(
 +                    crate::commit_work::RootWorkKindForTest::PublishBegin,
-+                    Some(&name),
++                    Some(name),
 +                    None,
 +                    0,
 +                )?;
-+                self.tree.insert(&name.as_str(), &definition)?;
++                self.mutable_tree().insert(&name, &definition)?;
 +                #[cfg(feature = "test-seams")]
 +                crate::commit_work::observe_root_work(
 +                    crate::commit_work::RootWorkKindForTest::PublishEnd,
-+                    Some(&name),
++                    Some(name),
 +                    None,
 +                    0,
 +                )?;
@@ -26220,24 +26757,102 @@
 +                    InternalTableDefinition::as_bytes(&definition).len(),
 +                );
 +            }
-+            self.pending_table_updates.remove(name.as_str());
++            self.pending_table_updates.remove(name);
 +        }
 +        Ok(())
      }
  
      // Opens a table, calls the provided closure to insert entries into it, and then
-@@ -539,12 +822,28 @@
+@@ -396,7 +731,7 @@
+             )?
+             .map(|x| x.value());
+         if let Some(existing) = existing {
+-            self.tree.insert(&name, &existing)?;
++            self.mutable_tree().insert(&name, &existing)?;
+         }
+ 
+         let table_root = match self.tree.get(&name)?.unwrap().value() {
+@@ -421,7 +756,7 @@
+         let table_length = tree.get_root().map(|x| x.length).unwrap_or_default();
+ 
+         // Flush the root to the table tree, without allocating
+-        self.tree.insert_inplace(
++        self.mutable_tree().insert_inplace(
+             &name,
+             &InternalTableDefinition::new::<K, V>(TableType::Normal, table_root, table_length),
+         )?;
+@@ -441,7 +776,7 @@
+         assert!(self.tree.get(&name)?.is_none());
+ 
+         // Reserve space in the table tree
+-        self.tree.insert(
++        self.mutable_tree().insert(
+             &name,
+             &InternalTableDefinition::new::<K, V>(TableType::Normal, None, 0),
+         )?;
+@@ -461,7 +796,7 @@
+         let table_length = tree.get_root().map(|x| x.length).unwrap_or_default();
+ 
+         // Flush the root to the table tree, without allocating
+-        self.tree.insert_inplace(
++        self.mutable_tree().insert_inplace(
+             &name,
+             &InternalTableDefinition::new::<K, V>(TableType::Normal, table_root, table_length),
+         )?;
+@@ -470,7 +805,7 @@
+     }
+ 
+     pub(crate) fn finalize_dirty_checksums(&mut self) -> Result<Option<BtreeHeader>> {
+-        self.tree.finalize_dirty_checksums()
++        self.mutable_tree().finalize_dirty_checksums()
+     }
+ 
+     // root_page: the root of the master table
+@@ -489,13 +824,7 @@
+         name: &str,
+         table_type: TableType,
+     ) -> Result<Option<InternalTableDefinition>, TableError> {
+-        let tree = TableTree::new(
+-            self.tree.get_root(),
+-            PageHint::None,
+-            self.guard.clone(),
+-            self.mem.clone(),
+-        )?;
+-        let mut result = tree.get_table_untyped(name, table_type);
++        let mut result = self.with_read_master(|tree| tree.get_table_untyped(name, table_type));
+ 
+         if let Ok(Some(definition)) = result.as_mut()
+             && let Some((updated_root, updated_length, _)) = self.pending_table_updates.get(name)
+@@ -512,13 +841,7 @@
+         name: &str,
+         table_type: TableType,
+     ) -> Result<Option<InternalTableDefinition>, TableError> {
+-        let tree = TableTree::new(
+-            self.tree.get_root(),
+-            PageHint::None,
+-            self.guard.clone(),
+-            self.mem.clone(),
+-        )?;
+-        let mut result = tree.get_table::<K, V>(name, table_type);
++        let mut result = self.with_read_master(|tree| tree.get_table::<K, V>(name, table_type));
+ 
+         if let Ok(Some(definition)) = result.as_mut()
+             && let Some((updated_root, updated_length, _)) = self.pending_table_updates.get(name)
+@@ -539,12 +862,32 @@
              if self.get_table_untyped(new_name, table_type)?.is_some() {
                  return Err(TableError::TableExists(new_name.to_string()));
              }
 -            if let Some(update) = self.pending_table_updates.remove(name) {
 -                self.pending_table_updates
 -                    .insert(new_name.to_string(), update);
+-            }
+-            assert!(self.tree.remove(&name)?.is_some());
+-            assert!(self.tree.insert(&new_name, &definition)?.is_none());
 +            if let Some(update) = self.pending_table_updates.get(name).copied() {
 +                self.stage_pending(new_name, update)?;
 +                self.pending_table_updates.remove(name);
-             }
-             assert!(self.tree.remove(&name)?.is_some());
++            }
++            assert!(self.mutable_tree().remove(&name)?.is_some());
 +            #[cfg(feature = "test-seams")]
 +            crate::table_write_observer::record(
 +                &self.table_write_observer,
@@ -26246,7 +26861,11 @@
 +                name.as_bytes(),
 +                InternalTableDefinition::as_bytes(&definition).len(),
 +            );
-             assert!(self.tree.insert(&new_name, &definition)?.is_none());
++            assert!(
++                self.mutable_tree()
++                    .insert(&new_name, &definition)?
++                    .is_none()
++            );
 +            #[cfg(feature = "test-seams")]
 +            crate::table_write_observer::record(
 +                &self.table_write_observer,
@@ -26258,7 +26877,7 @@
          } else {
              return Err(TableError::TableDoesNotExist(name.to_string()));
          }
-@@ -570,6 +869,8 @@
+@@ -570,6 +913,8 @@
              for page in pages {
                  if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                      freed_pages.push(page);
@@ -26267,10 +26886,12 @@
                  }
              }
              drop(allocated_pages);
-@@ -578,6 +879,14 @@
+@@ -577,7 +922,15 @@
+ 
              self.pending_table_updates.remove(name);
  
-             let found = self.tree.remove(&name)?.is_some();
+-            let found = self.tree.remove(&name)?.is_some();
++            let found = self.mutable_tree().remove(&name)?.is_some();
 +            #[cfg(feature = "test-seams")]
 +            crate::table_write_observer::record(
 +                &self.table_write_observer,
@@ -26282,10 +26903,12 @@
              return Ok(found);
          }
  
-@@ -594,6 +903,14 @@
+@@ -593,7 +946,15 @@
+             found
          } else {
              let table = InternalTableDefinition::new::<K, V>(table_type, None, 0);
-             self.tree.insert(&name, &table)?;
+-            self.tree.insert(&name, &table)?;
++            self.mutable_tree().insert(&name, &table)?;
 +            #[cfg(feature = "test-seams")]
 +            crate::table_write_observer::record(
 +                &self.table_write_observer,
@@ -26297,7 +26920,7 @@
              table
          };
  
-@@ -660,21 +977,123 @@
+@@ -660,21 +1021,123 @@
                  definition.set_header(*updated_root, *updated_length);
              }
  
@@ -26313,12 +26936,17 @@
 -                    entry.key().to_string(),
 -                    (Some(new_root), definition.get_length(), false),
 -                );
+-            }
+-        }
+-
+-        self.tree.relocate(relocation_map)?;
+-
 +                self.stage_pending(&name, (Some(new_root), definition.get_length(), true))?;
-             }
-         }
- 
-         self.tree.relocate(relocation_map)?;
- 
++            }
++        }
++
++        self.mutable_tree().relocate(relocation_map)?;
++
 +        Ok(())
 +    }
 +
@@ -26420,12 +27048,12 @@
 +                self.stage_pending(name, (Some(root), definition.get_length(), true))?;
 +            }
 +        } else {
-+            self.tree.relocate(relocation_map)?;
++            self.mutable_tree().relocate(relocation_map)?;
 +        }
          Ok(())
      }
  
-@@ -761,6 +1180,193 @@
+@@ -761,6 +1224,193 @@
      }
  }
  

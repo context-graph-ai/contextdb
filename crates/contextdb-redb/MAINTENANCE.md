@@ -1204,3 +1204,79 @@ writer's `zeroed_for_write` construction point.
 | Changed source | Reason |
 |---|---|
 | `src/db.rs`, `src/transactions.rs` | Remove three expectations for the unknown `clippy::assert_is_empty` lint. The existing const-constructor assertions need no exception on Rust 1.94.0; constructor behavior and the minimum supported Rust version are unchanged. |
+
+
+## close1-append-work (57e545223f393764276289abc7a45ad830789f5a)
+
+### Immutable singleton payload locations
+
+The feature-internal singleton byte-value seam exposes opaque page/checksum handles
+from a producer's whole u64-keyed value and reads that exact leaf without traversing
+an unrelated allocation-tree path. Reads validate the handle's native geometry,
+producer value-length quote, singleton layout and complete native checksum before
+lending its bytes. A sliced guard retains the same original page and charge. The
+caller owns the table/root binding; the engine authenticates canonical bytes and
+keeps the captured transaction alive. Mutable guards never escape or extend their
+owning transaction's borrow.
+
+The lazy singleton-table opener retains its captured root and transaction without
+faulting an unrelated root page. Relocation lends the actual existing finite map
+to a transaction-scoped callback; the callback visits only moved singleton leaves
+and lets the engine rebind its live locations in that same relocation transaction.
+No cloned relocation map or allocation-sized side directory is introduced. A
+failed deferred internal operation is retained by the transaction so publication
+refuses atomically. The engine chooses its payload/locator layout and reclamation
+policy outside the fork. Qualification remains pending until the engine's original
+append, fast-work, snapshot, crash and recovery gates pass.
+
+| Changed source | Retained delta |
+|---|---|
+| `src/table.rs` | Hidden singleton byte-table accessors and exact native capacity/maximum quotes. |
+| `src/tree_store/btree.rs` | Exact native singleton handle reads and leaf-capacity quotes. |
+| `src/tree_store/btree_base.rs` | Whole-value native handles, bounded singleton layout validation, original-page slicing and mutable byte access. |
+| `src/transactions.rs` | Lazy captured singleton opener, transaction identity, deferred error custody and borrowed relocation-map visitation. |
+| `src/db.rs` | Existing bounded deferred reclamation accepts a transactional engine hook, including when native fragmentation is low. |
+
+Propose exact opaque singleton locations and borrowed relocation notifications as
+small storage primitives upstream; neither proposal has been submitted. The full
+source-only patch is regenerated against the checksum-verified redb 4.1.0 archive.
+
+The internal write namespace retains one paid immutable master-directory root view
+across metadata lookups. Every native directory mutation releases that view before
+modification; pending table-root updates still overlay each typed lookup. The view
+and its existing page charge end with the transaction. This avoids repeatedly
+faulting the same root between changes while retaining table-type validation.
+
+Every writer-table close retains the original paid pending name and complete
+root header until publication succeeds, including unchanged roots. Publication
+uses a 128-byte stack copy for names that fit and the original admitted owned-copy
+path for wider names; the original paid pending name remains until success.
+
+| Changed source | Retained delta |
+|---|---|
+| `src/tree_store/table_tree.rs` | Internal write-namespace master-root retention with invalidation before all native mutations. |
+
+Immutable singleton inputs read by a write transaction are transient builder
+work: clean-cache hits use the existing peek operation and misses enter at low
+priority. They retain their genuine page admission and complete native checksum.
+Captured read transactions retain normal lookup behavior. Cache capacity,
+source invoices, native geometry checks and page-request observations are unchanged.
+
+The deferred-reclaim callback receives the exclusive native cycle boundary.
+The engine uses that real producer transaction ID to defer newer retirement
+records to a later cycle, so foreground writes cannot extend the captured cohort.
+The callback shares the existing maintenance entry allowance, while native
+reclamation retains its existing extent and entry ceilings. Cursor, bitmap,
+payload removal and native frees remain in one atomic transaction.
+
+| Changed source | Retained delta |
+|---|---|
+| `src/tree_store/page_store/base.rs`, `src/tree_store/page_store/cached_file.rs`, `src/tree_store/btree.rs` | Writer-only transient immutable-singleton cache treatment; captured reads retain normal caching and all lookups retain actual admission and authentication. |
+| `src/db.rs` | Pass the actual exclusive native cycle boundary to finite caller-owned garbage reclamation. |
+
+Writer scopes additionally bound completed dirty-buffer retention by the existing
+half-cache quote over the original accountant's current declared limit. A handle
+opened before a limit change therefore releases completed unreferenced dirty pages
+through the existing writeback path under its current budget. An allocation-free
+thread-local hint restores its caller on nesting and unwind. Serving-cache capacity,
+source invoices, external alias custody and failed-write reinsertion are unchanged.

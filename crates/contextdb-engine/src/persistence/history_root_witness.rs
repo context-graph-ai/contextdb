@@ -171,6 +171,7 @@ impl RedbPersistence {
         name: &str,
         event: redb::TableRootEvent,
     ) -> std::result::Result<(), redb::StorageError> {
+        content_identity::payloads::relocation_event(write, name, event)?;
         if !protected(name) {
             return Ok(());
         }

@@ -545,7 +545,19 @@ impl RedbPersistence {
         let database = self.db.read().map_err(Self::storage_error)?;
         match database.as_ref() {
             Some(database) => database
-                .reclaim_deferred_step(boundary, RECLAIM_EXTENTS_PER_STEP, RECLAIM_ENTRIES_PER_STEP)
+                .reclaim_deferred_step_with_hook(
+                    boundary,
+                    RECLAIM_EXTENTS_PER_STEP,
+                    RECLAIM_ENTRIES_PER_STEP,
+                    |write, before| {
+                        content_identity::payloads::reclaim_before(
+                            write,
+                            RECLAIM_ENTRIES_PER_STEP,
+                            before,
+                        )
+                        .map(|work| work.0 != 0)
+                    },
+                )
                 .map_err(Self::storage_error),
             None => Ok(redb::ReclaimStep::Drained),
         }

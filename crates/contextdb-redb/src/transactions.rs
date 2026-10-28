@@ -1047,6 +1047,8 @@ pub struct WriteTransaction {
     #[cfg(feature = "contextdb-internal")]
     table_root_hook: Option<TableRootHook>,
     table_root_hook_error: Mutex<Option<StorageError>>,
+    #[cfg(feature = "contextdb-internal")]
+    active_relocations: Mutex<Option<HashMap<PageNumber, PageNumber>>>,
 }
 
 /// Caller-owned observation of one actual write's publication interval.
@@ -1328,6 +1330,8 @@ impl WriteTransaction {
             #[cfg(feature = "contextdb-internal")]
             table_root_hook: None,
             table_root_hook_error: Mutex::new(None),
+            #[cfg(feature = "contextdb-internal")]
+            active_relocations: Mutex::new(None),
         })
     }
 
@@ -1469,6 +1473,66 @@ impl WriteTransaction {
     /// addition to the reader floor. The ceiling only ever lowers what may be freed.
     pub(crate) fn set_reclaim_ceiling(&mut self, ceiling: TransactionId) {
         self.reclaim_ceiling = Some(ceiling);
+    }
+
+    /// Borrow the actual finite relocation map and each moved singleton leaf.
+    /// Call only for a u64-keyed singleton byte table from its relocation hook.
+    /// Branch pages are skipped; guards cannot escape the callback's borrow.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn visit_relocated_u64_singletons(
+        &self,
+        mut visit: impl for<'a> FnMut(
+            [u8; 8],
+            [u8; 24],
+            u64,
+            AccessGuard<'a, &'static [u8]>,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(map) = self.active_relocations.lock().unwrap().as_ref() {
+            for (old, new) in map {
+                let page = self.mem.get_page(*new, PageHint::None)?;
+                let bytes = page.memory();
+                if bytes.first() == Some(&crate::tree_store::BRANCH) {
+                    continue;
+                }
+                if bytes.len() < 16
+                    || bytes[0] != crate::tree_store::LEAF
+                    || u16::from_le_bytes(bytes[2..4].try_into().unwrap()) != 1
+                {
+                    return Err(StorageError::Corrupted(
+                        "relocated payload is not a singleton".into(),
+                    ));
+                }
+                let end = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+                if end < 16 || end > bytes.len() {
+                    return Err(StorageError::Corrupted(
+                        "relocated singleton offsets are invalid".into(),
+                    ));
+                }
+                let key = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                let value = AccessGuard::with_page(page, 16..end);
+                let handle = value.singleton_u64_handle(key)?;
+                visit(old.to_le_bytes(), handle, key, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve a deferred internal operation failure so commit refuses atomically.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn record_internal_operation_error(&self, error: StorageError) {
+        let mut failure = self.table_root_hook_error.lock().unwrap();
+        if failure.is_none() {
+            *failure = Some(error);
+        }
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn native_transaction_id(&self) -> u64 {
+        self.transaction_id.raw_id()
     }
 
     #[cfg(any(test, feature = "contextdb-internal"))]
@@ -3386,7 +3450,10 @@ impl WriteTransaction {
             && !relocation_map.is_empty()
             && let Some(name) = target.as_deref()
         {
-            self.call_table_root_hook(name, TableRootEvent::AfterRelocate)?;
+            *self.active_relocations.lock().unwrap() = Some(relocation_map);
+            let result = self.call_table_root_hook(name, TableRootEvent::AfterRelocate);
+            relocation_map = self.active_relocations.lock().unwrap().take().unwrap();
+            result?;
         }
         #[cfg(all(test, debug_assertions))]
         online_relocation_tests::RELOCATIONS.with(|pairs| {
@@ -3971,6 +4038,30 @@ impl ReadTransaction {
                 self.tree.transaction_guard().clone(),
                 self.mem.clone(),
             )?),
+            InternalTableDefinition::Multimap { .. } => unreachable!(),
+        }
+    }
+
+    /// Retain a singleton u64 byte table's captured root without faulting it.
+    /// Exact physical handles still admit and verify their selected native leaf.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_singleton_u64_table(
+        &self,
+        definition: TableDefinition<u64, &'static [u8]>,
+    ) -> Result<ReadOnlyTable<u64, &'static [u8]>, TableError> {
+        let header = self
+            .tree
+            .get_table::<u64, &[u8]>(definition.name(), TableType::Normal)?
+            .ok_or_else(|| TableError::TableDoesNotExist(definition.name().to_string()))?;
+        match header {
+            InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new_singleton(
+                definition.name().to_string(),
+                table_root,
+                self.tree.hint(),
+                self.tree.transaction_guard().clone(),
+                self.mem.clone(),
+            )),
             InternalTableDefinition::Multimap { .. } => unreachable!(),
         }
     }

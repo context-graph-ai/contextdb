@@ -1057,7 +1057,15 @@ impl PagedCachedFile {
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
         {
             let read_lock = self.read_cache[cache_slot].read().unwrap();
-            if let Some(cached) = read_lock.get(offset) {
+            #[cfg(feature = "contextdb-internal")]
+            let cached = if hint.is_transient() {
+                read_lock.peek(offset)
+            } else {
+                read_lock.get(offset)
+            };
+            #[cfg(not(feature = "contextdb-internal"))]
+            let cached = read_lock.get(offset);
+            if let Some(cached) = cached {
                 #[cfg(feature = "cache_metrics")]
                 self.reads_hits.fetch_add(1, Ordering::Release);
                 debug_assert_eq!(cached.len(), len);
@@ -1069,7 +1077,7 @@ impl PagedCachedFile {
         let scan_replace = crate::read_admission::scan_reads_active()
             && !crate::read_admission::declared_scan_reads_active()
             && !crate::read_admission::take_scan_growth(cached_page_bytes(len));
-        self.cache_loaded_page(offset, len, buffer, scan_replace)
+        self.cache_loaded_page(offset, len, buffer, scan_replace, hint.is_transient())
     }
 
     fn cache_loaded_page(
@@ -1078,6 +1086,7 @@ impl PagedCachedFile {
         len: usize,
         buffer: PageAllocation,
         scan_replace: bool,
+        transient: bool,
     ) -> Result<PageMemory> {
         // Serialize publication with read-capacity changes. Release this lock
         // before transferring an opaque source receipt or dropping displacement.
@@ -1126,7 +1135,7 @@ impl PagedCachedFile {
                 || (offset == 0 && len == DB_HEADER_SIZE)
         );
         let mut write_lock = self.read_cache[cache_slot].write().unwrap();
-        let inserted = if scan_replace {
+        let inserted = if scan_replace || transient {
             write_lock.try_insert_lowest_priority(offset, buffer.clone())
         } else {
             write_lock.try_insert(offset, buffer.clone())
@@ -1287,11 +1296,15 @@ impl PagedCachedFile {
             self.retire_control_buffers(lock)?;
         }
         let (previous, payment) = CachePayment::reserve(&self.write_buffer_bytes, bytes)?;
-        let half = if control_write {
-            0
-        } else {
-            self.max_cache_size.load(Ordering::Acquire) / 2
-        };
+        let half = self.max_cache_size.load(Ordering::Acquire) / 2;
+        // Source-funded dirty pages follow the effective writer's existing
+        // cache sizing rule, even if this handle opened before its budget was
+        // declared. This only spills completed buffers; live aliases stay paid.
+        #[cfg(feature = "contextdb-internal")]
+        let half = half.min(
+            crate::native_storage_admission::native_storage_write_buffer_limit().unwrap_or(half),
+        );
+        let half = if control_write { 0 } else { half };
         let write_bytes = previous + bytes;
         if write_bytes > half {
             let excess = write_bytes - half;
@@ -1481,15 +1494,15 @@ impl PagedCachedFile {
         }
         // The shared cache takes custody under its actual fixed reserve; if
         // it cannot, the page keeps its genuine original source invoice.
-        let page =
-            self.cache_loaded_page(offset, len, page, false)
-                .map_err(|error| match error {
-                    StorageError::Native(error) => error,
-                    StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
-                        NativeColdFault::new("native cache capacity overflow"),
-                    ),
-                    _ => unreachable!("cache insertion retains native allocation failures"),
-                })?;
+        let page = self
+            .cache_loaded_page(offset, len, page, false, false)
+            .map_err(|error| match error {
+                StorageError::Native(error) => error,
+                StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
+                    NativeColdFault::new("native cache capacity overflow"),
+                ),
+                _ => unreachable!("cache insertion retains native allocation failures"),
+            })?;
         let page = match page {
             PageMemory::Cached(page)
             | PageMemory::Charged(page)

@@ -264,6 +264,67 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
     }
 }
 
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn singleton_u64_range(page: &impl Page, key: u64) -> Result<Range<usize>> {
+    let bytes = page.memory();
+    if bytes.len() < 16
+        || bytes[0] != LEAF
+        || u16::from_le_bytes(bytes[2..4].try_into().unwrap()) != 1
+        || bytes[8..16] != key.to_le_bytes()
+    {
+        return Err(StorageError::Corrupted(
+            "invalid singleton u64 payload leaf".into(),
+        ));
+    }
+    let end = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if end < 16 || end > bytes.len() {
+        return Err(StorageError::Corrupted(
+            "singleton value exceeds its native leaf".into(),
+        ));
+    }
+    Ok(16..end)
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl AccessGuard<'_, &'static [u8]> {
+    /// A singleton u64-keyed byte value's native page identity and checksum.
+    /// The opaque scalar handle grants no borrow and copies no backing.
+    #[doc(hidden)]
+    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
+        let EitherPage::Immutable(page) = &self.page else {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a native page".into(),
+            ));
+        };
+        let range = singleton_u64_range(page, key)?;
+        if self.offset != range.start
+            || self.len != range.len()
+            || !matches!(self.on_drop, OnDrop::None)
+        {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a whole value".into(),
+            ));
+        }
+        let mut handle = [0; 24];
+        handle[..8].copy_from_slice(&page.get_page_number().to_le_bytes());
+        handle[8..].copy_from_slice(&leaf_checksum(page, Some(8), None)?.to_le_bytes());
+        Ok(handle)
+    }
+
+    /// Retain the original page and select an admitted subrecord without copying it.
+    #[doc(hidden)]
+    pub fn slice_bytes(mut self, range: Range<usize>) -> Result<Self> {
+        if range.start > range.end || range.end > self.len {
+            return Err(StorageError::Corrupted(
+                "payload range exceeds its stored value".into(),
+            ));
+        }
+        self.offset += range.start;
+        self.len = range.len();
+        Ok(self)
+    }
+}
+
 impl<V: Value + 'static> Drop for AccessGuard<'_, V> {
     fn drop(&mut self) {
         match self.on_drop {
@@ -403,6 +464,31 @@ impl<V: MutInPlaceValue + 'static> AccessGuardMut<'_, V> {
     }
 }
 
+#[cfg(feature = "contextdb-internal")]
+impl<V: Value + 'static> AccessGuardMut<'_, V> {
+    /// Native identity and checksum after this whole singleton value is filled.
+    #[doc(hidden)]
+    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
+        let range = singleton_u64_range(&self.page, key)?;
+        if self.offset != range.start || self.len != range.len() {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a whole value".into(),
+            ));
+        }
+        let mut handle = [0; 24];
+        handle[..8].copy_from_slice(&self.page.get_page_number().to_le_bytes());
+        handle[8..].copy_from_slice(&leaf_checksum(&self.page, Some(8), None)?.to_le_bytes());
+        Ok(handle)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl<V: MutInPlaceValue + 'static> AsMut<V::BaseRefType> for AccessGuardMut<'_, V> {
+    fn as_mut(&mut self) -> &mut V::BaseRefType {
+        self.value_mut()
+    }
+}
+
 impl<V: Value + 'static> Drop for AccessGuardMut<'_, V> {
     fn drop(&mut self) {
         // no-op. This Drop impl is only here to ensure that self is dropped before the transaction
@@ -425,6 +511,24 @@ impl<'a, V: Value + 'static> AccessGuardMutInPlace<'a, V> {
             len,
             _value_type: Default::default(),
         }
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl<V: Value + 'static> AccessGuardMutInPlace<'_, V> {
+    /// Native identity and checksum after this whole singleton value is filled.
+    #[doc(hidden)]
+    pub fn singleton_u64_handle(&self, key: u64) -> Result<[u8; 24]> {
+        let range = singleton_u64_range(&self.page, key)?;
+        if self.offset != range.start || self.len != range.len() {
+            return Err(StorageError::Corrupted(
+                "singleton handle needs a whole value".into(),
+            ));
+        }
+        let mut handle = [0; 24];
+        handle[..8].copy_from_slice(&self.page.get_page_number().to_le_bytes());
+        handle[8..].copy_from_slice(&leaf_checksum(&self.page, Some(8), None)?.to_le_bytes());
+        Ok(handle)
     }
 }
 

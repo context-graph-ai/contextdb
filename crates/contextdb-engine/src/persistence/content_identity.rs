@@ -12,6 +12,7 @@ use super::{
     RedbPersistence,
 };
 use crate::direct_file_reader::DirectTypedImageDigest;
+pub(crate) mod payloads;
 #[cfg(test)]
 #[cfg_attr(
     not(feature = "test-seams"),
@@ -26,6 +27,7 @@ use contextdb_core::{
     AdjEntry, Error, Lsn, Result, RowId, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
     VectorQuantization, VersionedRow,
 };
+use payloads::{CanonicalNodeSource, NodeReadTable, NodeWriteTable};
 use redb::{ReadOnlyTable, ReadableDatabase, ReadableTable, TableHandle};
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -636,7 +638,7 @@ fn observe_node_remove() {
 }
 
 const IDENTITY_VERSION_KEY: &str = "logical_content_identity_version";
-const IDENTITY_VERSION: &[u8] = b"canonical-key-pages";
+const IDENTITY_VERSION: &[u8] = b"canonical-payload-pages";
 const NODE_VERSION: u8 = 1;
 const ROOT_VERSION: u8 = 2;
 const ORDERED_POSTING_MAGIC: &[u8] = b"\xffcontextdb-index-posting\0";
@@ -1491,6 +1493,29 @@ pub(crate) fn config_mutations(key: &str, value: Option<&[u8]>) -> Vec<ContentId
     }]
 }
 
+// One protected native handle is retained across this publication and its
+// derived pending-record publications. Native hooks authenticate on first open
+// and capture the complete replacement on the final close.
+type LineageWriteTable<'txn> = Option<redb::Table<'txn, &'static str, &'static [u8]>>;
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error retains inline native refusal diagnostics."
+)]
+fn lineage_table<'a, 'txn>(
+    write: &'txn redb::WriteTransaction,
+    held: &'a mut LineageWriteTable<'txn>,
+) -> Result<&'a mut redb::Table<'txn, &'static str, &'static [u8]>> {
+    if held.is_none() {
+        *held = Some(
+            write
+                .open_table(super::READ_LINEAGE_CONFIG_TABLE)
+                .map_err(RedbPersistence::storage_error)?,
+        );
+    }
+    Ok(held.as_mut().expect("lineage handle initialized"))
+}
+
 /// Read the old occurrence from the still-unmodified compact mirror. The
 /// canonical configuration may already contain the replacement in this write.
 #[expect(
@@ -1498,14 +1523,11 @@ pub(crate) fn config_mutations(key: &str, value: Option<&[u8]>) -> Vec<ContentId
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn pending_delete_positions(
-    write: &redb::WriteTransaction,
+    records: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &str,
     value: Option<&[u8]>,
 ) -> Result<(Option<Lsn>, Option<Lsn>)> {
     let old = {
-        let records = write
-            .open_table(super::READ_LINEAGE_CONFIG_TABLE)
-            .map_err(RedbPersistence::storage_error)?;
         records
             .get(key)
             .map_err(RedbPersistence::storage_error)?
@@ -2065,7 +2087,7 @@ fn chunk_id_checkpoint(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn resolve_key_checkpoint<'a>(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     key: &'a [u8],
     checkpoint: &mut dyn FnMut() -> Result<()>,
@@ -2084,7 +2106,7 @@ fn resolve_key_checkpoint<'a>(
     let id = key_hash_checkpoint(key, checkpoint)?;
     let stored_key = node_storage_key(family, &id);
     let blob = table
-        .get(stored_key.as_slice())
+        .canonical_get(stored_key.as_slice())
         .map_err(RedbPersistence::storage_error)?
         .ok_or_else(|| Error::Other("authenticated separator key is missing".into()))?;
     let bytes = blob.value();
@@ -2115,7 +2137,7 @@ fn resolve_key_checkpoint<'a>(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn resolve_key_charged_checkpoint<'a>(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     key: &'a [u8],
     admission: &mut ProofAdmission,
@@ -3371,7 +3393,7 @@ fn encoded_key(level: u32, key: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn resolve_key<'a>(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     key: &'a [u8],
 ) -> Result<std::borrow::Cow<'a, [u8]>> {
@@ -3392,7 +3414,7 @@ fn resolve_key<'a>(
     let id = key_hash(key);
     let stored_key = node_storage_key(family, &id);
     let blob = table
-        .get(stored_key.as_slice())
+        .canonical_get(stored_key.as_slice())
         .map_err(RedbPersistence::storage_error)?
         .ok_or_else(|| Error::Other("authenticated separator key is missing".into()))?;
     let bytes = blob.value();
@@ -3416,7 +3438,7 @@ fn resolve_key<'a>(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn resolve_key_charged<'a>(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     key: &'a [u8],
     admission: &mut ProofAdmission,
@@ -3720,7 +3742,7 @@ fn decode_node(family: LogicalFamily, bytes: &[u8]) -> Result<Node> {
     )
 )]
 fn read_node(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     id: [u8; 32],
 ) -> Result<Node> {
@@ -3739,7 +3761,7 @@ fn read_node(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn read_node_charged(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     id: [u8; 32],
     admission: &mut ProofAdmission,
@@ -3748,7 +3770,7 @@ fn read_node_charged(
     let read_started = std::time::Instant::now();
     let stored_key = node_storage_key(family, &id);
     let encoded = table
-        .get(stored_key.as_slice())
+        .canonical_get(stored_key.as_slice())
         .map_err(RedbPersistence::storage_error)?
         .ok_or_else(|| Error::Other("logical identity tree references a missing chunk".into()))?;
     #[cfg(any(test, feature = "test-seams"))]
@@ -3819,13 +3841,13 @@ fn precharged_node_bytes(encoded: &[u8]) -> usize {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn stored_node_precharge_bytes(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     id: [u8; 32],
 ) -> Result<usize> {
     let stored_key = node_storage_key(family, &id);
     let encoded = table
-        .get(stored_key.as_slice())
+        .canonical_get(stored_key.as_slice())
         .map_err(RedbPersistence::storage_error)?
         .ok_or_else(|| Error::Other("logical identity tree references a missing chunk".into()))?;
     Ok(precharged_node_bytes(encoded.value()))
@@ -4549,7 +4571,7 @@ const fn proof_path_bytes(height: u32) -> usize {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn resolving_key_cmp(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     left: &[u8],
     right: &[u8],
@@ -4591,7 +4613,7 @@ fn resolving_key_cmp(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn resolving_entry_search(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    table: &impl CanonicalNodeSource,
     family: LogicalFamily,
     entries: &[PageEntry],
     key: &[u8],
@@ -5831,7 +5853,7 @@ pub(crate) struct ContentIdentityReadVerifier {
     /// Set commitment of the complete per-row lineage copy, read from the
     /// same Configuration family-root record.
     lineage_config_root: [u8; 32],
-    nodes: ReadOnlyTable<&'static [u8], &'static [u8]>,
+    nodes: NodeReadTable,
     verified_records: Mutex<BTreeMap<[u8; 33], VerifiedRecordWitness>>,
     /// The store this verifier authenticates against, so every refusal it
     /// returns is the existing typed corruption error rather than an untyped
@@ -6206,8 +6228,7 @@ impl ContentIdentityReadVerifier {
             )
         })?;
         drop(roots_table);
-        let nodes = read_txn
-            .open_table(CONTENT_IDENTITY_NODES_TABLE)
+        let nodes = crate::persistence::content_identity::payloads::open(&read_txn)
             .map_err(RedbPersistence::storage_error)?;
         let mut resident = ResidentProofChunkSet::idle();
         resident.accountant = admission.as_ref().map(|accountant| {
@@ -8175,8 +8196,7 @@ impl RedbPersistence {
     ) -> Result<()> {
         Self::initialize_ddl_selectors_in_write(write_txn)?;
         super::content_size::initialize(write_txn)?;
-        let mut nodes = write_txn
-            .open_table(CONTENT_IDENTITY_NODES_TABLE)
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write_txn)
             .map_err(Self::storage_error)?;
         Self::delete_proof_nodes_in_admitted_batches(&mut nodes, None, admission)?;
         drop(nodes);
@@ -8223,8 +8243,7 @@ impl RedbPersistence {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        let mut nodes = write_txn
-            .open_table(CONTENT_IDENTITY_NODES_TABLE)
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write_txn)
             .map_err(Self::storage_error)?;
         for family in &selected {
             Self::delete_proof_nodes_in_admitted_batches(&mut nodes, Some(*family), admission)?;
@@ -8256,7 +8275,7 @@ impl RedbPersistence {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn delete_proof_nodes_in_admitted_batches(
-        nodes: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+        nodes: &mut NodeWriteTable<'_>,
         family: Option<LogicalFamily>,
         admission: &mut ProofAdmission,
     ) -> Result<()> {
@@ -8318,11 +8337,12 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn maintain_pending_delete_index_in_write(
-        write: &redb::WriteTransaction,
+    fn maintain_pending_delete_index_in_write<'txn>(
+        write: &'txn redb::WriteTransaction,
         key: &str,
         value: Option<&[u8]>,
         admission: &mut ProofAdmission,
+        lineage: &mut LineageWriteTable<'txn>,
     ) -> Result<()> {
         let _decode = if let Some(reader) = admission.reader_budget.as_ref() {
             crate::read_image_memory::ImageMemory::operation_reader(
@@ -8338,7 +8358,7 @@ impl RedbPersistence {
         } else {
             crate::read_image_memory::ImageMemory::enter_decode_call()?
         };
-        let (old, new) = pending_delete_positions(write, key, value)?;
+        let (old, new) = pending_delete_positions(lineage_table(write, lineage)?, key, value)?;
         if old.is_none() && new.is_none() {
             return Ok(());
         }
@@ -8371,10 +8391,13 @@ impl RedbPersistence {
             write_pending_delete_mutation(write, &mutation)?;
             // Publish the derived Configuration member before the enclosing
             // call samples family roots. This key cannot derive another key.
-            Self::apply_content_identity_mutations_in_write(
+            Self::apply_content_identity_with_lineage_in_write(
                 write,
                 std::slice::from_ref(&mutation),
+                &[],
                 admission,
+                None,
+                lineage,
             )?;
         }
         Ok(())
@@ -8416,6 +8439,29 @@ impl RedbPersistence {
         manifests: &[ContentIdentityMutation],
         admission: &mut ProofAdmission,
         groups: Option<&super::custody_groups::GroupPlan>,
+    ) -> Result<DirectTypedImageDigest> {
+        let mut lineage = None;
+        Self::apply_content_identity_with_lineage_in_write(
+            write_txn,
+            mutations,
+            manifests,
+            admission,
+            groups,
+            &mut lineage,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline native refusal diagnostics."
+    )]
+    fn apply_content_identity_with_lineage_in_write<'txn>(
+        write_txn: &'txn redb::WriteTransaction,
+        mutations: &[ContentIdentityMutation],
+        manifests: &[ContentIdentityMutation],
+        admission: &mut ProofAdmission,
+        groups: Option<&super::custody_groups::GroupPlan>,
+        lineage: &mut LineageWriteTable<'txn>,
     ) -> Result<DirectTypedImageDigest> {
         #[cfg(test)]
         let _capture_apply = crate::memory_accounting::compaction_admission_capture::Phase::apply();
@@ -8496,16 +8542,20 @@ impl RedbPersistence {
                     )?;
                 }
                 if super::read_image_lineage_config_key(key) {
+                    // Retain the protected native handle in the enclosing publication.
+                    lineage_table(write_txn, lineage)?;
                     if key.starts_with(crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX) {
                         Self::maintain_pending_delete_index_in_write(
                             write_txn,
                             key,
                             mutation.encoded_value()?,
                             admission,
+                            lineage,
                         )?;
                     }
-                    Self::write_read_lineage_config_entry(
+                    Self::write_read_lineage_config_entry_in_table(
                         write_txn,
+                        lineage_table(write_txn, lineage)?,
                         key,
                         mutation.encoded_value()?,
                     )?;
@@ -8781,8 +8831,7 @@ impl RedbPersistence {
 
                 #[cfg(any(test, feature = "test-seams"))]
                 observe_identity_span(IdentitySpan::CoalesceAndGroup, group_started);
-                let mut nodes = write_txn
-                    .open_table(CONTENT_IDENTITY_NODES_TABLE)
+                let mut nodes = crate::persistence::content_identity::payloads::open(&write_txn)
                     .map_err(Self::storage_error)?;
                 for family in LogicalFamily::ALL {
                     let mut mutations = std::mem::take(&mut grouped[family as usize]);
@@ -10167,7 +10216,7 @@ pub(crate) mod original_writer {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn resolve_key_charged<'a>(
-        table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        table: &impl CanonicalNodeSource,
         family: LogicalFamily,
         key: &'a [u8],
         admission: &mut ProofAdmission,
@@ -10194,7 +10243,7 @@ pub(crate) mod original_writer {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn read_node_charged(
-        table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        table: &impl CanonicalNodeSource,
         family: LogicalFamily,
         id: [u8; 32],
         admission: &mut ProofAdmission,
@@ -10203,7 +10252,7 @@ pub(crate) mod original_writer {
         let read_started = std::time::Instant::now();
         let stored_key = node_storage_key(family, &id);
         let encoded = table
-            .get(stored_key.as_slice())
+            .canonical_get(stored_key.as_slice())
             .map_err(RedbPersistence::storage_error)?
             .ok_or_else(|| {
                 Error::Other("logical identity tree references a missing chunk".into())
@@ -10461,16 +10510,17 @@ pub(crate) mod original_writer {
             clippy::result_large_err,
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
-        fn maintain_owned_pending_delete_index_in_write(
-            write: &redb::WriteTransaction,
+        fn maintain_owned_pending_delete_index_in_write<'txn>(
+            write: &'txn redb::WriteTransaction,
             key: &str,
             value: Option<&[u8]>,
             admission: &mut ProofAdmission,
+            lineage: &mut LineageWriteTable<'txn>,
         ) -> Result<()> {
             let _decode = crate::read_image_memory::ImageMemory::enter_writer_operation(
                 admission.original.accountant().clone(),
             )?;
-            let (old, new) = pending_delete_positions(write, key, value)?;
+            let (old, new) = pending_delete_positions(lineage_table(write, lineage)?, key, value)?;
             if old.is_none() && new.is_none() {
                 return Ok(());
             }
@@ -10499,11 +10549,13 @@ pub(crate) mod original_writer {
                 let _credit = admission.detach(bytes);
                 let mutation = pending_delete_mutation(key, position, present)?;
                 write_pending_delete_mutation(write, &mutation)?;
-                Self::apply_owned_content_identity_with_manifests_in_write(
+                Self::apply_owned_content_identity_with_lineage_in_write(
                     write,
                     std::slice::from_ref(&mutation),
                     &[],
                     admission,
+                    None,
+                    lineage,
                 )?;
             }
             Ok(())
@@ -10537,6 +10589,29 @@ pub(crate) mod original_writer {
             manifests: &[ContentIdentityMutation],
             admission: &mut ProofAdmission,
             groups: Option<&super::super::custody_groups::GroupPlan>,
+        ) -> Result<DirectTypedImageDigest> {
+            let mut lineage = None;
+            Self::apply_owned_content_identity_with_lineage_in_write(
+                write_txn,
+                mutations,
+                manifests,
+                admission,
+                groups,
+                &mut lineage,
+            )
+        }
+
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error retains inline native refusal diagnostics."
+        )]
+        fn apply_owned_content_identity_with_lineage_in_write<'txn>(
+            write_txn: &'txn redb::WriteTransaction,
+            mutations: &[ContentIdentityMutation],
+            manifests: &[ContentIdentityMutation],
+            admission: &mut ProofAdmission,
+            groups: Option<&super::super::custody_groups::GroupPlan>,
+            lineage: &mut LineageWriteTable<'txn>,
         ) -> Result<DirectTypedImageDigest> {
             #[cfg(test)]
             let _capture_apply =
@@ -10624,6 +10699,8 @@ pub(crate) mod original_writer {
                         )?;
                     }
                     if super::super::read_image_lineage_config_key(key) {
+                        // Retain the protected native handle in the enclosing publication.
+                        lineage_table(write_txn, lineage)?;
                         if key.starts_with(crate::database::Database::DURABLE_LINEAGE_CONFIG_PREFIX)
                         {
                             Self::maintain_owned_pending_delete_index_in_write(
@@ -10631,10 +10708,12 @@ pub(crate) mod original_writer {
                                 key,
                                 mutation.encoded_value()?,
                                 admission,
+                                lineage,
                             )?;
                         }
-                        Self::write_read_lineage_config_entry(
+                        Self::write_read_lineage_config_entry_in_table(
                             write_txn,
+                            lineage_table(write_txn, lineage)?,
                             key,
                             mutation.encoded_value()?,
                         )?;
@@ -10866,8 +10945,7 @@ pub(crate) mod original_writer {
 
                 #[cfg(any(test, feature = "test-seams"))]
                 observe_identity_span(IdentitySpan::CoalesceAndGroup, group_started);
-                let mut nodes = write_txn
-                    .open_table(CONTENT_IDENTITY_NODES_TABLE)
+                let mut nodes = crate::persistence::content_identity::payloads::open(&write_txn)
                     .map_err(Self::storage_error)?;
                 for family in LogicalFamily::ALL {
                     let mut mutations = std::mem::take(&mut grouped[family as usize]);
@@ -11143,7 +11221,7 @@ pub(crate) mod original_writer {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
         fn with_history_window<T>(
-            table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+            table: &NodeWriteTable<'_>,
             admission: &mut ProofAdmission,
             root: &FamilyRoot,
             bounds: (&[u8], &[u8], bool),
@@ -11182,7 +11260,7 @@ pub(crate) mod original_writer {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
         pub(super) fn history_member(
-            table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+            table: &NodeWriteTable<'_>,
             admission: &mut ProofAdmission,
             root: &FamilyRoot,
             key: &[u8],
@@ -11201,7 +11279,7 @@ pub(crate) mod original_writer {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
         pub(super) fn history_commit_extreme(
-            table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+            table: &NodeWriteTable<'_>,
             admission: &mut ProofAdmission,
             root: &FamilyRoot,
             reverse: bool,
@@ -11229,7 +11307,7 @@ pub(crate) mod original_writer {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
         pub(super) fn history_ddl_extreme(
-            table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+            table: &NodeWriteTable<'_>,
             admission: &mut ProofAdmission,
             root: &FamilyRoot,
         ) -> Result<Option<(u64, Lsn, [u8; 32], [u8; 32])>> {
@@ -12020,7 +12098,7 @@ pub(crate) mod original_writer {
         }
 
         struct Window<'a, 'txn, 'mem> {
-            table: &'a redb::Table<'txn, &'static [u8], &'static [u8]>,
+            table: &'a NodeWriteTable<'txn>,
             family: LogicalFamily,
             inputs: EntryEdits,
             scratch: Scratch,
@@ -12046,7 +12124,7 @@ pub(crate) mod original_writer {
         }
         impl<'a, 'txn, 'mem> Window<'a, 'txn, 'mem> {
             fn open(
-                table: &'a redb::Table<'txn, &'static [u8], &'static [u8]>,
+                table: &'a NodeWriteTable<'txn>,
                 family: LogicalFamily,
                 inputs: EntryEdits,
                 scratch: Scratch,
@@ -13500,7 +13578,7 @@ pub(crate) mod original_writer {
         fn replay(
             scratch: &Scratch,
             first: u64,
-            table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+            table: &mut NodeWriteTable<'_>,
             family: LogicalFamily,
         ) -> Result<()> {
             let mut at = first;
@@ -13547,7 +13625,9 @@ pub(crate) mod original_writer {
                             ));
                         }
                     }
-                    drop(destination);
+                    destination
+                        .finish()
+                        .map_err(RedbPersistence::storage_error)?;
                     #[cfg(any(test, feature = "test-seams"))]
                     {
                         observe_node_write(len);
@@ -13562,7 +13642,7 @@ pub(crate) mod original_writer {
                 }
                 at = action.next;
             }
-            Ok(())
+            table.seal_pending().map_err(RedbPersistence::storage_error)
         }
 
         #[expect(
@@ -13570,7 +13650,7 @@ pub(crate) mod original_writer {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
         pub(super) fn update_family_consuming_keys(
-            table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+            table: &mut NodeWriteTable<'_>,
             admission: &mut ProofAdmission,
             family: LogicalFamily,
             root: &FamilyRoot,
@@ -15726,8 +15806,7 @@ pub(crate) mod original_version_manifest {
         let root = decode_published_root(family, encoded.value())?.identity;
         drop(encoded);
         drop(roots);
-        let nodes = write
-            .open_table(CONTENT_IDENTITY_NODES_TABLE)
+        let nodes = crate::persistence::content_identity::payloads::open(&write)
             .map_err(RedbPersistence::storage_error)?;
         let target_bytes = start
             .len()
@@ -15740,7 +15819,7 @@ pub(crate) mod original_version_manifest {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )]
         fn descend(
-            nodes: &impl ReadableTable<&'static [u8], &'static [u8]>,
+            nodes: &impl CanonicalNodeSource,
             id: Option<[u8; 32]>,
             expected: [u8; 32],
             target: &[u8],
