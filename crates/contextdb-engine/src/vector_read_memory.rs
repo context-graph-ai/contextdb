@@ -2005,15 +2005,14 @@ pub(crate) fn register_native_forwarder<T: NativeOriginalPinSource + 'static>(
         record.forwarder_identity = Arc::as_ptr(forwarder) as usize;
         let erased: Arc<dyn NativeOriginalPinSource> = forwarder.clone();
         record.forwarder = Some(Arc::downgrade(&erased));
-        root_observations::with_live(record.parent, |parent| {
-            statement_child_proof::native_forwarder(
-                parent,
-                identity,
-                record.payload_identity,
-                record.counter,
-                record.forwarder_identity,
-            )
-        });
+        let parent = record.parent;
+        let payload = record.payload_identity;
+        let counter = record.counter;
+        let forwarder = record.forwarder_identity;
+        drop(registry);
+        if let Some(parent) = root_observations::live_identity(parent) {
+            statement_child_proof::native_forwarder(parent, identity, payload, counter, forwarder);
+        }
     }
 }
 #[cfg(any(test, feature = "test-seams"))]
@@ -3562,21 +3561,29 @@ pub mod statement_child_proof {
         });
     }
     pub(super) fn native_forwarder(
-        parent: &DeclaredReadMemory,
+        parent: usize,
         identity: usize,
         payload: usize,
         counter: usize,
         forwarder: usize,
     ) {
-        update(parent, |sample| {
-            if sample.owner_identity == identity {
-                sample.native_payload_identity = payload;
-                sample.native_counter = counter;
-                sample.native_forwarder_identity = forwarder;
-                if let Some(controls) = sample.native_controls.as_mut() {
-                    controls.payload = payload;
-                    controls.counter = counter;
+        if !ACTIVE_PARENT.with(|key| key.get() == parent) {
+            return;
+        }
+        ACTIVE.with(|slot| {
+            if let Some(mut sample) = copy_observation(slot)
+                && sample.parent_identity == parent
+            {
+                if sample.owner_identity == identity {
+                    sample.native_payload_identity = payload;
+                    sample.native_counter = counter;
+                    sample.native_forwarder_identity = forwarder;
+                    if let Some(controls) = sample.native_controls.as_mut() {
+                        controls.payload = payload;
+                        controls.counter = counter;
+                    }
                 }
+                slot.set(Some(sample));
             }
         });
     }
@@ -4070,37 +4077,50 @@ pub(crate) mod root_observations {
         event: 0,
     });
     impl Registry {
-        fn record(&mut self, token: Token) -> &mut Record {
+        fn record_index(&self, token: Token) -> Option<usize> {
             self.slots
-                .iter_mut()
-                .flatten()
-                .find(|r| r.token.0 == token.0)
-                .expect("root observation generation retired; proof invalidated")
+                .iter()
+                .position(|record| record.is_some_and(|record| record.token.0 == token.0))
         }
+    }
+    // Panic cleanup can deallocate through this same observer. Resolve the
+    // generation under its lock, but release the lock before reporting failure.
+    macro_rules! root_record {
+        ($registry:ident, $token:expr) => {{
+            let Some(index) = $registry.record_index($token) else {
+                drop($registry);
+                panic!("root observation generation retired; proof invalidated");
+            };
+            let Some(record) = $registry.slots[index].as_mut() else {
+                drop($registry);
+                panic!("root observation generation retired; proof invalidated");
+            };
+            record
+        }};
     }
     pub(super) fn begin(bytes: usize) -> Token {
         if !installed() {
             return Token(0);
         }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = registry
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .or_else(|| {
-                registry
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, r)| r.filter(|r| r.terminal_retired).map(|r| (i, r.token.0)))
-                    .min_by_key(|(_, generation)| *generation)
-                    .map(|(i, _)| i)
-            })
-            .expect("root observation static capacity exhausted; proof invalid");
-        registry.generation = registry
-            .generation
-            .checked_add(1)
-            .expect("root observation generation exhausted");
+        let slot = registry.slots.iter().position(Option::is_none).or_else(|| {
+            registry
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| r.filter(|r| r.terminal_retired).map(|r| (i, r.token.0)))
+                .min_by_key(|(_, generation)| *generation)
+                .map(|(i, _)| i)
+        });
+        let Some(slot) = slot else {
+            drop(registry);
+            panic!("root observation static capacity exhausted; proof invalid");
+        };
+        let Some(next_generation) = registry.generation.checked_add(1) else {
+            drop(registry);
+            panic!("root observation generation exhausted");
+        };
+        registry.generation = next_generation;
         let token = Token(registry.generation);
         registry.slots[slot] = Some(Record {
             token,
@@ -4132,39 +4152,39 @@ pub(crate) mod root_observations {
         if token.0 == 0 {
             return;
         }
-        let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let record = registry.record(token);
+        let mut record = {
+            let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            *root_record!(registry, token)
+        };
+        // The caller pins this new, unpublished root through validation/bind.
+        // A copied scalar record permits failure reporting without its lock.
         assert!(!record.payload_dropped && record.payload == 0);
         record.block = root.original_owner().accounting_identity();
         record.payload = root.as_ref() as *const _ as usize;
         assert_ne!(record.block, 0);
         assert_eq!(record.block % record.alignment, 0);
         record.alive = true;
+        let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        *root_record!(registry, token) = record;
     }
-    pub(super) fn with_live<T>(
-        token: Token,
-        f: impl FnOnce(&DeclaredReadMemory) -> T,
-    ) -> Option<T> {
+    pub(super) fn live_identity(token: Token) -> Option<usize> {
         if token.0 == 0 {
             return None;
         }
-        let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let record = registry.record(token);
+        let record = {
+            let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            *root_record!(registry, token)
+        };
         assert!(
             record.alive && record.payload != 0,
             "original root is retired"
         );
-        // SAFETY: bind records only the real projected payload. Root Drop
-        // invalidates under this same mutex before its native block can free.
-        // f cannot return a reference tied to this temporary root borrow.
-        Some(f(unsafe {
-            &*(record.payload as *const DeclaredReadMemory)
-        }))
+        Some(record.payload)
     }
     pub(super) fn sample(token: Token) -> (bool, u64, u64) {
         assert_ne!(token.0, 0, "physical observer not installed; no evidence");
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let record = registry.record(token);
+        let record = root_record!(registry, token);
         if record.alive {
             // SAFETY: this lock excludes payload retirement and physical free.
             let root = unsafe { &*(record.payload as *const DeclaredReadMemory) };
@@ -4188,7 +4208,7 @@ pub(crate) mod root_observations {
             return;
         }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let record = registry.record(token);
+        let record = root_record!(registry, token);
         record.last_charged = root.retained.load(Ordering::SeqCst);
         record.last_controls = root.live_child_control_bytes.load(Ordering::SeqCst);
         record.alive = false;
@@ -4200,14 +4220,20 @@ pub(crate) mod root_observations {
             return;
         }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        registry.event = registry
-            .event
-            .checked_add(1)
-            .expect("terminal event ordinal overflow");
+        let Some(next_event) = registry.event.checked_add(1) else {
+            drop(registry);
+            panic!("terminal event ordinal overflow");
+        };
+        registry.event = next_event;
         let event = registry.event;
-        let record = registry.record(token);
-        assert!(record.payload_dropped && !record.terminal_retired);
-        assert_eq!(record.bytes, bytes);
+        let record = root_record!(registry, token);
+        if !(record.payload_dropped && !record.terminal_retired && record.bytes == bytes) {
+            let record = *record;
+            drop(registry);
+            assert!(record.payload_dropped && !record.terminal_retired);
+            assert_eq!(record.bytes, bytes);
+            unreachable!("the rejected root retirement must fail its original assertions");
+        }
         // An initialized block's invoice reaches here only after the existing
         // NativeFreeGuard's dealloc returned. A null allocation never binds.
         // A bound root needs the independent allocator return event. A null
@@ -4225,11 +4251,22 @@ pub(crate) mod root_observations {
             return;
         }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let r = registry.record(token);
-        assert_eq!(r.producer, 0);
-        assert_eq!((r.bytes, r.alignment), (layout.size(), layout.align()));
+        let r = root_record!(registry, token);
+        if r.producer != 0 || (r.bytes, r.alignment) != (layout.size(), layout.align()) {
+            let r = *r;
+            drop(registry);
+            assert_eq!(r.producer, 0);
+            assert_eq!((r.bytes, r.alignment), (layout.size(), layout.align()));
+            unreachable!("the rejected root allocation must fail its original assertions");
+        }
         r.before_allocation = root.retained.load(Ordering::SeqCst);
-        r.allocation_attempts += 1;
+        let next_attempt = r.allocation_attempts.checked_add(1);
+        let Some(next_attempt) = next_attempt else {
+            drop(registry);
+            panic!("root allocation attempt ordinal overflow");
+        };
+        r.allocation_attempts = next_attempt;
+        drop(registry);
         crate::read_work_probe::allocator_events::funding_next(&root.retained as *const _ as usize);
     }
     #[cfg(test)]
@@ -4238,7 +4275,8 @@ pub(crate) mod root_observations {
             .with(|slot| slot.get())
             .expect("actual root attempt token");
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let r = registry.record(token);
+        let r = *root_record!(registry, token);
+        drop(registry);
         assert!(r.payload_dropped && r.terminal_retired && !r.physical_free_returned);
         assert_eq!(r.block, 0, "null produced no original allocation");
         assert_eq!(r.last_charged, r.bytes as u64);
@@ -4257,7 +4295,8 @@ pub(crate) mod root_observations {
             "unqualified physical-free observation"
         );
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let r = registry.record(token);
+        let r = *root_record!(registry, token);
+        drop(registry);
         assert_eq!(r.producer, 0);
         #[cfg(feature = "test-seams")]
         {
@@ -4332,10 +4371,11 @@ pub(crate) mod root_observations {
             drop(registry);
             panic!("producer observation static capacity exhausted; proof invalid");
         };
-        registry.generation = registry
-            .generation
-            .checked_add(1)
-            .expect("producer generation overflow");
+        let Some(next_generation) = registry.generation.checked_add(1) else {
+            drop(registry);
+            panic!("producer generation overflow");
+        };
+        registry.generation = next_generation;
         let token = Token(registry.generation);
         registry.slots[slot] = Some(Record {
             token,
@@ -4490,7 +4530,8 @@ pub(crate) mod root_observations {
             "unqualified physical-free observation"
         );
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let r = registry.record(token);
+        let r = *root_record!(registry, token);
+        drop(registry);
         assert_ne!(r.producer, 0);
         (
             r.alive,
@@ -4540,13 +4581,14 @@ pub(crate) mod root_observations {
         let address = image.as_ref() as *const ImageMemory as usize;
         let actual = {
             let registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-            *registry
+            registry
                 .slots
                 .iter()
                 .flatten()
                 .find(|record| record.payload == address && record.producer == 1 && record.alive)
-                .unwrap()
-        };
+                .copied()
+        }
+        .expect("actual image observation");
         let token = actual.token;
         assert!(producer_sample(token).0);
         let wrong_payer = if actual.payer.is_some() {
@@ -4627,6 +4669,84 @@ pub(crate) mod root_observations {
         );
         drop(images);
         println!("PROVENANCE_NEGATIVES payer reuse duplicate_free capacity PASS");
+    }
+    #[cfg(test)]
+    #[test]
+    fn exhausted_root_observation_capacity_reports_without_lock_reentry() {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 0);
+        const CHILD: &str = "CONTEXTDB_ROOT_OBSERVER_CAPACITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::io::Read;
+            let name = format!(
+                "{}::exhausted_root_observation_capacity_reports_without_lock_reentry",
+                module_path!()
+            );
+            let filter = name.split_once("::").unwrap().1;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", filter, "--nocapture"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .expect("start isolated root-observer exhaustion guard");
+            let mut stdout = child.stdout.take().unwrap();
+            let (sender, completed) = std::sync::mpsc::sync_channel(1);
+            let reader = std::thread::spawn(move || {
+                let mut output = String::new();
+                let result = stdout.read_to_string(&mut output).map(|_| output);
+                let _ = sender.send(result);
+            });
+            // A completion watchdog bounds a deadlocked child; it does not
+            // simulate time or assert how long valid work takes.
+            let output = completed.recv_timeout(std::time::Duration::from_secs(30));
+            if output.is_err() {
+                let _ = child.kill();
+            }
+            let status = child.wait().expect("reap isolated root-observer guard");
+            reader.join().expect("read isolated root-observer output");
+            assert!(
+                status.success(),
+                "observer exhaustion must report without lock reentry: {status}"
+            );
+            let output = output
+                .expect("root-observer guard completes")
+                .expect("read root-observer guard");
+            assert!(
+                output.contains("ROOT_CAPACITY_REJECTED_AND_RELEASED"),
+                "the capacity and actual final-free controls executed: {output}"
+            );
+            return;
+        }
+        assert!(
+            installed(),
+            "unit GlobalAlloc installs the physical observer"
+        );
+        let available = {
+            let registry = REGISTRY.lock().unwrap_or_else(|error| error.into_inner());
+            registry
+                .slots
+                .iter()
+                .filter(|slot| slot.is_none_or(|record| record.terminal_retired))
+                .count()
+        };
+        let bytes = native_control_layouts_for_test().0.size() as u64;
+        let roots = (0..available)
+            .map(|_| DeclaredReadMemory::from_reader_limit(bytes).expect("real original root"))
+            .collect::<Vec<_>>();
+        let failure = std::panic::catch_unwind(|| DeclaredReadMemory::from_reader_limit(bytes))
+            .expect_err("exhausted observation must report its failure");
+        let message = failure
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| failure.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("root observation static capacity exhausted; proof invalid")
+        );
+        for root in roots {
+            root.assert_final_root_free_for_test();
+        }
+        println!("ROOT_CAPACITY_REJECTED_AND_RELEASED");
     }
 }
 
