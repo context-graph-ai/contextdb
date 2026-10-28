@@ -1180,6 +1180,7 @@ struct Measurement {
     live: usize,
     peak: usize,
     payload_live: usize,
+    payload_peak: usize,
     source_unfunded_peak: usize,
     source_unfunded_request: (usize, usize, usize, bool),
 }
@@ -1195,6 +1196,7 @@ static MEASUREMENT: Mutex<Measurement> = Mutex::new(Measurement {
     live: 0,
     peak: 0,
     payload_live: 0,
+    payload_peak: 0,
     source_unfunded_peak: 0,
     source_unfunded_request: (0, 0, 0, false),
 });
@@ -1372,6 +1374,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 measurement.live += allocation.size();
                 measurement.peak = measurement.peak.max(measurement.live);
                 measurement.payload_live += layout.size();
+                measurement.payload_peak = measurement.payload_peak.max(measurement.payload_live);
                 if measurement.purge_active {
                     let request = (pointer as usize, layout.size(), layout.align(), offset);
                     if let Some(index) = measurement.purge_live.iter().position(|slot| slot.0 == 0)
@@ -1671,6 +1674,16 @@ static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
 // funding uses native Layout bytes; measured_purge additionally attributes the
 // unchanged raw peak to native payload, private headers and padding.
 pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+    let (value, peak, live, _, _) = measured_payload(operation);
+    (value, peak, live)
+}
+
+/// Scalar physical measurement without the purge producer census. Payload
+/// counts actual allocator Layout bytes; raw counts also include our Header
+/// and alignment padding. Only allocations born in this window contribute.
+pub(crate) fn measured_payload<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, usize, usize, usize, usize) {
     // All oracle callers are serial tests. Reject overlap without holding the
     // allocator's mutex while constructing a panic.
     let window = {
@@ -1683,6 +1696,7 @@ pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
             measurement.live = 0;
             measurement.peak = 0;
             measurement.payload_live = 0;
+            measurement.payload_peak = 0;
             measurement.source_unfunded_peak = 0;
             measurement.source_unfunded_request = (0, 0, 0, false);
             Some(measurement.active_window)
@@ -1699,12 +1713,39 @@ pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
     let guard = WindowGuard;
     MEASURING_HERE.with(|measuring| measuring.set(window));
     let value = operation();
-    let (peak, live) = {
+    let (peak, live, payload_peak, payload_live) = {
         let measurement = MEASUREMENT.lock().unwrap();
-        (measurement.peak, measurement.live)
+        (
+            measurement.peak,
+            measurement.live,
+            measurement.payload_peak,
+            measurement.payload_live,
+        )
     };
     drop(guard);
-    (value, peak, live)
+    (value, peak, live, payload_peak, payload_live)
+}
+
+#[test]
+#[serial]
+fn scalar_payload_measurement_has_no_pointer_census_ceiling() {
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let mut pointers = [std::ptr::null_mut(); 1050];
+    let (_, raw_peak, raw_live, payload_peak, payload_live) = measured_payload(|| {
+        for pointer in &mut pointers {
+            *pointer = unsafe { ALLOCATOR.alloc(layout) };
+            assert!(!pointer.is_null());
+        }
+        for pointer in pointers {
+            unsafe { ALLOCATOR.dealloc(pointer, layout) };
+        }
+    });
+    assert_eq!(payload_peak, pointers.len() * layout.size());
+    assert_eq!(
+        raw_peak,
+        pointers.len() * allocation_layout(layout).0.size()
+    );
+    assert_eq!((raw_live, payload_live), (0, 0));
 }
 
 #[test]

@@ -793,3 +793,85 @@ pub(crate) fn record_native_page_allocation_for_test(backing_bytes: usize) {
         }
     });
 }
+
+/// Actual page backing work on this thread, independent of source admission.
+/// Current values are signed net deltas: freeing a pre-window page is visible
+/// as negative, never silently attributed to a construction in this window.
+#[cfg(feature = "test-seams")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageLifetimesForTest {
+    pub allocated_pages: u64,
+    pub allocated_bytes: usize,
+    pub freed_pages: u64,
+    pub freed_bytes: usize,
+    pub current_pages: i64,
+    pub current_bytes: i128,
+    pub peak_pages: i64,
+    pub peak_bytes: i128,
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static PAGE_LIFETIMES: std::cell::Cell<Option<PageLifetimesForTest>> = const { std::cell::Cell::new(None) };
+}
+
+/// Counts successful physical constructions and frees after dealloc, on the
+/// executing thread. No allocation, pointer ledger or payer is retained.
+/// Start before opening and close all handles inside the operation when using
+/// zero current as a complete lifecycle assertion. Cross-thread work is excluded.
+#[cfg(feature = "test-seams")]
+pub fn observe_page_lifetimes_for_test<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, PageLifetimesForTest) {
+    struct Restore(Option<PageLifetimesForTest>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAGE_LIFETIMES.with(|slot| {
+                let child = slot.get().unwrap_or_default();
+                slot.set(self.0.map(|mut parent| {
+                    parent.peak_pages = parent
+                        .peak_pages
+                        .max(parent.current_pages + child.peak_pages);
+                    parent.peak_bytes = parent
+                        .peak_bytes
+                        .max(parent.current_bytes + child.peak_bytes);
+                    parent.current_pages += child.current_pages;
+                    parent.current_bytes += child.current_bytes;
+                    parent.allocated_pages += child.allocated_pages;
+                    parent.allocated_bytes += child.allocated_bytes;
+                    parent.freed_pages += child.freed_pages;
+                    parent.freed_bytes += child.freed_bytes;
+                    parent
+                }));
+            });
+        }
+    }
+    let restore =
+        Restore(PAGE_LIFETIMES.with(|slot| slot.replace(Some(PageLifetimesForTest::default()))));
+    let value = operation();
+    let receipt = PAGE_LIFETIMES.with(|slot| slot.get().unwrap());
+    drop(restore);
+    (value, receipt)
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn record_page_lifetime_for_test(bytes: usize, allocated: bool) {
+    let _ = PAGE_LIFETIMES.try_with(|slot| {
+        if let Some(mut receipt) = slot.get() {
+            if allocated {
+                receipt.allocated_pages += 1;
+                receipt.allocated_bytes += bytes;
+                receipt.current_pages += 1;
+                receipt.current_bytes += bytes as i128;
+                receipt.peak_pages = receipt.peak_pages.max(receipt.current_pages);
+                receipt.peak_bytes = receipt.peak_bytes.max(receipt.current_bytes);
+            } else {
+                receipt.freed_pages += 1;
+                receipt.freed_bytes += bytes;
+                receipt.current_pages -= 1;
+                receipt.current_bytes -= bytes as i128;
+            }
+            slot.set(Some(receipt));
+        }
+    });
+}
