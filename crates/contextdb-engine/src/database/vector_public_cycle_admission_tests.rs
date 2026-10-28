@@ -412,7 +412,7 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
             .first_failure_details
             .expect("the public cycle exposes the deferred physical owner");
         assert_eq!(details.failure, VectorMaintenanceFailure::MemoryLimit);
-        assert_eq!(details.operation, "prepare_vector_generation");
+        assert_eq!(details.operation, "exact_byte_read");
         assert!(details.requested_bytes.unwrap() > MALFORMED_METADATA_BYTES as u64);
         assert!(details.available_bytes.unwrap() <= headroom as u64);
         assert_eq!(details.budget_limit_bytes, Some(limit as u64));
