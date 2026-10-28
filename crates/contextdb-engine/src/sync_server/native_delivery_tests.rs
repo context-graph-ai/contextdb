@@ -3806,13 +3806,14 @@ async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
     let child = reader.child().expect("request reader");
     let body = BoundedWireBody::from_legacy_reply(request, child).expect("request body");
     let subject = delivery_outcomes_subject(TENANT);
-    let reply = within(async {
+    let reply = tokio::time::timeout(Duration::from_secs(30), async {
         match client.request_stream_admitted(&subject, body, ATTEMPT_TIMEOUT) {
             Ok(future) => future.await,
             Err(error) => Err(error),
         }
     })
-    .await;
+    .await
+    .expect("retry answer event never delivered");
     let held_first = tokio::select! {
         biased;
         () = gate.reached() => true,
