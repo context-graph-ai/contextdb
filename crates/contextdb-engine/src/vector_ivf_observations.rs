@@ -1,8 +1,11 @@
 //! Borrowed observations of authenticated clustered storage operations.
-pub(crate) mod disk;
 pub(crate) mod calibration;
-pub use calibration::{NativeIvfCalibrationAnswerForTest,NativeIvfCalibrationAnswersForTest,NativeIvfCalibrationSettingForTest};
+pub(crate) mod disk;
 pub use crate::persistence::vector_ivf::NativeIvfPhysicalDiskOwnerForTest;
+pub use calibration::{
+    NativeIvfCalibrationAnswerForTest, NativeIvfCalibrationAnswersForTest,
+    NativeIvfCalibrationSettingForTest,
+};
 use contextdb_core::{Error, Lsn, Result, VectorIndexRef, VectorPartitionKey};
 use contextdb_vector::ivf::{
     RowIdentity,
@@ -61,6 +64,11 @@ pub enum NativeIvfDriveKind {
     RowApply,
     Maintenance,
     AbortingStorage,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeIvfReadSetupPhase {
+    Authority,
+    TupleScope,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct NativeIvfScopeRef<'a> {
@@ -146,6 +154,10 @@ pub enum NativeIvfPageReadOutcome<'a> {
 }
 #[derive(Clone, Copy)]
 pub enum NativeIvfSealEvent<'a> {
+    ReadSetupEntered {
+        phase: NativeIvfReadSetupPhase,
+        snapshot: redb::StorageSnapshotIdentity,
+    },
     ReservationDebited {
         invoice: u64,
         original_owner: usize,

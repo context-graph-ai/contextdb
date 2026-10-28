@@ -66,6 +66,13 @@ impl<'a> NativeAuthority<'a> {
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         prepared: Option<&BuildVerification>,
     ) -> Result<Self> {
+        #[cfg(feature = "test-seams")]
+        let observer = Producer::current();
+        #[cfg(feature = "test-seams")]
+        observer.emit(NativeIvfSealEvent::ReadSetupEntered {
+            phase: NativeIvfReadSetupPhase::Authority,
+            snapshot: root.read.storage_snapshot_identity(),
+        });
         use super::super::native_storage_admission::{
             StorageAdmissionScope, original_storage_error,
         };
@@ -104,7 +111,7 @@ impl<'a> NativeAuthority<'a> {
         })?;
         Ok(Self {
             #[cfg(feature = "test-seams")]
-            observer: Producer::current(),
+            observer,
             #[cfg(feature = "test-seams")]
             source_instance: NativeIvfSourceInstance::Read {
                 admitted_object: crate::vector_ivf_observations::instance()?,
@@ -376,6 +383,13 @@ impl<'a> PageSource<'a> {
         distance: &'a dyn Fn(DistanceKind) -> Result<()>,
         prepared: Option<&BuildVerification>,
     ) -> Result<Option<Self>> {
+        #[cfg(feature = "test-seams")]
+        authority
+            .observer
+            .emit(NativeIvfSealEvent::ReadSetupEntered {
+                phase: NativeIvfReadSetupPhase::TupleScope,
+                snapshot: authority.root.read.storage_snapshot_identity(),
+            });
         checkpoint()?;
         let construction =
             ScopeConstruction::reserve::<Self>(authority.vector_owner(), index, tuple)?;
