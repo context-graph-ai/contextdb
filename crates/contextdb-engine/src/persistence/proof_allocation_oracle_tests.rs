@@ -3158,7 +3158,7 @@ impl contextdb_core::read_memory::ReadMemoryBudget for MaintenanceReaderSpy {
         let request = self.requests.fetch_add(1, AtomicOrdering::SeqCst) + 1;
         self.writer_peak
             .fetch_max(self.writer.usage().used, AtomicOrdering::SeqCst);
-        if subsystem == "reader" && operation == "materialize_answer" {
+        if subsystem == "reader" && operation == "query_decode" {
             self.decode_requests.fetch_add(1, AtomicOrdering::SeqCst);
             if crate::read_image_memory::current_reader_budget().is_some() {
                 let owner = crate::read_image_memory::active_owner()?;
@@ -3211,7 +3211,7 @@ impl contextdb_core::read_memory::ReadMemoryBudget for MaintenanceReaderSpy {
         let used = self.used.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
         self.peak.fetch_max(used, AtomicOrdering::SeqCst);
         if subsystem == "reader"
-            && operation == "materialize_answer"
+            && operation == "query_decode"
             && crate::read_image_memory::current_reader_budget().is_some()
         {
             let owner = crate::read_image_memory::active_owner()?;
