@@ -120,6 +120,21 @@ impl Database {
             Ok(progress)
         })
     }
+    /// Observe actual publication eligibility without advancing maintenance.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn native_ivf_publication_eligible_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+    ) -> Result<bool> {
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            Error::Other("native publication observation requires a file-backed writer".into())
+        })?;
+        self.with_native_ivf_read_for_test(index, tuple, |scope| {
+            persistence.native_ivf_publication_eligible_for_test(index, tuple, scope)
+        })
+    }
     pub fn native_ivf_journal_identity_for_test(
         &self,
         index: &VectorIndexRef,

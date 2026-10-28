@@ -758,6 +758,50 @@ impl RedbPersistence {
     }
 }
 
+#[cfg(feature = "test-seams")]
+impl RedbPersistence {
+    /// Observe the real candidate, active calibration and persisted completion
+    /// receipt used by publication. This neither advances nor plants state.
+    pub(crate) fn native_ivf_publication_eligible_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        read: &NativeIvfReadForTest<'_>,
+    ) -> Result<bool> {
+        let Some(build) = read.0.build_state(0)? else {
+            return Ok(false);
+        };
+        if build.phase != contextdb_vector::ivf::storage::BuildPhase::Publish {
+            return Ok(false);
+        }
+        if build.manifest.active_lists == 0 {
+            return Ok(true);
+        }
+        let epoch = {
+            let active = self.native_ivf_cache.calibration.lock();
+            active
+                .as_ref()
+                .filter(|active| {
+                    active.route == retained::route_identity(index, tuple)
+                        && active.manifest == build.manifest
+                        && !active.cancelled.load(std::sync::atomic::Ordering::Acquire)
+                        && active.finished.load(std::sync::atomic::Ordering::Acquire)
+                })
+                .map(|active| active.epoch)
+        };
+        let Some(epoch) = epoch else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            read.0.calibration_record(build.manifest.generation, 0, 0)?,
+            Some(qualification::Record::Header(header))
+                if header.complete
+                    && header.epoch == epoch
+                    && header.generation == build.manifest.generation
+        ))
+    }
+}
+
 impl RedbPersistence {
     /// Deliberate fixture damage uses the same original writer and native
     /// container publication sequence as descriptor corruption. The closure
