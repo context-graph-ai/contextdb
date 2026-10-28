@@ -421,6 +421,20 @@ impl RedbPersistence {
                 frame.map(OriginalPersistenceFrame::into_reservation),
             ));
         }
+        self.erase_table_row_retirements_in_write(write, table, original)?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve typed inline storage errors."
+    )]
+    pub(super) fn erase_table_row_retirements_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
+        original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
+    ) -> Result<()> {
         let frame = original.map(OriginalPersistenceFrame::new).transpose()?;
         let memory = match frame.as_ref() {
             Some(frame) => crate::memory_accounting::image_memory_for_original_record(frame)?,

@@ -3570,7 +3570,10 @@ impl RedbPersistence {
         write: &redb::WriteTransaction,
         table: &str,
     ) -> Result<()> {
-        self.retire_table_retention_expiries_in_write(write, table, None)
+        self.retire_table_retention_expiries_in_write(write, table, None)?;
+        // Every whole-table removal retires that table's exact owner controls
+        // in this same transaction, even when no graph bytes remain to select.
+        self.graph_writer_window(|| self.erase_table_row_retirements_in_write(write, table, None))
     }
 
     #[expect(
