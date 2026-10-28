@@ -2755,6 +2755,15 @@ pub(super) fn prune_expired_rows(
                 "prepare_prune",
                 "Raise MEMORY_LIMIT to admit the retention reclamation workspace.",
             )?;
+            // Removing the current expired version expires this endpoint
+            // even when an older version is still owed to a reader. Keep
+            // graph reclamation independent of whole-row-history cleanup;
+            // the edge's own snapshot visibility below decides deferral.
+            if row.deleted_tx.is_none()
+                && let Some(Value::Uuid(id)) = row.values.get("id")
+            {
+                pruned_node_ids.insert(*id);
+            }
             pruned_versions_by_table
                 .entry(table_name.clone())
                 .or_default()
