@@ -11,11 +11,22 @@ impl MaintenanceContext {
             return Ok(VectorMaintenanceReport::default());
         };
         let mut copy_owner = crate::vector_read_memory::admission(memory.clone());
-        let routes = super::super::maintenance_runtime::vector_partition_routes(
+        let mut report = VectorMaintenanceReport::default();
+        let routes = match super::super::maintenance_runtime::vector_partition_routes(
             &self.vector,
             &mut copy_owner,
-        )?;
-        let mut report = VectorMaintenanceReport::default();
+        ) {
+            Ok(routes) => routes,
+            Err(error) => {
+                let details = VectorMaintenanceFailureDetails::from_error(&error);
+                if details.failure != VectorMaintenanceFailure::MemoryLimit {
+                    return Err(error);
+                }
+                report.first_failure = Some(details.failure);
+                report.first_failure_details = Some(details);
+                return Ok(report);
+            }
+        };
         let mut indexes = HashSet::new();
         let mut pending = HashSet::new();
         let mut built = HashSet::new();

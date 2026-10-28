@@ -8,14 +8,51 @@ pub(super) fn vector_partition_routes(
     vector: &VectorStore,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<Vec<VectorPartitionRef>> {
-    let mut routes = Vec::new();
+    let mut routes: Vec<VectorPartitionRef> = Vec::new();
     for index in vector.index_layout_infos(vector_copy_owner)? {
-        routes.extend(
-            vector
-                .partition_keys(&index.index, vector_copy_owner)?
-                .into_iter()
-                .map(|key| VectorPartitionRef::new(index.index.clone(), key)),
-        );
+        let keys = vector.partition_keys(&index.index, vector_copy_owner)?;
+        #[cfg(all(test, feature = "test-seams"))]
+        let output = (routes.len(), routes.as_ptr() as usize, routes.capacity());
+        let append = || -> Result<()> {
+            let output_capacity = routes
+                .len()
+                .checked_add(keys.len())
+                .ok_or_else(|| Error::Other("vector route output size overflow".into()))?;
+            let output_bytes = output_capacity
+                .saturating_sub(routes.capacity())
+                .checked_mul(std::mem::size_of::<VectorPartitionRef>())
+                .ok_or_else(|| Error::Other("vector route output size overflow".into()))?;
+            let index_bytes = index
+                .index
+                .table
+                .len()
+                .checked_add(index.index.column.len())
+                .and_then(|bytes| bytes.checked_mul(keys.len()))
+                .ok_or_else(|| Error::Other("vector route index size overflow".into()))?;
+            let retained_bytes = output_bytes
+                .checked_add(index_bytes)
+                .ok_or_else(|| Error::Other("vector route copy size overflow".into()))?;
+            // The keys and layout inputs remain live. Prepay both the complete
+            // destination growth and every fresh index-string clone before
+            // either allocation, using this operation's original copy owner.
+            vector_copy_owner.reserve_for_static(
+                retained_bytes,
+                "vector_copy",
+                "maintenance_route_output",
+                "Reduce selected routes or raise maintenance reader memory.",
+            )?;
+            routes.reserve_exact(keys.len());
+            for key in keys {
+                routes.push(VectorPartitionRef::new(index.index.clone(), key));
+            }
+            Ok(())
+        };
+        #[cfg(all(test, feature = "test-seams"))]
+        super::vector_public_cycle_admission_tests::with_route_output_for_test(
+            output.0, output.1, output.2, append,
+        )?;
+        #[cfg(not(all(test, feature = "test-seams")))]
+        append()?;
     }
     Ok(routes)
 }
