@@ -1,11 +1,9 @@
 //! A routing allowance cannot turn writer turnover into a refused saved read.
-use contextdb_core::Value;
 use contextdb_core::read_contract::{DeadlineClock, ReadRoute};
+use contextdb_core::{Error, Value};
 use contextdb_engine::local_transport::ManualDeadlineClock;
 use contextdb_engine::read_session::{ReadSessionEvent, ReadSessionTestObserver};
-use contextdb_engine::{
-    Database, DatabaseOpenOptions, MaintenancePolicy, ReadSession, ReadSessionOptions,
-};
+use contextdb_engine::{Database, ReadSession, ReadSessionOptions};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,6 +24,11 @@ impl ReadSessionTestObserver for ExhaustAtDirectOpen {
         if matches!(event, ReadSessionEvent::BeforeDirectBackendOpen { .. })
             && self.armed.swap(false, Ordering::SeqCst)
         {
+            assert_eq!(
+                self.clock.now_ms(),
+                START_MS,
+                "turnover must start its routing deadline at the unchanged manual time"
+            );
             self.clock.advance_to(self.expire_at);
             self.fired.store(true, Ordering::SeqCst);
         }
@@ -33,14 +36,7 @@ impl ReadSessionTestObserver for ExhaustAtDirectOpen {
 }
 
 fn writer(path: &Path) -> Database {
-    Database::open_with_options(
-        path,
-        DatabaseOpenOptions {
-            maintenance_policy: MaintenancePolicy::CallerDriven,
-            ..Default::default()
-        },
-    )
-    .expect("open the public writer")
+    Database::open(path).expect("open the production Legacy writer through the public constructor")
 }
 
 #[test]
@@ -105,6 +101,18 @@ fn a_file_reader_keeps_answering_when_turnover_hydration_exhausts_its_routing_al
         expire_at,
         "the routing allowance is exhausted before hydration"
     );
+    // Drive a second statement even on RED: a failed turnover must not leave
+    // this reader permanently unusable. Both outcomes retain their typed errors.
+    let later = session.execute(QUERY, &HashMap::new());
+    for (label, outcome) in [("turnover read", &answer), ("later read", &later)] {
+        if let Err(Error::ReadFailure(failure)) = outcome {
+            eprintln!(
+                "{label}: typed {:?}, {:?}",
+                failure.kind(),
+                failure.detail()
+            );
+        }
+    }
     let answer = answer.expect(
         "a writer that came and went must not make the reader refuse its last saved answer",
     );
@@ -113,7 +121,9 @@ fn a_file_reader_keeps_answering_when_turnover_hydration_exhausts_its_routing_al
         vec![vec![Value::Text("latest saved".into())]]
     );
     assert_eq!(
-        session.execute(QUERY, &HashMap::new()).unwrap().rows(),
+        later
+            .expect("the same reader must also answer a later statement")
+            .rows(),
         vec![vec![Value::Text("latest saved".into())]]
     );
 }
