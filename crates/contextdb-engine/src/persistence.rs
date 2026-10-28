@@ -874,14 +874,12 @@ const MAX_READER_BREADCRUMB_BYTES: usize = READER_BREADCRUMB_MAGIC.len()
     + std::mem::size_of::<u32>()
     + MAX_READER_PROCESS_NAME_BYTES;
 
-/// Joins and leaves of every reader registry under one runtime root are
-/// serialized here: an exclusive flock on a directory descriptor of
-/// `RuntimeDirectory::root()` -- the platform base or an operator-supplied
-/// root -- a path contextdb never creates or removes, so it never departs
-/// under a holder. It is held only for one join or one leave, both fixed work.
-/// Lock order: the serializer, then a registry lock, then (a cleaner only) its
-/// gate's tries. Nothing takes the serializer while holding any of those, and
-/// a writer only ever takes it by try.
+/// A lock on the stable platform or supplied root, which contextdb never
+/// creates or removes. Snapshot joins/leaves share it for root lifetime and
+/// exclude peers through the store's own registry lock. Empty-root removal,
+/// diagnostic breadcrumbs and general inventory take it exclusively.
+/// Lock order: root lifetime, then per-store registry, then cleanup gate tries.
+/// Root removal releases the shared hold before trying an exclusive hold.
 #[cfg(unix)]
 struct RuntimeRootSerializer {
     _directory: File,
@@ -2793,7 +2791,10 @@ pub mod read_persistence_test_scaffold {
         fn is_physical(self) -> bool {
             matches!(
                 self,
-                Self::AfterPrecheck | Self::AfterGate | Self::BeforeRegistration | Self::AfterRuntimeRootLifetimeHold
+                Self::AfterPrecheck
+                    | Self::AfterGate
+                    | Self::BeforeRegistration
+                    | Self::AfterRuntimeRootLifetimeHold
             )
         }
     }

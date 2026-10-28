@@ -3055,13 +3055,36 @@ pub(super) fn serialize_runtime_root(
     root: &Path,
     nonblocking: bool,
 ) -> std::io::Result<RuntimeRootSerializer> {
+    lock_runtime_root(root, nonblocking, false)
+}
+
+/// Keep the shared publication directory alive while this store's registry
+/// lock serializes its own join/leave. Other stores may publish concurrently.
+#[cfg(unix)]
+fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
+    lock_runtime_root(root, nonblocking, true)
+}
+
+#[cfg(unix)]
+fn lock_runtime_root(
+    root: &Path,
+    nonblocking: bool,
+    shared: bool,
+) -> std::io::Result<RuntimeRootSerializer> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(root)?;
+    let try_lock = || {
+        if shared {
+            fs2::FileExt::try_lock_shared(&directory)
+        } else {
+            fs2::FileExt::try_lock_exclusive(&directory)
+        }
+    };
     if nonblocking {
-        fs2::FileExt::try_lock_exclusive(&directory).map_err(|error| {
+        try_lock().map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock
                 || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
             {
@@ -3076,14 +3099,18 @@ pub(super) fn serialize_runtime_root(
     } else {
         #[cfg(any(test, feature = "test-seams"))]
         if read_persistence_test_scaffold::reader_join_wait_hook_installed_for_test() {
-            if fs2::FileExt::try_lock_exclusive(&directory).is_ok() {
+            if try_lock().is_ok() {
                 return Ok(RuntimeRootSerializer {
                     _directory: directory,
                 });
             }
             read_persistence_test_scaffold::run_reader_join_wait_hook_for_test();
         }
-        fs2::FileExt::lock_exclusive(&directory)?;
+        if shared {
+            fs2::FileExt::lock_shared(&directory)?;
+        } else {
+            fs2::FileExt::lock_exclusive(&directory)?;
+        }
     }
     Ok(RuntimeRootSerializer {
         _directory: directory,
@@ -3096,6 +3123,11 @@ pub(super) fn serialize_runtime_root(
     _nonblocking: bool,
 ) -> std::io::Result<RuntimeRootSerializer> {
     Ok(RuntimeRootSerializer)
+}
+
+#[cfg(not(unix))]
+fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
+    serialize_runtime_root(root, nonblocking)
 }
 
 /// Remove the per-store registry directory once it is empty, and then the
@@ -3750,10 +3782,10 @@ impl ReaderSnapshotFileGuard {
 
 impl Drop for ReaderSnapshotFileGuard {
     fn drop(&mut self) {
-        // A leave takes the runtime root's serializer, then the registry lock:
-        // the same order as a join, so no join is ever left holding something
-        // this leave removed. An owner's leave takes both only by try.
-        let serializer = serialize_runtime_root(
+        // A leave shares the runtime root's lifetime hold, then takes this
+        // store's registry lock, in the same order as a join. An owner's leave
+        // takes both only by try; unrelated stores keep joining concurrently.
+        let serializer = hold_runtime_root(
             &self.serializer_root,
             self.try_only_teardown
                 || self
@@ -3806,11 +3838,20 @@ impl Drop for ReaderSnapshotFileGuard {
                     registry_directory,
                     &self.registry_lock.path,
                     gate_held,
-                    self.created_root.as_deref(),
+                    None,
                 )
             });
         }
+        // A different store may be joining under another shared lifetime hold.
+        // Release ours before trying exclusive empty-root removal; if any join
+        // still uses the root, leave it in place rather than unlinking it.
         drop(serializer);
+        if coordinated
+            && let Some(root) = self.created_root.as_deref()
+            && let Ok(_exclusive) = serialize_runtime_root(&self.serializer_root, true)
+        {
+            let _ = std::fs::remove_dir(root);
+        }
     }
 }
 
@@ -4864,10 +4905,10 @@ impl ReadSnapshotRegistrationGuard {
                         }),
                     )
                 };
-                // Each root is joined on its own, under that root's serializer and
-                // never two at once: the fence, then the registry lock, then the
-                // published record. No leaver can remove anything of this root
-                // while it is held, so a join never retries. An owner cursor takes
+                // Each root is joined under a shared lifetime hold, never two
+                // at once. The per-store registry lock excludes this store's
+                // leave; the shared hold prevents removal of the root while
+                // unrelated stores may still join or leave. An owner cursor takes
                 // every lock here by try and refuses, retryably, rather than wait;
                 // a later root's refusal drops the roots already joined, whose
                 // owner teardown is itself try-only.
@@ -4893,7 +4934,7 @@ impl ReadSnapshotRegistrationGuard {
                         read_persistence_test_scaffold::ReaderPausePoint::BeforeRegistration,
                     );
                     let serializer =
-                        serialize_runtime_root(runtime.root(), nonblocking).map_err(|error| {
+                        hold_runtime_root(runtime.root(), nonblocking).map_err(|error| {
                             if error.kind() == std::io::ErrorKind::WouldBlock {
                                 contention(runtime, error)
                             } else {
