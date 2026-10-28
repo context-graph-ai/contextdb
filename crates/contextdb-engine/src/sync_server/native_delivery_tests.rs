@@ -27,6 +27,20 @@ const ROOT_CLAUSES: &str =
 const MEMBER_CLAUSES: &str = "SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST";
 const LIMIT: u64 = 1 << 30;
 
+// The original root escapes the operation scope; every server, response and
+// callback alias drops before the same physical-root oracle checks final free.
+macro_rules! with_final_native_roots {
+    (($($root:ident),+); $($body:tt)*) => {{
+        let ($($root,)+) = { $($body)* ($($root,)+) };
+        $($root.assert_only_original_root_and_free_for_test();)+
+    }};
+}
+fn native_root_bytes_for_test() -> u64 {
+    crate::vector_read_memory::native_control_layouts_for_test()
+        .0
+        .size() as u64
+}
+
 fn expectation() -> ApplicationTablePolicyExpectation {
     ApplicationTablePolicyExpectation::new()
         .expect_table(ROOT_TABLE, ROOT_CLAUSES)
@@ -776,6 +790,7 @@ fn without_hub_clock(subject: &str, reply: &[u8]) -> String {
 // selection; every request byte returns and the installation is untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusal_and_cancellation_release_every_request_byte() {
+    with_final_native_roots! { (seeding, measured, tight, before, after);
     let world = World::new();
     let seeding =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
@@ -797,10 +812,10 @@ async fn refusal_and_cancellation_release_every_request_byte() {
     assert_eq!(decode_outcomes(&reply), 3);
     let peak = measured.file_child_high_water();
     let control = ReadMemoryOwnerLayout::control_bytes();
-    assert_eq!(measured.retained_bytes_for_test(), 0);
+    assert_eq!(measured.retained_bytes_for_test(), native_root_bytes_for_test());
 
     // Refusal: the request parent holds one byte less than the request's peak.
-    let tight = DeclaredReadMemory::from_reader_limit(control + peak - 1)
+    let tight = DeclaredReadMemory::from_reader_limit(native_root_bytes_for_test() + control + peak - 1)
         .expect("admit the declared fixture root");
     let route = installation(&world.server(&tight));
     let installation_before = installation_parent.retained_bytes_for_test();
@@ -810,7 +825,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
         other => panic!("expected a typed memory refusal, got {other:?} from {refused:?}"),
     };
     assert!(body.is_none(), "no partial reply");
-    assert_eq!(tight.retained_bytes_for_test(), 0);
+    assert_eq!(tight.retained_bytes_for_test(), native_root_bytes_for_test());
     assert_eq!(
         installation_parent.retained_bytes_for_test(),
         installation_before
@@ -827,7 +842,7 @@ async fn refusal_and_cancellation_release_every_request_byte() {
         Some(contextdb_core::Error::ReadCancelled)
     ));
     assert!(body.is_none());
-    assert_eq!(before.retained_bytes_for_test(), 0);
+    assert_eq!(before.retained_bytes_for_test(), native_root_bytes_for_test());
     assert_eq!(
         installation_parent.retained_bytes_for_test(),
         installation_before
@@ -862,8 +877,8 @@ async fn refusal_and_cancellation_release_every_request_byte() {
     assert!(body.is_none());
     let (installation_during, request_during) = during.lock().unwrap().expect("hook ran");
     assert_eq!(installation_during, installation_before);
-    assert!(request_during > 0);
-    assert_eq!(after.retained_bytes_for_test(), 0);
+    assert!(request_during > native_root_bytes_for_test());
+    assert_eq!(after.retained_bytes_for_test(), native_root_bytes_for_test());
     assert_eq!(
         installation_parent.retained_bytes_for_test(),
         installation_before
@@ -873,25 +888,23 @@ async fn refusal_and_cancellation_release_every_request_byte() {
         reply.len(),
         peak,
         control,
-        control + peak - 1,
+        native_root_bytes_for_test() + control + peak - 1,
         refusal,
         request_during,
         tight.retained_bytes_for_test(),
         before.retained_bytes_for_test(),
         after.retained_bytes_for_test(),
     );
+    }
 }
 
 /// The parent-side control charge of one native request owner.
 struct ReadMemoryOwnerLayout;
 impl ReadMemoryOwnerLayout {
     fn control_bytes() -> u64 {
-        let parent =
-            DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
-        let owner = parent.native_child().expect("one owner");
-        let bytes = parent.retained_bytes_for_test();
-        drop(owner);
-        bytes
+        crate::vector_read_memory::native_control_layouts_for_test()
+            .1
+            .size() as u64
     }
 }
 
@@ -1474,6 +1487,7 @@ impl crate::transport::ClientTransport for LoseDeliveryAfter {
 // request bytes on the hub; asking again completes the continuation once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page() {
+    with_final_native_roots! { (requests);
     let world = World::new();
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
@@ -1510,7 +1524,7 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
     assert!(lost.is_err(), "the second page was lost");
     let after_loss = accepted();
     let served_once = server.delivery_route_counts_for_test();
-    assert_eq!(settled(&requests, 0), 0, "no request bytes stay on the hub");
+    assert_eq!(settled(&requests, native_root_bytes_for_test()), native_root_bytes_for_test(), "no request bytes stay on the hub");
 
     let fetched = within(world.client.fetch_delivery_outcomes(None))
         .await
@@ -1532,7 +1546,8 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
     assert_eq!(accepted(), backlog as u64);
     assert_eq!(served, (1 + backlog.div_ceil(page), 0));
     hub.stop();
-    assert_eq!(settled(&requests, 0), 0);
+    assert_eq!(settled(&requests, native_root_bytes_for_test()), native_root_bytes_for_test());
+    }
 }
 
 // Iroh native path charges: the request body is read straight into the
@@ -1632,6 +1647,7 @@ fn settled_reply_controls(seen: &std::sync::Mutex<ReplyControls>, edge_node: &st
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request() {
+    with_final_native_roots! { (requests);
     let dir = tempfile::tempdir().expect("store directory");
     let tenant = TenantId::from(TENANT);
     let endpoint = crate::transport::iroh::IrohServer::bind(&format!(
@@ -1736,7 +1752,7 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
         .expect("native delivery over Iroh");
     let during = during.lock().unwrap().expect("selection ran");
     let writer = crate::transport::iroh::reply_writer_bytes_for_test() as u64;
-    let after = settled(&requests, 0);
+    let after = settled(&requests, native_root_bytes_for_test());
     let edge_node = crate::identity::FabricIdentity::load_or_generate(&dir.path().join("edge.key"))
         .expect("edge identity")
         .node_id();
@@ -1751,6 +1767,7 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
     let probe = vec![7u8; 64 * 1024];
     let mut peaks = Vec::new();
     for admitted in [false, true] {
+        with_final_native_roots! { (parent);
         let parent =
             DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
         let child = parent.child().expect("probe reader");
@@ -1771,6 +1788,7 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
         assert!(result.is_err(), "an unrouted subject has no responder");
         drop(child);
         peaks.push(parent.file_child_high_water());
+        }
     }
     println!(
         "S4_IROH_CHARGES outcomes={} request_len={} reply_writer_inline={} {controls} request_parent_during_selection={} request_parent_after={} client_probe_len={} client_peak(legacy_branch,admitted)=({},{})",
@@ -1785,10 +1803,10 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
     );
     assert_eq!(fetched.len(), 3);
     assert!(
-        during >= request_len + writer,
+        during >= native_root_bytes_for_test() + request_len + writer,
         "body and writer are on the request"
     );
-    assert_eq!(after, 0);
+    assert_eq!(after, native_root_bytes_for_test());
     // The admitted request holds its body plus its own admitted driver frame,
     // never a second body-sized copy.
     assert!(
@@ -1805,6 +1823,7 @@ async fn the_iroh_native_path_charges_its_body_and_reply_writer_to_the_request()
     within(transport.shutdown()).await.ok();
     stop.request_stop();
     within(task).await.expect("hub stops");
+    }
 }
 
 /// Companions keep a roomy reader; native delivery can be pointed at a tight
@@ -1838,6 +1857,7 @@ impl crate::vector_read_memory::NativeReadRequestBudgetProvider for SwitchablePr
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors() {
+    with_final_native_roots! { (roomy_original, initial_tight);
     let dir = tempfile::tempdir().expect("store directory");
     let tenant = TenantId::from(TENANT);
     let endpoint = crate::transport::iroh::IrohServer::bind(&format!(
@@ -1858,6 +1878,7 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
         ),
         use_tight: AtomicBool::new(false),
     });
+    let initial_tight = provider.tight.lock().unwrap().clone();
     let server = Arc::new(
         SyncServer::new_with_read_budget_provider_handle(
             hub_db.clone(),
@@ -1924,6 +1945,7 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
     let mut lines = Vec::new();
     // 1. Memory refusal during selection, then before the body is held.
     for (case, limit) in [("selection", 20_000u64), ("body", 100u64)] {
+        let tight = {
         let tight =
             DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
         *provider.tight.lock().unwrap() = tight.clone();
@@ -1940,14 +1962,18 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
             }) => format!("MemoryBudgetExceeded({subsystem}/{operation})"),
             other => panic!("{case}: expected a typed memory refusal, got {other:?}"),
         };
-        let retained = settled(&tight, 0);
+        let retained = settled(&tight, native_root_bytes_for_test());
         lines.push(format!(
             "{case}: limit={limit} error={kind} native_dispatches={} accepted={} tight_parent_after={retained}",
             after_counts.0 - before.0,
             accepted(),
         ));
-        assert_eq!(retained, 0);
+        assert_eq!(retained, native_root_bytes_for_test());
         assert_eq!(accepted(), 0, "no success body was admitted");
+        *provider.tight.lock().unwrap() = provider.roomy.clone();
+        tight
+        };
+        tight.assert_only_original_root_and_free_for_test();
     }
 
     // 2. Cancellation after selection on the hub's own worker thread.
@@ -1962,7 +1988,7 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
         matches!(cancelled, Err(contextdb_core::Error::ReadCancelled)),
         "expected a typed cancellation, got {cancelled:?}"
     );
-    let roomy_after = settled(&provider.roomy, 0);
+    let roomy_after = settled(&provider.roomy, native_root_bytes_for_test());
     let edge_node = crate::identity::FabricIdentity::load_or_generate(&dir.path().join("edge.key"))
         .expect("edge identity")
         .node_id();
@@ -1972,7 +1998,7 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
         accepted()
     ));
     assert_eq!(accepted(), 0);
-    assert_eq!(roomy_after, 0);
+    assert_eq!(roomy_after, native_root_bytes_for_test());
 
     // 3. The same hub then serves the request normally.
     let fetched = within(client.fetch_delivery_outcomes(None))
@@ -1982,7 +2008,7 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
         "after: outcomes={} accepted={} roomy_parent_after={}",
         fetched.len(),
         accepted(),
-        settled(&provider.roomy, 0)
+        settled(&provider.roomy, native_root_bytes_for_test())
     ));
     println!("S4_IROH_TYPED {}", lines.join(" | "));
     assert_eq!(fetched.len(), 3);
@@ -1990,6 +2016,8 @@ async fn the_iroh_native_path_answers_refusal_and_cancellation_with_typed_errors
     within(client.shutdown()).await;
     stop.request_stop();
     within(task).await.expect("hub stops");
+    let roomy_original = provider.roomy.clone();
+    }
 }
 
 // Finding 5: the Iroh native root is retired by whichever way its serve call
@@ -2416,6 +2444,7 @@ impl IrohHub {
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_iroh_native_reply_control_is_charged_until_its_last_holder_drops() {
+    with_final_native_roots! { (requests);
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let hub = IrohHub::start(&requests).await;
@@ -2430,7 +2459,8 @@ async fn the_iroh_native_reply_control_is_charged_until_its_last_holder_drops() 
     // request's own reader owner, which the paid subject keeps alive.
     let owned = (crate::transport::iroh::native_reply_control_bytes_for_test()
         + delivery_outcomes_subject(TENANT).len()) as u64
-        + ReadMemoryOwnerLayout::control_bytes();
+        + ReadMemoryOwnerLayout::control_bytes()
+        + native_root_bytes_for_test();
     let while_held = settled(&requests, owned);
     within(hub.client.shutdown()).await;
     let after_disconnect = requests.retained_bytes_for_test();
@@ -2448,7 +2478,7 @@ async fn the_iroh_native_reply_control_is_charged_until_its_last_holder_drops() 
         after_disconnect, owned,
         "the charge outlives the connection while a holder survives"
     );
-    assert_eq!(after_last_holder, 0, "the last holder settles the charge");
+    assert_eq!(after_last_holder, native_root_bytes_for_test(), "the last holder settles the charge");
     // The fixed per-connection residue (ruling E2) is measured and bounded.
     let connection_task = crate::transport::iroh::connection_task_bytes_for_test();
     println!(
@@ -2458,6 +2488,7 @@ async fn the_iroh_native_reply_control_is_charged_until_its_last_holder_drops() 
     assert!(connection_task > 0);
     assert!(connection_task <= crate::transport::iroh::MAX_CONNECTION_TASK_BYTES);
     hub.stop().await;
+    }
 }
 
 // Review 2, finding 12: the Iroh client admits each reply frame on the
@@ -2468,6 +2499,7 @@ async fn the_iroh_native_reply_control_is_charged_until_its_last_holder_drops() 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_reading_it() {
+    with_final_native_roots! { (roomy, tight, next, unpolled, cancelled);
     use crate::transport::{BoundedWireBody, HandlerRegistration, IncomingRequest};
     const REPLY: usize = 256 * 1024;
     let dir = tempfile::tempdir().expect("store directory");
@@ -2605,10 +2637,10 @@ async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_
     );
     assert_eq!(roomy_reply, Some(REPLY));
     assert!(
-        roomy_held >= REPLY as u64,
+        roomy_held >= native_root_bytes_for_test() + REPLY as u64,
         "the reply is charged to its reader"
     );
-    assert_eq!(roomy_after, 0);
+    assert_eq!(roomy_after, native_root_bytes_for_test());
     assert!(
         matches!(
             &refused,
@@ -2625,16 +2657,17 @@ async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_
         tight_peak < REPLY as u64,
         "the refused reply was never held"
     );
-    assert_eq!(tight_after, 0);
+    assert_eq!(tight_after, native_root_bytes_for_test());
     assert_eq!(
         receipts_for_refused_and_next, 1,
         "only the next reply was read and acknowledged"
     );
-    assert_eq!(unpolled_after, 0);
-    assert_eq!(cancelled_after, 0);
+    assert_eq!(unpolled_after, native_root_bytes_for_test());
+    assert_eq!(cancelled_after, native_root_bytes_for_test());
     within(client.shutdown()).await.ok();
     shutdown.store(true, Ordering::SeqCst);
     within(serve).await.expect("serve task").expect("serve");
+    }
 }
 
 // Review 2, finding 4 (round 3 shape): a native read the owner's route cannot
@@ -2977,6 +3010,7 @@ async fn a_declared_page_byte_bound_cuts_native_pages_in_delivery_order() {
 async fn a_page_that_cannot_fit_refuses_with_the_typed_page_byte_limit() {
     let mut lines = Vec::new();
     for page_bytes in [100u64, 1_500] {
+        with_final_native_roots! { (requests, seeding);
         let world = World::with_page_bytes(page_bytes);
         let seeding =
             DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
@@ -3008,7 +3042,8 @@ async fn a_page_that_cannot_fit_refuses_with_the_typed_page_byte_limit() {
             "bound {page_bytes}: {refused:?}"
         );
         assert!(reply.is_none(), "no success body");
-        assert_eq!(settled(&requests, 0), 0);
+        assert_eq!(settled(&requests, native_root_bytes_for_test()), native_root_bytes_for_test());
+        }
     }
     println!("S4_PAGE_BYTES_REFUSAL {}", lines.join(" | "));
 }
@@ -3424,6 +3459,7 @@ async fn every_hub_admission_site_refuses_before_its_allocation() {
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hold() {
+    with_final_native_roots! { (requests, caller);
     use crate::vector_read_memory::{
         take_native_admissions_for_test, watch_native_admissions_for_test,
     };
@@ -3484,7 +3520,7 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
     assert_eq!(roomy.len(), 3);
     drop(roomy);
     drop(child);
-    assert_eq!(caller.retained_bytes_for_test(), 0);
+    assert_eq!(caller.retained_bytes_for_test(), native_root_bytes_for_test());
     let mut refused_on_page_two = None;
     for limit in (2_000..2_000_000u64).step_by(2_000) {
         let tight =
@@ -3500,21 +3536,25 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
         let pages_asked = hub.server.delivery_route_counts_for_test().0 - served_before;
         assert_eq!(
             tight.retained_bytes_for_test(),
-            0,
+            native_root_bytes_for_test(),
             "nothing retained at {limit}"
         );
-        match result {
+        let stop = match result {
             Ok(outcomes) => {
                 drop(outcomes);
-                break;
+                true
             }
             Err(contextdb_core::Error::MemoryBudgetExceeded { operation, .. })
                 if pages_asked >= 2 =>
             {
                 refused_on_page_two = Some((limit, pages_asked, operation));
-                break;
+                true
             }
-            Err(_) => {}
+            Err(_) => false,
+        };
+        tight.assert_only_original_root_and_free_for_test();
+        if stop {
+            break;
         }
     }
     println!("S4_EDGE_RESULT_REFUSAL {refused_on_page_two:?}");
@@ -3523,6 +3563,7 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
         "a caller reader refuses after the first page, returning nothing and retaining nothing"
     );
     hub.stop().await;
+    }
 }
 
 // Round 3, design §8 (abort exits): a hub connection task aborted while a
@@ -3533,6 +3574,7 @@ async fn the_edge_admits_each_fetch_site_and_refuses_a_second_page_it_cannot_hol
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aborted_hub_task_releases_every_charge_in_receive_dispatch_and_write() {
+    with_final_native_roots! { (requests);
     use crate::transport::native_pause::{self, Point};
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
@@ -3555,18 +3597,18 @@ async fn an_aborted_hub_task_releases_every_charge_in_receive_dispatch_and_write
         let (fetched, (held, aborted)) =
             within(async { tokio::join!(hub.client.fetch_delivery_outcomes(None), abort) }).await;
         let fetched = fetched.map(|outcomes| outcomes.len());
-        let after = settled(&requests, 0);
+        let after = settled(&requests, native_root_bytes_for_test());
         let edge_after = edge.retained_bytes_for_test();
         lines.push(format!(
             "{point:?}: held={held} aborted={aborted} fetched={fetched:?} hub_after={after} edge(before,after)=({edge_before},{edge_after})"
         ));
-        assert!(held > 0, "{point:?}: the held request carries its charges");
+        assert!(held > native_root_bytes_for_test(), "{point:?}: the held request carries its charges");
         assert!(
             aborted >= 1,
             "{point:?}: the hub connection task was aborted"
         );
         assert_eq!(
-            after, 0,
+            after, native_root_bytes_for_test(),
             "{point:?}: the aborted task released every charge"
         );
         assert_eq!(
@@ -3581,6 +3623,7 @@ async fn an_aborted_hub_task_releases_every_charge_in_receive_dispatch_and_write
     }
     println!("S4_ABORT_EXITS {}", lines.join(" | "));
     hub.stop().await;
+    }
 }
 
 // Round 3, design §8 (drain exit): a drain while a native request is held
@@ -3589,6 +3632,7 @@ async fn an_aborted_hub_task_releases_every_charge_in_receive_dispatch_and_write
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drain_mid_dispatch_closes_the_request_unanswered_and_releases_every_charge() {
+    with_final_native_roots! { (requests);
     use crate::transport::iroh::TERMINAL_WRITES;
     use crate::transport::native_pause::{self, Point};
     let requests =
@@ -3612,24 +3656,25 @@ async fn a_drain_mid_dispatch_closes_the_request_unanswered_and_releases_every_c
     let fetched = fetched.map(|outcomes| outcomes.len());
     let terminals = TERMINAL_WRITES.lock().unwrap().len() - terminals_before;
     hub.stop().await;
-    let after = settled(&requests, 0);
+    let after = settled(&requests, native_root_bytes_for_test());
     let edge_after = edge.retained_bytes_for_test();
     println!(
         "S4_DRAIN_EXIT held={held} fetched={fetched:?} terminals_written={terminals} hub_after={after} edge(before,after)=({edge_before},{edge_after})"
     );
-    assert!(held > 0, "the held request carries its charges");
+    assert!(held > native_root_bytes_for_test(), "the held request carries its charges");
     assert!(fetched.is_err(), "a drained request is not answered");
     assert_eq!(
         terminals, 0,
         "the drained request's stream closes unanswered"
     );
-    assert_eq!(after, 0, "the drain released every charge");
+    assert_eq!(after, native_root_bytes_for_test(), "the drain released every charge");
     // The edge's redial meets a hub that stopped serving, so the edge may also
     // let go of standing state it held before the request; it never holds more.
     assert!(
         edge_after <= edge_before,
         "the edge retains nothing of the drained request: ({edge_before},{edge_after})"
     );
+    }
 }
 
 // Round 3, design §8 (terminal-write failure): when the edge stops reading
@@ -3639,6 +3684,7 @@ async fn a_drain_mid_dispatch_closes_the_request_unanswered_and_releases_every_c
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_the_edge_no_longer_reads_fails_its_write_and_releases_every_charge() {
+    with_final_native_roots! { (requests);
     use crate::transport::iroh::TERMINAL_WRITES;
     use crate::transport::native_pause::{self, Point};
     let requests =
@@ -3664,11 +3710,11 @@ async fn a_terminal_the_edge_no_longer_reads_fails_its_write_and_releases_every_
     gate.release();
     crate::transport::release_events::wait_until(|| !TERMINAL_WRITES.lock().unwrap().is_empty());
     let first = TERMINAL_WRITES.lock().unwrap().clone();
-    let after = settled(&requests, 0);
+    let after = settled(&requests, native_root_bytes_for_test());
     // The hub keeps serving: the next request is refused, typed.
     let again = within(hub.client.fetch_delivery_outcomes(None)).await;
     let writes = TERMINAL_WRITES.lock().unwrap().clone();
-    let after_again = settled(&requests, 0);
+    let after_again = settled(&requests, native_root_bytes_for_test());
     let edge_after = edge.retained_bytes_for_test();
     println!(
         "S4_TERMINAL_WRITE_FAILURE answered={answered:?} held={held} first_writes={first:?} hub_after={after} again={again:?} writes={writes:?} hub_after_again={after_again} edge(before,abandoned,after)=({edge_before},{edge_abandoned},{edge_after})"
@@ -3678,7 +3724,7 @@ async fn a_terminal_the_edge_no_longer_reads_fails_its_write_and_releases_every_
         "the hub holds the terminal before the edge has an answer"
     );
     assert!(
-        held > 0,
+        held > native_root_bytes_for_test(),
         "the failed request's control is alive while its terminal waits"
     );
     assert_eq!(
@@ -3686,19 +3732,20 @@ async fn a_terminal_the_edge_no_longer_reads_fails_its_write_and_releases_every_
         vec![false],
         "the terminal write to an abandoned stream fails"
     );
-    assert_eq!(after, 0, "the failed terminal write released every charge");
+    assert_eq!(after, native_root_bytes_for_test(), "the failed terminal write released every charge");
     assert!(
         matches!(&again, Err(contextdb_core::Error::ReadFailure(_))),
         "the next request is answered with its typed refusal: {again:?}"
     );
     assert_eq!(writes, vec![false, true]);
-    assert_eq!(after_again, 0);
+    assert_eq!(after_again, native_root_bytes_for_test());
     assert_eq!(
         edge_abandoned, edge_before,
         "the abandoned fetch retains nothing"
     );
     assert_eq!(edge_after, edge_before);
     hub.stop().await;
+    }
 }
 
 // Round 3, design §8 (edge timeout, retry and drop): an admitted edge request
@@ -3709,6 +3756,7 @@ async fn a_terminal_the_edge_no_longer_reads_fails_its_write_and_releases_every_
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
+    with_final_native_roots! { (requests, reader);
     use crate::transport::BoundedWireBody;
     use crate::transport::native_pause::{self, Point};
     // A parameter of the exchange, not a synchronization: the hub holds the
@@ -3763,10 +3811,10 @@ async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
         .map(decode_outcomes);
     let reply_ok = reply.is_ok();
     drop(reply);
-    let edge_after = settled(&reader, 0);
+    let edge_after = settled(&reader, native_root_bytes_for_test());
     let held = requests.retained_bytes_for_test();
     gate.release();
-    let hub_after = settled(&requests, 0);
+    let hub_after = settled(&requests, native_root_bytes_for_test());
     println!(
         "S4_EDGE_TIMEOUT held_first={held_first} reply_ok={reply_ok} outcomes={outcomes:?} edge_after={edge_after} hub_held={held} hub_after={hub_after}"
     );
@@ -3775,14 +3823,15 @@ async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
         "the first attempt was held at the hub past its timeout"
     );
     assert_eq!(outcomes, Some(3), "the single retry is answered");
-    assert_eq!(edge_after, 0, "the edge retains nothing");
+    assert_eq!(edge_after, native_root_bytes_for_test(), "the edge retains nothing");
     assert!(
-        held > 0,
+        held > native_root_bytes_for_test(),
         "the abandoned first attempt still holds its charges"
     );
-    assert_eq!(hub_after, 0, "its failed write released every charge");
+    assert_eq!(hub_after, native_root_bytes_for_test(), "its failed write released every charge");
     within(client.shutdown()).await.ok();
     hub.stop().await;
+    }
 }
 
 /// A provider that funds every hub request from its own fresh declared
@@ -4101,6 +4150,7 @@ impl World {
 // serves it (native_stop + run_until_stopped), answers natively again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transaction_repair_restores_native_delivery_after_reopen() {
+    with_final_native_roots! { (requests);
     let mut world = World::new();
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
@@ -4172,13 +4222,14 @@ async fn transaction_repair_restores_native_delivery_after_reopen() {
     lines.push(format!(
         "repaired: complete_after_reopen={complete_after_reopen} outcomes={} served={counts:?} request_parent_after={}",
         fetched.len(),
-        settled(&requests, 0)
+        settled(&requests, native_root_bytes_for_test())
     ));
     println!("S4_REPAIR {}", lines.join(" | "));
     assert!(complete_after_reopen);
     assert_eq!(fetched.len(), 3, "every recorded outcome, exactly once");
     assert_eq!(counts, (1, 0), "one request, served by the native route");
     hub.stop();
+    }
 }
 
 // Review 2, finding 4, over real Iroh: a hub whose custody index has lost its
@@ -4189,6 +4240,7 @@ async fn transaction_repair_restores_native_delivery_after_reopen() {
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_custody_marker_refuses_over_iroh_with_the_typed_owner_route_refusal() {
+    with_final_native_roots! { (requests);
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let IrohHub {
@@ -4249,7 +4301,7 @@ async fn a_lost_custody_marker_refuses_over_iroh_with_the_typed_owner_route_refu
         .delivery_status(ROOT_TABLE)
         .expect("edge delivery status")
         .accepted;
-    let retained = settled(&requests, 0);
+    let retained = settled(&requests, native_root_bytes_for_test());
     println!(
         "S4_IROH_LOST_MARKER refused={refused:?} served={counts:?} accepted={accepted} request_parent_after={retained}"
     );
@@ -4269,8 +4321,9 @@ async fn a_lost_custody_marker_refuses_over_iroh_with_the_typed_owner_route_refu
         "refused on the native route; no Legacy answer"
     );
     assert_eq!(accepted, 0, "no success body was admitted");
-    assert_eq!(retained, 0);
+    assert_eq!(retained, native_root_bytes_for_test());
     within(client.shutdown()).await;
     stop.request_stop();
     within(task).await.expect("restarted hub stops");
+    }
 }
