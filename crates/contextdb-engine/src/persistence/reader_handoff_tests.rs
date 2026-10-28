@@ -431,3 +431,148 @@ fn a_join_during_the_last_leave_opens_once_takes_once_and_retries_never() {
     assert_eq!(retries, 0, "no departed-descriptor retry");
     drop(session);
 }
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn a_join_holding_the_runtime_lifetime_lock_never_registers_into_a_removed_root() {
+    use read_persistence_test_scaffold::{
+        ReaderPausePoint, install_reader_join_wait_hook_for_test, pause_readers_at_for_test,
+        registration_attempt_counts_for_test,
+    };
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "a_join_holding_the_runtime_lifetime_lock_never_registers_into_a_removed_root",
+        &[],
+    ) {
+        return;
+    }
+    let private_base =
+        platform_reader_runtime_base().expect("the isolated child has an XDG runtime root");
+    std::fs::set_permissions(&private_base, std::fs::Permissions::from_mode(0o700))
+        .expect("secure only this child-owned runtime root");
+    let (_directory_a, path_a, channel_runtime) = fixture();
+    let (_directory_b, path_b, _) = fixture();
+    assert_ne!(identity(&path_a), identity(&path_b));
+    let earlier = crate::ReadSession::open_in_runtime_dir(
+        &path_a,
+        crate::ReadSessionOptions::default(),
+        Some(channel_runtime.clone()),
+    )
+    .expect("A is the last registered reader");
+    let publication_roots = reader_publication_directories(Some(&channel_runtime)).len() as u64;
+    let runtime = default_reader_runtime_directory().unwrap();
+    let root = runtime.path().to_path_buf();
+    let root_before = identity(&root);
+    let counts_before = registration_attempt_counts_for_test(&path_b);
+    let pause = pause_readers_at_for_test(&path_b, ReaderPausePoint::AfterRuntimeRootLifetimeHold);
+    let (answer_tx, answer_rx) = mpsc::channel();
+    let joining_path = path_b.clone();
+    let joiner = std::thread::spawn(move || {
+        let result = crate::ReadSession::open_in_runtime_dir(
+            &joining_path,
+            crate::ReadSessionOptions::default(),
+            Some(channel_runtime),
+        );
+        let _ = answer_tx.send(result);
+    });
+    let ticket = pause
+        .wait_for_paused_reader(WATCHDOG)
+        .expect("B holds the lifetime lock after creating the root but before registration");
+
+    // The old exclusive serializer may block A here; the shared lifetime
+    // implementation may finish A's leave. Both edges are explicit events,
+    // so the test never infers a blocked operation from elapsed time.
+    #[derive(Debug)]
+    enum LeaveEdge {
+        WaitingForRoot,
+        Finished,
+    }
+    let (edge_tx, edge_rx) = mpsc::channel();
+    let leaver = std::thread::spawn(move || {
+        let waiting = edge_tx.clone();
+        install_reader_join_wait_hook_for_test(Box::new(move || {
+            let _ = waiting.send(LeaveEdge::WaitingForRoot);
+        }));
+        drop(earlier);
+        let _ = edge_tx.send(LeaveEdge::Finished);
+    });
+    let edge = edge_rx
+        .recv_timeout(WATCHDOG)
+        .expect("A reaches a driven leave edge");
+    let root_after_a = std::fs::metadata(&root)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    pause.release(ticket);
+    drop(pause);
+    let joined = answer_rx
+        .recv_timeout(WATCHDOG)
+        .expect("B's finite join completes");
+    joiner.join().expect("B's join thread finishes");
+    // Retain B's result while A finishes, so a successful B registration
+    // remains present if the old serializer had to wait for B's join.
+    leaver
+        .join()
+        .expect("A's leave finishes after B's lifetime hold is released");
+    let counts_after = registration_attempt_counts_for_test(&path_b);
+    let opens = counts_after.opens - counts_before.opens;
+    let takes = counts_after.l0_takes - counts_before.l0_takes;
+    let retries = counts_after.retries - counts_before.retries;
+    let diagnostic = joined.as_ref().err().map(|error| format!("{error:?}"));
+    eprintln!(
+        "join_root_edge={edge:?} root_before={root_before:?} root_after_A={root_after_a:?} opens={opens} takes={takes} retries={retries} result={diagnostic:?}"
+    );
+    let session = joined.unwrap_or_else(|error| panic!(
+        "B joins a live root or retries once into a fresh root, never refuses because A left: {error:?}"
+    ));
+    assert!(
+        (publication_roots..=publication_roots + 1).contains(&opens),
+        "one join per publication root plus at most one fresh-root retry: {opens}"
+    );
+    assert!((publication_roots..=publication_roots + 1).contains(&takes) && takes <= opens);
+    assert!(retries <= 1, "no unbounded departed-root retry: {retries}");
+    let registered = session
+        .file_storage_registration_for_test()
+        .expect("B has a real file registration");
+    assert!(registered.descriptor_open);
+    let registration = registered
+        .registration_path
+        .expect("B publishes its exact registered root");
+    assert!(registration.starts_with(&root));
+    let metadata = std::fs::metadata(&registration)
+        .expect("B's registration remains linked under the live root");
+    assert_eq!(
+        metadata.nlink(),
+        1,
+        "B never retains an unlinked registration"
+    );
+    assert!(root.is_dir(), "B's published root is live");
+    if identity(&root) == root_before {
+        assert_eq!(
+            retries, 0,
+            "a root that stayed live requires no departure retry"
+        );
+        assert_eq!(opens, takes, "each registry open has one successful take");
+    } else {
+        assert_eq!(
+            opens,
+            publication_roots + 1,
+            "a removed root is joined again exactly once"
+        );
+        assert_eq!(retries, 1, "one fresh-root retry, never a loop");
+    }
+    let answer = session
+        .execute(
+            "SELECT id, payload FROM erased_rows ORDER BY id",
+            &HashMap::new(),
+        )
+        .expect("the successful join reads B's complete original content");
+    assert_eq!(
+        answer.rows(),
+        &[
+            vec![Value::Int64(1), Value::Text("secret".into())],
+            vec![Value::Int64(2), Value::Text("secret".into())],
+            vec![Value::Int64(3), Value::Text("secret".into())],
+        ]
+    );
+    drop(session);
+}
