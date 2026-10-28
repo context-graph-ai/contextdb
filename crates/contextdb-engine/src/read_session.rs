@@ -3004,6 +3004,39 @@ impl ReadSession {
         Ok(session)
     }
 
+    /// Open below the supplied runtime root while a proof controls the session clock.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn open_in_runtime_dir_with_clock_for_test(
+        path: impl AsRef<Path>,
+        options: ReadSessionOptions,
+        runtime_dir: Option<PathBuf>,
+        clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
+    ) -> Result<Self> {
+        let session_clock = Arc::clone(&clock);
+        let mut session = with_route_selection_clock_for_test(clock, || {
+            Self::select(
+                path.as_ref(),
+                options,
+                runtime_dir,
+                RouteRequirement::OwnerOrFile,
+                None,
+                None,
+                None,
+                None,
+            )
+        })?;
+        session.clock = Some(session_clock);
+        Ok(session)
+    }
+
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     #[cfg_attr(
