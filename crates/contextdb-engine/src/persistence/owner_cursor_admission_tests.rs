@@ -1236,7 +1236,7 @@ fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention(
     )
     .unwrap();
 
-    let (_directory, persistence, runtime) = writer();
+    let (_directory, persistence, _runtime) = writer();
     let owner = persistence
         .writer_file
         .read()
@@ -1249,15 +1249,10 @@ fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention(
     let handle = pin._registration.snapshot.handle_identity;
     let snapshot = pin.storage_identity();
 
-    // Hold the task-scoped runtime root serializer on a separate real descriptor,
-    // simulating an unrelated store in the same runtime root currently joining or leaving.
-    let root_serializer =
-        serialize_runtime_root(&runtime, false).expect("acquire runtime root serializer");
-
-    let outcome = owner.audit_reader_snapshots_under_hold();
-
-    // Release serializer before any blocking cleanup
-    drop(root_serializer);
+    // A real unrelated store's leave holds its lifetime lock and store exclusion.
+    let (outcome, _) = super::reader_handoff_tests::during_unrelated_reader_leave(|| {
+        owner.audit_reader_snapshots_under_hold()
+    });
 
     match outcome {
         writer_file::ReaderAuditOutcome::Proven(audit) => {

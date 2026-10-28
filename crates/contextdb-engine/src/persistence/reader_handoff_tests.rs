@@ -576,3 +576,368 @@ fn a_join_holding_the_runtime_lifetime_lock_never_registers_into_a_removed_root(
     );
     drop(session);
 }
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+fn reader_runtime_artifacts(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("storage-") || name.ends_with(".fence") {
+                found.push(path.clone());
+            }
+            if path.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn an_entering_reader_keeps_a_skipped_registry_and_cleans_every_root_when_it_leaves_last() {
+    use read_persistence_test_scaffold::{
+        ReaderPausePoint, install_reader_join_wait_hook_for_test, pause_readers_at_for_test,
+        registration_attempt_counts_for_test,
+    };
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "an_entering_reader_keeps_a_skipped_registry_and_cleans_every_root_when_it_leaves_last",
+        &[],
+    ) {
+        return;
+    }
+    let private_base = platform_reader_runtime_base().unwrap();
+    std::fs::set_permissions(&private_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_directory, path, supplied) = fixture();
+    let earlier = crate::ReadSession::open_in_runtime_dir(
+        &path,
+        crate::ReadSessionOptions::default(),
+        Some(supplied.clone()),
+    )
+    .unwrap();
+    let platform = default_reader_runtime_directory()
+        .unwrap()
+        .path()
+        .to_path_buf();
+    let registry = reader_snapshot_registry_lock_path(&platform, identity(&path));
+    let registry_before = identity(&registry);
+    let roots = reader_publication_directories(Some(&supplied)).len() as u64;
+    let before = registration_attempt_counts_for_test(&path);
+    let pause = pause_readers_at_for_test(&path, ReaderPausePoint::LeavingWithRegistryExclusion);
+    let leaving = std::thread::spawn(move || drop(earlier));
+    let ticket = pause
+        .wait_for_paused_reader(WATCHDOG)
+        .expect("the real leave holds this store's registry exclusion");
+    let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let (session_tx, session_rx) = mpsc::channel();
+    let joining_path = path.clone();
+    let joining_runtime = supplied.clone();
+    let joining = std::thread::spawn(move || {
+        install_reader_join_wait_hook_for_test(Box::new(move || {
+            waiting_tx.send(()).expect("report the real registry wait");
+            resume_rx
+                .recv_timeout(WATCHDOG)
+                .expect("the guard releases the waiting join");
+        }));
+        let result = crate::ReadSession::open_in_runtime_dir(
+            &joining_path,
+            crate::ReadSessionOptions::default(),
+            Some(joining_runtime),
+        );
+        let _ = session_tx.send(result);
+    });
+    waiting_rx
+        .recv_timeout(WATCHDOG)
+        .expect("the entering reader reaches its real registry wait");
+    // The waiting reader's physical hold is the real reason cleanup skips.
+    let cleanup_gate = with_last_reader_gate(&path, identity(&path), |held| held);
+    pause.release(ticket);
+    drop(pause);
+    leaving
+        .join()
+        .expect("the earlier reader leaves while the entrant is still waiting");
+    let registry_after_leave = std::fs::metadata(&registry)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()));
+    // Release the join before asserting, including on a failed skip witness.
+    let _ = resume_tx.send(());
+    let result = session_rx
+        .recv_timeout(WATCHDOG)
+        .expect("the entering reader completes");
+    joining.join().expect("the entering reader thread finishes");
+    let after = registration_attempt_counts_for_test(&path);
+    let opens = after.opens - before.opens;
+    let takes = after.l0_takes - before.l0_takes;
+    let retries = after.retries - before.retries;
+    assert!(
+        !cleanup_gate,
+        "the entering reader's real physical hold denies last-leave removal"
+    );
+    assert_eq!(
+        registry_after_leave,
+        Some(registry_before),
+        "the skipped registry is still the same linked inode"
+    );
+    let session = result.unwrap_or_else(|error| {
+        panic!("the waiting entrant reads after cleanup skipped: {error:?}")
+    });
+    assert_eq!(
+        (opens, takes, retries),
+        (roots, roots, 0),
+        "the preserved registry needs no departure retry"
+    );
+    let rows = session
+        .execute(
+            "SELECT id, payload FROM erased_rows ORDER BY id",
+            &HashMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        rows.rows(),
+        &[
+            vec![Value::Int64(1), Value::Text("secret".into())],
+            vec![Value::Int64(2), Value::Text("secret".into())],
+            vec![Value::Int64(3), Value::Text("secret".into())],
+        ]
+    );
+    drop(rows);
+    let registration = session
+        .file_storage_registration_for_test()
+        .unwrap()
+        .registration_path
+        .unwrap();
+    assert!(
+        registration.is_file(),
+        "the entering reader has a live registration"
+    );
+    drop(session);
+    let platform_left = reader_runtime_artifacts(&private_base);
+    let supplied_left = reader_runtime_artifacts(&supplied);
+    eprintln!(
+        "skip_registry_before={registry_before:?} after_A={registry_after_leave:?} opens={opens} takes={takes} retries={retries} platform_left={platform_left:?} supplied_left={supplied_left:?}"
+    );
+    assert!(
+        !platform.exists(),
+        "the last entering reader removes its empty platform contextdb root; left={platform_left:?}"
+    );
+    assert!(
+        platform_left.is_empty(),
+        "no reader registry, lock or fence remains in the platform root"
+    );
+    assert!(
+        supplied_left.is_empty(),
+        "no reader registry, lock or fence remains in the supplied root: {supplied_left:?}"
+    );
+    assert!(
+        supplied.is_dir() && private_base.is_dir(),
+        "both operator-owned root directories remain"
+    );
+}
+
+// Run B while a real unrelated A leave owns its store exclusion and root lifetime hold.
+// The wait hook reports a blocking root acquisition directly; no timeout is an oracle.
+#[cfg(target_os = "linux")]
+pub(super) fn during_unrelated_reader_leave<R: Send>(
+    operation: impl FnOnce() -> R + Send,
+) -> (R, bool) {
+    use read_persistence_test_scaffold::{
+        ReaderPausePoint, install_reader_join_wait_hook_for_test, pause_readers_at_for_test,
+    };
+    let private_base = platform_reader_runtime_base().unwrap();
+    std::fs::set_permissions(&private_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_directory, path, supplied) = fixture();
+    let earlier = crate::ReadSession::open_in_runtime_dir(
+        &path,
+        crate::ReadSessionOptions::default(),
+        Some(supplied),
+    )
+    .unwrap();
+    let pause = pause_readers_at_for_test(&path, ReaderPausePoint::LeavingWithRegistryExclusion);
+    std::thread::scope(|scope| {
+        let leaving = scope.spawn(move || drop(earlier));
+        let ticket = pause
+            .wait_for_paused_reader(WATCHDOG)
+            .expect("A's real leave holds its registry exclusion");
+        let (edge_tx, edge_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let working = scope.spawn(move || {
+            let waiting = edge_tx.clone();
+            install_reader_join_wait_hook_for_test(Box::new(move || {
+                let _ = waiting.send(true);
+            }));
+            let result = operation();
+            let _ = result_tx.send(result);
+            let _ = edge_tx.send(false);
+        });
+        let blocked = edge_rx
+            .recv_timeout(WATCHDOG)
+            .expect("B either finishes or reports its actual root wait");
+        pause.release(ticket);
+        drop(pause);
+        leaving.join().unwrap();
+        let result = result_rx
+            .recv_timeout(WATCHDOG)
+            .expect("B completes after A's finite leave");
+        working.join().unwrap();
+        (result, blocked)
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+fn isolated_root_case(name: &str) -> bool {
+    if crate::test_process::rerun_alone(module_path!(), name, &[]) {
+        return true;
+    }
+    let private_base = platform_reader_runtime_base().unwrap();
+    std::fs::set_permissions(&private_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    false
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn unrelated_leave_does_not_block_breadcrumb_create_in() {
+    if isolated_root_case("unrelated_leave_does_not_block_breadcrumb_create_in") {
+        return;
+    }
+    let (_directory, path, _) = fixture();
+    let runtime = default_reader_runtime_directory().unwrap();
+    let (result, blocked) = during_unrelated_reader_leave(move || {
+        ReaderBreadcrumbGuard::create_in(
+            &path,
+            &runtime,
+            Some(&current_reader_breadcrumb().unwrap()),
+        )
+    });
+    let guard = result.expect("B publishes its real breadcrumb");
+    assert!(
+        !blocked,
+        "B's diagnostic publication never waits for unrelated A's leave"
+    );
+    assert!(guard.path().is_file());
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn unrelated_leave_does_not_drop_create_for_open_breadcrumb() {
+    if isolated_root_case("unrelated_leave_does_not_drop_create_for_open_breadcrumb") {
+        return;
+    }
+    let (_directory, path, _) = fixture();
+    let runtime = default_reader_runtime_directory().unwrap();
+    let (result, blocked) = during_unrelated_reader_leave(move || {
+        let limits = crate::ReadSessionOptions::default().limits;
+        let declared =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory)
+                .unwrap();
+        let context = crate::executor::bounded::ReadOpenContext::new(
+            declared.child().unwrap(),
+            limits,
+            crate::read_session::read_clock(),
+            OwnerReadCancellation::new(),
+        )
+        .unwrap();
+        ReaderBreadcrumbGuard::create_for_open(
+            &path,
+            &runtime,
+            Some(&current_reader_breadcrumb().unwrap()),
+            &context,
+        )
+    });
+    assert!(!blocked);
+    let guard = result
+        .expect("B's open diagnostic has no refusal")
+        .expect("unrelated A never silently drops B's breadcrumb");
+    assert!(guard.path().is_file());
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn unrelated_leave_keeps_other_store_inventory_complete() {
+    if isolated_root_case("unrelated_leave_keeps_other_store_inventory_complete") {
+        return;
+    }
+    let (_directory, path, supplied) = fixture();
+    let reader = crate::ReadSession::open_in_runtime_dir(
+        &path,
+        crate::ReadSessionOptions::default(),
+        Some(supplied.clone()),
+    )
+    .unwrap();
+    let registered = reader.file_storage_registration_for_test().unwrap();
+    let physical = identity(&path);
+    let (inventory, blocked) = during_unrelated_reader_leave(move || {
+        capture_reader_snapshot_registry(physical, Some(&supplied))
+    });
+    assert!(!blocked);
+    match inventory {
+        ReaderSnapshotRegistry::Complete(snapshots) => assert!(snapshots.iter().any(|snapshot| {
+            snapshot.handle_identity == registered.handle_identity
+                && snapshot.storage_snapshot.transaction_id == registered.storage_transaction_id
+                && snapshot.storage_snapshot.user_root.map(|root| root.page)
+                    == registered.storage_root_page
+                && snapshot
+                    .storage_snapshot
+                    .user_root
+                    .map(|root| root.checksum)
+                    == registered.storage_root_checksum
+                && snapshot.storage_snapshot.user_root.map(|root| root.length)
+                    == registered.storage_root_length
+        })),
+        other => panic!("B's real registered reader stays observable during A's leave: {other:?}"),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
+#[test]
+fn unrelated_leave_does_not_skip_other_writer_idle_registry_cleanup() {
+    if isolated_root_case("unrelated_leave_does_not_skip_other_writer_idle_registry_cleanup") {
+        return;
+    }
+    let (_directory, path, supplied) = fixture();
+    let persistence =
+        RedbPersistence::open_with_cache_in_runtime_dir(&path, REDB_CACHE_BYTES, Some(&supplied))
+            .unwrap();
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+    let pin = persistence.owner_cursor_pin().unwrap();
+    drop(pin);
+    let roots = reader_publication_directories(Some(&supplied));
+    let registry_paths: Vec<_> = roots
+        .iter()
+        .flat_map(|root| {
+            [
+                reader_snapshot_directory(root.path(), identity(&path)),
+                reader_snapshot_registry_lock_path(root.path(), identity(&path)),
+            ]
+        })
+        .collect();
+    assert!(
+        registry_paths.iter().any(|path| path.is_file()),
+        "B has a real idle registry before writer cleanup"
+    );
+    persistence.make_writer_quiescent().unwrap();
+    let (remaining, blocked) = during_unrelated_reader_leave(|| {
+        persistence.remove_idle_reader_registries();
+        registry_paths
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    assert!(!blocked);
+    assert!(
+        remaining.is_empty(),
+        "B removes its own idle registries while unrelated A leaves: {remaining:?}"
+    );
+}
