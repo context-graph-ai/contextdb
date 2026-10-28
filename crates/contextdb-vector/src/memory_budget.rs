@@ -445,6 +445,11 @@ pub(crate) fn same_funder(left: &dyn MemoryBudget, right: &dyn MemoryBudget) -> 
 pub trait PrepaidVectorCopyCharge: Send + Sync {
     fn accountant(&self) -> crate::memory_budget::MemoryBudgetOwner;
     fn retained_bytes(&self) -> usize;
+    /// Whether this charge already owns admission for its enclosing Box.
+    /// When true, the charge retains that debit and its release responsibility.
+    fn prepaid_box_control_is_admitted(&self) -> bool {
+        false
+    }
     #[cfg(feature = "test-seams")]
     fn original_payer_identity_for_test(&self) -> usize {
         0
@@ -549,14 +554,19 @@ impl VectorCopyAdmission {
             ));
         }
         let prepaid_bytes = prepaid.retained_bytes();
-        let prepaid_control_bytes = std::mem::size_of::<C>();
         let control_invoice = accountant.control_invoice();
-        accountant.try_allocate_for_static(
-            prepaid_control_bytes,
-            "vector_copy",
-            "prepaid_control",
-            "Raise reader memory to fund the retained copy credit.",
-        )?;
+        let prepaid_control_bytes = if prepaid.prepaid_box_control_is_admitted() {
+            0
+        } else {
+            let bytes = std::mem::size_of::<C>();
+            accountant.try_allocate_for_static(
+                bytes,
+                "vector_copy",
+                "prepaid_control",
+                "Raise reader memory to fund the retained copy credit.",
+            )?;
+            bytes
+        };
         // No provider callback or fallible operation follows the move. Legacy
         // Box allocation retains its existing process OOM behavior.
         Ok(Self {

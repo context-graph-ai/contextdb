@@ -779,6 +779,10 @@ impl StagedCopyCharge {
 }
 
 impl contextdb_vector::PrepaidVectorCopyCharge for StagedCopyCharge {
+    fn prepaid_box_control_is_admitted(&self) -> bool {
+        self.own_control.is_some()
+    }
+
     fn accountant(&self) -> contextdb_vector::MemoryBudgetOwner {
         contextdb_vector::MemoryBudgetOwner::clone(&self.vector_accountant)
     }
