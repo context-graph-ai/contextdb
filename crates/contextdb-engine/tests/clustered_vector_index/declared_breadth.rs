@@ -15,7 +15,10 @@ use uuid::Uuid;
 
 const DIMENSIONS: usize = 16;
 const CONTEXTS: u128 = 8;
-const ROWS_PER_CONTEXT: i64 = 400;
+// The smallest equal-sized groups whose PROBES lists can supply the full
+// LIMIT * REFINE_FACTOR shortlist, while every declared list stays nonempty.
+const ROWS_PER_CONTEXT: i64 =
+    (LISTS as u64 * (LIMIT * REFINE_FACTOR as u64).div_ceil(PROBES)) as i64;
 const LISTS: u32 = 8;
 const PROBES: u64 = 3;
 const REFINE_FACTOR: u32 = 2;
@@ -46,7 +49,7 @@ fn explicit_probes_and_refine_factor_bound_list_pages_and_rescores_exactly() {
                 &params([
                     ("id", Value::Int64(id)),
                     ("context", Value::Uuid(context(ordinal))),
-                    ("embedding", Value::Vector(unit_vector(id as u64, DIMENSIONS))),
+                    ("embedding", Value::Vector(unit_vector(row as u64 % u64::from(LISTS), DIMENSIONS))),
                 ]),
             )
             .expect("stage one row");
