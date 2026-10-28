@@ -7355,3 +7355,9 @@ fn staged_terminal_refusal_override_clears_only_matching_marker_and_scan() {
 }
 
 include!("authored_occurrence_delivery_tests.rs");
+
+include!("received_closeout_guards.rs");
+
+include!("received_restatement_public_guards.rs");
+
+include!("received_native_alias_guards.rs");
