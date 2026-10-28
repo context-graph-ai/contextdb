@@ -30,3 +30,6 @@ mod a_volatile_default_keeps_mixed_edge_bindings_distinct;
 
 #[path = "sql_surface/raw_row_inserts_apply_declared_defaults.rs"]
 mod raw_row_inserts_apply_declared_defaults;
+
+#[path = "sql_surface/staged_wide_key_alias.rs"]
+mod staged_wide_key_alias;

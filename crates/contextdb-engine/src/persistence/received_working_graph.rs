@@ -218,94 +218,6 @@ impl ReceivedWorkingWrite {
         })
     }
 
-    /// Remove only versions of the exact pre-DROP row identity. The bounded
-    /// prefix seek avoids rewriting or gathering unrelated graph history.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn remove_graph_identity(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        source: NodeId,
-        kind: &str,
-        target: NodeId,
-    ) -> Result<()> {
-        self.require_original(original)?;
-        if !self.graph_prepared()? {
-            return Err(Error::Other(
-                "private graph DROP has no completed private image".into(),
-            ));
-        }
-        self.select_graph_type(original, kind)?;
-        self.retire_graph_occurrences(original, source, kind, target)?;
-        let frame = OriginalPersistenceFrame::new(original)?;
-        let length = kind
-            .len()
-            .checked_add(33)
-            .ok_or_else(|| Error::Other("working graph identity overflow".into()))?;
-        frame.reserve(
-            length
-                .checked_mul(2)
-                .ok_or_else(|| Error::Other("working graph identity overflow".into()))?,
-        )?;
-        let mut prefix = Vec::with_capacity(length);
-        prefix.extend_from_slice(source.as_bytes());
-        prefix.extend_from_slice(target.as_bytes());
-        prefix.extend_from_slice(kind.as_bytes());
-        prefix.push(0);
-        if prefix.capacity() != length {
-            return Err(Error::Other(
-                "working graph identity capacity differs from admission".into(),
-            ));
-        }
-        let upper = writer_source::prefix_end(&prefix);
-        let mut after = None::<GraphPosition>;
-        loop {
-            let lower = after
-                .as_ref()
-                .map_or(Bound::Included(prefix.as_slice()), |position| {
-                    Bound::Excluded(position.key.as_slice())
-                });
-            let upper = upper
-                .as_ref()
-                .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice()));
-            let Some(window) = self.next_graph_edge(original, false, lower, upper)? else {
-                break;
-            };
-            let next = OriginalPersistenceFrame::new(original)?;
-            let key = next.copy_bytes(window.position())?;
-            after = Some(GraphPosition {
-                key,
-                _owner: next.into_reservation(),
-            });
-            // An edge type containing a NUL can share this byte prefix. The
-            // decoded identity, not prefix inclusion, authorizes its removal.
-            if window.edge.source != source
-                || window.edge.target != target
-                || window.edge.edge_type != kind
-            {
-                continue;
-            }
-            let removal = OriginalPersistenceFrame::new(original)?;
-            let reverse = original_graph_key(&removal, &window.edge, true)?;
-            self.with_write(|write| {
-                write
-                    .open_table(WORKING_GRAPH_FWD)
-                    .map_err(RedbPersistence::storage_error)?
-                    .remove(window.position())
-                    .map_err(RedbPersistence::storage_error)?;
-                write
-                    .open_table(WORKING_GRAPH_REV)
-                    .map_err(RedbPersistence::storage_error)?
-                    .remove(reverse.as_slice())
-                    .map_err(RedbPersistence::storage_error)?;
-                Ok(())
-            })?;
-        }
-        Ok(())
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -1687,44 +1599,6 @@ struct WorkingGraphEvent {
     predecessor: Option<Vec<u8>>,
 }
 impl ReceivedWorkingWrite {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn retire_graph_occurrences(
-        &self,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        source: NodeId,
-        kind: &str,
-        target: NodeId,
-    ) -> Result<()> {
-        self.select_graph_type(original, kind)?;
-        let mut after = None::<GraphPosition>;
-        loop {
-            let lower = after
-                .as_ref()
-                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) =
-                self.next_graph_record(original, WORKING_GRAPH_BODIES, lower, Bound::Unbounded)?
-            else {
-                break;
-            };
-            let frame = OriginalPersistenceFrame::new(original)?;
-            let edge: AdjEntry = frame.decode(&record.body)?;
-            if edge.source == source && edge.target == target && edge.edge_type == kind {
-                for index in [1, 2, 3] {
-                    self.graph_record_put(original, index, &record.key, None)?;
-                }
-            }
-            after = Some(GraphPosition {
-                key: frame.copy_bytes(&record.key)?,
-                _owner: frame.into_reservation(),
-            });
-        }
-        let frame = OriginalPersistenceFrame::new(original)?;
-        let identity = Self::pending_graph_key(&frame, source, kind, target)?;
-        self.graph_record_put(original, 4, &identity, None)
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

@@ -589,6 +589,10 @@ pub struct WireApplyResult {
     pub applied_rows: usize,
     pub skipped_rows: usize,
     pub conflicts: Vec<WireConflict>,
+    /// The received unit's final acceptance position at this receiver.
+    /// A unit can contain several ordered replay positions but commits once;
+    /// interior positions are not committed snapshots. An identical retry
+    /// returns the original unit result rather than applying its effects again.
     pub new_lsn: Lsn,
 }
 

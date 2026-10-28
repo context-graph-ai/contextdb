@@ -609,6 +609,8 @@ pub(crate) struct ReceivedSchemaStage {
     _native_trigger_config_fee: Option<OwnedMemoryReservation>,
     // Declared after persistence so its copied edge bodies retire first.
     _received_edge_input_original: Option<OwnedMemoryReservation>,
+    _received_preparation_owner:
+        Option<crate::persistence::received_working::ReceivedPreparationOwner>,
 }
 
 /// The prepared vector payload precedes its exact executing export owner on
@@ -630,6 +632,8 @@ struct ReceivedSchemaPreparationCustody {
         Arc<contextdb_core::read_memory::ReadCredit>,
         Arc<contextdb_core::read_memory::ReadCredit>,
     )>,
+    _received_preparation_owner:
+        Option<crate::persistence::received_working::ReceivedPreparationOwner>,
 }
 
 pub(crate) type ReceivedSchemaStageRegistry = Arc<Mutex<schema_stage_registry::ReceivedRegistry>>;

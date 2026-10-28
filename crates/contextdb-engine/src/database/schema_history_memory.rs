@@ -250,6 +250,31 @@ impl SchemaHistoryMemory {
         }
         Ok(())
     }
+    // Empty capacity has no committed or pending owner after the last
+    // preparation claim retires. Free each buffer before refunding its
+    // original admission; populated history and other claims retain theirs.
+    fn release_empty_backing(&mut self) {
+        if self.pending_log == 0 {
+            let mut log = self.ddl_log.write();
+            if log.is_empty() {
+                drop(std::mem::take(&mut *log));
+                release_preparation_original(
+                    &mut self.backing,
+                    std::mem::take(&mut self.log_backing_bytes),
+                );
+            }
+        }
+        if self.pending_generations == 0 {
+            let mut generations = self.generations.lock();
+            if generations.is_empty() {
+                drop(std::mem::take(&mut *generations));
+                release_preparation_original(
+                    &mut self.backing,
+                    std::mem::take(&mut self.generation_backing_bytes),
+                );
+            }
+        }
+    }
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -274,7 +299,7 @@ impl Drop for SchemaHistoryMemory {
 
 /// Slot claims include all simultaneous stages, so preparing a trigger suffix
 /// cannot consume capacity already promised to its event prefix. Drop rolls
-/// back only the claim; retained physical capacity remains paid.
+/// back the claim and frees empty backing after its final pending owner ends.
 ///
 /// The strong owner is the same already-funded store finalization allocation.
 /// Erasing only its rollback capability seals the private recursive ownership
@@ -289,6 +314,7 @@ impl HistorySlotOwner for StoreFinalization {
             owner.pending_log -= logs;
             owner.pending_generations -= generations;
             owner.pending_bytes -= bytes;
+            owner.release_empty_backing();
         }
     }
 }
@@ -452,38 +478,44 @@ impl Database {
         let owner = retained
             .as_mut()
             .expect("initialized schema history custody");
-        owner.prepare_capacity(logs, generation_count)?;
-        let credit = reserve_preparation_from_original(
-            &owner.payload,
-            scratch.saturating_add(payload_bytes),
-            "ddl",
-            "history_occurrences",
-            HINT,
-        )?;
-        let mut entries = Vec::with_capacity(logs);
-        entries.extend(ddl.map(|(lsn, change)| (lsn, change.clone())));
-        let ddl = entries;
-        let mut values = Vec::with_capacity(generation_count);
-        values.extend(
-            generations.map(|(key, (table, generation))| (key, (table.clone(), generation))),
-        );
-        let generations = values;
-        owner.pending_log += logs;
-        owner.pending_generations += generation_count;
-        owner.pending_bytes += credit.bytes();
-        let bytes = credit.bytes();
-        Ok(PreparedSchemaHistory {
-            ddl,
-            generations,
-            credit,
-            scratch,
-            slots: HistorySlots {
-                finalization: self.finalization.clone(),
-                logs,
-                generations: generation_count,
-                bytes,
-            },
-        })
+        let prepared = (|| {
+            owner.prepare_capacity(logs, generation_count)?;
+            let credit = reserve_preparation_from_original(
+                &owner.payload,
+                scratch.saturating_add(payload_bytes),
+                "ddl",
+                "history_occurrences",
+                HINT,
+            )?;
+            let mut entries = Vec::with_capacity(logs);
+            entries.extend(ddl.map(|(lsn, change)| (lsn, change.clone())));
+            let ddl = entries;
+            let mut values = Vec::with_capacity(generation_count);
+            values.extend(
+                generations.map(|(key, (table, generation))| (key, (table.clone(), generation))),
+            );
+            let generations = values;
+            owner.pending_log += logs;
+            owner.pending_generations += generation_count;
+            owner.pending_bytes += credit.bytes();
+            let bytes = credit.bytes();
+            Ok(PreparedSchemaHistory {
+                ddl,
+                generations,
+                credit,
+                scratch,
+                slots: HistorySlots {
+                    finalization: self.finalization.clone(),
+                    logs,
+                    generations: generation_count,
+                    bytes,
+                },
+            })
+        })();
+        if prepared.is_err() {
+            owner.release_empty_backing();
+        }
+        prepared
     }
     pub(super) fn publish_memory_schema_history(&self, prepared: Option<PreparedSchemaHistory>) {
         let Some(mut prepared) = prepared else {

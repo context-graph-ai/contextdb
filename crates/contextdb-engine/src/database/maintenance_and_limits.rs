@@ -3050,7 +3050,7 @@ impl Database {
         // the initial content identity are the destination's FIRST artifact
         // writes, and attaching after they are on disk leaves that whole prefix
         // outside `MEMORY_LIMIT`.
-        let artifact = RedbPersistence::create_with_accountant(
+        let artifact = RedbPersistence::create_unpublished_export(
             temp_path,
             Some(crate::memory_accounting::AccountantHandle::clone(
                 &self.finalization.accountant,

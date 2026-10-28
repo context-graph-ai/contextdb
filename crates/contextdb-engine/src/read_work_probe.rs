@@ -825,6 +825,9 @@ pub(crate) fn enter_owner_graph_scope(
     }
 }
 pub(crate) fn bind_graph_root(root: impl std::fmt::Debug) {
+    if ACTIVE.with(|a| a.borrow().is_none()) {
+        return;
+    }
     GRAPH_ROOT.with(|r| {
         r.replace(Some(format!("{root:?}")));
     });

@@ -1129,6 +1129,15 @@ impl Database {
         if let Some(captured) = self.captured_graph_decisions() {
             return captured.root.clone();
         }
+        // The received source lends the committed root for physical pages,
+        // while its authenticated private catalog advances through source DDL.
+        // Metadata callers must use that catalog, including tables created in
+        // this unit, rather than the older captured physical root's schema.
+        if crate::persistence::received_working_source::WorkingReadSource::is_current_for(
+            self.tx_mgr.identity(),
+        ) {
+            return None;
+        }
         ROOT.with(|slot| {
             slot.borrow()
                 .as_ref()

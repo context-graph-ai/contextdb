@@ -963,8 +963,14 @@ fn changes_since_survives_reopen_after_compaction() {
                 )
                 .unwrap();
                 let tx = db.begin().unwrap();
-                db.insert_edge(tx, source, target, "link".into(), HashMap::new())
-                    .unwrap();
+                db.insert_edge(
+                    tx,
+                    source,
+                    target,
+                    "link".into(),
+                    HashMap::from([("origin".into(), Value::Text("standalone".into()))]),
+                )
+                .unwrap();
                 db.commit(tx).unwrap();
                 if !deleted {
                     let tx = db.begin().unwrap();
@@ -978,8 +984,14 @@ fn changes_since_survives_reopen_after_compaction() {
                 if deleted {
                     db.delete_edge(tx, source, target, "link").unwrap();
                 } else {
-                    db.insert_edge(tx, source, target, "link".into(), HashMap::new())
-                        .unwrap();
+                    db.insert_edge(
+                        tx,
+                        source,
+                        target,
+                        "link".into(),
+                        HashMap::from([("origin".into(), Value::Text("standalone".into()))]),
+                    )
+                    .unwrap();
                 }
                 db.commit(tx).unwrap();
                 db.access.contexts = Some([ContextId::new(context)].into_iter().collect());

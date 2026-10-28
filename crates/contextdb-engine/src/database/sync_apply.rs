@@ -1244,6 +1244,8 @@ impl Database {
     pub(super) fn arriving_statement_refusal(
         &self,
         change: &DdlChange,
+        complete_restatement: bool,
+        authenticated_schema: bool,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
@@ -1275,7 +1277,8 @@ impl Database {
                 ),
                 _ => return Ok(None),
             };
-        if matches!(change, DdlChange::CreateTable { .. })
+        if !complete_restatement
+            && matches!(change, DdlChange::CreateTable { .. })
             && let Some(refusal) = self.arriving_create_table_shape_refusal(
                 name,
                 columns,
@@ -1285,7 +1288,14 @@ impl Database {
                 composite_unique,
             )
         {
-            return Ok(Some(refusal));
+            // A schema contradiction is not a policy choice. Authenticated
+            // delivery must fail before installing refusal bookkeeping or
+            // advancing the receiver's acceptance position.
+            return if authenticated_schema {
+                Err(refusal)
+            } else {
+                Ok(Some(refusal))
+            };
         }
         let incoming = rough_sync_table_meta(
             columns,
@@ -1554,6 +1564,33 @@ impl Database {
             .or(identity);
         type UnitKey = (Option<(String, Incarnation)>, Lsn);
         let aligned = received.filter(|received| received.entries.len() == changes.ddl.len());
+        let complete_restatement = if let Some(received) = aligned {
+            if matches!(self.classify_received_schema_manifest(Some(received))?,
+                ReceivedSchemaManifestClassification::Replay(ref result) if result.conflicts.is_empty())
+            {
+                true
+            } else {
+                let matches = if self.persistence.is_some() {
+                    self.durable_superseded_local_ddl_occurrences(
+                        &changes.ddl,
+                        read_memory.clone(),
+                    )?
+                } else {
+                    self.superseded_local_ddl_occurrences(
+                        &self.ddl_log.read(),
+                        &changes.ddl,
+                        read_memory.clone(),
+                    )?
+                };
+                self.received_schema_restatement_is_complete(
+                    changes,
+                    matches.len() == changes.ddl.len(),
+                )?
+            }
+        } else {
+            false
+        };
+
         let unit_key = |index: usize| -> UnitKey {
             match aligned.map(|received| (received, &received.entries[index])) {
                 Some((_, entry)) if entry.author.is_some() => {
@@ -1640,9 +1677,12 @@ impl Database {
                 if refusal.is_some() {
                     break;
                 }
-                if let Some(error) =
-                    self.arriving_statement_refusal(&changes.ddl[*index], read_memory.clone())?
-                {
+                if let Some(error) = self.arriving_statement_refusal(
+                    &changes.ddl[*index],
+                    complete_restatement,
+                    aligned.is_some(),
+                    read_memory.clone(),
+                )? {
                     let table = Self::ddl_affected_table(&changes.ddl[*index])
                         .unwrap_or_default()
                         .to_string();
@@ -7398,12 +7438,14 @@ impl Database {
         tx: TxId,
         row: &RowChange,
         local_row_id: Option<RowId>,
-        connected: bool,
+        _connected: bool,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
-        if !connected || !self.capture_detached_sync_write_set.load(Ordering::SeqCst) {
+        // Every captured schema unit needs exact occurrence coordinates,
+        // including units without a declared foreign-key component.
+        if !self.capture_detached_sync_write_set.load(Ordering::SeqCst) {
             return Ok(());
         }
         let key = Self::detached_accepted_row_key(row, owner)?;

@@ -19,6 +19,52 @@ pub(super) fn next_working_control_identity() -> Result<u64> {
         .map_err(|_| Error::Other("received working control identity exhausted".into()))
 }
 
+/// One stable, source-funded Original for the production received interval.
+/// It descends from the live store's held writer loan, never a reconstructed
+/// registration. Payload/control pairs clone together and expose no Weak.
+pub(crate) struct ReceivedPreparationOwner {
+    source: Arc<ReceivedPreparationSource>,
+    control: contextdb_tx::SourceCharge,
+}
+struct ReceivedPreparationSource {
+    original: crate::memory_accounting::OwnedMemoryReservation,
+    funder: contextdb_tx::SourceFunder,
+}
+impl ReceivedPreparationOwner {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline typed admission details without allocating on refusal."
+    )]
+    pub(crate) fn prepare(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<Self> {
+        let budget = crate::memory_accounting::WriterBudget::from_original(original)?;
+        let funder = budget.prepare_source_funder()?;
+        let control = contextdb_tx::SourceCharge::admit_funded(
+            funder.clone(),
+            contextdb_tx::staged_source::source_arc_layout::<ReceivedPreparationSource>().size(),
+        )?;
+        let source = Arc::new(ReceivedPreparationSource {
+            original: crate::memory_accounting::retain_preparation_original(original),
+            funder,
+        });
+        Ok(Self { source, control })
+    }
+    pub(crate) fn original(&self) -> &crate::memory_accounting::OwnedMemoryReservation {
+        &self.source.original
+    }
+    pub(crate) fn funder(&self) -> &contextdb_tx::SourceFunder {
+        &self.source.funder
+    }
+}
+impl Clone for ReceivedPreparationOwner {
+    fn clone(&self) -> Self {
+        let control = self.control.clone();
+        let source = self.source.clone();
+        Self { source, control }
+    }
+}
+
 pub(crate) struct ReceivedWorkingWrite {
     // Physical transaction and its pages die before the exact original lease.
     write: Option<redb::WriteTransaction>,
@@ -35,6 +81,8 @@ pub(crate) struct ReceivedWorkingWrite {
         parking_lot::Mutex<Option<super::received_working_vector::WorkingVectorCatalogOwner>>,
     owner: parking_lot::Mutex<crate::memory_accounting::OwnedMemoryReservation>,
     original_owner: Option<crate::database::event_bus::OwnedEventBusHandle>,
+    // Last: physical transaction/scratch and all invoices retire first.
+    preparation_owner: Option<ReceivedPreparationOwner>,
 }
 impl ReceivedWorkingWrite {
     #[expect(
@@ -104,6 +152,7 @@ impl ReceivedWorkingWrite {
             vector_catalog: parking_lot::Mutex::new(None),
             owner: parking_lot::Mutex::new(owner),
             original_owner: None,
+            preparation_owner: None,
         })
     }
     #[expect(
@@ -119,6 +168,23 @@ impl ReceivedWorkingWrite {
             existing.with_owned_persistence_original(|original| self.require_original(original))?;
         } else {
             self.original_owner = Some(events.clone());
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline typed admission details without allocating on refusal."
+    )]
+    pub(crate) fn retain_preparation_owner(
+        &mut self,
+        owner: &ReceivedPreparationOwner,
+    ) -> Result<()> {
+        self.require_original(owner.original())?;
+        if let Some(existing) = &self.preparation_owner {
+            self.require_original(existing.original())?;
+        } else {
+            self.preparation_owner = Some(owner.clone());
         }
         Ok(())
     }
@@ -1237,8 +1303,8 @@ impl ReceivedWorkingWrite {
         let declaration = OriginalPersistenceFrame::new(original)?;
         declaration.reserve(
             previous
-                .estimated_bytes()
-                .saturating_add(arriving.estimated_bytes())
+                .metadata_bytes()
+                .saturating_add(arriving.metadata_bytes())
                 .saturating_add(
                     ddl.iter()
                         .map(DdlChange::estimated_bytes)
@@ -1277,7 +1343,7 @@ impl ReceivedWorkingWrite {
             let window = OriginalPersistenceFrame::new(original)?;
             window.reserve(
                 crate::memory_accounting::preparation_row_copy_bytes(source.value())?
-                    .saturating_add(arriving.estimated_bytes().saturating_mul(8))
+                    .saturating_add(arriving.metadata_bytes().saturating_mul(8))
                     .saturating_add(4096),
             )?;
             let mut row = crate::memory_accounting::preparation_copy_row(source.value())?;
@@ -1396,8 +1462,10 @@ impl WorkingSchema {
         meta: &TableMeta,
     ) -> Result<Self> {
         let frame = OriginalPersistenceFrame::new(original)?;
+        // TableMeta cloning copies declarations, not the separate exact-probe
+        // filters allocated by index storage.
         frame.reserve(
-            meta.estimated_bytes()
+            meta.metadata_bytes()
                 .saturating_mul(8)
                 .saturating_add(table.len())
                 .saturating_add(std::mem::size_of::<Self>())

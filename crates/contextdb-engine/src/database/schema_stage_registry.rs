@@ -1161,12 +1161,8 @@ fn local_growth_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     // A distinct production Database owns each real stage's payload charges;
     // registry corrections remain attributable to the tested original payer.
-    let payload_owner = Arc::new(MemoryAccountant::no_limit());
-    let database = Database::open_memory_with_plugin_and_accountant(
-        Arc::new(CorePlugin),
-        payload_owner.clone(),
-    )
-    .unwrap();
+    let database = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let payload_owner = database.accountant.clone();
     let owner = Arc::new(MemoryAccountant::no_limit());
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
@@ -1263,10 +1259,18 @@ fn local_growth_for_test() {
     assert_eq!(owner.usage().used, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     drop(database);
-    assert_eq!(payload_owner.usage().used, 0);
+    assert_eq!(
+        payload_owner.usage().used,
+        payload_owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>()
+    );
     assert_eq!(payload_owner.underflow_count_for_test(), 0);
     println!(
-        "CDB127_D2_ROW local_empty_released remove_keeps_backing_until_empty=true clear_frees_then_refunds=true existing_entry_request_count=0 last_alias=true post_system_free_before_refund=true original_registry_and_payload_funders_zero=true"
+        "CDB127_D2_ROW local_empty_released remove_keeps_backing_until_empty=true clear_frees_then_refunds=true existing_entry_request_count=0 last_alias=true post_system_free_before_refund=true original_registry_funder_zero=true payload_native_backing_only=true"
     );
 }
 
@@ -1430,12 +1434,8 @@ fn tombstone_rehash_rows_for_test() {
     );
     assert_eq!(owner.usage().used, baseline);
 
-    let payload_owner = Arc::new(MemoryAccountant::no_limit());
-    let database = Database::open_memory_with_plugin_and_accountant(
-        Arc::new(CorePlugin),
-        payload_owner.clone(),
-    )
-    .unwrap();
+    let database = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let payload_owner = database.accountant.clone();
     let registry = LocalRegistry::new_arc(&crate::memory_accounting::AccountantHandle::from_host(
         owner.clone(),
     ))
@@ -1515,7 +1515,15 @@ fn tombstone_rehash_rows_for_test() {
     assert_eq!(owner.usage().used, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     drop(database);
-    assert_eq!(payload_owner.usage().used, 0);
+    assert_eq!(
+        payload_owner.usage().used,
+        payload_owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>()
+    );
     assert_eq!(payload_owner.underflow_count_for_test(), 0);
     println!(
         "CDB127_D2_ROW tombstone_rehash family=local real_local_prepare_door=true numeric_hasher_cluster=true tracked_buckets=64 physical_len=27 growth_left=0 next_len=28 full_capacity=56 actual_request_count=0 reclaimed_tombstones=true retained_credit_while_populated=true free_before_refund_when_empty=true"
@@ -1658,10 +1666,8 @@ fn received_retired_construction_stage_witness_for_test() {
     use crate::memory_accounting::{ContainedMemoryReservation, OwnedMemoryReservation};
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
 
-    let owner = Arc::new(MemoryAccountant::no_limit());
-    let database =
-        Database::open_memory_with_plugin_and_accountant(Arc::new(CorePlugin), owner.clone())
-            .unwrap();
+    let database = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let owner = database.accountant.clone();
     let before_stage = owner.usage().used;
     let stage = received_stage_for_test(&database);
     let stage_charge = owner.usage().used;
@@ -1677,7 +1683,7 @@ fn received_retired_construction_stage_witness_for_test() {
     for entry in 0..6usize {
         let bytes = 19 + entry;
         let reservation = OwnedMemoryReservation::try_new_for(
-            owner.clone().into(),
+            owner.clone(),
             bytes,
             "sync",
             "cdb127_stage_witness",
@@ -1696,10 +1702,14 @@ fn received_retired_construction_stage_witness_for_test() {
             Some(ContainedMemoryReservation::from_owned(reservation)),
         ));
     }
+    let tuple_bytes = std::mem::size_of::<(
+        contextdb_vector::VectorPartitionRef,
+        Option<ContainedMemoryReservation>,
+    )>();
     assert_eq!(
         std::mem::size_of_val(retired.as_slice()) / retired.len(),
-        88,
-        "the actual retired-construction tuple remains the pre2 88-byte representation"
+        tuple_bytes,
+        "the actual retired-construction tuple follows the production element layout"
     );
     let backing = retired.as_ptr() as usize;
     let backing_capacity = retired.capacity();
@@ -1762,25 +1772,28 @@ fn received_retired_construction_stage_witness_for_test() {
         "dropping the real Stage physically frees its retained Vec backing and refunds its projection charge"
     );
     drop(database);
-    assert_eq!(owner.usage().used, 0);
+    assert_eq!(
+        owner.usage().used,
+        owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>()
+    );
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!(
-        "CDB127_D2_ROW received_retired_construction_stage_witness real_received_stage=true real_projection=true tuple88=true entries=6 drained_projection_retained=true actual_vec_system_free=true backing_charge_held=true physical_free_and_refund=true final_original_funder_zero=true"
+        "CDB127_D2_ROW received_retired_construction_stage_witness real_received_stage=true real_projection=true tuple_bytes={tuple_bytes} entries=6 drained_projection_retained=true actual_vec_system_free=true backing_charge_held=true physical_free_and_refund=true final_native_backing_only=true"
     );
 }
 
 #[cfg(test)]
 fn received_interleavings_for_test() {
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
-    let owner = Arc::new(MemoryAccountant::no_limit());
-    let database =
-        Database::open_memory_with_plugin_and_accountant(Arc::new(CorePlugin), owner.clone())
-            .unwrap();
-    let registry = ReceivedRegistry::new_arc(
-        &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
-    )
-    .unwrap();
+    let database = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let owner = database.accountant.clone();
+    let registry = ReceivedRegistry::new_arc(&owner).unwrap();
     let key = Lsn(101);
     ReceivedToken::reserve(&registry, key)
         .unwrap()
@@ -1816,20 +1829,26 @@ fn received_interleavings_for_test() {
     drop(database);
     assert_ne!(owner.writer_registration_observation_for_test().2, 0);
     drop(retained);
-    assert_eq!(owner.usage().used, 0);
+    assert_eq!(
+        owner.usage().used,
+        owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>()
+    );
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!(
-        "CDB127_D2_ROW received_interleavings real_received_prepare_door=true other_key_growth=true same_key_overlap=true remove_clear_preserves_occupancy=true actual_restore_request_count=0 surviving_database_alias=true final_original_funder_zero=true"
+        "CDB127_D2_ROW received_interleavings real_received_prepare_door=true other_key_growth=true same_key_overlap=true remove_clear_preserves_occupancy=true actual_restore_request_count=0 surviving_database_alias=true final_native_backing_only=true"
     );
 }
 
 #[cfg(test)]
 fn received_prepublication_refusal_and_cleanup_for_test() {
-    let owner = Arc::new(MemoryAccountant::no_limit());
-    let database =
-        Database::open_memory_with_plugin_and_accountant(Arc::new(CorePlugin), owner.clone())
-            .unwrap();
+    let database = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let owner = database.accountant.clone();
     let before = owner.usage().used;
     let stage = received_stage_for_test(&database);
     assert_eq!(database.received_schema_stages.lock().0.buckets, 0);
@@ -1891,11 +1910,19 @@ fn received_prepublication_refusal_and_cleanup_for_test() {
         "normal registration cleanup returns the emptied registry's backing"
     );
     drop(database);
-    assert_eq!(owner.usage().used, 0);
+    assert_eq!(
+        owner.usage().used,
+        owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>()
+    );
     assert_eq!(owner.writer_registration_observation_for_test().2, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!(
-        "CDB127_D2_ROW received_prepublication_refusal actual_received_register_door=true initial_admission_before_effects=true original_family_refusal=true no_stage_or_arriving_publication=true normal_registration_cleanup=true empty_backing_released=true final_original_funder_zero=true"
+        "CDB127_D2_ROW received_prepublication_refusal actual_received_register_door=true initial_admission_before_effects=true original_family_refusal=true no_stage_or_arriving_publication=true normal_registration_cleanup=true empty_backing_released=true final_native_backing_only=true"
     );
 }
 
@@ -1989,12 +2016,8 @@ fn occupied_populated_growth_for_test<K, V, P>(
 #[cfg(test)]
 fn occupied_populated_rows_for_test() {
     use crate::memory_accounting::WriterBudget;
-    let payload_owner = Arc::new(MemoryAccountant::no_limit());
-    let database = Database::open_memory_with_plugin_and_accountant(
-        Arc::new(CorePlugin),
-        payload_owner.clone(),
-    )
-    .unwrap();
+    let database = Database::open_with_options(":memory:", Default::default()).unwrap();
+    let payload_owner = database.accountant.clone();
     let owner = Arc::new(MemoryAccountant::no_limit());
     let writer = WriterBudget::from_accountant(owner.clone()).unwrap();
     let baseline = owner.usage().used;
@@ -2024,7 +2047,15 @@ fn occupied_populated_rows_for_test() {
     assert_eq!(owner.usage().used, 0);
     assert_eq!(owner.underflow_count_for_test(), 0);
     drop(database);
-    assert_eq!(payload_owner.usage().used, 0);
+    assert_eq!(
+        payload_owner.usage().used,
+        payload_owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>()
+    );
     assert_eq!(payload_owner.underflow_count_for_test(), 0);
 }
 

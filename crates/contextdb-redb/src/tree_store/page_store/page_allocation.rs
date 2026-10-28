@@ -377,6 +377,8 @@ impl PageAllocation {
             });
             std::ptr::write_bytes(block.as_ptr().cast::<u8>().add(offset), 0, len);
         }
+        #[cfg(feature = "test-seams")]
+        crate::read_admission::record_page_lifetime_for_test(layout.size(), true);
         Ok(Self { block })
     }
     // Snapshot the CURRENT payment under its real transition lock. This is
@@ -581,6 +583,8 @@ struct PageFree {
 impl Drop for PageFree {
     fn drop(&mut self) {
         unsafe { dealloc(self.block.as_ptr().cast(), self.layout) };
+        #[cfg(feature = "test-seams")]
+        crate::read_admission::record_page_lifetime_for_test(self.layout.size(), false);
         // Only after physical free does Rust drop the actual source receipt or
         // refund occupancy and release its counter owner. Also runs on unwind.
     }
@@ -876,4 +880,48 @@ pub(crate) fn cache_array_prepaid<T>(
     }
     std::mem::forget(guard);
     Ok(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer.as_ptr(), len)) })
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod physical_lifetime_observer_tests {
+    use super::PageAllocation;
+    use crate::observe_page_lifetimes_for_test;
+
+    #[test]
+    fn cloned_page_counts_one_construction_and_one_physical_free() {
+        let bytes = PageAllocation::layout(128).unwrap().0.size();
+        let (_, receipt) = observe_page_lifetimes_for_test(|| {
+            let page = PageAllocation::zeroed(128, None).unwrap();
+            let alias = page.clone();
+            drop(page);
+            drop(alias);
+        });
+        assert_eq!((receipt.allocated_pages, receipt.freed_pages), (1, 1));
+        assert_eq!(
+            (receipt.allocated_bytes, receipt.freed_bytes),
+            (bytes, bytes)
+        );
+        assert_eq!((receipt.current_pages, receipt.current_bytes), (0, 0));
+        assert_eq!((receipt.peak_pages, receipt.peak_bytes), (1, bytes as i128));
+    }
+
+    #[test]
+    fn earlier_page_free_is_signed_and_nested_work_is_merged() {
+        let earlier = PageAllocation::zeroed(128, None).unwrap();
+        let bytes = PageAllocation::layout(128).unwrap().0.size();
+        let (_, parent) = observe_page_lifetimes_for_test(|| {
+            let (_, child) = observe_page_lifetimes_for_test(|| drop(earlier));
+            assert_eq!(
+                (child.current_pages, child.current_bytes),
+                (-1, -(bytes as i128))
+            );
+            drop(PageAllocation::zeroed(128, None).unwrap());
+        });
+        assert_eq!((parent.allocated_pages, parent.freed_pages), (1, 2));
+        assert_eq!(
+            (parent.current_pages, parent.current_bytes),
+            (-1, -(bytes as i128))
+        );
+        assert_eq!((parent.peak_pages, parent.peak_bytes), (0, 0));
+    }
 }

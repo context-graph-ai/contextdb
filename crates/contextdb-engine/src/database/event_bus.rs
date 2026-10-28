@@ -13,6 +13,12 @@ pub use sink_dispatch_drive::{
     SinkDispatchRetryIdentity,
 };
 
+#[cfg(any(test, feature = "test-seams"))]
+#[path = "sink_progress_for_test.rs"]
+mod sink_progress_for_test;
+#[cfg(any(test, feature = "test-seams"))]
+use sink_progress_for_test::SinkProgressControlForTest;
+
 const EVENT_TYPES_CONFIG_KEY: &str = "__event_bus_event_types";
 const SINKS_CONFIG_KEY: &str = "__event_bus_sinks";
 const ROUTES_CONFIG_KEY: &str = "__event_bus_routes";
@@ -37,6 +43,8 @@ const ATTEMPT_COUNT_MASK: u32 = !UNCONFIRMED_ATTEMPT;
 type SinkCallback = Arc<dyn Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync>;
 
 pub(crate) struct EventBusState {
+    #[cfg(any(test, feature = "test-seams"))]
+    progress_for_test: Arc<SinkProgressControlForTest>,
     #[cfg(feature = "test-seams")]
     dispatch_drive_for_test: Arc<SinkDispatchControlForTest>,
     pub(super) definitions: Mutex<EventBusDefinitions>,
@@ -1063,6 +1071,8 @@ impl<'de> Deserialize<'de> for EventGrantRows {
 impl EventBusState {
     pub(super) fn new() -> Self {
         Self {
+            #[cfg(any(test, feature = "test-seams"))]
+            progress_for_test: Arc::new(SinkProgressControlForTest::default()),
             #[cfg(feature = "test-seams")]
             dispatch_drive_for_test: Arc::new(SinkDispatchControlForTest::default()),
             definitions: Mutex::new(EventBusDefinitions::default()),
@@ -3687,6 +3697,8 @@ impl EventBusWorker {
         #[cfg(not(feature = "test-seams"))]
         let dispatch_batch = SINK_DISPATCH_BATCH;
         'dispatch: while !shutdown.load(Ordering::SeqCst) {
+            #[cfg(any(test, feature = "test-seams"))]
+            let _progress = self.event_bus.progress_for_test.begin_iteration();
             #[cfg(feature = "test-seams")]
             let _iteration = self
                 .event_bus
@@ -4128,6 +4140,11 @@ impl EventBusWorker {
             return;
         }
         let mut guard = self.event_bus.wait_lock.lock();
+        #[cfg(any(test, feature = "test-seams"))]
+        if self.event_bus.progress_for_test.progress_waiting() {
+            self.event_bus.waiters.wait(&mut guard);
+            return;
+        }
         self.event_bus.waiters.wait_for(&mut guard, duration);
     }
 
@@ -8945,6 +8962,17 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
             return;
         }
         let mut guard = self.events.data().common.wait_lock.lock();
+        #[cfg(any(test, feature = "test-seams"))]
+        if self
+            .events
+            .data()
+            .common
+            .progress_for_test
+            .progress_waiting()
+        {
+            self.events.data().common.waiters.wait(&mut guard);
+            return;
+        }
         self.events
             .data()
             .common
@@ -8969,6 +8997,13 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
         #[cfg(not(feature = "test-seams"))]
         let dispatch_batch = SINK_DISPATCH_BATCH;
         'dispatch: while !shutdown.load(Ordering::SeqCst) {
+            #[cfg(any(test, feature = "test-seams"))]
+            let _progress = self
+                .events
+                .data()
+                .common
+                .progress_for_test
+                .begin_iteration();
             #[cfg(feature = "test-seams")]
             let _iteration = self
                 .events
