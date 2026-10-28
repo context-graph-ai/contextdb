@@ -3061,7 +3061,10 @@ pub(super) fn serialize_runtime_root(
 /// Keep the shared publication directory alive while this store's registry
 /// lock serializes its own join/leave. Other stores may publish concurrently.
 #[cfg(unix)]
-pub(super) fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
+pub(super) fn hold_runtime_root(
+    root: &Path,
+    nonblocking: bool,
+) -> std::io::Result<RuntimeRootSerializer> {
     lock_runtime_root(root, nonblocking, true)
 }
 
@@ -3126,7 +3129,10 @@ pub(super) fn serialize_runtime_root(
 }
 
 #[cfg(not(unix))]
-pub(super) fn hold_runtime_root(root: &Path, nonblocking: bool) -> std::io::Result<RuntimeRootSerializer> {
+pub(super) fn hold_runtime_root(
+    root: &Path,
+    nonblocking: bool,
+) -> std::io::Result<RuntimeRootSerializer> {
     serialize_runtime_root(root, nonblocking)
 }
 
@@ -3295,13 +3301,10 @@ impl ReaderBreadcrumbGuard {
 
     /// Remove this breadcrumb's emptied store directory and, only while the
     /// runtime root's serializer is held, the `contextdb` child it created.
-    pub(super) fn remove_directories(&self, nonblocking: bool) {
-        let lifetime = self
-            .serializer_root
-            .as_deref()
-            .and_then(|root| hold_runtime_root(root, nonblocking).ok());
+    pub(super) fn remove_directories(&self) {
+        // Per-store diagnostic directories are removed unconditionally. Only
+        // removing the empty shared root requires exclusive lifetime exclusion.
         remove_empty_breadcrumb_directories(&self.path, None);
-        drop(lifetime);
         if let (Some(root), Some(created)) = (
             self.serializer_root.as_deref(),
             self.created_root.as_deref(),
@@ -3344,7 +3347,7 @@ impl ReaderBreadcrumbGuard {
         }
         on_handoff_settled();
         drop(self.file.take());
-        self.remove_directories(true);
+        self.remove_directories();
         self.removed = true;
         Ok((self.path.clone(), retained))
     }
@@ -3362,7 +3365,7 @@ impl Drop for ReaderBreadcrumbGuard {
         if !self.removed {
             // A failed hydration may still hold its coordination locks here,
             // so this leave takes the serializer only by try.
-            self.remove_directories(true);
+            self.remove_directories();
         }
     }
 }
@@ -3628,6 +3631,7 @@ impl ReaderSnapshotRegistryLock {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn lock_exclusive(&mut self) -> std::io::Result<()> {
         if !self.locked {
             fs2::FileExt::lock_exclusive(&self.file)?;
