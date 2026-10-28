@@ -154,7 +154,7 @@ impl Lattice<'_> {
             }
         }
     }
-    fn point(&self, probes: u32, factor: u32) -> Result<Point> {
+    pub(super) fn point(&self, probes: u32, factor: u32) -> Result<Point> {
         let shortlist = shortlist(self.depth, factor)?;
         let candidates = (shortlist as u128).min(u128::from(self.population)) as f64;
         let projected = self.population as f64 * f64::from(probes) / f64::from(self.active);

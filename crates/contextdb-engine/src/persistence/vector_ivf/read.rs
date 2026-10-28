@@ -16,6 +16,22 @@ use contextdb_vector::ivf::storage::{
 use contextdb_vector::{MemoryBudgetOwner, ivf::Work};
 use std::cell::{Cell, RefCell};
 
+/// Private candidate facts are bound to one exact immutable native root.
+/// Ordinary serving-descriptor caches never receive this window.
+pub(super) type BuildVerification =
+    contextdb_core::read_memory::ReadShared<BuildVerificationWindow, Invoice>;
+pub(super) struct BuildVerificationWindow {
+    scope: [u8; 64],
+    snapshot: redb::StorageSnapshotIdentity,
+    manifest: Manifest,
+    record: ScopeRecord,
+    summary: super::super::vector_membership_pages::MembershipSummary,
+    #[cfg(feature = "test-seams")]
+    scopes_fingerprint: Option<[u8; 32]>,
+    #[cfg(feature = "test-seams")]
+    configuration_vector_binding: [u8; 32],
+    verified: parking_lot::Mutex<([u16; control::ROOTS], [Option<Verdict>; control::ROOTS])>,
+}
 /// This borrowed capability keeps the existing source/holder and its original
 /// native invoice alive. Its constructor authenticates shared authorities once.
 pub(super) struct NativeAuthority<'a> {
@@ -36,6 +52,20 @@ impl<'a> NativeAuthority<'a> {
         root: &'a super::super::vector_paged::CapturedPagedRoot,
         memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Self> {
+        Self::open_inner(root, memory, None)
+    }
+    pub(super) fn open_prepared(
+        root: &'a super::super::vector_paged::CapturedPagedRoot,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+        prepared: &BuildVerification,
+    ) -> Result<Self> {
+        Self::open_inner(root, memory, Some(prepared))
+    }
+    fn open_inner(
+        root: &'a super::super::vector_paged::CapturedPagedRoot,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+        prepared: Option<&BuildVerification>,
+    ) -> Result<Self> {
         use super::super::native_storage_admission::{
             StorageAdmissionScope, original_storage_error,
         };
@@ -49,18 +79,25 @@ impl<'a> NativeAuthority<'a> {
             .map_err(original_storage_error)?;
         let (snapshot, snapshot_lsn) = admission.run_original_unqualified(|| {
             let (_, snapshot, lsn) = root.authenticate()?;
-            super::super::vector_membership_pages::validate_in_read(&root.read)?;
-            let scopes = root
-                .read
-                .table_root_fingerprint(SCOPES)
-                .map_err(RedbPersistence::storage_error)?;
-            if scopes.is_some() {
-                let expected =
-                    super::super::content_identity::vector_pages_root_in_read(&root.read)?;
-                let actual =
-                    super::super::content_identity::vector_schema_pages_root_in_read(&root.read)?;
-                if actual != expected {
+            if let Some(prepared) = prepared {
+                if prepared.snapshot != root.read.storage_snapshot_identity() {
                     return Err(corrupt());
+                }
+            } else {
+                super::super::vector_membership_pages::validate_in_read(&root.read)?;
+                let scopes = root
+                    .read
+                    .table_root_fingerprint(SCOPES)
+                    .map_err(RedbPersistence::storage_error)?;
+                if scopes.is_some() {
+                    let expected =
+                        super::super::content_identity::vector_pages_root_in_read(&root.read)?;
+                    let actual = super::super::content_identity::vector_schema_pages_root_in_read(
+                        &root.read,
+                    )?;
+                    if actual != expected {
+                        return Err(corrupt());
+                    }
                 }
             }
             Ok((snapshot, lsn.0))
@@ -140,6 +177,7 @@ pub(super) struct PageSource<'a> {
     pub scope_key: [u8; 64],
     retained_entry: Option<super::retained::EntryOwner>,
     query_manifest: Cell<Option<Manifest>>,
+    build_verification: RefCell<Option<BuildVerification>>,
     cache: RefCell<Option<contextdb_core::read_memory::ReadShared<super::cache::DescriptorWindow>>>,
     #[cfg(feature = "test-seams")]
     attempts: Cell<u64>,
@@ -310,28 +348,73 @@ impl<'a> PageSource<'a> {
         checkpoint: &'a dyn Fn() -> Result<()>,
         distance: &'a dyn Fn(DistanceKind) -> Result<()>,
     ) -> Result<Option<Self>> {
+        Self::open_inner(authority, index, tuple, checkpoint, distance, None)
+    }
+    pub(super) fn open_prepared(
+        authority: &'a NativeAuthority<'a>,
+        index: &'a VectorIndexRef,
+        tuple: &'a VectorPartitionKey,
+        checkpoint: &'a dyn Fn() -> Result<()>,
+        distance: &'a dyn Fn(DistanceKind) -> Result<()>,
+        prepared: &BuildVerification,
+    ) -> Result<Self> {
+        Self::open_inner(
+            authority,
+            index,
+            tuple,
+            checkpoint,
+            distance,
+            Some(prepared),
+        )?
+        .ok_or_else(corrupt)
+    }
+    fn open_inner(
+        authority: &'a NativeAuthority<'a>,
+        index: &'a VectorIndexRef,
+        tuple: &'a VectorPartitionKey,
+        checkpoint: &'a dyn Fn() -> Result<()>,
+        distance: &'a dyn Fn(DistanceKind) -> Result<()>,
+        prepared: Option<&BuildVerification>,
+    ) -> Result<Option<Self>> {
         checkpoint()?;
         let construction =
             ScopeConstruction::reserve::<Self>(authority.vector_owner(), index, tuple)?;
         let route = construction.route(index, tuple)?;
-        let schema = authority.admission.run_original_unqualified(|| {
-            RedbPersistence::vector_schema_binding_in_read(&authority.root.read, index)
-        })?;
-        let digest = control::tuple_digest(tuple);
-        let key = control::scope_key(control::index_digest(index, schema), digest);
-        let native = authority.native();
-        let record = native.with_value(SCOPES.name(), &key, |value| {
-            value
-                .map(|value| ScopeRecord::decode(index, &key, value, schema, digest))
-                .transpose()
-        })?;
-        let Some(record) = record else {
-            return Ok(None);
+        let (key, record, source_summary) = if let Some(prepared) = prepared {
+            let key = control::scope_key(
+                control::index_digest(index, prepared.record.schema),
+                control::tuple_digest(tuple),
+            );
+            if prepared.snapshot != authority.root.read.storage_snapshot_identity()
+                || prepared.scope != key
+            {
+                return Err(corrupt());
+            }
+            (key, prepared.record, prepared.summary.clone())
+        } else {
+            let schema = authority.admission.run_original_unqualified(|| {
+                RedbPersistence::vector_schema_binding_in_read(&authority.root.read, index)
+            })?;
+            let digest = control::tuple_digest(tuple);
+            let key = control::scope_key(control::index_digest(index, schema), digest);
+            let native = authority.native();
+            let record = native.with_value(SCOPES.name(), &key, |value| {
+                value
+                    .map(|value| ScopeRecord::decode(index, &key, value, schema, digest))
+                    .transpose()
+            })?;
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            if record.committed_through_lsn > authority.snapshot_lsn {
+                return Err(corrupt());
+            }
+            let source_summary = authority.source_summary(&route)?;
+            (key, record, source_summary)
         };
         if record.committed_through_lsn > authority.snapshot_lsn {
             return Err(corrupt());
         }
-        let source_summary = authority.source_summary(&route)?;
         // Incomplete private builds are inspectable but cannot supply a native
         // canonical search. Serving scopes must match actual applied coverage.
         if record.canonical_complete
@@ -355,6 +438,7 @@ impl<'a> PageSource<'a> {
                 .native_ivf_cache()
                 .retained_entry(super::retained::route_identity(index, tuple), key),
             query_manifest: Cell::new(None),
+            build_verification: RefCell::new(None),
             cache: RefCell::new(None),
             #[cfg(feature = "test-seams")]
             attempts: Cell::new(0),
@@ -375,18 +459,31 @@ impl<'a> PageSource<'a> {
         };
         #[cfg(feature = "test-seams")]
         {
-            let scopes_fingerprint = authority.native().fingerprint(SCOPES.name())?;
-            let configuration_vector_binding =
-                authority.admission.run_original_unqualified(|| {
-                    super::super::content_identity::vector_pages_root_in_read(&authority.root.read)
-                })?;
+            let (scopes_fingerprint, configuration_vector_binding) =
+                if let Some(prepared) = prepared {
+                    (
+                        prepared.scopes_fingerprint,
+                        prepared.configuration_vector_binding,
+                    )
+                } else {
+                    let scopes_fingerprint = authority.native().fingerprint(SCOPES.name())?;
+                    let configuration_vector_binding =
+                        authority.admission.run_original_unqualified(|| {
+                            super::super::content_identity::vector_pages_root_in_read(
+                                &authority.root.read,
+                            )
+                        })?;
+                    (scopes_fingerprint, configuration_vector_binding)
+                };
             let record = result.record.borrow();
-            authority
-                .observer
-                .emit(NativeIvfSealEvent::RootControlLoaded {
-                    scope: result.observed_scope(),
-                    stored_bytes: PAGE_BYTES,
-                });
+            if prepared.is_none() {
+                authority
+                    .observer
+                    .emit(NativeIvfSealEvent::RootControlLoaded {
+                        scope: result.observed_scope(),
+                        stored_bytes: PAGE_BYTES,
+                    });
+            }
             authority.observer.emit(NativeIvfSealEvent::ScopeOpened {
                 scope: result.observed_scope(),
                 source_instance: authority.source_instance,
@@ -424,6 +521,9 @@ impl<'a> PageSource<'a> {
         if let Some(window) = self.cache.borrow().as_ref() {
             self.verified[slot].set(self.verified[slot].get() | window.verified.lock().0[slot]);
         }
+        if let Some(window) = self.build_verification.borrow().as_ref() {
+            self.verified[slot].set(self.verified[slot].get() | window.verified.lock().0[slot]);
+        }
         if self.verified[slot].get() & bit != 0 {
             #[cfg(feature = "test-seams")]
             self.authority
@@ -452,6 +552,9 @@ impl<'a> PageSource<'a> {
         }
         self.verified[slot].set(self.verified[slot].get() | bit);
         if let Some(window) = self.cache.borrow().as_ref() {
+            window.verified.lock().0[slot] |= bit;
+        }
+        if let Some(window) = self.build_verification.borrow().as_ref() {
             window.verified.lock().0[slot] |= bit;
         }
         Ok(present)
@@ -604,6 +707,52 @@ impl<'a> PageSource<'a> {
         self.query_manifest.set(Some(build.manifest));
         Ok(build.manifest)
     }
+    pub(super) fn new_build_verification(&self) -> Result<BuildVerification> {
+        let manifest = self.select_build_authority()?;
+        let invoice = Invoice::reserve(
+            self.authority.vector_owner(),
+            BuildVerification::layout().size(),
+            "clustered_candidate_verification_window",
+        )?;
+        let window = BuildVerification::try_from_invoice_native(
+            BuildVerificationWindow {
+                scope: self.scope_key,
+                snapshot: self.authority.root.read.storage_snapshot_identity(),
+                manifest,
+                record: *self.record.borrow(),
+                summary: self.source_summary.clone(),
+                #[cfg(feature = "test-seams")]
+                scopes_fingerprint: self.authority.native().fingerprint(SCOPES.name())?,
+                #[cfg(feature = "test-seams")]
+                configuration_vector_binding: self.authority.admission.run_original_unqualified(
+                    || {
+                        super::super::content_identity::vector_pages_root_in_read(
+                            &self.authority.root.read,
+                        )
+                    },
+                )?,
+                verified: parking_lot::Mutex::new(([0; control::ROOTS], [None; control::ROOTS])),
+            },
+            invoice,
+        )
+        .map_err(Error::NativeEngineOther)?;
+        *self.build_verification.borrow_mut() = Some(window.clone());
+        Ok(window)
+    }
+    pub(super) fn select_build_authority_with_verification(
+        &self,
+        window: &BuildVerification,
+    ) -> Result<Manifest> {
+        let manifest = self.select_build_authority()?;
+        if window.scope != self.scope_key
+            || window.manifest != manifest
+            || window.snapshot != self.authority.root.read.storage_snapshot_identity()
+        {
+            return Err(corrupt());
+        }
+        *self.build_verification.borrow_mut() = Some(window.clone());
+        Ok(manifest)
+    }
     pub fn canonical_ready(&self) -> bool {
         let record = self.record.borrow();
         record.canonical_complete
@@ -625,12 +774,20 @@ impl ReadPages for PageSource<'_> {
             return None;
         }
         self.family_slot(generation).and_then(|slot| {
-            self.verdicts[slot].get().or_else(|| {
-                self.cache
-                    .borrow()
-                    .as_ref()
-                    .and_then(|window| window.verified.lock().1[slot])
-            })
+            self.verdicts[slot]
+                .get()
+                .or_else(|| {
+                    self.build_verification
+                        .borrow()
+                        .as_ref()
+                        .and_then(|window| window.verified.lock().1[slot])
+                })
+                .or_else(|| {
+                    self.cache
+                        .borrow()
+                        .as_ref()
+                        .and_then(|window| window.verified.lock().1[slot])
+                })
         })
     }
     fn record_inspection_verdict(&self, partition: u64, generation: u64, verdict: Verdict) {
@@ -644,6 +801,11 @@ impl ReadPages for PageSource<'_> {
                     .borrow()
                     .as_ref()
                     .is_none_or(|window| window.verified.lock().1[slot].is_none())
+                    && self
+                        .build_verification
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|window| window.verified.lock().1[slot].is_none())
                     && self
                         .record
                         .borrow()
@@ -668,6 +830,9 @@ impl ReadPages for PageSource<'_> {
                 self.verdicts[slot].set(Some(verdict));
             }
             if let Some(window) = self.cache.borrow().as_ref() {
+                window.verified.lock().1[slot].get_or_insert(verdict);
+            }
+            if let Some(window) = self.build_verification.borrow().as_ref() {
                 window.verified.lock().1[slot].get_or_insert(verdict);
             }
         }

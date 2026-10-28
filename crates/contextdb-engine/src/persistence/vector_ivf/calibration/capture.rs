@@ -22,6 +22,7 @@ pub(super) enum Phase {
     Trial,
     Final,
     Finished,
+    Unavailable,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Cursor {
@@ -30,6 +31,7 @@ pub(super) struct Cursor {
     pub source_after: Option<[u8; 40]>,
     pub last_source_row: Option<u64>,
     pub query: u32,
+    pub failure_witness: Option<u32>,
     pub depth_ordinal: u32,
     pub previous_depth: u32,
     pub point: Option<selector::Point>,
@@ -59,6 +61,7 @@ pub(super) struct SourceData {
     pub live: u64,
 }
 pub(in crate::persistence::vector_ivf) struct Capture {
+    pub(super) verification: read::BuildVerification,
     pub root: super::super::super::vector_paged::CapturedPagedRoot,
     pub memory: ReadMemoryOwner,
     pub original: StoreAccountantHandle,
@@ -68,17 +71,20 @@ pub(in crate::persistence::vector_ivf) struct Capture {
     pub index_name: [u8; 32],
     pub manifest: Manifest,
     pub seed: u64,
+    pub training: contextdb_vector::ivf::TrainingPolicy,
     pub slot_start: u64,
     pub slot_stride: u64,
     pub planned_samples: usize,
     pub maximum_depth: u32,
     pub population: u64,
-    pub source: Option<Source>,
+    pub(super) source: Option<Source>,
     pub source_identity: u64,
+    pub source_partitioned: bool,
     pub source_digest: [u8; 32],
     pub epoch: u64,
     pub cancelled: AtomicBool,
-    pub state: Mutex<State>,
+    pub finished: AtomicBool,
+    pub(super) state: Mutex<State>,
 }
 fn array<T>(count: usize) -> Result<Layout> {
     Layout::array::<T>(count).map_err(|_| corrupt())
@@ -212,6 +218,16 @@ fn source_probe(
     }))
 }
 impl Capture {
+    pub(super) fn column(&self, index: &VectorIndexRef) -> Result<&ColumnDef> {
+        writer(&self.root)?
+            .borrow_captured_table_meta(&index.table)
+            .and_then(|meta| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == index.column)
+            })
+            .ok_or_else(corrupt)
+    }
     /// Called after the publisher refreshed this exact root, before releasing
     /// its commit boundary. Query work happens later, outside that boundary.
     pub(super) fn new(
@@ -228,6 +244,7 @@ impl Capture {
         let source = read::PageSource::open(&authority, index, tuple, &|| Ok(()), &|_| Ok(()))?
             .ok_or_else(corrupt)?;
         let manifest = source.select_build_authority()?;
+        let verification = source.new_build_verification()?;
         let build = source
             .build_state(0)?
             .filter(|build| build.phase == BuildPhase::Publish)
@@ -270,6 +287,9 @@ impl Capture {
         )?;
         let scope = source.scope_key;
         let population = source.source_summary.live_entries;
+        let source_partitioned = source_probe
+            .as_ref()
+            .is_some_and(|source| source.data.partitioned);
         let source_identity = source_probe
             .as_ref()
             .map_or(0, |source| source.data.identity);
@@ -310,6 +330,7 @@ impl Capture {
                 source_after: None,
                 last_source_row: None,
                 query: 0,
+                failure_witness: None,
                 depth_ordinal: 0,
                 previous_depth: 0,
                 point: None,
@@ -329,6 +350,7 @@ impl Capture {
         drop(authority);
         ReadShared::try_from_invoice_native(
             Self {
+                verification,
                 root,
                 memory,
                 original,
@@ -338,6 +360,7 @@ impl Capture {
                 index_name: retained::index_name_identity(&index.table, &index.column),
                 manifest,
                 seed: build.training.seed,
+                training: build.training,
                 slot_start,
                 slot_stride,
                 planned_samples,
@@ -345,9 +368,11 @@ impl Capture {
                 population,
                 source: external,
                 source_identity,
+                source_partitioned,
                 source_digest,
                 epoch,
                 cancelled: AtomicBool::new(false),
+                finished: AtomicBool::new(false),
                 state: Mutex::new(state),
             },
             invoice,

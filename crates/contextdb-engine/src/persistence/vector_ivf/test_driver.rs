@@ -740,3 +740,20 @@ impl NativeIvfReadForTest<'_> {
         Ok(())
     }
 }
+
+impl NativeIvfReadForTest<'_> {
+    pub fn requalification_pending_for_test(
+        &self,
+        column: &contextdb_core::ColumnDef,
+    ) -> Result<bool> {
+        self.0.requalification_pending(column, self.0.tuple)
+    }
+}
+
+impl RedbPersistence {
+    pub(crate) fn native_ivf_cache_observation_for_test(
+        &self,
+    ) -> Result<redb::ReadCacheObservation> {
+        self.with_db(|database| Ok(database.read_cache_observation()))
+    }
+}

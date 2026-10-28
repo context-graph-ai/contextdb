@@ -41,3 +41,7 @@ pub use layout_observation::{
     IvfConstructorAllocationForTest, IvfConstructorObserverForTest, load_codebook_values_for_test,
     with_ivf_constructor_observer_for_test,
 };
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use search::quantized_query_codes_for_test;

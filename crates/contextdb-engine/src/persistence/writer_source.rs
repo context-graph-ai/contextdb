@@ -1856,10 +1856,13 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
+    pub(crate) fn check_table_entitlement(&self, table: &str) -> Result<()> {
         self.erasure
             .read()
-            .check_scope(Some(table), "ACL entitlement")?;
+            .check_scope(Some(table), "ACL entitlement")
+    }
+    pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
+        self.check_table_entitlement(table)?;
         RedbPersistence::verify_history_root(
             self.owner_read()?.as_ref(),
             &RedbPersistence::rel_table_name(table),

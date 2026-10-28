@@ -74,3 +74,12 @@ mod native_candidate_port;
 
 #[path = "clustered_vector_index/native_seal.rs"]
 mod native_seal;
+
+#[path = "clustered_vector_index/public_rust_indexed.rs"]
+mod public_rust_indexed;
+
+#[path = "clustered_vector_index/public_rust_auto_and_overlay.rs"]
+mod public_rust_auto_and_overlay;
+
+#[path = "clustered_vector_index/reader_turnover_cleanup.rs"]
+mod reader_turnover_cleanup;

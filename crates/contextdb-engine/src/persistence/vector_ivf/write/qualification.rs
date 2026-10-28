@@ -2,6 +2,50 @@
 use super::super::qualification::{self, Record, TableName};
 use super::*;
 impl WriteScope<'_, '_> {
+    pub(in crate::persistence::vector_ivf) fn read_qualification(
+        &self,
+        generation: u64,
+        kind: u8,
+        ordinal: u64,
+    ) -> Result<Option<Record>> {
+        self.check_cancel()?;
+        let family = *self
+            .record
+            .borrow()
+            .family(generation)
+            .ok_or_else(corrupt)?;
+        qualification::read(
+            &NativeIo::Borrowed(self.session.write),
+            &self.key,
+            family,
+            kind,
+            ordinal,
+        )
+    }
+    /// A cold unpublished calibration restarts after a bounded physical clear.
+    pub(in crate::persistence::vector_ivf) fn clear_calibration_records(
+        &mut self,
+        generation: u64,
+        limit: usize,
+    ) -> Result<bool> {
+        let mut family = *self
+            .record
+            .borrow()
+            .family(generation)
+            .ok_or_else(corrupt)?;
+        let mut remaining = limit;
+        self.reclaim_qualification(&mut family, &mut remaining)?;
+        self.record
+            .borrow_mut()
+            .families
+            .iter_mut()
+            .flatten()
+            .find(|f| f.generation == generation)
+            .ok_or_else(corrupt)?
+            .qualification_root = family.qualification_root;
+        self.begin()?.commit()?;
+        Ok(family.qualification_root.is_none())
+    }
     pub(in crate::persistence::vector_ivf) fn write_qualification(
         &self,
         generation: u64,

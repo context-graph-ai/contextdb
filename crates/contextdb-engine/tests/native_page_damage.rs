@@ -3,6 +3,9 @@ use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use contextdb_vector::ivf::storage::PageKind;
 use std::collections::HashMap;
+const fn build_cycle_bound(rows: usize, batch: usize, training: usize) -> usize {
+    rows.div_ceil(batch) * (training + 3) + rows + 3
+}
 #[test]
 fn actual_page_header_and_payload_damage_refuse_indexed_and_leave_canonical_exact_usable() {
     for payload in [false, true] {
@@ -129,7 +132,7 @@ fn a_frozen_source_range_excludes_later_appends_and_preparation_is_counted_once_
     };
     insert(0..120);
     let mut ready = false;
-    for _ in 0..280 {
+    for _ in 0..build_cycle_bound(120, 16, 10) {
         if db
             .run_maintenance_cycle()
             .unwrap()
@@ -150,7 +153,7 @@ fn a_frozen_source_range_excludes_later_appends_and_preparation_is_counted_once_
     let index = VectorIndexRef::new("items", "v");
     let tuple = VectorPartitionKey::unpartitioned();
     let mut published = false;
-    for _ in 0..280 {
+    for _ in 0..build_cycle_bound(360, 16, 10) {
         let report = db.run_maintenance_cycle().unwrap();
         assert!(report.vector.first_failure.is_none(), "{report:?}");
         if report.vector.built_partitions != 0 {
@@ -160,7 +163,10 @@ fn a_frozen_source_range_excludes_later_appends_and_preparation_is_counted_once_
     }
     assert!(
         published,
-        "future appends do not extend the frozen ingestion range"
+        "future appends do not extend the frozen ingestion range: {:?}",
+        db.native_ivf_build_progress_for_test(&index, &tuple)
+            .unwrap()
+            .build
     );
     let mut complete = false;
     for _ in 0..64 {

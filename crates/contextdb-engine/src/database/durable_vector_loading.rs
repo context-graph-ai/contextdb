@@ -438,6 +438,52 @@ impl SnapshotFloorRegistry {
 }
 
 impl ActiveRemovalPassGuard {
+    /// Inspect one real reader root at a time, outside the registry lock.
+    /// The token horizon bounds the pass even under continuous reader arrivals.
+    /// Newer selected generations do not need obsolete current-tree entries;
+    /// their actual read transactions still hold the ordinary physical floor.
+    pub(super) fn native_readers_allow_cleanup(
+        &self,
+        generation: u64,
+        basis: SnapshotId,
+        mut selected: impl FnMut(crate::persistence::WriterSnapshotHandle) -> Result<Option<u64>>,
+    ) -> Result<bool> {
+        let through = self.registry.next_token.load(Ordering::SeqCst);
+        let mut after = None;
+        loop {
+            let next = {
+                let floors = self.registry.construction_floors.lock();
+                let state = self.registry.state.lock();
+                state
+                    .active
+                    .iter()
+                    .filter(|(token, registered)| {
+                        **token < through
+                            && after.is_none_or(|after| **token > after)
+                            && !floors.values().any(|floor| floor == *token)
+                            && registered.holder_still_entitled()
+                    })
+                    .min_by_key(|(token, _)| **token)
+                    .map(|(token, registered)| {
+                        (*token, registered.snapshot, registered.native_root.clone())
+                    })
+            };
+            let Some((token, snapshot, root)) = next else {
+                return Ok(true);
+            };
+            after = Some(token);
+            if let Some(root) = root.and_then(|root| root.upgrade()) {
+                if selected(root)?.is_some_and(|selected| selected < generation) {
+                    return Ok(false);
+                }
+            } else if snapshot < basis {
+                // No retained native root proves this older reader independent
+                // of current-tree history. Preserve that history conservatively.
+                return Ok(false);
+            }
+        }
+    }
+
     pub(super) fn protects_history(&self, lsn: Lsn) -> bool {
         self.history_through.is_some_and(|through| lsn <= through)
     }

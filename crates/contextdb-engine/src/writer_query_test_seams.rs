@@ -489,3 +489,9 @@ pub(crate) fn note_erasure_frontier_probe() {
         }
     });
 }
+
+/// The same engine-library worker identity used by ownership receipts.
+#[cfg(feature = "test-seams")]
+pub fn current_owned_worker_thread_id_for_test() -> String {
+    format!("{:?}", crate::owned_worker::current_thread_id())
+}

@@ -123,6 +123,7 @@ pub(crate) fn resolve(
         h.update(index.table.as_bytes());
         h.update(index.column.as_bytes());
         h.update(&source_identity);
+        h.update(&column.vector_policy_revision.to_le_bytes());
         u64::from_le_bytes(
             h.finalize().as_bytes()[..8]
                 .try_into()

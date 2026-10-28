@@ -10503,6 +10503,7 @@ struct VectorExplainShape<'a> {
     restricted_candidates: bool,
     candidates: Option<&'a PhysicalPlan>,
     search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+    query_policy: Option<&'a contextdb_parser::ast::VectorSearchOverride>,
     query_expr: &'a Expr,
 }
 

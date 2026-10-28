@@ -1,5 +1,7 @@
 //! Borrowed observations of authenticated clustered storage operations.
 pub(crate) mod disk;
+pub(crate) mod calibration;
+pub use calibration::{NativeIvfCalibrationAnswerForTest,NativeIvfCalibrationAnswersForTest,NativeIvfCalibrationSettingForTest};
 pub use crate::persistence::vector_ivf::NativeIvfPhysicalDiskOwnerForTest;
 use contextdb_core::{Error, Lsn, Result, VectorIndexRef, VectorPartitionKey};
 use contextdb_vector::ivf::{

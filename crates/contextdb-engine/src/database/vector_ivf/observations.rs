@@ -619,3 +619,87 @@ impl Database {
         })
     }
 }
+
+impl Database {
+    pub fn rewrite_native_ivf_calibration_answers_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        answer: crate::vector_ivf_observations::NativeIvfCalibrationAnswerForTest,
+    ) -> Result<crate::vector_ivf_observations::NativeIvfCalibrationAnswersForTest> {
+        let owner = self
+            .finalization
+            .accountant
+            .vector_budget()?
+            .as_ref()
+            .stable_funder_identity();
+        Ok(crate::vector_ivf_observations::calibration::arm_answers(
+            owner,
+            crate::persistence::vector_ivf::retained::route_identity(index, tuple),
+            answer,
+        ))
+    }
+    pub fn plant_native_ivf_calibration_setting_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        probes: u32,
+        factor: u32,
+    ) -> Result<crate::vector_ivf_observations::NativeIvfCalibrationSettingForTest> {
+        if probes == 0 || factor < 100 {
+            return Err(Error::InvalidVectorPolicyDeclaration {
+                index: index.clone(),
+                issue: contextdb_core::VectorPolicyDeclarationIssue::InvalidMember {
+                    member: "PROBES / REFINE_FACTOR",
+                },
+            });
+        }
+        let owner = self
+            .finalization
+            .accountant
+            .vector_budget()?
+            .as_ref()
+            .stable_funder_identity();
+        Ok(crate::vector_ivf_observations::calibration::arm_setting(
+            owner,
+            crate::persistence::vector_ivf::retained::route_identity(index, tuple),
+            probes,
+            factor,
+        ))
+    }
+}
+
+impl Database {
+    pub fn native_ivf_requalification_pending_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+    ) -> Result<bool> {
+        let metadata = self
+            .table_meta(&index.table)
+            .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+        let column = metadata
+            .columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        self.with_native_ivf_read_for_test(index, tuple, |scope| {
+            scope.requalification_pending_for_test(column)
+        })
+    }
+}
+
+impl Database {
+    /// Borrow this writer's actual native cache owner. No alternate database,
+    /// cache, capacity setting or payer is constructed by the observation.
+    pub fn native_ivf_cache_observation_for_test(&self) -> Result<redb::ReadCacheObservation> {
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("native cache observation requires a file-backed writer".into())
+            })?
+            .native_ivf_cache_observation_for_test()
+    }
+}

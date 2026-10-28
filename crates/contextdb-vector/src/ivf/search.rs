@@ -119,20 +119,7 @@ fn search_impl<E>(
     let mut raw = vec![0; raw_bytes];
     let mut values = vec![0.0; policy.dimensions];
     let mut query_code = vec![0i8; policy.dimensions];
-    let norm = query
-        .iter()
-        .map(|x| f64::from(*x).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    for (dst, src) in query_code.iter_mut().zip(query) {
-        *dst = if norm == 0.0 {
-            0
-        } else {
-            (f64::from(*src) / norm * 127.0)
-                .round()
-                .clamp(-127.0, 127.0) as i8
-        };
-    }
+    encode_query(query, &mut query_code);
     let mut visit = |partition| -> QueryResult<(), E> {
         let Some(m) = source.manifest(partition)? else {
             return Ok(());
@@ -890,4 +877,28 @@ fn canonical_visit_layout<S: ReadPages>(_: &S, dimensions: usize) -> Result<usiz
             .0;
     }
     Ok(layout.pad_to_align().size())
+}
+
+// One production encoder; the observation writes into its caller's buffer.
+fn encode_query(query: &[f32], query_code: &mut [i8]) {
+    let norm = query
+        .iter()
+        .map(|x| f64::from(*x).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    for (dst, src) in query_code.iter_mut().zip(query) {
+        *dst = if norm == 0.0 {
+            0
+        } else {
+            (f64::from(*src) / norm * 127.0)
+                .round()
+                .clamp(-127.0, 127.0) as i8
+        };
+    }
+}
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn quantized_query_codes_for_test(query: &[f32], output: &mut [i8]) {
+    assert_eq!(query.len(), output.len());
+    encode_query(query, output);
 }

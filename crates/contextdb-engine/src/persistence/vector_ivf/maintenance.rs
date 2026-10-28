@@ -15,6 +15,7 @@ pub(crate) struct Progress {
     pub in_flight: bool,
     pub published: bool,
     pub ready: bool,
+    pub calibration: bool,
 }
 
 /// Two exact-capacity range keys and the complete input holder share one
@@ -279,6 +280,7 @@ impl RedbPersistence {
             checkpoint()?;
             let root = (self.paged_root_capture()?)()?;
             let (_, snapshot, frontier) = root.authenticate()?;
+            let calibration_pending=qualification::pending(&root,projection.read_budget()?,index,tuple,column,checkpoint)?;
             self.with_db(|db| {
                 let write = Self::begin_history_write(db)?;
                 let native_owner = projection.vector_budget()?;
@@ -293,6 +295,7 @@ impl RedbPersistence {
                 #[cfg(feature = "test-seams")]
                 { session.disk_owner=Some(disk_owner.clone()); }
                 let mut retained_change=None;
+                let mut published_generation=None;
                 let progress =
                     session.with_scope(index, tuple, checkpoint, &|_| Ok(()), |scope| {
                         let route = Self::vector_partition_prefix(index, tuple);
@@ -333,6 +336,7 @@ impl RedbPersistence {
                         let mut state = scope.build_state(0)?;
                         let serving = scope.manifest(0)?;
                         let mut published = false;
+                        let mut calibration=false;
                         let mut ready = serving.is_some_and(|m| m.active_lists != 0);
                         let mut family_snapshot = snapshot;
                         let catalog = scope.with_clustered_writer(
@@ -347,7 +351,7 @@ impl RedbPersistence {
                         let replacement_due = replacement_trigger(
                             column,&scope.record.borrow(),serving,summary.live_entries,
                             catalog.is_some_and(|catalog|catalog.unserviceable.is_some()),
-                        ).is_some();
+                        ).is_some()||calibration_pending;
                         let new_build = state.is_none()
                             || (state.is_some_and(|b| b.phase == BuildPhase::Ready)
                                 && (!ready || replacement_due));
@@ -478,12 +482,29 @@ impl RedbPersistence {
                                     )?;
                                 }
                             } else {
-                                published = scope.with_clustered_writer(
-                                    resolved.policy,
-                                    resolved.training,
-                                    |w| w.advance_build(&mut build),
+                                scope.with_clustered_writer(
+                                    resolved.policy,resolved.training,
+                                    |w|w.advance_build_preparation(&mut build),
                                 )?;
+                                if build.phase==BuildPhase::Publish {
+                                    let active=self.native_ivf_cache.calibration.lock().as_ref().filter(|active|active.route==retained::route_identity(index,tuple)&&active.manifest==build.manifest&&!active.cancelled.load(std::sync::atomic::Ordering::Acquire)).cloned();
+                                    let complete=if let Some(active)=active.as_ref().filter(|active|active.finished.load(std::sync::atomic::Ordering::Acquire)) {
+                                        matches!(scope.read_qualification(build.manifest.generation,0,0)?,Some(qualification::Record::Header(header)) if header.complete&&header.epoch==active.epoch&&header.generation==build.manifest.generation)
+                                    } else {false};
+                                    if build.manifest.active_lists==0||complete {
+                                        published=scope.with_clustered_writer(resolved.policy,resolved.training,|w|w.advance_build(&mut build))?;
+                                    } else if active.is_some() {calibration=true;}
+                                    else {
+                                        // An unpublished interrupted receipt is cleared in
+                                        // bounded batches before a new root is captured.
+                                        let cleared=scope.clear_calibration_records(build.manifest.generation,build.training.phase_batch_entries)?;
+                                        if cleared {
+                                            calibration=scope.with_clustered_writer(resolved.policy,resolved.training,|w|w.prepare_publication_view(&build))?.is_some();
+                                        }
+                                    }
+                                }
                                 if published {
+                                    published_generation=Some(build.manifest.generation);
                                     let mut record = scope.record.borrow_mut();
                                     let family = record
                                         .family(build.manifest.generation)
@@ -581,6 +602,7 @@ impl RedbPersistence {
                                 || reclaiming,
                             published,
                             ready,
+                            calibration,
                         })
                     })?;
                 {
@@ -609,6 +631,10 @@ impl RedbPersistence {
                 }
                 write.commit().map_err(Self::storage_error)?;
                 if let Some(change)=retained_change {change.commit();}
+                if let Some(generation)=published_generation {
+                    let route=retained::route_identity(index,tuple);
+                    self.native_ivf_cache.cancel_calibration_where(|active|active.route==route&&active.manifest.generation==generation);
+                }
                 #[cfg(feature = "test-seams")]
                 {
                     use crate::vector_ivf_observations::*;

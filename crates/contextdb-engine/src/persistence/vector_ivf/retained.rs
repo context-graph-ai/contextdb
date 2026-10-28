@@ -30,10 +30,7 @@ pub(super) struct Registry {
     state: Mutex<Entries>,
 }
 
-pub(in crate::persistence) fn route_identity(
-    index: &VectorIndexRef,
-    tuple: &VectorPartitionKey,
-) -> [u8; 32] {
+pub(crate) fn route_identity(index: &VectorIndexRef, tuple: &VectorPartitionKey) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"contextdb.clustered.retained.route.v1");
     hash.update(&(index.table.len() as u64).to_le_bytes());

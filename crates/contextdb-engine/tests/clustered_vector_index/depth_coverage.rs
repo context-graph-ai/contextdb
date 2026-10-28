@@ -405,6 +405,7 @@ fn near_store(path: &std::path::Path, rows: &[(i64, Vec<f32>)]) -> Database {
         &params([("embedding", Value::Vector(axis_query()))]),
     )
     .expect("the single calibration question is the axis query");
+    db.execute("ALTER TABLE near_items ALTER COLUMN embedding SET WITH (calibration_samples = 1)", &empty()).unwrap();
     super::support::declare_calibration_queries(
         &db,
         "near_items",

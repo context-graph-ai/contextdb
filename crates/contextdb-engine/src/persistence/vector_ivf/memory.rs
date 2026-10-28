@@ -231,6 +231,13 @@ pub(super) fn route_with_suffix_capacity(
 }
 
 pub(super) fn route_bytes(index: &VectorIndexRef, tuple: &VectorPartitionKey) -> Result<usize> {
+    route_bytes_for_names(&index.table, &index.column, tuple)
+}
+pub(super) fn route_bytes_for_names(
+    table: &str,
+    column: &str,
+    tuple: &VectorPartitionKey,
+) -> Result<usize> {
     let mut canonical = 9usize;
     for component in tuple.components() {
         canonical = add(
@@ -245,10 +252,7 @@ pub(super) fn route_bytes(index: &VectorIndexRef, tuple: &VectorPartitionKey) ->
             },
         )?;
     }
-    add(
-        add(add(index.table.len(), index.column.len())?, 24)?,
-        canonical,
-    )
+    add(add(add(table.len(), column.len())?, 24)?, canonical)
 }
 
 pub(super) const OPERATION_PREFIX_BYTES: usize = 72;

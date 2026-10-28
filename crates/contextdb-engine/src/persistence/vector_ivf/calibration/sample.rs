@@ -19,6 +19,19 @@ pub(super) fn check(
     }
     capture::writer(&capture.root)?.check_table_scope(&index.table)
 }
+/// The immutable history root is authenticated at the query boundary.
+/// Work checkpoints keep checking the live erasure entitlement and cancellation.
+pub(super) fn work_checkpoint(
+    capture: &Capture,
+    index: &VectorIndexRef,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    checkpoint()?;
+    if capture.cancelled.load(Ordering::Acquire) {
+        return Err(Error::ReadCancelled);
+    }
+    capture::writer(&capture.root)?.check_table_entitlement(&index.table)
+}
 pub(super) fn read_bytes(
     source: &impl ReadPages,
     manifest: Manifest,
@@ -108,12 +121,23 @@ impl Capture {
         if let Some(source) = &self.source {
             self.sample_questions(tuple, state, limit, checkpoint, source)
         } else {
-            let authority = read::NativeAuthority::open(&self.root, self.memory.clone())?;
+            let authority = read::NativeAuthority::open_prepared(
+                &self.root,
+                self.memory.clone(),
+                &self.verification,
+            )?;
             let selected = || check(self, index, checkpoint);
-            let page_source =
-                read::PageSource::open(&authority, index, tuple, &selected, &|_| Ok(()))?
-                    .ok_or_else(corrupt)?;
-            if page_source.select_build_authority()? != self.manifest {
+            let page_source = read::PageSource::open_prepared(
+                &authority,
+                index,
+                tuple,
+                &selected,
+                &|_| Ok(()),
+                &self.verification,
+            )?;
+            if page_source.select_build_authority_with_verification(&self.verification)?
+                != self.manifest
+            {
                 return Err(corrupt());
             }
             let _invoice = memory::Invoice::reserve(
@@ -356,13 +380,26 @@ impl Capture {
                 return Err(corrupt());
             }
             output.copy_from_slice(&body.value.vector);
+            if output.iter().any(|value| !value.is_finite()) {
+                return Err(corrupt());
+            }
             Ok(())
         } else {
-            let authority = read::NativeAuthority::open(&self.root, self.memory.clone())?;
+            let authority = read::NativeAuthority::open_prepared(
+                &self.root,
+                self.memory.clone(),
+                &self.verification,
+            )?;
             let selected = || check(self, index, checkpoint);
-            let source = read::PageSource::open(&authority, index, tuple, &selected, &|_| Ok(()))?
-                .ok_or_else(corrupt)?;
-            if source.select_build_authority()? != self.manifest
+            let source = read::PageSource::open_prepared(
+                &authority,
+                index,
+                tuple,
+                &selected,
+                &|_| Ok(()),
+                &self.verification,
+            )?;
+            if source.select_build_authority_with_verification(&self.verification)? != self.manifest
                 || sample.generation != self.manifest.generation
             {
                 return Err(corrupt());
@@ -375,23 +412,34 @@ impl Capture {
             if word(&source, self.manifest, PageKind::Canonical, offset, page)? != sample.row {
                 return Err(corrupt());
             }
-            for (at, value) in output.iter_mut().enumerate() {
-                let mut bits = [0; 4];
-                read_bytes(
-                    &source,
-                    self.manifest,
-                    PageKind::Canonical,
-                    offset
-                        .checked_add(8)
-                        .and_then(|n| n.checked_add(at as u64 * 4))
-                        .ok_or_else(corrupt)?,
-                    &mut bits,
-                    page,
-                )?;
-                *value = f32::from_le_bytes(bits);
-                if !value.is_finite() {
+            let mut copied = 0usize;
+            while copied < output.len() {
+                let at = offset
+                    .checked_add(8)
+                    .and_then(|n| n.checked_add((copied as u64).checked_mul(4)?))
+                    .ok_or_else(corrupt)?;
+                let ordinal = at / PAGE_BYTES as u64;
+                if !source
+                    .read_admitted_page(self.manifest.key(PageKind::Canonical, 0, ordinal), page)?
+                {
                     return Err(corrupt());
                 }
+                let start = (at % PAGE_BYTES as u64) as usize;
+                // Canonical coordinates and native payloads are four-byte aligned.
+                let take = (output.len() - copied).min((PAGE_BYTES - start) / 4);
+                if take == 0 {
+                    return Err(corrupt());
+                }
+                for (value, bits) in output[copied..copied + take]
+                    .iter_mut()
+                    .zip(page[start..start + take * 4].chunks_exact(4))
+                {
+                    *value = f32::from_le_bytes(bits.try_into().map_err(|_| corrupt())?);
+                    if !value.is_finite() {
+                        return Err(corrupt());
+                    }
+                }
+                copied += take;
             }
             Ok(())
         }

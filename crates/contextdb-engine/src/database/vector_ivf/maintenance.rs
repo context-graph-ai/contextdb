@@ -8,7 +8,7 @@ impl MaintenanceContext {
         let Some(persistence) = &self.persistence else {
             return Ok(VectorMaintenanceReport::default());
         };
-        let mut copy_owner = crate::vector_read_memory::admission(memory);
+        let mut copy_owner = crate::vector_read_memory::admission(memory.clone());
         let routes = super::super::maintenance_runtime::vector_partition_routes(
             &self.vector,
             &mut copy_owner,
@@ -49,19 +49,81 @@ impl MaintenanceContext {
             }
             report.nonempty_partitions += 1;
             indexes.insert(route.index.clone());
-            let outcome =
-                super::super::maintenance_runtime::publish_direct_metadata(&self.tx_mgr, || {
+            if persistence.native_ivf_calibration_route().is_some()
+                && !persistence
+                    .native_ivf_calibration_is_selected(&route.index, &route.partition_key)
+            {
+                report.remaining_partitions += 1;
+                pending.insert(route.index.clone());
+                continue;
+            }
+            let outcome = self
+                .tx_mgr
+                .with_maintenance_publication(|publication| {
+                    publication.reserve()?;
                     self.admit_generation_disk(0)?;
                     let removal = self
                         .snapshot_registry
                         .begin_vector_removal_pass(self.tx_mgr.current_tx_max());
-                    persistence.advance_native_ivf_partition(
+                    let can_reclaim = if removal.registered_snapshots().is_empty() {
+                        true
+                    } else if let Some((generation, basis)) = persistence.native_ivf_cleanup_basis(
+                        &route.index,
+                        &route.partition_key,
+                        memory.clone(),
+                    )? {
+                        removal.native_readers_allow_cleanup(generation, basis, |root| {
+                            let root =
+                                crate::persistence::vector_paged::CapturedPagedRoot::from_writer(
+                                    root,
+                                )?;
+                            crate::persistence::vector_ivf::reclamation::selected_generation(
+                                &root,
+                                memory.clone(),
+                                &route.index,
+                                &route.partition_key,
+                            )
+                            .map(|selected| selected.map(|(generation, _)| generation))
+                        })?
+                    } else {
+                        false
+                    };
+                    let progress = persistence.advance_native_ivf_partition(
                         &route.index,
                         &route.partition_key,
                         column,
-                        removal.registered_snapshots().is_empty(),
+                        can_reclaim,
                         &|| self.build_checkpoint(),
-                    )
+                    )?;
+                    drop(removal);
+                    publication.complete();
+                    // Capture the publisher's real refreshed root before releasing
+                    // the same boundary. All query work runs after this closure.
+                    if progress.calibration {
+                        persistence.capture_native_ivf_calibration(
+                            &route.index,
+                            &route.partition_key,
+                            column,
+                        )?;
+                    }
+                    Ok(progress)
+                })
+                .and_then(|progress| {
+                    if progress.calibration {
+                        let mut publish = |operation: &mut dyn FnMut() -> Result<()>| {
+                            super::super::maintenance_runtime::publish_direct_metadata(
+                                &self.tx_mgr,
+                                operation,
+                            )
+                        };
+                        persistence.advance_native_ivf_calibration(
+                            &route.index,
+                            &route.partition_key,
+                            &|| self.build_checkpoint(),
+                            &mut publish,
+                        )?;
+                    }
+                    Ok(progress)
                 });
             match outcome {
                 Ok(progress) => {

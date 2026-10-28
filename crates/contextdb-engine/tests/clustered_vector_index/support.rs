@@ -2122,7 +2122,8 @@ pub fn calibration_receipt(
                 | Record::SampleWork(_)
                 | Record::Sample(_)
                 | Record::Rows(_)
-                | Record::Rewrite(_) => {}
+                | Record::Rewrite(_)
+                | Record::Oracle(_) => {}
             })
         },
     )
@@ -2133,12 +2134,16 @@ pub fn calibration_receipt(
 /// The Context's serving generation must be requalified (its target or its
 /// calibration-query source changed since it was qualified).
 pub fn requalification_pending(
-    _db: &Database,
-    _table: &str,
-    _column: &str,
-    _context: &[Value],
+    db: &Database,
+    table: &str,
+    column: &str,
+    context: &[Value],
 ) -> bool {
-    unimplemented!("{UNBOUND}: requalification pending")
+    db.native_ivf_requalification_pending_for_test(
+        &contextdb_core::VectorIndexRef::new(table, column),
+        &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
+    )
+    .expect("inspect the actual served receipt's declaration and source dependency")
 }
 
 /// Supplies the answer scored for one (sample query, calibrated depth) from
@@ -2153,17 +2158,24 @@ pub type CalibrationAnswer = Box<dyn Fn(usize, u32, &[u64]) -> Vec<u64> + Send +
 /// canonical row identities. It is called once for each (sample query,
 /// calibrated depth) the calibration actually runs.
 pub struct CalibrationAnswersRewritten {
-    _private: (),
+    _guard: contextdb_engine::vector_ivf_observations::NativeIvfCalibrationAnswersForTest,
 }
-
 pub fn rewrite_next_calibration_answers(
-    _db: &Database,
-    _table: &str,
-    _column: &str,
-    _context: &[Value],
-    _answer: CalibrationAnswer,
+    db: &Database,
+    table: &str,
+    column: &str,
+    context: &[Value],
+    answer: CalibrationAnswer,
 ) -> CalibrationAnswersRewritten {
-    unimplemented!("{UNBOUND}: rewriting calibration answers")
+    CalibrationAnswersRewritten {
+        _guard: db
+            .rewrite_native_ivf_calibration_answers_for_test(
+                &contextdb_core::VectorIndexRef::new(table, column),
+                &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
+                answer,
+            )
+            .expect("rewrite only the scored identities of each actual production run"),
+    }
 }
 
 /// Installs on the Context's serving generation a qualification receipt
@@ -2425,13 +2437,70 @@ pub fn legacy_entries_prepared_total(
 /// for `query`, best first, as primary keys: the order a shortlist is cut
 /// from.
 pub fn quantized_order(
-    _db: &Database,
-    _table: &str,
-    _column: &str,
-    _context: &[Value],
-    _query: &[f32],
+    db: &Database,
+    table: &str,
+    column: &str,
+    context: &[Value],
+    query: &[f32],
 ) -> Vec<Value> {
-    unimplemented!("{UNBOUND}: the quantized candidate order")
+    let manifest = db
+        .native_ivf_maintenance_state_for_test(
+            &contextdb_core::VectorIndexRef::new(table, column),
+            &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
+        )
+        .expect("read native serving manifest")
+        .manifest
+        .expect("a serving generation");
+    assert_eq!(query.len(), manifest.dimensions);
+    // Decode the revision-one signed int8 wire format. All row codes below
+    // come from the saved physical list records, never from a test index.
+    let mut query_codes = vec![0i8; query.len()];
+    contextdb_vector::ivf::quantized_query_codes_for_test(query, &mut query_codes);
+    let mut ranked = Vec::new();
+    db.with_native_ivf_read_for_test(
+        &contextdb_core::VectorIndexRef::new(table, column),
+        &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
+        |scope| {
+            scope.visit_physical_pages(&mut |page| {
+                if page.key.generation != manifest.generation
+                    || page.key.kind != contextdb_vector::ivf::storage::PageKind::Lists
+                {
+                    return;
+                }
+                let count = u32::from_le_bytes(page.bytes[112..116].try_into().unwrap()) as usize;
+                for record in page
+                    .payload
+                    .chunks_exact(manifest.dimensions + 16)
+                    .take(count)
+                {
+                    let row = u64::from_le_bytes(record[8..16].try_into().unwrap());
+                    let (mut dot, mut aa, mut bb) = (0i64, 0i64, 0i64);
+                    for (&a, &b) in query_codes.iter().zip(&record[16..]) {
+                        let (a, b) = (i64::from(a), i64::from(b as i8));
+                        dot += a * b;
+                        aa += a * a;
+                        bb += b * b;
+                    }
+                    let distance = if aa == 0 || bb == 0 {
+                        1.0
+                    } else {
+                        1.0 - dot as f64 / ((aa as f64).sqrt() * (bb as f64).sqrt())
+                    };
+                    ranked.push((distance, row));
+                }
+            })
+        },
+    )
+    .expect("read actual quantized list bytes");
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    ranked.dedup_by_key(|entry| entry.1);
+    ranked
+        .into_iter()
+        .map(|(_, row)| {
+            db.native_ivf_primary_key_for_row_for_test(table, row, None)
+                .expect("resolve actual native row primary key")
+        })
+        .collect()
 }
 
 /// While it lives, the next calibration of the named Context evaluates only
@@ -2441,18 +2510,28 @@ pub fn quantized_order(
 /// the selector moves no depth to another point. Every depth's pair is then
 /// this point.
 pub struct CalibrationSettingPlanted {
-    _private: (),
+    _guard: contextdb_engine::vector_ivf_observations::NativeIvfCalibrationSettingForTest,
 }
-
 pub fn plant_calibration_setting(
-    _db: &Database,
-    _table: &str,
-    _column: &str,
-    _context: &[Value],
-    _probes: u64,
-    _refine_factor: f64,
+    db: &Database,
+    table: &str,
+    column: &str,
+    context: &[Value],
+    probes: u64,
+    refine_factor: f64,
 ) -> CalibrationSettingPlanted {
-    unimplemented!("{UNBOUND}: planting a calibration setting")
+    let factor = (refine_factor * 100.0).round();
+    assert!(factor >= 100.0 && factor <= u32::MAX as f64);
+    CalibrationSettingPlanted {
+        _guard: db
+            .plant_native_ivf_calibration_setting_for_test(
+                &contextdb_core::VectorIndexRef::new(table, column),
+                &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
+                u32::try_from(probes).unwrap(),
+                factor as u32,
+            )
+            .expect("pin the actual calibration lattice to the supplied point"),
+    }
 }
 
 /// The quantization step of each dimension of the serving generation's
@@ -2481,15 +2560,18 @@ pub fn quantized_codes(
     context: &[Value],
     vector: &[f32],
 ) -> Vec<i32> {
-    db.with_native_ivf_read_for_test(
-        &contextdb_core::VectorIndexRef::new(table, column),
-        &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
-        |scope| scope.quantized_record(vector),
-    )
-    .expect("inspect actual list record")
-    .into_iter()
-    .map(|v| i32::from(v as i8))
-    .collect()
+    let manifest = db
+        .native_ivf_maintenance_state_for_test(
+            &contextdb_core::VectorIndexRef::new(table, column),
+            &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
+        )
+        .expect("inspect serving codec")
+        .manifest
+        .expect("a serving generation");
+    assert_eq!(manifest.dimensions, vector.len());
+    let mut encoded = vec![0i8; vector.len()];
+    contextdb_vector::ivf::quantized_query_codes_for_test(vector, &mut encoded);
+    encoded.into_iter().map(i32::from).collect()
 }
 
 /// The list of the serving generation that holds the row with this primary
@@ -2714,31 +2796,27 @@ pub fn inspected_search_settings(
     db: &Database,
     table: &str,
     column: &str,
-    _context: &[Value],
+    context: &[Value],
 ) -> Vec<DepthSetting> {
-    let meta = db.table_meta(table).expect("declared table");
-    let column = meta
-        .columns
-        .iter()
-        .find(|c| c.name == column)
-        .expect("declared vector column");
-    if let (Some(probes), Some(factor)) = (column.ivf_probes, column.ivf_refine_factor_hundredths) {
-        let depths = column
-            .vector_engine_policy
-            .calibration_depths
-            .clone()
-            .unwrap_or_else(|| vec![1, 2, 5, 10, 20, 50, 100]);
-        depths
-            .into_iter()
-            .map(|depth| DepthSetting {
-                depth: depth as u32,
-                probes: probes as u64,
-                refine_factor: f64::from(factor) / 100.0,
+    use contextdb_engine::vector_ivf_observations::NativeIvfQualificationRecordForTest as Record;
+    let mut settings = Vec::new();
+    db.with_native_ivf_read_for_test(
+        &contextdb_core::VectorIndexRef::new(table, column),
+        &contextdb_core::VectorPartitionKey::from_values(context).unwrap(),
+        |scope| {
+            scope.visit_qualification(&mut |record| {
+                if let Record::Depth(depth) = record {
+                    settings.push(DepthSetting {
+                        depth: depth.depth,
+                        probes: u64::from(depth.probes),
+                        refine_factor: f64::from(depth.factor_hundredths) / 100.0,
+                    });
+                }
             })
-            .collect()
-    } else {
-        Vec::new()
-    }
+        },
+    )
+    .expect("inspect each actual served depth's measured production pair");
+    settings
 }
 
 /// Work from a real ReadSession file query, forwarded from its production

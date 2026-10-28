@@ -18,9 +18,11 @@ pub struct Header {
     pub policy_revision: u64,
     pub target_hundredths: u16,
     pub query_source: bool,
+    pub source_partitioned: bool,
     pub source_identity: u64,
     pub source_frontier: u64,
     pub samples: u32,
+    pub planned_samples: u32,
     pub selection_samples: u32,
     pub validation_samples: u32,
     pub depths: u32,
@@ -108,6 +110,11 @@ pub struct Rewrite {
 pub(super) fn paired_key(kind: u8, left: u32, right: u32) -> [u8; 9] {
     key(kind, (u64::from(left) << 32) | u64::from(right))
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Oracle {
+    pub count: u32,
+    pub work: u64,
+}
 /// Every measured query's own work remains independently inspectable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SampleWork {
@@ -143,6 +150,7 @@ pub enum Record {
     Sample(Sample),
     Rows(RowChunk),
     Rewrite(Rewrite),
+    Oracle(Oracle),
 }
 pub(crate) struct Selection {
     pub depth: Depth,
@@ -232,7 +240,7 @@ fn decode(scope: &[u8; 64], generation: u64, key: &[u8; 9], bytes: &[u8]) -> Res
     }
     Ok(record)
 }
-fn read(
+pub(super) fn read(
     native: &NativeIo<'_>,
     scope: &[u8; 64],
     family: Family,
@@ -474,9 +482,11 @@ impl RedbPersistence {
                                     .search_target_accuracy_hundredths
                                     .unwrap_or(9500),
                                 query_source: false,
+                                source_partitioned: false,
                                 source_identity: 0,
                                 source_frontier: family.source_frontier,
                                 samples,
+                                planned_samples: samples,
                                 selection_samples: samples / 2,
                                 validation_samples: samples - samples / 2,
                                 depths: 0,
@@ -484,6 +494,14 @@ impl RedbPersistence {
                         }
                         _ => return Err(corrupt()),
                     };
+                    // Supplied test facts state "as if measured". A cost-only
+                    // receipt has no measured queries; preserve its actual basis
+                    // and use its selected sample allowance for these supplied facts.
+                    if header.samples == 0 {
+                        header.samples = header.planned_samples;
+                        header.selection_samples = header.samples / 2;
+                        header.validation_samples = header.samples - header.selection_samples;
+                    }
                     let old_depths = header.depths;
                     header.depths = u32::try_from(depths.len()).map_err(|_| corrupt())?;
                     let mut previous = 0;
@@ -597,3 +615,7 @@ impl RedbPersistence {
 #[cfg(test)]
 #[path = "qualification_distribution_tests.rs"]
 mod distribution_tests;
+
+#[path = "qualification_dependency.rs"]
+mod dependency;
+pub(super) use dependency::pending;
