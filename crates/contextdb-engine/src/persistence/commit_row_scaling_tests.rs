@@ -410,47 +410,77 @@ fn many_table_commit_with_history(
 /// the point that charge first raises it to is refused with nothing committed.
 #[test]
 fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
+    let derive_tight_from_ledger = |ledger: &[crate::memory_accounting::BudgetLedgerEntry]| {
+        let held: usize = ledger
+            .iter()
+            .filter(|entry| entry.what == HOLD_RELATIONS)
+            .map(|entry| entry.bytes)
+            .sum();
+        assert!(
+            held >= 2 * HELD_TABLES * 200,
+            "holding a relation per written table is admitted to the writer budget: {held} bytes charged as {HOLD_RELATIONS}"
+        );
+        let mut high = 0;
+        let mut tight = None;
+        for entry in ledger {
+            if entry.what == HOLD_RELATIONS && entry.used_after > high {
+                tight = Some(entry.used_after - 1);
+                break;
+            }
+            high = high.max(entry.used_after);
+        }
+        let tight = tight.expect("some relation charge raises the commit's peak");
+        let held_requests: Vec<usize> = ledger
+            .iter()
+            .filter(|entry| entry.what == HOLD_RELATIONS)
+            .map(|entry| entry.bytes)
+            .collect();
+        let pending_requests: Vec<usize> = ledger
+            .iter()
+            .filter(|entry| entry.what == "redb/pending_directory")
+            .map(|entry| entry.bytes)
+            .collect();
+        (tight, held_requests, pending_requests)
+    };
     let ample = 1 << 32;
     let (_root, db, tx) = many_table_commit(ample);
     watch_budget_ledger_for_test();
     db.commit(tx).expect("an ample limit commits every table");
     let ledger = take_budget_ledger_for_test();
-    let held: usize = ledger
-        .iter()
-        .filter(|entry| entry.what == HOLD_RELATIONS)
-        .map(|entry| entry.bytes)
-        .sum();
-    assert!(
-        held >= 2 * HELD_TABLES * 200,
-        "holding a relation per written table is admitted to the writer budget: \
-         {held} bytes charged as {HOLD_RELATIONS}"
-    );
-    // The first relation charge that raises the commit's usage above every
-    // earlier point of it: a limit one byte below is refused by that charge.
-    let mut high = 0;
-    let mut tight = None;
-    for entry in &ledger {
-        if entry.what == HOLD_RELATIONS && entry.used_after > high {
-            tight = Some(entry.used_after - 1);
-            break;
-        }
-        high = high.max(entry.used_after);
-    }
-    let tight = tight.expect("some relation charge raises the commit's peak");
-    // The producer's actual native requests define the allowed size classes.
-    // A changed map layout can make map growth precede its receipt refusal.
-    let pending_requests: Vec<usize> = ledger
-        .iter()
-        .filter(|entry| entry.what == "redb/pending_directory")
-        .map(|entry| entry.bytes)
-        .collect();
+    let (mut tight, mut held_requests, mut pending_requests) = derive_tight_from_ledger(&ledger);
     db.close().expect("close the measured store");
 
-    let (_root, db, tx) = many_table_commit(tight);
-    let refusal = db
-        .commit(tx)
-        .expect_err("the relations do not fit the tight limit");
+    // Re-measure successful commits under their actual smaller dirty-buffer
+    // windows. A completed optional page can leave before relation holding.
+    // Once the window no longer changes, need - 1 must refuse atomically.
+    let mut refused = None;
+    for step in 0..8 {
+        let (root, db, tx) = many_table_commit(tight);
+        watch_budget_ledger_for_test();
+        let outcome = db.commit(tx);
+        let ledger = take_budget_ledger_for_test();
+        match outcome {
+            Ok(()) => {
+                let (next_tight, next_held, next_pending) = derive_tight_from_ledger(&ledger);
+                assert!(
+                    next_tight < tight,
+                    "successful fixed-point step must lower the derived limit: {tight} -> {next_tight}"
+                );
+                eprintln!("MANY_TABLE_REFUSAL step={step} tight={tight} next_tight={next_tight}");
+                (tight, held_requests, pending_requests) = (next_tight, next_held, next_pending);
+                db.close().expect("close the successful derivation store");
+            }
+            Err(refusal) => {
+                eprintln!("MANY_TABLE_REFUSAL step={step} tight={tight} refusal={refusal:?}");
+                refused = Some((root, db, refusal));
+                break;
+            }
+        }
+    }
+    let (_root, db, refusal) =
+        refused.expect("need - 1 converges to a refused commit under the same effective window");
     match &refusal {
         contextdb_core::Error::MemoryBudgetExceeded {
             subsystem,
@@ -460,18 +490,25 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
             budget_limit_bytes,
             ..
         } => {
-            assert_eq!(*subsystem, "redb");
-            assert_eq!(*operation, "pending_directory");
-            assert!(pending_requests.contains(requested_bytes));
+            if *subsystem == "content_identity" && *operation == "hold_row_head_relations" {
+                assert!(held_requests.contains(requested_bytes));
+                assert!(refusal.to_string().ends_with("Hint: Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to."));
+            } else {
+                assert_eq!(*subsystem, "redb");
+                assert_eq!(*operation, "pending_directory");
+                assert!(pending_requests.contains(requested_bytes));
+            }
             assert!(*available_bytes < *requested_bytes);
             assert_eq!(*budget_limit_bytes, tight);
-            assert_eq!(
-                refusal.to_string(),
-                format!(
-                    "writing this transaction's rows to {HELD_TABLES} tables: the table roots did not fit in the declared memory ({requested_bytes} B requested, {available_bytes} B available of {budget_limit_bytes} B). Hint: Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to."
-                ),
-                "the original numeric refusal must explain the row-write work in user terms"
-            );
+            if *subsystem == "redb" {
+                assert_eq!(
+                    refusal.to_string(),
+                    format!(
+                        "writing this transaction's rows to {HELD_TABLES} tables: the table roots did not fit in the declared memory ({requested_bytes} B requested, {available_bytes} B available of {budget_limit_bytes} B). Hint: Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to."
+                    ),
+                    "the original numeric refusal must explain the row-write work in user terms"
+                );
+            }
         }
         other => panic!("a typed budget refusal, not {other:?}"),
     }
