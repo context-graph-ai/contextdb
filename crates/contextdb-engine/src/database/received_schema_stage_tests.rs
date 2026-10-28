@@ -3101,10 +3101,15 @@ fn schema_stage_rejects_missing_duplicate_or_mismatched_lineage_without_mutation
     // 4 KiB over the schema: the single-column PRIMARY KEY allocates a
     // fixed 64 KiB exact-probe bitmap for the life of the index, which it
     // always did and which the accountant now sees.
-    let accountant = Arc::new(MemoryAccountant::with_budget(
-        contextdb_core::EXACT_PROBE_FILTER_BYTES + 4096,
-    ));
-    let db = Database::open_memory_with_accountant(accountant.clone());
+    let db = Database::open_with_options(
+        ":memory:",
+        crate::read_session::DatabaseOpenOptions {
+            memory_limit: Some(contextdb_core::EXACT_PROBE_FILTER_BYTES + 4096),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let accountant = db.accountant.clone();
     db.execute(
         "CREATE TABLE lineage_rows (id INTEGER PRIMARY KEY)",
         &HashMap::new(),
@@ -3199,8 +3204,15 @@ fn schema_stage_rejects_missing_duplicate_or_mismatched_lineage_without_mutation
 fn staged_vector_replacement_releases_retired_hnsw_and_negative_delta() {
     // Fund the counted preparation controls as well as the vector fixture.
     // The invariant below is exact retirement back to the opening balance.
-    let accountant = Arc::new(MemoryAccountant::with_budget(8 * 1024));
-    let db = Database::open_memory_with_accountant(accountant.clone());
+    let db = Database::open_with_options(
+        ":memory:",
+        crate::read_session::DatabaseOpenOptions {
+            memory_limit: Some(8 * 1024),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let accountant = db.accountant.clone();
     let baseline = accountant.usage().used;
     let index = VectorIndexRef::new("retired", "embedding");
     db.vector_store

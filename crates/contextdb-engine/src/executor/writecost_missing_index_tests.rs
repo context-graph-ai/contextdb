@@ -1,21 +1,8 @@
 use super::execute_plan;
 use crate::database::Database;
 use contextdb_core::{ContextId, Error, Value};
-use contextdb_vector::{MemoryBudget, VectorCopyAdmission};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use uuid::Uuid;
-
-#[derive(Debug)]
-struct TestVectorBudget;
-
-impl MemoryBudget for TestVectorBudget {
-    fn try_allocate_for(&self, _: usize, _: &str, _: &str, _: &str) -> contextdb_core::Result<()> {
-        Ok(())
-    }
-
-    fn release(&self, _: usize) {}
-}
 
 fn params(membership: u128) -> HashMap<String, Value> {
     HashMap::from([("m".into(), Value::Uuid(Uuid::from_u128(membership)))])
@@ -68,16 +55,21 @@ fn fixture() -> Database {
 fn eager(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Result<usize, Error> {
     let statement = contextdb_parser::parse(sql)?;
     let plan = contextdb_planner::plan(&statement)?;
-    let mut vector_copy = VectorCopyAdmission::new(Arc::new(TestVectorBudget));
+    let read_memory = db.declared_reader_memory()?;
+    let mut vector_copy = crate::vector_read_memory::admission(read_memory.clone());
     execute_plan(
         db,
         &plan,
         params,
         None,
         &mut vector_copy,
-        db.declared_reader_memory()?,
+        read_memory.clone(),
     )
-    .and_then(|result| result.into_public().map(|result| result.rows().len()))
+    .and_then(|result| {
+        result
+            .into_public_with_owner(read_memory)
+            .map(|result| result.rows().len())
+    })
 }
 
 #[test]
