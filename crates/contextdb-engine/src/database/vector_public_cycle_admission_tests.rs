@@ -617,6 +617,9 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     .unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     if !matches!(kind, UnknownCatalog::DurableOnly) {
+        let _fixture_decode_scope =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(db.accountant.clone())
+                .unwrap();
         assert!(
             db.vector_store
                 .preload_dormant_partition_generation(&route(0), true)
