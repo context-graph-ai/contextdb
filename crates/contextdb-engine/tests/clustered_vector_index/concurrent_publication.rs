@@ -33,6 +33,19 @@ fn ids(db: &Database, snapshot: SnapshotId) -> Vec<i64> {
     int_ids(&result)
 }
 
+fn complete_rows(db: &Database, snapshot: SnapshotId) -> Result<Vec<i64>, String> {
+    let result = db
+        .execute_at_snapshot(
+            "SELECT id FROM items ORDER BY embedding <=> $v USE VECTOR INDEXED LIMIT 64",
+            &params([("v", Value::Vector(unit_vector(7, DIM)))]),
+            snapshot,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    let mut rows = int_ids(&result);
+    rows.sort_unstable();
+    Ok(rows)
+}
+
 #[test]
 fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers() {
     let root = tempfile::tempdir().unwrap();
@@ -58,6 +71,10 @@ fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers()
     let newer = db.snapshot();
     assert_eq!(ids(&db, old), vec![7]);
     assert_eq!(ids(&db, newer), vec![1000]);
+    let old_expected: Vec<i64> = (0..40).collect();
+    let new_expected: Vec<i64> = (0..48).filter(|id| *id != 7).chain([1000]).collect();
+    assert_eq!(complete_rows(&db, old).unwrap(), old_expected);
+    assert_eq!(complete_rows(&db, newer).unwrap(), new_expected);
 
     let (reached_tx, reached_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -92,9 +109,46 @@ fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers()
         )
     });
     let event = attempt_rx.recv_timeout(WATCHDOG);
+    let (answers_tx, answers_rx) = mpsc::channel();
+    let reader_db = db.clone();
+    let reader = std::thread::spawn(move || {
+        answers_tx
+            .send((
+                complete_rows(&reader_db, old),
+                complete_rows(&reader_db, newer),
+            ))
+            .unwrap();
+    });
+    let during = answers_rx.recv_timeout(WATCHDOG);
     release_tx.send(()).unwrap();
     first_worker.join().unwrap();
     let second_result = second_worker.join().unwrap().unwrap();
+    reader.join().unwrap();
+    let (during_old, during_new) =
+        during.expect("complete reader answers during publication were never delivered");
+    assert_eq!(
+        during_old,
+        Ok(old_expected.clone()),
+        "the old snapshot must return every old row exactly once during competing maintenance"
+    );
+    assert_eq!(
+        during_new,
+        Ok(new_expected.clone()),
+        "the new snapshot must return every new row exactly once during competing maintenance"
+    );
+    assert_eq!(
+        complete_rows(&db, old),
+        Ok(old_expected),
+        "the old snapshot remains complete after both maintenance calls"
+    );
+    assert_eq!(
+        complete_rows(&db, newer),
+        Ok(new_expected),
+        "the new snapshot remains complete after both maintenance calls"
+    );
+    println!(
+        "PUBLICATION_ANSWER_PROMISE_PASS: complete old and new snapshots during and after competing maintenance"
+    );
     assert!(
         matches!(
             event.expect("second maintenance acquisition event was never delivered"),
