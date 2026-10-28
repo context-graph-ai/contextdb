@@ -703,3 +703,22 @@ impl Database {
             .native_ivf_cache_observation_for_test()
     }
 }
+
+#[cfg(feature = "test-seams")]
+impl Database {
+    /// Borrow a real registered writer snapshot and its original native
+    /// admission for independent physical read and custody guards.
+    #[doc(hidden)]
+    pub fn with_native_ivf_fixture_read_for_test<T>(
+        &self,
+        run: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
+    ) -> Result<T> {
+        let _operation = self.assert_open_operation();
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("native fixture read requires a file-backed writer".into())
+            })?
+            .with_native_ivf_fixture_read_for_test(run)
+    }
+}

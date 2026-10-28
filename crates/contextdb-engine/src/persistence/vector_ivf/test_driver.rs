@@ -793,3 +793,26 @@ impl RedbPersistence {
         })
     }
 }
+
+#[cfg(feature = "test-seams")]
+impl RedbPersistence {
+    /// Borrow an authenticated captured transaction under this writer's genuine
+    /// native admission. The caller uses the ordinary byte/cursor read APIs.
+    pub(crate) fn with_native_ivf_fixture_read_for_test<T>(
+        &self,
+        run: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
+    ) -> Result<T> {
+        let _decode = self.writer_decode_scope()?;
+        let projection = self.require_decode_original()?;
+        let original = projection.preparation_original()?;
+        let admission =
+            super::super::native_storage_admission::StorageAdmissionScope::writer_original(
+                &original,
+            )?;
+        let root = (self.paged_root_capture()?)()?;
+        admission.run_original_unqualified(|| {
+            root.authenticate()?;
+            run(&root.read)
+        })
+    }
+}
