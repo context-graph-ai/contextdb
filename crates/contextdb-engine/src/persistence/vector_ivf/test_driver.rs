@@ -757,3 +757,39 @@ impl RedbPersistence {
         self.with_db(|database| Ok(database.read_cache_observation()))
     }
 }
+
+impl RedbPersistence {
+    /// Deliberate fixture damage uses the same original writer and native
+    /// container publication sequence as descriptor corruption. The closure
+    /// may leave a value's own checksum invalid while the container is rebound.
+    #[cfg(feature = "test-seams")]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: native fixture writer is called by independently authored engine unit guards under cfg(test)"
+        )
+    )]
+    pub(crate) fn with_native_ivf_fixture_write_for_test<T>(
+        &self,
+        run: impl FnOnce(&redb::WriteTransaction) -> Result<T>,
+    ) -> Result<T> {
+        let _decode = self.writer_decode_scope()?;
+        let projection = self.require_decode_original()?;
+        let original = projection.preparation_original()?;
+        let admission =
+            super::super::native_storage_admission::StorageAdmissionScope::writer_original(
+                &original,
+            )?;
+        admission.run_original_unqualified(|| {
+            self.with_db(|database| {
+                let write = Self::begin_history_write(database)?;
+                let result = run(&write)?;
+                super::super::content_identity::bind_vector_pages_root_in_write(&write)?;
+                Self::write_writer_recovery_bounds_in_write(&write, None)?;
+                write.commit().map_err(Self::storage_error)?;
+                Ok(result)
+            })
+        })
+    }
+}
