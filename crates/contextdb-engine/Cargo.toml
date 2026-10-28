@@ -878,3 +878,8 @@ required-features = ["test-seams"]
 name = "hnsw_public_engine_ports"
 path = "tests/hnsw_public_engine_ports.rs"
 required-features = ["test-seams"]
+
+[[test]]
+name = "first_saved_search_owned_worker"
+path = "tests/first_saved_search_owned_worker.rs"
+required-features = ["test-seams"]
