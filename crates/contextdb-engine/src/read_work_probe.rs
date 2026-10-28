@@ -293,6 +293,7 @@ struct CommitDirectoryFundingReceipt {
     request_child: Option<crate::vector_read_memory::DeclaredReadChildObserver>,
     image: Option<crate::read_image_memory::ImageMemoryObservation>,
     source_registration: Option<CommitDirectorySourceRegistrationFunding>,
+    vector_adapter: Option<(usize, usize, usize)>,
 }
 impl CommitDirectoryFundingReceipt {
     fn sample(&self) -> CommitDirectoryFunding {
@@ -749,6 +750,14 @@ impl ReadWorkObservationScope {
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
             .and_then(|receipt| receipt.source_registration)
+    }
+    /// Actual vector-adapter admission on the original accountant.
+    pub fn commit_directory_vector_adapter_admission(&self) -> Option<(usize, usize, usize)> {
+        self.commit_directory_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|receipt| receipt.vector_adapter)
     }
     pub fn owner_worker_paths(&self) -> Vec<GraphWorkerInstallation> {
         self.graph
@@ -1233,6 +1242,7 @@ pub(crate) fn note_commit_directory_open_funding(
                         request_child: None,
                         image: None,
                         source_registration: None,
+                        vector_adapter: None,
                     });
                 }
                 None => *receipt = None,
@@ -1274,6 +1284,28 @@ pub(crate) fn note_commit_directory_request_funding(
                 .as_mut()
         {
             receipt.request_child = crate::vector_read_memory::declared_child_observer(memory);
+        }
+    });
+}
+
+/// Record the real vector-adapter admission without retaining its payer.
+pub(crate) fn note_commit_directory_vector_adapter_admission(
+    accountant: &crate::memory_accounting::AccountantHandle,
+    before: usize,
+) {
+    ACTIVE.with(|active| {
+        if let Some(active) = active.borrow().as_ref()
+            && let Some(receipt) = active
+                .commit_directory_funding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+        {
+            receipt.vector_adapter = Some((
+                accountant.as_ptr() as usize,
+                before,
+                accountant.usage().used,
+            ));
         }
     });
 }

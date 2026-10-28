@@ -1701,7 +1701,14 @@ impl Database {
         )?;
         let _decode_scope = decode_memory.enter();
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        #[cfg(any(test, feature = "test-seams"))]
+        let vector_adapter_before = accountant.usage().used;
         let vector_accountant: contextdb_vector::MemoryBudgetOwner = accountant.vector_budget()?;
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_work_probe::note_commit_directory_vector_adapter_admission(
+            &accountant,
+            vector_adapter_before,
+        );
         let crate::persistence::ReadPersistenceImageParts {
             open_context,
             content_identity: _,
