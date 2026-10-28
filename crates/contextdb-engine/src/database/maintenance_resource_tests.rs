@@ -497,7 +497,11 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
             probe.reader_budget().unwrap().accounting_identity(),
             Arc::as_ptr(&spy) as usize
         );
-        let operation_control = probe.held();
+        let operation_control = contextdb_core::read_memory::ReadMemoryOwner::native_layout::<
+            ImageMemory,
+            (contextdb_core::read_memory::ReadCredit, ()),
+        >()
+        .size();
         drop(probe);
         let persistence = db.persistence.as_ref().unwrap();
         let before_rows = persistence.load_all_tables().unwrap();
@@ -532,7 +536,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         );
         assert_eq!(db.accountant().usage().used, writer_before);
         drop(small_child);
-        assert_eq!(small_parent.retained_bytes_for_test(), 0);
+        small_parent.assert_only_original_root_and_free_for_test();
         let report = db
             .maintenance_context()
             .run_currency(CurrencyGate::Always, spy.clone())
@@ -562,7 +566,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         );
         drop(spy);
         drop(child);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
         db.close().unwrap();
     }
     // Cancellation is observed during actual ownership audit before any
