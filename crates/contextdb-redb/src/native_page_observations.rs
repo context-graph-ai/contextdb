@@ -57,6 +57,9 @@ pub enum NativePageCustodyEventForTest {
         cache: usize,
         strong_handles: usize,
     },
+    ColdReadFailed {
+        attempt: NativeColdReadAttemptForTest,
+    },
     BeforePhysicalFree {
         backing: NativePageBackingForTest,
         payment: NativePagePaymentForTest,
@@ -222,6 +225,25 @@ impl PageObservation {
 /// Closing with live backings/payments is an incomplete capture.
 pub struct NativePageObservationForTest(Arc<Capture>);
 impl NativePageObservationForTest {
+    /// Re-enter this same capture without retaining any tested page or payer.
+    /// The prior thread scope is restored on both return and unwind.
+    pub fn run<R>(&self, run: impl FnOnce() -> R) -> R {
+        {
+            let mut ring = self.0.ring.lock().unwrap_or_else(|e| e.into_inner());
+            if ring.closed {
+                ring.closed_lost = true;
+            }
+        }
+        struct Installed(Option<Arc<Capture>>);
+        impl Drop for Installed {
+            fn drop(&mut self) {
+                CURRENT.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _installed = Installed(CURRENT.with(|slot| slot.replace(Some(self.0.clone()))));
+        run()
+    }
+
     pub fn drain(&self) {
         if self.0.draining.swap(true, Ordering::AcqRel) {
             self.0

@@ -1587,6 +1587,8 @@ impl PagedCachedFile {
             if let Err(error) = result {
                 self.file.io_failed.store(true, Ordering::Release);
                 #[cfg(feature = "test-seams")]
+                observation.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt });
+                #[cfg(feature = "test-seams")]
                 observation.after_cold_read(&attempt, Err(&error));
                 return Err(error);
             }

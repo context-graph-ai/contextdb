@@ -3303,7 +3303,7 @@
      /// Add the given value to the mapping of the key
 --- /dev/null
 +++ b/src/native_page_observations.rs
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,440 @@
 +//! Bounded test-owned observations of real native page custody.
 +//! Producers enqueue scalar facts only. Guard callbacks run during explicit
 +//! drain, after storage locks have been released. Tokens own no page or payer.
@@ -3362,6 +3362,9 @@
 +        allocation: usize,
 +        cache: usize,
 +        strong_handles: usize,
++    },
++    ColdReadFailed {
++        attempt: NativeColdReadAttemptForTest,
 +    },
 +    BeforePhysicalFree {
 +        backing: NativePageBackingForTest,
@@ -3528,6 +3531,25 @@
 +/// Closing with live backings/payments is an incomplete capture.
 +pub struct NativePageObservationForTest(Arc<Capture>);
 +impl NativePageObservationForTest {
++    /// Re-enter this same capture without retaining any tested page or payer.
++    /// The prior thread scope is restored on both return and unwind.
++    pub fn run<R>(&self, run: impl FnOnce() -> R) -> R {
++        {
++            let mut ring = self.0.ring.lock().unwrap_or_else(|e| e.into_inner());
++            if ring.closed {
++                ring.closed_lost = true;
++            }
++        }
++        struct Installed(Option<Arc<Capture>>);
++        impl Drop for Installed {
++            fn drop(&mut self) {
++                CURRENT.with(|slot| *slot.borrow_mut() = self.0.take());
++            }
++        }
++        let _installed = Installed(CURRENT.with(|slot| slot.replace(Some(self.0.clone()))));
++        run()
++    }
++
 +    pub fn drain(&self) {
 +        if self.0.draining.swap(true, Ordering::AcqRel) {
 +            self.0
@@ -19137,7 +19159,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1492,434 @@
+@@ -614,13 +1492,436 @@
  }
  
  #[cfg(test)]
@@ -19235,6 +19257,8 @@
 +                .map_err(|error| error.into_native());
 +            if let Err(error) = result {
 +                self.file.io_failed.store(true, Ordering::Release);
++                #[cfg(feature = "test-seams")]
++                observation.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt });
 +                #[cfg(feature = "test-seams")]
 +                observation.after_cold_read(&attempt, Err(&error));
 +                return Err(error);
@@ -19574,7 +19598,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1952,948 @@
+@@ -653,4 +1954,948 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }

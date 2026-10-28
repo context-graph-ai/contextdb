@@ -1,5 +1,11 @@
 # contextdb-redb maintenance
 
+The native page capture token can re-enter its original observation scope without
+retaining a page or payer; closed reuse invalidates completeness. Actual failed
+cold reads enqueue their exact backing and source receipt in that same bounded
+ring before physical release. Guards can drain after the query with the database
+still live and distinguish the failed backing from successful metadata reads.
+
 The `test-seams` native page observations in `native_page_observations.rs` use a
 bounded test-owned scalar event ring. Real page allocation, payer transfer,
 cache installation/rejection/map eviction, physical deallocation and original
