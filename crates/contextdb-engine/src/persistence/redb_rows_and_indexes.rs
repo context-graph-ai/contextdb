@@ -1901,6 +1901,8 @@ impl RedbPersistence {
             lsn: Lsn,
             created_at: Option<contextdb_core::Wallclock>,
         }
+        #[cfg(feature = "test-seams")]
+        let _family = contextdb_core::family_loads::enter(contextdb_core::family_loads::Family::RowProjection);
         let scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let (row, _): (RowWire, usize) =
             crate::read_image_memory::decode_exact_buffers(&scope, bytes)?;

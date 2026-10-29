@@ -1483,14 +1483,18 @@ pub(crate) fn select_live_fallback(
         };
         let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
         let mut window = copies.scratch();
-        window.reserve(
-            key.value()
-                .len()
-                .checked_add(value.value().len())
-                .and_then(|n| n.checked_mul(8))
-                .and_then(|n| n.checked_add(std::mem::size_of::<SelectedVectorMembership>()))
-                .ok_or_else(|| damage("live vector membership window overflow"))?,
-        )?;
+        let membership_bytes = key.value()
+            .len()
+            .checked_add(value.value().len())
+            .and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_add(std::mem::size_of::<SelectedVectorMembership>()))
+            .ok_or_else(|| damage("live vector membership window overflow"))?;
+        window.reserve(membership_bytes)?;
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded(
+            contextdb_core::family_loads::Family::VectorMembership,
+            membership_bytes,
+        );
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
                 .map_err(damage)?;
@@ -1499,12 +1503,16 @@ pub(crate) fn select_live_fallback(
             payload,
         )
         .map_err(damage)?;
-        window.reserve(
-            vector_partition_route_native_capacity(payload)
-                .map_err(damage)?
-                .checked_mul(6)
-                .ok_or_else(|| damage("vector route clone capacity overflow"))?,
-        )?;
+        let route_bytes = vector_partition_route_native_capacity(payload)
+            .map_err(damage)?
+            .checked_mul(6)
+            .ok_or_else(|| damage("vector route clone capacity overflow"))?;
+        window.reserve(route_bytes)?;
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded(
+            contextdb_core::family_loads::Family::VectorMembership,
+            route_bytes,
+        );
         let record: VectorPartitionMembershipRecord =
             decode_vector_partition_record_payload_checked(
                 VectorPartitionRecordKind::Membership,

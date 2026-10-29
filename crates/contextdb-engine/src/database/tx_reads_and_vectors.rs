@@ -1028,6 +1028,11 @@ impl Database {
             "insert_edge",
             "Reduce edge fan-out or raise MEMORY_LIMIT before inserting more graph edges.",
         )?;
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded(
+            contextdb_core::family_loads::Family::GraphEdge,
+            bytes,
+        );
 
         let staged = if replace_pending {
             self.graph

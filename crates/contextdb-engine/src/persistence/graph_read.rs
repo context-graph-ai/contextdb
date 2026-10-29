@@ -457,7 +457,13 @@ fn credit(
 ) -> Result<ReadCredit> {
     let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
-    ReadCredit::try_new(memory, bytes, "graph_source", "read_window", HINT)
+    let credit = ReadCredit::try_new(memory, bytes, "graph_source", "read_window", HINT)?;
+    #[cfg(feature = "test-seams")]
+    contextdb_core::family_loads::loaded(
+        contextdb_core::family_loads::Family::GraphEdge,
+        bytes,
+    );
+    Ok(credit)
 }
 /// Admission for any stored page a persistence read faults in, graph or not.
 /// It names the budget that funds the read, not a graph window.

@@ -2991,6 +2991,11 @@ impl WriterSnapshot {
         let erasure = self.erasure.read();
         erasure.check_scope(Some(table), "sync provenance")?;
         let key = owner.endpoint(&[table.as_bytes(), &row_id.0.to_be_bytes()], "sync_point")?;
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded(
+            contextdb_core::family_loads::Family::SyncProvenance,
+            key.key.len(),
+        );
         let lsns = match read.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -3230,7 +3235,13 @@ impl WriterReadCursor {
             before,
             |key, value| {
                 let encoded = decode_window_exact::<EncodedRelationalIndexPosition>(key)?;
-                crate::read_image_memory::reserve(key.len().saturating_mul(2))?;
+                let posting_bytes = key.len().saturating_mul(2);
+                crate::read_image_memory::reserve(posting_bytes)?;
+                #[cfg(feature = "test-seams")]
+                contextdb_core::family_loads::loaded(
+                    contextdb_core::family_loads::Family::IndexPosting,
+                    posting_bytes,
+                );
                 if RedbPersistence::encode(&encoded)? != key {
                     return Err(Error::StoreCorrupted {
                         path: "relational index".into(),

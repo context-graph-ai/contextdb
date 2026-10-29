@@ -552,6 +552,16 @@ pub fn retained_row_side_map_bytes(table: &str) -> usize {
         .saturating_add(table.len().saturating_mul(2))
 }
 
+/// Test-only decomposition of the existing row-side-map charge.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn row_side_map_family_bytes_for_test(table: &str) -> (usize, usize, usize) {
+    let provenance = 36 + 36;
+    let positions = ROW_SIDE_MAP_BYTES.saturating_sub(provenance)
+        .saturating_add(table.len().saturating_mul(2));
+    (ROW_VERSION_SLOT_BYTES, positions, provenance)
+}
+
 /// What holds ONE index posting besides the clone of its key: the map slot it
 /// is filed in and the posting list under it.
 ///

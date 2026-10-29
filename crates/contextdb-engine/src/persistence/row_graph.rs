@@ -149,6 +149,8 @@ pub(super) fn encode_row_graph(owned: &OwnedAdjEntry) -> Result<Vec<u8>> {
     bincode::serde::encode_into_std_write(owned, &mut size, bincode::config::standard())
         .map_err(|e| Error::Other((e.to_string()).into()))?;
     crate::read_image_memory::reserve(size.0)?;
+    #[cfg(feature = "test-seams")]
+    contextdb_core::family_loads::loaded(contextdb_core::family_loads::Family::GraphEdge, size.0);
     let mut bytes = Vec::with_capacity(size.0);
     bincode::serde::encode_into_std_write(owned, &mut bytes, bincode::config::standard())
         .map_err(|e| Error::Other((e.to_string()).into()))?;

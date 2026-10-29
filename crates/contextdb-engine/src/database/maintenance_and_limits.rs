@@ -5317,6 +5317,24 @@ impl Database {
             "Open the database with a larger MEMORY_LIMIT or prune retained rows first.",
         )?;
         charged.1 = charged.1.saturating_add(row_bytes);
+        #[cfg(feature = "test-seams")]
+        {
+            use contextdb_core::family_loads::{loaded, Family};
+            for (table, rows) in self.relational_store.tables.read().iter() {
+                if let Some(meta) = self.table_meta(table) {
+                    for row in rows.iter().filter(|row| row.deleted_tx.is_none() || self.relational_store.is_retention_expired(table, row.row_id, row.created_tx)) {
+                        let projection = estimate_row_bytes_for_meta(&row.values, &meta, false)
+                            .saturating_mul(ROW_VALUE_RETENTIONS)
+                            .saturating_add(f32_projection_payload_bytes(&row.values, &meta));
+                        let (slot, positions, provenance) = contextdb_core::row_side_map_family_bytes_for_test(table);
+                        loaded(Family::RowProjection, projection.saturating_add(slot));
+                        loaded(Family::RowPosition, positions);
+                        loaded(Family::SyncProvenance, provenance);
+                        loaded(Family::IndexPosting, contextdb_core::retained_index_posting_bytes_for_meta(&row.values, &meta));
+                    }
+                }
+            }
+        }
 
         let edge_bytes = self
             .graph_store
@@ -5334,6 +5352,11 @@ impl Database {
             "Open the database with a larger MEMORY_LIMIT or reduce graph edge volume.",
         )?;
         charged.1 = charged.1.saturating_add(edge_bytes);
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded(
+            contextdb_core::family_loads::Family::GraphEdge,
+            edge_bytes,
+        );
 
         // The vector store attaches the exact open-time reservations to the
         // directory/raw objects that own them. A later DROP or eviction can
@@ -5394,6 +5417,15 @@ impl Database {
             operation,
             hint,
         )?;
+        #[cfg(feature = "test-seams")]
+        {
+            use contextdb_core::family_loads::{loaded, Family};
+            let (slot, positions, provenance) = contextdb_core::row_side_map_family_bytes_for_test(table);
+            loaded(Family::RowProjection, estimate_row_bytes_for_meta(values, meta, false).saturating_mul(ROW_VALUE_RETENTIONS).saturating_add(slot));
+            loaded(Family::RowPosition, positions);
+            loaded(Family::SyncProvenance, provenance);
+            loaded(Family::IndexPosting, contextdb_core::retained_index_posting_bytes_for_meta(values, meta));
+        }
         let mut admitted = non_vector_bytes;
         for (column, projection_bytes) in f32_projection_payload_bytes_by_column(values, meta) {
             if let Err(err) = (|| {
@@ -5416,6 +5448,11 @@ impl Database {
                 self.finalization.accountant.release(admitted);
                 return Err(err);
             }
+            #[cfg(feature = "test-seams")]
+            contextdb_core::family_loads::loaded(
+                contextdb_core::family_loads::Family::RowProjection,
+                projection_bytes,
+            );
             admitted = admitted.saturating_add(projection_bytes);
         }
         debug_assert_eq!(
@@ -5450,6 +5487,15 @@ impl Database {
                 operation,
                 hint,
             )?;
+            #[cfg(feature = "test-seams")]
+            {
+                use contextdb_core::family_loads::{loaded, Family};
+                let (slot, positions, provenance) = contextdb_core::row_side_map_family_bytes_for_test(table);
+            loaded(Family::RowProjection, estimate_row_bytes_for_meta(values, meta, false).saturating_mul(ROW_VALUE_RETENTIONS).saturating_add(slot));
+            loaded(Family::RowPosition, positions);
+            loaded(Family::SyncProvenance, provenance);
+                loaded(Family::IndexPosting, contextdb_core::retained_index_posting_bytes_for_meta(values, meta));
+            }
             for (column, bytes) in f32_projection_payload_bytes_by_column(values, meta) {
                 crate::memory_accounting::grow_preparation_with_operation_label(
                     &mut admission,
@@ -5458,6 +5504,11 @@ impl Database {
                     format_args!("vector_insert@{table}.{column}"),
                     "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
                 )?;
+                #[cfg(feature = "test-seams")]
+                contextdb_core::family_loads::loaded(
+                    contextdb_core::family_loads::Family::RowProjection,
+                    bytes,
+                );
             }
             return Ok(admission);
         }

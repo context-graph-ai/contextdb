@@ -1,3 +1,6 @@
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod family_loads;
 pub mod companion;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]

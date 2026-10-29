@@ -3136,7 +3136,7 @@ impl WriterStagedPostingAdmission {
 }
 impl contextdb_relational::mem::StagedPostingAdmission for WriterStagedPostingAdmission {
     fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
-        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+        let charge = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
             self.accountant
                 .as_ref()
                 .expect("live provider has its funder")
@@ -3145,8 +3145,13 @@ impl contextdb_relational::mem::StagedPostingAdmission for WriterStagedPostingAd
             "relational",
             "staged_index_posting",
             "Reduce staged rows or raise MEMORY_LIMIT.",
-        )?
-        .into_admitted_arc()
+        )?;
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded(
+            contextdb_core::family_loads::Family::IndexPosting,
+            bytes,
+        );
+        charge.into_admitted_arc()
         .map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
     }
 }

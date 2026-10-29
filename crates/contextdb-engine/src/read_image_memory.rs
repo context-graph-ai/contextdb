@@ -2152,7 +2152,10 @@ pub(crate) fn current_reader_budget() -> Option<ReadMemoryOwner> {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(crate) fn reserve(bytes: usize) -> Result<()> {
-    active_owner()?.reserve(bytes)
+    active_owner()?.reserve(bytes)?;
+    #[cfg(feature = "test-seams")]
+    contextdb_core::family_loads::loaded_scoped(bytes);
+    Ok(())
 }
 
 /// Admit a decoded value the caller keeps. A caller that already admitted
@@ -2167,7 +2170,10 @@ pub(crate) fn reserve_output(bytes: usize) -> Result<()> {
     if adopt_candidate_decode(&owner, bytes) || owner.adopt_prepaid_output(bytes) {
         return Ok(());
     }
-    owner.reserve(bytes)
+    owner.reserve(bytes)?;
+    #[cfg(feature = "test-seams")]
+    contextdb_core::family_loads::loaded_scoped(bytes);
+    Ok(())
 }
 
 fn admit_output<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
@@ -2472,7 +2478,10 @@ fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
         let native = unsafe { native.as_ref() };
         // A refusal is kept by value in the accountant; the codec only needs
         // to stop, and an empty message allocates nothing.
-        return native.admit(bytes).map_err(|()| E::custom(NoMessage));
+        native.admit(bytes).map_err(|()| E::custom(NoMessage))?;
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded_scoped(bytes);
+        return Ok(());
     }
     let owner = active_owner().map_err(E::custom)?;
     if owner.failed() {
@@ -2482,6 +2491,8 @@ fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
         owner.keep_refusal(error);
         return Err(E::custom("read image admission refused"));
     }
+    #[cfg(feature = "test-seams")]
+    contextdb_core::family_loads::loaded_scoped(bytes);
     Ok(())
 }
 #[expect(

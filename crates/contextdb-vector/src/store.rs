@@ -2159,6 +2159,23 @@ fn with_copy_admission<T>(
     }
 }
 
+#[cfg(not(feature = "test-seams"))]
+use self::with_copy_admission as with_membership_copy_admission;
+
+#[cfg(feature = "test-seams")]
+#[expect(
+    clippy::result_large_err,
+    reason = "The source preserves its typed memory refusal."
+)]
+fn with_membership_copy_admission<T>(
+    owner: &mut VectorCopyAdmission,
+    action: impl FnOnce(&mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<T>,
+) -> Result<T> {
+    #[cfg(feature = "test-seams")]
+    let _family = contextdb_core::family_loads::enter(contextdb_core::family_loads::Family::VectorMembership);
+    with_copy_admission(owner, action)
+}
+
 /// Reader-funded control for ephemeral sources. The raw Arc never escapes:
 /// every clone must free its control allocation before its final admission drops.
 #[doc(hidden)]
@@ -2295,7 +2312,14 @@ impl OwnedVectorEntries<'_> {
             let scratch = self.scratch.as_mut().unwrap();
             let next = cursor.next_with_body_identity(&mut |request| match request {
                 DormantVectorLoadRequest::Reserve(bytes) => match scratch.reserve(bytes) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        #[cfg(feature = "test-seams")]
+                        contextdb_core::family_loads::loaded(
+                            contextdb_core::family_loads::Family::VectorMembership,
+                            bytes,
+                        );
+                        true
+                    },
                     Err(error) => {
                         refusal = Some(error);
                         false
@@ -4450,9 +4474,9 @@ impl IndexState {
         }
         let mut scratch = owner.scratch();
         let mut scan = || -> Result<bool> {
-            let mut cursor = with_copy_admission(&mut scratch, |request| source.open(request))?;
+            let mut cursor = with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
             while let Some(entry) =
-                with_copy_admission(&mut scratch, |request| cursor.next(request))?
+                with_membership_copy_admission(&mut scratch, |request| cursor.next(request))?
             {
                 *streamed_records += 1;
                 if snapshots.iter().any(|snapshot| {
@@ -4644,8 +4668,8 @@ impl IndexState {
             Error::Other("durable vector partition lost its membership source".into())
         })?;
         let mut scratch = owner.scratch();
-        let mut cursor = with_copy_admission(&mut scratch, |request| source.open(request))?;
-        while let Some(entry) = with_copy_admission(&mut scratch, |request| cursor.next(request))? {
+        let mut cursor = with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
+        while let Some(entry) = with_membership_copy_admission(&mut scratch, |request| cursor.next(request))? {
             visit(&entry)?;
         }
         Ok(())
@@ -4675,9 +4699,9 @@ impl IndexState {
         let mut selected = Vec::new();
         let mut directory_scratch = copy_owner.scratch();
         let mut cursor =
-            with_copy_admission(&mut directory_scratch, |request| source.open(request))?;
+            with_membership_copy_admission(&mut directory_scratch, |request| source.open(request))?;
         while let Some(interval) =
-            with_copy_admission(&mut directory_scratch, |request| cursor.next(request))?
+            with_membership_copy_admission(&mut directory_scratch, |request| cursor.next(request))?
         {
             if select(&interval) {
                 owner(self.generation_copy_bytes(index, selected.len() + 1))?;
@@ -5993,7 +6017,14 @@ impl IndexState {
                 }
                 let result = match request {
                     DormantVectorLoadRequest::Reserve(bytes) => match reserved.checked_add(bytes) {
-                        Some(total) => before_retain(bytes).map(|()| reserved = total),
+                        Some(total) => before_retain(bytes).map(|()| {
+                            #[cfg(feature = "test-seams")]
+                            contextdb_core::family_loads::loaded(
+                                contextdb_core::family_loads::Family::VectorMembership,
+                                bytes,
+                            );
+                            reserved = total
+                        }),
                         None => Err(E::from(Error::Other(
                             "membership window charge overflow".into(),
                         ))),
@@ -6022,7 +6053,14 @@ impl IndexState {
                         let result = match request {
                             DormantVectorLoadRequest::Reserve(bytes) => {
                                 match reserved.checked_add(bytes) {
-                                    Some(total) => before_retain(bytes).map(|()| reserved = total),
+                                    Some(total) => before_retain(bytes).map(|()| {
+                                        #[cfg(feature = "test-seams")]
+                                        contextdb_core::family_loads::loaded(
+                                            contextdb_core::family_loads::Family::VectorMembership,
+                                            bytes,
+                                        );
+                                        reserved = total
+                                    }),
                                     None => Err(E::from(Error::Other(
                                         "membership window charge overflow".into(),
                                     ))),
@@ -6317,7 +6355,14 @@ impl IndexState {
             let mut refusal = None;
             let opened = source.open(&mut |request| match request {
                 DormantVectorLoadRequest::Reserve(bytes) => match scratch.reserve(bytes) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        #[cfg(feature = "test-seams")]
+                        contextdb_core::family_loads::loaded(
+                            contextdb_core::family_loads::Family::VectorMembership,
+                            bytes,
+                        );
+                        true
+                    },
                     Err(error) => {
                         refusal = Some(error);
                         false
@@ -10163,10 +10208,10 @@ impl IndexState {
         let sample_lsn = match self.durable_membership_source() {
             Some(source) => {
                 let mut scratch = VectorCopyAdmission::new(accountant.clone());
-                let mut cursor = with_copy_admission(&mut scratch, |request| source.open(request))?;
+                let mut cursor = with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
                 let mut sample_lsn = Lsn(0);
                 while let Some(entry) =
-                    with_copy_admission(&mut scratch, |request| cursor.next(request))?
+                    with_membership_copy_admission(&mut scratch, |request| cursor.next(request))?
                 {
                     if entry.created_tx <= sample_tx {
                         sample_lsn = sample_lsn.max(entry.lsn);
@@ -26148,6 +26193,15 @@ impl VectorStore {
                     let growth = bytes.saturating_sub(charge.bytes);
                     if growth != 0 {
                         loaded_directories.reserve_index(index.clone(), charge.accountant.clone(), growth)?;
+                        #[cfg(feature = "test-seams")]
+                        if charge.bytes == 0 {
+                            let membership = column.directory_ownership(index).total()
+                                .saturating_sub(column.directory_fixed_bytes(index));
+                            contextdb_core::family_loads::loaded(
+                                contextdb_core::family_loads::Family::VectorMembership,
+                                membership,
+                            );
+                        }
                     } else {
                         loaded_directories.index_charges.lock().insert(index.clone(), PaidRetainedMemoryCharge::new(0, charge.accountant.clone()));
                     }
