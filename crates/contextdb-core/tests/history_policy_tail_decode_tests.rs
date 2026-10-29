@@ -48,6 +48,12 @@ fn sample_columns() -> Vec<ColumnDef> {
         consolidation_change_percent: None,
         consolidation_tombstone_percent: None,
         consolidation_disabled: false,
+        search_target_accuracy_hundredths: None,
+        search_expected_vectors: None,
+        ivf_lists: None,
+        ivf_probes: None,
+        ivf_refine_factor_hundredths: None,
+        vector_engine_policy: Default::default(),
     }]
 }
 
