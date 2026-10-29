@@ -89,3 +89,6 @@ mod concurrent_publication;
 
 #[path = "clustered_vector_index/live_route.rs"]
 mod live_route;
+
+#[path = "clustered_vector_index/native_copy_auth.rs"]
+mod native_copy_auth;
