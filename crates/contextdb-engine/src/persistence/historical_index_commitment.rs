@@ -840,12 +840,17 @@ impl CommitmentBatch {
                 (Side::Postings, &touched.postings),
                 (Side::Versions, &touched.versions),
             ] {
-                states
-                    .insert(
-                        state_key(table, index, side).as_slice(),
-                        state.encode().as_slice(),
-                    )
-                    .map_err(RedbPersistence::storage_error)?;
+                let key = state_key(table, index, side);
+                let encoded = state.encode();
+                let unchanged = states
+                    .get(key.as_slice())
+                    .map_err(RedbPersistence::storage_error)?
+                    .is_some_and(|previous| previous.value() == encoded.as_slice());
+                if !unchanged {
+                    states
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(RedbPersistence::storage_error)?;
+                }
             }
             mutations.push(publication(
                 table,
