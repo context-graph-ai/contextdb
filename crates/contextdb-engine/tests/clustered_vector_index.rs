@@ -40,6 +40,8 @@ mod exact_and_indexed_work;
 mod graph_option_refusal;
 #[path = "clustered_vector_index/index_corruption.rs"]
 mod index_corruption;
+#[path = "clustered_vector_index/native_candidate_port.rs"]
+mod native_candidate_port;
 #[path = "clustered_vector_index/non_finite_vectors.rs"]
 mod non_finite_vectors;
 #[path = "clustered_vector_index/objective_change.rs"]
@@ -69,8 +71,6 @@ mod write_buffer;
 
 #[path = "clustered_vector_index/engine_stage.rs"]
 mod engine_stage;
-#[path = "clustered_vector_index/native_candidate_port.rs"]
-mod native_candidate_port;
 
 #[path = "clustered_vector_index/native_seal.rs"]
 mod native_seal;
