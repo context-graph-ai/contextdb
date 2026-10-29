@@ -86,3 +86,6 @@ mod reader_turnover_cleanup;
 
 #[path = "clustered_vector_index/concurrent_publication.rs"]
 mod concurrent_publication;
+
+#[path = "clustered_vector_index/live_route.rs"]
+mod live_route;
