@@ -6013,7 +6013,10 @@ impl ConnectionInbox {
                 if remaining != 0 {
                     state = self
                         .arrived
-                        .wait_timeout(state, std::time::Duration::from_millis(remaining))
+                        .wait_timeout(
+                            state,
+                            crate::local_transport::deadlines::deadline_wait_duration_ms(remaining),
+                        )
                         .expect("owner connection inbox deadline wait")
                         .0;
                 }
