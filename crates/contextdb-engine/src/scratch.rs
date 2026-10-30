@@ -52,8 +52,9 @@ impl ScratchDirectory {
                 Err(error) => return Err(error),
             }
             // A concurrent sweep may take a directory between its creation and
-            // its lock. The sweep holds the lock while it removes the
-            // directory, so a failed open or lock here means start over.
+            // its lock. `open_and_lock` proves it locked the live directory's
+            // lock file, so a directory a sweep removed makes it fail and this
+            // loop start over with a new name.
             match open_and_lock(&path) {
                 Ok(lock) => {
                     return Ok(Self {
@@ -81,16 +82,77 @@ impl Drop for ScratchDirectory {
     }
 }
 
+/// Open the lock file of `directory` and take its exclusive lock.
+///
+/// Opening and locking are two steps. Another process (or thread) can lock the
+/// same file in between, remove the directory while it holds that lock, and
+/// close it; the lock taken afterwards then succeeds on a file nobody can reach
+/// any more. So after the lock is held, the locked descriptor must still be the
+/// file the directory's lock path names. If it is not, the lock is dropped and
+/// the caller starts over.
 fn open_and_lock(directory: &Path) -> io::Result<File> {
+    let lock_path = directory.join(LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(directory.join(LOCK_FILE))?;
+        .open(&lock_path)?;
+    #[cfg(test)]
+    test_support::run_between_open_and_lock_hook();
     file.try_lock_exclusive()?;
+    if !locks_the_live_file(&file, &lock_path)? {
+        // Dropping `file` releases the lock.
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the scratch directory was removed while its lock was taken",
+        ));
+    }
     Ok(file)
 }
 
+/// Whether `locked` is the file `path` names right now: the same device and
+/// inode, so the directory still exists and holds this very lock file. A path
+/// that names nothing is an error of its own kind (`NotFound`), which callers
+/// treat the same way: the directory is gone.
+#[cfg(unix)]
+fn locks_the_live_file(locked: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = locked.metadata()?;
+    let named = std::fs::metadata(path)?;
+    Ok(held.dev() == named.dev() && held.ino() == named.ino())
+}
+
+/// A file that is open cannot be unlinked on this platform, so a lock file
+/// that still exists at its path is the file that was locked.
+#[cfg(not(unix))]
+fn locks_the_live_file(_locked: &File, path: &Path) -> io::Result<bool> {
+    std::fs::metadata(path).map(|_| true)
+}
+
+/// Remove a scratch directory whose lock the caller holds. The lock file goes
+/// last and the directory is removed without recursion: a creator that opens
+/// the lock path after it is gone makes a new file there, which makes the
+/// final removal fail and leaves that creator's directory alone.
+fn remove_locked_directory(path: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name() == LOCK_FILE {
+            continue;
+        }
+        let member = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&member)?;
+        } else {
+            std::fs::remove_file(&member)?;
+        }
+    }
+    match std::fs::remove_file(path.join(LOCK_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::remove_dir(path)
+}
 /// Remove every directory under `root` whose lock can be taken: its owner is
 /// gone. Returns how many directories were removed.
 pub(crate) fn sweep_abandoned(root: &Path) -> usize {
@@ -105,11 +167,13 @@ pub(crate) fn sweep_abandoned(root: &Path) -> usize {
         }
         // Taking the lock proves no owner holds this directory. A creator that
         // has made the directory but not yet locked it loses the race cleanly:
-        // its own lock attempt fails and it starts over with a new name.
+        // either its own lock attempt fails, or it locks a file this sweep
+        // removed and its live-file check fails. Both make it start over with
+        // a new name.
         let Ok(lock) = open_and_lock(&path) else {
             continue;
         };
-        if std::fs::remove_dir_all(&path).is_ok() {
+        if remove_locked_directory(&path).is_ok() {
             removed += 1;
         }
         drop(lock);
@@ -291,14 +355,6 @@ pub(crate) fn release(database_file: &Path) {
     drop(directory);
 }
 
-/// Whether the database at `database_file` is a scratch database.
-pub(crate) fn owns(database_file: &Path) -> bool {
-    owned_by_database()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(database_file)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +389,38 @@ mod tests {
         assert!(!abandoned.exists());
         assert!(!unlocked.exists());
         assert!(live.path().is_dir(), "a live owner's directory survives");
+    }
+
+    #[test]
+    fn a_sweep_between_the_open_and_the_lock_makes_the_creator_start_over() {
+        let root = tempfile::tempdir().unwrap();
+        let swept = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hook_root = root.path().to_path_buf();
+        let hook_swept = std::rc::Rc::clone(&swept);
+        // The creator has opened its lock file and not yet locked it: a sweep
+        // locks the same file, unlinks the directory and closes. The creator's
+        // lock then succeeds on a file nobody can reach.
+        test_support::on_next_open_before_lock(Box::new(move || {
+            hook_swept.set(sweep_abandoned(&hook_root));
+        }));
+        let directory = ScratchDirectory::create_in(root.path()).unwrap();
+        assert_eq!(
+            swept.get(),
+            1,
+            "the sweep removed the creator's first directory"
+        );
+        assert!(
+            directory.path().is_dir(),
+            "the creator returned a directory that no longer exists: {}",
+            directory.path().display()
+        );
+        assert!(directory.path().join(LOCK_FILE).is_file());
+        assert!(
+            open_and_lock(directory.path()).is_err(),
+            "the returned directory's lock is held by its creator"
+        );
+        let entries = std::fs::read_dir(root.path()).unwrap().count();
+        assert_eq!(entries, 1, "only the creator's live directory remains");
     }
 
     #[test]
@@ -414,6 +502,26 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BETWEEN_OPEN_AND_LOCK: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once, on this thread, at the next `open_and_lock` between its
+    /// open and its lock. The hook is taken out before it runs, so locks it
+    /// takes itself (a sweep) do not run it again.
+    pub(crate) fn on_next_open_before_lock(hook: Box<dyn FnOnce()>) {
+        BETWEEN_OPEN_AND_LOCK.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+
+    pub(super) fn run_between_open_and_lock_hook() {
+        let hook = BETWEEN_OPEN_AND_LOCK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 
     /// Run `body` on this thread and return the lines it logged at warn level.
     pub(crate) fn captured_warnings(body: impl FnOnce()) -> Vec<String> {
