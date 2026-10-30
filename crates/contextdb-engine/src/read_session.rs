@@ -799,7 +799,7 @@ impl Drop for RouteSelectionClockGuard {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-fn with_route_selection_clock_for_test<T>(
+pub(crate) fn with_route_selection_clock_for_test<T>(
     clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
     run: impl FnOnce() -> T,
 ) -> T {

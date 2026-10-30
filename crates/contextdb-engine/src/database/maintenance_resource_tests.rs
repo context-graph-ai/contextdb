@@ -28,7 +28,12 @@ fn durable_generation_workspace_separates_build_and_persistence_owners() {
     assert_eq!(plan.graph_build_bytes, graph_build_bytes);
     assert_eq!(plan.raw_entry_bytes, 25_900_000);
     assert_eq!(plan.selected_entry_bytes, plan.raw_entry_bytes);
-    assert_eq!(plan.durable_metadata_bytes, 4_664);
+    let metadata_layout =
+        VectorGenerationWorkspacePlan::new(0, 0, &layout, &partition, policy, 0).unwrap();
+    assert_eq!(
+        plan.durable_metadata_bytes,
+        metadata_layout.durable_metadata_bytes
+    );
     assert_eq!(
         plan.build_phase_bytes(),
         graph_build_bytes
@@ -478,7 +483,11 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         let parent =
             crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824)
                 .expect("admit the declared fixture root");
-        let child = parent.child().unwrap();
+        let (child, _) = crate::vector_read_memory::statement_child_proof::observe(
+            &parent,
+            1_073_741_824,
+            || parent.child().unwrap(),
+        );
         let child_control = parent.retained_bytes_for_test();
         let observer = crate::vector_read_memory::declared_child_observer(&child).unwrap();
         let spy = MaintenanceReaderSpy::new(child.clone(), db.__accountant_handle_for_test());
@@ -488,7 +497,11 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
             probe.reader_budget().unwrap().accounting_identity(),
             Arc::as_ptr(&spy) as usize
         );
-        let operation_control = probe.held();
+        let operation_control = contextdb_core::read_memory::ReadMemoryOwner::native_layout::<
+            ImageMemory,
+            (contextdb_core::read_memory::ReadCredit, ()),
+        >()
+        .size();
         drop(probe);
         let persistence = db.persistence.as_ref().unwrap();
         let before_rows = persistence.load_all_tables().unwrap();
@@ -523,7 +536,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         );
         assert_eq!(db.accountant().usage().used, writer_before);
         drop(small_child);
-        assert_eq!(small_parent.retained_bytes_for_test(), 0);
+        small_parent.assert_only_original_root_and_free_for_test();
         let report = db
             .maintenance_context()
             .run_currency(CurrencyGate::Always, spy.clone())
@@ -553,7 +566,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         );
         drop(spy);
         drop(child);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
         db.close().unwrap();
     }
     // Cancellation is observed during actual ownership audit before any

@@ -9015,6 +9015,9 @@ impl ProofFixtureDatabase {
             .open(path)?;
         let owner = super::writer_file::LockedWriterFile::lock(file, path.parent())?;
         let database = redb::Database::builder().create_with_backend(owner.view())?;
+        let write = database.begin_write()?;
+        super::erasure_frontiers::initialize(&write)?;
+        write.commit()?;
         Ok(Self { database, owner })
     }
 

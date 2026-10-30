@@ -575,6 +575,32 @@ fn run_budget_gates() -> BudgetReport {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        for n in WRITE_VOLUME_N {
+            c.bench_function(
+                &format!("commit_write_volume_scaling/write_volume/{n}"),
+                |_| {},
+            );
+        }
+        for n in WRITE_VOLUME_N {
+            c.bench_function(&format!("commit_write_volume_scaling/upsert/{n}"), |_| {});
+        }
+        for rows in [HISTORY_SMALL, HISTORY_LARGE] {
+            c.bench_function(
+                &format!("commit_write_volume_scaling/history/{rows}"),
+                |_| {},
+            );
+        }
+        c.bench_function(
+            "commit_write_volume_scaling/trigger/trigger_staged_n_100",
+            |_| {},
+        );
+        c.bench_function(
+            "commit_write_volume_scaling/file_backed/file_backed_n_100",
+            |_| {},
+        );
+        return;
+    }
     let budget = run_budget_gates();
     black_box(&budget);
 

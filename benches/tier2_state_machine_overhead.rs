@@ -234,6 +234,13 @@ fn assert_report(report: &StateReport) {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "tier2_state_machine_overhead/100k_seeded_1k_mixed_state_machine_updates",
+            |_| {},
+        );
+        return;
+    }
     let (db, ids, strict_id) = setup_seeded_db();
     pre_gate_state_machine_semantics(&db, strict_id);
     let mut cursor = StateCursor {

@@ -407,6 +407,20 @@ pub struct BoundedByteCursor<'a> {
 }
 
 impl<'a> BoundedByteCursor<'a> {
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn navigation_memory_ownership_for_test(&self) -> (usize, usize, bool, bool) {
+        let bytes = std::alloc::Layout::array::<(PageImpl, usize)>(self.branches.capacity())
+            .expect("the live navigation backing has a valid layout")
+            .size();
+        (
+            self.branches.len(),
+            bytes,
+            self.navigation_invoice.is_some(),
+            self.leaf.is_some(),
+        )
+    }
+
     fn new(tree: &Btree<&'static [u8], &'static [u8]>) -> Self {
         Self {
             mem: tree.mem.clone(),

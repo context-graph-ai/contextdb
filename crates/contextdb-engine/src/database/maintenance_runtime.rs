@@ -771,7 +771,9 @@ impl MaintenanceContext {
         };
         let stream = self.maintenance_catalog_stream()?;
         #[cfg(test)]
-        vector_journal_cleanup_cancellation_tests::after_inventory_capture_for_test();
+        vector_journal_cleanup_cancellation_tests::after_inventory_capture_for_test(
+            stream.lazy_cursor_memory_ownership_for_test(),
+        );
         self.build_checkpoint()?;
         let mut outcome = VectorJournalCleanupRetryOutcome {
             first_failure_details: None,

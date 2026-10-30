@@ -1334,6 +1334,65 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         );
         control.bytes
     }
+    fn request_for(pointer: usize, requests: &[(usize, usize, usize)]) -> (usize, usize, usize) {
+        let mut matches = requests.iter().copied().filter(|request| {
+            request.0 <= pointer
+                && request
+                    .0
+                    .checked_add(request.1)
+                    .is_some_and(|end| pointer < end)
+        });
+        let request = matches
+            .next()
+            .expect("live answer allocation was physically observed");
+        assert!(
+            matches.next().is_none(),
+            "one physical backing for this live answer component"
+        );
+        request
+    }
+    fn live_requests(
+        answer: &QueryResult,
+        requests: &[(usize, usize, usize)],
+    ) -> Vec<(usize, usize, usize)> {
+        let (pointer, _, images) = answer.live_answer_allocations_for_test();
+        let mut retained = vec![request_for(pointer, requests)];
+        for image in images {
+            if image != 0 {
+                let request = request_for(image, requests);
+                if !retained.contains(&request) {
+                    retained.push(request);
+                }
+            }
+        }
+        retained
+    }
+    fn live_bytes(answer: &QueryResult) -> usize {
+        answer
+            .live_answer_allocations_for_test()
+            .1
+            .into_iter()
+            .try_fold(0usize, usize::checked_add)
+            .unwrap()
+    }
+    fn assert_physically_freed(requests: &[(usize, usize, usize)]) {
+        let observed = oracle::source_free_for_test(requests.len());
+        for (request, free) in requests.iter().zip(observed.iter()) {
+            assert_eq!(
+                free.2, 1,
+                "the original answer backing physically frees once"
+            );
+            assert_eq!(
+                free.0, free.1,
+                "physical free precedes its original invoice refund"
+            );
+            assert!(
+                free.0 >= request.1,
+                "the actual backing is still paid at physical free"
+            );
+        }
+        oracle::disarm_source_free_watch();
+    }
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("public-answer-credit.redb");
@@ -1415,6 +1474,29 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
             baseline,
             "probe releases its exact reservation"
         );
+    };
+    let parent_counter = db.declared_read_memory.ordinary_parent_counter_for_test();
+    let assert_parent_with_live_answers = |answer_bytes: usize, control_bytes: usize| {
+        let expected = baseline
+            .checked_add(answer_bytes.checked_add(control_bytes).unwrap() as u64)
+            .unwrap();
+        let used = db.declared_read_memory.retained_bytes_for_test();
+        assert_eq!(
+            used, expected,
+            "only named live answers, their controls and the standing parent remain"
+        );
+        let available = limit.checked_sub(expected).unwrap();
+        let credit = ReadCredit::try_new(
+            db.declared_read_memory.original_owner(),
+            available as usize,
+            "reader",
+            "test_available_declared_capacity",
+            "all transient operation credit must be released",
+        )
+        .unwrap();
+        assert_eq!(db.declared_read_memory.retained_bytes_for_test(), limit);
+        drop(credit);
+        assert_eq!(db.declared_read_memory.retained_bytes_for_test(), expected);
     };
     assert_parent_baseline();
     // Calibrate against the actual production bridge with zero prepaid payload.
@@ -1529,24 +1611,44 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         owner.used.load(Ordering::SeqCst) > 0,
         "internal lifetime retains executing reader credit"
     );
-    let converted = owned
-        .into_public()
-        .expect("publish the admitted fixture answer");
+    let (converted, converted_requests, converted_count) =
+        oracle::source_request_prefix_for_test(parent_counter, || {
+            owned
+                .into_public()
+                .expect("publish the admitted fixture answer")
+        });
+    let converted_requests = live_requests(
+        &converted,
+        &converted_requests[..converted_count.min(converted_requests.len())],
+    );
+    let converted_bytes = live_bytes(&converted);
+    let converted_observer = owner.clone();
+    let source_control_bytes = crate::vector_read_memory::native_control_layouts_for_test()
+        .1
+        .size();
     assert_eq!(converted.rows(), expected);
     assert_eq!(
         owner.used.load(Ordering::SeqCst),
-        0,
-        "consuming conversion releases all observed credit while public rows remain alive"
+        converted_bytes,
+        "only the live public answer retains observed credit after conversion"
     );
     assert!(owner.peak.load(Ordering::SeqCst) > 0);
     drop(control);
     drop(owner);
-    assert_parent_baseline();
+    assert_parent_with_live_answers(converted_bytes, source_control_bytes);
     let owner = observe();
     let control = oracle::AnswerCopyControlObservation::begin(&owner.used);
-    let explicit = db
-        .execute_with_read_memory(sql, &HashMap::new(), owner.clone())
-        .unwrap();
+    let (explicit, explicit_requests, explicit_count) =
+        oracle::source_request_prefix_for_test(parent_counter, || {
+            db.execute_with_read_memory(sql, &HashMap::new(), owner.clone())
+                .unwrap()
+        });
+    let explicit_requests = live_requests(
+        &explicit,
+        &explicit_requests[..explicit_count.min(explicit_requests.len())],
+    );
+    let explicit_bytes = live_bytes(&explicit);
+    let explicit_observer = owner.clone();
     assert_eq!(explicit.rows(), expected);
     assert_control_freed(&control, control_layout);
     assert_eq!(
@@ -1560,18 +1662,64 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
     );
     assert_eq!(
         owner.used.load(Ordering::SeqCst),
-        0,
-        "public explicit-owner boundary releases every observed answer/copy credit before return"
+        explicit_bytes,
+        "only the live public answer retains observed credit after explicit-owner execution"
     );
     drop(control);
     drop(owner);
-    assert_parent_baseline();
-    let ordinary = db.execute(sql, &HashMap::new()).unwrap();
+    assert_parent_with_live_answers(converted_bytes + explicit_bytes, 2 * source_control_bytes);
+    let ((ordinary, ordinary_requests, ordinary_count), ordinary_sample) =
+        crate::vector_read_memory::statement_child_proof::observe(
+            &db.declared_read_memory,
+            limit,
+            || {
+                oracle::source_request_prefix_for_test(parent_counter, || {
+                    db.execute(sql, &HashMap::new()).unwrap()
+                })
+            },
+        );
+    let ordinary_requests = live_requests(
+        &ordinary,
+        &ordinary_requests[..ordinary_count.min(ordinary_requests.len())],
+    );
+    let ordinary_bytes = live_bytes(&ordinary);
+    let native = ordinary_sample
+        .native_controls
+        .expect("ordinary answer retains its original native operation");
+    let ordinary_controls = native.block.layout.0
+        + native.keeper.map_or(0, |allocation| allocation.layout.0)
+        + native.adapter.map_or(0, |allocation| allocation.layout.0)
+        + ordinary_requests[1..]
+            .iter()
+            .map(|request| request.1)
+            .sum::<usize>();
     assert_eq!(ordinary.rows(), expected);
-    assert_parent_baseline();
-    // Keep all three public values alive through the final baseline-availability probe.
+    assert_parent_with_live_answers(
+        converted_bytes + explicit_bytes + ordinary_bytes,
+        2 * source_control_bytes + ordinary_controls,
+    );
+    // Keep all three public values alive through the final live-answer availability probe.
     assert_eq!(converted.rows(), ordinary.rows());
     assert_eq!(explicit.rows(), ordinary.rows());
+    oracle::watch_exact_frees_for_test(&converted_requests, parent_counter);
+    drop(converted);
+    assert_physically_freed(&converted_requests);
+    assert_eq!(converted_observer.used.load(Ordering::SeqCst), 0);
+    drop(converted_observer);
+    assert_parent_with_live_answers(
+        explicit_bytes + ordinary_bytes,
+        source_control_bytes + ordinary_controls,
+    );
+    oracle::watch_exact_frees_for_test(&explicit_requests, parent_counter);
+    drop(explicit);
+    assert_physically_freed(&explicit_requests);
+    assert_eq!(explicit_observer.used.load(Ordering::SeqCst), 0);
+    drop(explicit_observer);
+    assert_parent_with_live_answers(ordinary_bytes, ordinary_controls);
+    oracle::watch_exact_frees_for_test(&ordinary_requests, parent_counter);
+    drop(ordinary);
+    assert_physically_freed(&ordinary_requests);
+    assert_parent_baseline();
     // Owned configuration follows the captured root; scalar decoding ends at return.
     let config_tx = db.begin_or_panic();
     let config_text = "owned configuration image".repeat(128);

@@ -1691,6 +1691,13 @@ pub(crate) struct QueryImageCharge {
         crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
 }
 impl QueryAnswerCharge {
+    #[cfg(test)]
+    pub(crate) fn retained_image_pointer_for_test(&self) -> usize {
+        match self {
+            Self::Image(charge) => &*charge.image.value as *const ImageMemory as usize,
+            _ => 0,
+        }
+    }
     /// Passive pointers and the existing invoice of the actual retained image.
     #[cfg(all(test, feature = "test-seams"))]
     pub(crate) fn control_receipts_for_test(&self) -> [(usize, usize, usize, usize); 2] {
@@ -3829,7 +3836,7 @@ mod native_decode_tests {
         drop(second);
         assert_eq!(parent.retained_bytes_for_test(), baseline);
         drop(owner);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
     }
 
     // A refusal inside the decode is kept by value, with no owned diagnostic,
@@ -3868,7 +3875,7 @@ mod native_decode_tests {
         assert_eq!(parent.retained_bytes_for_test(), child + block);
         drop(memory);
         drop(owner);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
     }
 
     // Malformed input answers the static codec class; nothing stays admitted.
@@ -3883,7 +3890,7 @@ mod native_decode_tests {
         assert_eq!(memory.held(), 0);
         drop(memory);
         drop(owner);
-        assert_eq!(parent.retained_bytes_for_test(), 0);
+        parent.assert_only_original_root_and_free_for_test();
     }
 }
 

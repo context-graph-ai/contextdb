@@ -41,7 +41,7 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
             db.persistence
                 .as_ref()
                 .unwrap()
-                .load_forward_edges()
+                .load_row_owned_edges_for_test(false)
                 .unwrap()
                 .len(),
             2
@@ -106,7 +106,10 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
                 "a row commit must never strand its vector"
             );
             assert_eq!(
-                persistence.load_forward_edges().unwrap().len(),
+                persistence
+                    .load_row_owned_edges_for_test(false)
+                    .unwrap()
+                    .len(),
                 if case == "after" { 1 } else { 2 }
             );
             if case == "deferred" {
@@ -124,10 +127,16 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
             }
             db.run_pruning_cycle_checked().unwrap();
             assert_eq!(persistence.load_vectors().unwrap().len(), 1);
-            let edges = persistence.load_forward_edges().unwrap();
+            let edges = persistence.load_row_owned_edges_for_test(false).unwrap();
             assert_eq!(edges.len(), 1);
             assert_eq!(edges[0].source, survivor);
-            assert_eq!(persistence.load_reverse_edges().unwrap().len(), 1);
+            assert_eq!(
+                persistence
+                    .load_row_owned_edges_for_test(true)
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert!(
                 persistence
                     .load_config_value::<BTreeSet<NodeId>>(
@@ -156,7 +165,7 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
                 .persistence
                 .as_ref()
                 .unwrap()
-                .load_forward_edges()
+                .load_row_owned_edges_for_test(false)
                 .unwrap()
                 .len(),
             1

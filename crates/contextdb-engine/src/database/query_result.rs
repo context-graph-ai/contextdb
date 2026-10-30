@@ -97,6 +97,28 @@ impl QueryResult {
         self.encoding_owner()
             .expect("fixture supplies a funded answer")
     }
+    // Scalar custody view for unit tests, including builds without test-seams.
+    // It retains neither the answer nor an owner, and reads only live invoices.
+    #[cfg(test)]
+    pub(super) fn live_answer_allocations_for_test(&self) -> (usize, [usize; 3], [usize; 2]) {
+        match &self.inner {
+            QueryResultInner::Shared(answer) => (
+                &**answer as *const OwnedQueryResult as usize,
+                [
+                    answer.credit().bytes(),
+                    answer.answer_charge.held(),
+                    answer.vector_copy_charge.held(),
+                ],
+                [
+                    answer.answer_charge.retained_image_pointer_for_test(),
+                    answer.vector_copy_charge.retained_image_pointer_for_test(),
+                ],
+            ),
+            QueryResultInner::Empty { .. } | QueryResultInner::Application(_) => {
+                (0, [0; 3], [0; 2])
+            }
+        }
+    }
     /// Passive actual carrier/charge receipt for an independent physical-free
     /// control. No owner clone, admission, allocator hook or payload projection.
     #[cfg(all(test, feature = "test-seams"))]

@@ -8,6 +8,11 @@ use common::workloads::{
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn mixed_workflows_pr(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("mixed_workflows_pr/graph_relational_vector", |_| {});
+        c.bench_function("mixed_workflows_pr/flagship_recall_query", |_| {});
+        return;
+    }
     let mut group = c.benchmark_group("mixed_workflows_pr");
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(5));

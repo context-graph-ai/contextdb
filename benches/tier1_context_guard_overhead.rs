@@ -58,6 +58,12 @@ fn hot_selects(
 }
 
 fn bench_context_guard_overhead(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("tier1_context_guard_overhead/ungated", |_| {});
+        c.bench_function("tier1_context_guard_overhead/ratio_guard", |_| {});
+        c.bench_function("tier1_context_guard_overhead/gated", |_| {});
+        return;
+    }
     let tmp = TempDir::new().unwrap();
     let admin_path = tmp.path().join("context-guard-admin.redb");
     let gated_path = tmp.path().join("context-guard-gated.redb");

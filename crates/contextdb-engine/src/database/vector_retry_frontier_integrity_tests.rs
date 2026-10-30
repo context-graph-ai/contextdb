@@ -234,9 +234,14 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     // to this same writer. Restore the serving premise through normal preload.
     db.close().unwrap();
     drop(db);
-    let accountant = Arc::new(MemoryAccountant::no_limit());
-    accountant.set_budget(Some(64 * 1024 * 1024)).unwrap();
-    let db = Database::open_with_config(&copy, Arc::new(CorePlugin), accountant).unwrap();
+    let db = Database::open_with_options(
+        &copy,
+        crate::read_session::DatabaseOpenOptions {
+            memory_limit: Some(64 * 1024 * 1024),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     assert!(
         db.vector_store

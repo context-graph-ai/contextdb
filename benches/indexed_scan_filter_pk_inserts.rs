@@ -51,6 +51,10 @@ fn timed_seed_and_assert() {
 }
 
 fn bench_pk01_pk_inserts_routes_through_index(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("pk01_pk_inserts_routes_through_index", |_| {});
+        return;
+    }
     seed_and_assert();
     c.bench_function("pk01_pk_inserts_routes_through_index", |b| {
         b.iter(timed_seed_and_assert)

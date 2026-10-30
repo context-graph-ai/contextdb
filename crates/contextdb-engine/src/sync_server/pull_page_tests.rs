@@ -14,18 +14,14 @@ const TENANT: &str = "pull-page-cut";
 const TABLE: &str = "embeddings";
 const DIM: usize = 768;
 
-/// Funds every hub request from its own fresh declared reader at the shipped
-/// default limit, and keeps each one, so a request's own peak is observable.
-#[derive(Debug)]
-struct PerRequestReader {
-    parents: std::sync::Mutex<Vec<DeclaredReadRoot>>,
-}
+/// Funds each hub request from its own fresh declared reader at the shipped
+/// limit. The real request capability retains the root until that request ends.
+#[derive(Debug, Default)]
+struct PerRequestReader {}
 impl PerRequestReader {
     fn next(&self) -> DeclaredReadRoot {
-        let parent = DeclaredReadMemory::from_reader_limit(ReadLimits::SHIPPED_MEMORY)
-            .expect("admit the declared fixture root");
-        self.parents.lock().unwrap().push(parent.clone());
-        parent
+        DeclaredReadMemory::from_reader_limit(ReadLimits::SHIPPED_MEMORY)
+            .expect("admit the declared fixture root")
     }
 }
 impl crate::vector_read_memory::NativeReadRequestBudgetProvider for PerRequestReader {
@@ -97,9 +93,7 @@ async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
     let broker = InProcessBroker::with_event_driven_shutdown_for_test();
     let hub_identity = Arc::new(crate::identity::FabricIdentity::generate());
     let hub_node = hub_identity.node_id();
-    let provider = Arc::new(PerRequestReader {
-        parents: std::sync::Mutex::new(Vec::new()),
-    });
+    let provider = Arc::new(PerRequestReader::default());
     let server = Arc::new(
         SyncServer::with_authenticated_transport_and_identity_for_test_with_read_budget_provider(
             db,
@@ -316,4 +310,15 @@ async fn a_transaction_larger_than_a_page_arrives_whole() {
         "the 200-row transaction arrives on one page: {:?}",
         pulled.page_rows
     );
+}
+
+#[test]
+fn completed_pull_requests_release_their_original_reader_root() {
+    let provider = PerRequestReader::default();
+    let parent = provider.next();
+    let request = parent
+        .request_budget_owner_native()
+        .expect("real request root capability");
+    drop(request);
+    parent.assert_only_original_root_and_free_for_test();
 }

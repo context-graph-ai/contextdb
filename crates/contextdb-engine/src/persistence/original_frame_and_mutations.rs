@@ -5022,3 +5022,19 @@ pub(crate) fn install_source_fixture_cache_reserve_for_test(
     })
     .unwrap()
 }
+
+#[cfg(test)]
+impl RedbPersistence {
+    pub(crate) fn install_source_fixture_cache_reserve_for_test(
+        &self,
+        accountant: &crate::memory_accounting::AccountantHandle,
+        capacity: usize,
+    ) -> (redb::CacheReserveOwner, usize) {
+        let database = self.db.read().unwrap();
+        install_source_fixture_cache_reserve_for_test(
+            database.as_ref().unwrap(),
+            accountant,
+            capacity,
+        )
+    }
+}

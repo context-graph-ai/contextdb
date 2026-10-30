@@ -362,3 +362,30 @@ impl RedbPersistence {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl RedbPersistence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn load_row_owned_edges_for_test(&self, reverse: bool) -> Result<Vec<AdjEntry>> {
+        let _decode_scope = self.reader_decode_scope()?;
+        self.with_db(|database| {
+            let read = database.begin_read().map_err(Self::storage_error)?;
+            let table = match read.open_table(if reverse { REVERSE } else { FORWARD }) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut entries = Vec::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (_, value) = entry.map_err(Self::storage_error)?;
+                let owned: OwnedAdjEntry = Self::decode_exact(value.value())?;
+                validate(&owned)?;
+                entries.push(owned.entry);
+            }
+            Ok(entries)
+        })
+    }
+}

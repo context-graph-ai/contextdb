@@ -123,6 +123,10 @@ fn change_reload_borrows_prior_graph_and_copies_change_at_exact_capacity() {
     )
 )]
 fn short_authenticated_change_route_and_graph_hints_do_not_allocate_serde_cap() {
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     let (base, change) = records(VectorQuantization::F32);
     let base_bytes = RedbPersistence::encode_vector_partition_record(
         VectorPartitionRecordKind::BaseGeneration,

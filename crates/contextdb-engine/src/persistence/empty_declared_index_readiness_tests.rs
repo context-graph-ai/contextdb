@@ -2747,8 +2747,11 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
             as usize;
         let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
         assert_eq!(observation.commit_directory_funding(), None);
+        crate::vector_read_memory::watch_reader_budget_ledger_for_test();
+        let open_child = declared_read_memory.child().unwrap();
+        drop(crate::vector_read_memory::take_reader_budget_ledger_for_test());
         let open_context = crate::executor::bounded::ReadOpenContext::new(
-            declared_read_memory.child().unwrap(),
+            open_child,
             limits,
             crate::read_session::read_clock(),
             OwnerReadCancellation::new(),
@@ -2890,9 +2893,17 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
             source_registration.image_held_before_reservation,
             raw_image_held
         );
+        let vector_adapter_bytes =
+            crate::memory_accounting::MemoryAccountant::writer_vector_adapter_full_size_for_test();
+        let vector_adapter = observation
+            .commit_directory_vector_adapter_admission()
+            .expect("actual vector adapter admission is observed");
+        assert_eq!(vector_adapter.0, raw_image_accountant_identity);
+        assert_eq!(vector_adapter.1, raw_accountant_used);
+        assert_eq!(vector_adapter.2, raw_accountant_used + vector_adapter_bytes);
         assert_eq!(
             source_registration.image_accountant_used_before_reservation,
-            raw_accountant_used
+            raw_accountant_used + vector_adapter_bytes
         );
         let wrapper_held_delta = source_registration
             .image_held_after_reservation
@@ -5601,9 +5612,9 @@ fn assert_graph_authorization_and_cancellation_rows(directory: &Path) {
                         {
                             let mut table = write
                                 .open_table(if malformed_projection == Some(true) {
-                                    GRAPH_REV_TABLE
+                                    row_graph::REVERSE
                                 } else {
-                                    GRAPH_FWD_TABLE
+                                    row_graph::FORWARD
                                 })
                                 .map_err(RedbPersistence::storage_error)?;
                             let (key, mut raw) = {

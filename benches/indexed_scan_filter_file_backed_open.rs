@@ -92,6 +92,10 @@ fn timed_seed_reopen_and_assert() {
 }
 
 fn bench_file_backed_100k_rows_open_upper_bound(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("file_backed_100k_rows_open_upper_bound", |_| {});
+        return;
+    }
     seed_reopen_and_assert();
     c.bench_function("file_backed_100k_rows_open_upper_bound", |b| {
         b.iter(timed_seed_reopen_and_assert)

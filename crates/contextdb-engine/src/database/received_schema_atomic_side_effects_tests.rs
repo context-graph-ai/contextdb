@@ -619,6 +619,28 @@ fn assert_durable_side_projection(
 }
 
 fn assert_received_ddl_is_appended(db: &Database, changes: &ChangeSet, receiver_lsn: Lsn) {
+    let authored_positions = changes
+        .ddl_lsn
+        .iter()
+        .copied()
+        .chain(changes.rows.iter().map(|row| row.lsn))
+        .chain(changes.edges.iter().map(|edge| edge.lsn))
+        .chain(changes.vectors.iter().map(|vector| vector.lsn))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let first_position = receiver_lsn.0 + 1 - authored_positions.len() as u64;
+    let ddl_positions = changes
+        .ddl_lsn
+        .iter()
+        .map(|position| {
+            Lsn(first_position
+                + authored_positions
+                    .binary_search(position)
+                    .expect("the source DDL position belongs to this received unit")
+                    as u64)
+        })
+        .collect::<Vec<_>>();
     let actual = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(actual.ddl.len() >= changes.ddl.len());
     assert_eq!(
@@ -627,7 +649,7 @@ fn assert_received_ddl_is_appended(db: &Database, changes: &ChangeSet, receiver_
     );
     assert_eq!(
         &actual.ddl_lsn[actual.ddl_lsn.len() - changes.ddl.len()..],
-        vec![receiver_lsn; changes.ddl.len()]
+        ddl_positions
     );
     assert_eq!(durable_observation::rows(db, "notes")[0].lsn, receiver_lsn);
 }

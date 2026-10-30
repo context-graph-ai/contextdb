@@ -7,7 +7,6 @@ const CATALOGS: TableDefinition<&[u8], &[u8]> =
 const MEMBERSHIPS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_membership");
 const JOURNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_partition_journal");
-const MALFORMED_METADATA_BYTES: usize = 9 * 1024 * 1024;
 #[derive(Clone, Copy)]
 enum ColdMetadata {
     Catalog,
@@ -26,6 +25,7 @@ enum ColdMetadata {
     )
 )]
 fn public_cold_metadata_refusal(metadata: ColdMetadata) {
+    const MALFORMED_METADATA_BYTES: usize = 9 * 1024 * 1024;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("metadata-owner.db");
     let copy = directory.path().join("metadata-cold.db");
@@ -412,6 +412,16 @@ enum UnknownCatalog {
     )
 )]
 fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCatalog) {
+    let startup_writer_budget = Some(64 * 1024 * 1024);
+    let actual_capacity =
+        crate::persistence::redb_writer_cache_bytes_for_limit(startup_writer_budget);
+    #[expect(
+        non_snake_case,
+        reason = "This binding names the malformed source extent byte quota."
+    )]
+    let MALFORMED_METADATA_BYTES = actual_capacity.checked_add(1).unwrap();
+    let row_bytes = 64 * 1024;
+    let pressure_rows = actual_capacity / row_bytes + 1;
     use contextdb_core::VectorPartitionComponent;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owner.db");
@@ -460,14 +470,14 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
             &HashMap::new(),
         )
         .unwrap();
-        for id in 0..128 {
+        for id in 0..i64::try_from(pressure_rows).unwrap() {
             db.execute(
                 "INSERT INTO cold_catalog_pressure VALUES ($id, $body)",
                 &HashMap::from([
                     ("id".into(), Value::Int64(id)),
                     (
                         "body".into(),
-                        Value::Text(format!("{id}:{}", "p".repeat(64 * 1024))),
+                        Value::Text(format!("{id}:{}", "p".repeat(row_bytes))),
                     ),
                 ]),
             )
@@ -607,11 +617,24 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     // extent, preserving a cold physical admission on the observed cycle.
     db.close().unwrap();
     drop(db);
-    let accountant = Arc::new(MemoryAccountant::no_limit());
-    accountant.set_budget(Some(64 * 1024 * 1024)).unwrap();
-    let db = Database::open_with_config(&copy, Arc::new(CorePlugin), accountant).unwrap();
+    let db = Database::open_with_options(
+        &copy,
+        crate::read_session::DatabaseOpenOptions {
+            memory_limit: startup_writer_budget,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    assert_eq!(
+        db.persistence.as_ref().unwrap().installed_cache_capacity(),
+        Some(actual_capacity),
+        "the fixture pressure and malformed extent use this store's actual cache policy"
+    );
     if !matches!(kind, UnknownCatalog::DurableOnly) {
+        let _fixture_decode_scope =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(db.accountant.clone())
+                .unwrap();
         assert!(
             db.vector_store
                 .preload_dormant_partition_generation(&route(0), true)
@@ -647,8 +670,8 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         let before = db.__writer_cache_stats_for_test().unwrap();
         let declared_share =
             crate::persistence::redb_writer_cache_bytes_for_limit(Some(64 * 1024 * 1024));
-        assert!(128 * 64 * 1024 > declared_share);
-        for id in 0..128 {
+        assert!(pressure_rows * row_bytes > declared_share);
+        for id in 0..i64::try_from(pressure_rows).unwrap() {
             assert_eq!(
                 db.execute(
                     &format!("SELECT body FROM cold_catalog_pressure WHERE id = {id}"),
@@ -827,7 +850,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         );
     }
     drop(observation);
-    db.accountant.set_budget(None).unwrap();
+    db.accountant.set_budget(startup_writer_budget).unwrap();
     if matches!(kind, UnknownCatalog::DurableOnly) {
         let vector_fixture_reader_2 = db
             .declared_reader_memory()
@@ -1180,8 +1203,13 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
             "the deleted route needs closing retirement rather than another publication"
         );
     }
+    let admission_site = match slot {
+        "sampled_routes" => "sampled_route_copy",
+        "closing_routes" => "closing_route_copy",
+        other => other,
+    };
     INVENTORY_SLOT_REFUSAL_FOR_TEST.with(|active| {
-        *active.borrow_mut() = Some((db.accountant.as_ptr() as usize, slot, 0));
+        *active.borrow_mut() = Some((db.accountant.as_ptr() as usize, admission_site, 0));
     });
     let refusal = InventorySlotRefusalScopeForTest;
     db.clear_maintenance_cycle_stamp_for_test();

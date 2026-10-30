@@ -263,6 +263,12 @@ fn setup_multi_edge_converge(rt: &tokio::runtime::Runtime) -> MultiEdgeFixture {
 }
 
 fn sync_pr(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("sync_pr/chunked_mixed_push_400_rows", |_| {});
+        c.bench_function("sync_pr/chunked_large_pull_600_rows", |_| {});
+        c.bench_function("sync_pr/multi_edge_push_pull_converge_2x100", |_| {});
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("sync_pr");

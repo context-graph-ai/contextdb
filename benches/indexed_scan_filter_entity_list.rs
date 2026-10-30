@@ -86,6 +86,10 @@ fn timed_queries_and_assert(db: &Database) {
 }
 
 fn bench_entity_list_filter_under_budget(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("entity_list_filter_under_budget", |_| {});
+        return;
+    }
     seed_and_assert();
     c.bench_function("entity_list_filter_under_budget", |b| {
         b.iter_batched(

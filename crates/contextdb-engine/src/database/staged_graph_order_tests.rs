@@ -95,8 +95,15 @@ fn interleaved_staged_row_owners_and_standalone_edges_share_logical_reachability
 #[test]
 fn detached_standalone_graph_copies_return_exactly_their_admitted_bytes() {
     for versions in [1usize, 4] {
-        let accountant = Arc::new(MemoryAccountant::with_budget(1024 * 1024));
-        let db = Database::open_memory_with_accountant(accountant.clone());
+        let db = Database::open_with_options(
+            ":memory:",
+            crate::read_session::DatabaseOpenOptions {
+                memory_limit: Some(1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let accountant = db.accountant.clone();
         for version in 0..versions {
             let edge = AdjEntry {
                 source: NodeId::from_u128(100 + version as u128),

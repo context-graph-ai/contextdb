@@ -398,7 +398,7 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     assert_eq!(parent.retained_bytes_for_test(), controls);
     drop(reader_a);
     drop(reader_b);
-    assert_eq!(parent.retained_bytes_for_test(), 0);
+    parent.assert_only_original_root_and_free_for_test();
     drop(a);
     drop(b);
     drop(db);
@@ -624,8 +624,11 @@ fn embedded_graph_reader_scratch_rows() {
             };
             let parent = DeclaredReadMemory::from_reader_limit(8 * 1024 * 1024).unwrap();
             let root_baseline = parent.retained_bytes_for_test();
-            let child = parent.child().unwrap();
-            let sibling = parent.child().unwrap();
+            let ((child, sibling), _) = crate::vector_read_memory::statement_child_proof::observe(
+                &parent,
+                8 * 1024 * 1024,
+                || (parent.child().unwrap(), parent.child().unwrap()),
+            );
             let observer = declared_child_observer(&child).unwrap();
             let standing = parent.retained_bytes_for_test();
             let distances = Arc::new(Distances(AtomicUsize::new(0)));

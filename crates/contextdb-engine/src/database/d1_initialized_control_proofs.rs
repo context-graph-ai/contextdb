@@ -133,13 +133,19 @@ fn reader_credit() -> contextdb_vector::VectorCopyAdmission {
     .expect("admit the declared fixture root");
     crate::vector_read_memory::admission(declared.child().unwrap())
 }
-fn open(path: &std::path::Path, owner: &Arc<MemoryAccountant>) -> (Database, OpenCapture) {
+fn open(
+    path: &std::path::Path,
+) -> (
+    Database,
+    crate::memory_accounting::AccountantHandle,
+    OpenCapture,
+) {
     OPEN.with(|slot| {
         assert!(slot.borrow().is_none());
         *slot.borrow_mut() = Some(OpenCapture::default());
     });
-    let (database, _, _) =
-        measured(|| Database::open_with_config(path, Arc::new(CorePlugin), owner.clone()).unwrap());
+    let (database, _, _) = measured(|| Database::open(path).unwrap());
+    let owner = database.accountant.clone();
     let captured = OPEN.with(|slot| slot.borrow_mut().take().unwrap());
     assert!(
         captured.callback.is_some(),
@@ -149,7 +155,7 @@ fn open(path: &std::path::Path, owner: &Arc<MemoryAccountant>) -> (Database, Ope
         captured.columns.is_some(),
         "actual fallible writable assembly constructed its column factory"
     );
-    (database, captured)
+    (database, owner, captured)
 }
 fn pair(
     columns: &DurableColumnSourceFactory,
@@ -187,7 +193,7 @@ fn pair(
 fn finish<T: ?Sized>(
     row: &str,
     database: Database,
-    owner: &Arc<MemoryAccountant>,
+    owner: &crate::memory_accounting::AccountantHandle,
     control: Arc<T>,
     request: Request,
     payload_pointer: Option<usize>,
@@ -249,12 +255,17 @@ fn finish<T: ?Sized>(
     );
     assert_eq!(
         owner.usage().used,
-        0,
-        "{row}: host accountant survives with its original zero balance"
+        owner
+            .native_backing_for_test()
+            .1
+            .iter()
+            .map(|(_, layout)| layout.size())
+            .sum::<usize>(),
+        "{row}: native accountant survives with only its original backing"
     );
     assert_eq!(owner.underflow_count_for_test(), 0);
     println!(
-        "CDB127_D1_ROW row={row} real_initialized=true original_epoch={epoch} parent_drop=true final_physical_free=true payload_observed={} final_registration=0 final_used=0",
+        "initialized_control row={row} real_initialized=true original_epoch={epoch} parent_drop=true final_physical_free=true payload_observed={} final_registration=0 final_native_backing_only=true",
         payload_pointer.is_some()
     );
 }
@@ -287,6 +298,10 @@ fn layout() -> VectorIndexLayout {
     )
 )]
 pub(crate) fn mapped_rows_for_test() {
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("d1-initialized-controls.db");
     let seed = Database::open(&path).unwrap();
@@ -330,8 +345,7 @@ pub(crate) fn mapped_rows_for_test() {
             {
                 continue;
             }
-            let owner = Arc::new(MemoryAccountant::no_limit());
-            let (database, capture) = open(&path, &owner);
+            let (database, owner, capture) = open(&path);
             let (columns, columns_request) = capture.columns.unwrap();
             let factory_credit = capture.factory_credit;
             drop(capture.callback);
@@ -346,7 +360,7 @@ pub(crate) fn mapped_rows_for_test() {
                             None,
                             &partition,
                             RawVectorMembershipSummary::default(),
-                            owner.clone().into(),
+                            owner.clone(),
                             &mut workspace,
                             reader_credit(),
                         )
@@ -396,7 +410,7 @@ pub(crate) fn mapped_rows_for_test() {
                         DurableReverseMembershipSource::from_owner_admitted(
                             MembershipOwner::Writable(source.clone()),
                             &index,
-                            owner.clone().into(),
+                            owner.clone(),
                             &mut workspace,
                             reader_credit(),
                         )
@@ -501,8 +515,7 @@ pub(crate) fn mapped_rows_for_test() {
         }
     }
     for (invoked, observe_credit) in [(false, false), (false, true), (true, false)] {
-        let owner = Arc::new(MemoryAccountant::no_limit());
-        let (database, capture) = open(&path, &owner);
+        let (database, owner, capture) = open(&path);
         let (callback, request) = capture.callback.unwrap();
         let credit = capture.factory_credit;
         drop(capture.columns);
@@ -523,7 +536,7 @@ pub(crate) fn mapped_rows_for_test() {
             )
             .expect("admit the declared fixture root");
             let image = crate::read_image_memory::ImageMemory::charging_reader(
-                owner.clone().into(),
+                owner.clone(),
                 declared.child().unwrap(),
             );
             let mut construction = image.vector_copy(0).unwrap();
@@ -545,7 +558,7 @@ pub(crate) fn mapped_rows_for_test() {
                     &task_vector,
                     &database.tx_mgr,
                     database.persistence.as_ref().unwrap(),
-                    &crate::memory_accounting::AccountantHandle::from_host(owner.clone()),
+                    &owner,
                     &mut construction.owner,
                 )
                 .unwrap()
@@ -637,6 +650,10 @@ pub(crate) fn mapped_rows_for_test() {
             *handler.run.lock().unwrap() = Some(Box::new(move || {
                 entered.send(()).unwrap();
                 released.recv().unwrap();
+                let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+                    crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+                )
+                .unwrap();
                 let mut copy = reader_credit();
                 let loaded = returned.load_all(&mut copy).unwrap();
                 assert_eq!(
@@ -691,10 +708,18 @@ pub(crate) fn mapped_rows_for_test() {
             );
             drop(returned);
             assert_eq!(owner.writer_registration_observation_for_test().2, 0);
-            assert_eq!(owner.usage().used, 0);
+            assert_eq!(
+                owner.usage().used,
+                owner
+                    .native_backing_for_test()
+                    .1
+                    .iter()
+                    .map(|(_, layout)| layout.size())
+                    .sum::<usize>()
+            );
             assert_eq!(owner.underflow_count_for_test(), 0);
             println!(
-                "CDB127_D1_ROW row=callback.separately_assembled_production.invoked real_production_callback=true whole_allocation_free=true returned_loader_after_parent=true preserved_answer=true original_epoch=true final_zero=true"
+                "initialized_control row=callback.separately_assembled_production.invoked real_production_callback=true whole_allocation_free=true returned_loader_after_parent=true preserved_answer=true original_epoch=true final_native_backing_only=true"
             );
         } else {
             finish(

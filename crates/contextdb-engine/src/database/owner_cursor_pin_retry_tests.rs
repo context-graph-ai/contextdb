@@ -177,7 +177,6 @@ enum RegistryWaitOutcome {
 #[derive(Clone, Copy)]
 enum RegistryWaitPhase {
     Registration,
-    ProviderScan,
     FirstRoot,
     SecondRoot,
 }
@@ -211,34 +210,58 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         cursor_page_rows: 1,
         ..ReadLimits::default()
     };
-    let db = Database::open_with_options(
-        &path,
-        DatabaseOpenOptions {
-            owner_reads: OwnerReadConfig {
-                runtime_dir: Some(runtime_dir.clone()),
-                limits: OwnerReadLimits {
-                    limits,
-                    ..OwnerReadLimits::default()
+    struct RequestRetired(std::sync::mpsc::Sender<()>);
+    impl crate::owner_read::OwnerBoundedExecutionObserver for RequestRetired {
+        fn before_operation(
+            &self,
+            _: crate::owner_read::OwnerBoundedOperation,
+            _: ReadLimits,
+            _: OwnerReadCancellation,
+        ) {}
+        fn before_work(
+            &self,
+            _: crate::executor::bounded_read_test_support::TestWorkSource,
+            _: u64,
+        ) {}
+        fn cancellation_observed(&self, _: u64) {}
+        fn carrier_request_retired(&self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (finished_owner, owner_finished) = std::sync::mpsc::channel();
+    let db = crate::owner_read::OwnerServiceSpec::with_execution_observer_during_start_for_test(
+        Arc::new(RequestRetired(finished_owner)),
+        || {
+            Database::open_with_options(
+                &path,
+                DatabaseOpenOptions {
+                    owner_reads: OwnerReadConfig {
+                        runtime_dir: Some(runtime_dir.clone()),
+                        limits: OwnerReadLimits {
+                            limits,
+                            ..OwnerReadLimits::default()
+                        },
+                        timeouts: OwnerServiceTimeouts {
+                            request_ms: 600_000,
+                            ..OwnerServiceTimeouts::default()
+                        },
+                        test_hooks: Some(crate::OwnerReadTestHooks {
+                            clock: clock.clone(),
+                            drain_started,
+                            active_request_registered: None,
+                            accept_thread_exited: None,
+                            accept_thread_joined: None,
+                            service_dropped: None,
+                            quiescent_stop: None,
+                        }),
+                        ..OwnerReadConfig::default()
+                    },
+                    ..DatabaseOpenOptions::default()
                 },
-                timeouts: OwnerServiceTimeouts {
-                    request_ms: 600_000,
-                    ..OwnerServiceTimeouts::default()
-                },
-                test_hooks: Some(crate::OwnerReadTestHooks {
-                    clock: clock.clone(),
-                    drain_started,
-                    active_request_registered: None,
-                    accept_thread_exited: None,
-                    accept_thread_joined: None,
-                    service_dropped: None,
-                    quiescent_stop: None,
-                }),
-                ..OwnerReadConfig::default()
-            },
-            ..DatabaseOpenOptions::default()
+            )
+            .unwrap()
         },
-    )
-    .unwrap();
+    );
     db.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY)",
         &HashMap::new(),
@@ -273,12 +296,6 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         db.snapshot_registry.owner_cursor_busy_test_pause.clone(),
     );
     let (finished, completed) = std::sync::mpsc::sync_channel(1);
-    let scan_pause = matches!(phase, RegistryWaitPhase::ProviderScan).then(|| {
-        crate::persistence::read_persistence_test_scaffold::pause_reader_snapshot_registry_scan_for_test(
-            &path,
-        )
-        .unwrap()
-    });
     let start_reader = || {
         std::thread::spawn(move || {
             let result = executor.block_on(client.request_watching(
@@ -295,12 +312,6 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
             finished.send(result).unwrap();
         })
     };
-    let mut start_reader = Some(start_reader);
-    let scan_reader = scan_pause.as_ref().map(|scan| {
-        let reader = start_reader.take().unwrap()();
-        scan.wait_until_inspected_for_test();
-        reader
-    });
     let persistence = db.persistence.as_ref().unwrap();
     let registry_paths = persistence.owner_cursor_registry_paths_for_test();
     let root_index = match phase {
@@ -329,13 +340,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         root
     });
     let wait_while_contended = || {
-        let reader = match scan_reader {
-            Some(reader) => {
-                scan_pause.as_ref().unwrap().resume_for_test();
-                reader
-            }
-            None => start_reader.take().unwrap()(),
-        };
+        let reader = start_reader();
         assert!(
             pause.wait_until_reached(Duration::from_secs(30)),
             "the actual owner request meets the held registry"
@@ -376,6 +381,11 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
                 ),
                 RegistryWaitOutcome::Released => unreachable!(),
             }
+            if matches!(outcome, RegistryWaitOutcome::Cancelled) {
+                owner_finished
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("cancelled owner worker retirement event never delivered");
+            }
             assert!(db.snapshot_registry.state.lock().active.is_empty());
         }
         reader
@@ -391,9 +401,7 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
     if matches!(outcome, RegistryWaitOutcome::Released) {
         let expected_first = if matches!(
             phase,
-            RegistryWaitPhase::ProviderScan
-                | RegistryWaitPhase::FirstRoot
-                | RegistryWaitPhase::SecondRoot
+            RegistryWaitPhase::FirstRoot | RegistryWaitPhase::SecondRoot
         ) {
             // The failed scan releases every pin and the commit boundary.
             // Retry must capture the whole root after this intervening commit.
@@ -421,9 +429,6 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
         assert!(page.has_more);
     }
     reader.join().unwrap();
-    if let Some(scan) = scan_pause {
-        scan.finish_for_test();
-    }
     db.close().unwrap();
     if root_index.is_some() {
         let inventory = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -482,28 +487,19 @@ fn owner_channel_cursor_registry_contention_obeys_cancellation() {
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_retries_registry_scan_contention_until_release() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Released,
-        RegistryWaitPhase::ProviderScan,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Released, RegistryWaitPhase::FirstRoot);
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_registry_scan_contention_obeys_active_deadline() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Deadline,
-        RegistryWaitPhase::ProviderScan,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Deadline, RegistryWaitPhase::FirstRoot);
 }
 
 #[cfg(all(unix, feature = "test-seams"))]
 #[test]
 fn owner_channel_cursor_registry_scan_contention_obeys_cancellation() {
-    owner_channel_registry_wait(
-        RegistryWaitOutcome::Cancelled,
-        RegistryWaitPhase::ProviderScan,
-    );
+    owner_channel_registry_wait(RegistryWaitOutcome::Cancelled, RegistryWaitPhase::FirstRoot);
 }
 
 #[test]

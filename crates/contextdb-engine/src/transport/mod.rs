@@ -768,10 +768,17 @@ pub(crate) mod native_pause {
     #[derive(Debug, Default)]
     pub(crate) struct Gate {
         reached: tokio::sync::Notify,
+        #[cfg(feature = "test-seams")]
+        on_reach: Mutex<Option<Arc<tokio::sync::Notify>>>,
         release: tokio::sync::Notify,
     }
 
     impl Gate {
+        #[cfg(feature = "test-seams")]
+        pub(crate) fn notify_on_reach_for_test(&self, notice: Arc<tokio::sync::Notify>) {
+            *self.on_reach.lock().unwrap() = Some(notice);
+        }
+
         /// Resolves once a request is held at the point (or already was).
         #[cfg_attr(
             not(feature = "test-seams"),
@@ -824,6 +831,10 @@ pub(crate) mod native_pause {
         };
         if let Some(gate) = gate {
             gate.reached.notify_one();
+            #[cfg(feature = "test-seams")]
+            if let Some(notice) = gate.on_reach.lock().unwrap().take() {
+                notice.notify_one();
+            }
             gate.release.notified().await;
         }
     }

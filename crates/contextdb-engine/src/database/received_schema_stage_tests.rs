@@ -1,4 +1,10 @@
 use super::*;
+
+macro_rules! with_received_fixture_commit_boundary {
+    ($database:expr => $body:block) => {
+        ($database).tx_mgr.with_commit_lock(|| $body)
+    };
+}
 include!("durable_test_observations.rs");
 
 fn create_table() -> DdlChange {
@@ -2730,7 +2736,7 @@ fn detached_stage_restamps_only_affected_row_edge_and_vector_mvcc() {
         lsn: Lsn(12),
     };
     db.accountant
-        .try_allocate(old_edge.estimated_bytes())
+        .try_allocate(contextdb_graph::GraphAdjEntry::from(old_edge.clone()).estimated_bytes())
         .expect("fund the graph fixture that finalization refunds");
     db.graph_store.apply_inserts(vec![old_edge.clone()]);
     let ddl = DdlChange::AlterTable {
@@ -3101,10 +3107,15 @@ fn schema_stage_rejects_missing_duplicate_or_mismatched_lineage_without_mutation
     // 4 KiB over the schema: the single-column PRIMARY KEY allocates a
     // fixed 64 KiB exact-probe bitmap for the life of the index, which it
     // always did and which the accountant now sees.
-    let accountant = Arc::new(MemoryAccountant::with_budget(
-        contextdb_core::EXACT_PROBE_FILTER_BYTES + 4096,
-    ));
-    let db = Database::open_memory_with_accountant(accountant.clone());
+    let db = Database::open_with_options(
+        ":memory:",
+        crate::read_session::DatabaseOpenOptions {
+            memory_limit: Some(contextdb_core::EXACT_PROBE_FILTER_BYTES + 4096),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let accountant = db.accountant.clone();
     db.execute(
         "CREATE TABLE lineage_rows (id INTEGER PRIMARY KEY)",
         &HashMap::new(),
@@ -3199,8 +3210,15 @@ fn schema_stage_rejects_missing_duplicate_or_mismatched_lineage_without_mutation
 fn staged_vector_replacement_releases_retired_hnsw_and_negative_delta() {
     // Fund the counted preparation controls as well as the vector fixture.
     // The invariant below is exact retirement back to the opening balance.
-    let accountant = Arc::new(MemoryAccountant::with_budget(8 * 1024));
-    let db = Database::open_memory_with_accountant(accountant.clone());
+    let db = Database::open_with_options(
+        ":memory:",
+        crate::read_session::DatabaseOpenOptions {
+            memory_limit: Some(8 * 1024),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let accountant = db.accountant.clone();
     let baseline = accountant.usage().used;
     let index = VectorIndexRef::new("retired", "embedding");
     db.vector_store
@@ -3302,7 +3320,7 @@ fn staged_publication_moves_complete_replacements_across_derived_handles() {
         lsn: Lsn(1),
     };
     db.accountant
-        .try_allocate(graph_entry.estimated_bytes())
+        .try_allocate(contextdb_graph::GraphAdjEntry::from(graph_entry.clone()).estimated_bytes())
         .expect("fund the graph fixture that finalization refunds");
     db.graph_store.apply_inserts(vec![graph_entry]);
     let vector_index = VectorIndexRef::new("kept", "embedding");
@@ -4245,14 +4263,14 @@ fn an_authenticated_unit_that_declares_a_vector_table_installs_its_vectors_in_th
 }
 
 /// A mixed schema + rows + vectors unit installs whole on
-/// a file-backed hub, at ONE commit LSN, with a durable per-unit receipt.
+/// a file-backed hub, with ordered authored positions and one final acceptance receipt.
 /// The author declares a vector table and writes rows into it; the unit
 /// is pushed exactly as sync sends it. The proof reads the receipt back
 /// from the hub's durable store after a restart -- the whole-unit schema
 /// record naming the author's identity, the exact request's stored
 /// outcome, and the author's delivery frontier -- rather than trusting
 /// the apply call's own answer, and it checks that the schema, every row
-/// and every vector carry the one LSN the hub advanced by.
+/// and every vector retain their authored order within the atomic unit.
 #[test]
 fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receipt() {
     let root = tempfile::TempDir::new().expect("scratch peer directory");
@@ -4292,6 +4310,23 @@ fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receip
     assert!(pushed.result.conflicts.is_empty(), "{:?}", pushed.result);
     assert_eq!(pushed.result.applied_rows, 2, "both rows applied");
     let unit_lsn = pushed.result.new_lsn;
+    let authored_positions = served
+        .ddl_lsn
+        .iter()
+        .copied()
+        .chain(served.rows.iter().map(|row| row.lsn))
+        .chain(served.vectors.iter().map(|vector| vector.lsn))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let receiver_position = |source: Lsn| {
+        Lsn(lsn_before.0
+            + 1
+            + authored_positions
+                .binary_search(&source)
+                .expect("the member belongs to an authored commit in this unit")
+                as u64)
+    };
     assert_eq!(
         hub.db.current_lsn(),
         unit_lsn,
@@ -4299,8 +4334,8 @@ fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receip
     );
     assert_eq!(
         unit_lsn,
-        Lsn(lsn_before.0 + 1),
-        "schema, rows and vectors consumed exactly one commit LSN"
+        Lsn(lsn_before.0 + authored_positions.len() as u64),
+        "the atomic unit preserves one ordered position per authored commit"
     );
     let installed = hub
         .db
@@ -4316,13 +4351,30 @@ fn a_mixed_schema_rows_and_vectors_unit_installs_whole_with_one_lsn_and_a_receip
         "the hub holds the whole unit"
     );
     assert!(
-        installed.ddl_lsn.iter().all(|lsn| *lsn == unit_lsn)
-            && installed.rows.iter().all(|row| row.lsn == unit_lsn)
-            && installed
-                .vectors
+        installed.ddl_lsn
+            == served
+                .ddl_lsn
                 .iter()
-                .all(|vector| vector.lsn == unit_lsn),
-        "every DDL record, row and vector carries the one unit LSN {unit_lsn:?}: {:?} / {:?} \
+                .copied()
+                .map(receiver_position)
+                .collect::<Vec<_>>()
+            && installed.rows.iter().all(|row| {
+                served
+                    .rows
+                    .iter()
+                    .find(|source| {
+                        source.table == row.table && source.values.get("id") == row.values.get("id")
+                    })
+                    .is_some_and(|source| row.lsn == receiver_position(source.lsn))
+            })
+            && installed.vectors.iter().all(|vector| {
+                served
+                    .vectors
+                    .iter()
+                    .find(|source| source.index == vector.index && source.vector == vector.vector)
+                    .is_some_and(|source| vector.lsn == receiver_position(source.lsn))
+            }),
+        "every member preserves its authored commit's ordered position inside the atomic unit ending at {unit_lsn:?}: {:?} / {:?} \
              / {:?}",
         installed.ddl_lsn,
         installed.rows.iter().map(|row| row.lsn).collect::<Vec<_>>(),
@@ -7011,6 +7063,7 @@ fn staged_accepted_delete_restamps_only_its_tombstone_and_durable_lineage() {
     let mut received_schema_copy_owner_25 =
         contextdb_engine::vector_read_memory::admission(received_schema_read_memory_25.clone());
 
+    with_received_fixture_commit_boundary!(db => {
     let stage = db
         .prepare_received_schema_stage_with_adjudication(
             Lsn(99),
@@ -7065,6 +7118,9 @@ fn staged_accepted_delete_restamps_only_its_tombstone_and_durable_lineage() {
             .delete_lsn,
         Lsn(1)
     );
+    let _fixture_decode_scope =
+        crate::read_image_memory::ImageMemory::enter_writer_operation(db.accountant.clone())
+            .unwrap();
     let records = stage
         .persistence
         .config_values
@@ -7099,6 +7155,7 @@ fn staged_accepted_delete_restamps_only_its_tombstone_and_durable_lineage() {
         .unwrap();
     assert_eq!(preserved.created_tx, unaffected_row.created_tx);
     assert_eq!(preserved.deleted_tx, unaffected_row.deleted_tx);
+    });
 }
 
 #[test]
@@ -7188,6 +7245,7 @@ fn staged_terminal_refusal_override_clears_only_matching_marker_and_scan() {
     let mut received_schema_copy_owner_26 =
         contextdb_engine::vector_read_memory::admission(received_schema_read_memory_26.clone());
 
+    with_received_fixture_commit_boundary!(db => {
     assert!(
         db.prepare_received_schema_stage_with_adjudication(
             Lsn(99),
@@ -7254,6 +7312,9 @@ fn staged_terminal_refusal_override_clears_only_matching_marker_and_scan() {
             received_schema_read_memory_27,
         )
         .unwrap();
+    let _fixture_decode_scope =
+        crate::read_image_memory::ImageMemory::enter_writer_operation(db.accountant.clone())
+            .unwrap();
     let inactive = stage
         .persistence
         .terminal_values
@@ -7302,6 +7363,7 @@ fn staged_terminal_refusal_override_clears_only_matching_marker_and_scan() {
             .read()
             .contains_key(&matching_marker_key)
     );
+    });
 }
 
 include!("authored_occurrence_delivery_tests.rs");

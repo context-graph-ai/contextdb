@@ -256,7 +256,7 @@ fn provider_inventory_refusal_preserves_owner_cursor_operation_runtime_and_cause
         refusal,
         "owner cursor pin",
         &runtime,
-        "authenticated reader snapshot registry is indeterminate",
+        "candidate reader registry is indeterminate",
     );
     drop(
         persistence

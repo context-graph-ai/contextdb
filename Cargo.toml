@@ -38,6 +38,7 @@ pest = "2.8.6"
 pest_derive = "2.8.6"
 rustyline = { version = "17.0.2", features = ["buffer-redux"] }
 tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
 rmp-serde = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
