@@ -117,7 +117,7 @@ fn a_provisional_registration_is_visible_after_data_admission_and_detaches_on_re
     let reader_path = path.clone();
     let reader_runtime = runtime.clone();
     let reader = std::thread::spawn(move || {
-        let _ = tell.send(crate::ReadSession::open_in_runtime_dir(
+        let _ = tell.send(open_with_frozen_request_clock(
             &reader_path,
             crate::ReadSessionOptions::default(),
             Some(reader_runtime),
@@ -222,7 +222,7 @@ fn assert_a_failure_under_the_data_lock_detaches_without_blocking(
     let reader_runtime = runtime.clone();
     let reader = std::thread::spawn(move || {
         let _ = tell.send(
-            crate::ReadSession::open_in_runtime_dir(
+            open_with_frozen_request_clock(
                 &reader_path,
                 crate::ReadSessionOptions::default(),
                 Some(reader_runtime),
@@ -359,7 +359,7 @@ fn a_join_during_the_last_leave_opens_once_takes_once_and_retries_never() {
     };
 
     let (_directory, path, runtime) = fixture();
-    let earlier = crate::ReadSession::open_in_runtime_dir(
+    let earlier = open_with_frozen_request_clock(
         &path,
         crate::ReadSessionOptions::default(),
         Some(runtime.clone()),
@@ -374,7 +374,7 @@ fn a_join_during_the_last_leave_opens_once_takes_once_and_retries_never() {
     let joiner_path = path.clone();
     let joiner_runtime = runtime.clone();
     let joiner = std::thread::spawn(move || {
-        let _ = tell.send(crate::ReadSession::open_in_runtime_dir(
+        let _ = tell.send(open_with_frozen_request_clock(
             &joiner_path,
             crate::ReadSessionOptions::default(),
             Some(joiner_runtime),
