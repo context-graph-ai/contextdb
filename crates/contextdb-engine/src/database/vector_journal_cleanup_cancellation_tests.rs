@@ -10,14 +10,17 @@ thread_local! {
     static CAPTURED_LAZY_CURSOR: std::cell::Cell<Option<(usize, usize, bool, bool)>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(feature = "test-seams")]
 struct BoundaryHookGuard(Option<BoundaryHook>);
 
+#[cfg(feature = "test-seams")]
 impl Drop for BoundaryHookGuard {
     fn drop(&mut self) {
         BOUNDARY_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn on_boundary(
     hook: impl FnMut(Option<&VectorPartitionGenerationCatalogRecord>) + 'static,
 ) -> BoundaryHookGuard {
@@ -41,6 +44,7 @@ pub(super) fn after_retry_for_test(catalog: &VectorPartitionGenerationCatalogRec
     });
 }
 
+#[cfg(feature = "test-seams")]
 fn pending_cleanup_fixture() -> (
     tempfile::TempDir,
     PathBuf,
@@ -60,7 +64,7 @@ fn pending_cleanup_fixture() -> (
         .unwrap(),
     );
     db.execute(
-        "CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3 SEARCH_MODE INDEXED HNSW (M = 4, EF_CONSTRUCTION = 64))",
+        "CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3 SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 16) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 16, training_iterations = 1))",
         &HashMap::new(),
     ).unwrap();
     let partitions = (0..3)
@@ -83,10 +87,12 @@ fn pending_cleanup_fixture() -> (
             .unwrap();
         }
     }
+    super::vector_public_cycle_admission_tests::native_fixture_before_publication(&db, &partitions, 16);
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         3
     );
+    super::vector_public_cycle_admission_tests::native_fixture_ready(&db, &partitions, 16);
     db.execute("UPDATE items SET v = '[0,1,0]'", &HashMap::new())
         .unwrap();
     let crashes = partitions
@@ -117,6 +123,7 @@ fn pending_cleanup_fixture() -> (
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservations() {
     let (_directory, _path, db, partitions) = pending_cleanup_fixture();
     let persistence = db.persistence.as_ref().unwrap();
@@ -183,6 +190,7 @@ fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservati
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_on_restart() {
     let (_directory, path, db, partitions) = pending_cleanup_fixture();
     let persistence = db.persistence.as_ref().unwrap();

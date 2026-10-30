@@ -41,6 +41,7 @@ fn insert(db: &Database, id: i64, scope: i64) {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
+#[cfg(feature = "test-seams")]
 fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_progress() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -64,7 +65,7 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     db.execute(
         "CREATE TABLE retry_frontier_items (id INT PRIMARY KEY, scope INT NOT NULL, \
          v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED \
-         AUTO_INDEX_AT 1 HNSW (M = 4, EF_CONSTRUCTION = 64, EF_SEARCH = 64) \
+         AUTO_INDEX_AT 1 SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 256) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 16, training_iterations = 1) \
          CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 1))",
         &HashMap::new(),
     )
@@ -74,10 +75,13 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     for id in 0..INITIAL_ROWS {
         insert(&db, id, 0);
     }
+    let native_routes = [route(0)];
+    super::vector_public_cycle_admission_tests::native_fixture_before_publication(&db, &native_routes, INITIAL_ROWS as usize);
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         1
     );
+    super::vector_public_cycle_admission_tests::native_fixture_ready(&db, &native_routes, INITIAL_ROWS as usize);
     let refusing = route(0);
     let sibling = route(1);
     let mut serving = db

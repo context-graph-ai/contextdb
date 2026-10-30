@@ -324,6 +324,7 @@ fn cold_oversized_membership_extent_refuses_before_fallback_count_decode() {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
+#[cfg(feature = "test-seams")]
 fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serving() {
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
@@ -343,7 +344,7 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     )
     .unwrap();
     db.execute(
-        "CREATE TABLE covered_retry_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED)",
+        "CREATE TABLE covered_retry_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 16) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 16, training_iterations = 1))",
         &HashMap::new(),
     )
     .unwrap();
@@ -354,10 +355,16 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
         )
         .unwrap();
     }
+    let native_routes = [VectorPartitionRef::new(
+        VectorIndexRef::new("covered_retry_items", "v"),
+        VectorPartitionKey::unpartitioned(),
+    )];
+    super::vector_public_cycle_admission_tests::native_fixture_before_publication(&db, &native_routes, 16);
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         1
     );
+    super::vector_public_cycle_admission_tests::native_fixture_ready(&db, &native_routes, 16);
     let partition = VectorPartitionRef::new(
         VectorIndexRef::new("covered_retry_items", "v"),
         VectorPartitionKey::unpartitioned(),

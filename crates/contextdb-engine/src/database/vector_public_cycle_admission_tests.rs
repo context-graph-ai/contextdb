@@ -531,7 +531,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     let copy = directory.path().join("cold.db");
     let db = Database::open(&path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3 SEARCH_MODE INDEXED HNSW (M = 4, EF_CONSTRUCTION = 64))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3 SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 16) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 16, training_iterations = 1))", &HashMap::new()).unwrap();
     for scope in 0..2 {
         for row in 0..16 {
             db.execute(
@@ -544,10 +544,16 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
             .unwrap();
         }
         if scope == 0 {
+            let native_routes = [VectorPartitionRef::new(
+                VectorIndexRef::new("items", "v"),
+                VectorPartitionKey::from_values(&[Value::Int64(0)]).unwrap(),
+            )];
+            native_fixture_before_publication(&db, &native_routes, 16);
             assert_eq!(
                 db.run_maintenance_cycle().unwrap().vector.built_partitions,
                 1
             );
+            native_fixture_ready(&db, &native_routes, 16);
         }
     }
     let route = |scope| {
@@ -1052,7 +1058,7 @@ fn public_cycle_giant_after_healthy_catalog_continues() {
 }
 #[test]
 fn public_cycle_small_unknown_invalid_catalog_does_not_quarantine() {
-    public_unknown_catalog_preserves_healthy_work(true, UnknownCatalog::Invalid);
+    public_small_unknown_invalid_native();
 }
 #[test]
 fn public_cycle_miskey_before_valid_catalog_quarantines_canonical_route() {
@@ -1778,6 +1784,8 @@ fn assert_saved_retry_publication(db: &Database) {
 }
 
 
+
+
 type RouteOutputHookForTest =
     Box<dyn FnMut(usize, usize, usize, &mut dyn FnMut() -> Result<()>) -> Result<()>>;
 thread_local! {
@@ -1996,5 +2004,317 @@ fn native_route_output_refusal_releases_partial_output_preserves_serving_and_clo
     );
     drop(_hook_scope);
     assert_serving();
+    db.close().unwrap();
+}
+
+fn native_isolation_fixture() -> (tempfile::TempDir, Database, [VectorPartitionRef; 2]) {
+    let directory = tempfile::tempdir().unwrap();
+    let db = native_fixture_open(
+        &directory.path().join("native-isolation.db"),
+        Some(64 * 1024 * 1024),
+    );
+    db.execute(
+        "CREATE TABLE native_items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3 SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 32) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 16, training_iterations = 1, calibration_samples = 1, calibration_depths = [1]))",
+        &HashMap::new(),
+    ).unwrap();
+    for scope in 0..2 {
+        for row in 0..16 {
+            db.execute(
+                "INSERT INTO native_items VALUES ($id, $scope, '[1,0,0]')",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(scope * 16 + row)),
+                    ("scope".into(), Value::Int64(scope)),
+                ]),
+            )
+            .unwrap();
+        }
+    }
+    let routes = [0, 1].map(|scope| {
+        VectorPartitionRef::new(
+            VectorIndexRef::new("native_items", "v"),
+            VectorPartitionKey::from_values(&[Value::Int64(scope)]).unwrap(),
+        )
+    });
+    native_fixture_ready(&db, &routes, 16);
+    (directory, db, routes)
+}
+
+struct NativeIsolationQueryObserver {
+    tuple: VectorPartitionKey,
+    counters: Arc<std::sync::Mutex<(usize, usize, usize)>>,
+}
+
+impl crate::vector_ivf_observations::NativeIvfSealObserver for NativeIsolationQueryObserver {
+    fn observe(&self, event: crate::vector_ivf_observations::NativeIvfSealEvent<'_>) {
+        use crate::vector_ivf_observations::NativeIvfSealEvent;
+        match event {
+            NativeIvfSealEvent::QueryExecuted {
+                index,
+                tuple,
+                indexed,
+                ..
+            } => {
+                let mut counters = self.counters.lock().unwrap();
+                if indexed
+                    && index.table == "native_items"
+                    && index.column == "v"
+                    && *tuple == self.tuple
+                {
+                    counters.0 += 1;
+                } else {
+                    counters.1 += 1;
+                }
+            }
+            NativeIvfSealEvent::PayloadWritten { .. } | NativeIvfSealEvent::HeaderSealed { .. } => {
+                self.counters.lock().unwrap().2 += 1;
+            }
+            _ => {}
+        }
+    }
+    fn before_boundary(
+        &self,
+        _: crate::vector_ivf_observations::NativeIvfFaultBoundary<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn native_isolation_answer(db: &Database, scope: i64) -> Result<Vec<Vec<Value>>> {
+    let reader = db.read_session_with_clock_for_test(
+        contextdb_core::read_contract::ReadLimits::default(),
+        Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+    )?;
+    let counters = Arc::new(std::sync::Mutex::new((0, 0, 0)));
+    let observer = Arc::new(NativeIsolationQueryObserver {
+        tuple: VectorPartitionKey::from_values(&[Value::Int64(scope)]).unwrap(),
+        counters: Arc::clone(&counters),
+    });
+    let result = crate::vector_ivf_observations::with_native_ivf_seal_observer_for_test(
+        observer,
+        || {
+            reader.execute(
+            "SELECT id FROM native_items WHERE scope = $scope ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 16",
+            &HashMap::from([("scope".into(), Value::Int64(scope))]),
+        )
+        },
+    )?;
+    assert_eq!(
+        *counters.lock().unwrap(),
+        (1, 0, 0),
+        "the public query executes the requested native indexed route with no query-time build writes"
+    );
+    let mut rows = result.rows().to_vec();
+    rows.sort_by_key(|row| match row.first() {
+        Some(Value::Int64(id)) => *id,
+        other => panic!("the indexed public answer keeps its row id: {other:?}"),
+    });
+    Ok(rows)
+}
+
+#[test]
+fn native_non_route_values_are_not_read_while_healthy_routes_keep_serving() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let (directory, db, routes) = native_isolation_fixture();
+    let before = routes
+        .each_ref()
+        .map(|route| native_fixture_serving(&db, route).unwrap());
+    let expected = [0, 1].map(|scope| native_isolation_answer(&db, scope).unwrap());
+    assert_eq!(
+        expected[0],
+        (0..16).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        expected[1],
+        (16..32)
+            .map(|id| vec![Value::Int64(id)])
+            .collect::<Vec<_>>()
+    );
+    db.with_native_ivf_fixture_write_for_test(|write| {
+        let mut controls = write
+            .open_table(TableDefinition::<&[u8], &[u8]>::new("ivf_scopes"))
+            .unwrap();
+        controls
+            .insert(
+                b"".as_slice(),
+                vec![0xff; MALFORMED_METADATA_BYTES].as_slice(),
+            )
+            .unwrap();
+        controls
+            .insert(b"\xff".as_slice(), [0xff; 32].as_slice())
+            .unwrap();
+        Ok(())
+    })
+    .unwrap();
+    db.close().unwrap();
+    drop(db);
+    let db = native_fixture_open(
+        &directory.path().join("native-isolation.db"),
+        Some(64 * 1024 * 1024),
+    );
+    native_fixture_cold_cache(&db);
+    let extent_reads = Arc::new(AtomicUsize::new(0));
+    let total = Arc::new(AtomicUsize::new(0));
+    let observed_extents = Arc::clone(&extent_reads);
+    let observed_total = Arc::clone(&total);
+    let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
+        observed_total.fetch_add(bytes, Ordering::SeqCst);
+        if bytes >= MALFORMED_METADATA_BYTES {
+            observed_extents.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let report = db.run_maintenance_cycle().unwrap().vector;
+    assert!(
+        report.first_failure.is_none(),
+        "non-route values do not refuse a declared route: {report:?}"
+    );
+    assert_eq!(report.ready_partitions, 2);
+    assert_eq!(report.remaining_partitions, 0);
+    for scope in 0..2 {
+        assert_eq!(
+            native_isolation_answer(&db, scope as i64).unwrap(),
+            expected[scope]
+        );
+        assert_eq!(
+            native_fixture_serving(&db, &routes[scope]),
+            Some(before[scope])
+        );
+    }
+    drop(observation);
+    assert_eq!(
+        extent_reads.load(Ordering::SeqCst),
+        0,
+        "no cold backend read of the orphan value extent"
+    );
+    assert!(
+        total.load(Ordering::SeqCst) < MALFORMED_METADATA_BYTES,
+        "all successful backend reads together exclude even one full orphan body read"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn native_authentic_route_control_damage_refuses_only_that_route() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    for oversized in [false, true] {
+        let (directory, db, routes) = native_isolation_fixture();
+        let sibling = native_isolation_answer(&db, 1).unwrap();
+        let sibling_descriptor = native_fixture_serving(&db, &routes[1]).unwrap();
+        let (key, control) = native_fixture_control(&db, &routes[0]);
+        db.with_native_ivf_fixture_write_for_test(|write| {
+            let damaged = vec![
+                0xff;
+                if oversized {
+                    MALFORMED_METADATA_BYTES
+                } else {
+                    control.len()
+                }
+            ];
+            write
+                .open_table(TableDefinition::<&[u8], &[u8]>::new("ivf_scopes"))
+                .unwrap()
+                .insert(key.as_slice(), damaged.as_slice())
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        db.close().unwrap();
+        drop(db);
+        let db = native_fixture_open(
+            &directory.path().join("native-isolation.db"),
+            Some(64 * 1024 * 1024),
+        );
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        assert!(
+            report.first_failure.is_some(),
+            "a damaged authentic control is refused: {report:?}"
+        );
+        for _ in 0..2 {
+            let reader = db
+                .read_session_with_clock_for_test(
+                    contextdb_core::read_contract::ReadLimits {
+                        memory: 64 * 1024 * 1024,
+                        ..Default::default()
+                    },
+                    Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+                )
+                .unwrap();
+            let result = reader.execute(
+                "SELECT id FROM native_items WHERE scope = 0 ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 16",
+                &HashMap::new(),
+            );
+            assert!(
+                matches!(result, Err(Error::StoreCorrupted { .. })),
+                "persistent route damage stays a typed refusal: {result:?}"
+            );
+            assert_eq!(native_isolation_answer(&db, 1).unwrap(), sibling);
+            assert_eq!(
+                native_fixture_serving(&db, &routes[1]),
+                Some(sibling_descriptor)
+            );
+        }
+        db.close().unwrap();
+    }
+}
+
+
+// The retained public outcome assertions are copied byte-for-byte from the
+// shared fixture; their indentation remains part of the frozen assertion bytes.
+#[rustfmt::skip]
+fn public_small_unknown_invalid_native() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let directory = tempfile::tempdir().unwrap();
+    let db = native_fixture_open(&directory.path().join("small-invalid-native.db"), Some(64 * 1024 * 1024));
+    db.execute(
+        "CREATE TABLE native_items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3 SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 32) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 16, training_iterations = 1, calibration_samples = 1, calibration_depths = [1]))",
+        &HashMap::new(),
+    ).unwrap();
+    let routes = [0, 1].map(|scope| VectorPartitionRef::new(
+        VectorIndexRef::new("native_items", "v"),
+        VectorPartitionKey::from_values(&[Value::Int64(scope)]).unwrap(),
+    ));
+    for scope in 0..2 {
+        for row in 0..16 {
+            db.execute(
+                "INSERT INTO native_items VALUES ($id, $scope, '[1,0,0]')",
+                &HashMap::from([("id".into(), Value::Int64(scope * 16 + row)), ("scope".into(), Value::Int64(scope))]),
+            ).unwrap();
+        }
+        if scope == 0 {
+            native_fixture_before_publication(&db, &routes[..1], 16);
+            assert_eq!(
+                db.run_maintenance_cycle().unwrap().vector.built_partitions,
+                1
+            );
+            native_fixture_ready(&db, &routes[..1], 16);
+        }
+    }
+    let serving = native_fixture_serving(&db, &routes[0]).unwrap();
+    native_fixture_before_publication(&db, &routes[1..], 16);
+    db.with_native_ivf_fixture_write_for_test(|write| {
+        write.open_table(TableDefinition::<&[u8], &[u8]>::new("ivf_scopes"))
+            .unwrap().insert(b"".as_slice(), [0xff; 32].as_slice()).unwrap();
+        Ok(())
+    }).unwrap();
+    db.clear_maintenance_cycle_stamp_for_test();
+    let report = db.run_maintenance_cycle().unwrap();
+    {
+        assert!(
+            report.vector.built_partitions >= 1,
+            "the independent healthy route publishes; report={report:?}"
+        );
+    }
+    assert!(db.maintenance_cycle_stamp_is_set_for_test());
+    assert_eq!(
+        db.vector_memory_ownership_receipt_for_test()
+            .temporary_workspace,
+        0
+    );
+    assert_eq!(db.accountant.underflow_count_for_test(), 0);
+    assert!(report.vector.first_failure.is_none());
+    assert_eq!(native_fixture_serving(&db, &routes[0]), Some(serving));
+    let catalog = db.native_ivf_catalog_for_test(&routes[0].index, &routes[0].partition_key).unwrap().unwrap();
+    assert!(catalog.unserviceable.is_none() && !catalog.legacy_unserviceable);
+    assert_eq!(native_isolation_answer(&db, 0).unwrap(), (0..16).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>());
+    assert_eq!(native_isolation_answer(&db, 1).unwrap(), (16..32).map(|id| vec![Value::Int64(id)]).collect::<Vec<_>>());
     db.close().unwrap();
 }
