@@ -89,62 +89,134 @@ fn open_against_silent_channel_after_first_waiter(
     runtime_root: &Path,
     after_first_waiter: impl FnOnce(),
 ) -> Result<ReadSession> {
+    type SharedResult = Arc<std::sync::Mutex<Option<Result<ReadSession>>>>;
+    enum OpeningEvent {
+        WaiterRegistered,
+        Finished(SharedResult),
+        LivenessExpired,
+    }
+    struct Watchdog {
+        cancel: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.cancel.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
     let clock = ManualDeadlineClock::at(1_000);
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    struct RegistrationRelay {
+        clock: ManualDeadlineClock,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for RegistrationRelay {
+        fn drop(&mut self) {
+            // Replacing the observer closes the relay's receiver before join.
+            drop(self.clock.observe_waiter_registrations());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let registrations = clock.observe_waiter_registrations();
+    let waiter_events = event_tx.clone();
+    let registration_relay = std::thread::spawn(move || {
+        while registrations.recv().is_ok() {
+            if waiter_events.send(OpeningEvent::WaiterRegistered).is_err() {
+                break;
+            }
+        }
+    });
+    let _registration_relay = RegistrationRelay {
+        clock: clock.clone(),
+        thread: Some(registration_relay),
+    };
+    let (cancel, cancel_rx) = std::sync::mpsc::channel();
+    let watchdog_events = event_tx.clone();
+    let watchdog = std::thread::spawn(move || {
+        if matches!(
+            cancel_rx.recv_timeout(std::time::Duration::from_secs(60)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = watchdog_events.send(OpeningEvent::LivenessExpired);
+        }
+    });
+    let _watchdog = Watchdog {
+        cancel,
+        thread: Some(watchdog),
+    };
     let opening_clock = clock.clone();
     let opening_path = path.to_path_buf();
     let opening_runtime_root = runtime_root.to_path_buf();
     let opening = std::thread::spawn(move || {
-        ReadSession::with_runtime_directory_for_test(&opening_runtime_root, || {
+        let result = ReadSession::with_runtime_directory_for_test(&opening_runtime_root, || {
             ReadSession::open_with_clock_for_test(
                 &opening_path,
                 short_route_options(),
                 Arc::new(opening_clock),
             )
-        })
+        });
+        let shared = Arc::new(std::sync::Mutex::new(Some(result)));
+        let _ = event_tx.send(OpeningEvent::Finished(shared.clone()));
+        shared
     });
 
-    // Between two deadlines route selection may do real work of any length --
-    // opening the idle file once the silent candidate has timed out -- so
-    // only the opener itself ends this wait, by registering its next deadline
-    // or by finishing. The patience never judges speed; it only turns an
-    // opener that does neither into a failure instead of a hang.
-    let patience = std::time::Duration::from_secs(60);
     let mut deadlines_driven = 0u64;
     let mut after_first_waiter = Some(after_first_waiter);
-    while deadlines_driven < 4 && !opening.is_finished() {
-        let waiting_since = std::time::Instant::now();
-        while clock.registered_waiter_count() != 1
-            && !opening.is_finished()
-            && waiting_since.elapsed() < patience
-        {
-            std::thread::yield_now();
+    let finished = loop {
+        match event_rx.recv().expect("owner route event channel closed") {
+            OpeningEvent::WaiterRegistered => {
+                if clock.registered_waiter_count() != 1 {
+                    continue;
+                }
+                if deadlines_driven >= 4 {
+                    break None;
+                }
+                if let Some(after_first_waiter) = after_first_waiter.take() {
+                    after_first_waiter();
+                }
+                deadlines_driven = deadlines_driven.saturating_add(1);
+                clock.advance_to(10_000u64.saturating_mul(deadlines_driven));
+            }
+            OpeningEvent::Finished(result) => break Some(result),
+            OpeningEvent::LivenessExpired => {
+                clock.advance_to(u64::MAX / 2);
+                opening.thread().unpark();
+                panic!("owner route event never delivered");
+            }
         }
-        if opening.is_finished() {
-            break;
-        }
-        if clock.registered_waiter_count() != 1 {
-            clock.advance_to(u64::MAX / 2);
-            opening.thread().unpark();
-            let _ = opening.join();
-            panic!(
-                "the silent owner candidate neither registered its response deadline nor finished"
-            );
-        }
-        if let Some(after_first_waiter) = after_first_waiter.take() {
-            after_first_waiter();
-        }
-        deadlines_driven = deadlines_driven.saturating_add(1);
-        clock.advance_to(10_000u64.saturating_mul(deadlines_driven));
-    }
+    };
     assert!(
         deadlines_driven > 0,
         "the silent owner candidate answered without reaching its response deadline"
     );
+    if finished.is_none() {
+        clock.advance_to(u64::MAX / 2);
+        opening.thread().unpark();
+    }
     assert!(
-        opening.is_finished(),
+        finished.is_some(),
         "route selection consumed more than the two sanctioned attempts"
     );
-    opening.join().expect("join the route-selection proof")
+    let carried = finished.expect("owner route completion never delivered");
+    let joined = opening.join().expect("join the route-selection proof");
+    assert!(
+        Arc::ptr_eq(&carried, &joined),
+        "Finished and join carry the same result"
+    );
+    let mut slot = carried.lock().expect("owner route result slot");
+    assert!(slot.is_some(), "owner route result must be present once");
+    let result = slot.take().expect("owner route result present");
+    assert!(
+        slot.is_none(),
+        "owner route result must be taken exactly once"
+    );
+    result
 }
 
 fn seed(database: &Database) {

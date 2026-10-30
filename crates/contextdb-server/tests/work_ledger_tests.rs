@@ -1636,12 +1636,11 @@ async fn canonical_worker_never_pushes_its_advertisement() {
     };
     let broker = InProcessBroker::new();
     let (hub_db, shutdown, task) = start_hub(&broker, "t-canon");
-    let push_subject = contextdb_engine::subjects::push_subject("t-canon");
     tokio::select! {
         biased;
         _ = &mut expiry => panic!("hub route registration never delivered"),
         _ = broker.wait_for_registered_route_for_test(
-            &push_subject
+            &contextdb_engine::subjects::push_subject("t-canon")
         ) => {}
     }
 

@@ -44,20 +44,50 @@ fn cargo_fixture(path: &Path, command: &str, feature: Option<&str>, args: &[&str
             .expect("contextdb root")
             .join("target/public-api-surface-fixture"),
     };
+    // Compiler completion is the setup event. Compilation can be cold, so
+    // its completion must not be judged by the executable's liveness bound.
     let mut cargo = Command::new("cargo");
     cargo
-        .arg(command)
+        .arg(if command == "run" { "build" } else { command })
         .args(["--offline", "--locked", "--quiet", "--target-dir"])
-        .arg(target)
+        .arg(&target)
         .arg("--manifest-path")
         .arg(path.join("Cargo.toml"));
     if let Some(feature) = feature {
         cargo.args(["--features", feature]);
     }
     if command == "run" {
-        cargo.arg("--").args(args);
+        cargo.arg("--message-format=json");
     }
-    bounded_command_output(cargo, "fixture cargo command")
+    let built = cargo.output().expect("fixture compilation completes");
+    if command != "run" || !built.status.success() {
+        return built;
+    }
+
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|message| {
+            let is_fixture = message.get("reason").and_then(|value| value.as_str())
+                == Some("compiler-artifact")
+                && message
+                    .get("target")
+                    .and_then(|target| target.get("name"))
+                    .and_then(|name| name.as_str())
+                    == Some("public-api-allowed");
+            is_fixture
+                .then(|| {
+                    message
+                        .get("executable")
+                        .and_then(|value| value.as_str())
+                        .map(PathBuf::from)
+                })
+                .flatten()
+        })
+        .expect("fixture build reports its executable");
+    let mut executable = Command::new(binary);
+    executable.args(args);
+    bounded_command_output(executable, "fixture executable")
 }
 
 // Observe process exit without reaping it; the owner can still kill and reap
@@ -516,8 +546,37 @@ fn database_normal_public_methods(engine: &Path) -> Vec<ImplItemFn> {
         .collect::<BTreeSet<_>>();
     let mut paths = vec![root];
     collect_rust_files(&engine.join("src/database"), &mut paths);
+    // A test-only module can be declared from a nested file using #[path].
+    // Resolve those exact files instead of treating every collected file as
+    // an unconditional production module.
+    let mut nested_gated_paths = BTreeSet::new();
+    let mut nested_public_paths = BTreeSet::new();
+    for path in &paths {
+        let source = std::fs::read_to_string(path).expect("read Database module source");
+        let file = syn::parse_file(&source).expect("parse Database module source");
+        for item in file.items {
+            let Item::Mod(module) = item else { continue; };
+            let path_attr = module.attrs.iter().find_map(|attr| {
+                let Meta::NameValue(value) = &attr.meta else { return None; };
+                if !value.path.is_ident("path") { return None; }
+                let syn::Expr::Lit(value) = &value.value else { return None; };
+                let syn::Lit::Str(value) = &value.lit else { return None; };
+                Some(value.value())
+            });
+            let Some(path_attr) = path_attr else { continue; };
+            let resolved = path.parent().expect("module parent").join(path_attr);
+            if module.attrs.iter().any(cfg_is_test_only) {
+                nested_gated_paths.insert(resolved);
+            } else {
+                nested_public_paths.insert(resolved);
+            }
+        }
+    }
+    // A second ungated module can reference the same file: keep it visible.
+    nested_gated_paths.retain(|path| !nested_public_paths.contains(path));
     paths
         .iter()
+        .filter(|path| !nested_gated_paths.contains(*path))
         .filter(|path| {
             let Ok(relative) = path.strip_prefix(engine.join("src/database")) else {
                 return true;
@@ -536,6 +595,35 @@ fn database_normal_public_methods(engine: &Path) -> Vec<ImplItemFn> {
         })
         .flat_map(|path| public_impl_methods(path, "Database"))
         .collect()
+}
+
+#[test]
+fn normal_database_inventory_keeps_ungated_nested_public_methods() {
+    let root = tempfile::tempdir().expect("inventory fixture");
+    let engine = root.path();
+    let source = engine.join("src");
+    let database = source.join("database");
+    std::fs::create_dir_all(&database).unwrap();
+    std::fs::write(source.join("database.rs"), "mod event_bus;").unwrap();
+    std::fs::write(database.join("event_bus.rs"),
+        "#[cfg(any(test, feature = \"test-seams\"))] #[path = \"test_child.rs\"] mod test_child; #[path = \"public_child.rs\"] mod public_child;").unwrap();
+    std::fs::write(database.join("test_child.rs"),
+        "impl Database { pub fn hidden_test_child(&self) {} }").unwrap();
+    std::fs::write(database.join("public_child.rs"),
+        "impl Database { pub fn visible_public_child(&self) {} }").unwrap();
+    let names = method_names(&database_normal_public_methods(engine));
+    assert_eq!(names, BTreeSet::from(["visible_public_child".to_string()]));
+    // The ordinary frozen equality must reject this new public method.
+    assert_ne!(names, BTreeSet::new());
+    // Even a file also referenced by a gated module remains visible when an
+    // ungated declaration references it as well.
+    std::fs::write(database.join("event_bus.rs"),
+        "#[cfg(any(test, feature = \"test-seams\"))] #[path = \"test_child.rs\"] mod test_child; #[path = \"test_child.rs\"] mod public_alias; #[path = \"public_child.rs\"] mod public_child;").unwrap();
+    let names = method_names(&database_normal_public_methods(engine));
+    assert_eq!(names, BTreeSet::from([
+        "hidden_test_child".to_string(),
+        "visible_public_child".to_string(),
+    ]));
 }
 
 fn collect_rust_files(directory: &Path, paths: &mut Vec<PathBuf>) {
@@ -732,7 +820,7 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         !method_mentions(safe_client_new, "ReadMemoryBudget")
             && method_mentions(safe_client_new, "Result")
             && safe_client_new.sig.inputs.len() == 3
-            && method_mentions(explicit_client_new, "ReadMemoryBudget")
+            && method_mentions(explicit_client_new, "ReadMemoryOwner")
             && method_mentions(explicit_client_new, "Result")
             && explicit_client_new.sig.inputs.len() == 4,
         "the client keeps its original constructor inputs and requires a read owner only on the host variant"
