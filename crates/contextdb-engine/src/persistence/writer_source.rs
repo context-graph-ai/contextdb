@@ -273,6 +273,39 @@ pub(crate) fn native_snapshot_control_bytes() -> Result<usize> {
     .ok_or_else(|| Error::Other("writer publication control size overflow".into()))
 }
 
+/// The control of a root published through an exact prepared read that holds
+/// `slots` slots of the root registry array.
+fn exact_writer_root_control_bytes(slots: usize) -> Option<usize> {
+    contextdb_tx::native_capture::NativeCapture::allocation_bytes::<
+        WriterSnapshot,
+        OwnedMemoryReservation,
+    >()?
+    .checked_add(redb::PreparedWrite::<PreparedWriterSnapshot>::control_bytes())
+    .and_then(|n| {
+        n.checked_add(std::mem::size_of::<
+            crate::persistent_store::PreparedQueueSourceLink<'_>,
+        >())
+    })
+    .and_then(|n| n.checked_add(slots.checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?))
+}
+
+/// The control of an owned-host published root that holds `slots` slots of
+/// the root registry array.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn owned_writer_root_control_bytes(slots: usize) -> Result<usize> {
+    native_snapshot_control_bytes()?
+        .checked_add(
+            contextdb_tx::staged_source::source_arc_layout::<redb::ReadTransaction>().size(),
+        )
+        .and_then(|bytes| {
+            bytes.checked_add(slots.checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?)
+        })
+        .ok_or_else(|| Error::Other("writer publication control size overflow".into()))
+}
+
 /// An admitted durable descriptor prepared before the transaction manager's
 /// publication swap. Only capture_published_read captures statement roots.
 pub(crate) struct WriterSnapshot {
@@ -959,28 +992,51 @@ impl RedbPersistence {
         control: &mut Option<OwnedMemoryReservation>,
     ) -> PreparedWriterSnapshot {
         let accountant = original.accountant().clone();
-        let root = WriterSnapshotHandle::native(
-            WriterSnapshot {
-                read: parking_lot::RwLock::new(None),
-                identity,
-                active: std::sync::atomic::AtomicBool::new(false),
-                custody_groups_complete,
-                snapshot,
-                lsn,
-                accountant,
-                _control: WriterSnapshotControl::empty(),
-                native_ivf_cache: self.native_ivf_cache.fork(),
-                erasure: parking_lot::RwLock::new(WriterErasure::default()),
-                schema,
-                registry: Arc::clone(&self.writer_snapshots),
-            },
-            control.take().expect("original prepaid descriptor"),
-        );
+        let descriptor = WriterSnapshot {
+            read: parking_lot::RwLock::new(None),
+            identity,
+            active: std::sync::atomic::AtomicBool::new(false),
+            custody_groups_complete,
+            snapshot,
+            lsn,
+            accountant,
+            _control: WriterSnapshotControl::empty(),
+            native_ivf_cache: self.native_ivf_cache.fork(),
+            erasure: parking_lot::RwLock::new(WriterErasure::default()),
+            schema,
+            registry: Arc::clone(&self.writer_snapshots),
+        };
+        let mut control = control.take().expect("original prepaid descriptor");
+        let own_bytes = exact_writer_root_control_bytes(1)
+            .expect("one registry slot prices within the admitted control");
         let mut roots = self.writer_snapshots.lock();
-        roots.retain(|root| root.strong_count() != 0);
-        roots.reserve_exact(1);
+        Self::reserve_registry_slot(&mut roots, &mut control, own_bytes);
+        let root = WriterSnapshotHandle::native(descriptor, control);
         roots.push(root.downgrade());
         PreparedWriterSnapshot { root }
+    }
+
+    /// Make room in the root registry for one more root, and keep out of the
+    /// new root's control only `own_bytes`, its price with its own slot. The
+    /// control was admitted for the whole array the push may reallocate
+    /// (every root registered at admission plus this one), so the
+    /// reallocation is paid before it happens. Once it has happened the array
+    /// holds one slot per live root, each paid by its own root, so the rest is
+    /// returned here. Before this, a
+    /// root published while other roots were live kept paying for their slots
+    /// after they retired: on the owned host a durable write inside a
+    /// transaction left 32 bytes charged past ROLLBACK for the transaction's
+    /// retired root.
+    fn reserve_registry_slot(
+        roots: &mut Vec<WriterSnapshotWeak>,
+        control: &mut OwnedMemoryReservation,
+        own_bytes: usize,
+    ) {
+        roots.retain(|root| root.strong_count() != 0);
+        roots.shrink_to_fit();
+        roots.reserve_exact(1);
+        let surplus = control.bytes().saturating_sub(own_bytes);
+        crate::memory_accounting::release_preparation_original(control, surplus);
     }
 
     /// Exact read-preparation endpoint. The consuming write mints the identity;
@@ -1018,25 +1074,9 @@ impl RedbPersistence {
             let slots = self.writer_snapshots.lock().len().checked_add(1).ok_or(
                 PreparedReadCause::EngineStatic("writer registry size overflow"),
             )?;
-            let bytes = contextdb_tx::native_capture::NativeCapture::allocation_bytes::<
-                WriterSnapshot,
-                OwnedMemoryReservation,
-            >()
-            .ok_or(PreparedReadCause::EngineStatic(
-                "writer publication control size overflow",
-            ))?
-            .checked_add(redb::PreparedWrite::<PreparedWriterSnapshot>::control_bytes())
-            .and_then(|n| {
-                n.checked_add(std::mem::size_of::<
-                    crate::persistent_store::PreparedQueueSourceLink<'_>,
-                >())
-            })
-            .and_then(|n| {
-                n.checked_add(slots.checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?)
-            })
-            .ok_or(PreparedReadCause::EngineStatic(
-                "writer publication control size overflow",
-            ))?;
+            let bytes = exact_writer_root_control_bytes(slots).ok_or(
+                PreparedReadCause::EngineStatic("writer publication control size overflow"),
+            )?;
             let credit = scope
                 .reserve_prepared_control(bytes)
                 .map_err(PreparedReadCause::Refused)?;
@@ -1292,26 +1332,25 @@ impl RedbPersistence {
             };
             read.release_optional_root_cache();
             let read = Arc::new(read);
-            let root = WriterSnapshotHandle::native(
-                WriterSnapshot {
-                    read: parking_lot::RwLock::new(Some(read)),
-                    identity,
-                    active: std::sync::atomic::AtomicBool::new(true),
-                    custody_groups_complete,
-                    snapshot,
-                    lsn,
-                    accountant,
-                    _control: WriterSnapshotControl::empty(),
-                    native_ivf_cache: self.native_ivf_cache.fork(),
-                    erasure: parking_lot::RwLock::new(WriterErasure::default()),
-                    schema,
-                    registry: Arc::clone(&self.writer_snapshots),
-                },
-                control,
-            );
+            let descriptor = WriterSnapshot {
+                read: parking_lot::RwLock::new(Some(read)),
+                identity,
+                active: std::sync::atomic::AtomicBool::new(true),
+                custody_groups_complete,
+                snapshot,
+                lsn,
+                accountant,
+                _control: WriterSnapshotControl::empty(),
+                native_ivf_cache: self.native_ivf_cache.fork(),
+                erasure: parking_lot::RwLock::new(WriterErasure::default()),
+                schema,
+                registry: Arc::clone(&self.writer_snapshots),
+            };
+            let mut control = control;
+            let own_bytes = owned_writer_root_control_bytes(1)?;
             let mut roots = self.writer_snapshots.lock();
-            roots.retain(|root| root.strong_count() != 0);
-            roots.reserve_exact(1);
+            Self::reserve_registry_slot(&mut roots, &mut control, own_bytes);
+            let root = WriterSnapshotHandle::native(descriptor, control);
             roots.push(root.downgrade());
             drop(roots);
             // Admit the lease while its original native view protects the pages.

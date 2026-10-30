@@ -611,23 +611,17 @@ impl RedbPersistence {
     ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
         self.prepare_proof_owner()?;
         let _schema = self.prepared_writer_schema()?;
+        // Admitted for the whole registry array the publication's push may
+        // reallocate; the root keeps only its own slot once it is registered.
+        let slots = self
+            .writer_snapshots
+            .lock()
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("writer publication control size overflow".into()))?;
         crate::memory_accounting::reserve_preparation_from_original(
             original,
-            writer_source::native_snapshot_control_bytes()?
-                .checked_add(
-                    contextdb_tx::staged_source::source_arc_layout::<redb::ReadTransaction>()
-                        .size(),
-                )
-                .and_then(|bytes| {
-                    bytes.checked_add(
-                        self.writer_snapshots
-                            .lock()
-                            .len()
-                            .checked_add(1)?
-                            .checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?,
-                    )
-                })
-                .ok_or_else(|| Error::Other("writer publication control size overflow".into()))?,
+            writer_source::owned_writer_root_control_bytes(slots)?,
             "writer_source",
             "published_root",
             "Raise MEMORY_LIMIT to admit the published writer root.",

@@ -1165,6 +1165,15 @@ impl Database {
         working
             .maintenance_caller_driven
             .store(true, Ordering::SeqCst);
+        // The fallible reader setup runs before any stage credit moves, so a
+        // reader refusal leaves the reservation whole. Its child is a reader
+        // control funded outside the scope; it is released after the scope
+        // ends, so it never returns as stage credit.
+        #[cfg(test)]
+        super::statement_execution::local_schema_test_seams::preparation_fault_at(
+            super::statement_execution::local_schema_test_seams::PreparationFault::ReaderSetup,
+        )?;
+        let read_memory = working.declared_reader_memory()?;
         let hold = ledger.hold;
         let scope = reservation.enter_spend_scope(hold, &mut ledger.spend)?;
         // The image's retained-state owner returns its metadata fold when it
@@ -1187,8 +1196,18 @@ impl Database {
             crate::memory_accounting::RESERVATION_SPEND_OPERATION,
             "Reduce the schema transaction size or raise MEMORY_LIMIT before retrying.",
         )?;
+        // Until the table image holds the fold, this guard owns it: any
+        // failure before the tables are installed returns the drawn fold to
+        // the stage credit, inside the still-live scope.
+        let mut fold = PreadmittedMetadataFold {
+            accountant: &working.finalization.accountant,
+            bytes: metadata_bytes,
+        };
+        #[cfg(test)]
+        super::statement_execution::local_schema_test_seams::preparation_fault_at(
+            super::statement_execution::local_schema_test_seams::PreparationFault::AfterFoldBeforeTables,
+        )?;
         let metadata = self.relational_store.table_meta.read().clone();
-        let read_memory = working.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         for (table, meta) in &metadata {
             working.relational_store.create_table(table, meta.clone());
@@ -1208,6 +1227,10 @@ impl Database {
                 }
             }
         }
+        // The table image now holds the fold; its retained-state owner
+        // returns it when the image drops.
+        fold.transfer_to_image();
+        drop(fold);
         // The admitted fold must be exactly what the image now holds, or its
         // drop would refund a different figure than the stage paid.
         let held_bytes =
@@ -1240,11 +1263,14 @@ impl Database {
             }
         }
         #[cfg(test)]
-        super::statement_execution::local_schema_test_seams::preparation_fault()?;
-        // Every helper that admitted out of the scope returns inside it.
+        super::statement_execution::local_schema_test_seams::preparation_fault_at(
+            super::statement_execution::local_schema_test_seams::PreparationFault::AfterRegistration,
+        )?;
+        // Every helper that admitted out of the scope returns inside it; the
+        // reader child, funded before the scope, is released after it.
         drop(vector_copy_owner);
-        drop(read_memory);
         drop(scope);
+        drop(read_memory);
         Ok(working)
     }
 
@@ -6973,4 +6999,26 @@ pub(super) fn received_schema_requires_durable_receiver() -> Error {
         "received schema stages require a durable receiver; this database has no durable store"
             .into(),
     )
+}
+
+/// The local schema image's metadata fold between its draw from the stage
+/// credit and the moment the table image holds it. Dropped while it still owns
+/// the fold (a failure before the tables are installed), it returns the fold;
+/// inside the live spend scope that restores the stage credit it came from.
+struct PreadmittedMetadataFold<'a> {
+    accountant: &'a crate::memory_accounting::AccountantHandle,
+    bytes: usize,
+}
+
+impl PreadmittedMetadataFold<'_> {
+    /// The table image now holds the fold and returns it when it drops.
+    fn transfer_to_image(&mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for PreadmittedMetadataFold<'_> {
+    fn drop(&mut self) {
+        self.accountant.release(std::mem::take(&mut self.bytes));
+    }
 }

@@ -257,23 +257,8 @@ mod local_schema_stage_accounting {
         );
         db.set_memory_limit(before.limit).unwrap();
         db.execute("ROLLBACK", &EMPTY()).unwrap();
-        assert_settled_after_refused_reservation(db, outer, tx, host, &format!("{host:?} after rollback"));
+        assert_settled(db, outer, tx, &format!("{host:?} after rollback"));
         assert!(db.table_meta("refused_stage").is_none());
-    }
-
-    /// After ROLLBACK both deltas are 0 from before BEGIN. On the owned host a
-    /// refused Original preparation (`reserve_original_preparation_for`, the
-    /// transaction host's own code, outside the stage) keeps 32 bytes past
-    /// ROLLBACK; that pre-existing owned-host defect is reported separately,
-    /// so after such a refusal only the stage's absence is asserted there.
-    fn assert_settled_after_refused_reservation(db: &Database, outer: Base, tx: TxId, host: Host, what: &str) {
-        match host {
-            Host::Legacy => assert_settled(db, outer, tx, what),
-            Host::Owned => assert!(
-                db.local_schema_stage_ledger_for_test(tx).is_none(),
-                "{what}: no local schema stage is pending"
-            ),
-        }
     }
 
     // Test 2, owned host. The Legacy host is the integration fixture
@@ -511,7 +496,7 @@ mod local_schema_stage_accounting {
         assert_eq!(deltas(db, limited), first_deltas, "{host:?}: both deltas unchanged");
         db.set_memory_limit(before.limit).unwrap();
         db.execute("ROLLBACK", &EMPTY()).unwrap();
-        assert_settled_after_refused_reservation(db, outer, tx, host, &format!("{host:?} after rollback"));
+        assert_settled(db, outer, tx, &format!("{host:?} after rollback"));
     }
 
     #[test]
@@ -955,13 +940,115 @@ mod local_schema_stage_accounting {
         failed_preparation(Host::Owned);
     }
 
-    // Test 11. The autocommit database is opened only after the transactional
-    // one has been measured and dropped, so their windows never overlap. Both
-    // start from the same schema, reached the same way: one prior
-    // transactional schema commit. (The owned host builds a one-time 116-byte
-    // structure at its first transactional schema commit; every later commit
-    // retains the same as autocommit. The warm-up keeps that one-time cost out
-    // of the comparison on both hosts.)
+    /// A committed schema with automatic, declared and foreign-key indexes,
+    /// so the image's metadata fold is nonzero.
+    const POPULATED: [&str; 4] = [
+        "CREATE TABLE parents (id UUID PRIMARY KEY, name TEXT UNIQUE)",
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id), body TEXT)",
+        "CREATE INDEX children_body ON children (body)",
+        "CREATE TABLE notes (id UUID PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b))",
+    ];
+
+    /// The fold the image draws for the live schema: each table's
+    /// `estimated_bytes`, since the image store is not disk-backed.
+    fn image_fold_bytes(db: &Database) -> usize {
+        db.relational_store
+            .table_meta
+            .read()
+            .values()
+            .map(|meta| meta.estimated_bytes())
+            .sum()
+    }
+
+    // A refusal at the two preparation boundaries the stage crosses before
+    // its image holds the fold: the image's reader setup, which now runs
+    // before any stage credit moves, and the point just after the fold is
+    // drawn and before the tables hold it. Each returns the reader refusal,
+    // leaves no stage, and both counters exactly as they were after BEGIN;
+    // the transaction then stages a statement normally.
+    fn preparation_boundary_refusal(host: Host, at: seams::PreparationFault) {
+        let fixture = open_host(host);
+        let db = &fixture.db;
+        for sql in POPULATED {
+            db.execute(sql, &EMPTY()).unwrap();
+        }
+        let fold = image_fold_bytes(db);
+        assert!(fold > 0, "{host:?}: the populated schema has a metadata fold");
+        let outer = base(db);
+        let (tx, before) = begin(db);
+        records::take_draws();
+        seams::arm_preparation_fault_at(at);
+        let error = db
+            .execute("CREATE TABLE never_prepared (id UUID PRIMARY KEY)", &EMPTY())
+            .expect_err("the armed boundary refuses the preparation");
+        assert_eq!(
+            error.to_string(),
+            seams::injected_reader_refusal().to_string(),
+            "{host:?} {at:?}: the reader refusal"
+        );
+        let draws = records::take_draws();
+        match at {
+            seams::PreparationFault::ReaderSetup => assert!(
+                draws.is_empty(),
+                "{host:?}: no stage credit moved before the reader setup: {draws:?}"
+            ),
+            seams::PreparationFault::AfterFoldBeforeTables => assert_eq!(
+                draws,
+                vec![(0, fold)],
+                "{host:?}: exactly the fold was drawn before the refusal"
+            ),
+            seams::PreparationFault::AfterRegistration => unreachable!(),
+        }
+        assert_settled(db, before, tx, &format!("{host:?} {at:?}: every admitted byte returned"));
+        assert!(db.table_meta("never_prepared").is_none());
+        // The transaction is still usable: the next statement stages a fresh
+        // image with the full fold and the ledger equation holds.
+        db.execute(STATEMENTS[0], &EMPTY()).unwrap();
+        let staged = ledger(db, before, "after the refused preparation");
+        assert!(staged.payload >= fold, "{host:?}: the new image holds the fold");
+        db.execute("ROLLBACK", &EMPTY()).unwrap();
+        assert_settled(db, outer, tx, &format!("{host:?} {at:?} after rollback"));
+        assert!(db.table_meta("authored_migration").is_none());
+    }
+
+    #[test]
+    fn local_schema_reader_setup_refusal_refunds_every_byte_on_the_legacy_host() {
+        preparation_boundary_refusal(Host::Legacy, seams::PreparationFault::ReaderSetup);
+    }
+
+    #[test]
+    fn local_schema_reader_setup_refusal_refunds_every_byte_on_the_owned_host() {
+        preparation_boundary_refusal(Host::Owned, seams::PreparationFault::ReaderSetup);
+    }
+
+    #[test]
+    fn local_schema_refusal_after_the_fold_returns_it_on_the_legacy_host() {
+        preparation_boundary_refusal(Host::Legacy, seams::PreparationFault::AfterFoldBeforeTables);
+    }
+
+    #[test]
+    fn local_schema_refusal_after_the_fold_returns_it_on_the_owned_host() {
+        preparation_boundary_refusal(Host::Owned, seams::PreparationFault::AfterFoldBeforeTables);
+    }
+
+    /// The owned host's commit-event stage map: its live stages, capacity,
+    /// held bytes and the plan price of that capacity. The Legacy host has no
+    /// such map.
+    fn commit_event_stage_map(db: &Database) -> (usize, usize, usize, usize) {
+        match &db.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => {
+                handle.with_host(|host| host.events.stage_map_for_test())
+            }
+            DatabaseTransactionHost::Legacy(_) => (0, 0, 0, 0),
+        }
+    }
+
+    // Test 11, warmed. The autocommit database is opened only after the
+    // transactional one has been measured and dropped, so their windows never
+    // overlap. Both start from the same schema, reached the same way: one
+    // prior transactional schema commit, which builds the owned host's one
+    // retained first-commit owner (the cold test below prices it). On that
+    // common state a later commit retains exactly what autocommit retains.
     fn warmed(host: Host) -> Fixture {
         let fixture = open_host(host);
         fixture.db.execute("BEGIN", &EMPTY()).unwrap();
@@ -1004,6 +1091,101 @@ mod local_schema_stage_accounting {
             db.finalization.accountant.usage().used,
             "{host:?}: live used equals the autocommit database's"
         );
+    }
+
+    const REPEATED: [&str; 3] = [
+        "CREATE TABLE repeated_0 (id UUID PRIMARY KEY, body TEXT)",
+        "CREATE TABLE repeated_1 (id UUID PRIMARY KEY, body TEXT)",
+        "CREATE TABLE repeated_2 (id UUID PRIMARY KEY, body TEXT)",
+    ];
+
+    // Test 11, cold. The first transactional schema commit on a fresh
+    // database retains exactly what the same DDL in autocommit retains, plus
+    // one named owner: on the owned host, the commit-event stage map's first
+    // capacity. The map is created empty, and the first ordinary owned commit,
+    // which autocommit DDL never takes, grows it to hold a stage and keeps that
+    // capacity (the smallest map the plan builds). Legacy has no such map, so
+    // its equation has no extra term.
+    // Three more transactional commits then each retain exactly what the same
+    // DDL retains in autocommit, and the map neither grows nor keeps a stage,
+    // so the owner is paid once and never accumulates.
+    fn cold_commit_matches_autocommit(host: Host) {
+        let (transactional_used, transactional, owner, repeated) = {
+            let fixture = open_host(host);
+            let db = &fixture.db;
+            let outer = base(db);
+            assert_eq!(
+                commit_event_stage_map(db),
+                (0, 0, 0, 0),
+                "{host:?}: the stage map holds nothing before the first ordinary commit"
+            );
+            let (tx, _) = run_growth(db);
+            db.execute("COMMIT", &EMPTY()).unwrap();
+            assert!(db.local_schema_stage_ledger_for_test(tx).is_none());
+            let committed = deltas(db, outer);
+            let committed_used = db.finalization.accountant.usage().used;
+            assert_eq!(committed.1, committed.0, "{host:?}: the aggregate delta equals the live delta");
+            let (stages, capacity, held, priced) = commit_event_stage_map(db);
+            assert_eq!(stages, 0, "{host:?}: the committed stage left the map");
+            assert_eq!(held, priced, "{host:?}: the map holds exactly its capacity's price");
+            match host {
+                Host::Legacy => assert_eq!(capacity, 0, "Legacy has no commit-event stage map"),
+                Host::Owned => {
+                    assert!(capacity >= 1, "the first commit grows the map to hold one stage");
+                    assert!(held > 0, "that capacity is a priced owner");
+                }
+            }
+            let mut repeated = Vec::new();
+            for sql in REPEATED {
+                let before = base(db);
+                db.execute("BEGIN", &EMPTY()).unwrap();
+                db.execute(sql, &EMPTY()).unwrap();
+                db.execute("COMMIT", &EMPTY()).unwrap();
+                repeated.push(deltas(db, before));
+                assert_eq!(
+                    commit_event_stage_map(db),
+                    (0, capacity, held, priced),
+                    "{host:?}: a later commit neither grows the map nor leaves a stage in it"
+                );
+            }
+            (committed_used, committed, held, repeated)
+        };
+        let fixture = open_host(host);
+        let db = &fixture.db;
+        let before = base(db);
+        for sql in STATEMENTS {
+            db.execute(sql, &EMPTY()).unwrap();
+        }
+        let autocommit = deltas(db, before);
+        assert_eq!(
+            transactional,
+            (autocommit.0 + owner as i128, autocommit.1 + owner as i128),
+            "{host:?}: the first transactional commit = autocommit + the stage map's first capacity ({owner} bytes)"
+        );
+        assert_eq!(
+            transactional_used,
+            db.finalization.accountant.usage().used + owner,
+            "{host:?}: live used = the autocommit database's + the stage map's first capacity"
+        );
+        for (index, sql) in REPEATED.iter().enumerate() {
+            let before = base(db);
+            db.execute(sql, &EMPTY()).unwrap();
+            assert_eq!(
+                repeated[index],
+                deltas(db, before),
+                "{host:?}: repeated commit {index} retains exactly what autocommit retains"
+            );
+        }
+    }
+
+    #[test]
+    fn local_schema_first_commit_matches_autocommit_plus_its_named_owner_on_the_legacy_host() {
+        cold_commit_matches_autocommit(Host::Legacy);
+    }
+
+    #[test]
+    fn local_schema_first_commit_matches_autocommit_plus_its_named_owner_on_the_owned_host() {
+        cold_commit_matches_autocommit(Host::Owned);
     }
 
     #[test]

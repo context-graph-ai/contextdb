@@ -4479,8 +4479,19 @@ pub(super) mod local_schema_test_seams {
 
     static STATEMENT_FAULT: std::sync::Mutex<Option<LocalSchemaStatementFault>> =
         std::sync::Mutex::new(None);
-    static PREPARATION_FAULT: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static PREPARATION_FAULT: std::sync::Mutex<Option<PreparationFault>> =
+        std::sync::Mutex::new(None);
+
+    /// Where a fault inside `detached_local_schema_working_database` fires.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PreparationFault {
+        /// At the image's reader setup, before any stage credit moves.
+        ReaderSetup,
+        /// After the metadata fold is drawn, before the tables hold it.
+        AfterFoldBeforeTables,
+        /// After the controls, the fold and every registration.
+        AfterRegistration,
+    }
     static SCOPE_PROBE: std::sync::Mutex<Option<ScopeProbeFn>> = std::sync::Mutex::new(None);
 
     /// What a probe sees from inside a real statement's spend scope.
@@ -4541,7 +4552,11 @@ pub(super) mod local_schema_test_seams {
     }
 
     pub(crate) fn arm_preparation_fault() {
-        PREPARATION_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+        arm_preparation_fault_at(PreparationFault::AfterRegistration);
+    }
+
+    pub(crate) fn arm_preparation_fault_at(fault: PreparationFault) {
+        *PREPARATION_FAULT.lock().expect("fault lock") = Some(fault);
     }
 
     pub(crate) fn arm_scope_probe(probe: impl FnOnce(&ScopeProbe<'_, '_>) + Send + 'static) {
@@ -4573,12 +4588,32 @@ pub(super) mod local_schema_test_seams {
         }
     }
 
-    pub(in crate::database) fn preparation_fault() -> Result<()> {
-        if PREPARATION_FAULT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Err(Error::Other(
-                "injected local schema preparation fault after controls and fold".into(),
-            ));
+    /// The reader refusal the image's reader setup returns when the declared
+    /// reader memory cannot admit its child control.
+    pub(crate) fn injected_reader_refusal() -> Error {
+        Error::MemoryBudgetExceeded {
+            subsystem: "reader".into(),
+            operation: "request_owner".into(),
+            requested_bytes: 1,
+            available_bytes: 0,
+            budget_limit_bytes: 0,
+            hint: "injected reader setup refusal".into(),
         }
-        Ok(())
+    }
+
+    pub(in crate::database) fn preparation_fault_at(at: PreparationFault) -> Result<()> {
+        let mut armed = PREPARATION_FAULT.lock().expect("fault lock");
+        if *armed != Some(at) {
+            return Ok(());
+        }
+        *armed = None;
+        match at {
+            PreparationFault::AfterRegistration => Err(Error::Other(
+                "injected local schema preparation fault after controls and fold".into(),
+            )),
+            PreparationFault::ReaderSetup | PreparationFault::AfterFoldBeforeTables => {
+                Err(injected_reader_refusal())
+            }
+        }
     }
 }
