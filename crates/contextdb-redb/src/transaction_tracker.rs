@@ -584,6 +584,8 @@ impl TransactionTracker {
         let mut state = self.state.lock().unwrap();
         while state.live_write_transaction.is_some() {
             state.waiting_write_transactions += 1;
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::note_writer_queued_for_test();
             state = self.live_write_transaction_available.wait(state).unwrap();
             state.waiting_write_transactions -= 1;
         }

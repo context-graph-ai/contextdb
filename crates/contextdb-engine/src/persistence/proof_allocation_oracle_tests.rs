@@ -10,7 +10,7 @@ use serial_test::serial;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 struct MeasuredAllocator;
 // Measurement is scoped to the THREAD under test, not to the process. A
@@ -1973,26 +1973,30 @@ fn a_cross_thread_free_is_attributed_only_to_its_allocation_window() {
 #[test]
 #[serial]
 fn the_allocation_oracle_measures_only_the_thread_under_test() {
-    let running = Arc::new(AtomicBool::new(true));
-    let neighbour = {
-        let running = Arc::clone(&running);
-        std::thread::spawn(move || {
-            let mut held: Vec<Vec<u8>> = Vec::new();
-            while running.load(AtomicOrdering::SeqCst) {
-                held.push(vec![0u8; 1024 * 1024]);
-                if held.len() > 8 {
-                    held.clear();
-                }
-                std::thread::yield_now();
-            }
-        })
-    };
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
+    let (allocated_tx, allocated_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let neighbour = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("measurement start never delivered");
+        let held = vec![0u8; 2 * 1024 * 1024];
+        std::hint::black_box(&held);
+        allocated_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("allocation release never delivered");
+        std::hint::black_box(&held);
+    });
     let ((), peak, _) = measured(|| {
         let small = vec![0u8; 4096];
         std::hint::black_box(&small);
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        start_tx.send(()).unwrap();
+        allocated_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("neighbour allocation never delivered");
+        release_tx.send(()).unwrap();
     });
-    running.store(false, AtomicOrdering::SeqCst);
     neighbour.join().expect("the neighbour thread finishes");
     assert!(
         peak < 1024 * 1024,

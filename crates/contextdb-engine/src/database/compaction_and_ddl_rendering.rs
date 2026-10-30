@@ -1073,12 +1073,66 @@ pub(super) fn max_lsn_across_all(relational: &RelationalStore, graph: &GraphStor
 /// maxima, which is the highest-index (last-stored) equal-`lsn` entry here.
 #[cfg(test)]
 pub(super) fn resolve_tombstone(versions: &[(Lsn, TxId)], threshold: Lsn) -> Option<TxId> {
-    let boundary = versions.partition_point(|(lsn, _)| *lsn < threshold);
+    let boundary = versions.partition_point(|(lsn, _)| {
+        #[cfg(feature = "test-seams")]
+        count_reconstruction_work_for_test(|work| work.delete_version_probes += 1);
+        *lsn < threshold
+    });
     if boundary == 0 {
         None
     } else {
         Some(versions[boundary - 1].1)
     }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+#[derive(Clone, Copy, Default)]
+pub(super) struct ReconstructionWorkForTest {
+    pub(super) row_examinations: usize,
+    pub(super) tombstone_insertions: usize,
+    pub(super) delete_version_probes: usize,
+    pub(super) index_insertions: usize,
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+impl ReconstructionWorkForTest {
+    pub(super) fn total(self) -> usize {
+        self.row_examinations
+            + self.tombstone_insertions
+            + self.delete_version_probes
+            + self.index_insertions
+    }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+thread_local! {
+    static RECONSTRUCTION_WORK: std::cell::Cell<ReconstructionWorkForTest> = const {
+        std::cell::Cell::new(ReconstructionWorkForTest {
+            row_examinations: 0,
+            tombstone_insertions: 0,
+            delete_version_probes: 0,
+            index_insertions: 0,
+        })
+    };
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+pub(super) fn reconstruction_work_reset_for_test() {
+    RECONSTRUCTION_WORK.with(|work| work.set(ReconstructionWorkForTest::default()));
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+pub(super) fn reconstruction_work_for_test() -> ReconstructionWorkForTest {
+    RECONSTRUCTION_WORK.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+fn count_reconstruction_work_for_test(update: impl FnOnce(&mut ReconstructionWorkForTest)) {
+    RECONSTRUCTION_WORK.with(|work| {
+        let mut current = work.get();
+        update(&mut current);
+        work.set(current);
+    });
 }
 
 /// Reconstructs the `Lsn -> TxId` commit index from the live stores plus the
@@ -1099,6 +1153,8 @@ pub(super) fn commit_index_across_all(
     let mut index = BTreeMap::new();
     let mut add_entry = |lsn: Lsn, tx: TxId| {
         if lsn != Lsn(0) {
+            #[cfg(feature = "test-seams")]
+            count_reconstruction_work_for_test(|work| work.index_insertions += 1);
             index
                 .entry(lsn)
                 .and_modify(|current: &mut TxId| *current = (*current).max(tx))
@@ -1113,8 +1169,12 @@ pub(super) fn commit_index_across_all(
     let mut row_tombstones: RowTombstoneIndex = HashMap::new();
     for (table, rows) in relational_tables.iter() {
         for row in rows {
+            #[cfg(feature = "test-seams")]
+            count_reconstruction_work_for_test(|work| work.row_examinations += 1);
             add_entry(row.lsn, row.created_tx);
             if let Some(deleted_tx) = row.deleted_tx {
+                #[cfg(feature = "test-seams")]
+                count_reconstruction_work_for_test(|work| work.tombstone_insertions += 1);
                 row_tombstones
                     .entry(table.as_str())
                     .or_default()

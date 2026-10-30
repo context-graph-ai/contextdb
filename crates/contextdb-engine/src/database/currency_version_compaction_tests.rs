@@ -1286,7 +1286,7 @@ fn debris_corpus_acceptance_shrinks_debris_ledger() {
 fn installing_the_ledger_starts_maintenance_and_it_auto_heals() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("fabric-ledger.db");
-    let db = Database::open(&path).expect("open");
+    let db = Arc::new(Database::open(&path).expect("open"));
     // Fresh DB with no eligible tables yet: no thread.
     assert!(
         !db.__maintenance_thread_running(),
@@ -1303,6 +1303,10 @@ fn installing_the_ledger_starts_maintenance_and_it_auto_heals() {
     // Preserve the accumulated-version precondition before the measured
     // background work is released at the fast test cadence below.
     db.__set_currency_maintenance_interval(Duration::from_secs(3600));
+    let worker_clock = db
+        .__hold_engine_owned_vector_maintenance_clock_for_test()
+        .expect("hold maintenance worker clock");
+    let baseline_wakes = db.__maintenance_wakes();
     for advertised_at in 1..=200 {
         crate::work_ledger::advertise_capability(
             &db,
@@ -1315,23 +1319,31 @@ fn installing_the_ledger_starts_maintenance_and_it_auto_heals() {
     }
     assert_eq!(durable_physical_versions(&db, "work_capabilities"), 200);
 
-    // Speed the cadence up and let the thread heal the accumulated versions.
-    db.__set_currency_maintenance_interval(Duration::from_millis(40));
-    // State-polled wait with sleep pacing: poll the thread's wake counter
-    // and the healed version count under a generous failure ceiling (this
-    // test's promise IS that a real background thread does real work, so
-    // a ceiling remains by necessity — but success is decided by observed
-    // STATE, never by how long we happened to sleep).
-    let baseline_wakes = db.__maintenance_wakes();
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
-        if db.__maintenance_wakes() > baseline_wakes
-            && durable_physical_versions(&db, "work_capabilities") == 1
-        {
-            break;
-        }
-        std::thread::yield_now();
-    }
+    // Drive real, bounded maintenance cycles until the original condition holds.
+    let max_cycles = durable_physical_versions(&db, "work_capabilities");
+    let worker_db = db.clone();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = (|| -> contextdb_core::Result<()> {
+            for _ in 0..max_cycles {
+                worker_clock.wake_once()?;
+                if durable_physical_versions(&worker_db, "work_capabilities") == 1 {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        let _ = finished_tx.send(result);
+    });
+    finished_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("maintenance cycle completion never delivered")
+        .expect("maintenance cycle completed");
+    worker.join().expect("maintenance clock driver finishes");
+    assert!(
+        db.__maintenance_wakes() > baseline_wakes,
+        "the background maintenance worker must wake"
+    );
     assert_eq!(
         durable_physical_versions(&db, "work_capabilities"),
         1,

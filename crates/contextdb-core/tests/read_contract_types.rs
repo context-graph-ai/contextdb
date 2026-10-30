@@ -765,7 +765,7 @@ fn local_owner_identity_values_are_distinct_strong_types() {
 
 #[test]
 fn breadcrumb_is_addressed_by_the_database_hash_and_uses_process_start_identity() {
-    let runtime_seed = rand::random::<[u8; 32]>();
+    let runtime_seed = [0x42; 32];
     let addresses =
         [0x00, 0x3c, 0xa5, 0xff].map(|mask| ChannelAddress(runtime_seed.map(|byte| byte ^ mask)));
     let locations = addresses.map(ReaderBreadcrumbLocation::for_database_path_hash);

@@ -440,47 +440,80 @@ fn commit_index_matches_naive_for_vector_deletes() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn commit_index_reconstruction_is_not_quadratic() {
-    // Reproduces the live incident shape: one table with N tombstoned rows and
-    // N RowDelete change-log entries (the work ledger's per-input retention
-    // deletes). The original algorithm rescans all N rows for EACH delete →
-    // ~N² row visits. Here N = 60_000, so the original does ~3.6e9 row
-    // comparisons; an O(R + D) reconstruction does ~60_000 map builds plus
-    // 60_000 lookups. The gap is > 1000×, so a generous 10s wall-clock bound
-    // cleanly separates them — this is NOT a 2× timing race. The original code
-    // takes tens of seconds here (and pinned a real node's CPU for minutes on a
-    // 349MB ledger); any near-linear implementation finishes in well under a
-    // second.
-    const N: u64 = 60_000;
-
-    let mut rows = Vec::with_capacity(N as usize);
-    let mut change_log = Vec::with_capacity(N as usize);
-    for i in 0..N {
-        // Row i: tombstoned at lsn 2i+2, deleted by tx N+i+1.
-        rows.push(row(RowId(i), i + 1, Some(N + i + 1), Lsn(2 * i + 2)));
-        // Delete entry i: threshold lsn 2i+3 (> the row's lsn), so each entry
-        // resolves against its row and exercises the full scan+max path.
-        change_log.push(row_delete("t", RowId(i), Lsn(2 * i + 3)));
+    fn work(
+        n: u64,
+    ) -> (
+        usize,
+        super::compaction_and_ddl_rendering::ReconstructionWorkForTest,
+    ) {
+        let mut rows = Vec::with_capacity(n as usize);
+        let mut change_log = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            rows.push(row(RowId(i), i + 1, Some(n + i + 1), Lsn(2 * i + 2)));
+            change_log.push(row_delete("t", RowId(i), Lsn(2 * i + 3)));
+        }
+        let relational = relational_with(vec![("t", rows)]);
+        let graph = graph_with(vec![]);
+        let vector = empty_vector();
+        super::compaction_and_ddl_rendering::reconstruction_work_reset_for_test();
+        let index = commit_index_across_all(&relational, &graph, &vector, &change_log);
+        (
+            index.len(),
+            super::compaction_and_ddl_rendering::reconstruction_work_for_test(),
+        )
     }
 
-    let relational = relational_with(vec![("t", rows)]);
-    let graph = graph_with(vec![]);
-    let vector = empty_vector();
+    fn assert_stages(n: u64, work: super::compaction_and_ddl_rendering::ReconstructionWorkForTest) {
+        let size = n as usize;
+        assert_eq!(work.row_examinations, size, "each row is examined once");
+        assert_eq!(
+            work.tombstone_insertions, size,
+            "each row contributes one tombstone"
+        );
+        assert_eq!(
+            work.delete_version_probes, size,
+            "each delete probes one matching version"
+        );
+        assert_eq!(
+            work.index_insertions,
+            2 * size,
+            "each row and delete contributes an index insertion"
+        );
+    }
 
-    let start = std::time::Instant::now();
-    let index = commit_index_across_all(&relational, &graph, &vector, &change_log);
-    let elapsed = start.elapsed();
-
-    // Sanity: every delete resolved (created_tx entries + delete entries).
+    const N0: u64 = 10;
+    const N: u64 = 60_000;
+    let (_, w0) = work(0);
+    let (_, wn0) = work(N0);
+    let (_, w2n0) = work(2 * N0);
+    let (len_n, wn) = work(N);
     assert_eq!(
-        index.len(),
+        len_n,
         2 * N as usize,
         "each row contributes a created_tx entry and each delete a distinct-lsn entry"
     );
+    assert_stages(N, wn);
+    let (len_2n, w2n) = work(2 * N);
+    assert_eq!(
+        len_2n,
+        4 * N as usize,
+        "each row contributes a created_tx entry and each delete a distinct-lsn entry"
+    );
+    assert_stages(2 * N, w2n);
+    assert_eq!(
+        w2n.total(),
+        2 * wn.total(),
+        "doubling the input must double reconstruction work"
+    );
     assert!(
-        elapsed < Duration::from_secs(10),
-        "commit index reconstruction of {N} rows + {N} deletes took {elapsed:?}; \
-             the O(deletes × rows) original cannot meet this bound while any O(R+D) \
-             implementation finishes in milliseconds"
+        w2n.total() - w0.total() <= 2 * (wn.total() - w0.total()),
+        "doubling the input must at most double reconstruction work"
+    );
+    assert!(
+        (wn.total() - wn0.total()) * N0 as usize
+            <= (N - N0) as usize * (w2n0.total() - wn0.total()),
+        "the marginal work must not exceed the measured small-fixture slope"
     );
 }

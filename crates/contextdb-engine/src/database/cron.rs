@@ -8,6 +8,11 @@ const CRON_SCHEDULES_CONFIG_KEY: &str = "__cron_schedules";
 const CRON_AUDIT_CONFIG_KEY: &str = "__cron_audit";
 const MAX_CRON_AUDIT_DEPTH: usize = 10_000;
 
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static SUPPRESS_CRON_TICKLER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 type CronCallback = Arc<dyn Fn(&Database) -> Result<()> + Send + Sync + 'static>;
 
 pub(super) struct CronState {
@@ -340,6 +345,33 @@ impl Database {
             .collect()
     }
 
+    /// Suppress automatic tickler startup on this thread while a test drives
+    /// the schedule synchronously. Restores the previous state on unwind.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn suppress_cron_tickler_for_test() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SUPPRESS_CRON_TICKLER_FOR_TEST.with(|slot| slot.set(self.0));
+            }
+        }
+        let previous = SUPPRESS_CRON_TICKLER_FOR_TEST.with(|slot| slot.replace(true));
+        Restore(previous)
+    }
+
+    /// Dispatch schedules due at the caller's clock without waiting for time to advance.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cron_dispatch_due_without_wait_for_test(
+        &self,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<u64> {
+        let _operation = self.open_operation()?;
+        self.dispatch_due_cron_schedules(true, vector_copy_owner, read_memory)
+    }
+
     #[cfg(any(test, feature = "test-seams"))]
     pub fn cron_run_due_now_for_test(
         &self,
@@ -418,6 +450,10 @@ impl Database {
     }
 
     fn ensure_cron_tickler_running(&self) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        if SUPPRESS_CRON_TICKLER_FOR_TEST.with(std::cell::Cell::get) {
+            return Ok(());
+        }
         if !self.resource_owner {
             return Ok(());
         }

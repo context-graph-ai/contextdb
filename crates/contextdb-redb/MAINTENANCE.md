@@ -1240,3 +1240,7 @@ Legacy scan growth uses a provisional claim on its existing allowance counter wh
 |---|---|
 | `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/page_allocation.rs` | Bind a genuine fixed-cache payment to otherwise unscoped page construction before allocation and I/O. Reuse the existing capacity/eviction decision and carry one payment through publication, allocation failure, I/O failure and physical free. Source-funded and standalone unqualified reads retain their paths. Upstream proposal: prepaid cache-page construction using its existing owned reserve (not submitted). |
 | `src/read_admission.rs` | Keep the admission-presence query available in default builds and preserve the existing legacy scan allowance through provisional I/O claims. |
+
+## close1-determinism (77b6bec8)
+
+The `test-seams`-only `commit_work` writer-queue watch registers a one-shot event for a specific writer thread; `transaction_tracker.rs` signals it when that thread actually enters the existing writer wait. A dropped registration removes only its own entry. Ordinary builds contain neither the registry nor the notifier, and writer locking and queue behavior are unchanged. The train regenerates `upstream-4.1.0.patch` from the merged fork; local proof uses a regenerated patch.

@@ -686,6 +686,9 @@ pub async fn poll_and_execute_once_with_read_memory(
                 "worker capability re-push deferred; hub unreachable"
             );
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        let _ = CAPABILITY_PUSH_OBSERVER_FOR_TEST
+            .try_with(|observer| observer.send(CapabilityPushEventForTest::RepushFinished));
         return Ok(PollOutcome::NoMatchingWork);
     }
 
@@ -829,6 +832,9 @@ pub async fn poll_and_execute_once_with_read_memory(
         });
         tokio::pin!(executor_task);
         let mut warned_in_execution_pull_failure = false;
+        #[cfg(any(test, feature = "test-seams"))]
+        let execution_pull = execution_pull_tick_for_test_or_sleep();
+        #[cfg(not(any(test, feature = "test-seams")))]
         let execution_pull = tokio::time::sleep(Duration::from_millis(EXECUTION_PULL_INTERVAL_MS));
         tokio::pin!(execution_pull);
         let verdict = loop {
@@ -840,7 +846,12 @@ pub async fn poll_and_execute_once_with_read_memory(
                     });
                 }
                 _ = &mut execution_pull => {
-                    if let Err(err) = client.pull_default_with_read_memory(read_memory.clone()).await
+                    let pull_result = client.pull_default_with_read_memory(read_memory.clone()).await;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if pull_result.is_ok() {
+                        let _ = IN_EXECUTION_PULL_CONTROL_FOR_TEST.try_with(|control| control.observer.send(()));
+                    }
+                    if let Err(err) = pull_result
                     {
                         if !is_offline_sync_error(&err) { return Err(err); }
                         if !warned_in_execution_pull_failure {
@@ -854,6 +865,9 @@ pub async fn poll_and_execute_once_with_read_memory(
                         );
                         }
                     }
+                    #[cfg(any(test, feature = "test-seams"))]
+                    execution_pull.set(execution_pull_tick_for_test_or_sleep());
+                    #[cfg(not(any(test, feature = "test-seams")))]
                     execution_pull.as_mut().reset(
                         tokio::time::Instant::now()
                             + Duration::from_millis(EXECUTION_PULL_INTERVAL_MS),
@@ -927,6 +941,46 @@ pub async fn poll_and_execute_once_with_read_memory(
 }
 
 // Sync transport failures preserve the existing disconnected-worker behavior.
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Clone)]
+struct InExecutionPullControlForTest {
+    observer: tokio::sync::mpsc::UnboundedSender<()>,
+    ticks: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+tokio::task_local! {
+    static IN_EXECUTION_PULL_CONTROL_FOR_TEST: InExecutionPullControlForTest;
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+async fn execution_pull_tick_for_test_or_sleep() {
+    if let Ok(control) = IN_EXECUTION_PULL_CONTROL_FOR_TEST.try_with(Clone::clone) {
+        if control.ticks.lock().await.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    } else {
+        tokio::time::sleep(Duration::from_millis(EXECUTION_PULL_INTERVAL_MS)).await;
+    }
+}
+
+/// Scope a worker task's pull cadence and post-pull observation to test events.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub async fn with_in_execution_pull_control_for_test<F: std::future::Future>(
+    observer: tokio::sync::mpsc::UnboundedSender<()>,
+    ticks: tokio::sync::mpsc::UnboundedReceiver<()>,
+    future: F,
+) -> F::Output {
+    let control = InExecutionPullControlForTest {
+        observer,
+        ticks: Arc::new(tokio::sync::Mutex::new(ticks)),
+    };
+    IN_EXECUTION_PULL_CONTROL_FOR_TEST
+        .scope(control, future)
+        .await
+}
+
 // Local engine failures retain their typed cause and must reach the caller.
 fn is_offline_sync_error(error: &Error) -> bool {
     matches!(error, Error::SyncError(_))
@@ -945,7 +999,72 @@ fn tolerate_offline_sync(
     }
 }
 
+/// Observe worker capability push completion without changing its pacing.
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityPushEventForTest {
+    StartupFinished,
+    RepushFinished,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+tokio::task_local! {
+    static CAPABILITY_PUSH_OBSERVER_FOR_TEST:
+        tokio::sync::mpsc::UnboundedSender<CapabilityPushEventForTest>;
+}
+
+/// Scope capability-push observations to this worker task.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub async fn with_capability_push_observer_for_test<F: std::future::Future>(
+    observer: tokio::sync::mpsc::UnboundedSender<CapabilityPushEventForTest>,
+    future: F,
+) -> F::Output {
+    CAPABILITY_PUSH_OBSERVER_FOR_TEST.scope(observer, future).await
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone)]
+pub enum WorkerLoopEventForTest {
+    Started,
+    PollFinished(PollOutcome),
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Clone)]
+struct WorkerLoopControlForTest {
+    observer: tokio::sync::mpsc::UnboundedSender<WorkerLoopEventForTest>,
+    ticks: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
+    now_ms: i64,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+tokio::task_local! {
+    static WORKER_LOOP_CONTROL_FOR_TEST: WorkerLoopControlForTest;
+}
+
+/// Scope a worker loop's pacing, clock and completion events to a test task.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub async fn with_worker_loop_control_for_test<F: std::future::Future>(
+    observer: tokio::sync::mpsc::UnboundedSender<WorkerLoopEventForTest>,
+    ticks: tokio::sync::mpsc::UnboundedReceiver<()>,
+    now_ms: i64,
+    future: F,
+) -> F::Output {
+    let control = WorkerLoopControlForTest {
+        observer,
+        ticks: Arc::new(tokio::sync::Mutex::new(ticks)),
+        now_ms,
+    };
+    WORKER_LOOP_CONTROL_FOR_TEST.scope(control, future).await
+}
+
 fn wall_now_ms() -> i64 {
+    #[cfg(any(test, feature = "test-seams"))]
+    if let Ok(now_ms) = WORKER_LOOP_CONTROL_FOR_TEST.try_with(|control| control.now_ms) {
+        return now_ms;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1029,7 +1148,20 @@ async fn run_worker_loop_with_provider(
         );
     }
     drop(read_memory);
+    #[cfg(any(test, feature = "test-seams"))]
+    let _ = CAPABILITY_PUSH_OBSERVER_FOR_TEST
+        .try_with(|observer| observer.send(CapabilityPushEventForTest::StartupFinished));
+    #[cfg(any(test, feature = "test-seams"))]
+    let _ = WORKER_LOOP_CONTROL_FOR_TEST
+        .try_with(|control| control.observer.send(WorkerLoopEventForTest::Started));
     while !shutdown.load(Ordering::SeqCst) {
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Ok(control) = WORKER_LOOP_CONTROL_FOR_TEST.try_with(Clone::clone) {
+            if control.ticks.lock().await.recv().await.is_none() || shutdown.load(Ordering::SeqCst)
+            {
+                break;
+            }
+        }
         let read_memory = read_budgets.request_budget()?;
         // Keep this node's advertisement CURRENT, not merely re-delivered:
         // re-advertise (upsert) on the poll cadence so `advertised_at` tracks
@@ -1049,7 +1181,7 @@ async fn run_worker_loop_with_provider(
             wall_now_ms(),
             read_memory.clone(),
         )?;
-        poll_and_execute_once_with_read_memory(
+        let outcome = poll_and_execute_once_with_read_memory(
             client,
             read_memory.clone(),
             config,
@@ -1057,7 +1189,19 @@ async fn run_worker_loop_with_provider(
             wall_now_ms(),
         )
         .await?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let _ = WORKER_LOOP_CONTROL_FOR_TEST.try_with(|control| {
+            control
+                .observer
+                .send(WorkerLoopEventForTest::PollFinished(outcome.clone()))
+        });
+        drop(outcome);
         drop(read_memory);
+        #[cfg(any(test, feature = "test-seams"))]
+        if WORKER_LOOP_CONTROL_FOR_TEST.try_with(|_| ()).is_err() {
+            tokio::time::sleep(poll_interval).await;
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
         tokio::time::sleep(poll_interval).await;
     }
     Ok(())

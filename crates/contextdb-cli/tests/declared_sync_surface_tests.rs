@@ -11,7 +11,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 fn run_cli_at_with_status(
@@ -291,22 +291,116 @@ fn delete_offline_edge_row(path: &std::path::Path, id: Uuid) {
     .expect("offline edge delete");
 }
 
-fn wait_for_exit(child: &mut Child, name: &str) -> ExitStatus {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match child.try_wait().expect("poll child") {
-            Some(status) => return status,
-            None if Instant::now() < deadline => std::thread::yield_now(),
-            None => {
-                child.kill().expect("stop overdue child");
-                let _ = child.wait();
-                panic!("{name} did not exit within 30 seconds");
+// Observe process exit without reaping it; the owner can still kill and reap
+// the child if the liveness watchdog expires.
+#[cfg(unix)]
+fn child_exit_event(child: &std::process::Child) -> std::thread::JoinHandle<std::io::Result<()>> {
+    let pid = child.id();
+    std::thread::spawn(move || {
+        loop {
+            // SAFETY: waitid initializes siginfo on success; the child remains
+            // owned by the caller and WNOWAIT leaves it available for Child::wait.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if status == 0 {
+                return Ok(());
             }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    })
+}
+
+#[cfg(windows)]
+fn child_exit_event(child: &std::process::Child) -> std::thread::JoinHandle<std::io::Result<()>> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    }
+    let handle = child.as_raw_handle() as usize;
+    std::thread::spawn(move || {
+        // SAFETY: the caller owns the child until this thread has joined.
+        let result = unsafe { WaitForSingleObject(handle as *mut std::ffi::c_void, u32::MAX) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+fn wait_for_child_event(
+    child: &mut std::process::Child,
+    name: &str,
+    bound: std::time::Duration,
+) -> std::process::ExitStatus {
+    let waiter = child_exit_event(child);
+    let (events, event_rx) = std::sync::mpsc::channel();
+    let relay = std::thread::spawn(move || {
+        let result = waiter.join().expect("child exit observer join");
+        let _ = events.send(result);
+    });
+    let observed = event_rx.recv_timeout(bound);
+    if matches!(observed, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        relay.join().expect("child exit relay join");
+        panic!("{name} exit never delivered");
+    }
+    observed
+        .expect("child exit event channel closed")
+        .expect("observe child exit");
+    relay.join().expect("child exit relay join");
+    child.wait().expect("reap observed child")
+}
+
+fn wait_for_exit(child: &mut Child, name: &str) -> ExitStatus {
+    wait_for_child_event(child, name, Duration::from_secs(30))
+}
+
+type ChildOutput = (&'static str, Option<String>);
+
+struct OutputWatchdog {
+    cancel: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OutputWatchdog {
+    fn start(events: mpsc::Sender<ChildOutput>, label: &'static str) -> Self {
+        let (cancel, cancel_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            if matches!(
+                cancel_rx.recv_timeout(Duration::from_secs(30)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = events.send((label, None));
+            }
+        });
+        Self {
+            cancel,
+            thread: Some(thread),
         }
     }
 }
 
-type ChildOutput = (&'static str, Option<String>);
+impl Drop for OutputWatchdog {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("output watchdog join");
+        }
+    }
+}
 
 fn start_line_reader<R: Read + Send + 'static>(
     reader: R,
@@ -329,6 +423,7 @@ fn start_output_readers(
 ) -> (
     mpsc::Receiver<ChildOutput>,
     Vec<std::thread::JoinHandle<()>>,
+    mpsc::Sender<ChildOutput>,
 ) {
     let (tx, rx) = mpsc::channel();
     let stdout = start_line_reader(
@@ -336,25 +431,29 @@ fn start_output_readers(
         "stdout",
         tx.clone(),
     );
-    let stderr = start_line_reader(child.stderr.take().expect("child stderr"), "stderr", tx);
-    (rx, vec![stdout, stderr])
+    let stderr = start_line_reader(
+        child.stderr.take().expect("child stderr"),
+        "stderr",
+        tx.clone(),
+    );
+    (rx, vec![stdout, stderr], tx)
 }
 
 fn collect_reader_output(
     rx: &mpsc::Receiver<ChildOutput>,
     readers: Vec<std::thread::JoinHandle<()>>,
+    events: mpsc::Sender<ChildOutput>,
     mut closed: usize,
     name: &str,
 ) -> (String, String) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let _watchdog = OutputWatchdog::start(events, "output-watchdog");
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     while closed < 2 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let (stream, line) = rx
-            .recv_timeout(remaining)
-            .unwrap_or_else(|_| panic!("{name} output readers did not close within 30 seconds"));
+        let (stream, line) = rx.recv().expect("child output event channel closed");
         match (stream, line) {
+            ("auto-watchdog", None) => continue,
+            ("output-watchdog", None) => panic!("{name} output completion never delivered"),
             ("stdout", Some(line)) => stdout.push(line),
             ("stderr", Some(line)) => stderr.push(line),
             (_, None) => closed += 1,
@@ -368,9 +467,9 @@ fn collect_reader_output(
 }
 
 fn wait_with_bounded_output(mut child: Child, name: &str) -> (ExitStatus, String, String) {
-    let (rx, readers) = start_output_readers(&mut child);
+    let (rx, readers, events) = start_output_readers(&mut child);
     let status = wait_for_exit(&mut child, name);
-    let (stdout, stderr) = collect_reader_output(&rx, readers, 0, name);
+    let (stdout, stderr) = collect_reader_output(&rx, readers, events, 0, name);
     (status, stdout, stderr)
 }
 
@@ -525,7 +624,7 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn auto-sync CLI");
-    let (report_rx, readers) = start_output_readers(&mut auto);
+    let (report_rx, readers, report_events) = start_output_readers(&mut auto);
     let notification_id = Uuid::new_v4();
     let auto_sql = format!(
         ".sync auto on\nINSERT INTO notes (id, body) VALUES ('{notification_id}', 'post-launch notification');\n"
@@ -535,16 +634,16 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
         .write_all(auto_sql.as_bytes())
         .expect("write auto trigger DML");
     auto_stdin.flush().expect("flush auto trigger DML");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let report_watchdog = OutputWatchdog::start(report_events.clone(), "auto-watchdog");
     let mut auto_reports = Vec::new();
     let mut auto_closed = 0;
     let auto_id_string = auto_id.to_string();
     let auto_author = hub.node_id.as_str();
     let auto_event = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let (stream, line) = report_rx
-            .recv_timeout(remaining)
-            .unwrap_or_else(|_| panic!("bounded actual auto-sync report event: {auto_reports:?}"));
+        let (stream, line) = report_rx.recv().expect("auto-sync report channel closed");
+        if stream == "auto-watchdog" {
+            panic!("auto-sync report never delivered: {auto_reports:?}");
+        }
         let Some(line) = line else {
             auto_closed += 1;
             assert!(
@@ -576,6 +675,7 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
             break document;
         }
     };
+    drop(report_watchdog);
     assert_no_role_mechanic_words(&auto_event.to_string(), "automatic refusal event");
     auto_stdin
         .write_all(b".sync pull\n.quit\n")
@@ -583,7 +683,7 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
     drop(auto_stdin);
     let status = wait_for_exit(&mut auto, "auto CLI");
     assert!(status.success(), "auto CLI exits cleanly: {status}");
-    let _ = collect_reader_output(&report_rx, readers, auto_closed, "auto CLI");
+    let _ = collect_reader_output(&report_rx, readers, report_events, auto_closed, "auto CLI");
     let auto_db = Database::open(&auto_path).expect("reopen auto edge");
     assert_eq!(body(&hub.db, auto_id).as_deref(), Some("second hub winner"));
     assert_eq!(

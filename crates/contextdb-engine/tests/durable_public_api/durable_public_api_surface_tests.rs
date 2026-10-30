@@ -60,6 +60,79 @@ fn cargo_fixture(path: &Path, command: &str, feature: Option<&str>, args: &[&str
     bounded_command_output(cargo, "fixture cargo command")
 }
 
+// Observe process exit without reaping it; the owner can still kill and reap
+// the child if the liveness watchdog expires.
+#[cfg(unix)]
+fn child_exit_event(child: &std::process::Child) -> std::thread::JoinHandle<std::io::Result<()>> {
+    let pid = child.id();
+    std::thread::spawn(move || {
+        loop {
+            // SAFETY: waitid initializes siginfo on success; the child remains
+            // owned by the caller and WNOWAIT leaves it available for Child::wait.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if status == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    })
+}
+
+#[cfg(windows)]
+fn child_exit_event(child: &std::process::Child) -> std::thread::JoinHandle<std::io::Result<()>> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    }
+    let handle = child.as_raw_handle() as usize;
+    std::thread::spawn(move || {
+        // SAFETY: the caller owns the child until this thread has joined.
+        let result = unsafe { WaitForSingleObject(handle as *mut std::ffi::c_void, u32::MAX) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+fn wait_for_child_event(
+    child: &mut std::process::Child,
+    name: &str,
+    bound: std::time::Duration,
+) -> std::process::ExitStatus {
+    let waiter = child_exit_event(child);
+    let (events, event_rx) = std::sync::mpsc::channel();
+    let relay = std::thread::spawn(move || {
+        let result = waiter.join().expect("child exit observer join");
+        let _ = events.send(result);
+    });
+    let observed = event_rx.recv_timeout(bound);
+    if matches!(observed, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        relay.join().expect("child exit relay join");
+        panic!("{name} exit never delivered");
+    }
+    observed
+        .expect("child exit event channel closed")
+        .expect("observe child exit");
+    relay.join().expect("child exit relay join");
+    child.wait().expect("reap observed child")
+}
+
 fn bounded_command_output(mut command: Command, name: &str) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
@@ -78,18 +151,7 @@ fn bounded_command_output(mut command: Command, name: &str) -> Output {
         let _ = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
         bytes
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    let status = loop {
-        match child.try_wait().expect("poll fixture cargo") {
-            Some(status) => break status,
-            None if std::time::Instant::now() < deadline => std::thread::yield_now(),
-            None => {
-                child.kill().expect("stop overdue fixture cargo");
-                let _ = child.wait();
-                panic!("{name} did not exit within 300 seconds");
-            }
-        }
-    };
+    let status = wait_for_child_event(&mut child, name, std::time::Duration::from_secs(300));
     Output {
         status,
         stdout: stdout_reader.join().expect("fixture stdout reader"),

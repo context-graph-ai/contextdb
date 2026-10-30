@@ -73,30 +73,21 @@ fn assert_online_compaction(explicit: bool) {
         }
     });
     entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    let observe_writer_wait = persistence
-        .with_db(|db| Ok(db.write_wait_observer()))
-        .unwrap();
     let (requested_tx, requested_rx) = mpsc::channel();
+    let (start_tx, start_rx) = mpsc::sync_channel(0);
     let writer_db = db.clone();
     let writer = thread::spawn(move || {
         requested_tx.send(()).unwrap();
+        start_rx.recv().expect("writer start never delivered");
         writer_db
             .execute("INSERT INTO recordings VALUES (0)", &HashMap::new())
             .unwrap();
     });
     requested_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    // Observe the actual redb writer queue before resuming relocation. Merely
-    // starting a thread permits its execute call to run after the release.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let writer_waiting = loop {
-        if observe_writer_wait() {
-            break true;
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
-        thread::yield_now();
-    };
+    // Register this writer before letting it attempt the locked transaction.
+    let writer_watch = redb::commit_work::watch_writer_queue_for_test(writer.thread().id());
+    start_tx.send(()).expect("writer start never delivered");
+    let writer_waiting = writer_watch.wait_for_test(Duration::from_secs(60));
     // The maintenance transaction has read a real relocation source page and
     // remains open. A second storage read must finish before it resumes.
     let (read_tx, read_rx) = mpsc::channel();
@@ -123,6 +114,9 @@ fn assert_online_compaction(explicit: bool) {
     reader.join().unwrap();
     let first = maintenance.join().unwrap();
     writer.join().unwrap();
+    if !writer_waiting {
+        panic!("writer queue event never delivered");
+    }
     assert!(writer_waiting, "foreground write queued inside relocation");
     read_completed.expect("storage reads finish inside the active relocation transaction");
     assert!(first.ran);

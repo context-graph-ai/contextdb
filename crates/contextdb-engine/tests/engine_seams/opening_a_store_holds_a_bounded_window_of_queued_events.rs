@@ -50,16 +50,12 @@ fn queued(path: &std::path::Path, count: usize) {
     db.close().unwrap();
 }
 
-/// Wait for dispatcher state, failing (never sleeping) if it does not arrive.
-fn wait_for(label: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while !ready() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {label}"
-        );
-        std::thread::yield_now();
-    }
+/// Wait for automatic dispatcher progress, driving each pacing wait by event.
+fn wait_for(db: &Database, label: &str, ready: impl FnMut() -> bool) {
+    assert!(
+        db.wait_for_sink_progress_for_test(std::time::Duration::from_secs(120), ready),
+        "{label} never delivered"
+    );
 }
 
 fn peak(ledger: &[contextdb_engine::memory_accounting::BudgetLedgerEntry]) -> usize {
@@ -122,7 +118,7 @@ fn every_queued_event_is_delivered_once_in_order_across_windows() {
         Ok(())
     })
     .unwrap();
-    wait_for("every queued event delivered and acknowledged", || {
+    wait_for(&db, "every queued event delivered and acknowledged", || {
         db.sink_metrics(SINK).queued == 0
     });
     let delivered = delivered.lock().unwrap().clone();
@@ -171,7 +167,7 @@ fn drain(db: &Database, count: u64) -> Vec<u64> {
         Ok(())
     })
     .unwrap();
-    wait_for("the expected deliveries acknowledged", || {
+    wait_for(db, "the expected deliveries acknowledged", || {
         let metrics = db.sink_metrics(SINK);
         metrics.delivered >= count && metrics.queued == target
     });
@@ -281,7 +277,7 @@ fn a_window_the_writer_budget_cannot_hold_is_refused_observably_and_resumes_when
         Ok(())
     })
     .unwrap();
-    wait_for("the refused window recorded on the sink", || {
+    wait_for(&db, "the refused window recorded on the sink", || {
         db.sink_metrics(SINK).window_refused
     });
     let metrics = db.sink_metrics(SINK);
@@ -294,9 +290,11 @@ fn a_window_the_writer_budget_cannot_hold_is_refused_observably_and_resumes_when
     assert!(delivered.lock().unwrap().is_empty());
     // The budget returns: delivery resumes, every event once, in order.
     db.set_memory_limit(Some(512 * 1024 * 1024)).unwrap();
-    wait_for("every event delivered after the budget returned", || {
-        db.sink_metrics(SINK).queued == 0
-    });
+    wait_for(
+        &db,
+        "every event delivered after the budget returned",
+        || db.sink_metrics(SINK).queued == 0,
+    );
     assert_eq!(delivered.lock().unwrap().clone(), expected);
     assert!(!db.sink_metrics(SINK).window_refused);
     db.close().unwrap();
@@ -378,7 +376,7 @@ fn a_queue_the_registration_cannot_see_is_read_one_paced_window_at_a_time() {
     // Every queued event belongs to a context this handle cannot read.
     let db = open_in(&path, &[1]);
     db.register_sink(SINK, None, |_| Ok(())).unwrap();
-    wait_for("two full sweeps of window reads", || {
+    wait_for(&db, "two full sweeps of window reads", || {
         db.sink_window_pacing_for_test(SINK).0 >= 8
     });
     let (reads, pauses) = db.sink_window_pacing_for_test(SINK);

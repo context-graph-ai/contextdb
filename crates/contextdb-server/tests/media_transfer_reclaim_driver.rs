@@ -2,7 +2,7 @@
 //!
 //! The frozen suite drives `reclaim_unreferenced` explicitly. This proves the
 //! OWNED driver — `BlobStore::spawn_reclaim_driver` — actually invokes that
-//! reclaim on its own, at the real fabric wall-clock, so a holder's blob store
+//! reclaim on its own, so a holder's blob store
 //! cannot fill without bound in a real deployment (a review found the
 //! cadence un-driven). It is NOT a frozen acceptance test;
 //! it exercises the driver seam a host would wire.
@@ -22,8 +22,9 @@ fn blob_job(job_id: &str, submitter: &str, hash: &BlobHash) -> JobSpec {
         .build()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn spawn_reclaim_driver_reclaims_a_terminal_past_grace_blob_on_its_own() {
+    let _clock = contextdb_core::types::Wallclock::test_clock_guard(|| 1_000_000);
     let dir = tempfile::tempdir().expect("dir");
     let key = dir.path().join("fabric-identity.key");
     let node = FabricIdentity::load_or_generate(&key)
@@ -34,8 +35,8 @@ async fn spawn_reclaim_driver_reclaims_a_terminal_past_grace_blob_on_its_own() {
     install_work_ledger_schema(&db).expect("schema");
 
     // A blob whose only referencing job is terminal far in the past — so with
-    // grace 0 it is immediately reclaim-eligible against the REAL wall-clock
-    // the driver reads (the job's cancel time is epoch-0, decades behind now).
+    // grace 0 it is immediately reclaim-eligible against the frozen clock
+    // the driver reads (the job cancel time is epoch-0).
     let content = b"reclaim-driver-blob".to_vec();
     let h = BlobHash::of(&content);
     submit_job(&db, &blob_job("job-1", &node, &h), &[] as &[&[u8]]).expect("submit");
@@ -48,8 +49,6 @@ async fn spawn_reclaim_driver_reclaims_a_terminal_past_grace_blob_on_its_own() {
         },
         key,
     ));
-    // No test clock is injected: the driver runs at the real fabric wall-clock,
-    // exactly as in production.
     assert_eq!(service.ingest_bytes(&content).expect("ingest"), h);
     assert_eq!(
         service.servable_count_for_test(),
@@ -57,18 +56,23 @@ async fn spawn_reclaim_driver_reclaims_a_terminal_past_grace_blob_on_its_own() {
         "the blob is servable before the driver sweeps"
     );
 
-    // The driver's first interval tick fires immediately, so a bounded poll
-    // observes the sweep within a moment — no waiting on the full interval.
+    // Observe the real driver after its first completed sweep.
+    let observed = service.observe_next_reclaim_sweep_for_test();
     let handle = service.clone().spawn_reclaim_driver(0);
-
-    let mut reclaimed = false;
-    for _ in 0..100 {
-        if service.servable_count_for_test() == 0 {
-            reclaimed = true;
-            break;
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (watchdog_tx, watchdog_rx) = tokio::sync::oneshot::channel();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            let _ = watchdog_tx.send(());
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    tokio::select! {
+        result = observed => result.expect("reclaim sweep never delivered"),
+        _ = watchdog_rx => panic!("reclaim sweep never delivered"),
     }
+    let _ = done_tx.send(());
+    watchdog.join().expect("reclaim watchdog");
+    let reclaimed = service.servable_count_for_test() == 0;
     handle.abort();
 
     assert!(

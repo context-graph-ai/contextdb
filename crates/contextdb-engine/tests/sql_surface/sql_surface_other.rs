@@ -9,9 +9,9 @@ use std::collections::{BTreeSet, HashMap};
 #[rustfmt::skip]
 #[cfg_attr(not(feature = "test-seams"), allow(unused_imports, reason = "KEEP-SEAM: live only under the test-seams feature"))]
 #[cfg_attr(not(feature = "test-seams"), allow(unused_imports, reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_tests.rs"))]
-use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, TryRecvError}, Arc, Barrier};
+use std::sync::{atomic::Ordering, mpsc::{self, TryRecvError}, Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -5209,6 +5209,7 @@ fn ddl_name(change: &contextdb_engine::sync_types::DdlChange) -> String {
 
 #[test]
 fn sql_15_ddl_dml_lsn_causal_ordering() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Arc::new(Database::open_memory());
     db.execute(
         "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
@@ -5219,28 +5220,25 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
     let workers = 4;
     let iterations = 40;
     let barrier = Arc::new(Barrier::new(workers + 1));
-    let done = Arc::new(AtomicBool::new(false));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
     let expected_tables: Vec<String> = (0..workers)
         .flat_map(|worker| (0..iterations).map(move |i| format!("lsn_race_{worker}_{i}")))
         .collect();
     let poller_expected = Arc::new(expected_tables.clone());
     let poller_db = db.clone();
-    let poller_done = done.clone();
     let poller_barrier = barrier.clone();
 
     let poller = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         let mut watermark = Lsn(0);
         let mut seen_creates = std::collections::HashSet::new();
         let mut row_before_create = Vec::new();
-        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        loop {
-            let expected_len = poller_expected.len();
+        while progress_rx.recv().is_ok() {
             let changes = poller_db
                 .changes_since(watermark)
                 .expect("read the declared changes");
-            let before_seen = seen_creates.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
                     if matches!(
@@ -5258,24 +5256,6 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
                 if let Some(lsn) = changes.max_lsn() {
                     watermark = lsn;
                 }
-            } else {
-                thread::yield_now();
-            }
-
-            if poller_done.load(Ordering::SeqCst) && seen_creates.len() >= expected_len {
-                break;
-            }
-            if poller_done.load(Ordering::SeqCst) {
-                if seen_creates.len() == before_seen {
-                    idle_after_done_since.get_or_insert_with(Instant::now);
-                } else {
-                    idle_after_done_since = None;
-                }
-                if idle_after_done_since
-                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
-                {
-                    break;
-                }
             }
         }
 
@@ -5287,7 +5267,9 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
     for worker in 0..workers {
         let db = db.clone();
         let barrier = barrier.clone();
+        let progress_tx = progress_tx.clone();
         handles.push(thread::spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
             barrier.wait();
             for i in 0..iterations {
                 let table = format!("lsn_race_{worker}_{i}");
@@ -5296,24 +5278,27 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
                     &empty(),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
                 db.execute(
                     &format!("INSERT INTO {table} (id, val) VALUES ($id, 'data')"),
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
                 db.execute(
                     "INSERT INTO shared (id, val) VALUES ($id, 'shared')",
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
             }
         }));
     }
 
+    drop(progress_tx);
     for handle in handles {
         handle.join().unwrap();
     }
-    done.store(true, Ordering::SeqCst);
     let (row_before_create, seen_creates, expected) = poller.join().unwrap();
 
     assert!(
@@ -5331,6 +5316,7 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
 
 #[test]
 fn sql_16_ddl_lsn_no_duplicates_under_contention() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Arc::new(Database::open_memory());
     db.execute(
         "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
@@ -5341,27 +5327,24 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
     let workers = 4;
     let iterations = 25;
     let barrier = Arc::new(Barrier::new(workers + 1));
-    let done = Arc::new(AtomicBool::new(false));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
     let expected_columns: Vec<String> = (0..workers)
         .flat_map(|worker| (0..iterations).map(move |i| format!("c_{worker}_{i}")))
         .collect();
     let poller_expected = Arc::new(expected_columns.clone());
     let poller_db = db.clone();
-    let poller_done = done.clone();
     let poller_barrier = barrier.clone();
 
     let poller = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         let mut watermark = Lsn(0);
         let mut seen_columns = std::collections::HashSet::new();
-        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        loop {
-            let expected_len = poller_expected.len();
+        while progress_rx.recv().is_ok() {
             let changes = poller_db
                 .changes_since(watermark)
                 .expect("read the declared changes");
-            let before_seen = seen_columns.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
                     if let contextdb_engine::sync_types::DdlChange::AlterTable {
@@ -5379,24 +5362,6 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
                 if let Some(lsn) = changes.max_lsn() {
                     watermark = lsn;
                 }
-            } else {
-                thread::yield_now();
-            }
-
-            if poller_done.load(Ordering::SeqCst) && seen_columns.len() >= expected_len {
-                break;
-            }
-            if poller_done.load(Ordering::SeqCst) {
-                if seen_columns.len() == before_seen {
-                    idle_after_done_since.get_or_insert_with(Instant::now);
-                } else {
-                    idle_after_done_since = None;
-                }
-                if idle_after_done_since
-                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
-                {
-                    break;
-                }
             }
         }
 
@@ -5408,7 +5373,9 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
     for worker in 0..workers {
         let db = db.clone();
         let barrier = barrier.clone();
+        let progress_tx = progress_tx.clone();
         handles.push(thread::spawn(move || {
+            let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
             barrier.wait();
             for i in 0..iterations {
                 let col = format!("c_{worker}_{i}");
@@ -5417,19 +5384,21 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
                 db.execute(
                     &format!("ALTER TABLE shared ADD COLUMN {col} TEXT"),
                     &empty(),
                 )
                 .unwrap();
+                progress_tx.send(()).unwrap();
             }
         }));
     }
 
+    drop(progress_tx);
     for handle in handles {
         handle.join().unwrap();
     }
-    done.store(true, Ordering::SeqCst);
     let (seen_columns, expected_columns, expected) = poller.join().unwrap();
 
     assert_eq!(expected_columns.len(), expected);
@@ -5443,6 +5412,7 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
 
 #[test]
 fn sql_17_sync_watermark_does_not_skip_ddl() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     let db = Arc::new(Database::open_memory());
     db.execute(
         "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
@@ -5451,25 +5421,22 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
     .unwrap();
 
     let barrier = Arc::new(Barrier::new(3));
-    let done = Arc::new(AtomicBool::new(false));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
     let expected_tables: Vec<String> = (0..120).map(|i| format!("watermark_race_{i}")).collect();
 
     let poller_db = db.clone();
-    let poller_done = done.clone();
     let poller_expected = Arc::new(expected_tables.clone());
     let poller_barrier = barrier.clone();
     let poller = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         let mut watermark = Lsn(0);
         let mut seen_tables = std::collections::HashSet::new();
-        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        loop {
-            let expected_len = poller_expected.len();
+        while progress_rx.recv().is_ok() {
             let changes = poller_db
                 .changes_since(watermark)
                 .expect("read the declared changes");
-            let before_seen = seen_tables.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
                     if matches!(
@@ -5482,24 +5449,6 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
                 if let Some(lsn) = changes.max_lsn() {
                     watermark = lsn;
                 }
-            } else {
-                thread::yield_now();
-            }
-
-            if poller_done.load(Ordering::SeqCst) && seen_tables.len() >= expected_len {
-                break;
-            }
-            if poller_done.load(Ordering::SeqCst) {
-                if seen_tables.len() == before_seen {
-                    idle_after_done_since.get_or_insert_with(Instant::now);
-                } else {
-                    idle_after_done_since = None;
-                }
-                if idle_after_done_since
-                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
-                {
-                    break;
-                }
             }
         }
 
@@ -5509,7 +5458,9 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
 
     let ddl_db = db.clone();
     let ddl_barrier = barrier.clone();
+    let ddl_progress = progress_tx.clone();
     let ddl_thread = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         ddl_barrier.wait();
         for i in 0..120 {
             let table = format!("watermark_race_{i}");
@@ -5519,12 +5470,15 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
                     &empty(),
                 )
                 .unwrap();
+            ddl_progress.send(()).unwrap();
         }
     });
 
     let dml_db = db.clone();
     let dml_barrier = barrier.clone();
+    let dml_progress = progress_tx.clone();
     let dml_thread = thread::spawn(move || {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
         dml_barrier.wait();
         for _ in 0..400 {
             dml_db
@@ -5533,12 +5487,13 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
+            dml_progress.send(()).unwrap();
         }
     });
 
+    drop(progress_tx);
     ddl_thread.join().unwrap();
     dml_thread.join().unwrap();
-    done.store(true, Ordering::SeqCst);
     let (seen_tables, expected) = poller.join().unwrap();
 
     for table in expected {
@@ -6047,6 +6002,11 @@ fn integrity_02_upsert_noop_does_not_leak_memory() {
 #[test]
 #[cfg(feature = "test-seams")]
 fn integrity_03_retain_pruning_releases_memory() {
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+    let _clock = {
+        let now = Arc::clone(&now);
+        contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
+    };
     let db = Database::open_with_options(":memory:", contextdb_engine::DatabaseOpenOptions {
         memory_limit: Some(256 * 1024),
         ..Default::default()
@@ -6070,7 +6030,7 @@ fn integrity_03_retain_pruning_releases_memory() {
     let used_after_insert = accountant.usage().used;
     assert!(used_after_insert > baseline);
 
-    std::thread::sleep(Duration::from_millis(1100));
+    now.store(1_001_100, Ordering::SeqCst);
     let pruned = db.run_pruning_cycle().unwrap();
     assert_eq!(pruned, 1, "expired row must be pruned");
 
@@ -9003,21 +8963,30 @@ fn prv_seed_rank_policy_docs(db: &Database, rows: usize) -> PrvFixture {
 
 fn prv_06_child_process() {
     let db_path = std::env::var("CONTEXTDB_PRV06_DB").unwrap();
-    let barrier_dir = std::path::PathBuf::from(std::env::var("CONTEXTDB_PRV06_BARRIER").unwrap());
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    let mut barrier = std::os::unix::net::UnixStream::connect(
+        std::env::var_os("CONTEXTDB_PRV06_BARRIER").unwrap(),
+    )
+    .expect("parent barrier never delivered");
+    #[cfg(not(unix))]
+    let mut barrier =
+        std::net::TcpStream::connect(std::env::var("CONTEXTDB_PRV06_BARRIER").unwrap())
+            .expect("parent barrier never delivered");
+    barrier
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    barrier
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
     let query_id = Uuid::parse_str(&std::env::var("CONTEXTDB_PRV06_QUERY_ID").unwrap()).unwrap();
     let f = prv_fixture();
     let db = Database::open(&db_path).unwrap();
     for phase in 0..3 {
-        let go = barrier_dir.join(format!("phase-{phase}.go"));
-        let done = barrier_dir.join(format!("phase-{phase}.done"));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !go.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "child timed out waiting for barrier {go:?}"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        let mut go = [0u8; 1];
+        barrier
+            .read_exact(&mut go)
+            .expect("phase start never delivered");
         match phase {
             1 => {
                 prv_update_doc_embedding(&db, f.source, f.mid_vec.clone());
@@ -9041,23 +9010,7 @@ fn prv_06_child_process() {
             "child process ROW_VECTOR query",
         );
         let top = prv_uuid_at(&result, 0, "id");
-        let tmp_done = done.with_extension("tmp");
-        std::fs::write(&tmp_done, top.to_string()).unwrap();
-        std::fs::rename(tmp_done, done).unwrap();
-    }
-}
-
-fn prv_wait_for_file(path: &std::path::Path) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(value) = std::fs::read_to_string(path) {
-            return value;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for barrier file {path:?}"
-        );
-        thread::sleep(Duration::from_millis(10));
+        writeln!(barrier, "{top}").expect("phase result never delivered");
     }
 }
 
@@ -9321,6 +9274,8 @@ fn prv_05_row_vector_query_respects_candidate_filter() {
 
 #[test]
 fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
+    use std::io::{BufRead, Write};
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_000_000);
     if std::env::var_os("CONTEXTDB_PRV06_CHILD").is_some() {
         prv_06_child_process();
         return;
@@ -9398,8 +9353,20 @@ fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
     assert_eq!(prv_uuid_at(&post_commit, 0, "id"), f.far);
     drop(db);
 
-    let barrier = tmp.path().join("prv06-barrier");
-    std::fs::create_dir(&barrier).unwrap();
+    #[cfg(unix)]
+    let (listener, barrier) = {
+        let path = tmp.path().join("prv06.sock");
+        (
+            std::os::unix::net::UnixListener::bind(&path).unwrap(),
+            path.into_os_string(),
+        )
+    };
+    #[cfg(not(unix))]
+    let (listener, barrier) = {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address: std::ffi::OsString = listener.local_addr().unwrap().to_string().into();
+        (listener, address)
+    };
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg(crate::child_test_filter(
@@ -9413,16 +9380,68 @@ fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
         .spawn()
         .unwrap();
 
-    std::fs::write(barrier.join("phase-0.go"), b"go").unwrap();
-    let phase0 = prv_wait_for_file(&barrier.join("phase-0.done"));
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let acceptor = thread::spawn(move || {
+        let _ = accepted_tx.send(listener.accept().map(|(stream, _)| stream));
+    });
+    let mut barrier = match accepted_rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(stream)) => stream,
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            #[cfg(unix)]
+            let _ = std::os::unix::net::UnixStream::connect(&barrier);
+            #[cfg(not(unix))]
+            let _ = std::net::TcpStream::connect(barrier.to_string_lossy().as_ref());
+            let _ = acceptor.join();
+            panic!("child barrier connection never delivered");
+        }
+    };
+    acceptor.join().unwrap();
+    barrier
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    barrier
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut replies = std::io::BufReader::new(barrier.try_clone().unwrap());
+    barrier
+        .write_all(b"g")
+        .expect("phase 0 start never delivered");
+    let mut phase0 = String::new();
+    if replies
+        .read_line(&mut phase0)
+        .expect("phase 0 result never delivered")
+        == 0
+    {
+        panic!("phase 0 result never delivered");
+    }
     assert_eq!(phase0.trim(), f.far.to_string());
 
-    std::fs::write(barrier.join("phase-1.go"), b"go").unwrap();
-    let phase1 = prv_wait_for_file(&barrier.join("phase-1.done"));
+    barrier
+        .write_all(b"g")
+        .expect("phase 1 start never delivered");
+    let mut phase1 = String::new();
+    if replies
+        .read_line(&mut phase1)
+        .expect("phase 1 result never delivered")
+        == 0
+    {
+        panic!("phase 1 result never delivered");
+    }
     assert_eq!(phase1.trim(), f.near.to_string());
 
-    std::fs::write(barrier.join("phase-2.go"), b"go").unwrap();
-    let phase2 = prv_wait_for_file(&barrier.join("phase-2.done"));
+    barrier
+        .write_all(b"g")
+        .expect("phase 2 start never delivered");
+    let mut phase2 = String::new();
+    if replies
+        .read_line(&mut phase2)
+        .expect("phase 2 result never delivered")
+        == 0
+    {
+        panic!("phase 2 result never delivered");
+    }
     assert_eq!(phase2.trim(), f.mid.to_string());
     assert!(child.wait().unwrap().success());
 }
