@@ -10785,7 +10785,7 @@ mod cdb141_received_witness_tests;
 #[path = "database/checkpointed_commit_floor_tests.rs"]
 mod checkpointed_commit_floor_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 mod stable_funder_identity_proof_tests;
 
 #[cfg(test)]
