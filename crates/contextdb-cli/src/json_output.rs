@@ -1272,36 +1272,64 @@ mod tests {
 
     #[test]
     fn maintenance_json_retains_the_failed_budget_and_real_recovery_command() {
-        let db = Database::open_memory();
-        db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-        db.execute(
-            "CREATE TABLE vector_docs (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
-            &HashMap::new(),
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO vector_docs VALUES (1, '[1,0,0]'), (2, '[0,1,0]')",
-            &HashMap::new(),
-        )
-        .unwrap();
-        let limits = db.execute("SHOW MEMORY_LIMIT", &HashMap::new()).unwrap();
-        let used_column = limits
-            .columns()
-            .iter()
-            .position(|column| column == "used")
+        let directory = tempfile::tempdir().unwrap();
+        // A durable store's writer needs headroom of its own to run a cycle at
+        // all, so a limit equal to the measured use refuses before the vector
+        // stage is reached. Each attempt uses a fresh database file and sets
+        // the limit to the measured use plus `extra`; when the writer reports
+        // it is short, `extra` grows by exactly that shortage. The loop ends
+        // at the first limit where the cycle runs and the vector stage is the
+        // one that cannot fit.
+        let mut extra = 0usize;
+        let mut ran = None;
+        for attempt in 0..64 {
+            let db =
+                Database::open(directory.path().join(format!("maintenance-{attempt}.db"))).unwrap();
+            db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+            db.execute(
+                "CREATE TABLE vector_docs (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
+                &HashMap::new(),
+            )
             .unwrap();
-        let contextdb_core::Value::Int64(used) = &limits.rows()[0][used_column] else {
-            panic!("SHOW MEMORY_LIMIT reports used bytes: {limits:?}");
-        };
-        let used = *used;
-        db.set_memory_limit(Some(usize::try_from(used).unwrap()))
+            db.execute(
+                "INSERT INTO vector_docs VALUES (1, '[1,0,0]'), (2, '[0,1,0]')",
+                &HashMap::new(),
+            )
             .unwrap();
-
-        let report = db.run_maintenance_cycle().unwrap();
+            let limits = db.execute("SHOW MEMORY_LIMIT", &HashMap::new()).unwrap();
+            let used_column = limits
+                .columns()
+                .iter()
+                .position(|column| column == "used")
+                .unwrap();
+            let contextdb_core::Value::Int64(used) = &limits.rows()[0][used_column] else {
+                panic!("SHOW MEMORY_LIMIT reports used bytes: {limits:?}");
+            };
+            let limit = usize::try_from(*used).unwrap() + extra;
+            let outcome = db
+                .set_memory_limit(Some(limit))
+                .and_then(|()| db.run_maintenance_cycle());
+            match outcome {
+                Ok(report) => {
+                    ran = Some((report, limit));
+                    break;
+                }
+                Err(contextdb_core::Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    ..
+                }) => extra += usize::try_from(requested_bytes - available_bytes).unwrap(),
+                Err(other) => panic!("maintenance cycle failed for another reason: {other}"),
+            }
+        }
+        let (report, limit) = ran.expect("the cycle runs once the writer has its own headroom");
         let document = maintenance_report_document(&report);
+        // A durable store has a file to measure, so the receipt carries the
+        // measured fragmentation instead of the unknown (null) a store with
+        // no file reports.
         assert!(
-            document["maintenance_cycle"]["compaction"]["fragmentation_before"].is_null(),
-            "an in-memory store measures nothing, so the receipt says unknown, never 0: {document}"
+            document["maintenance_cycle"]["compaction"]["fragmentation_before"].is_number(),
+            "a file-backed store measures its fragmentation, so the receipt carries the figure: {document}"
         );
         let detail = &document["maintenance_cycle"]["vector"]["first_failure_details"];
         assert_eq!(
@@ -1309,8 +1337,19 @@ mod tests {
             json!("memory_limit")
         );
         assert!(detail["requested_bytes"].as_u64().unwrap() > 0);
-        assert_eq!(detail["available_bytes"], json!(0));
-        assert_eq!(detail["budget_limit_bytes"], json!(used));
+        // With the writer's own headroom in the limit, what the vector stage
+        // finds available is the limit less what is already in use; the
+        // request does not fit in it.
+        assert_eq!(
+            detail["available_bytes"].as_u64().unwrap(),
+            detail["budget_limit_bytes"].as_u64().unwrap()
+                - detail["current_bytes"].as_u64().unwrap()
+        );
+        assert!(
+            detail["available_bytes"].as_u64().unwrap()
+                < detail["requested_bytes"].as_u64().unwrap()
+        );
+        assert_eq!(detail["budget_limit_bytes"], json!(limit));
         assert_eq!(detail["recovery_action"], json!("raise_memory_limit"));
         assert!(
             detail["recovery_instruction"]
