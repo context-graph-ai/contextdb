@@ -201,11 +201,15 @@ impl World {
     /// transaction, and have the hub record one terminal outcome for each of
     /// them. Returns the new roots' keys.
     async fn seed_outcomes(&self, count: usize) -> Vec<NaturalKey> {
+        self.seed_outcomes_in_batches(count, 100).await
+    }
+
+    async fn seed_outcomes_in_batches(&self, count: usize, batch_size: usize) -> Vec<NaturalKey> {
         let started = std::time::Instant::now();
         let mut all = Vec::with_capacity(count);
         let mut remaining = count;
         while remaining > 0 {
-            let batch = remaining.min(100);
+            let batch = remaining.min(batch_size);
             remaining -= batch;
             let tx = self.edge_db.begin().expect("begin");
             let mut keys = Vec::with_capacity(batch);
@@ -1485,7 +1489,7 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
         .limits
         .cursor_page_rows as usize;
     let backlog = page * 2 + page / 2;
-    world.seed_outcomes(backlog).await;
+    world.seed_outcomes_in_batches(backlog, backlog).await;
     let accepted = || {
         world
             .edge_db
@@ -1494,6 +1498,25 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
             .accepted
     };
     let before = accepted();
+    // Count actual Ed25519 operations only during the lost-page and resume
+    // exchanges, after fixture seeding has completed.
+    let signature_start =
+        crate::identity::PAGING_SIGNATURES.load(std::sync::atomic::Ordering::Relaxed);
+    let verification_start =
+        crate::identity::PAGING_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let maximum_delivered_records = backlog + page;
+    let record_components = ["terminal", "certificate"];
+    let page_record_components = ["manifest", "row lineage"];
+    let verification_ends = ["server", "client"];
+    let maximum_verifications = maximum_delivered_records
+        * (record_components.len() + page_record_components.len())
+        * verification_ends.len();
+    let _paging_work_limit = crate::identity::PagingWorkLimit::arm(
+        signature_start,
+        verification_start,
+        maximum_delivered_records,
+        maximum_verifications,
+    );
 
     let lossy = SyncClient::with_authenticated_transport_and_identity_for_test(
         world.edge_db.clone(),
@@ -1530,6 +1553,30 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
     assert_eq!(fetched.len(), backlog);
     assert_eq!(accepted(), backlog as u64);
     assert_eq!(served, (1 + backlog.div_ceil(page), 0));
+    // Count the records actually delivered on the first page before loss
+    // and again across the resumed pages, including the replay.
+    let delivered_records = usize::try_from(after_loss).unwrap() + fetched.len();
+    // Every record can carry a signed terminal and certificate. Each page can
+    // also authenticate a manifest and row lineage for each record it carries.
+    // Price each signed component once at each endpoint, including replay.
+    let record_components = ["terminal", "certificate"];
+    let page_record_components = ["manifest", "row lineage"];
+    let verification_ends = ["server", "client"];
+    let verification_limit = delivered_records
+        * (record_components.len() + page_record_components.len())
+        * verification_ends.len();
+    let signatures = crate::identity::PAGING_SIGNATURES
+        .load(std::sync::atomic::Ordering::Relaxed) - signature_start;
+    let verifications = crate::identity::PAGING_VERIFICATIONS
+        .load(std::sync::atomic::Ordering::Relaxed) - verification_start;
+    assert!(
+        verifications <= verification_limit,
+        "bounded signed-component verifications: {verifications} > {verification_limit}"
+    );
+    assert!(
+        signatures <= delivered_records,
+        "one certificate signing per delivered record: {signatures} for {delivered_records}"
+    );
     hub.stop();
     assert_eq!(settled(&requests, native_root_bytes_for_test()), native_root_bytes_for_test());
     }

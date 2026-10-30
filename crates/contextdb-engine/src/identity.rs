@@ -111,6 +111,8 @@ impl FabricIdentity {
     pub(crate) fn sign_lineage(&self, bytes: &[u8]) -> Vec<u8> {
         use ed25519_dalek::Signer as _;
 
+        #[cfg(test)]
+        PAGING_SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ed25519_dalek::SigningKey::from_bytes(&self.seed)
             .sign(bytes)
             .to_bytes()
@@ -120,6 +122,8 @@ impl FabricIdentity {
     /// Native sibling: the original fabric seed, with a stack-only signature.
     pub(crate) fn sign_lineage_fixed(&self, bytes: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer as _;
+        #[cfg(test)]
+        PAGING_SIGNATURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ed25519_dalek::SigningKey::from_bytes(&self.seed)
             .sign(bytes)
             .to_bytes()
@@ -154,10 +158,23 @@ impl FabricIdentity {
         let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|err| {
             Error::SyncError((format!("invalid lineage signature encoding: {err}")).into())
         })?;
+        let proof =
+            crate::custody::signature_work::digest(&public_bytes, bytes, &signature.to_bytes());
+        if crate::custody::signature_work::known(&proof) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        PAGING_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         verifying.verify(bytes, &signature).map_err(|_| {
             Error::SyncError(
                 ("wire row lineage signature does not verify for its author".to_string()).into(),
             )
+        })?;
+        crate::custody::signature_work::remember(proof).map_err(|failure| match failure {
+            crate::custody::native_selection::Failure::Refused(refusal) => {
+                Error::NativeEngineOther(refusal)
+            }
+            _ => Error::Other("signature proof admission failed".into()),
         })
     }
 
@@ -192,4 +209,45 @@ fn hex_node_id(node_id: &str) -> contextdb_core::Result<[u8; 32]> {
         })?;
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+pub(crate) static PAGING_SIGNATURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static PAGING_VERIFICATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static PAGING_WORK_LIMIT: std::sync::Mutex<Option<(usize, usize, usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct PagingWorkLimit;
+#[cfg(test)]
+impl PagingWorkLimit {
+    pub(crate) fn arm(sign_start: usize, verify_start: usize, records: usize, verify_limit: usize) -> Self {
+        let mut limit = PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(limit.is_none(), "only one paging work guard is active");
+        *limit = Some((sign_start, verify_start, records, verify_limit));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for PagingWorkLimit {
+    fn drop(&mut self) {
+        *PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+#[cfg(test)]
+pub(crate) fn check_paging_work_limit() {
+    let limit = *PAGING_WORK_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((sign_start, verify_start, records, verify_limit)) = limit {
+        let verifications = PAGING_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed) - verify_start;
+        let signatures = PAGING_SIGNATURES.load(std::sync::atomic::Ordering::Relaxed) - sign_start;
+        assert!(verifications <= verify_limit,
+            "bounded signed-component verifications: {verifications} > {verify_limit}");
+        assert!(signatures <= records,
+            "one certificate signing per delivered record: {signatures} for {records}");
+    }
 }

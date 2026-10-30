@@ -934,6 +934,8 @@ impl SyncClient {
             let (page, more) = self
                 .fetch_delivery_page(since.take(), &owner, custody_reader.clone(), &mut result)
                 .await?;
+            #[cfg(test)]
+            crate::identity::check_paging_work_limit();
             match (more, page) {
                 (false, _) => return Ok(result.into_outcomes()),
                 (true, 0) => return Err(crate::custody::canonical::invalid()),
@@ -1090,33 +1092,35 @@ impl SyncClient {
             "Reduce the delivery page or raise the declared reader memory limit.",
         )
         .map_err(delivery_transport_error)?;
-        self.db.with_authoritative_hub_reply(hub, |db| {
-            let mut packets = Vec::with_capacity(count);
-            let before = decoded_memory.held();
-            for wire in &page.outcomes {
-                packets.push(crate::custody::delivery::read_packet(
-                    wire,
-                    &decoded_memory,
-                )?);
-            }
-            // Custody admitted every decoded value of these packets; their
-            // projections copy a subset, so this bounds the result's growth.
-            let decoded = decoded_memory.held().saturating_sub(before);
-            // The page's result is admitted and reserved before its custody
-            // effects commit: a refusal here leaves delivery status unchanged.
-            result.reserve_projected(decoded, packets.len())?;
-            crate::custody::preparation::admit_terminals(
-                db,
-                &self.tenant_id,
-                hub,
-                edge,
-                &packets,
-                vector_copy_owner,
-                read_memory.clone(),
-            )?;
-            result.extend_reserved(packets.iter().map(|packet| {
-                crate::custody::inspection::projection(&packet.record, &packet.block)
-            }))
+        crate::custody::signature_work::scoped(owner, || {
+            self.db.with_authoritative_hub_reply(hub, |db| {
+                let mut packets = Vec::with_capacity(count);
+                let before = decoded_memory.held();
+                for wire in &page.outcomes {
+                    packets.push(crate::custody::delivery::read_packet(
+                        wire,
+                        &decoded_memory,
+                    )?);
+                }
+                // Custody admitted every decoded value of these packets; their
+                // projections copy a subset, so this bounds the result's growth.
+                let decoded = decoded_memory.held().saturating_sub(before);
+                // The page's result is admitted and reserved before its custody
+                // effects commit: a refusal here leaves delivery status unchanged.
+                result.reserve_projected(decoded, packets.len())?;
+                crate::custody::preparation::admit_terminals(
+                    db,
+                    &self.tenant_id,
+                    hub,
+                    edge,
+                    &packets,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
+                result.extend_reserved(packets.iter().map(|packet| {
+                    crate::custody::inspection::projection(&packet.record, &packet.block)
+                }))
+            })
         })?;
         Ok((count, more))
     }

@@ -300,6 +300,7 @@ fn encode_packet(
     operation: &NativeReadRequest,
     context: &NativeReadOpenContext,
     identity: &FabricIdentity,
+    signatures: &mut CertificateSignatures,
     terminal: TerminalRecord<'_>,
     submission: &Views<'_>,
     authority: &Views<'_>,
@@ -365,7 +366,7 @@ fn encode_packet(
             &retirement_digest,
         )
     })?;
-    let signature = identity.sign_lineage_fixed(certificate_bytes.bytes());
+    let signature = signatures.sign(identity, certificate_bytes.bytes())?;
     let packet = PacketView {
         // Selection validated the actual source. Legacy current copies this
         // checkpoint without extra namespace/root/terminal-position checks.
@@ -461,8 +462,30 @@ pub(crate) struct OutcomeLengths {
 
 /// Count what `encode_packet` would build for one outcome, from borrowed
 /// views. The diagnostic body, signed core and lookup source are counted and
-/// never built; the certificate is the one buffer built here, because the
-/// signature's encoding depends on its bytes, and it is freed before return.
+/// never built. The exact certificate signature is retained on the page owner
+/// and reused during building: MessagePack integer widths depend on its bytes.
+struct CertificateSignatures {
+    slots: NativeSelectionHold<([u8; 32], [u8; 64])>,
+}
+impl CertificateSignatures {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal is retained inline."
+    )]
+    fn sign(&mut self, identity: &FabricIdentity, bytes: &[u8]) -> Selected<[u8; 64]> {
+        let mut hash = blake3::Hasher::new_derive_key("contextdb.delivery.certificate-signing.v1");
+        hash.update(&identity.public_key_bytes());
+        hash.update(bytes);
+        let digest = *hash.finalize().as_bytes();
+        if let Some((_, signature)) = self.slots.as_slice().iter().find(|(key, _)| *key == digest) {
+            return Ok(*signature);
+        }
+        let signature = identity.sign_lineage_fixed(bytes);
+        self.slots.retain((digest, signature))?;
+        Ok(signature)
+    }
+}
+
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -470,6 +493,7 @@ pub(crate) struct OutcomeLengths {
 fn measure_packet(
     owner: &ReadMemoryOwner,
     identity: &FabricIdentity,
+    signatures: &mut CertificateSignatures,
     terminal: TerminalRecord<'_>,
     submission: &Views<'_>,
     authority: &Views<'_>,
@@ -503,7 +527,7 @@ fn measure_packet(
             &retirement_digest,
         )
     })?;
-    let signature = identity.sign_lineage_fixed(certificate_bytes.bytes());
+    let signature = signatures.sign(identity, certificate_bytes.bytes())?;
     drop(certificate_bytes);
     let packet = PacketView {
         checkpoint,
@@ -606,6 +630,9 @@ fn encode_selection(
         .as_slice()
         .iter()
         .zip(selection.submissions.as_slice());
+    let mut signatures = CertificateSignatures {
+        slots: NativeSelectionHold::try_new(&owner, selection.positions.as_slice().len())?,
+    };
     let mut outcome_bytes = 0usize;
     let mut included = 0usize;
     for ((index, position), submission) in candidates.clone() {
@@ -631,6 +658,7 @@ fn encode_selection(
         let lengths = measure_packet(
             &owner,
             identity,
+            &mut signatures,
             terminal,
             &submission,
             &authority,
@@ -685,6 +713,7 @@ fn encode_selection(
             operation,
             context,
             identity,
+            &mut signatures,
             terminal,
             &submission,
             &authority,
@@ -721,6 +750,37 @@ fn encode_selection(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(crate) fn encode_custody_outcomes(
+    db: &Database,
+    identity: &FabricIdentity,
+    namespace: &NativePacketNamespace,
+    edge_incarnation: Incarnation,
+    after: Option<(Lsn, u32)>,
+    page: usize,
+    cut: &PageCut<'_>,
+    operation: &NativeReadRequest,
+    context: &NativeReadOpenContext,
+) -> Selected<NativeBorrowedOutcomeBatch> {
+    crate::custody::signature_work::scoped(&operation.owner(), || {
+        encode_custody_outcomes_inner(
+            db,
+            identity,
+            namespace,
+            edge_incarnation,
+            after,
+            page,
+            cut,
+            operation,
+            context,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Native refusal is retained inline."
+)]
+fn encode_custody_outcomes_inner(
     db: &Database,
     identity: &FabricIdentity,
     namespace: &NativePacketNamespace,
