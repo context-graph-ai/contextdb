@@ -143,7 +143,7 @@ impl Drop for RedbPersistence {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
-    match fs2::FileExt::try_lock_exclusive(file) {
+    match companion_ownership_lock(file, CompanionOwnershipLock::Exclusive) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
         Err(err) => Err(Error::Other(
@@ -153,7 +153,7 @@ pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
 }
 
 pub(super) fn unlock_file(file: &File) {
-    let _ = fs2::FileExt::unlock(file);
+    let _ = companion_ownership_lock(file, CompanionOwnershipLock::Unlock);
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -2184,5 +2184,31 @@ impl RedbPersistence {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn companion_ownership_lock(
+    file: &File,
+    operation: CompanionOwnershipLock,
+) -> std::io::Result<()> {
+    let lock_type = match operation {
+        CompanionOwnershipLock::Exclusive => RangeLockMode::Exclusive.lock_type(),
+        CompanionOwnershipLock::Unlock => libc::F_UNLCK as libc::c_short,
+    };
+    match companion_range_lock(file, COMPANION_OWNER_LOCK_OFFSET, lock_type, false)? {
+        RangeLockOutcome::Taken => Ok(()),
+        RangeLockOutcome::HeldByAnother => Err(std::io::ErrorKind::WouldBlock.into()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn companion_ownership_lock(
+    file: &File,
+    operation: CompanionOwnershipLock,
+) -> std::io::Result<()> {
+    match operation {
+        CompanionOwnershipLock::Exclusive => fs2::FileExt::try_lock_exclusive(file),
+        CompanionOwnershipLock::Unlock => fs2::FileExt::unlock(file),
     }
 }

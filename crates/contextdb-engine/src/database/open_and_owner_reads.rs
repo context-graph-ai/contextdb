@@ -2426,6 +2426,8 @@ impl Database {
                         self.trigger
                             .wait_observed_count
                             .fetch_add(1, Ordering::SeqCst);
+                        #[cfg(any(test, feature = "test-seams"))]
+                        self.trigger.wait_observed_changed.notify_all();
                         observed_wait = true;
                     }
                 }

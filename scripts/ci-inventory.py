@@ -229,7 +229,7 @@ def redb_target_contract(root):
         for command in commands:
             if text.count(command) != 1:
                 raise ValueError(f"redb publication target mismatch: {workflow}: {command}")
-    for workflow, expected in [('ci.yml', 3), ('integration.yml', 1)]:
+    for workflow, expected in [('ci.yml', 4), ('integration.yml', 1)]:
         text = (root / '.github/workflows' / workflow).read_text()
         if text.count('crates/contextdb-redb -> ../../target/redb') != expected:
             raise ValueError(f"redb cache target mismatch: {workflow}")
@@ -323,7 +323,7 @@ def pr_jobs(root):
 
 
 def redb_featured_contract(root):
-    expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal')]
+    expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal'), ('cache_residency', 'contextdb-internal')]
     source = (root / 'scripts/ci-integration.py').read_text()
     declarations = [node for node in ast.parse(source).body if isinstance(node, ast.Assign)
                     and any(isinstance(name, ast.Name) and name.id == 'REDB_FEATURED_TARGETS'

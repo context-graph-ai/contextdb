@@ -126,10 +126,12 @@ use crate::database::trigger::TriggerPersistenceCommit;
 use crate::direct_file_reader::DirectTypedImageDigest;
 use crate::local_transport::{RuntimeDirectory, derive_channel_address};
 use crate::sync_types::DdlChange;
+#[cfg(target_os = "linux")]
+use contextdb_core::read_contract::ReaderProcessIdentity;
 use contextdb_core::read_contract::{
     ChannelAddress, DatabaseIdentity, HeldByReadersDetail, HeldByWriterDetail, LocalUserIdentity,
     OwnerReadCancellation, OwnerReadStatus, OwnerServingReason, OwnerServingState, ReadFailure,
-    ReadFailureDetail, ReadFailureKind, ReaderBreadcrumb, ReaderProcessIdentity, WriterRunNumber,
+    ReadFailureDetail, ReadFailureKind, ReaderBreadcrumb, WriterRunNumber,
 };
 use contextdb_core::{
     AdjEntry, ColumnType, DirectedValue, Error, ForeignKeyReference, IndexDecl, IndexKey,
@@ -465,10 +467,10 @@ pub(crate) struct ObservedWriterState {
 /// byte of the record will ever occupy, and neither is ever read or written:
 /// taking one costs a lock call and nothing else, the companion's own content
 /// is untouched, and the kernel drops the hold the moment the holder's process
-/// dies. Byte-range locks are independent of the whole-file advisory lock a
-/// writer takes to claim the store, so a hold here never contends with a
-/// claim -- and both are on the companion beside the store, so nothing here
-/// opens, reads, locks, or creates anything in the store folder.
+/// dies. Linux ownership also takes an independent whole-file lock. macOS
+/// ownership takes its own non-overlapping byte because whole-file locks
+/// overlap byte-range holds there. All holds live on the companion, so nothing
+/// here opens, reads, locks, or creates anything in the store folder.
 ///
 /// `CLAIM_WINDOW` is held by a writer from the moment it claims the store
 /// until it publishes its serving decision, so a caller arriving inside that
@@ -521,18 +523,11 @@ struct WakePipe {
 #[cfg(unix)]
 struct PipeWaker(Arc<WakePipe>);
 
-/// What a coordination wait sleeps on while a companion byte it wants is held
-/// by somebody else.
-///
-/// The hold itself is not something the kernel will let a thread wait on and
-/// also be woken from, so the wait does not try: it sleeps on NOTIFICATIONS
-/// about the companion instead -- a holder closing its descriptor, a writer
-/// publishing a record -- and re-asks for the byte each time one arrives. That
-/// keeps every property the blocking acquisition had (the wake IS the event,
-/// nothing polls, no interval decides how quickly a caller learns) and adds
-/// the one it lacked: the wait belongs to the caller's own thread, so when the
-/// caller stops waiting there is nothing left anywhere still queued for a hold
-/// nobody wants.
+/// A coordination wait stays on its caller thread and rechecks the trusted
+/// hold after waking. Linux watches companion notifications and the wake pipe.
+/// macOS watches the wake pipe with a short lock-recheck interval so cancellation
+/// can end the wait while the hold remains live. Other Unix targets keep the
+/// blocking fallback, which notices cancellation at the next release.
 #[cfg(unix)]
 struct CoordinationWatch {
     wake: Arc<WakePipe>,
@@ -8652,3 +8647,20 @@ mod retention_retired_binding_guard_tests;
 
 #[cfg(test)]
 mod retention_obligations_guard_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_process_info_observation;
+
+/// Exclusive ownership and error cleanup address the same lock. Reader
+/// ownership probes query the separate owner byte without acquiring a hold. macOS whole-file locks overlap
+/// the reader and claim-window bytes, so ownership uses a separate OFD byte.
+/// An older whole-file owner still overlaps that byte and excludes a writer.
+#[derive(Clone, Copy)]
+enum CompanionOwnershipLock {
+    Exclusive,
+    Unlock,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "persistence/reader_coordination_wait_tests.rs"]
+mod reader_coordination_wait_tests;

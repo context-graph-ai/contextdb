@@ -1,14 +1,18 @@
 use contextdb_core::read_contract::{ChannelAddress, LocalUserIdentity};
+#[cfg(target_os = "linux")]
+use contextdb_engine::local_transport::ProcessRuntimeDirectoryEnvironment;
 #[cfg(unix)]
 use contextdb_engine::local_transport::UnixLocalCarrier;
 #[cfg(target_os = "linux")]
 use contextdb_engine::local_transport::linux_filesystem_type_is_local;
+#[cfg(target_os = "macos")]
+use contextdb_engine::local_transport::resolve_runtime_directory;
 use contextdb_engine::local_transport::{
     ChannelPathFacts, ChannelPathViolation, LocalTransportError, OWNER_ONLY_MODE,
-    ProcessRuntimeDirectoryEnvironment, ResolvedRuntimeDirectory, RuntimeDirectoryEnvironment,
-    RuntimeDirectoryFacts, RuntimeDirectoryInspector, RuntimeDirectoryRequest,
-    RuntimeDirectorySource, RuntimeRootViolation, SystemRuntimeDirectoryInspector,
-    channel_socket_path, inspect_channel_path, opaque_channel_basename, prepare_runtime_directory,
+    ResolvedRuntimeDirectory, RuntimeDirectoryEnvironment, RuntimeDirectoryFacts,
+    RuntimeDirectoryInspector, RuntimeDirectoryRequest, RuntimeDirectorySource,
+    RuntimeRootViolation, SystemRuntimeDirectoryInspector, channel_socket_path,
+    inspect_channel_path, opaque_channel_basename, prepare_runtime_directory,
     prepare_runtime_directory_with_environment, resolve_runtime_directory_with_environment,
     unix_socket_path_limit, validate_channel_path, validate_runtime_root,
 };
@@ -302,53 +306,31 @@ fn linux_filesystem_locality_is_an_allowlist_and_unknown_types_are_refused() {
     assert!(!linux_filesystem_type_is_local(0x1234_5678));
 }
 
+#[cfg(target_os = "macos")]
+fn native_private_root() -> PathBuf {
+    PathBuf::from("/private/var/folders/ab/012345678901234567890123456789/T")
+}
+
 #[test]
 #[cfg(target_os = "macos")]
-fn local_channel_derives_the_macos_direct_default_channel() {
-    let owner = LocalUserIdentity(7_106); // 0x1bc2
-    let canonical_parent = PathBuf::from("/private/tmp");
-    let request = RuntimeDirectoryRequest {
-        explicit_root: None,
-        current_user: owner,
-    };
-    let inspector = FactsInspector::default()
-        .with(RuntimeDirectoryFacts {
-            requested_root: PathBuf::from("/tmp"),
-            resolved_root: canonical_parent.clone(),
-            is_absolute: true,
-            is_local: true,
-            is_directory: true,
-            is_symbolic_link: true,
-            owner: LocalUserIdentity(0),
-            mode: 0o1777,
-            writable: true,
-            available: true,
-        })
-        .with(RuntimeDirectoryFacts {
-            requested_root: canonical_parent.clone(),
-            resolved_root: canonical_parent.clone(),
-            is_absolute: true,
-            is_local: true,
-            is_directory: true,
-            is_symbolic_link: false,
-            owner: LocalUserIdentity(0),
-            mode: 0o1777,
-            writable: true,
-            available: true,
-        });
-
+fn local_channel_derives_the_macos_private_default_channel() {
+    let owner = LocalUserIdentity(7_106);
+    let root = native_private_root();
+    let inspector = FactsInspector::default().with(facts(root.clone(), owner));
     let resolved = resolve_runtime_directory_with_environment(
-        &request,
+        &RuntimeDirectoryRequest {
+            explicit_root: None,
+            current_user: owner,
+        },
         &inspector,
         &RuntimeEnvironment {
             xdg: Some(PathBuf::from("/ignored-on-macos")),
             effective_user: owner,
-            macos_temporary: None,
+            macos_temporary: Some(root.clone()),
         },
     )
-    .expect("macOS direct default runtime resolution");
-
-    let expected_dir = canonical_parent.join("cdb0000000000001bc2");
+    .expect("macOS private default runtime resolution");
+    let expected_dir = root.join("c");
     assert_eq!(
         resolved,
         ResolvedRuntimeDirectory {
@@ -356,195 +338,102 @@ fn local_channel_derives_the_macos_direct_default_channel() {
             source: RuntimeDirectorySource::MacosTemporary,
         }
     );
-    assert_eq!(expected_dir.as_os_str().as_encoded_bytes().len(), 32);
-    let socket_path =
-        expected_dir.join("0000000000000000000000000000000000000000000000000000000000000000.sock");
-    assert_eq!(socket_path.as_os_str().as_encoded_bytes().len(), 102);
-    assert!(socket_path.as_os_str().as_encoded_bytes().len() <= 103);
+    let socket = channel_socket_path(&expected_dir, ChannelAddress([0; 32]))
+        .expect("native private socket address fits");
+    assert!(socket.as_os_str().as_encoded_bytes().len() <= 103);
+    assert_eq!(socket.file_name().unwrap().as_encoded_bytes().len(), 43);
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 fn macos_default_channel_full_u64_uid_boundaries() {
-    let canonical_parent = PathBuf::from("/private/tmp");
-    let base_parent_facts = RuntimeDirectoryFacts {
-        requested_root: canonical_parent.clone(),
-        resolved_root: canonical_parent.clone(),
-        is_absolute: true,
-        is_local: true,
-        is_directory: true,
-        is_symbolic_link: false,
-        owner: LocalUserIdentity(0),
-        mode: 0o1777,
-        writable: true,
-        available: true,
-    };
-    let tmp_facts = RuntimeDirectoryFacts {
-        requested_root: PathBuf::from("/tmp"),
-        resolved_root: canonical_parent.clone(),
-        is_absolute: true,
-        is_local: true,
-        is_directory: true,
-        is_symbolic_link: true,
-        owner: LocalUserIdentity(0),
-        mode: 0o1777,
-        writable: true,
-        available: true,
-    };
-
-    let boundary_cases = [
-        (LocalUserIdentity(0), "cdb0000000000000000"),
-        (
-            LocalUserIdentity(0xffff_ffff_ffff_ffff),
-            "cdbffffffffffffffff",
-        ),
-    ];
-
-    for (uid, leaf_name) in boundary_cases {
-        let inspector = FactsInspector::default()
-            .with(tmp_facts.clone())
-            .with(base_parent_facts.clone());
-        let request = RuntimeDirectoryRequest {
-            explicit_root: None,
-            current_user: uid,
-        };
+    let root = native_private_root();
+    for owner in [LocalUserIdentity(0), LocalUserIdentity(u64::MAX)] {
+        let inspector = FactsInspector::default().with(facts(root.clone(), owner));
         let resolved = resolve_runtime_directory_with_environment(
-            &request,
+            &RuntimeDirectoryRequest {
+                explicit_root: None,
+                current_user: owner,
+            },
             &inspector,
             &RuntimeEnvironment {
                 xdg: None,
-                effective_user: uid,
-                macos_temporary: None,
+                effective_user: owner,
+                macos_temporary: Some(root.clone()),
             },
         )
-        .expect("boundary UID resolution");
-        assert_eq!(
-            resolved,
-            ResolvedRuntimeDirectory {
-                path: canonical_parent.join(leaf_name),
-                source: RuntimeDirectorySource::MacosTemporary,
-            }
-        );
+        .expect("private root resolution for UID boundary");
+        assert_eq!(resolved.path, root.join("c"));
     }
 }
 
 #[test]
 #[cfg(target_os = "macos")]
-fn macos_default_channel_path_length_bound_b13_accept_b14_refuse() {
-    let dummy_address = contextdb_core::read_contract::ChannelAddress([0x33; 32]);
-    // Leaf is cdb0000000000000001 (19 bytes). Channel socket name is 69 bytes.
-    // Full socket address is B + 1 + 19 + 1 + 69 = B + 90 bytes.
-    // B = 13 encoded bytes gives 13 + 90 = 103 bytes (accepted).
-    // B = 14 encoded bytes gives 14 + 90 = 104 bytes (refused).
-    let parent_b13 = PathBuf::from("/private/tmp1"); // 13 bytes
-    assert_eq!(parent_b13.as_os_str().as_encoded_bytes().len(), 13);
-    let dir_b13 = parent_b13.join("cdb0000000000000001");
-    let socket_b13 = channel_socket_path(&dir_b13, dummy_address);
-    assert!(
-        socket_b13.is_ok(),
-        "B=13 parent must yield valid 103-byte socket path"
-    );
+fn macos_default_channel_path_length_bound_b57_accept_b58_refuse() {
+    let address = ChannelAddress([0x33; 32]);
+    // Parent + /c/ + 43-byte basename fits exactly at 103 when parent is 57 bytes.
+    let parent_b57 = PathBuf::from(format!("/{}", "p".repeat(56)));
+    assert_eq!(parent_b57.as_os_str().as_encoded_bytes().len(), 57);
+    let socket =
+        channel_socket_path(&parent_b57.join("c"), address).expect("103-byte socket address fits");
+    assert_eq!(socket.as_os_str().as_encoded_bytes().len(), 103);
+    let parent_b58 = PathBuf::from(format!("/{}", "p".repeat(57)));
     assert_eq!(
-        socket_b13.unwrap().as_os_str().as_encoded_bytes().len(),
-        103
-    );
-
-    let parent_b14 = PathBuf::from("/private/tmp14"); // 14 bytes
-    assert_eq!(parent_b14.as_os_str().as_encoded_bytes().len(), 14);
-    let dir_b14 = parent_b14.join("cdb0000000000000001");
-    let socket_b14 = channel_socket_path(&dir_b14, dummy_address);
-    assert_eq!(
-        socket_b14,
+        channel_socket_path(&parent_b58.join("c"), address),
         Err(LocalTransportError::ChannelPath(
             ChannelPathViolation::PathTooLong
-        )),
-        "B=14 parent must be refused as exceeding 103-byte limit"
+        ))
     );
 }
 
 #[test]
 #[cfg(target_os = "macos")]
-fn macos_default_channel_canonicalizes_alias_before_symlink_inspection() {
+fn macos_default_channel_refuses_native_and_explicit_symlinks() {
     let owner = LocalUserIdentity(7_102);
-    let tmp = PathBuf::from("/tmp");
-    let canonical_parent = PathBuf::from("/private/tmp");
-
-    // /tmp is a symlink on Darwin; canonical parent /private/tmp is not a symlink.
-    let inspector = FactsInspector::default()
-        .with(RuntimeDirectoryFacts {
-            requested_root: tmp.clone(),
-            resolved_root: canonical_parent.clone(),
-            is_absolute: true,
-            is_local: true,
-            is_directory: true,
-            is_symbolic_link: true,
-            owner: LocalUserIdentity(0),
-            mode: 0o1777,
-            writable: true,
-            available: true,
-        })
-        .with(RuntimeDirectoryFacts {
-            requested_root: canonical_parent.clone(),
-            resolved_root: canonical_parent.clone(),
-            is_absolute: true,
-            is_local: true,
-            is_directory: true,
-            is_symbolic_link: false,
-            owner: LocalUserIdentity(0),
-            mode: 0o1777,
-            writable: true,
-            available: true,
-        });
-
-    let default_res = resolve_runtime_directory_with_environment(
-        &RuntimeDirectoryRequest {
-            explicit_root: None,
-            current_user: owner,
-        },
-        &inspector,
-        &RuntimeEnvironment {
-            xdg: None,
-            effective_user: owner,
-            macos_temporary: None,
-        },
-    );
-    assert!(
-        default_res.is_ok(),
-        "platform alias /tmp must canonicalize to /private/tmp without symlink rejection"
-    );
-
-    // Explicit roots MUST still reject symlinks
-    let explicit_symlink = PathBuf::from("/service/explicit-symlink");
-    let explicit_inspector = FactsInspector::default().with(RuntimeDirectoryFacts {
-        requested_root: explicit_symlink.clone(),
-        resolved_root: PathBuf::from("/elsewhere"),
-        is_absolute: true,
-        is_local: true,
-        is_directory: true,
-        is_symbolic_link: true,
-        owner: owner,
-        mode: OWNER_ONLY_MODE,
-        writable: true,
-        available: true,
-    });
-    let explicit_res = resolve_runtime_directory_with_environment(
-        &RuntimeDirectoryRequest {
-            explicit_root: Some(explicit_symlink),
-            current_user: owner,
-        },
-        &explicit_inspector,
-        &RuntimeEnvironment {
-            xdg: None,
-            effective_user: owner,
-            macos_temporary: None,
-        },
-    );
+    let alias = PathBuf::from("/private/var/folders/alias/T");
+    let root = native_private_root();
+    let mut alias_facts = facts(alias.clone(), owner);
+    alias_facts.resolved_root = root;
+    alias_facts.is_symbolic_link = true;
+    let inspector = FactsInspector::default().with(alias_facts);
     assert_eq!(
-        explicit_res,
+        resolve_runtime_directory_with_environment(
+            &RuntimeDirectoryRequest {
+                explicit_root: None,
+                current_user: owner
+            },
+            &inspector,
+            &RuntimeEnvironment {
+                xdg: None,
+                effective_user: owner,
+                macos_temporary: Some(alias)
+            },
+        ),
         Err(LocalTransportError::RuntimeRoot(
             RuntimeRootViolation::SymbolicLink
-        )),
-        "explicit root pointing to symlink must still be refused"
+        ))
+    );
+
+    let explicit_symlink = PathBuf::from("/service/explicit-symlink");
+    let mut explicit_facts = facts(explicit_symlink.clone(), owner);
+    explicit_facts.is_symbolic_link = true;
+    let explicit_inspector = FactsInspector::default().with(explicit_facts);
+    assert_eq!(
+        resolve_runtime_directory_with_environment(
+            &RuntimeDirectoryRequest {
+                explicit_root: Some(explicit_symlink),
+                current_user: owner
+            },
+            &explicit_inspector,
+            &RuntimeEnvironment {
+                xdg: None,
+                effective_user: owner,
+                macos_temporary: None
+            },
+        ),
+        Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::SymbolicLink
+        ))
     );
 }
 
@@ -631,11 +520,9 @@ fn local_channel_path_is_an_owner_only_socket_below_the_validated_runtime_direct
     }
 }
 
-/// A Unix socket pathname is capped at 107 bytes, and the channel basename
-/// alone is 69, so a runtime base created under a long ambient temporary
-/// directory cannot host a socket at all. These journeys therefore build
-/// their bases under a deliberately short root instead of inheriting the
-/// environment's temporary directory.
+/// A Unix socket pathname has a small platform limit, so a runtime base
+/// created under a long ambient temporary directory may not host a socket.
+/// These journeys use a deliberately short root.
 #[cfg(unix)]
 fn short_runtime_base() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -776,7 +663,7 @@ fn production_preparation_refuses_every_hostile_preexisting_runtime_child() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn process_environment_resolves_the_native_macos_direct_default_channel() {
+fn process_environment_resolves_the_native_macos_private_default_channel() {
     let current = LocalUserIdentity(nix::unistd::geteuid().as_raw() as u64);
     let resolved = resolve_runtime_directory(
         &RuntimeDirectoryRequest {
@@ -786,10 +673,14 @@ fn process_environment_resolves_the_native_macos_direct_default_channel() {
         &SystemRuntimeDirectoryInspector,
     )
     .expect("resolve native macOS default runtime directory");
+    let native_root = contextdb_engine::local_transport::ProcessRuntimeDirectoryEnvironment
+        .macos_user_temporary_directory()
+        .expect("native private temporary directory");
+    let canonical_root = fs::canonicalize(native_root).expect("canonical native private root");
     assert_eq!(
         resolved,
         ResolvedRuntimeDirectory {
-            path: PathBuf::from("/private/tmp").join(format!("cdb{:016x}", current.0)),
+            path: canonical_root.join("c"),
             source: RuntimeDirectorySource::MacosTemporary,
         }
     );
@@ -862,7 +753,10 @@ fn channel_names_are_distinct_opaque_and_survive_a_deep_runtime_directory() {
         first_path.file_name().and_then(|name| name.to_str()),
         Some(first_basename.as_str())
     );
+    #[cfg(target_os = "linux")]
     assert_eq!(first_basename.len(), 69);
+    #[cfg(target_os = "macos")]
+    assert_eq!(first_basename.len(), 43);
 
     let limit = unix_socket_path_limit().expect("Unix socket pathname limit");
     let too_long_runtime = PathBuf::from("/").join("r".repeat(limit));

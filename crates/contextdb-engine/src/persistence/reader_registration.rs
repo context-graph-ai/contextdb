@@ -930,7 +930,7 @@ pub(crate) fn observed_writer_state(database_path: &Path) -> Option<ObservedWrit
         // A writer takes the claim-window byte before replacing the previous
         // run's durable record. While that byte is held, the bytes below can
         // still describe the departed writer and must not be attributed to
-        // the live holder merely because the whole-file writer lock is held.
+        // the live holder merely because the writer ownership lock is held.
         // The claim-window path is what waits for the arriving writer's own
         // decision; this status path deliberately has no answer yet.
         match query_companion_range_lock(&file, COMPANION_CLAIM_WINDOW_LOCK_OFFSET).ok()? {
@@ -1280,8 +1280,9 @@ impl From<std::io::Error> for CoordinationWatchFailure {
 
 #[cfg(unix)]
 impl CoordinationWatch {
-    /// Arm the watch BEFORE asking for the byte, so a release that happens
-    /// between the ask and the sleep is already queued rather than missed.
+    /// Arm BEFORE asking for the byte so cancellation can queue a wake before
+    /// sleep begins. Linux also queues companion notifications; macOS rechecks
+    /// the hold at its private interval.
     pub(super) fn arm(
         companion: &Path,
         stop: Option<&OwnerReadCancellation>,
@@ -1339,11 +1340,8 @@ impl CoordinationWatch {
         std::task::Waker::from(Arc::new(PipeWaker(Arc::clone(&self.wake))))
     }
 
-    /// Sleep until something about this companion happens, or until somebody
-    /// pokes the wake pipe. On a platform with no notification channel the
-    /// caller's own thread takes the blocking acquisition instead: the answer
-    /// is the same and nothing is left running either way, but a stop is
-    /// noticed at the next wake rather than at once.
+    /// Sleep on companion notifications or the caller's wake pipe, then let
+    /// the caller recheck cancellation and the trusted nonblocking lock.
     #[cfg(target_os = "linux")]
     pub(super) fn sleep(
         &self,
@@ -1387,7 +1385,45 @@ impl CoordinationWatch {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// Wait for cancellation or the next lock recheck without acquiring a hold.
+    #[cfg(target_os = "macos")]
+    pub(super) fn sleep(
+        &self,
+        _held: &File,
+        _offset: u64,
+        timeout: Option<std::time::Duration>,
+    ) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        // A private scheduling bound, not a caller deadline or retry policy.
+        // Only the outer trusted nonblocking probe can establish release.
+        const LOCK_RECHECK_QUANTUM: std::time::Duration = std::time::Duration::from_millis(10);
+        let timeout = timeout
+            .unwrap_or(LOCK_RECHECK_QUANTUM)
+            .min(LOCK_RECHECK_QUANTUM);
+        // Round down so even a sub-millisecond remaining allowance is never
+        // extended. An interruption returns to the caller instead of renewing it.
+        let timeout_ms = timeout.as_millis() as libc::c_int;
+        let mut watched = libc::pollfd {
+            fd: self.wake.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Arm precedes the outer probe. Do not drain here: cancellation or a
+        // deadline wake queued between that probe and this poll must be seen.
+        let ready = unsafe { libc::poll(&mut watched, 1, timeout_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+            return Ok(());
+        }
+        self.wake.drain();
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(super) fn sleep(
         &self,
         held: &File,
@@ -1512,12 +1548,11 @@ pub(crate) fn observe_unsettled_claim(database_path: &Path) -> Option<UnsettledC
 
 /// Wait out a writer's claim window inside the budget the caller declared.
 ///
-/// Nothing polls and nothing sleeps for an interval: the caller's thread sleeps
-/// on the companion's own notifications and re-asks for the byte each time one
-/// arrives, so the writer publishing its decision IS what wakes this. The other
-/// thing that may end it is the caller's own declared budget, and that budget
-/// is spent against the CLOCK the caller supplied -- never against real time --
-/// so a proof advances a clock instead of waiting an hour.
+/// Linux rechecks on companion notifications; macOS rechecks at a short private
+/// interval while also watching the deadline's wake pipe. The caller's declared
+/// budget is still spent against the CLOCK it supplied -- never renewed by a
+/// recheck -- so a proof advances a clock instead of waiting an hour. Other
+/// Unix targets retain their blocking fallback and notice expiry at its next wake.
 ///
 /// The writer is never blocked or delayed: a shared request never stands in the
 /// way of the exclusive hold it already owns, and the store file is untouched.
@@ -2764,8 +2799,22 @@ pub(super) fn macos_process_info(
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == 136);
+    #[cfg(all(test, target_os = "macos"))]
+    let written = macos_process_info_observation::observe(pid, &mut info).unwrap_or_else(|| {
+        // SAFETY: same native record, size, flavor and argument as the non-test call below.
+        unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size,
+            )
+        }
+    });
     // SAFETY: `info` is a live `proc_bsdinfo` and `size` is its byte length.
     // `PROC_PIDTBSDINFO` with arg 0 returns that record and does not select a zombie.
+    #[cfg(not(test))]
     let written = unsafe {
         libc::proc_pidinfo(
             pid,

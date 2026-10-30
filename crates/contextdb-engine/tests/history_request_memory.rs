@@ -12,7 +12,10 @@
 //!
 //! Measured with a counting global allocator, so what is compared is what the
 //! request actually allocated, not what it said it would. Run one test at a
-//! time: the allocator counts every thread.
+//! time in its own process: the allocator counts every thread.
+
+#[path = "fixtures/isolated_process.rs"]
+mod isolated_process;
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_engine::Database;
@@ -241,6 +244,12 @@ fn assert_result_bytes_refusal(error: &DirectFileReaderError, ceiling: u64) {
 
 #[test]
 fn an_oversized_history_record_is_refused_before_it_is_copied_and_leaves_nothing_charged() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "an_oversized_history_record_is_refused_before_it_is_copied_and_leaves_nothing_charged",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed(&path);
@@ -414,6 +423,12 @@ fn reader_with_available_within(
 /// own charged.
 #[test]
 fn a_roomy_reader_with_a_tight_result_ceiling_refuses_before_the_answer_is_encoded() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_roomy_reader_with_a_tight_result_ceiling_refuses_before_the_answer_is_encoded",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed(&path);
@@ -454,6 +469,12 @@ fn a_roomy_reader_with_a_tight_result_ceiling_refuses_before_the_answer_is_encod
 /// refused, typed, one byte below it, without copying the history either time.
 #[test]
 fn a_small_sync_answer_over_a_large_history_is_limited_by_its_own_size() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_small_sync_answer_over_a_large_history_is_limited_by_its_own_size",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed(&path);
@@ -518,6 +539,12 @@ fn a_small_sync_answer_over_a_large_history_is_limited_by_its_own_size() {
 /// `encode_metadata_body`'s result finally gets checked.
 #[test]
 fn a_reader_with_room_for_history_but_not_its_answer_is_refused_typed_and_clean() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_reader_with_room_for_history_but_not_its_answer_is_refused_typed_and_clean",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed(&path);
@@ -565,6 +592,12 @@ fn a_reader_with_room_for_history_but_not_its_answer_is_refused_typed_and_clean(
 /// be skipped.
 #[test]
 fn repeated_requests_after_history_is_cached_still_answer_and_stay_within_room() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "repeated_requests_after_history_is_cached_still_answer_and_stay_within_room",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed(&path);
@@ -588,6 +621,12 @@ fn repeated_requests_after_history_is_cached_still_answer_and_stay_within_room()
 /// cancelled, even though nothing is left to walk.
 #[test]
 fn a_cached_historys_second_request_still_honours_cancellation() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_cached_historys_second_request_still_honours_cancellation",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::{
         DirectCancellation, metadata_with_cancellation_for_test,
     };
@@ -638,6 +677,12 @@ fn a_cached_historys_second_request_still_honours_cancellation() {
 /// than the first left behind.
 #[test]
 fn many_row_changes_admit_their_aux_indexes_before_building_them_and_clean_up_on_refusal() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "many_row_changes_admit_their_aux_indexes_before_building_them_and_clean_up_on_refusal",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed_many_rows(&path);
@@ -702,6 +747,12 @@ fn many_row_changes_admit_their_aux_indexes_before_building_them_and_clean_up_on
 /// caches already warm, occupies no more than it is charged while held.
 #[test]
 fn a_history_answer_fits_its_admission_while_built_and_stays_charged_while_held() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_history_answer_fits_its_admission_while_built_and_stays_charged_while_held",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed_rows(&path, ANSWER_ROWS);
@@ -802,6 +853,12 @@ fn one_answer_budget(path: &std::path::Path) -> OneAnswerBudget {
 /// while the first is held, and answers once the first is dropped.
 #[test]
 fn a_second_answer_is_refused_while_the_first_is_held() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_second_answer_is_refused_while_the_first_is_held",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed_rows(&path, ANSWER_ROWS);
@@ -825,6 +882,12 @@ fn a_second_answer_is_refused_while_the_first_is_held() {
 /// hold one, a refusal is typed, and everything is given back afterwards.
 #[test]
 fn racing_requests_never_hold_two_answers_past_the_limit() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "racing_requests_never_hold_two_answers_past_the_limit",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
     seed_rows(&path, ANSWER_ROWS);
@@ -950,6 +1013,12 @@ fn cached_answer_under(
 /// lies strictly between an early stop and the whole answer.
 #[test]
 fn cancellation_stops_a_cached_answer_mid_projection() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "cancellation_stops_a_cached_answer_mid_projection",
+    ) {
+        return;
+    }
     let (complete, steps, complete_peak) = cached_answer_under(None, u64::MAX / 4);
     complete.expect("an uncancelled request answers");
     let (cancelled, cancelled_steps, cancelled_peak) =
@@ -977,6 +1046,12 @@ fn cancellation_stops_a_cached_answer_mid_projection() {
 /// request stops there with the active-time refusal.
 #[test]
 fn active_time_stops_a_cached_answer_mid_projection() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "active_time_stops_a_cached_answer_mid_projection",
+    ) {
+        return;
+    }
     use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
     let (complete, steps, complete_peak) = cached_answer_under(None, u64::MAX / 4);
     complete.expect("a request with time to spare answers");
@@ -1009,6 +1084,12 @@ fn active_time_stops_a_cached_answer_mid_projection() {
 /// than answered.
 #[test]
 fn cancellation_during_encoding_refuses_the_answer() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "cancellation_during_encoding_refuses_the_answer",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::while_encoding_answers_for_test;
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
@@ -1039,6 +1120,12 @@ fn cancellation_during_encoding_refuses_the_answer() {
 /// kept structures never occupy more than they were charged.
 #[test]
 fn history_indexes_are_charged_for_long_table_names_and_list_growth() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "history_indexes_are_charged_for_long_table_names_and_list_growth",
+    ) {
+        return;
+    }
     use contextdb_engine::database::ChangeLogAuxIndexFixtureForTest;
     for (tables, name_len, rows_per_table) in [(2_000, 4_096, 1), (64, 16, 1_500), (500, 1, 3)] {
         let mut fixture = ChangeLogAuxIndexFixtureForTest::new(tables, name_len, rows_per_table);
@@ -1082,6 +1169,12 @@ fn fallback_reader(
 /// and a returned answer stays charged while the caller holds it.
 #[test]
 fn a_history_answer_built_from_persisted_state_is_admitted_as_it_is_built() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_history_answer_built_from_persisted_state_is_admitted_as_it_is_built",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::held_answer_bytes_for_test;
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
@@ -1306,6 +1399,12 @@ fn answer_rows(response: &DirectMetadataResponse) -> (usize, usize, usize) {
 /// retained-proof accounting charges until the statement itself ends.
 #[test]
 fn pending_deletions_complete_the_history_answer_on_both_paths() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "pending_deletions_complete_the_history_answer_on_both_paths",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::{
         held_answer_bytes_for_test, statement_own_charge_for_test,
     };
@@ -1357,6 +1456,12 @@ fn pending_deletions_complete_the_history_answer_on_both_paths() {
 /// the refusal gives back everything it took.
 #[test]
 fn many_pending_deletions_under_a_tight_limit_are_refused_before_they_are_built() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "many_pending_deletions_under_a_tight_limit_are_refused_before_they_are_built",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::held_answer_bytes_for_test;
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
@@ -1416,6 +1521,12 @@ fn many_pending_deletions_under_a_tight_limit_are_refused_before_they_are_built(
 /// A request cancelled while it reads the pending deletions stops there.
 #[test]
 fn cancellation_stops_the_pending_deletion_read() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "cancellation_stops_the_pending_deletion_read",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::force_history_log_gap_for_test;
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
@@ -1477,6 +1588,12 @@ fn cancellation_stops_the_pending_deletion_read() {
 /// history request.)
 #[test]
 fn an_unreadable_pending_deletion_record_refuses_the_history() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "an_unreadable_pending_deletion_record_refuses_the_history",
+    ) {
+        return;
+    }
     use contextdb_engine::database::fail_next_pending_deletion_read_for_test;
     use contextdb_engine::direct_file_reader::test_seams::DirectStoreDiagnostic;
     let root = tempfile::tempdir().expect("history memory directory");
@@ -1571,6 +1688,12 @@ fn schema_history_reader(
 /// and stops where it is when cancelled during the reconstruction.
 #[test]
 fn a_long_schema_history_is_reconstructed_inside_the_limit() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_long_schema_history_is_reconstructed_inside_the_limit",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::held_answer_bytes_for_test;
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");
@@ -1639,6 +1762,12 @@ fn a_long_schema_history_is_reconstructed_inside_the_limit() {
 /// stops there.
 #[test]
 fn cancellation_stops_a_schema_history_reconstruction() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "cancellation_stops_a_schema_history_reconstruction",
+    ) {
+        return;
+    }
     use contextdb_engine::direct_file_reader::test_seams::force_change_log_gap_for_test;
     let root = tempfile::tempdir().expect("history memory directory");
     let path = root.path().join("history.db");

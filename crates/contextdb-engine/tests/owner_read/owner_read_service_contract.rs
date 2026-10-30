@@ -509,6 +509,15 @@ impl Harness {
         )
     }
 
+    fn advance_clock(&self, now_ms: u64) {
+        self.advance_clock_observed(now_ms, || {});
+    }
+
+    fn advance_clock_observed(&self, now_ms: u64, on_wait: impl FnOnce()) {
+        self.service.wait_for_carrier_requests_for_test(on_wait);
+        self.clock.advance_to(now_ms);
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2373,6 +2382,56 @@ fn custom_namespace_against_a_handler_less_owner_answers_a_named_owner_route_uns
 }
 
 #[test]
+fn manual_clock_advance_waits_for_carrier_completion() {
+    let handler = Arc::new(GatedHandler::default());
+    let handler_seam: Arc<dyn OwnerRequestHandler> = handler.clone();
+    let harness = Harness::new(limits(), 4, Some(handler_seam));
+    let client = harness.client(60);
+    let clock = harness.clock.clone();
+    let (events, observed) = std::sync::mpsc::channel();
+    let (first_event, clock_before_release, answer) = std::thread::scope(|scope| {
+        let request =
+            scope.spawn(move || {
+                block_on(client.lock().expect("held-request client").request(
+                    LocalRequestEnvelope {
+                        limits: limits(),
+                        request: custom("proof.hold", b"clock boundary"),
+                    },
+                ))
+            });
+        handler.wait_for_entered(1);
+        let release = scope.spawn(move || {
+            let first_event = observed.recv().expect("observe wait or advancement");
+            let clock_before_release = clock.now_ms();
+            handler.release();
+            if first_event == "waiting" {
+                assert_eq!(
+                    observed.recv().expect("clock advancement event"),
+                    "advanced"
+                );
+            }
+            (first_event, clock_before_release)
+        });
+        harness.advance_clock_observed(101, || {
+            events.send("waiting").expect("report carrier wait entry");
+        });
+        events.send("advanced").expect("report clock advancement");
+        let (first_event, clock_before_release) = release.join().expect("request release joins");
+        let answer = request.join().expect("held request joins");
+        (first_event, clock_before_release, answer)
+    });
+    assert_eq!(first_event, "waiting");
+    assert_eq!(clock_before_release, 100);
+    assert_eq!(harness.clock.now_ms(), 101);
+    assert_eq!(
+        answer.expect("held request finishes before the clock advances"),
+        vec![LocalResponse::Custom {
+            payload: b"clock boundary".to_vec(),
+        }],
+    );
+}
+
+#[test]
 fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen_contract() {
     let mut owner_limits = limits();
     owner_limits.result_rows = 10;
@@ -2835,7 +2894,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
             )
             .expect("open idle-boundary cursor"),
     );
-    harness.clock.advance_to(110);
+    harness.advance_clock(110);
     harness
         .request(
             34,
@@ -2846,7 +2905,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
             },
         )
         .expect("exact idle boundary succeeds");
-    harness.clock.advance_to(121);
+    harness.advance_clock(121);
     let expired = refusal(harness.request(
         34,
         owner_limits,
@@ -2881,7 +2940,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
             .expect("open lifetime-boundary cursor"),
     );
     for now_ms in (130..=220).step_by(9) {
-        harness.clock.advance_to(now_ms);
+        harness.advance_clock(now_ms);
         harness
             .request(
                 35,
@@ -2893,7 +2952,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
             )
             .expect("periodic fetch keeps idle time below its boundary");
     }
-    harness.clock.advance_to(221);
+    harness.advance_clock(221);
     harness
         .request(
             35,
@@ -2904,7 +2963,7 @@ fn cursor_page_rows_bytes_identity_exhaustion_close_and_expiry_follow_the_frozen
             },
         )
         .expect("exact total lifetime boundary succeeds");
-    harness.clock.advance_to(222);
+    harness.advance_clock(222);
     let expired = refusal(harness.request(
         35,
         owner_limits,

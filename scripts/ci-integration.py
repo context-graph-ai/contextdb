@@ -21,6 +21,7 @@ REDB_FEATURED_TARGETS = [
     ('open_table_registry_allocations', 'contextdb-internal,test-seams'),
     ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'),
     ('growth_after_compaction_contract', 'contextdb-internal'),
+    ('cache_residency', 'contextdb-internal'),
 ]
 OPTIONAL = {'workspace', 'redb', 'production', 'production-release'}
 KINDS = {'engine-tests', 'release-acceptance', 'examples', 'doctests'} | OPTIONAL
@@ -65,7 +66,7 @@ SYNC_ROUTING_FINGERPRINTS = {'crates/contextdb-engine/tests/sync_schema_transact
 # Reviewed normal-only partition of the unchanged three-case native inventory.
 LONG_RUNNING_CASES = ('long_running::f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes', 'long_running::f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge', 'long_running::f27_incremental_pull_after_initial_sync')
 LONG_RUNNING_PARTITIONS = {'acceptance-long-running-transfer-test': ('long_running::f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes', 'long_running::f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge'), 'acceptance-long-running-test': ('long_running::f27_incremental_pull_after_initial_sync',)}
-LONG_RUNNING_FINGERPRINTS = {'tests/acceptance_long_running.rs': 'c070eb6fe18b5871b42419f33ed2c78c8e938c421384e7f1bcc9f35641b6e04d', 'tests/acceptance/long_running.rs': 'a1441aa17b96b6583fcfde53406205bf223447c00da8f613d330a438a936c5cb', 'tests/acceptance/common.rs': 'fea3fd47556cbcabc2da91f3deb434c9dddad561a2517a4b303c44bb7479130c', 'tests/support/binary_path_helpers.rs': '05bd95280e47f5141b2a04bec3bcf5ca934c4cc642597cc46e16496d9461cb0c'}
+LONG_RUNNING_FINGERPRINTS = {'tests/acceptance_long_running.rs': 'c070eb6fe18b5871b42419f33ed2c78c8e938c421384e7f1bcc9f35641b6e04d', 'tests/acceptance/long_running.rs': 'a1441aa17b96b6583fcfde53406205bf223447c00da8f613d330a438a936c5cb', 'tests/acceptance/common.rs': '8f6aea2930f4ac2fcf2e0050f15dfd70620a6c24742fa25949804116a393d860', 'tests/support/binary_path_helpers.rs': '05bd95280e47f5141b2a04bec3bcf5ca934c4cc642597cc46e16496d9461cb0c'}
 
 def long_running_contract(root=ROOT):
     for path, expected in LONG_RUNNING_FINGERPRINTS.items():
@@ -708,7 +709,7 @@ def combined_matrix(rows, enabled, decision, root=ROOT):
     return {'include': envelopes}
 
 
-NORMAL_BUNDLES_SHA256 = '54cc4a9062ccb737819faaf7da923793005a8d0dcb55bf28b78e459d953e5c86'
+NORMAL_BUNDLES_SHA256 = '14e6e7c3e0958b6e0ab5c435879830fa09fac2eec1de48560304aeb3d5a7584e'
 SLOT_FIELDS = ENVELOPE_FIELDS | {'cache_key'}
 
 
@@ -726,19 +727,21 @@ def _bundle_slots(value, enabled, decision, root=ROOT):
         raise ValueError('normal bundle manifest differs from reviewed design')
     bundles = definition['bundles']
     additions = definition['fallback_additions']
-    if (not isinstance(bundles, list) or len(bundles) != 18
-            or any(not isinstance(bundle, list) or not 1 <= len(bundle) <= 3 for bundle in bundles)
+    if (not isinstance(bundles, list) or len(bundles) != 16
+            or any(not isinstance(bundle, list) or not 1 <= len(bundle) <= 4 for bundle in bundles)
             or any(not isinstance(row_id, str) for bundle in bundles for row_id in bundle)
             or not isinstance(additions, dict)
-            or additions != {'integration-engine-family-10': 8,
-                              'integration-engine-family-11': 10,
-                              'integration-engine-family-13': 14,
-                              'integration-engine-family-14': 15}):
+            or additions != {'integration-engine-family-10': 12,
+                              'integration-engine-family-11': 12,
+                              'integration-engine-family-13': 4,
+                              'integration-engine-family-14': 4}):
         raise ValueError('invalid reviewed normal bundle layout')
     planned = [list(bundle) for bundle in bundles]
     if enabled and not decision['dedup_sha']:
         for row_id, one_based_bundle in additions.items():
             planned[one_based_bundle - 1].append(row_id)
+    if any(len(bundle) > 4 for bundle in planned):
+        raise ValueError('normal bundle exceeds the four reviewed constituent slots')
     flattened = [row_id for bundle in planned for row_id in bundle]
     if len(flattened) != len(set(flattened)):
         raise ValueError('normal bundles contain duplicate canonical rows')
@@ -768,7 +771,8 @@ def bundle_matrix(value, rows, enabled, decision, root=ROOT):
             slot['name'].removeprefix('normal correctness / ') for slot in slots)
         result.append(dict(id=f'normal-bundle-{index:02d}', name=name,
                            slot1=slots[0], slot2=slots[1] if len(slots) > 1 else None,
-                           slot3=slots[2] if len(slots) > 2 else None))
+                           slot3=slots[2] if len(slots) > 2 else None,
+                           slot4=slots[3] if len(slots) > 3 else None))
     return {'include': result}
 
 
@@ -888,6 +892,7 @@ def workflow_contract(root=ROOT):
             raise ValueError('unsupported integration job execution metadata: ' + name)
     runs = re.findall(r'^        run: (.*)$', text, re.M)
     if runs != ['python3 -B scripts/ci-integration.py plan', 'bash scripts/ci-free-disk.sh',
+                'sudo apt-get update && sudo apt-get install -y ripgrep',
                 'bash scripts/verify integration "${CI_INTEGRATION_SLICE}"',
                 'python3 -B scripts/ci-integration.py required']:
         raise ValueError('integration command execution changed')

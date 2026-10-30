@@ -94,8 +94,8 @@ def integration_caller(workflow):
 
 
 def root_chain(workflow):
-    expected = {'lint': None, 'features': 'lint', 'build': 'features',
-                'cross-compile': 'build', 'installed-smoke': None,
+    expected = {'lint': None, 'features': 'lint', 'build': 'lint',
+                'cross-compile': None, 'installed-smoke': None,
                 'lint-macos': None}
     for name, predecessor in expected.items():
         block = re.search(r"^  " + re.escape(name) + r":\n(.*?)(?=^  [\w-]+:|\Z)",

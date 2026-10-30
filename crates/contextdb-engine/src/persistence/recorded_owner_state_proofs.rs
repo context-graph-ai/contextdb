@@ -20,6 +20,106 @@ fn a_store_with_no_published_record_records_no_verdict() {
 /// open file the record was read from.
 #[test]
 fn a_record_nobody_is_holding_refuses_nobody() {
+    #[cfg(unix)]
+    {
+        // A reader hold and a writer claim are independent facts. Exercise
+        // their actual primitives before the recorded-owner control below.
+        let directory = tempfile::TempDir::new().expect("task-scoped lock directory");
+        let store = directory.path().join("independent-locks.db");
+        std::fs::write(&store, b"").expect("the store exists");
+        let initial = CompanionGuard::acquire(&store, CompanionAdmission::NewStore)
+            .expect("create the trusted companion");
+        initial.publish_writer_run(&store, true, None).unwrap();
+        drop(initial);
+
+        let path = companion_path(&store);
+        let reader = open_trusted_companion(&path).expect("separate reader description");
+        let contender = open_trusted_companion_for_exclusive_hold(&path)
+            .expect("separate competing writer description");
+        assert_eq!(
+            take_companion_range_lock_shared(&reader, COMPANION_READER_HOLD_LOCK_OFFSET).unwrap(),
+            RangeLockOutcome::Taken
+        );
+        let writer =
+            CompanionGuard::acquire(&store, CompanionAdmission::Existing).unwrap_or_else(|error| {
+                panic!("a reader byte hold must coexist with a writer claim: {error}")
+            });
+        writer.publish_writer_run(&store, false, None).unwrap();
+
+        let assert_writer_still_owns = || {
+            assert!(
+                !try_lock_exclusive(&contender).unwrap(),
+                "a separate open in this process must not steal writer ownership"
+            );
+            assert!(matches!(
+                CompanionGuard::acquire(&store, CompanionAdmission::Existing),
+                Err(Error::ReadFailure(failure))
+                    if failure.kind() == ReadFailureKind::HeldByWriter
+            ));
+        };
+        assert_writer_still_owns();
+        assert_eq!(
+            take_companion_range_lock_shared(&contender, COMPANION_CLAIM_WINDOW_LOCK_OFFSET)
+                .unwrap(),
+            RangeLockOutcome::HeldByAnother
+        );
+        assert_eq!(
+            take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                .unwrap(),
+            RangeLockOutcome::HeldByAnother,
+            "same-process opens must also contend for the reader byte"
+        );
+
+        drop(open_trusted_companion(&path).expect("unrelated open and close"));
+        assert_writer_still_owns();
+        assert_eq!(
+            take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                .unwrap(),
+            RangeLockOutcome::HeldByAnother,
+            "an unrelated descriptor close must not release the reader hold"
+        );
+
+        writer.close_claim_window();
+        assert_writer_still_owns();
+        assert_eq!(
+            take_companion_range_lock_exclusive(&contender, COMPANION_CLAIM_WINDOW_LOCK_OFFSET)
+                .unwrap(),
+            RangeLockOutcome::Taken
+        );
+        release_companion_range_lock(&contender, COMPANION_CLAIM_WINDOW_LOCK_OFFSET);
+        assert_writer_still_owns();
+        {
+            let state = writer.lock_state().unwrap();
+            assert_eq!(
+                take_companion_range_lock_shared(&state.file, COMPANION_READER_HOLD_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::Taken
+            );
+            release_companion_range_lock(&state.file, COMPANION_READER_HOLD_LOCK_OFFSET);
+        }
+        assert_writer_still_owns();
+        assert_eq!(
+            take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                .unwrap(),
+            RangeLockOutcome::HeldByAnother,
+            "precise unlock on the writer must preserve the other reader's hold"
+        );
+
+        release_companion_range_lock(&reader, COMPANION_READER_HOLD_LOCK_OFFSET);
+        assert_writer_still_owns();
+        assert_eq!(
+            take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                .unwrap(),
+            RangeLockOutcome::Taken,
+            "the reader byte becomes free while the writer still owns the store"
+        );
+        release_companion_range_lock(&contender, COMPANION_READER_HOLD_LOCK_OFFSET);
+        assert_writer_still_owns();
+        drop(writer);
+        assert!(try_lock_exclusive(&contender).unwrap());
+        unlock_file(&contender);
+    }
+
     let directory = tempfile::TempDir::new().expect("task-scoped store directory");
     let store = directory.path().join("released.db");
     std::fs::write(&store, b"").expect("the store exists");

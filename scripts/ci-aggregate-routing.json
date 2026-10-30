@@ -3992,7 +3992,7 @@
     "vector_writer_residency_attribution": "3f917b0f6db0fcd04d000355c7cbf0213fd9256ec3816705da883052a0acae95"
   },
   "source_sha256": {
-    "crates/contextdb-engine/Cargo.toml": "2aebcbc6a886a6868ed7df16af168e4b9d3808c2e2e70542f36f27eb88a934fd",
+    "crates/contextdb-engine/Cargo.toml": "830a45383a6031e858b8a75e32955d9844c761b9778210122de6f14d7a5bef20",
     "crates/contextdb-engine/tests/custody.rs": "ffbf87bd12016a926c637fc342555a4dc3dda3953893470ec8aea9bb331f931d",
     "crates/contextdb-engine/tests/custody/custody_inspection_contract.rs": "a2b30f8a7195603edd72c4395d29885ded5fb48151bb382f857cc39d0e4856ec",
     "crates/contextdb-engine/tests/custody/custody_protocol_contract.rs": "822dad465eff806fb22795285463fd7653ddbbeae435013ca9fe1a369aee9f39",
