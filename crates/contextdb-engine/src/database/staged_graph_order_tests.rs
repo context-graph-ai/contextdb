@@ -92,7 +92,50 @@ fn interleaved_staged_row_owners_and_standalone_edges_share_logical_reachability
     assert_eq!(db.execute("SELECT t FROM GRAPH_TABLE(links MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(source))])).unwrap().rows().len(), 2);
 }
 
+/// Every edge version the private received image reads through its working
+/// source, as (source, target, created_tx, lsn), for the seeded sources.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn source_backed_selected_edges(
+    db: &Database,
+    sources: &[NodeId],
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<Vec<(NodeId, NodeId, TxId, Lsn)>> {
+    assert!(
+        db.graph_store.is_source_backed(),
+        "the private image reads edges through its working source, not a resident map"
+    );
+    let snapshot = db.tx_mgr.capture_published_read().snapshot;
+    let root = db.graph_store.capture_source(snapshot, memory)?;
+    assert!(
+        root.is_some(),
+        "a source-backed image captures its source root"
+    );
+    let mut edges = Vec::new();
+    for source in sources {
+        db.graph_store.visit_edges(
+            root.as_ref(),
+            contextdb_graph::GraphQuery {
+                node: *source,
+                direction: Direction::Outgoing,
+                identity: None,
+            },
+            |edge| {
+                if edge.edge_type == "selected" {
+                    edges.push((edge.source, edge.target, edge.created_tx, edge.lsn));
+                }
+                Ok(true)
+            },
+        )?;
+    }
+    edges.sort_unstable();
+    Ok(edges)
+}
+
 #[test]
+#[serial_test::serial]
 fn detached_standalone_graph_copies_return_exactly_their_admitted_bytes() {
     for versions in [1usize, 4] {
         let db = Database::open_with_options(
@@ -104,26 +147,30 @@ fn detached_standalone_graph_copies_return_exactly_their_admitted_bytes() {
         )
         .unwrap();
         let accountant = db.accountant.clone();
+        // Seed through the ordinary committed write path, one edge per
+        // transaction, and record each edge's coordinates as committed.
+        let mut seeded = Vec::new();
+        let mut sources = Vec::new();
         for version in 0..versions {
-            let edge = AdjEntry {
-                source: NodeId::from_u128(100 + version as u128),
-                target: NodeId::from_u128(200 + version as u128),
-                edge_type: "selected".to_owned(),
-                properties: HashMap::new(),
-                created_tx: TxId(1),
-                deleted_tx: None,
-                lsn: Lsn(1),
-            };
-            let retained = contextdb_graph::GraphAdjEntry::from(edge.clone()).estimated_bytes();
-            accountant.try_allocate(retained).unwrap();
-            db.graph_store.insert_loaded_edge(edge);
+            let source = NodeId::from_u128(100 + version as u128);
+            let target = NodeId::from_u128(200 + version as u128);
+            let tx = db.begin().unwrap();
+            assert!(
+                db.insert_edge(tx, source, target, "selected".to_owned(), HashMap::new())
+                    .unwrap()
+            );
+            db.commit(tx).unwrap();
+            seeded.push((source, target, tx, db.current_lsn()));
+            sources.push(source);
         }
+        seeded.sort_unstable();
         let baseline = accountant.usage().used;
+        let baseline_aggregate = crate::memory_accounting::process_aggregate_bytes_for_test();
         for _ in 0..2 {
             let memory = db.declared_reader_memory().unwrap();
             let mut copies = crate::vector_read_memory::admission(memory.clone());
-            let (metadata, working) = db
-                .detached_received_schema_working_database(
+            let observed = db
+                .with_detached_received_schema_working_database(
                     &HashMap::new(),
                     &HashSet::new(),
                     &HashSet::from(["selected".to_owned()]),
@@ -135,26 +182,24 @@ fn detached_standalone_graph_copies_return_exactly_their_admitted_bytes() {
                     &HashSet::new(),
                     &HashSet::new(),
                     &mut copies,
-                    memory,
+                    memory.clone(),
+                    |_metadata, working| source_backed_selected_edges(working, &sources, memory),
                 )
                 .unwrap();
             assert_eq!(
-                working
-                    .graph_store
-                    .forward_adj
-                    .read()
-                    .values()
-                    .map(Vec::len)
-                    .sum::<usize>(),
-                versions
+                observed, seeded,
+                "the image reads exactly the {versions} committed standalone versions, with their committed tx and lsn"
             );
-            drop(working);
-            drop(metadata);
             drop(copies);
             assert_eq!(
                 accountant.usage().used,
                 baseline,
                 "dropping {versions} copied standalone versions must preserve the receiver balance"
+            );
+            assert_eq!(
+                crate::memory_accounting::process_aggregate_bytes_for_test(),
+                baseline_aggregate,
+                "dropping {versions} copied standalone versions must preserve the process aggregate"
             );
         }
     }

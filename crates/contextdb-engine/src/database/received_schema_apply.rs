@@ -1226,11 +1226,12 @@ impl Database {
     }
 
     /// Copy the affected state into a private adjudicator with its own
-    /// transaction manager and row-id cursor. Temporary allocations share the
-    /// receiver's accountant; receipt and terminal changes remain private
-    /// until the real commit succeeds.
-    // Preserve the existing private graph-accounting fixture door. Production
-    // supplies its authentic working-source arguments to the implementation.
+    /// transaction manager and row-id cursor, on the same unpublished live
+    /// write production uses, and run `inspect` while that write's working
+    /// source is current for the image. The door keeps custody of the write
+    /// and its preparation owner for the whole inspection, then drops the
+    /// image, its metadata charges, the write (an abort) and the owner, in
+    /// that order, before it returns.
     #[cfg(test)]
     #[cfg_attr(
         any(test, feature = "test-seams"),
@@ -1239,7 +1240,7 @@ impl Database {
             reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
         )
     )]
-    pub(super) fn detached_received_schema_working_database(
+    pub(super) fn with_detached_received_schema_working_database<R>(
         &self,
         projected_tables: &HashMap<String, TableMeta>,
         affected_tables: &HashSet<String>,
@@ -1253,27 +1254,73 @@ impl Database {
         replaced_vector_refs: &HashSet<contextdb_core::VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<(MetadataCopyCharges, Database)> {
-        self.detached_received_schema_working_database_with_sources(
-            projected_tables,
-            self.tx_mgr.peek_next_tx(),
-            false,
-            false,
-            None,
-            None,
-            None,
-            affected_tables,
-            affected_graph_edge_types,
-            copy_vectors,
-            copy_side_metadata,
-            terminal_context,
-            receipt,
-            push_outcome_key,
-            renamed_vector_sources,
-            replaced_vector_refs,
-            vector_copy_owner,
-            read_memory,
-        )
+        inspect: impl FnOnce(&MetadataCopyCharges, &Database) -> Result<R>,
+    ) -> Result<R> {
+        self.with_writer_preparation_original(|original| {
+            let owner =
+                crate::persistence::received_working::ReceivedPreparationOwner::prepare(original)?;
+            let original = owner.original();
+            let store = self.persistence.as_ref().ok_or_else(|| {
+                Error::Other("received working image fixture requires a durable store".into())
+            })?;
+            let mut write =
+                crate::persistence::received_working::ReceivedWorkingWrite::begin(store, original)?;
+            write.retain_preparation_owner(&owner)?;
+            let root = self.writer_read_root()?.ok_or_else(|| {
+                Error::Other("received working image fixture lost its captured publication".into())
+            })?;
+            write.prepare_vectors(store, original, root.clone(), read_memory.clone())?;
+            let catalog =
+                crate::persistence::received_working_vector::WorkingVectorCatalogOwner::prepare(
+                    original,
+                    owner.funder(),
+                )?;
+            write.install_vector_catalog(original, catalog.clone())?;
+            let (metadata_copy_charges, working) = self
+                .detached_received_schema_working_database_with_sources(
+                    projected_tables,
+                    self.tx_mgr.peek_next_tx(),
+                    false,
+                    true,
+                    Some(original),
+                    Some(FundedWorkingGraphSource::prepare(owner.funder())?),
+                    Some(catalog),
+                    affected_tables,
+                    affected_graph_edge_types,
+                    copy_vectors,
+                    copy_side_metadata,
+                    terminal_context,
+                    receipt,
+                    push_outcome_key,
+                    renamed_vector_sources,
+                    replaced_vector_refs,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
+            write.prepare_graph(store, original, root.clone())?;
+            for kind in affected_graph_edge_types {
+                write.select_graph_type(original, kind)?;
+            }
+            let snapshot = working.tx_mgr.capture_published_read().snapshot;
+            let lsn = root.lsn;
+            let result = write.with_source(
+                original,
+                store,
+                &working.relational_store,
+                affected_tables,
+                working.tx_mgr.identity(),
+                working.id,
+                root,
+                snapshot,
+                lsn,
+                |_| inspect(&metadata_copy_charges, &working),
+            );
+            drop(working);
+            drop(metadata_copy_charges);
+            drop(write);
+            drop(owner);
+            result
+        })
     }
 
     #[expect(
@@ -3335,7 +3382,10 @@ impl Database {
     ) -> Result<ReceivedSchemaStage> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        self.prepare_received_schema_stage_with_interval(
+        // The test door prepares exactly as production does: the loan is an
+        // unpublished write on the live store, and the returned stage keeps
+        // custody of that write and its preparation owner.
+        self.prepare_legacy_file_received_schema_stage(
             local_lsn,
             None,
             changes,
@@ -3345,8 +3395,6 @@ impl Database {
             delivery_prepare,
             vector_copy_owner,
             read_memory,
-            None,
-            None,
         )
     }
 

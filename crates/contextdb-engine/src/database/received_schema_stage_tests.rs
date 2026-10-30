@@ -6701,27 +6701,77 @@ fn staged_receipt_watermarks_keep_other_keys_and_relay_preserves_creator() {
         (watermark_key.clone(), Lsn(7)),
         ("unrelated".to_string(), Lsn(91)),
     ]);
-    let ddl = create_table();
-    let received = received_single_ddl(&ddl, 3);
-    let changes = ChangeSet {
-        ddl: vec![ddl],
-        ddl_lsn: vec![Lsn(41)],
-        rows: vec![RowChange {
-            table: "events".to_string(),
-            natural_key: NaturalKey::single("id".to_string(), Value::Int64(1)),
-            values: HashMap::from([("id".to_string(), Value::Int64(1))]),
-            deleted: false,
-            lsn: Lsn(42),
-            created_at: None,
-        }],
-        ..ChangeSet::default()
+    // Production holds one received stage per store at a time: each stage
+    // keeps its unpublished working write until publication. So the two
+    // receipts are staged in sequence on the one receiver, `lower` published
+    // durably before `higher` is prepared. `higher` declares its own table, so
+    // its CREATE is a fresh declaration rather than a restatement of
+    // `lower`'s, and both watermark keys still coexist on this receiver.
+    let unit = |table: &str, lsn: u64| {
+        let ddl = match create_table() {
+            DdlChange::CreateTable {
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+                ..
+            } => DdlChange::CreateTable {
+                name: table.to_string(),
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            },
+            _ => unreachable!("create_table builds a CREATE TABLE"),
+        };
+        let received = received_single_ddl(&ddl, 3);
+        let changes = ChangeSet {
+            ddl: vec![ddl],
+            ddl_lsn: vec![Lsn(lsn)],
+            rows: vec![RowChange {
+                table: table.to_string(),
+                natural_key: NaturalKey::single("id".to_string(), Value::Int64(1)),
+                values: HashMap::from([("id".to_string(), Value::Int64(1))]),
+                deleted: false,
+                lsn: Lsn(lsn + 1),
+                created_at: None,
+            }],
+            ..ChangeSet::default()
+        };
+        let lineages = vec![(
+            table.to_string(),
+            NaturalKey::single("id".to_string(), Value::Int64(1)),
+            Lsn(lsn + 1),
+            lineage("original-author", 501, 3),
+        )];
+        (received, changes, lineages)
     };
-    let lineages = vec![(
-        "events".to_string(),
-        NaturalKey::single("id".to_string(), Value::Int64(1)),
-        Lsn(42),
-        lineage("original-author", 501, 3),
-    )];
+    let assert_creator_preserved = |stage: &ReceivedSchemaStage, table: &str| {
+        let (_, lineage_value) = stage.persistence.lineage_values.first().unwrap();
+        assert_eq!(
+            RedbPersistence::decode_config_value::<DurableRowLineageSidecar>(lineage_value)
+                .unwrap()
+                .author_node_id,
+            "original-author"
+        );
+        let (_, author_value) = stage.persistence.accepted_author_values.first().unwrap();
+        assert_eq!(
+            RedbPersistence::decode_config_value::<String>(author_value).unwrap(),
+            "original-author"
+        );
+        assert_eq!(
+            stage.mirrors.accepted_authors[&(
+                table.to_string(),
+                sync_identity_key(
+                    table,
+                    &NaturalKey::single("id".to_string(), Value::Int64(1))
+                )
+            )],
+            "original-author"
+        );
+    };
     let arrivals = HashMap::new();
     let received_schema_read_memory_22 = db
         .declared_reader_memory()
@@ -6729,6 +6779,7 @@ fn staged_receipt_watermarks_keep_other_keys_and_relay_preserves_creator() {
     let mut received_schema_copy_owner_22 =
         contextdb_engine::vector_read_memory::admission(received_schema_read_memory_22.clone());
 
+    let (received, changes, lineages) = unit("events", 41);
     let lower = db
         .prepare_received_schema_stage_with_adjudication(
             Lsn(90),
@@ -6765,12 +6816,21 @@ fn staged_receipt_watermarks_keep_other_keys_and_relay_preserves_creator() {
         lower.mirrors.receipt_and_applied_watermarks[&tenant_watermark_key],
         Lsn(6)
     );
+    assert_creator_preserved(&lower, "events");
+    db.publish_received_schema_stage(lower);
+    {
+        let watermarks = db.in_memory_applied_push_watermarks.lock();
+        assert_eq!(watermarks["unrelated"], Lsn(91));
+        assert_eq!(watermarks[&watermark_key], Lsn(7));
+        assert_eq!(watermarks[&tenant_watermark_key], Lsn(6));
+    }
+
     let received_schema_read_memory_23 = db
         .declared_reader_memory()
         .expect("admit the received-schema operation reader");
     let mut received_schema_copy_owner_23 =
         contextdb_engine::vector_read_memory::admission(received_schema_read_memory_23.clone());
-
+    let (received, changes, lineages) = unit("events_higher", 41);
     let higher = db
         .prepare_received_schema_stage_with_adjudication(
             Lsn(91),
@@ -6793,6 +6853,8 @@ fn staged_receipt_watermarks_keep_other_keys_and_relay_preserves_creator() {
             received_schema_read_memory_23,
         )
         .unwrap();
+    // `lower`'s watermark is now published and durable; `higher` keeps the
+    // other keys out of its mirrors against that real state.
     assert!(
         !higher
             .mirrors
@@ -6830,35 +6892,7 @@ fn staged_receipt_watermarks_keep_other_keys_and_relay_preserves_creator() {
         RedbPersistence::decode_config_value::<u64>(watermark).unwrap(),
         8
     );
-    let (_, lineage_value) = higher.persistence.lineage_values.first().unwrap();
-    assert_eq!(
-        RedbPersistence::decode_config_value::<DurableRowLineageSidecar>(lineage_value)
-            .unwrap()
-            .author_node_id,
-        "original-author"
-    );
-    let (_, author_value) = higher.persistence.accepted_author_values.first().unwrap();
-    assert_eq!(
-        RedbPersistence::decode_config_value::<String>(author_value).unwrap(),
-        "original-author"
-    );
-    assert_eq!(
-        higher.mirrors.accepted_authors[&(
-            "events".to_string(),
-            sync_identity_key(
-                "events",
-                &NaturalKey::single("id".to_string(), Value::Int64(1))
-            )
-        )],
-        "original-author"
-    );
-    db.publish_received_schema_stage(lower);
-    {
-        let watermarks = db.in_memory_applied_push_watermarks.lock();
-        assert_eq!(watermarks["unrelated"], Lsn(91));
-        assert_eq!(watermarks[&watermark_key], Lsn(7));
-        assert_eq!(watermarks[&tenant_watermark_key], Lsn(6));
-    }
+    assert_creator_preserved(&higher, "events_higher");
     db.publish_received_schema_stage(higher);
     let watermarks = db.in_memory_applied_push_watermarks.lock();
     assert_eq!(watermarks["unrelated"], Lsn(91));
