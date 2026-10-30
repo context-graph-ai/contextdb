@@ -1112,7 +1112,19 @@ impl Database {
                 )
             })?
         } else {
-            Database::open_memory()
+            // A private image, not a database a caller opened: it is built
+            // directly rather than through `:memory:`, which names a durable
+            // scratch database of its own.
+            Database::open_memory_internal_with_working_graph(
+                Arc::new(CorePlugin),
+                MemoryAccountant::writer_no_limit()?,
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    OwnerReadConfig::default().limits.limits.memory,
+                )?,
+                None,
+                None,
+                None,
+            )?
         };
         working
             .finalization
