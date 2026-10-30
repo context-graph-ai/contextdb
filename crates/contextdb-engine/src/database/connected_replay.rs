@@ -446,22 +446,6 @@ impl Database {
                 Self::apply_sync_table_ddl_to_projected_meta(&mut tables, ddl);
                 match ddl {
                     DdlChange::DropTable { name } => {
-                        if previous.as_ref().is_some_and(has_graph_edge_table_shape) {
-                            projected.edges.retain(|edge| {
-                                !originals
-                                    .iter()
-                                    .filter_map(|(_, _, pending, _)| pending.as_ref())
-                                    .filter(|row| row.table == *name && !row.deleted)
-                                    .any(|row| {
-                                        row.values.get("source_id").and_then(Value::as_uuid)
-                                            == Some(&edge.source)
-                                            && row.values.get("target_id").and_then(Value::as_uuid)
-                                                == Some(&edge.target)
-                                            && row.values.get("edge_type").and_then(Value::as_text)
-                                                == Some(edge.edge_type.as_str())
-                                    })
-                            });
-                        }
                         for (original, _, pending, _) in &mut originals {
                             if original.table == *name {
                                 *pending = None;
@@ -1901,132 +1885,82 @@ impl Database {
 }
 
 impl Database {
-    /// Retire graph inserts owned by pending graph-table rows before DROP
-    /// destroys the row identities used by the existing graph projection.
+    /// Retire only row-owned graph mutations at a table lifetime boundary.
+    /// Standalone records, including same-triple aliases, have their own lifetime.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn drop_private_pending_graph_rows(&self, tx: TxId, table: &str) -> Result<()> {
-        if !self
-            .table_meta(table)
-            .is_some_and(|meta| has_graph_edge_table_shape(&meta))
-        {
-            return Ok(());
-        }
-        // The current private graph can also contain an older committed edge
-        // with this pending row's identity. Preserve that identity before the
-        // pending row is retired: the later committed-row DROP cursor cannot
-        // recover it from the write set after drop_private_pending_relational_rows.
-        // Each pass retains one independently admitted name, never an identity
-        // set or adjacency image. The same working loan supplies the exact identity seek.
-        if let Some(source) =
-            crate::persistence::received_working_source::WorkingReadSource::current_for(
-                self.tx_mgr.identity(),
-            )?
-        {
-            source.with_original(|original| {
-                let mut position = 0usize;
-                loop {
-                    let candidate = self.tx_mgr.with_ordinary_read(tx, |ws| {
-                        ws.relational_inserts
-                            .iter()
-                            .enumerate()
-                            .skip(position)
-                            .find_map(|(index, (name, row))| {
-                                if name != table {
-                                    return None;
-                                }
-                                let from = *row.values.get("source_id")?.as_uuid()?;
-                                let to = *row.values.get("target_id")?.as_uuid()?;
-                                let kind = row.values.get("edge_type")?.as_text()?;
-                                Some((index, row.row_id, from, to, kind.len()))
-                            })
-                    })?;
-                    let Some((index, row_id, from, to, length)) = candidate else {
-                        break;
-                    };
-                    // Admission happens outside the transaction-state guard;
-                    // the exact source is rechecked before allocating the copy.
-                    let identity_owner =
-                        crate::memory_accounting::reserve_preparation_from_original(
-                            original,
-                            length,
-                            "sync",
-                            "private_graph_drop_identity",
-                            "Raise MEMORY_LIMIT to prepare graph table removal.",
-                        )?;
-                    let kind = self
-                        .tx_mgr
-                        .with_ordinary_read(tx, |ws| -> Result<String> {
-                            let (name, row) =
-                                ws.relational_inserts.get(index).ok_or_else(|| {
-                                    Error::Other(
-                                        "private graph DROP row changed during admission".into(),
-                                    )
-                                })?;
-                            let kind = row
-                                .values
-                                .get("edge_type")
-                                .and_then(Value::as_text)
-                                .ok_or_else(|| {
-                                    Error::Other(
-                                        "private graph DROP identity changed during admission"
-                                            .into(),
-                                    )
-                                })?;
-                            if name != table
-                                || row.row_id != row_id
-                                || kind.len() != length
-                                || row.values.get("source_id").and_then(Value::as_uuid)
-                                    != Some(&from)
-                                || row.values.get("target_id").and_then(Value::as_uuid) != Some(&to)
-                            {
-                                return Err(Error::Other(
-                                    "private graph DROP identity changed during admission".into(),
-                                ));
-                            }
-                            crate::memory_accounting::preparation_copy_string(kind)
-                        })??;
-                    source.remove_private_graph_identity(from, &kind, to)?;
-                    drop(kind);
-                    drop(identity_owner);
-                    position = index + 1;
-                }
-                Ok(())
-            })?;
-        }
-        // Retire the pending graph bodies only after the private source has
-        // consumed their row identities. Committed rows are handled separately
-        // by graph_edges_after_table_drop before its schema removal.
-        loop {
-            let retired = self.tx_mgr.with_write_set(tx, |ws| -> Result<_> {
-                if ws.ordered_staged_rows.checkpoint_active() {
-                    return Err(Error::Other(
-                        "private graph DROP retained a statement checkpoint".into(),
-                    ));
-                }
-                let position = ws.adj_inserts.iter().position(|edge| {
-                    ws.relational_inserts.iter().any(|(name, row)| {
-                        name == table
-                            && row.values.get("source_id").and_then(Value::as_uuid)
-                                == Some(&edge.source)
-                            && row.values.get("target_id").and_then(Value::as_uuid)
-                                == Some(&edge.target)
-                            && row.values.get("edge_type").and_then(Value::as_text)
-                                == Some(edge.edge_type.as_str())
+        match &self.tx_mgr {
+            DatabaseTransactionHost::Owned(handle) => handle.with_host(|host| {
+                host.transactions.with_transactions(|transactions| {
+                    transactions.with_engine(tx, |guard| {
+                        loop {
+                            let Some(at) = guard
+                                .read()
+                                .row_adj_inserts
+                                .iter()
+                                .rposition(|entry| entry.owner.table == table)
+                            else {
+                                break;
+                            };
+                            let empty = guard.copy_aux(
+                                contextdb_tx::staged_source::AuxBorrow::RowAdjInserts(&[]),
+                            )?;
+                            let prepared = guard.prepare_aux_splice(at, &[at], empty)?;
+                            guard.publish_tx(prepared);
+                        }
+                        loop {
+                            let Some(at) = guard
+                                .read()
+                                .row_adj_deletes
+                                .iter()
+                                .rposition(|(entry, _)| entry.owner.table == table)
+                            else {
+                                break;
+                            };
+                            let empty = guard.copy_aux(
+                                contextdb_tx::staged_source::AuxBorrow::RowAdjDeletes(&[]),
+                            )?;
+                            let prepared = guard.prepare_aux_splice(at, &[at], empty)?;
+                            guard.publish_tx(prepared);
+                        }
+                        Ok(())
                     })
-                });
-                Ok(position.map(|position| ws.adj_inserts.remove(position)))
-            })??;
-            let Some(edge) = retired else {
-                break;
-            };
-            let bytes = edge.estimated_bytes();
-            drop(edge);
-            self.finalization.accountant.release(bytes);
+                })
+            }),
+            DatabaseTransactionHost::Legacy(_) => {
+                self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
+                    if ws.ordered_staged_rows.checkpoint_active() {
+                        return Err(Error::Other(
+                            "private graph retirement retained a statement checkpoint".into(),
+                        ));
+                    }
+                    while let Some(at) = ws
+                        .row_adj_inserts
+                        .iter()
+                        .rposition(|entry| entry.owner.table == table)
+                    {
+                        let retired = ws.row_adj_inserts.remove(at);
+                        let bytes = retired.estimated_bytes();
+                        drop(retired);
+                        self.finalization.accountant.release(bytes);
+                    }
+                    while let Some(at) = ws
+                        .row_adj_deletes
+                        .iter()
+                        .rposition(|(entry, _)| entry.owner.table == table)
+                    {
+                        let (retired, _) = ws.row_adj_deletes.remove(at);
+                        let bytes = retired.estimated_bytes();
+                        drop(retired);
+                        self.finalization.accountant.release(bytes);
+                    }
+                    Ok(())
+                })?
+            }
         }
-        Ok(())
     }
 
     /// Retire pending row bodies through their recorded owners before DROP
@@ -2112,6 +2046,9 @@ impl Database {
             )?;
             meta.clone()
         };
+        if previous.is_some_and(has_graph_edge_table_shape) && !has_graph_edge_table_shape(&meta) {
+            self.drop_private_pending_graph_rows(tx, name)?;
+        }
         let mut renames = sync_column_renames_from_constraints(constraints);
         if let Some((from, to)) = sync_vector_rename_from_constraints(constraints)
             && let Some(old) =
@@ -2218,11 +2155,9 @@ impl Database {
 }
 
 impl Database {
-    /// Each intermediate declaration must be handled by the prefix kernel.
-    /// Pending vector lifetimes move through its funded ALTER/DROP transforms.
-    /// A graph-backed table can accompany table-only schema replay when no
-    /// source operation touches it. Graph lifetimes still use the established
-    /// replacement kernel; mixed data units remain outside this opening.
+    /// Inspect intermediate declarations under the prefix operation owner.
+    /// Rows, vectors and graph changes retain their source ordering through
+    /// the same funded ALTER/DROP transforms and atomic replacement path.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2230,45 +2165,11 @@ impl Database {
     pub(super) fn private_source_order_supported(
         changes: &ChangeSet,
         live: &HashMap<String, TableMeta>,
-        projected: &HashMap<String, TableMeta>,
+        _projected: &HashMap<String, TableMeta>,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
-        if !changes.edges.is_empty() {
-            return Ok(false);
-        }
-        let graph_bearing =
-            |meta: &TableMeta| has_graph_edge_table_shape(meta) || !meta.dag_edge_types.is_empty();
-        if live.values().chain(projected.values()).any(graph_bearing) {
-            // Only unrelated table-schema units are newly admitted. Rows can
-            // fire callbacks and vectors can carry row ownership; neither is
-            // evidence of an untouched graph, even when explicit edges is empty.
-            if !changes.rows.is_empty()
-                || !changes.vectors.is_empty()
-                || changes.ddl.iter().any(|ddl| {
-                    !matches!(
-                        ddl,
-                        DdlChange::CreateTable { .. }
-                            | DdlChange::AlterTable { .. }
-                            | DdlChange::DropTable { .. }
-                    )
-                })
-            {
-                return Ok(false);
-            }
-            for ddl in &changes.ddl {
-                if let Some(table) = Self::ddl_affected_table(ddl)
-                    && live
-                        .get(table)
-                        .into_iter()
-                        .chain(projected.get(table))
-                        .any(graph_bearing)
-                {
-                    return Ok(false);
-                }
-            }
-        }
         let mut catalog_credit = ReadCredit::new(owner);
         catalog_credit.try_grow_for(
             live.iter().fold(0usize, |bytes, (table, meta)| {
@@ -2289,20 +2190,7 @@ impl Database {
                 "connected_intermediate_shape",
                 "Raise the declared memory limit to inspect intermediate declarations.",
             )?;
-            // Inspect both sides of each source step. DROP or an ALTER that
-            // removes edge shape must not hide the preceding graph lifetime;
-            // a repeated final declaration must not hide an intermediate one.
-            if let Some(meta) = Self::ddl_affected_table(ddl).and_then(|table| tables.get(table))
-                && graph_bearing(meta)
-            {
-                return Ok(false);
-            }
             Self::apply_sync_table_ddl_to_projected_meta(&mut tables, ddl);
-            if let Some(meta) = Self::ddl_affected_table(ddl).and_then(|table| tables.get(table))
-                && graph_bearing(meta)
-            {
-                return Ok(false);
-            }
         }
         Ok(true)
     }

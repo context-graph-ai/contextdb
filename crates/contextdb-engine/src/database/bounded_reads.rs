@@ -1687,7 +1687,7 @@ impl Database {
             // the row this read is about, and a row it deleted is not there.
             let staged = self
                 .tx_mgr
-                .with_write_set(tx, |ws| {
+                .with_read(tx, |ws| {
                     if let Some((_, row)) = ws
                         .relational_inserts
                         .iter()
@@ -1713,7 +1713,7 @@ impl Database {
                     before_clone(crate::read_image_memory::RowReadAdmission::Copy(bytes))?;
                     return self
                         .tx_mgr
-                        .with_write_set(tx, |ws| {
+                        .with_read(tx, |ws| {
                             ws.relational_inserts
                                 .iter()
                                 .rev()

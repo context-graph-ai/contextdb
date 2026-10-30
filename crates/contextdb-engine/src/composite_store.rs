@@ -2184,6 +2184,12 @@ impl CompositeStore {
         // File-backed history is already installed atomically in durable
         // selectors. Keep no second decoded log or lookup directory.
         if self.relational.uses_disk_backed_committed_bodies() {
+            // The unpublished paged worker still uses an in-memory commit
+            // directory. Its manager retains this entry even though row/log
+            // bodies use the working source, so fund the entry until close.
+            if self.private_working_graph {
+                self.accountant.charge_retained(COMMIT_INDEX_ENTRY_BYTES);
+            }
             return Ok(());
         }
         // What the log and its two side indexes now hold, plus the one
@@ -2739,6 +2745,12 @@ impl CompositeStore {
         // File-backed history is already installed atomically in durable
         // selectors. Keep no second decoded log or lookup directory.
         if self.relational.uses_disk_backed_committed_bodies() {
+            // The unpublished paged worker still uses an in-memory commit
+            // directory. Its manager retains this entry even though row/log
+            // bodies use the working source, so fund the entry until close.
+            if self.private_working_graph {
+                self.accountant.charge_retained(COMMIT_INDEX_ENTRY_BYTES);
+            }
             return Ok(());
         }
         // What the log and its two side indexes now hold, plus the one

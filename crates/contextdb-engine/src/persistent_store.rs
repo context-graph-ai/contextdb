@@ -120,25 +120,58 @@ impl PersistentCompositeStore {
                 }
                 return result;
             }
+            drop(local_stages);
+            // Copy only the paired source handle, then release registry guards
+            // before the reader's provider can run. This is the same writer /
+            // declared-reader scope used by the original-funded terminal path.
+            let preparation_owner = self
+                .received_schema_stages
+                .lock()
+                .get(&lsn)
+                .and_then(|stage| stage.durable_projection.preparation_owner.clone());
+            let image_reader = preparation_owner
+                .as_ref()
+                .map(|owner| {
+                    crate::read_image_memory::ImageMemory::operation_reader(
+                        owner.original().accountant().clone(),
+                        read_memory.clone(),
+                    )
+                })
+                .transpose()?;
+            let _read_scope = image_reader.as_ref().map(|reader| reader.enter());
             let mut stages = self.received_schema_stages.lock();
             if let Some(stage) = stages.get(&lsn) {
-                let result = self.persistence.flush_data_with_logs_and_sink_events(
-                    ws,
-                    &stage.change_log_entries,
-                    FlushDataOptions {
-                        local_erasure: None,
-                        sink_events: &stage.sink_events,
-                        trigger_audits: &stage.trigger_audits,
-                        schema_ddl: SchemaDdlPersistence {
-                            event_bus: None,
-                            trigger: None,
+                let result = if let Some(owner) = preparation_owner.as_ref() {
+                    self.persistence.flush_owned_received_schema_stage(
+                        owner.original(),
+                        ws,
+                        &stage.change_log_entries,
+                        &stage.durable_projection,
+                        &stage.sink_events,
+                        &stage.trigger_audits,
+                        MAX_SINK_QUEUE_DEPTH,
+                        None,
+                        0,
+                    )
+                } else {
+                    self.persistence.flush_data_with_logs_and_sink_events(
+                        ws,
+                        &stage.change_log_entries,
+                        FlushDataOptions {
+                            local_erasure: None,
+                            sink_events: &stage.sink_events,
+                            trigger_audits: &stage.trigger_audits,
+                            schema_ddl: SchemaDdlPersistence {
+                                event_bus: None,
+                                trigger: None,
+                            },
+                            max_sink_queue_depth: MAX_SINK_QUEUE_DEPTH,
+                            snapshots: FlushDataSnapshots::default(),
+                            received_schema: Some(&stage.durable_projection),
+                            partition_mutations: None,
                         },
-                        max_sink_queue_depth: MAX_SINK_QUEUE_DEPTH,
-                        snapshots: FlushDataSnapshots::default(),
-                        received_schema: Some(&stage.durable_projection),
-                        partition_mutations: None,
-                    },
-                );
+                    )
+                };
                 if result.is_err() {
                     stages.remove(&lsn);
                 }

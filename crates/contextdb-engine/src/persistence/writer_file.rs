@@ -50,6 +50,7 @@ pub(super) fn take_reader_coordination_refusal() -> Option<(PathBuf, String)> {
 /// Backend views never unlock it.
 pub(super) struct LockedWriterFile {
     file: File,
+    sync_mode: WriterSyncMode,
     runtime_dir: Option<PathBuf>,
     #[cfg(unix)]
     identity: (u64, u64),
@@ -62,6 +63,14 @@ pub(super) struct LockedWriterFile {
     projected_growth_bytes: std::sync::Mutex<u64>,
     #[cfg(any(test, feature = "test-seams"))]
     live_views: std::sync::atomic::AtomicUsize,
+}
+
+/// Durability is per commit for every live writer. Only an unpublished export
+/// artifact may defer intermediate barriers to its mandatory final sync_all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriterSyncMode {
+    PerCommit,
+    UnpublishedExport,
 }
 
 /// Only temporary, positively identified contention permits optional deferral.
@@ -116,6 +125,14 @@ impl LockedWriterFile {
 
     /// Consume a descriptor already locked by the writer admission path.
     pub(super) fn from_locked(file: File, runtime_dir: Option<&Path>) -> io::Result<Arc<Self>> {
+        Self::from_locked_with_sync(file, runtime_dir, WriterSyncMode::PerCommit)
+    }
+
+    fn from_locked_with_sync(
+        file: File,
+        runtime_dir: Option<&Path>,
+        sync_mode: WriterSyncMode,
+    ) -> io::Result<Arc<Self>> {
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt as _;
@@ -124,6 +141,7 @@ impl LockedWriterFile {
         };
         Ok(Arc::new(Self {
             file,
+            sync_mode,
             runtime_dir: runtime_dir.map(Path::to_path_buf),
             #[cfg(unix)]
             identity,
@@ -141,6 +159,14 @@ impl LockedWriterFile {
         file: File,
         runtime_dir: Option<&Path>,
     ) -> Result<Arc<Self>, redb::DatabaseError> {
+        Self::lock_with_sync(file, runtime_dir, WriterSyncMode::PerCommit)
+    }
+
+    pub(super) fn lock_with_sync(
+        file: File,
+        runtime_dir: Option<&Path>,
+        sync_mode: WriterSyncMode,
+    ) -> Result<Arc<Self>, redb::DatabaseError> {
         // Without waiting: the claim, then the data lock. The waiting
         // acquisition for an existing store is `acquire_writer_file`.
         #[cfg(unix)]
@@ -154,7 +180,9 @@ impl LockedWriterFile {
                 Err(error) => return Err(error.into()),
             }
             match try_data(&file, ByteLock::Exclusive) {
-                Ok(Granted::Yes) => Self::from_locked(file, runtime_dir).map_err(Into::into),
+                Ok(Granted::Yes) => {
+                    Self::from_locked_with_sync(file, runtime_dir, sync_mode).map_err(Into::into)
+                }
                 Ok(Granted::HeldByAnother) => {
                     let _ = release_byte(&file, CLAIM_OFFSET);
                     Err(redb::DatabaseError::DatabaseAlreadyOpen)
@@ -167,7 +195,7 @@ impl LockedWriterFile {
         }
         #[cfg(not(unix))]
         match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Self::from_locked(file, runtime_dir).map_err(Into::into),
+            Ok(()) => Self::from_locked_with_sync(file, runtime_dir, sync_mode).map_err(Into::into),
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
@@ -666,11 +694,17 @@ impl redb::NativeStorageBackend for WriterFileView {
     }
 
     fn native_sync_data(&self) -> Result<(), redb::NativeBackendError> {
+        let owner = self.native_owner()?;
+        if owner.sync_mode == WriterSyncMode::UnpublishedExport {
+            // Logical commits still write and validate every page. This private
+            // file has no reader/publication until close + final sync_all.
+            return Ok(());
+        }
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(IoKindForTest::SyncBegin, 0, 0, None);
         #[cfg(any(test, feature = "test-seams"))]
         super::read_persistence_test_scaffold::note_writer_data_sync_for_test();
-        let result = self.native_owner()?.file.sync_data();
+        let result = owner.file.sync_data();
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(IoKindForTest::SyncEnd, 0, 0, Some(result.is_ok()));
         #[cfg(feature = "in-process-test-seams")]

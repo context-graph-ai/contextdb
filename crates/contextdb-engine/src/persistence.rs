@@ -7264,6 +7264,9 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     pub(crate) row_adj_inserts: Vec<contextdb_tx::OwnedAdjEntry>,
     pub(crate) row_adj_deletes: Vec<(contextdb_tx::OwnedAdjEntry, TxId)>,
     pub(crate) dropped_row_graph: Vec<contextdb_tx::OwnedAdjEntry>,
+    /// Every graph ownership lifetime ended by this unit, even if a later
+    /// declaration restores the table's graph shape.
+    pub(crate) retired_row_graph_tables: Vec<String>,
     /// The optional SAME public write opened during native received preparation.
     pub(crate) working_write: parking_lot::Mutex<Option<received_working::ReceivedWorkingWrite>>,
     /// A data-empty received declaration whose row/column projection stays
@@ -7321,6 +7324,9 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     /// row/vector entries must leave the durable log in the same transaction
     /// that installs the replacement schema image.
     pub(crate) structurally_dropped_tables: HashSet<String>,
+    /// Last: the same Original survives private writes, projection payloads and
+    /// their physical cleanup, including a failed terminal flush.
+    pub(crate) preparation_owner: Option<received_working::ReceivedPreparationOwner>,
 }
 
 pub(crate) enum ReceivedRowsGuard<'a> {

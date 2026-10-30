@@ -710,6 +710,30 @@ impl RedbPersistence {
         Self::create_with_lock(path, lock_file, accountant, cache_bytes, runtime_dir)
     }
 
+    /// Private construction for the unpublished export file only. The caller
+    /// must close and sync_all this file before no-replace publication.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn create_unpublished_export(
+        path: &Path,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
+        cache_bytes: usize,
+    ) -> Result<Self> {
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_probe::note_persistence_writer_open();
+        let lock_file = CompanionGuard::acquire(path, CompanionAdmission::NewStore)?;
+        Self::create_with_lock_and_sync(
+            path,
+            lock_file,
+            accountant,
+            cache_bytes,
+            None,
+            writer_file::WriterSyncMode::UnpublishedExport,
+        )
+    }
+
     /// Recreate a store while holding its existing coordination lock. The lock
     /// file is never unlinked: its OS lock is the ownership boundary that
     /// prevents another process from opening the path between removal and the
@@ -980,6 +1004,28 @@ impl RedbPersistence {
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
+        Self::create_with_lock_and_sync(
+            path,
+            lock_file,
+            accountant,
+            cache_bytes,
+            runtime_dir,
+            writer_file::WriterSyncMode::PerCommit,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn create_with_lock_and_sync(
+        path: &Path,
+        lock_file: CompanionGuard,
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
+        cache_bytes: usize,
+        runtime_dir: Option<&Path>,
+        sync_mode: writer_file::WriterSyncMode,
+    ) -> Result<Self> {
         // The caller has already established companion-first ownership for a
         // genuinely new database. Reserve the store itself with create-new
         // and no-follow semantics, then hand that exact descriptor to Redb;
@@ -991,7 +1037,7 @@ impl RedbPersistence {
                 return Err(error);
             }
         };
-        let owner = LockedWriterFile::lock(store_file, runtime_dir)
+        let owner = LockedWriterFile::lock_with_sync(store_file, runtime_dir, sync_mode)
             .map_err(|error| Self::storage_open_error(path, error))?;
         let created = Self::open_hook_suppressed(|| {
             redb_builder_with_cache(cache_bytes).create_with_native_backend_and_external_snapshots(

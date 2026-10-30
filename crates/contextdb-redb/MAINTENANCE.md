@@ -1319,3 +1319,20 @@ opened before a limit change therefore releases completed unreferenced dirty pag
 through the existing writeback path under its current budget. An allocation-free
 thread-local hint restores its caller on nesting and unwind. Serving-cache capacity,
 source invoices, external alias custody and failed-write reinsertion are unchanged.
+
+## Scalar physical page lifecycle observation
+
+The test-seams-only `observe_page_lifetimes_for_test` counts successful physical
+`PageAllocation::allocate` constructions and releases after `PageFree` calls
+`dealloc`, independently of admission and payer transitions. Cloning a page is
+not a construction. Thread-local scalar totals retain no allocation, pointer,
+invoice or page owner; nested windows merge exact deltas. Current page/byte
+counts are signed so freeing a pre-window allocation remains visible rather
+than being invented as an in-window construction. A zero-live lifecycle proof
+starts before open and closes every captured handle within the same thread's
+window; cross-thread work is outside the receipt. Production builds contain
+neither hooks nor counters and PageBlock Layout is unchanged.
+
+| Changed source | Reason |
+|---|---|
+| `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs` | Expose allocation-free scalar physical page construction/free/current/peak observations under test-seams; observe the actual backing constructor and post-deallocation release, with clone, earlier-free and nesting controls. |

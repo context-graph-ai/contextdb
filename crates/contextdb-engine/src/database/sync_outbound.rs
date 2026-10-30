@@ -5279,6 +5279,11 @@ impl Database {
 
     /// Extract ordered changes and preserve every materialization refusal.
     /// The caller retains the owner through consumption and encoding.
+    ///
+    /// A received atomic unit may retain several ordered replay positions.
+    /// Only its final acceptance position is a committed snapshot. Resuming
+    /// from an interior position returns the complete containing unit, so
+    /// callers must tolerate replay and advance to the unit's final position.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -6570,7 +6575,11 @@ impl Database {
         self.received_schema_stages.lock().len()
     }
 
-    /// Returns the current LSN of this database.
+    /// Returns this database's latest committed acceptance position.
+    ///
+    /// One received atomic unit can reserve several ordered replay positions,
+    /// so a successful apply can advance this value by more than one. Its
+    /// interior positions are not separately committed snapshots.
     pub fn current_lsn(&self) -> Lsn {
         let _operation = self.assert_open_operation();
         if let Some(lsn) = CRON_LSN_OVERRIDE.with(|slot| *slot.borrow()) {
