@@ -2113,6 +2113,7 @@ fn native_isolation_answer(db: &Database, scope: i64) -> Result<Vec<Vec<Value>>>
 
 #[test]
 fn native_non_route_values_are_not_read_while_healthy_routes_keep_serving() {
+    const MALFORMED_METADATA_BYTES: usize = 9 * 1024 * 1024;
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let (directory, db, routes) = native_isolation_fixture();
     let before = routes
@@ -2194,6 +2195,7 @@ fn native_non_route_values_are_not_read_while_healthy_routes_keep_serving() {
 
 #[test]
 fn native_authentic_route_control_damage_refuses_only_that_route() {
+    const MALFORMED_METADATA_BYTES: usize = 9 * 1024 * 1024;
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for oversized in [false, true] {
         let (directory, db, routes) = native_isolation_fixture();
