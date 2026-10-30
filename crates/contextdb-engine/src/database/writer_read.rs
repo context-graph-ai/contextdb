@@ -3151,8 +3151,9 @@ impl contextdb_relational::mem::StagedPostingAdmission for WriterStagedPostingAd
             contextdb_core::family_loads::Family::IndexPosting,
             bytes,
         );
-        charge.into_admitted_arc()
-        .map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
+        charge
+            .into_admitted_arc()
+            .map(|owner| owner as Arc<dyn contextdb_tx::StagedPostingCharge>)
     }
 }
 impl Drop for WriterStagedPostingAdmission {

@@ -2172,7 +2172,8 @@ fn with_membership_copy_admission<T>(
     action: impl FnOnce(&mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<T>,
 ) -> Result<T> {
     #[cfg(feature = "test-seams")]
-    let _family = contextdb_core::family_loads::enter(contextdb_core::family_loads::Family::VectorMembership);
+    let _family =
+        contextdb_core::family_loads::enter(contextdb_core::family_loads::Family::VectorMembership);
     with_copy_admission(owner, action)
 }
 
@@ -2319,7 +2320,7 @@ impl OwnedVectorEntries<'_> {
                             bytes,
                         );
                         true
-                    },
+                    }
                     Err(error) => {
                         refusal = Some(error);
                         false
@@ -4474,7 +4475,8 @@ impl IndexState {
         }
         let mut scratch = owner.scratch();
         let mut scan = || -> Result<bool> {
-            let mut cursor = with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
+            let mut cursor =
+                with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
             while let Some(entry) =
                 with_membership_copy_admission(&mut scratch, |request| cursor.next(request))?
             {
@@ -4668,8 +4670,11 @@ impl IndexState {
             Error::Other("durable vector partition lost its membership source".into())
         })?;
         let mut scratch = owner.scratch();
-        let mut cursor = with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
-        while let Some(entry) = with_membership_copy_admission(&mut scratch, |request| cursor.next(request))? {
+        let mut cursor =
+            with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
+        while let Some(entry) =
+            with_membership_copy_admission(&mut scratch, |request| cursor.next(request))?
+        {
             visit(&entry)?;
         }
         Ok(())
@@ -6362,7 +6367,7 @@ impl IndexState {
                             bytes,
                         );
                         true
-                    },
+                    }
                     Err(error) => {
                         refusal = Some(error);
                         false
@@ -10208,7 +10213,8 @@ impl IndexState {
         let sample_lsn = match self.durable_membership_source() {
             Some(source) => {
                 let mut scratch = VectorCopyAdmission::new(accountant.clone());
-                let mut cursor = with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
+                let mut cursor =
+                    with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
                 let mut sample_lsn = Lsn(0);
                 while let Some(entry) =
                     with_membership_copy_admission(&mut scratch, |request| cursor.next(request))?

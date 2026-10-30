@@ -1,11 +1,11 @@
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
-pub mod family_loads;
 pub mod companion;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub mod coordination_test_observation;
 pub mod error;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod family_loads;
 pub mod find_attribution;
 mod json_read_builder;
 pub mod memory;

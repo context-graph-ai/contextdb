@@ -13,7 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-test-seams = []
+test-seams = ["contextdb-core/test-seams"]
 
 [dependencies]
 contextdb-core = { path = "../contextdb-core", version = "1.0" }

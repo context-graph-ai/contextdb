@@ -1483,7 +1483,8 @@ pub(crate) fn select_live_fallback(
         };
         let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
         let mut window = copies.scratch();
-        let membership_bytes = key.value()
+        let membership_bytes = key
+            .value()
             .len()
             .checked_add(value.value().len())
             .and_then(|n| n.checked_mul(8))

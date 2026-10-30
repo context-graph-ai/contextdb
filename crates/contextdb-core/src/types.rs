@@ -557,7 +557,8 @@ pub fn retained_row_side_map_bytes(table: &str) -> usize {
 #[doc(hidden)]
 pub fn row_side_map_family_bytes_for_test(table: &str) -> (usize, usize, usize) {
     let provenance = 36 + 36;
-    let positions = ROW_SIDE_MAP_BYTES.saturating_sub(provenance)
+    let positions = ROW_SIDE_MAP_BYTES
+        .saturating_sub(provenance)
         .saturating_add(table.len().saturating_mul(2));
     (ROW_VERSION_SLOT_BYTES, positions, provenance)
 }

@@ -705,7 +705,9 @@ impl VectorCopyAdmission {
             )?;
         }
         #[cfg(feature = "test-seams")]
-        contextdb_core::family_loads::loaded_scoped(additional_bytes.saturating_sub(self.additional_bytes));
+        contextdb_core::family_loads::loaded_scoped(
+            additional_bytes.saturating_sub(self.additional_bytes),
+        );
         self.additional_bytes = additional_bytes;
         self.used_bytes = used_bytes;
         Ok(())
@@ -741,7 +743,9 @@ impl VectorCopyAdmission {
             )?;
         }
         #[cfg(feature = "test-seams")]
-        contextdb_core::family_loads::loaded_scoped(additional_bytes.saturating_sub(self.additional_bytes));
+        contextdb_core::family_loads::loaded_scoped(
+            additional_bytes.saturating_sub(self.additional_bytes),
+        );
         self.additional_bytes = additional_bytes;
         self.used_bytes = used_bytes;
         Ok(())
