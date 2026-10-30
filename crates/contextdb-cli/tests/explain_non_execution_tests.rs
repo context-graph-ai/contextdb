@@ -292,6 +292,6 @@ fn trace_on_publishes_the_vector_route_that_actually_executed() {
     assert_eq!(vector["resolved_mode"], "EXACT");
     assert_eq!(vector["aggregate_allowed_vectors"], 1);
     assert_eq!(vector["route"], "exact");
-    assert_eq!(vector["fallback"], "aggregate_below_auto_index_at");
+    assert_eq!(vector["fallback"], "clustered_exact");
     assert!(trace["rows_examined"].as_u64().is_some());
 }
