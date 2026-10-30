@@ -555,15 +555,27 @@ fn database_normal_public_methods(engine: &Path) -> Vec<ImplItemFn> {
         let source = std::fs::read_to_string(path).expect("read Database module source");
         let file = syn::parse_file(&source).expect("parse Database module source");
         for item in file.items {
-            let Item::Mod(module) = item else { continue; };
+            let Item::Mod(module) = item else {
+                continue;
+            };
             let path_attr = module.attrs.iter().find_map(|attr| {
-                let Meta::NameValue(value) = &attr.meta else { return None; };
-                if !value.path.is_ident("path") { return None; }
-                let syn::Expr::Lit(value) = &value.value else { return None; };
-                let syn::Lit::Str(value) = &value.lit else { return None; };
+                let Meta::NameValue(value) = &attr.meta else {
+                    return None;
+                };
+                if !value.path.is_ident("path") {
+                    return None;
+                }
+                let syn::Expr::Lit(value) = &value.value else {
+                    return None;
+                };
+                let syn::Lit::Str(value) = &value.lit else {
+                    return None;
+                };
                 Some(value.value())
             });
-            let Some(path_attr) = path_attr else { continue; };
+            let Some(path_attr) = path_attr else {
+                continue;
+            };
             let resolved = path.parent().expect("module parent").join(path_attr);
             if module.attrs.iter().any(cfg_is_test_only) {
                 nested_gated_paths.insert(resolved);
@@ -607,10 +619,16 @@ fn normal_database_inventory_keeps_ungated_nested_public_methods() {
     std::fs::write(source.join("database.rs"), "mod event_bus;").unwrap();
     std::fs::write(database.join("event_bus.rs"),
         "#[cfg(any(test, feature = \"test-seams\"))] #[path = \"test_child.rs\"] mod test_child; #[path = \"public_child.rs\"] mod public_child;").unwrap();
-    std::fs::write(database.join("test_child.rs"),
-        "impl Database { pub fn hidden_test_child(&self) {} }").unwrap();
-    std::fs::write(database.join("public_child.rs"),
-        "impl Database { pub fn visible_public_child(&self) {} }").unwrap();
+    std::fs::write(
+        database.join("test_child.rs"),
+        "impl Database { pub fn hidden_test_child(&self) {} }",
+    )
+    .unwrap();
+    std::fs::write(
+        database.join("public_child.rs"),
+        "impl Database { pub fn visible_public_child(&self) {} }",
+    )
+    .unwrap();
     let names = method_names(&database_normal_public_methods(engine));
     assert_eq!(names, BTreeSet::from(["visible_public_child".to_string()]));
     // The ordinary frozen equality must reject this new public method.
@@ -620,10 +638,13 @@ fn normal_database_inventory_keeps_ungated_nested_public_methods() {
     std::fs::write(database.join("event_bus.rs"),
         "#[cfg(any(test, feature = \"test-seams\"))] #[path = \"test_child.rs\"] mod test_child; #[path = \"test_child.rs\"] mod public_alias; #[path = \"public_child.rs\"] mod public_child;").unwrap();
     let names = method_names(&database_normal_public_methods(engine));
-    assert_eq!(names, BTreeSet::from([
-        "hidden_test_child".to_string(),
-        "visible_public_child".to_string(),
-    ]));
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "hidden_test_child".to_string(),
+            "visible_public_child".to_string(),
+        ])
+    );
 }
 
 fn collect_rust_files(directory: &Path, paths: &mut Vec<PathBuf>) {

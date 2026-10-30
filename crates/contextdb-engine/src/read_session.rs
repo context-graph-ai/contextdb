@@ -2668,7 +2668,8 @@ impl ReadSession {
             match reader.check_turnover_with_budget(&budget) {
                 Ok(()) => Ok(None),
                 Err(Error::ReadFailure(failure))
-                    if failure.kind() == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure =>
+                    if failure.kind()
+                        == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure =>
                 {
                     // Keep the original snapshot and its fences. Bounded
                     // reads let the kernel decide which tables are affected;

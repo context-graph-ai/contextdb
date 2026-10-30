@@ -11,13 +11,12 @@
 //! function below, each stating the behaviour it pins and the bug no existing
 //! test catches.
 
-use super::*;
 use super::reader_contention_test_helper::{during_unrelated_reader_leave, fixture};
+use super::*;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::sync::mpsc;
 
 const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
-
 
 fn identity(path: &Path) -> (u64, u64) {
     let metadata = std::fs::metadata(path).expect("stat the store");
@@ -720,7 +719,6 @@ fn an_entering_reader_keeps_a_skipped_registry_and_cleans_every_root_when_it_lea
         "both operator-owned root directories remain"
     );
 }
-
 
 #[cfg(all(target_os = "linux", feature = "test-seams"))]
 fn isolated_root_case(name: &str) -> bool {

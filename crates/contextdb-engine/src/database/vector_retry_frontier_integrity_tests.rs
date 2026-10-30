@@ -76,12 +76,20 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
         insert(&db, id, 0);
     }
     let native_routes = [route(0)];
-    super::vector_public_cycle_admission_tests::native_fixture_before_publication(&db, &native_routes, INITIAL_ROWS as usize);
+    super::vector_public_cycle_admission_tests::native_fixture_before_publication(
+        &db,
+        &native_routes,
+        INITIAL_ROWS as usize,
+    );
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         1
     );
-    super::vector_public_cycle_admission_tests::native_fixture_ready(&db, &native_routes, INITIAL_ROWS as usize);
+    super::vector_public_cycle_admission_tests::native_fixture_ready(
+        &db,
+        &native_routes,
+        INITIAL_ROWS as usize,
+    );
     let refusing = route(0);
     let sibling = route(1);
     let mut serving = db

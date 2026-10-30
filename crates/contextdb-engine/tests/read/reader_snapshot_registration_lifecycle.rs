@@ -983,7 +983,9 @@ fn lowered_disk_limit_bounds_its_own_metadata_and_preserves_failed_setting() {
     let reader = ReadSession::open_with_clock_for_test(
         &path,
         Default::default(),
-        Arc::new(contextdb_engine::local_transport::ManualDeadlineClock::at(0)),
+        Arc::new(contextdb_engine::local_transport::ManualDeadlineClock::at(
+            0,
+        )),
     )
     .unwrap();
     let writer = Database::open(&path).unwrap();

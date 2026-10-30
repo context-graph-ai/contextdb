@@ -47,8 +47,8 @@ use contextdb_core::read_memory::ReadMemoryBudget as _;
 pub use historical_index_commitment::HistoricalIndexVerification;
 mod graph_history_record;
 mod graph_history_writer;
-mod graph_reclaim_decode;
 pub(crate) mod graph_read;
+mod graph_reclaim_decode;
 pub mod holder_presence;
 #[cfg(unix)]
 pub(crate) mod physical_admission;
@@ -2586,7 +2586,8 @@ pub mod read_persistence_test_scaffold {
                         .get(&self.identity)
                         .filter(|run| run.token == self.token)
                         .expect("reader registration pause was cancelled")
-                        .arrivals < attempt
+                        .arrivals
+                        < attempt
                 })
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state
@@ -2594,7 +2595,8 @@ pub mod read_persistence_test_scaffold {
                 .get(&self.identity)
                 .filter(|run| run.token == self.token)
                 .expect("reader registration pause was cancelled")
-                .arrivals >= attempt
+                .arrivals
+                >= attempt
         }
 
         /// Let the paused registration continue from every arrival so far.

@@ -3644,7 +3644,6 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
     );
 }
 
-
 /// A native build keeps its workspace hold while persistence admits its own
 /// complete operation holder; neither can reuse the other holder's credit.
 #[cfg(all(feature = "test-seams", target_pointer_width = "64"))]

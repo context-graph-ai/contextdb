@@ -2401,47 +2401,87 @@ fn allocation_observation_withholds_only_its_scope_and_reports_real_minimum() {
 /// pages, and removes the borrowed callback before returning or unwinding.
 #[test]
 fn borrowed_write_observation_orders_real_accesses_and_restores_on_unwind() {
-    use redb::allocation_observation::{AllocationObserverForTest,AllocationPlanForTest,with_borrowed_allocation_observer_for_test};
-    const ROWS:TableDefinition<u64,u64>=TableDefinition::new("borrowed_write_observation");
-    struct Borrowed<'a> {db:&'a redb::Database,starts:AtomicUsize,writes:AtomicUsize,existing:AtomicUsize}
+    use redb::allocation_observation::{
+        AllocationObserverForTest, AllocationPlanForTest,
+        with_borrowed_allocation_observer_for_test,
+    };
+    const ROWS: TableDefinition<u64, u64> = TableDefinition::new("borrowed_write_observation");
+    struct Borrowed<'a> {
+        db: &'a redb::Database,
+        starts: AtomicUsize,
+        writes: AtomicUsize,
+        existing: AtomicUsize,
+    }
     impl AllocationObserverForTest for Borrowed<'_> {
-        fn before_allocate(&self,_:AllocationPlanForTest)->redb::Result {Ok(())}
-        fn allocated(&self,_:AllocationPlanForTest,_:[u8;8]) {}
-        fn before_existing_write(&self,plan:AllocationPlanForTest)->redb::Result {
-            assert_eq!(plan.minimum_growth_bytes,0);
-            self.existing.fetch_add(1,Ordering::SeqCst);Ok(())
+        fn before_allocate(&self, _: AllocationPlanForTest) -> redb::Result {
+            Ok(())
         }
-        fn before_write(&self,plan:AllocationPlanForTest,_:[u8;8],bytes:usize)->redb::Result {
+        fn allocated(&self, _: AllocationPlanForTest, _: [u8; 8]) {}
+        fn before_existing_write(&self, plan: AllocationPlanForTest) -> redb::Result {
+            assert_eq!(plan.minimum_growth_bytes, 0);
+            self.existing.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn before_write(
+            &self,
+            plan: AllocationPlanForTest,
+            _: [u8; 8],
+            bytes: usize,
+        ) -> redb::Result {
             // Reacquire the allocator lock from both new and existing accesses.
-            self.db.allocation_plan_for_test(4096,false)?;
-            assert!(bytes>=plan.requested_bytes);
-            self.starts.fetch_add(1,Ordering::SeqCst);Ok(())
+            self.db.allocation_plan_for_test(4096, false)?;
+            assert!(bytes >= plan.requested_bytes);
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
-        fn written(&self,_:AllocationPlanForTest,_:[u8;8],_:usize) {
-            let writes=self.writes.fetch_add(1,Ordering::SeqCst)+1;
-            assert!(writes<=self.starts.load(Ordering::SeqCst));
+        fn written(&self, _: AllocationPlanForTest, _: [u8; 8], _: usize) {
+            let writes = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(writes <= self.starts.load(Ordering::SeqCst));
         }
     }
-    let db=redb::Builder::new().create_with_backend(InMemoryBackend::new()).unwrap();
-    let observer=Borrowed{db:&db,starts:AtomicUsize::new(0),writes:AtomicUsize::new(0),existing:AtomicUsize::new(0)};
-    let write=db.begin_write().unwrap();
-    with_borrowed_allocation_observer_for_test(&observer,false,|| {
-        let mut table=write.open_table(ROWS).unwrap();
-        for key in 0..128 {table.insert(key,key+1).unwrap();}
-        for key in 0..128 {table.insert(key,key+2).unwrap();}
+    let db = redb::Builder::new()
+        .create_with_backend(InMemoryBackend::new())
+        .unwrap();
+    let observer = Borrowed {
+        db: &db,
+        starts: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
+        existing: AtomicUsize::new(0),
+    };
+    let write = db.begin_write().unwrap();
+    with_borrowed_allocation_observer_for_test(&observer, false, || {
+        let mut table = write.open_table(ROWS).unwrap();
+        for key in 0..128 {
+            table.insert(key, key + 1).unwrap();
+        }
+        for key in 0..128 {
+            table.insert(key, key + 2).unwrap();
+        }
     });
-    assert!(observer.existing.load(Ordering::SeqCst)>0);
-    assert!(observer.writes.load(Ordering::SeqCst)>0);
-    assert_eq!(observer.starts.load(Ordering::SeqCst),observer.writes.load(Ordering::SeqCst));
-    let writes=observer.writes.load(Ordering::SeqCst);
-    let caught=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        with_borrowed_allocation_observer_for_test(&observer,false,||panic!("stop the borrowed scope"));
+    assert!(observer.existing.load(Ordering::SeqCst) > 0);
+    assert!(observer.writes.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        observer.starts.load(Ordering::SeqCst),
+        observer.writes.load(Ordering::SeqCst)
+    );
+    let writes = observer.writes.load(Ordering::SeqCst);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_borrowed_allocation_observer_for_test(&observer, false, || {
+            panic!("stop the borrowed scope")
+        });
     }));
     assert!(caught.is_err());
-    write.open_table(ROWS).unwrap().insert(999,1001).unwrap();
+    write.open_table(ROWS).unwrap().insert(999, 1001).unwrap();
     write.commit().unwrap();
-    assert_eq!(observer.writes.load(Ordering::SeqCst),writes,"borrowed scope did not escape");
-    let read=db.begin_read().unwrap();let table=read.open_table(ROWS).unwrap();
-    for key in 0..128 {assert_eq!(table.get(key).unwrap().unwrap().value(),key+2);}
-    assert_eq!(table.get(999).unwrap().unwrap().value(),1001);
+    assert_eq!(
+        observer.writes.load(Ordering::SeqCst),
+        writes,
+        "borrowed scope did not escape"
+    );
+    let read = db.begin_read().unwrap();
+    let table = read.open_table(ROWS).unwrap();
+    for key in 0..128 {
+        assert_eq!(table.get(key).unwrap().unwrap().value(), key + 2);
+    }
+    assert_eq!(table.get(999).unwrap().unwrap().value(), 1001);
 }

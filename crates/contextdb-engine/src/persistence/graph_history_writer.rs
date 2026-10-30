@@ -352,7 +352,9 @@ impl RedbPersistence {
         crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
 
         #[cfg(test)]
-        let edge = reclaim_allocation_guard::observe_decode(|| super::graph_reclaim_decode::decode(encoded))?;
+        let edge = reclaim_allocation_guard::observe_decode(|| {
+            super::graph_reclaim_decode::decode(encoded)
+        })?;
         #[cfg(not(test))]
         let edge = super::graph_reclaim_decode::decode(encoded)?;
         if !edge.matches_forward_key(p) {
@@ -2287,9 +2289,12 @@ mod reclaim_allocation_guard {
     }
     pub(super) fn observe_decode<T>(decode: impl FnOnce() -> Result<T>) -> Result<T> {
         let accountant = ACCOUNTANT.with(std::cell::Cell::get);
-        if accountant == 0 { return decode(); }
+        if accountant == 0 {
+            return decode();
+        }
         // The fixture pins this exact original accountant until the call returns.
-        let accountant = unsafe { &*(accountant as *const crate::memory_accounting::MemoryAccountant) };
+        let accountant =
+            unsafe { &*(accountant as *const crate::memory_accounting::MemoryAccountant) };
         let before = accountant.usage().used;
         let ((result, physical), gap) = oracle::funded_requests(accountant, || {
             let observation = oracle::declaration_observation();
@@ -2297,7 +2302,11 @@ mod reclaim_allocation_guard {
             (result, observation.physical_receipt())
         });
         let after = accountant.usage().used;
-        RECEIPT.with(|slot| slot.set(Some((physical.0, physical.1, physical.2, gap, before, after))));
+        RECEIPT.with(|slot| {
+            slot.set(Some((
+                physical.0, physical.1, physical.2, gap, before, after,
+            )))
+        });
         result
     }
 
@@ -2329,20 +2338,46 @@ mod reclaim_allocation_guard {
                 RedbPersistence::initialize_graph_proof_tables_in_write(&write)?;
                 RedbPersistence::install_graph_creation_in_write(&write, &edge, &bytes)?;
                 store.graph_writer_window(|| {
-                    ACCOUNTANT.with(|slot| slot.set((&*owner as *const crate::memory_accounting::MemoryAccountant) as usize));
+                    ACCOUNTANT.with(|slot| {
+                        slot.set(
+                            (&*owner as *const crate::memory_accounting::MemoryAccountant) as usize,
+                        )
+                    });
                     RECEIPT.with(|slot| slot.set(None));
-                    let result = RedbPersistence::reclaim_graph_creation_in_write(&write, &key, &bytes);
+                    let result =
+                        RedbPersistence::reclaim_graph_creation_in_write(&write, &key, &bytes);
                     ACCOUNTANT.with(|slot| slot.set(0));
                     let succeeded = result.is_ok();
                     drop(result);
-                    let physical = RECEIPT.with(|slot| slot.take()).expect("actual decoder was observed");
+                    let physical = RECEIPT
+                        .with(|slot| slot.take())
+                        .expect("actual decoder was observed");
                     assert_eq!(succeeded, should_succeed);
-                    assert_eq!(physical.3, 0, "actual decoder allocations stay funded through physical free");
-                    assert_eq!(physical.0, 0, "decoder leaves no allocated property payload live");
-                    assert_eq!(physical.1, 0, "native decoder allocation census is fully funded");
-                    if wide { assert!(physical.2 < bytes.len(), "reclaim never copies the wide payload"); }
-                    if allocates { assert!(physical.2 > 0, "the actual parser or its error allocated"); }
-                    assert_eq!(physical.4, physical.5, "the actual decoder returns its transient invoice");
+                    assert_eq!(
+                        physical.3, 0,
+                        "actual decoder allocations stay funded through physical free"
+                    );
+                    assert_eq!(
+                        physical.0, 0,
+                        "decoder leaves no allocated property payload live"
+                    );
+                    assert_eq!(
+                        physical.1, 0,
+                        "native decoder allocation census is fully funded"
+                    );
+                    if wide {
+                        assert!(
+                            physical.2 < bytes.len(),
+                            "reclaim never copies the wide payload"
+                        );
+                    }
+                    if allocates {
+                        assert!(physical.2 > 0, "the actual parser or its error allocated");
+                    }
+                    assert_eq!(
+                        physical.4, physical.5,
+                        "the actual decoder returns its transient invoice"
+                    );
                     Ok(())
                 })
             })
@@ -2353,7 +2388,13 @@ mod reclaim_allocation_guard {
     #[test]
     #[serial_test::serial]
     fn actual_reclaim_borrows_wide_and_funds_json_validation() {
-        run(Value::Text("wide-body".repeat(131072)), false, true, true, false);
+        run(
+            Value::Text("wide-body".repeat(131072)),
+            false,
+            true,
+            true,
+            false,
+        );
         run(
             Value::Json(serde_json::json!({"text": "a\\\"b\n", "nested": [1, {"v": true}]})),
             false,
@@ -2361,7 +2402,13 @@ mod reclaim_allocation_guard {
             false,
             true,
         );
-        run(Value::Json(serde_json::json!({"a": 1})), true, false, false, true);
+        run(
+            Value::Json(serde_json::json!({"a": 1})),
+            true,
+            false,
+            false,
+            true,
+        );
         let mut nested = serde_json::json!(0);
         for _ in 0..120 {
             nested = serde_json::Value::Array(vec![nested]);

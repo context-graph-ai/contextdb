@@ -84,7 +84,9 @@ impl PendingCounts {
 }
 
 impl MembershipSummary {
-    pub(super) fn source_identity(&self) -> [u8; 32] { self.digest }
+    pub(super) fn source_identity(&self) -> [u8; 32] {
+        self.digest
+    }
 
     #[expect(
         clippy::result_large_err,

@@ -87,7 +87,11 @@ fn pending_cleanup_fixture() -> (
             .unwrap();
         }
     }
-    super::vector_public_cycle_admission_tests::native_fixture_before_publication(&db, &partitions, 16);
+    super::vector_public_cycle_admission_tests::native_fixture_before_publication(
+        &db,
+        &partitions,
+        16,
+    );
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         3

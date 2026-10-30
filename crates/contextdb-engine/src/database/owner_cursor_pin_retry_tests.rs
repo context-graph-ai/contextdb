@@ -217,12 +217,14 @@ fn owner_channel_registry_wait(outcome: RegistryWaitOutcome, phase: RegistryWait
             _: crate::owner_read::OwnerBoundedOperation,
             _: ReadLimits,
             _: OwnerReadCancellation,
-        ) {}
+        ) {
+        }
         fn before_work(
             &self,
             _: crate::executor::bounded_read_test_support::TestWorkSource,
             _: u64,
-        ) {}
+        ) {
+        }
         fn cancellation_observed(&self, _: u64) {}
         fn carrier_request_retired(&self) {
             let _ = self.0.send(());

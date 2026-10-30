@@ -6007,10 +6007,14 @@ fn integrity_03_retain_pruning_releases_memory() {
         let now = Arc::clone(&now);
         contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
     };
-    let db = Database::open_with_options(":memory:", contextdb_engine::DatabaseOpenOptions {
-        memory_limit: Some(256 * 1024),
-        ..Default::default()
-    }).unwrap();
+    let db = Database::open_with_options(
+        ":memory:",
+        contextdb_engine::DatabaseOpenOptions {
+            memory_limit: Some(256 * 1024),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let accountant = db.accountant();
     db.execute(
         "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",

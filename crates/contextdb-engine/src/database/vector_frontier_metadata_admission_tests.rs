@@ -359,7 +359,11 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
         VectorIndexRef::new("covered_retry_items", "v"),
         VectorPartitionKey::unpartitioned(),
     )];
-    super::vector_public_cycle_admission_tests::native_fixture_before_publication(&db, &native_routes, 16);
+    super::vector_public_cycle_admission_tests::native_fixture_before_publication(
+        &db,
+        &native_routes,
+        16,
+    );
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         1

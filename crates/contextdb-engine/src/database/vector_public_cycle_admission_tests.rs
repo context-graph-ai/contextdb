@@ -8,7 +8,6 @@ const MEMBERSHIPS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_membership");
 const JOURNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_partition_journal");
 
-
 // The final publication remains the original public maintenance call in each
 // fixture. Only its prerequisite advances through actual stored native phases.
 pub(super) fn native_fixture_before_publication(
@@ -76,7 +75,6 @@ pub(super) fn native_fixture_ready(
     panic!("native fixture never reported ready with no remaining partitions");
 }
 
-
 pub(super) fn native_fixture_open(path: &std::path::Path, limit: Option<usize>) -> Database {
     let mut options = DatabaseOpenOptions {
         memory_limit: limit,
@@ -92,20 +90,35 @@ pub(super) fn native_fixture_open(path: &std::path::Path, limit: Option<usize>) 
 pub(super) fn native_fixture_cold_cache(db: &Database) {
     let persistence = db.persistence.as_ref().unwrap();
     persistence.settle_writer_cache_budget(0).unwrap();
-    assert_eq!(persistence.read_cache_observation().unwrap().unwrap().installed_capacity(), 0);
+    assert_eq!(
+        persistence
+            .read_cache_observation()
+            .unwrap()
+            .unwrap()
+            .installed_capacity(),
+        0
+    );
 }
 
-pub(super) fn native_fixture_control(db: &Database, route: &VectorPartitionRef) -> (Vec<u8>, Vec<u8>) {
+pub(super) fn native_fixture_control(
+    db: &Database,
+    route: &VectorPartitionRef,
+) -> (Vec<u8>, Vec<u8>) {
     db.with_native_ivf_read_for_test(&route.index, &route.partition_key, |scope| {
         scope.with_scope_control_for_test(|_, stored, bytes| {
             Ok((stored.scope_key.to_vec(), bytes.to_vec()))
         })
-    }).unwrap()
+    })
+    .unwrap()
 }
 
-pub(super) fn native_fixture_serving(db: &Database, route: &VectorPartitionRef) -> Option<[u8; 200]> {
+pub(super) fn native_fixture_serving(
+    db: &Database,
+    route: &VectorPartitionRef,
+) -> Option<[u8; 200]> {
     db.native_ivf_serving_descriptor_for_test(&route.index, &route.partition_key)
-        .unwrap().map(|descriptor| descriptor.bytes)
+        .unwrap()
+        .map(|descriptor| descriptor.bytes)
 }
 
 pub(super) fn native_fixture_page_target(
@@ -120,25 +133,38 @@ pub(super) fn native_fixture_page_target(
                 saved = Some((page.storage, page.bytes.to_vec()));
             }
         })
-    }).unwrap();
+    })
+    .unwrap();
     let (storage, bytes) = saved.expect("the real maintained native family owns the target page");
     let prefix = format!("ivf_{storage:016x}_");
     db.with_native_ivf_fixture_read_for_test(|read| {
         let mut found = None;
         for handle in read.list_tables().unwrap() {
             let name = handle.name();
-            if !name.starts_with(&prefix) { continue; }
-            let table = read.open_table(TableDefinition::<&[u8], &[u8]>::new(name)).unwrap();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let table = read
+                .open_table(TableDefinition::<&[u8], &[u8]>::new(name))
+                .unwrap();
             for entry in table.iter().unwrap() {
                 let (key, value) = entry.unwrap();
                 if value.value() == bytes.as_slice() {
-                    assert!(found.is_none(), "the observed saved page has one physical table/key");
-                    found = Some((name.to_owned(), key.value().to_vec(), value.value().to_vec()));
+                    assert!(
+                        found.is_none(),
+                        "the observed saved page has one physical table/key"
+                    );
+                    found = Some((
+                        name.to_owned(),
+                        key.value().to_vec(),
+                        value.value().to_vec(),
+                    ));
                 }
             }
         }
         Ok(found.expect("the captured native saved page exists in its real storage family"))
-    }).unwrap()
+    })
+    .unwrap()
 }
 
 #[derive(Clone, Copy)]
@@ -348,34 +374,70 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
         VectorPartitionKey::unpartitioned(),
     );
     if matches!(metadata, ColdMetadata::Journal) {
-        db.execute("UPDATE metadata_items SET v = '[0,1,0]' WHERE id = 0", &HashMap::new()).unwrap();
+        db.execute(
+            "UPDATE metadata_items SET v = '[0,1,0]' WHERE id = 0",
+            &HashMap::new(),
+        )
+        .unwrap();
     }
-    if matches!(metadata, ColdMetadata::Journal | ColdMetadata::CoveredJournal) {
+    if matches!(
+        metadata,
+        ColdMetadata::Journal | ColdMetadata::CoveredJournal
+    ) {
         // A real policy revision starts replacement ingestion on the next cycle;
         // it leaves the covered/uncovered row frontier itself unchanged.
         db.execute(
             "ALTER TABLE metadata_items ALTER COLUMN v SET WITH (training_seed = 1)",
             &HashMap::new(),
-        ).unwrap();
+        )
+        .unwrap();
     }
     let serving = native_fixture_serving(&db, &partition).unwrap();
     let original_catalog = native_fixture_control(&db, &partition);
     let (table_name, malformed_key, original_value) = match metadata {
-        ColdMetadata::Catalog => ("ivf_scopes".to_owned(), original_catalog.0.clone(), original_catalog.1.clone()),
+        ColdMetadata::Catalog => (
+            "ivf_scopes".to_owned(),
+            original_catalog.0.clone(),
+            original_catalog.1.clone(),
+        ),
         ColdMetadata::Journal | ColdMetadata::CoveredJournal => {
-            let (current, covered) = db.with_native_ivf_read_for_test(&partition.index, &partition.partition_key, |scope| {
-                scope.with_scope_control_for_test(|_, stored, _| {
-                    let generation = stored.serving.expect("the original serving manifest").generation;
-                    let family = stored.families.iter().flatten().find(|family| family.generation == generation).unwrap();
-                    Ok((stored.current.frontier, family.frozen_frontier))
-                })
-            }).unwrap();
+            let (current, covered) = db
+                .with_native_ivf_read_for_test(
+                    &partition.index,
+                    &partition.partition_key,
+                    |scope| {
+                        scope.with_scope_control_for_test(|_, stored, _| {
+                            let generation = stored
+                                .serving
+                                .expect("the original serving manifest")
+                                .generation;
+                            let family = stored
+                                .families
+                                .iter()
+                                .flatten()
+                                .find(|family| family.generation == generation)
+                                .unwrap();
+                            Ok((stored.current.frontier, family.frozen_frontier))
+                        })
+                    },
+                )
+                .unwrap();
             if matches!(metadata, ColdMetadata::Journal) {
-                assert!(current > covered, "the real committed update is outside the serving basis");
+                assert!(
+                    current > covered,
+                    "the real committed update is outside the serving basis"
+                );
             } else {
-                assert!(current <= covered, "the native row-version source is covered by the serving basis");
+                assert!(
+                    current <= covered,
+                    "the native row-version source is covered by the serving basis"
+                );
             }
-            native_fixture_page_target(&db, &partition, contextdb_vector::ivf::storage::PageKind::RowVersions)
+            native_fixture_page_target(
+                &db,
+                &partition,
+                contextdb_vector::ivf::storage::PageKind::RowVersions,
+            )
         }
         _ => unreachable!("the graph-only private fixtures returned above"),
     };
@@ -383,9 +445,14 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     native_fixture_cold_cache(&db);
     db.with_native_ivf_fixture_write_for_test(|write| {
         let malformed = vec![0xff; MALFORMED_METADATA_BYTES];
-        write.open_table(definition).unwrap().insert(malformed_key.as_slice(), malformed.as_slice()).unwrap();
+        write
+            .open_table(definition)
+            .unwrap()
+            .insert(malformed_key.as_slice(), malformed.as_slice())
+            .unwrap();
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     let persistence = Arc::clone(db.persistence.as_ref().unwrap());
     let baseline = db.accountant.usage().used;
     let snapshot_holds = db.snapshot_registry.state.lock().active.len();
@@ -399,7 +466,10 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     }));
     db.accountant.set_budget(Some(limit)).unwrap();
     let cycle = db.run_maintenance_cycle();
-    if matches!(metadata, ColdMetadata::Journal | ColdMetadata::CoveredJournal) {
+    if matches!(
+        metadata,
+        ColdMetadata::Journal | ColdMetadata::CoveredJournal
+    ) {
         assert!(
             matches!(&cycle, Err(Error::StoreCorrupted { .. })),
             "persistent damage to the native journal must remain a typed corruption refusal: {cycle:?}"
@@ -449,9 +519,14 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     // Restore only the deliberately damaged private input, then reopen its
     // real writer so the final public control borrows the current real root.
     db.with_native_ivf_fixture_write_for_test(|write| {
-        write.open_table(definition).unwrap().insert(malformed_key.as_slice(), original_value.as_slice()).unwrap();
+        write
+            .open_table(definition)
+            .unwrap()
+            .insert(malformed_key.as_slice(), original_value.as_slice())
+            .unwrap();
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     drop(persistence);
     db.close().unwrap();
     drop(db);
@@ -1783,9 +1858,6 @@ fn assert_saved_retry_publication(db: &Database) {
     );
 }
 
-
-
-
 type RouteOutputHookForTest =
     Box<dyn FnMut(usize, usize, usize, &mut dyn FnMut() -> Result<()>) -> Result<()>>;
 thread_local! {
@@ -2257,7 +2329,6 @@ fn native_authentic_route_control_damage_refuses_only_that_route() {
         db.close().unwrap();
     }
 }
-
 
 // The retained public outcome assertions are copied byte-for-byte from the
 // shared fixture; their indentation remains part of the frozen assertion bytes.

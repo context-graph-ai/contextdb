@@ -1020,7 +1020,9 @@ pub async fn with_capability_push_observer_for_test<F: std::future::Future>(
     observer: tokio::sync::mpsc::UnboundedSender<CapabilityPushEventForTest>,
     future: F,
 ) -> F::Output {
-    CAPABILITY_PUSH_OBSERVER_FOR_TEST.scope(observer, future).await
+    CAPABILITY_PUSH_OBSERVER_FOR_TEST
+        .scope(observer, future)
+        .await
 }
 
 #[cfg(any(test, feature = "test-seams"))]

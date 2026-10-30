@@ -508,7 +508,10 @@ fn a_pinned_page_view_keeps_its_versions_after_update_delete_and_tail_commit() {
         current[&1], new_identity,
         "actual row LSN, never captured F0"
     );
-    assert!(tail_seen, "the actual unsealed tail participates in exhaustive traversal");
+    assert!(
+        tail_seen,
+        "the actual unsealed tail participates in exhaustive traversal"
+    );
     assert_eq!(work.exact_score_count, ROWS);
 }
 
