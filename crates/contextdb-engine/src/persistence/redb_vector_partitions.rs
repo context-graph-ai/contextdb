@@ -590,6 +590,7 @@ impl RedbPersistence {
         }
     }
 
+    #[cfg(test)]
     /// Charge one persisted row's decoded allocations before each allocation
     /// occurs. The transient charge remains held through the caller's row
     /// insertion and is released before the next stored row is decoded.
@@ -606,6 +607,7 @@ impl RedbPersistence {
         self.visit_relational_table_impl(name, accountant, visit)
     }
 
+    #[cfg(test)]
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

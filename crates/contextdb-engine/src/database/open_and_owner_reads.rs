@@ -2089,7 +2089,7 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn open_memory_internal_with_working_graph(
+    pub(super) fn open_private_working_image(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
         declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
@@ -2099,7 +2099,7 @@ impl Database {
             crate::persistence::received_working_vector::WorkingVectorCatalogOwner,
         >,
     ) -> Result<Self> {
-        Self::open_memory_internal_with_host(
+        Self::open_private_working_image_with_host(
             plugin,
             writer_budget,
             declared_read_memory,
@@ -2114,7 +2114,7 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn open_memory_internal_with_host(
+    pub(super) fn open_private_working_image_with_host(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
         declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,

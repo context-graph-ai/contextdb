@@ -3448,6 +3448,7 @@ impl ImageMemoryHandle {
         }
     }
 
+    #[cfg(test)]
     /// A separate row lifetime funded by this operation's existing capability.
     /// The parent remains live while a selected row is being replaced.
     /// A decoded row transferred directly into a detached write projection

@@ -600,18 +600,6 @@ pub(crate) struct ReceivedRowRecords {
     _owner: contextdb_vector::VectorCopyAdmission,
 }
 impl ReceivedRowRecords {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn push_table(&mut self, table: &str, rows: &[VersionedRow]) -> Result<()> {
-        self.push_table_with(table, |push| {
-            for row in rows {
-                push(row)?;
-            }
-            Ok(())
-        })
-    }
     /// The producer lends a single admitted body at a time. No body or
     /// callback is retained after this call; only the existing table range is.
     #[expect(

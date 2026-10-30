@@ -883,6 +883,55 @@ struct PendingLocalSchemaStage {
     base_triggers: BTreeMap<String, TriggerDeclaration>,
     base_table_generations: HashMap<String, u64>,
     temporary_memory: TemporaryMemoryReservation,
+    ledger: LocalSchemaStageLedger,
+}
+
+/// The ownership ledger of one pending local schema stage. `hold` (H) is the
+/// part of the baseline reservation that funds the stage's copies made outside
+/// the accountant; it is held, never spent. `spend` keeps the image payload P
+/// drawn out of the reservation credit, with cumulative draws D and in-scope
+/// restores Rs. Under test seams the construction controls are kept too: Kc,
+/// the `used` delta of building the image, and Kr, its aggregate-only open
+/// residue.
+#[derive(Debug, Default, Clone, Copy)]
+struct LocalSchemaStageLedger {
+    hold: usize,
+    spend: crate::memory_accounting::ReservationSpendLedger,
+    #[cfg(any(test, feature = "test-seams"))]
+    controls_used: usize,
+    #[cfg(any(test, feature = "test-seams"))]
+    controls_residue: usize,
+    /// S and Sr: the `used` and aggregate-only charge of this stage's slot in
+    /// the live pending-stage registry, measured when the slot was reserved.
+    #[cfg(any(test, feature = "test-seams"))]
+    slot_used: usize,
+    #[cfg(any(test, feature = "test-seams"))]
+    slot_residue: usize,
+}
+
+/// A read of one pending local schema stage's ledger, for the step-28
+/// accounting tests: H, C, P, D, Rs, Kc and Kr, plus the image accountant's
+/// and the live accountant's identities.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSchemaStageLedgerForTest {
+    pub hold: usize,
+    pub credit: usize,
+    pub payload: usize,
+    pub draws: usize,
+    pub restores: usize,
+    pub controls_used: usize,
+    pub controls_residue: usize,
+    /// S: the `used` charge of this stage's slot in the live pending-stage
+    /// registry, admitted outside the scope.
+    pub stage_slot: usize,
+    /// Sr: that slot's aggregate-only residue.
+    pub stage_slot_residue: usize,
+    pub image_accountant: usize,
+    pub live_accountant: usize,
+    pub image_writer_identity: Option<usize>,
+    pub live_writer_identity: Option<usize>,
 }
 
 /// The caller-owned facts that govern a received unit's existing
@@ -3559,6 +3608,9 @@ struct PendingCommitMetadata {
     vector_schema_epochs: HashMap<VectorIndexRef, u64>,
     lineage_generations: Option<Arc<PendingLineageGenerations>>,
     row_graph_undo: Option<Arc<row_graph::LegacyRowGraphJournal>>,
+    /// A statement failed after its execution and discarded the transaction's
+    /// local schema stage; only ROLLBACK may follow.
+    local_schema_stage_discarded: bool,
 }
 
 struct LegacyWriteSetCheckpoint<'a> {

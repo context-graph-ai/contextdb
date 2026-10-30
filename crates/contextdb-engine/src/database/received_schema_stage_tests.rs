@@ -6080,6 +6080,11 @@ fn assert_local_schema_transaction_absent(db: &Database, table: &str, trigger: &
 
 #[test]
 fn local_schema_memory_refusal_leaves_no_live_or_durable_schema() {
+    // Test 1 (step 28): one byte below the exact baseline refuses with the
+    // typed stage error, and leaves both counters as they were.
+    local_schema_stage_accounting::initial_stage_refusal_is_exact(
+        local_schema_stage_accounting::Host::Legacy,
+    );
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("local-schema-memory-refusal.redb");
     let db = Database::open(&path).unwrap();
@@ -7410,3 +7415,5 @@ include!("received_native_alias_guards.rs");
 
 include!("received_legacy_growth_guards.rs");
 include!("received_export_sync_guards.rs");
+
+include!("local_schema_stage_accounting.rs");

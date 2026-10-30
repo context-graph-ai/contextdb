@@ -321,23 +321,9 @@ pub(super) fn record_received_schema_staged_table_image_for_test(table: &str) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-pub(super) fn record_received_schema_staged_row_for_test() {
-    with_received_schema_apply_observation_for_test(|observation| {
-        observation.staged_rows_copied += 1;
-    });
-}
-
-#[cfg(any(test, feature = "test-seams"))]
 pub(super) fn record_received_schema_staged_graph_edge_for_test() {
     with_received_schema_apply_observation_for_test(|observation| {
         observation.staged_graph_edges_copied += 1;
-    });
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(super) fn record_received_schema_staged_vector_for_test() {
-    with_received_schema_apply_observation_for_test(|observation| {
-        observation.staged_vectors_copied += 1;
     });
 }
 
@@ -643,6 +629,61 @@ impl TemporaryMemoryReservation {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    /// Check, before any statement runs, that `other` can be absorbed into
+    /// this reservation: the same accountant on the Legacy host, mergeable
+    /// Originals on the owned host.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn check_absorbable(&self, other: &Self) -> Result<()> {
+        match (&self.original, &other.original) {
+            (Some(left), Some(right)) => {
+                crate::memory_accounting::check_preparation_originals_mergeable(left, right)
+            }
+            (None, None) if std::ptr::eq(self.accountant.as_ptr(), other.accountant.as_ptr()) => {
+                Ok(())
+            }
+            _ => Err(EngineMetadataJournal::identity_error()),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    /// The bytes this reservation holds that a spend scope may draw from:
+    /// `bytes` on the Legacy host, the Original's bytes on the owned host,
+    /// where `bytes` is 0 and is never added.
+    pub(super) fn spendable_bytes(&self) -> usize {
+        match &self.original {
+            Some(original) => original.bytes(),
+            None => self.bytes,
+        }
+    }
+
+    /// Enter a spend scope that pays a private image's payload out of this
+    /// reservation's credit above `hold`. The scope mutably borrows the
+    /// reservation, so its admission cannot be released while the scope lives.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn enter_spend_scope<'a>(
+        &'a mut self,
+        hold: usize,
+        ledger: &'a mut crate::memory_accounting::ReservationSpendLedger,
+    ) -> Result<crate::memory_accounting::ReservationSpendScope<'a>> {
+        match &mut self.original {
+            Some(original) => crate::memory_accounting::ReservationSpendScope::enter_original(
+                original, hold, ledger,
+            ),
+            None => crate::memory_accounting::ReservationSpendScope::enter(
+                &self.accountant,
+                &mut self.bytes,
+                hold,
+                ledger,
+            ),
+        }
+    }
+
     pub(super) fn absorb(&mut self, mut other: Self) -> Result<()> {
         match (&mut self.original, &mut other.original) {
             (Some(left), Some(right)) => {
@@ -753,6 +794,7 @@ impl StagedCopyCharge {
         }
     }
 
+    #[cfg(test)]
     /// Admit the sole outer Box at the existing fallible prepaid handoff.
     #[expect(
         clippy::result_large_err,

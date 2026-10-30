@@ -2785,7 +2785,7 @@ impl Database {
 
     sync_test_seam! {
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from schema_stage_registry.rs"))]
+    #[cfg(any(test, feature = "test-seams"))]
     fn open_memory_with_plugin_and_accountant(
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,

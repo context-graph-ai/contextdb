@@ -19,6 +19,12 @@ pub(super) fn next_working_control_identity() -> Result<u64> {
         .map_err(|_| Error::Other("received working control identity exhausted".into()))
 }
 
+/// The next working control identity, read without taking one.
+#[cfg(test)]
+pub(crate) fn working_control_identity_watermark_for_test() -> u64 {
+    NEXT_WORKING_CONTROL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One stable, source-funded Original for the production received interval.
 /// It descends from the live store's held writer loan, never a reconstructed
 /// registration. Payload/control pairs clone together and expose no Weak.
@@ -1384,64 +1390,6 @@ impl ReceivedWorkingWrite {
                 .insert(source.position().as_slice(), encoded.as_slice())
                 .map_err(RedbPersistence::storage_error)?;
             after = Some(*source.position());
-        }
-        Ok(())
-    }
-}
-
-impl ReceivedWorkingWrite {
-    /// Install the adjudicator's complete final table into private scratch.
-    /// This transitional caller accepts borrowed resident rows; the paged
-    /// adjudicator uses apply_row_replacements instead of building this slice.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn replace_projected_rows(
-        &self,
-        store: &RedbPersistence,
-        original: &crate::memory_accounting::OwnedMemoryReservation,
-        table: &str,
-        meta: &TableMeta,
-        rows: &[VersionedRow],
-    ) -> Result<()> {
-        self.prepare_rows(store, original, table)?;
-        self.invalidate_indexes()?;
-        let declaration = OriginalPersistenceFrame::new(original)?;
-        declaration.reserve(table.len().saturating_add(64))?;
-        let name = working_row_name(table);
-        let definition = TableDefinition::<&[u8], &[u8]>::new(name.as_str());
-        self.transaction()
-            .delete_table(definition)
-            .map_err(RedbPersistence::storage_error)?;
-        drop(
-            self.transaction()
-                .open_table(definition)
-                .map_err(RedbPersistence::storage_error)?,
-        );
-        let mut previous = None;
-        for row in rows {
-            let mut key = [0u8; 24];
-            key[..8].copy_from_slice(&row.row_id.0.to_be_bytes());
-            key[8..16].copy_from_slice(&row.created_tx.0.to_be_bytes());
-            key[16..].copy_from_slice(&row.lsn.0.to_be_bytes());
-            if previous.is_some_and(|old| old >= key) {
-                return Err(crate::funded_error::corruption_text(
-                    crate::funded_error::original_budget(original),
-                    table,
-                    "private projection contains repeated or unordered row identities".into(),
-                ));
-            }
-            let window = OriginalPersistenceFrame::new(original)?;
-            let encoded = RedbPersistence::encode_versioned_row_original(&window, row, Some(meta))?;
-            let mut destination = self
-                .transaction()
-                .open_table(definition)
-                .map_err(RedbPersistence::storage_error)?;
-            destination
-                .insert(key.as_slice(), encoded.as_slice())
-                .map_err(RedbPersistence::storage_error)?;
-            previous = Some(key);
         }
         Ok(())
     }

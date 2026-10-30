@@ -249,12 +249,101 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn ensure_no_mixed_local_schema_dml(&self, tx: TxId) -> Result<()> {
+        self.ensure_local_schema_stage_not_discarded(tx)?;
         if self.pending_local_schema_stages.lock().contains_key(&tx) {
             return Err(Error::Other((
                 "mixed DML and transactional local schema DDL is not supported; commit or roll back before writing rows"
                     .to_string()).into()));
         }
         Ok(())
+    }
+
+    /// Whether an earlier statement of `tx` discarded its local schema stage
+    /// after a failure past execution. Such a transaction must ROLLBACK.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn ensure_local_schema_stage_not_discarded(&self, tx: TxId) -> Result<()> {
+        if self
+            .pending_commit_metadata
+            .lock()
+            .get(&tx)
+            .is_some_and(|metadata| metadata.local_schema_stage_discarded)
+        {
+            return Err(local_schema_stage_requires_rollback());
+        }
+        Ok(())
+    }
+
+    /// Mark `tx` as requiring ROLLBACK: its local schema stage was discarded.
+    pub(super) fn mark_local_schema_stage_discarded(&self, tx: TxId) {
+        self.pending_commit_metadata
+            .lock()
+            .entry(tx)
+            .or_default()
+            .local_schema_stage_discarded = true;
+    }
+
+    /// H, the copy hold of a new local schema stage: the copies the stage
+    /// keeps outside the accountant. `base_tables` clones the live metadata;
+    /// `base_triggers` and the image's seeded trigger declarations are two
+    /// trigger copies; `base_event_bus` and the image's seeded projection are
+    /// two event-bus copies.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn local_schema_stage_hold_bytes(&self) -> Result<usize> {
+        let metadata =
+            self.relational_store
+                .table_meta
+                .read()
+                .values()
+                .fold(0usize, |bytes, meta| {
+                    bytes
+                        .saturating_add(retained_table_metadata_bytes(&self.relational_store, meta))
+                });
+        let triggers = self.local_schema_trigger_bytes();
+        let event_bus = self.received_event_bus_projection_bytes()?;
+        metadata
+            .checked_add(
+                triggers
+                    .checked_mul(2)
+                    .ok_or_else(EngineMetadataJournal::identity_error)?,
+            )
+            .and_then(|bytes| bytes.checked_add(event_bus.checked_mul(2)?))
+            .ok_or_else(EngineMetadataJournal::identity_error)
+    }
+
+    /// The spendable payload credit a new stage's baseline admits for its
+    /// private image: the image's metadata fold, its index declarations, and a
+    /// fixed 4096-byte slack. The image store is not disk-backed, so its fold
+    /// is each table's `estimated_bytes`.
+    pub(super) fn local_schema_stage_payload_credit_bytes(&self) -> usize {
+        let fold = self
+            .relational_store
+            .table_meta
+            .read()
+            .values()
+            .fold(0usize, |bytes, meta| {
+                bytes.saturating_add(meta.estimated_bytes())
+            });
+        fold.saturating_mul(2).saturating_add(4096)
+    }
+
+    fn local_schema_trigger_bytes(&self) -> usize {
+        self.trigger
+            .declarations
+            .lock()
+            .values()
+            .fold(0usize, |bytes, declaration| {
+                bytes
+                    .saturating_add(64)
+                    .saturating_add(declaration.name.len())
+                    .saturating_add(declaration.table.len())
+                    .saturating_add(declaration.on_events.len().saturating_mul(8))
+            })
     }
 
     pub(super) fn local_schema_pending_baseline_bytes(&self) -> usize {
@@ -287,35 +376,29 @@ impl Database {
             .saturating_add(4096)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn local_schema_original_baseline_bytes(&self) -> Result<usize> {
-        let base = self.local_schema_pending_baseline_bytes();
-        if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
-            base.checked_add(
-                self.received_event_bus_projection_bytes()?
-                    .checked_mul(3)
-                    .ok_or_else(EngineMetadataJournal::identity_error)?,
-            )
-            .ok_or_else(EngineMetadataJournal::identity_error)
-        } else {
-            Ok(base)
-        }
-    }
-
+    /// Admit a new stage's baseline once (H plus the image payload credit),
+    /// then build its private image on the live accountant, paying the
+    /// image's payload out of that credit.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn new_pending_local_schema_stage(&self) -> Result<PendingLocalSchemaStage> {
-        let temporary_memory = TemporaryMemoryReservation::reserve_for_database(
+        let hold = self.local_schema_stage_hold_bytes()?;
+        let baseline = hold
+            .checked_add(self.local_schema_stage_payload_credit_bytes())
+            .ok_or_else(EngineMetadataJournal::identity_error)?;
+        let mut temporary_memory = TemporaryMemoryReservation::reserve_for_database(
             self,
-            self.local_schema_original_baseline_bytes()?,
+            baseline,
             "stage_transactional_schema",
         )?;
-        let working = self.detached_local_schema_working_database()?;
+        let mut ledger = LocalSchemaStageLedger {
+            hold,
+            ..LocalSchemaStageLedger::default()
+        };
+        let working =
+            self.detached_local_schema_working_database(&mut temporary_memory, &mut ledger)?;
         let base_event_bus = self.received_event_bus_projection();
         working.seed_received_event_bus_projection(base_event_bus.clone());
         *working.trigger.declarations.lock() = self.trigger.declarations.lock().clone();
@@ -327,7 +410,130 @@ impl Database {
             working,
             base_tables: self.relational_store.table_meta.read().clone(),
             temporary_memory,
+            ledger,
         })
+    }
+
+    /// The transaction an SQL `BEGIN` opened on this handle, if one is open.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn session_transaction_for_test(&self) -> Option<TxId> {
+        *self.session_tx.lock()
+    }
+
+    /// The reservation one staged DDL statement admits on the live database.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    /// The reservation `sql` would admit as the next statement of `tx`'s
+    /// pending stage. With no stage pending, a target table is read from the
+    /// live metadata, as the new stage's image will clone it.
+    pub fn staged_statement_reservation_bytes_for_test(&self, tx: TxId, sql: &str) -> usize {
+        let statement = contextdb_parser::parse(sql).expect("a parseable staged statement");
+        let stages = self.pending_local_schema_stages.lock();
+        let working = stages.get(&tx).map(|pending| &pending.working);
+        Self::staged_statement_reservation_bytes(&statement, sql, |table| match working {
+            Some(working) => Self::local_schema_image_table_bytes(working, table),
+            None => self
+                .relational_store
+                .table_meta
+                .read()
+                .get(table)
+                .map_or(0, |meta| meta.estimated_bytes()),
+        })
+    }
+
+    /// The ledger of `tx`'s pending local schema stage, if one is pending.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn local_schema_stage_ledger_for_test(
+        &self,
+        tx: TxId,
+    ) -> Option<LocalSchemaStageLedgerForTest> {
+        let stages = self.pending_local_schema_stages.lock();
+        let pending = stages.get(&tx)?;
+        Some(LocalSchemaStageLedgerForTest {
+            hold: pending.ledger.hold,
+            credit: pending
+                .temporary_memory
+                .spendable_bytes()
+                .saturating_sub(pending.ledger.hold),
+            payload: pending.ledger.spend.payload,
+            draws: pending.ledger.spend.draws,
+            restores: pending.ledger.spend.restores,
+            controls_used: pending.ledger.controls_used,
+            controls_residue: pending.ledger.controls_residue,
+            stage_slot: pending.ledger.slot_used,
+            stage_slot_residue: pending.ledger.slot_residue,
+            image_accountant: pending.working.finalization.accountant.as_ptr() as usize,
+            live_accountant: self.finalization.accountant.as_ptr() as usize,
+            image_writer_identity: pending
+                .working
+                .finalization
+                .accountant
+                .writer_identity_for_test(),
+            live_writer_identity: self.finalization.accountant.writer_identity_for_test(),
+        })
+    }
+
+    /// The reservation one staged statement admits on the live database: the
+    /// statement's transient envelope, plus the index storage its private
+    /// image retains, plus the image's widest point while it rewrites an
+    /// existing table. Every single-column automatic index a CREATE TABLE or
+    /// an ALTER ADD COLUMN can declare carries an exact-probe filter
+    /// (`TableMeta::estimated_bytes`), which the image holds until it drops.
+    /// An ALTER TABLE or CREATE INDEX prepares the target table's metadata
+    /// swap (`PreparedMemorySwap`) and admits the replacement before it
+    /// releases the old, on top of the schema copy it validates against, so
+    /// for that moment the image spends up to twice the target's current
+    /// `estimated_bytes` beyond what it holds; `target_bytes` answers that
+    /// figure from the stage's own image.
+    pub(super) fn staged_statement_reservation_bytes(
+        stmt: &Statement,
+        sql: &str,
+        target_bytes: impl Fn(&str) -> usize,
+    ) -> usize {
+        // An upper bound on the automatic indexes the statement can add, by
+        // the rule `visit_auto_indexes` derives them: each primary-key,
+        // unique or foreign-key column, each table-level unique constraint
+        // and a table-level primary key.
+        let column_indexes = |column: &contextdb_parser::ast::ColumnDef| {
+            usize::from(column.primary_key || column.unique)
+                .saturating_add(usize::from(column.references.is_some()))
+        };
+        let exact_indexes = match stmt {
+            Statement::CreateTable(create) => create
+                .columns
+                .iter()
+                .map(column_indexes)
+                .sum::<usize>()
+                .saturating_add(create.unique_constraints.len())
+                .saturating_add(usize::from(!create.primary_key_columns.is_empty())),
+            Statement::AlterTable(alter) => match &alter.action {
+                AlterAction::AddColumn(column) => column_indexes(column),
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let rewritten = match stmt {
+            Statement::AlterTable(alter) => target_bytes(&alter.table).saturating_mul(2),
+            Statement::CreateIndex(index) => target_bytes(&index.table).saturating_mul(2),
+            _ => 0,
+        };
+        Self::staged_table_ddl_temporary_bytes(sql)
+            .saturating_add(exact_indexes.saturating_mul(contextdb_core::EXACT_PROBE_FILTER_BYTES))
+            .saturating_add(rewritten)
+    }
+
+    /// The bytes the stage's private image holds for `table`'s metadata.
+    fn local_schema_image_table_bytes(working: &Database, table: &str) -> usize {
+        working
+            .relational_store
+            .table_meta
+            .read()
+            .get(table)
+            .map_or(0, |meta| {
+                retained_table_metadata_bytes(&working.relational_store, meta)
+            })
     }
 
     pub(super) fn staged_table_ddl_temporary_bytes(sql: &str) -> usize {
@@ -414,6 +620,7 @@ impl Database {
             Statement::DropTrigger { .. } => self.require_admin_trigger_ddl("DROP TRIGGER")?,
             _ => {}
         }
+        self.ensure_local_schema_stage_not_discarded(tx)?;
         let detached = schema_stage_registry::PendingToken::detach_existing(
             &self.pending_local_schema_stages,
             tx,
@@ -427,16 +634,43 @@ impl Database {
                     "mixed DML and transactional local schema DDL is not supported; commit or roll back before changing schema"
                         .to_string()).into()));
         }
+        #[cfg(any(test, feature = "test-seams"))]
+        let slot_before = (
+            self.finalization.accountant.usage().used,
+            crate::memory_accounting::process_aggregate_bytes_for_test(),
+        );
         let token = match token {
             Some(token) => token,
             None => {
                 schema_stage_registry::PendingToken::reserve(&self.pending_local_schema_stages, tx)?
             }
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        let slot = (
+            self.finalization
+                .accountant
+                .usage()
+                .used
+                .saturating_sub(slot_before.0),
+            crate::memory_accounting::process_aggregate_bytes_for_test()
+                .saturating_sub(slot_before.1),
+        );
         let had_pending = existing.is_some();
         let mut pending = match existing {
             Some(pending) => pending,
-            None => self.new_pending_local_schema_stage()?,
+            None => {
+                let pending = self.new_pending_local_schema_stage()?;
+                #[cfg(any(test, feature = "test-seams"))]
+                let pending = PendingLocalSchemaStage {
+                    ledger: LocalSchemaStageLedger {
+                        slot_used: slot.0,
+                        slot_residue: slot.1.saturating_sub(slot.0),
+                        ..pending.ledger
+                    },
+                    ..pending
+                };
+                pending
+            }
         };
         let change = match pending.working.ddl_change_for_statement(stmt, None) {
             Some(change) => Ok(change),
@@ -467,9 +701,15 @@ impl Database {
             }
             return Err(error);
         }
+        // 1. Admit the statement's reservation on the live database.
+        let statement_bytes = Self::staged_statement_reservation_bytes(stmt, sql, |table| {
+            Self::local_schema_image_table_bytes(&pending.working, table)
+        });
+        #[cfg(test)]
+        let statement_bytes = local_schema_test_seams::statement_reservation_bytes(statement_bytes);
         let statement_memory = match TemporaryMemoryReservation::reserve_for_database(
             self,
-            Self::staged_table_ddl_temporary_bytes(sql),
+            statement_bytes,
             "grow_transactional_schema_stage",
         ) {
             Ok(reservation) => reservation,
@@ -480,40 +720,143 @@ impl Database {
                 return Err(error);
             }
         };
-        if let Err(error) = self.plugin.on_ddl(&change) {
+        // Absorbability is checked before anything runs, so a mismatch
+        // refuses here rather than after the image has spent the credit.
+        if let Err(error) = pending.temporary_memory.check_absorbable(&statement_memory) {
+            drop(statement_memory);
             if had_pending {
                 token.publish(pending);
             }
             return Err(error);
         }
-        let result = pending.working.execute_owned_with_read_memory(
-            sql,
-            &HashMap::new(),
-            read_memory.clone(),
-        );
-        match result {
-            Ok(result) => {
-                if let Err(error) = pending.temporary_memory.absorb(statement_memory) {
-                    if had_pending {
-                        token.publish(pending);
-                    }
+        // 2. A plugin refusal spends nothing; the stage is republished as it was.
+        if let Err(error) = self.plugin.on_ddl(&change) {
+            drop(statement_memory);
+            if had_pending {
+                token.publish(pending);
+            }
+            return Err(error);
+        }
+        // 3. Run the statement on the private image inside a spend scope on
+        // this statement's reservation only. The guard owns the stage and the
+        // reservation from here: an unwind discards the whole stage, image
+        // first, then the statement reservation, then the stage reservation.
+        let payload_before = pending.ledger.spend.payload;
+        let mut guard = LocalSchemaStatementGuard {
+            database: self,
+            tx,
+            pending: Some(pending),
+            statement_memory: Some(statement_memory),
+        };
+        let execution = {
+            let LocalSchemaStatementGuard {
+                pending,
+                statement_memory,
+                ..
+            } = &mut guard;
+            let pending = pending.as_mut().expect("guard holds the stage");
+            let statement_memory = statement_memory
+                .as_mut()
+                .expect("guard holds the statement reservation");
+            match statement_memory.enter_spend_scope(0, &mut pending.ledger.spend) {
+                Ok(scope) => {
+                    #[cfg(test)]
+                    local_schema_test_seams::run_scope_probe(
+                        &pending.working.finalization.accountant,
+                        &scope,
+                    );
+                    // The answer is not image payload: its carrier charges
+                    // drop here, inside the scope, and an equal carrier is
+                    // rebuilt outside it, so no stage-funded byte outlives
+                    // the scope.
+                    let result = pending
+                        .working
+                        .execute_owned_with_read_memory(sql, &HashMap::new(), read_memory.clone())
+                        .map(detach_staged_answer);
+                    #[cfg(test)]
+                    let result = match result {
+                        Ok(result) => local_schema_test_seams::after_execute_before_absorb()
+                            .map(|()| (result, true))
+                            .map_err(|error| (error, true)),
+                        Err(error) => Err((error, false)),
+                    };
+                    #[cfg(not(test))]
+                    let result = result
+                        .map(|result| (result, true))
+                        .map_err(|error| (error, false));
+                    drop(scope);
+                    result
+                }
+                Err(error) => Err((error, false)),
+            }
+        };
+        let (pending, statement_memory) = guard.disarm();
+        match execution {
+            // 4. Execution failed: the scope has ended, the statement
+            // reservation releases its unspent credit, and the image keeps no
+            // new payload. The stage is republished.
+            Err((error, false)) => {
+                drop(statement_memory);
+                if pending.ledger.spend.payload != payload_before {
+                    // A refused statement left payload in the image: the image
+                    // no longer matches its funding, so it is discarded.
+                    self.discard_local_schema_stage(tx, pending, None);
                     return Err(error);
                 }
-                self.tx_mgr.update_flags(tx, |flags| {
-                    flags.requires_commit_lsn = true;
-                })?;
-                token.publish(pending);
-                Ok(result)
-            }
-            Err(error) => {
-                // A failed second statement must not erase earlier valid DDL
-                // from the still-open transaction.
                 if had_pending {
                     token.publish(pending);
                 }
                 Err(error)
             }
+            // 6. A failure after a successful execution discards the whole
+            // stage; the transaction must roll back.
+            Err((error, true)) => {
+                self.discard_local_schema_stage(tx, pending, Some(statement_memory));
+                Err(error)
+            }
+            // 5. Success: only now does the stage own the statement's credit.
+            Ok(((data, owner), _)) => {
+                let result = OwnedQueryResult {
+                    result: data,
+                    answer_charge: Default::default(),
+                    vector_copy_charge: Default::default(),
+                    retained_read_memory: owner,
+                };
+                let mut pending = pending;
+                if let Err(error) = pending.temporary_memory.absorb(statement_memory) {
+                    self.discard_local_schema_stage(tx, pending, None);
+                    return Err(error);
+                }
+                if let Err(error) = self.tx_mgr.update_flags(tx, |flags| {
+                    flags.requires_commit_lsn = true;
+                }) {
+                    self.discard_local_schema_stage(tx, pending, None);
+                    return Err(error);
+                }
+                token.publish(pending);
+                Ok(result)
+            }
         }
+    }
+
+    /// Discard a pending local schema stage after a failure past execution:
+    /// the image drops first, then the statement reservation, then the stage
+    /// reservation. The transaction is marked so only ROLLBACK may follow.
+    fn discard_local_schema_stage(
+        &self,
+        tx: TxId,
+        pending: PendingLocalSchemaStage,
+        statement_memory: Option<TemporaryMemoryReservation>,
+    ) {
+        let PendingLocalSchemaStage {
+            working,
+            temporary_memory,
+            ..
+        } = pending;
+        drop(working);
+        drop(statement_memory);
+        drop(temporary_memory);
+        self.mark_local_schema_stage_discarded(tx);
     }
 
     pub fn snapshot(&self) -> SnapshotId {
@@ -3449,6 +3792,7 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+        self.ensure_local_schema_stage_not_discarded(tx)?;
         let Some(pending) = self.pending_local_schema_stages.lock().remove(&tx) else {
             return Ok(None);
         };
@@ -4044,5 +4388,197 @@ impl Database {
             &self.local_schema_stages,
             lsn,
         )))
+    }
+}
+
+/// Split a staged statement's answer from the charges that fund its carrier.
+/// The charges drop with the returned tuple's caller scope; the data and the
+/// owner that publishes it survive. A staged DDL answer carries no rows.
+fn detach_staged_answer(
+    answer: OwnedQueryResult,
+) -> (
+    QueryResultData,
+    Option<contextdb_core::read_memory::ReadMemoryOwner>,
+) {
+    let OwnedQueryResult {
+        result,
+        answer_charge,
+        vector_copy_charge,
+        retained_read_memory,
+    } = answer;
+    let owner = retained_read_memory
+        .or_else(|| answer_charge.owner())
+        .or_else(|| vector_copy_charge.owner());
+    drop(answer_charge);
+    drop(vector_copy_charge);
+    (result, owner)
+}
+
+/// Owns a pending local schema stage and its statement reservation while the
+/// statement runs on the private image. Dropped while still armed (an unwind
+/// from inside the statement), it discards the whole stage in the order the
+/// accounting needs: the image, then the statement reservation, then the
+/// stage reservation, and marks the transaction for ROLLBACK.
+struct LocalSchemaStatementGuard<'d> {
+    database: &'d Database,
+    tx: TxId,
+    pending: Option<PendingLocalSchemaStage>,
+    statement_memory: Option<TemporaryMemoryReservation>,
+}
+
+impl LocalSchemaStatementGuard<'_> {
+    fn disarm(mut self) -> (PendingLocalSchemaStage, TemporaryMemoryReservation) {
+        (
+            self.pending.take().expect("guard holds the stage"),
+            self.statement_memory
+                .take()
+                .expect("guard holds the statement reservation"),
+        )
+    }
+}
+
+impl Drop for LocalSchemaStatementGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.database.discard_local_schema_stage(
+                self.tx,
+                pending,
+                self.statement_memory.take(),
+            );
+        }
+    }
+}
+
+/// The typed refusal for a statement after the transaction's local schema
+/// stage was discarded.
+pub(super) fn local_schema_stage_requires_rollback() -> Error {
+    Error::Other(
+        "this transaction's schema stage was discarded after a failed statement; ROLLBACK is required"
+            .into(),
+    )
+}
+
+/// Unit-test fault points and probes for the local schema stage's
+/// accounting tests. Each is armed by a test and fires once.
+#[cfg(test)]
+pub(super) mod local_schema_test_seams {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LocalSchemaFaultKind {
+        Error,
+        Unwind,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LocalSchemaStatementFault {
+        AfterExecuteBeforeAbsorb(LocalSchemaFaultKind),
+    }
+
+    type ScopeProbeFn = Box<dyn FnOnce(&ScopeProbe<'_, '_>) + Send>;
+
+    static STATEMENT_FAULT: std::sync::Mutex<Option<LocalSchemaStatementFault>> =
+        std::sync::Mutex::new(None);
+    static PREPARATION_FAULT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static SCOPE_PROBE: std::sync::Mutex<Option<ScopeProbeFn>> = std::sync::Mutex::new(None);
+
+    /// What a probe sees from inside a real statement's spend scope.
+    pub(crate) struct ScopeProbe<'a, 's> {
+        accountant: &'a crate::memory_accounting::AccountantHandle,
+        scope: &'a crate::memory_accounting::ReservationSpendScope<'s>,
+    }
+
+    impl ScopeProbe<'_, '_> {
+        pub(crate) fn remaining_credit(&self) -> usize {
+            self.scope.remaining_credit()
+        }
+        pub(crate) fn ledger(&self) -> crate::memory_accounting::ReservationSpendLedger {
+            self.scope.ledger()
+        }
+        pub(crate) fn try_allocate(&self, bytes: usize) -> Result<()> {
+            self.accountant.try_allocate(bytes)
+        }
+        pub(crate) fn release(&self, bytes: usize) {
+            self.accountant.release(bytes);
+        }
+        pub(crate) fn charge_retained(&self, bytes: usize) {
+            self.accountant.charge_retained(bytes);
+        }
+        pub(crate) fn used(&self) -> usize {
+            self.accountant.usage().used
+        }
+        /// Start the accountant's high-water mark again from `used` now.
+        pub(crate) fn reset_high_water(&self) {
+            self.accountant.reset_high_water_for_test();
+        }
+        pub(crate) fn retained_charges(&self) -> usize {
+            self.accountant.retained_charge_bytes_for_test()
+        }
+        pub(crate) fn admitted(&self) -> usize {
+            self.accountant.admitted_bytes_for_test()
+        }
+    }
+
+    static STATEMENT_RESERVATION: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+    /// The next staged statement reserves exactly `bytes` instead of its
+    /// ordinary estimate.
+    pub(crate) fn override_next_statement_reservation(bytes: usize) {
+        *STATEMENT_RESERVATION.lock().expect("reservation lock") = Some(bytes);
+    }
+
+    pub(super) fn statement_reservation_bytes(ordinary: usize) -> usize {
+        STATEMENT_RESERVATION
+            .lock()
+            .expect("reservation lock")
+            .take()
+            .unwrap_or(ordinary)
+    }
+
+    pub(crate) fn arm_statement_fault(fault: LocalSchemaStatementFault) {
+        *STATEMENT_FAULT.lock().expect("fault lock") = Some(fault);
+    }
+
+    pub(crate) fn arm_preparation_fault() {
+        PREPARATION_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn arm_scope_probe(probe: impl FnOnce(&ScopeProbe<'_, '_>) + Send + 'static) {
+        *SCOPE_PROBE.lock().expect("probe lock") = Some(Box::new(probe));
+    }
+
+    pub(super) fn run_scope_probe(
+        accountant: &crate::memory_accounting::AccountantHandle,
+        scope: &crate::memory_accounting::ReservationSpendScope<'_>,
+    ) {
+        let probe = SCOPE_PROBE.lock().expect("probe lock").take();
+        if let Some(probe) = probe {
+            probe(&ScopeProbe { accountant, scope });
+        }
+    }
+
+    pub(super) fn after_execute_before_absorb() -> Result<()> {
+        let fault = STATEMENT_FAULT.lock().expect("fault lock").take();
+        match fault {
+            Some(LocalSchemaStatementFault::AfterExecuteBeforeAbsorb(
+                LocalSchemaFaultKind::Error,
+            )) => Err(Error::Other(
+                "injected local schema statement fault after execution".into(),
+            )),
+            Some(LocalSchemaStatementFault::AfterExecuteBeforeAbsorb(
+                LocalSchemaFaultKind::Unwind,
+            )) => panic!("injected local schema statement unwind after execution"),
+            None => Ok(()),
+        }
+    }
+
+    pub(in crate::database) fn preparation_fault() -> Result<()> {
+        if PREPARATION_FAULT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Other(
+                "injected local schema preparation fault after controls and fold".into(),
+            ));
+        }
+        Ok(())
     }
 }

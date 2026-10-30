@@ -2075,7 +2075,43 @@ impl CompositeStore {
             read_memory,
         )?;
         drop(live_table_meta);
-        self.apply_exact_with_log_entries(ws, log_entries, partition_mutations)
+        // Inside a reservation spend scope (a private local schema image), the
+        // retention this commit makes unavoidable is pre-admitted here, at a
+        // fallible point, out of the stage credit; the apply consumes it in
+        // place of its infallible charge.
+        let preadmitted = crate::memory_accounting::PreadmittedRetention::admit_if_scoped(
+            &self.accountant,
+            self.commit_retained_bytes(&log_entries),
+        )?;
+        self.apply_exact_with_log_entries(ws, log_entries, partition_mutations, preadmitted)
+    }
+
+    /// What one commit's apply retains: the change-log entries and their side
+    /// indexes plus the commit-index entry, or only the private paged worker's
+    /// commit-index entry when bodies live on disk.
+    pub(crate) fn commit_retained_bytes(&self, log_entries: &[ChangeLogEntry]) -> usize {
+        if self.relational.uses_disk_backed_committed_bodies() {
+            if self.private_working_graph {
+                COMMIT_INDEX_ENTRY_BYTES
+            } else {
+                0
+            }
+        } else {
+            change_log_retained_bytes(log_entries).saturating_add(COMMIT_INDEX_ENTRY_BYTES)
+        }
+    }
+
+    /// Charge one commit's retention: consume its pre-admission when a spend
+    /// scope funded it, otherwise take the ordinary infallible charge.
+    fn retain_commit_bytes(
+        &self,
+        bytes: usize,
+        preadmitted: Option<crate::memory_accounting::PreadmittedRetention<'_>>,
+    ) {
+        match preadmitted {
+            Some(preadmitted) => preadmitted.consume(bytes),
+            None => self.accountant.charge_retained(bytes),
+        }
     }
 
     pub(crate) fn with_private_working_graph(mut self) -> Self {
@@ -2092,6 +2128,7 @@ impl CompositeStore {
         ws: &WriteSet,
         log_entries: Vec<ChangeLogEntry>,
         partition_mutations: PreparedVectorPartitionMutationBatch,
+        preadmitted: Option<crate::memory_accounting::PreadmittedRetention<'_>>,
     ) -> Result<()> {
         let working_graph = if self.private_working_graph {
             Some(crate::persistence::received_working_source::WorkingReadSource::current_for_relational(self.relational.as_ref())?
@@ -2188,7 +2225,9 @@ impl CompositeStore {
             // directory. Its manager retains this entry even though row/log
             // bodies use the working source, so fund the entry until close.
             if self.private_working_graph {
-                self.accountant.charge_retained(COMMIT_INDEX_ENTRY_BYTES);
+                self.retain_commit_bytes(COMMIT_INDEX_ENTRY_BYTES, preadmitted);
+            } else {
+                self.retain_commit_bytes(0, preadmitted);
             }
             return Ok(());
         }
@@ -2197,14 +2236,10 @@ impl CompositeStore {
         // the moment this apply returns. Both exist once the commit is
         // durable, so the charge cannot refuse here -- the typed refusal
         // fires on the next admission, which is what a declared limit is for.
-        self.accountant
-            .charge_retained(change_log_retained_bytes(&log_entries).saturating_add(
-                if self.relational.uses_disk_backed_committed_bodies() {
-                    0
-                } else {
-                    COMMIT_INDEX_ENTRY_BYTES
-                },
-            ));
+        self.retain_commit_bytes(
+            change_log_retained_bytes(&log_entries).saturating_add(COMMIT_INDEX_ENTRY_BYTES),
+            preadmitted,
+        );
         record_change_log_entries(
             &mut self.change_log_table_index.write(),
             &mut self.change_log_lsn_refcounts.write(),
@@ -2676,6 +2711,12 @@ impl CompositeStore {
         ws: &WriteSet,
         mut prepared: OwnedPreparedMemoryApply,
     ) -> Result<()> {
+        // Pre-admit, before the first publication below, the retention this
+        // apply makes unavoidable when a spend scope funds it.
+        let preadmitted = crate::memory_accounting::PreadmittedRetention::admit_if_scoped(
+            &self.accountant,
+            self.commit_retained_bytes(&prepared.log_entries),
+        )?;
         crate::database::discard::publish_original_discard_for_apply(ws);
         let partition_mutations = prepared
             .partition_mutations
@@ -2749,7 +2790,9 @@ impl CompositeStore {
             // directory. Its manager retains this entry even though row/log
             // bodies use the working source, so fund the entry until close.
             if self.private_working_graph {
-                self.accountant.charge_retained(COMMIT_INDEX_ENTRY_BYTES);
+                self.retain_commit_bytes(COMMIT_INDEX_ENTRY_BYTES, preadmitted);
+            } else {
+                self.retain_commit_bytes(0, preadmitted);
             }
             return Ok(());
         }
@@ -2758,14 +2801,10 @@ impl CompositeStore {
         // the moment this apply returns. Both exist once the commit is
         // durable, so the charge cannot refuse here -- the typed refusal
         // fires on the next admission, which is what a declared limit is for.
-        self.accountant.charge_retained(
-            change_log_retained_bytes(&prepared.log_entries).saturating_add(
-                if self.relational.uses_disk_backed_committed_bodies() {
-                    0
-                } else {
-                    COMMIT_INDEX_ENTRY_BYTES
-                },
-            ),
+        self.retain_commit_bytes(
+            change_log_retained_bytes(&prepared.log_entries)
+                .saturating_add(COMMIT_INDEX_ENTRY_BYTES),
+            preadmitted,
         );
         record_change_log_entries(
             &mut self.change_log_table_index.write(),

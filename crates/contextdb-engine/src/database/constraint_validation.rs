@@ -1478,6 +1478,7 @@ impl Database {
                 delivery_registrations: Vec::new(),
                 lineage_generations: entry.lineage_generations.clone(),
                 row_graph_undo: entry.row_graph_undo.clone(),
+                local_schema_stage_discarded: entry.local_schema_stage_discarded,
             }
         };
         let published = self.tx_mgr.capture_published_read();

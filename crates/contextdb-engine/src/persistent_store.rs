@@ -286,7 +286,7 @@ impl PersistentCompositeStore {
             crate::writer_commit_test_seams::CommitBoundary::BeforeMemoryPublication,
         );
         self.inner
-            .apply_exact_with_log_entries(ws, log_entries, partition_mutations)
+            .apply_exact_with_log_entries(ws, log_entries, partition_mutations, None)
     }
 
     /// Retain admitted current bodies only for row/vector identities this commit

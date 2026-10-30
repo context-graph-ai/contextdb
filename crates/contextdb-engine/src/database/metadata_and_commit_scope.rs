@@ -1467,6 +1467,13 @@ impl DatabaseCommitScope<'_, '_, '_> {
         existing: impl Fn(Error) -> E,
     ) -> std::result::Result<ReceivedSchemaStage, E> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        // A receiver without a durable store has no live write to lend its
+        // private image. Refuse before any host validation or working write.
+        if database.persistence.is_none() {
+            return Err(existing(
+                super::received_schema_apply::received_schema_requires_durable_receiver(),
+            ));
+        }
 
         database
             .validate_owned_received_event_host(events, self.host)
@@ -1481,25 +1488,24 @@ impl DatabaseCommitScope<'_, '_, '_> {
         events
             .with_owned_persistence_original(|original| {
                 Ok((|| {
-                    // Memory hosts lend the same authentic original without inventing
-                    // a persistence writer. File hosts additionally retain their one
-                    // unpublished working write through the prepared stage.
-                    let mut working = database
-                        .persistence
-                        .as_ref()
-                        .map(|persistence| begin(persistence, original))
-                        .transpose()?;
-                    if let Some(write) = working.as_mut() {
-                        write.retain_original_owner(events).map_err(&existing)?;
-                    }
-                    let loan = working.as_ref().zip(database.persistence.as_ref()).map(
-                        |(write, store)| ReceivedWorkingPreparation {
-                            write,
-                            original,
-                            funder: &self.host.funder,
-                            store,
-                        },
-                    );
+                    // The private image keeps its rows in one unpublished write
+                    // on the live store, retained through the prepared stage. A
+                    // receiver without a durable store is refused before any
+                    // working write begins.
+                    let Some(store) = database.persistence.as_ref() else {
+                        return Err(existing(
+                            super::received_schema_apply::received_schema_requires_durable_receiver(
+                            ),
+                        ));
+                    };
+                    let mut write = begin(store, original)?;
+                    write.retain_original_owner(events).map_err(&existing)?;
+                    let loan = ReceivedWorkingPreparation {
+                        write: &write,
+                        original,
+                        funder: &self.host.funder,
+                        store,
+                    };
                     let mut stage = database
                         .prepare_received_schema_stage_with_interval(
                             local_lsn,
@@ -1512,7 +1518,7 @@ impl DatabaseCommitScope<'_, '_, '_> {
                             vector_copy_owner,
                             read_memory,
                             Some(original),
-                            loan.as_ref(),
+                            &loan,
                         )
                         .map_err(&existing)?;
                     if !stage.trigger_audits.is_empty() {
@@ -1525,7 +1531,7 @@ impl DatabaseCommitScope<'_, '_, '_> {
                                 .map_err(&existing)?,
                         );
                     }
-                    *stage.durable_projection.working_write.get_mut() = working;
+                    *stage.durable_projection.working_write.get_mut() = Some(write);
                     Ok(stage)
                 })())
             })

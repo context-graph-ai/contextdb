@@ -1095,14 +1095,30 @@ impl Database {
     /// Clone only declarations needed to validate locally authored CREATE /
     /// ALTER ADD / trigger DDL. Row, edge, and vector payloads remain solely
     /// in the live database and are never duplicated by a long-lived BEGIN.
+    ///
+    /// The image runs on the live database's own accountant: the Legacy host
+    /// keeps the live writer registration through `from_handle`, the owned
+    /// host keeps its Original. Its construction controls are admitted by the
+    /// ordinary allocator; its payload is paid out of `reservation`'s credit
+    /// above the stage hold, inside a spend scope, and admitted before it is
+    /// allocated.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn detached_local_schema_working_database(&self) -> Result<Database> {
+    pub(super) fn detached_local_schema_working_database(
+        &self,
+        reservation: &mut TemporaryMemoryReservation,
+        ledger: &mut LocalSchemaStageLedger,
+    ) -> Result<Database> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let controls_before = (
+            self.finalization.accountant.usage().used,
+            crate::memory_accounting::process_aggregate_bytes_for_test(),
+        );
         let working = if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             self.with_preparation_original(|original| {
-                Database::open_memory_internal_with_working_graph(
+                Database::open_private_working_image(
                     Arc::new(CorePlugin),
                     WriterBudget::from_original(original)?,
                     self.declared_read_memory.clone(),
@@ -1113,11 +1129,13 @@ impl Database {
             })?
         } else {
             // A private image, not a database a caller opened: it is built
-            // directly rather than through `:memory:`, which names a durable
-            // scratch database of its own.
-            Database::open_memory_internal_with_working_graph(
+            // directly on the live writer, never through `:memory:`, which
+            // names a durable scratch database of its own.
+            Database::open_private_working_image(
                 Arc::new(CorePlugin),
-                MemoryAccountant::writer_no_limit()?,
+                WriterBudget::from_handle(crate::memory_accounting::AccountantHandle::clone(
+                    &self.finalization.accountant,
+                ))?,
                 crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                     OwnerReadConfig::default().limits.limits.memory,
                 )?,
@@ -1126,6 +1144,19 @@ impl Database {
                 None,
             )?
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            let used = self
+                .finalization
+                .accountant
+                .usage()
+                .used
+                .saturating_sub(controls_before.0);
+            let aggregate = crate::memory_accounting::process_aggregate_bytes_for_test()
+                .saturating_sub(controls_before.1);
+            ledger.controls_used = used;
+            ledger.controls_residue = aggregate.saturating_sub(used);
+        }
         working
             .finalization
             .local_policy_metadata_enabled
@@ -1134,6 +1165,28 @@ impl Database {
         working
             .maintenance_caller_driven
             .store(true, Ordering::SeqCst);
+        let hold = ledger.hold;
+        let scope = reservation.enter_spend_scope(hold, &mut ledger.spend)?;
+        // The image's retained-state owner returns its metadata fold when it
+        // drops. Admit exactly that fold out of the stage credit before the
+        // clone exists, so a short credit refuses before anything is copied.
+        let metadata_bytes =
+            self.relational_store
+                .table_meta
+                .read()
+                .values()
+                .fold(0usize, |bytes, meta| {
+                    bytes.saturating_add(retained_table_metadata_bytes(
+                        &working.relational_store,
+                        meta,
+                    ))
+                });
+        working.finalization.accountant.try_allocate_for(
+            metadata_bytes,
+            crate::memory_accounting::RESERVATION_SPEND_SUBSYSTEM,
+            crate::memory_accounting::RESERVATION_SPEND_OPERATION,
+            "Reduce the schema transaction size or raise MEMORY_LIMIT before retrying.",
+        )?;
         let metadata = self.relational_store.table_meta.read().clone();
         let read_memory = working.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -1155,10 +1208,9 @@ impl Database {
                 }
             }
         }
-        // The working image's retained-state owner returns the metadata fold
-        // when it drops; charge exactly that fold now, so the drop refunds a
-        // charge this image actually holds.
-        let metadata_bytes =
+        // The admitted fold must be exactly what the image now holds, or its
+        // drop would refund a different figure than the stage paid.
+        let held_bytes =
             working
                 .relational_store
                 .table_meta
@@ -1170,13 +1222,13 @@ impl Database {
                         meta,
                     ))
                 });
-        working
-            .finalization
-            .accountant
-            .charge_retained(metadata_bytes);
-        // Registration is fallible, so the working image must own its metadata
-        // charge before a refusal can drop it. Register declarations only;
-        // row/vector payloads stay live until bounded commit preparation.
+        if held_bytes != metadata_bytes {
+            return Err(Error::Other(
+                "private schema image holds a different metadata fold than it admitted".into(),
+            ));
+        }
+        // Register declarations only; row/vector payloads stay live until
+        // bounded commit preparation.
         for (table, meta) in metadata {
             for column in &meta.columns {
                 working.register_vector_index_for_column(
@@ -1187,6 +1239,12 @@ impl Database {
                 )?;
             }
         }
+        #[cfg(test)]
+        super::statement_execution::local_schema_test_seams::preparation_fault()?;
+        // Every helper that admitted out of the scope returns inside it.
+        drop(vector_copy_owner);
+        drop(read_memory);
+        drop(scope);
         Ok(working)
     }
 
@@ -1245,13 +1303,10 @@ impl Database {
         projected_tables: &HashMap<String, TableMeta>,
         affected_tables: &HashSet<String>,
         affected_graph_edge_types: &HashSet<String>,
-        copy_vectors: bool,
         copy_side_metadata: bool,
         terminal_context: Option<&TerminalRefusalPullContext>,
         receipt: Option<&SyncApplyReceipt>,
         push_outcome_key: Option<&SyncPushOutcomeContext>,
-        renamed_vector_sources: &HashSet<contextdb_core::VectorIndexRef>,
-        replaced_vector_refs: &HashSet<contextdb_core::VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         inspect: impl FnOnce(&MetadataCopyCharges, &Database) -> Result<R>,
@@ -1280,20 +1335,14 @@ impl Database {
                 .detached_received_schema_working_database_with_sources(
                     projected_tables,
                     self.tx_mgr.peek_next_tx(),
-                    false,
-                    true,
-                    Some(original),
-                    Some(FundedWorkingGraphSource::prepare(owner.funder())?),
-                    Some(catalog),
+                    original,
+                    FundedWorkingGraphSource::prepare(owner.funder())?,
+                    catalog,
                     affected_tables,
-                    affected_graph_edge_types,
-                    copy_vectors,
                     copy_side_metadata,
                     terminal_context,
                     receipt,
                     push_outcome_key,
-                    renamed_vector_sources,
-                    replaced_vector_refs,
                     vector_copy_owner,
                     read_memory.clone(),
                 )?;
@@ -1331,22 +1380,14 @@ impl Database {
         &self,
         projected_tables: &HashMap<String, TableMeta>,
         receiver_tx: TxId,
-        copy_initial_vector_shapes: bool,
-        paged_rows: bool,
-        original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
-        working_graph: Option<FundedWorkingGraphSource>,
-        working_vectors: Option<
-            crate::persistence::received_working_vector::WorkingVectorCatalogOwner,
-        >,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        working_graph: FundedWorkingGraphSource,
+        working_vectors: crate::persistence::received_working_vector::WorkingVectorCatalogOwner,
         affected_tables: &HashSet<String>,
-        affected_graph_edge_types: &HashSet<String>,
-        copy_vectors: bool,
         copy_side_metadata: bool,
         terminal_context: Option<&TerminalRefusalPullContext>,
         receipt: Option<&SyncApplyReceipt>,
         push_outcome_key: Option<&SyncPushOutcomeContext>,
-        renamed_vector_sources: &HashSet<contextdb_core::VectorIndexRef>,
-        replaced_vector_refs: &HashSet<contextdb_core::VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(MetadataCopyCharges, Database)> {
@@ -1369,38 +1410,27 @@ impl Database {
         // so every helper that installs a copy below has to admit exactly what
         // that fold will give back. Otherwise a refusal after copying
         // subtracts bytes from the live receiver's bill that nothing added.
-        // Declared before the detached image so every refusal drops the image
-        // before releasing its prepaid vector-copy charge.
-        let mut vector_copy_charge = None;
         let mut metadata_copy_charges = self.new_received_metadata_copy_charges()?;
         // Copied committed versions must be visible before the first private
         // commit. Fresh private transactions also need identities beyond all
         // copied versions so later interval restamping cannot confuse them.
-        let paged_vectors = working_vectors.is_some();
-        let working = Database::open_memory_internal_with_working_graph(
+        // Rows, edges and vectors stay in the live store's unpublished write;
+        // the image reads them through its working source.
+        let working = Database::open_private_working_image(
             Arc::new(CorePlugin),
-            match original {
-                Some(original) => WriterBudget::from_original(original)?,
-                None => {
-                    WriterBudget::from_handle(crate::memory_accounting::AccountantHandle::clone(
-                        &self.finalization.accountant,
-                    ))?
-                }
-            },
+            WriterBudget::from_original(original)?,
             self.declared_read_memory.clone(),
             Some((receiver_tx, self.tx_mgr.current_tx_max())),
-            working_graph,
-            working_vectors.clone(),
+            Some(working_graph),
+            Some(working_vectors),
         )?;
         // An unpublished schema image never owns a maintenance schedule.
         working
             .maintenance_caller_driven
             .store(true, Ordering::SeqCst);
-        if paged_rows {
-            working
-                .relational_store
-                .enable_disk_backed_committed_bodies();
-        }
+        working
+            .relational_store
+            .enable_disk_backed_committed_bodies();
         // This unpublished memory store retains tombstoned bodies until its
         // final projection is spooled. Move their existing release invoice
         // into that same standing owner rather than refunding live history.
@@ -1664,74 +1694,6 @@ impl Database {
                 Ok(())
             };
         prepare_metadata(true, &mut metadata_copy_charges)?;
-        let copied_vector_index = |index: &contextdb_core::VectorIndexRef| {
-            if copy_initial_vector_shapes {
-                affected_tables.contains(&index.table)
-            } else {
-                !replaced_vector_refs.contains(index)
-                    && (renamed_vector_sources.contains(index)
-                        || affected_tables.contains(&index.table)
-                            && projected_tables.get(&index.table).is_some_and(|meta| {
-                                meta.columns.iter().any(|column| {
-                                    column.name == index.column
-                                        && matches!(column.column_type, ColumnType::Vector(_))
-                                })
-                            }))
-            }
-        };
-        // Price the affected table/row image with the selected vector copy
-        // before allocating their bodies. Otherwise refusing that final vector
-        // copy has already allocated the relational image. The ordinary object
-        // charges below own the copy; this reservation checks their combined
-        // widest point before those objects exist.
-        if copy_vectors && !paged_vectors {
-            let mut image_bytes = self
-                .vector_store
-                .partitioned_copy_bytes_matching(copied_vector_index);
-            let metadata = self.relational_store.table_meta.read();
-            for table in affected_tables {
-                let Some(meta) = metadata.get(table) else {
-                    continue;
-                };
-                image_bytes = image_bytes
-                    .saturating_add(meta.estimated_bytes())
-                    .saturating_add(self.relational_store.table_index_structure_bytes(table).0);
-                if self.relational_store.uses_disk_backed_committed_bodies() {
-                    self.persistence
-                        .as_ref()
-                        .expect("disk-backed relational bodies require persistence")
-                        .visit_relational_table_with_admission(
-                            table,
-                            &self.finalization.accountant,
-                            |row| {
-                                if row.deleted_tx.is_none() {
-                                    image_bytes = image_bytes.saturating_add(
-                                        retained_row_bytes_with_optional_meta(
-                                            table,
-                                            &row,
-                                            Some(meta),
-                                        ),
-                                    );
-                                }
-                                Ok(())
-                            },
-                        )?;
-                } else if let Some(rows) = self.relational_store.tables.read().get(table) {
-                    for row in rows.iter().filter(|row| row.deleted_tx.is_none()) {
-                        image_bytes = image_bytes.saturating_add(
-                            retained_row_bytes_with_optional_meta(table, row, Some(meta)),
-                        );
-                    }
-                }
-            }
-            drop(StagedCopyCharge::admit_for_host(
-                &self.tx_mgr,
-                &self.finalization.accountant,
-                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-                image_bytes,
-                "stage_received_unit_vector_image",
-            )?);
-        }
         {
             let metadata = self.relational_store.table_meta.read();
             for table in affected_tables {
@@ -1776,159 +1738,6 @@ impl Database {
                 }
             }
         }
-        if !paged_rows {
-            for table in affected_tables {
-                if !working
-                    .relational_store
-                    .table_meta
-                    .read()
-                    .contains_key(table)
-                {
-                    continue;
-                }
-                // The private image is not a user scan. Reading it through the
-                // ordinary visible-scan API bills every affected table's rows to
-                // the receiver's scan counter, so a sync apply that installs schema
-                // would report table scans that the door this replaces never did --
-                // the same counter the foreign-key preflight contract reads to
-                // prove it stays indexed. It is also the wrong content:
-                // publication REPLACES each table's whole version vector, so the
-                // copy has to carry every retained version, including tombstoned
-                // history, not only what is visible at the newest snapshot.
-                let copied_meta = working
-                    .relational_store
-                    .table_meta
-                    .read()
-                    .get(table)
-                    .cloned();
-                // Price and admit each version before it is cloned into the
-                // working copy, one at a time, instead of materialising the
-                // table's whole retained vector (`table_versions_for_projection`)
-                // and only THEN pricing what it already holds -- a copy far over
-                // the limit must be refused before the process allocates it, not
-                // after.
-                if self.relational_store.uses_disk_backed_committed_bodies() {
-                    // Disk-backed committed bodies have no resident directory to
-                    // duplicate, so the copy reads them back from disk -- one
-                    // version at a time, each priced and admitted before the next
-                    // is read. Loading the whole retained table first
-                    // (`table_versions_for_projection`) would put the process over
-                    // the declared limit before the first charge could refuse.
-                    let persistence = self
-                        .persistence
-                        .as_ref()
-                        .expect("disk-backed relational bodies require persistence");
-                    persistence.visit_relational_table_with_admission(
-                        table,
-                        &self.finalization.accountant,
-                        |row| {
-                            #[cfg(any(test, feature = "test-seams"))]
-                            {
-                                record_received_schema_profile_work_for_test(
-                                    "staged-rows-loaded",
-                                    1,
-                                );
-                                record_received_schema_staged_row_for_test();
-                            }
-                            let retained_bytes = retained_row_bytes_with_optional_meta(
-                                table,
-                                &row,
-                                copied_meta.as_ref(),
-                            );
-                            let charge = StagedCopyCharge::admit_for_host(
-                                &self.tx_mgr,
-                                &self.finalization.accountant,
-                                contextdb_vector::MemoryBudgetOwner::clone(
-                                    &self.finalization.vector_accountant,
-                                ),
-                                retained_bytes,
-                                "stage_received_unit_row_image",
-                            )?;
-                            // Rebuilding the row's index memberships is admitted node
-                            // by node and can be refused after the row itself was
-                            // admitted. Until the row reaches the working table the
-                            // guard owns its charge; afterwards the worker's drop owner
-                            // does. Index nodes an earlier index already admitted for
-                            // this row carry their own credits, released when the
-                            // refused worker drops.
-                            let row_id = row.row_id;
-                            let source = if row.deleted_tx.is_none() {
-                                self.relational_sync_source_at_read_root(
-                                    table,
-                                    row_id,
-                                    read_memory.clone(),
-                                )?
-                            } else {
-                                (None, None)
-                            };
-                            if source.0.is_some() != source.1.is_some() {
-                                return Err(Error::SyncError(
-                                    (format!(
-                                        "sync provenance sidecar is incomplete for {table} row {}",
-                                        row_id.0,
-                                    ))
-                                    .into(),
-                                ));
-                            }
-                            working.relational_store.insert_loaded_row(table, row)?;
-                            charge.transfer();
-                            // A file-backed source keeps these maps in Redb, so
-                            // copying its resident sidecars below yields nothing.
-                            // Preserve this exact row's arbitration/echo provenance
-                            // before the detached adjudicator consults it. The live
-                            // row's existing side-map admission funds both entries.
-                            if let (Some(lsn), Some(kind)) = source {
-                                working.relational_store.set_sync_source_lsns([(
-                                    table.to_owned(),
-                                    row_id,
-                                    lsn,
-                                )]);
-                                working.relational_store.set_sync_source_kinds([(
-                                    table.to_owned(),
-                                    row_id,
-                                    kind,
-                                )]);
-                            }
-                            Ok(())
-                        },
-                    )?;
-                } else {
-                    let source = self.relational_store.tables.read();
-                    if let Some(rows) = source.get(table) {
-                        for row in rows {
-                            #[cfg(any(test, feature = "test-seams"))]
-                            record_received_schema_staged_row_for_test();
-                            // Only a live version is released by the worker's drop
-                            // fold -- a version carrying `deleted_tx` handed its
-                            // bytes back at the commit that stamped it -- so only
-                            // a live version is charged here. Charged BEFORE the
-                            // clone, so a copy that stops half way has admitted
-                            // exactly what it holds.
-                            let retained_bytes = retained_row_bytes_with_optional_meta(
-                                table,
-                                row,
-                                copied_meta.as_ref(),
-                            );
-                            let charge = StagedCopyCharge::admit_for_host(
-                                &self.tx_mgr,
-                                &self.finalization.accountant,
-                                contextdb_vector::MemoryBudgetOwner::clone(
-                                    &self.finalization.vector_accountant,
-                                ),
-                                retained_bytes,
-                                "stage_received_unit_row_image",
-                            )?;
-                            // Owned by the guard until the row reaches the working
-                            // table: its index rebuild can still be refused.
-                            working
-                                .relational_store
-                                .insert_loaded_row(table, row.clone())?;
-                            charge.transfer();
-                        }
-                    }
-                }
-            }
-        }
         working
             .relational_store
             .set_next_row_id(self.relational_store.next_row_id());
@@ -1945,27 +1754,6 @@ impl Database {
                 .into_iter()
                 .map(|((table, row_id), (_, kind))| (table, row_id, kind)),
         );
-        if !working.graph_store.is_source_backed() && !affected_graph_edge_types.is_empty() {
-            self.visit_graph_versions(
-                |edge| {
-                    if !affected_graph_edge_types.contains(&edge.edge_type) {
-                        return Ok(());
-                    }
-                    #[cfg(any(test, feature = "test-seams"))]
-                    record_received_schema_staged_graph_edge_for_test();
-                    self.finalization.accountant.try_allocate_for(
-                        standalone_edge_retained_bytes(edge),
-                        "sync",
-                        "stage_received_unit_edge_image",
-                        STAGE_RECEIVED_UNIT_COPY_HINT,
-                    )?;
-                    working.graph_store.insert_loaded_edge(edge.clone());
-                    Ok(())
-                },
-                read_memory.clone(),
-            )?;
-        }
-
         // Schema planning must preserve empty vector declarations too. Build
         // their complete layouts from the copied ColumnDefs. A registry entry
         // whose declaration no longer exists is retired state, not schema;
@@ -1987,52 +1775,6 @@ impl Database {
             vector_copy_owner,
             read_memory.clone(),
         )?;
-        // Only a vector column the unit reshapes, and that its projected shape
-        // still declares, enters the detached image. Durable bodies are
-        // selected by exact source membership before hydration. A column
-        // the unit renames is copied under its old name: the replayed rename
-        // carries those vectors to the new one.
-        // The copy's widest point -- the owned clone and the destination built
-        // from it, both alive while `replace_loaded_partitioned_vectors` runs --
-        // is admitted before either exists, and this guard owns that charge
-        // until the copied vectors carry their own charges
-        // (`account_loaded_state_within` converts it into them) or the copy is
-        // dropped on an error or unwind.
-        if copy_vectors && !paged_vectors {
-            let charge = StagedCopyCharge::admit_for_host(
-                &self.tx_mgr,
-                &self.finalization.accountant,
-                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-                self.vector_store
-                    .partitioned_copy_bytes_matching(copied_vector_index),
-                "stage_received_unit_vector_image",
-            )?;
-            let _ = vector_copy_charge.insert(contextdb_vector::VectorCopyAdmission::from_prepaid(
-                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-                charge.prepare_prepaid_box()?,
-            )?);
-            let owner = vector_copy_charge
-                .take()
-                .expect("the copied vector image holds its prepaid admission");
-            let (declared_vectors, owner) = self.copy_partitioned_vector_membership_image(
-                copied_vector_index,
-                owner,
-                read_memory.clone(),
-            )?;
-            #[cfg(any(test, feature = "test-seams"))]
-            {
-                record_received_schema_profile_work_for_test(
-                    "staged-vector-entries-cloned",
-                    declared_vectors.len() as u64,
-                );
-                for _ in &declared_vectors {
-                    record_received_schema_staged_vector_for_test();
-                }
-            }
-            working
-                .vector_store
-                .replace_loaded_partitioned_vectors(declared_vectors, owner)?;
-        }
         self.copy_received_row_graph_witnesses(&working, affected_tables, read_memory.clone())?;
         // Replacement consumes the prepaid copy admission and adopts the
         // retained payload charges before publishing the detached image.
@@ -3077,7 +2819,7 @@ impl Database {
                 vector_copy_owner,
                 read_memory,
                 Some(original),
-                Some(&loan),
+                &loan,
             )?;
             if !stage.trigger_audits.is_empty() {
                 stage.native_audit_memory = Some(self.prepare_original_audit_memory_iter(
@@ -3414,9 +3156,18 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         preparation_original: Option<&OwnedMemoryReservation>,
-        working_preparation: Option<&ReceivedWorkingPreparation<'_>>,
+        working_preparation: &ReceivedWorkingPreparation<'_>,
     ) -> Result<ReceivedSchemaStage> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        // Every received image keeps its rows in the live store's unpublished
+        // write; a receiver whose committed bodies are not on disk has no such
+        // source to page from.
+        if !self.relational_store.uses_disk_backed_committed_bodies() {
+            return Err(Error::Other(
+                "received schema preparation requires a durable receiver with disk-backed bodies"
+                    .into(),
+            ));
+        }
 
         // The private working vector source borrows this executing reader
         // while the same received operation prepares and validates its image.
@@ -3428,12 +3179,11 @@ impl Database {
         // Declared before every possible target config buffer, so errors
         // destroy those buffers before this independently copied-body fee.
         let mut native_trigger_config_fee = None;
-        if let Some(loan) = working_preparation {
-            if !preparation_original.is_some_and(|original| std::ptr::eq(original, loan.original)) {
-                return Err(EngineMetadataJournal::identity_error());
-            }
-            loan.write.require_original(loan.original)?;
+        let loan = working_preparation;
+        if !preparation_original.is_some_and(|original| std::ptr::eq(original, loan.original)) {
+            return Err(EngineMetadataJournal::identity_error());
         }
+        loan.write.require_original(loan.original)?;
 
         let mut publication_vector_copy_owner = Some(contextdb_vector::VectorCopyAdmission::new(
             match preparation_original {
@@ -3968,9 +3718,7 @@ impl Database {
         let live_table_count = self.relational_store.table_meta.read().len();
         let mut callback_tables = HashSet::<String>::new();
         loop {
-            if let Some(loan) = working_preparation {
-                loan.write.reset_scratch()?;
-            }
+            loan.write.reset_scratch()?;
             let mut stage_shape_changes = changes.clone();
             if schema_projection_noop {
                 stage_shape_changes.ddl.clear();
@@ -4092,55 +3840,30 @@ impl Database {
             // owning rows of vector/graph replacements. Their final ownership
             // checks below probe exact source coordinates instead of an empty
             // resident row map. Vector/edge payload gathering remains separate.
-            let paged_rows = working_preparation.is_some()
-                && self.relational_store.uses_disk_backed_committed_bodies();
-
-            let working_vectors = if paged_rows {
-                let loan =
-                    working_preparation.expect("paged working source retains its original loan");
-                let root = self.writer_read_root()?.ok_or_else(|| {
-                    Error::Other("native vector preparation lost its captured publication".into())
-                })?;
-                loan.write
-                    .prepare_vectors(loan.store, loan.original, root, read_memory.clone())?;
-                let catalog = crate::persistence::received_working_vector::WorkingVectorCatalogOwner::prepare(loan.original, loan.funder)?;
-                loan.write
-                    .install_vector_catalog(loan.original, catalog.clone())?;
-                Some(catalog)
-            } else {
-                None
-            };
+            let root = self.writer_read_root()?.ok_or_else(|| {
+                Error::Other("native vector preparation lost its captured publication".into())
+            })?;
+            loan.write
+                .prepare_vectors(loan.store, loan.original, root, read_memory.clone())?;
+            let working_vectors =
+                crate::persistence::received_working_vector::WorkingVectorCatalogOwner::prepare(
+                    loan.original,
+                    loan.funder,
+                )?;
+            loan.write
+                .install_vector_catalog(loan.original, working_vectors.clone())?;
             let (mut metadata_copy_charges, mut working) = self
                 .detached_received_schema_working_database_with_sources(
                     &side_semantic.tables,
                     inputs.receiver_tx,
-                    private_source_coordinates.is_some(),
-                    paged_rows,
-                    preparation_original,
-                    working_preparation
-                        .filter(|_| paged_rows)
-                        .map(|loan| FundedWorkingGraphSource::prepare(loan.funder))
-                        .transpose()?,
+                    loan.original,
+                    FundedWorkingGraphSource::prepare(loan.funder)?,
                     working_vectors.clone(),
                     &affected_tables,
-                    &affected_graph_edge_types,
-                    copy_vectors,
                     side_metadata_required,
                     inputs.terminal_refusal_context,
                     inputs.receipt.as_ref(),
                     inputs.push_outcome_key,
-                    &changes
-                        .ddl
-                        .iter()
-                        .filter_map(|ddl| match ddl {
-                            DdlChange::AlterTable {
-                                name, constraints, ..
-                            } => sync_vector_rename_from_constraints(constraints)
-                                .map(|(from, _)| VectorIndexRef::new(name, from)),
-                            _ => None,
-                        })
-                        .collect(),
-                    &replaced_vector_refs,
                     vector_copy_owner,
                     read_memory.clone(),
                 )?;
@@ -4199,15 +3922,13 @@ impl Database {
             // fields here.  Its commit is private to `working`.
             // Keep a distinct original-funded CURRENT scope through the
             // synchronous source loan; the stage may move its affected set.
-            let graph_schema_scope = working_preparation
-                .map(|loan| -> Result<_> {
-                    let frame = crate::persistence::OriginalPersistenceFrame::new(loan.original)?;
-                    frame.reserve(affected_tables.iter().fold(0usize, |bytes, name| {
-                        bytes.saturating_add(name.len()).saturating_add(256)
-                    }))?;
-                    Ok((affected_tables.clone(), frame.into_reservation()))
-                })
-                .transpose()?;
+            let graph_schema_scope = {
+                let frame = crate::persistence::OriginalPersistenceFrame::new(loan.original)?;
+                frame.reserve(affected_tables.iter().fold(0usize, |bytes, name| {
+                    bytes.saturating_add(name.len()).saturating_add(256)
+                }))?;
+                (affected_tables.clone(), frame.into_reservation())
+            };
             let mut refused_result = None;
             // Replay declaration lifetimes separately from the final schema image.
             // The list and its strings are admitted before allocating and retained
@@ -4251,9 +3972,7 @@ impl Database {
                 }
             }
             let prepare_attempt = || -> Result<Option<ReceivedSchemaStage>> {
-                if let Some(catalog) = &working_vectors {
-                    catalog.activate(&working.vector_store, vector_copy_owner)?;
-                }
+                working_vectors.activate(&working.vector_store, vector_copy_owner)?;
                 let applied = working.apply_changes_with_private_source_order(
                     replay_changes.clone(),
                     &detached_policies,
@@ -4405,8 +4124,8 @@ impl Database {
                     &accepted_positions,
                     read_memory.clone(),
                 )?;
-                if let Some(loan) = working_preparation {
-                    if paged_rows {
+                {
+                    {
                         let metadata = working.relational_store.table_meta.read();
                         for table in metadata
                             .keys()
@@ -4423,63 +4142,6 @@ impl Database {
                         )?;
                         loan.write
                             .apply_provenance(loan.original, &finalized_write_set)?;
-                    } else {
-                        {
-                            let mut tables = working.relational_store.tables.write();
-                            for (table, rows) in tables.iter_mut() {
-                                if affected_tables.contains(table) {
-                                    rows.sort_unstable_by_key(|row| {
-                                        (row.row_id, row.created_tx, row.lsn)
-                                    });
-                                }
-                            }
-                        }
-                        let tables = working.relational_store.tables.read();
-                        let metadata = working.relational_store.table_meta.read();
-                        for (table, rows) in tables
-                            .iter()
-                            .filter(|(table, _)| affected_tables.contains(*table))
-                        {
-                            let meta = metadata
-                                .get(table)
-                                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
-                            loan.write.replace_projected_rows(
-                                loan.store,
-                                loan.original,
-                                table,
-                                meta,
-                                rows,
-                            )?;
-                            let mut previous = None;
-                            for row in rows {
-                                if previous == Some(row.row_id) {
-                                    continue;
-                                }
-                                previous = Some(row.row_id);
-                                let value = match (
-                                    working.relational_store.sync_source_lsn(table, row.row_id),
-                                    working.relational_store.sync_source_kind(table, row.row_id),
-                                ) {
-                                    (Some(lsn), Some(kind)) => Some((lsn, kind)),
-                                    (None, None) => None,
-                                    _ => {
-                                        return Err(crate::funded_error::corruption_text(
-                                            Ok(read_memory.clone()),
-                                            table,
-                                            "private projected provenance is incomplete".into(),
-                                        ));
-                                    }
-                                };
-                                loan.write.mark_sync_source(
-                                    loan.original,
-                                    table,
-                                    row.row_id,
-                                    value,
-                                )?;
-                            }
-                        }
-                        drop(metadata);
-                        drop(tables);
                     }
                     let source=crate::persistence::received_working_source::WorkingReadSource::current_for(working.tx_mgr.identity())?
                 .ok_or_else(||Error::Other("native working projection lost its synchronous source".into()))?;
@@ -4754,21 +4416,13 @@ impl Database {
 
                 // Discovery/callbacks can select additional types, including an empty
                 // replacement. Freeze only after restamp and complete validation.
-                let graph_occurrences =
-                    if let Some(loan) = working_preparation.filter(|_| paged_rows) {
-                        loan.write.graph_capturing(loan.original)?
-                    } else {
-                        false
-                    };
-                let graph_selection = if let Some(loan) = working_preparation.filter(|_| paged_rows)
-                {
+                let graph_occurrences = loan.write.graph_capturing(loan.original)?;
+                let graph_selection = {
                     for kind in &affected_graph_edge_types {
                         loan.write.select_graph_type(loan.original, kind)?;
                     }
                     copy_graph |= loan.write.graph_selection_dirty(loan.original)?;
                     Some(loan.write.freeze_graph_selection(loan.original)?)
-                } else {
-                    None
                 };
                 let edges = Self::received_row_graph_image(
                     &working.graph_store,
@@ -4839,55 +4493,18 @@ impl Database {
                         return false;
                     }
                     let entry = &placed.entry;
-                    let owns_row = if paged_rows {
-                        let loan =
-                            working_preparation.expect("paged rows retain their original loan");
-                        match loan.write.exact_version(
-                            loan.original,
-                            &entry.index.table,
-                            entry.row_id,
-                            placed.membership.owning_row_tx,
-                            placed.membership.row_lsn,
-                        ) {
-                            Ok(row) => row.is_some(),
-                            Err(error) => {
-                                ownership_error = Some(error);
-                                false
-                            }
+                    let owns_row = match loan.write.exact_version(
+                        loan.original,
+                        &entry.index.table,
+                        entry.row_id,
+                        placed.membership.owning_row_tx,
+                        placed.membership.row_lsn,
+                    ) {
+                        Ok(row) => row.is_some(),
+                        Err(error) => {
+                            ownership_error = Some(error);
+                            false
                         }
-                    } else if source_backed {
-                        prepared_rows_for_memory
-                            .get(&entry.index.table)
-                            .is_some_and(|rows| {
-                                rows.binary_search_by_key(
-                                    &(
-                                        entry.row_id,
-                                        placed.membership.owning_row_tx,
-                                        placed.membership.row_lsn,
-                                    ),
-                                    |row| (row.row_id, row.created_tx, row.lsn),
-                                )
-                                .is_ok()
-                            })
-                    } else if self.persistence.is_none() {
-                        row_versions
-                            .binary_search_by_key(
-                                &(entry.index.table.as_str(), entry.row_id),
-                                |(table, row)| (*table, row.row_id),
-                            )
-                            .is_ok()
-                    } else {
-                        row_versions
-                            .binary_search_by_key(
-                                &(
-                                    entry.index.table.as_str(),
-                                    entry.row_id,
-                                    placed.membership.owning_row_tx,
-                                    placed.membership.row_lsn,
-                                ),
-                                |(table, row)| (*table, row.row_id, row.created_tx, row.lsn),
-                            )
-                            .is_ok()
                     };
                     owns_row
                         && semantic.tables.get(&entry.index.table).is_some_and(|meta| {
@@ -5032,9 +4649,7 @@ impl Database {
                         durable_memberships.push(membership);
                     }
                 }
-                if paged_rows && copy_vectors {
-                    let loan =
-                        working_preparation.expect("paged vector image retains its authentic loan");
+                if copy_vectors {
                     let records = vector_records.as_mut().ok_or_else(|| {
                         Error::Other("paged vector image lost its record sink".into())
                     })?;
@@ -5268,27 +4883,17 @@ impl Database {
                     .flatten();
                 let prepared_sink_events = match prefix_sinks {
                     Some(events) => events,
-                    None if paged_rows => {
-                        let loan =
-                            working_preparation.expect("paged rows retain their preparation loan");
-                        working.prepare_received_sink_events_from_source(
-                            &finalized_write_set,
-                            &semantic.event_bus,
-                            loan.write,
-                            loan.original,
-                            self.event_bus.next_action_id(),
-                            publication_vector_copy_owner
-                                .as_mut()
-                                .expect("one publication owner"),
-                            read_memory.clone(),
-                        )?
-                    }
-                    None => self.prepare_received_sink_events_from_projection(
+                    None => working.prepare_received_sink_events_from_source(
                         &finalized_write_set,
                         &semantic.event_bus,
-                        &prepared_rows_for_memory,
-                        &semantic.tables,
-                    ),
+                        loan.write,
+                        loan.original,
+                        self.event_bus.next_action_id(),
+                        publication_vector_copy_owner
+                            .as_mut()
+                            .expect("one publication owner"),
+                        read_memory.clone(),
+                    )?,
                 };
                 self.event_bus
                     .ensure_queue_capacity(&prepared_sink_events.events)?;
@@ -5472,9 +5077,7 @@ impl Database {
                 let mut staged_deleted_rows =
                     HashMap::<String, HashMap<RowId, VersionedRow>>::new();
                 for (table, row_id, _) in &finalized_write_set.relational_deletes {
-                    if paged_rows {
-                        let loan =
-                            working_preparation.expect("paged rows retain their preparation loan");
+                    {
                         if let Some(row) = loan.write.latest_row(loan.original, table, *row_id)? {
                             publication_vector_copy_owner
                                 .as_mut()
@@ -5494,20 +5097,6 @@ impl Database {
                                     crate::memory_accounting::preparation_copy_row(row.value())?,
                                 );
                         }
-                        continue;
-                    }
-                    if let Some(row) = prepared_rows_for_memory
-                        .get(table)
-                        // A primary-key update leaves historical versions with the
-                        // same RowId. The finalized delete names the latest version,
-                        // so its change-log tombstone must take the last authoritative
-                        // projected version rather than the stale first append.
-                        .and_then(|rows| rows.iter().rev().find(|row| row.row_id == *row_id))
-                    {
-                        staged_deleted_rows
-                            .entry(table.clone())
-                            .or_default()
-                            .insert(*row_id, row.clone());
                     }
                 }
                 let structurally_dropped_tables =
@@ -5660,26 +5249,13 @@ impl Database {
                     None
                 };
                 if let Some(records) = &mut row_records {
-                    if paged_rows {
-                        let loan =
-                            working_preparation.expect("paged rows retain their preparation loan");
+                    {
                         for table in semantic
                             .tables
                             .keys()
                             .filter(|table| affected_tables.contains(*table))
                         {
                             loan.write.spool_rows(loan.original, table, records)?;
-                        }
-                    } else {
-                        for (table, rows) in &*prepared_rows_for_memory {
-                            if !affected_tables.contains(table) {
-                                continue;
-                            }
-                            if let Some(loan) = working_preparation {
-                                loan.write.spool_rows(loan.original, table, records)?;
-                            } else {
-                                records.push_table(table, rows)?;
-                            }
                         }
                     }
                 }
@@ -5696,9 +5272,7 @@ impl Database {
                     None
                 };
                 if let Some(records) = &mut sync_source_records {
-                    if paged_rows {
-                        let loan =
-                            working_preparation.expect("paged rows retain their preparation loan");
+                    {
                         for table in semantic
                             .tables
                             .keys()
@@ -5717,25 +5291,6 @@ impl Database {
                                 }
                                 Ok(())
                             })?;
-                        }
-                    } else {
-                        for (table, rows) in &*prepared_rows_for_memory {
-                            if !affected_tables.contains(table) {
-                                continue;
-                            }
-                            let mut previous = None;
-                            for row in rows {
-                                if previous == Some(row.row_id) {
-                                    continue;
-                                }
-                                previous = Some(row.row_id);
-                                if let (Some(lsn), Some(kind)) = (
-                                    working.relational_store.sync_source_lsn(table, row.row_id),
-                                    working.relational_store.sync_source_kind(table, row.row_id),
-                                ) {
-                                    records.push(table, row.row_id, lsn, kind)?;
-                                }
-                            }
                         }
                     }
                 }
@@ -5872,12 +5427,10 @@ impl Database {
                     working
                         .relational_store
                         .enable_disk_backed_committed_bodies();
-                    if working_preparation.is_some() {
-                        *working.relational_store.indexes.write() = HashMap::new();
-                        *working.relational_store.table_meta.write() = HashMap::new();
-                        *working.graph_store.forward_adj.write() = HashMap::new();
-                        *working.graph_store.reverse_adj.write() = HashMap::new();
-                    }
+                    *working.relational_store.indexes.write() = HashMap::new();
+                    *working.relational_store.table_meta.write() = HashMap::new();
+                    *working.graph_store.forward_adj.write() = HashMap::new();
+                    *working.graph_store.reverse_adj.write() = HashMap::new();
                     Some(
                         working
                             .finalization
@@ -5964,7 +5517,7 @@ impl Database {
                     _received_preparation_owner: None,
                 }))
             };
-            let prepared = if let Some(loan) = working_preparation {
+            let prepared = {
                 let root = self.writer_read_root()?.ok_or_else(|| {
                     Error::Other(
                         "native received working source lost its captured publication".into(),
@@ -5986,10 +5539,7 @@ impl Database {
                     loan.original,
                     loan.store,
                     &working.relational_store,
-                    &graph_schema_scope
-                        .as_ref()
-                        .expect("working loan retains its schema scope")
-                        .0,
+                    &graph_schema_scope.0,
                     working.tx_mgr.identity(),
                     working.id,
                     root,
@@ -5997,13 +5547,9 @@ impl Database {
                     lsn,
                     |_| prepare_attempt(),
                 )?
-            } else {
-                prepare_attempt()?
             };
             if let Some(mut stage) = prepared {
-                if let Some(loan) = working_preparation
-                    && stage.durable_projection.graph_selection.is_some()
-                {
+                if stage.durable_projection.graph_selection.is_some() {
                     // with_source has returned successfully and its loan
                     // has ended. Retain the same frozen graph under the
                     // authentic write/Original for terminal persistence.
@@ -6069,7 +5615,7 @@ impl Database {
                     vector_copy_owner,
                     read_memory.clone(),
                     preparation_original,
-                    None,
+                    loan,
                 )?;
                 apply_result.new_lsn = local_lsn;
                 stage.apply_result = apply_result;
@@ -6803,9 +6349,15 @@ impl Database {
                             vector_copy_owner,
                             read_memory.clone(),
                         )?,
-                        None if self.persistence.is_some()
-                            && self.relational_store.uses_disk_backed_committed_bodies() =>
-                        {
+                        None => {
+                            // A receiver without a durable store has no live
+                            // write to lend the private image; refuse before
+                            // any working write begins.
+                            if self.persistence.is_none()
+                                || !self.relational_store.uses_disk_backed_committed_bodies()
+                            {
+                                return Err(received_schema_requires_durable_receiver());
+                            }
                             self.prepare_legacy_file_received_schema_stage(
                                 lsn,
                                 coordinates.as_ref(),
@@ -6818,19 +6370,6 @@ impl Database {
                                 read_memory.clone(),
                             )?
                         }
-                        None => self.prepare_received_schema_stage_with_interval(
-                            lsn,
-                            coordinates.as_ref(),
-                            changes,
-                            received,
-                            validated_lineages,
-                            inputs,
-                            delivery_prepare.take(),
-                            vector_copy_owner,
-                            read_memory.clone(),
-                            None,
-                            None,
-                        )?,
                     };
                     let operational = match scope {
                         Some(scope) => {
@@ -7425,4 +6964,13 @@ impl Database {
             })
         })
     }
+}
+
+/// The typed internal refusal for a received schema stage on a database that
+/// has no durable store to lend its private image a working write.
+pub(super) fn received_schema_requires_durable_receiver() -> Error {
+    Error::Other(
+        "received schema stages require a durable receiver; this database has no durable store"
+            .into(),
+    )
 }
