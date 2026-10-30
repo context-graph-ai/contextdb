@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
 
 use super::page_allocation::{CacheCounter, CachePayment, PageAllocation};
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+use crate::native_page_observations::{
+    NativeColdReadAttemptForTest, NativePageCustodyEventForTest,
+};
 
 /// Every alias retains the same complete physical backing and its payer.
 #[derive(Clone)]
@@ -274,12 +278,60 @@ impl CheckedBackend {
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        {
+            self.read_inner(offset, out, None)
+        }
+        #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
+        {
+            self.read_inner(offset, out)
+        }
+    }
+
+    fn read_inner(
+        &self,
+        offset: u64,
+        out: &mut [u8],
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))] observation: Option<(
+            &crate::native_page_observations::PageObservation,
+            &NativeColdReadAttemptForTest,
+        )>,
+    ) -> Result<()> {
         self.check_failure()?;
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let result =
+            match observation.and_then(|(observer, attempt)| observer.before_cold_read(attempt)) {
+                Some(error) => Err(crate::native_storage_admission::native_storage_error(error)),
+                None => self.file.read(offset, out),
+            };
+        #[cfg(not(all(feature = "test-seams", feature = "contextdb-internal")))]
         let result = self.file.read(offset, out);
-        if result.is_err() {
-            self.io_failed.store(true, Ordering::Release);
-        } else {
+        if result.is_ok() {
             crate::read_admission::record_backend_read(out.len());
+        }
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        if let Some((observer, attempt)) = observation {
+            if result.is_err() {
+                observer.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt: *attempt });
+            }
+            return match result {
+                Ok(()) => {
+                    observer.after_cold_read(attempt, Ok(()));
+                    Ok(())
+                }
+                Err(StorageError::Native(error)) => {
+                    observer.after_cold_read(attempt, Err(&error));
+                    Err(StorageError::Native(error))
+                }
+                Err(StorageError::Io(error)) => {
+                    // Borrow and return the identical I/O error; the observation
+                    // never replaces its kind, payload or producer category.
+                    let error = crate::NativeColdReadError::Io(error);
+                    observer.after_cold_read(attempt, Err(&error));
+                    Err(crate::native_storage_admission::native_storage_error(error))
+                }
+                Err(error) => Err(error),
+            };
         }
         result
     }
@@ -395,6 +447,24 @@ pub(super) struct PagedCachedFile {
 pub struct CachePageForTest(PageMemory);
 #[cfg(feature = "test-seams")]
 impl CachePageForTest {
+    fn page(&self) -> &PageAllocation {
+        match &self.0 {
+            PageMemory::Cached(p) | PageMemory::Charged(p) | PageMemory::Plain(p) => p,
+            #[cfg(feature = "contextdb-internal")]
+            PageMemory::Native(p) => p,
+        }
+    }
+    pub fn strong_handles(&self) -> usize {
+        PageAllocation::strong_count(self.page())
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub fn native_backing(&self) -> crate::native_page_observations::NativePageBackingForTest {
+        self.page().backing_for_test()
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub fn native_payment(&self) -> crate::native_page_observations::NativePagePaymentForTest {
+        self.page().native_payment_for_test()
+    }
     pub fn bytes(&self) -> &[u8] {
         &self.0
     }
@@ -404,7 +474,7 @@ impl CachePageForTest {
                 p.payment_for_test()
             }
             #[cfg(feature = "contextdb-internal")]
-            PageMemory::Native(_) => panic!("expected real legacy cache allocation"),
+            PageMemory::Native(p) => p.payment_for_test(),
         }
     }
     pub fn native_source_receipt_for_test(&self) -> Option<usize> {
@@ -421,7 +491,7 @@ impl CachePageForTest {
         let page = match &self.0 {
             PageMemory::Cached(p) | PageMemory::Plain(p) | PageMemory::Charged(p) => p,
             #[cfg(feature = "contextdb-internal")]
-            PageMemory::Native(_) => panic!("expected real legacy cache allocation"),
+            PageMemory::Native(p) => p,
         };
         let layout = PageAllocation::layout(page.len()).unwrap().0;
         (
@@ -886,6 +956,14 @@ impl PagedCachedFile {
                     // The stripe write lock prevents a new cache holder from
                     // appearing after victim selection. Pinned entries stay
                     // linked, so their later release cannot leave a cache hole.
+                    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+                    v.observation_for_test().emit(
+                        NativePageCustodyEventForTest::MapHandleEvicted {
+                            allocation: PageAllocation::as_ptr(&v) as usize,
+                            cache: self.read_cache_bytes.observation_for_test().0,
+                            strong_handles: PageAllocation::strong_count(&v),
+                        },
+                    );
                     freed += cached_page_bytes(v.len());
                 } else {
                     break;
@@ -1014,6 +1092,25 @@ impl PagedCachedFile {
         Ok(buffer)
     }
 
+    /// Borrow the actual paid native backing at the checked backend call.
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    fn read_native_backend_for_test(&self, offset: u64, page: &mut PageAllocation) -> Result<()> {
+        let observation = page.observation_for_test();
+        let attempt = NativeColdReadAttemptForTest {
+            backend: &self.file.file as *const _ as usize,
+            cache: self.read_cache_bytes.observation_for_test().0,
+            offset,
+            len: page.len(),
+            backing: page.backing_for_test(),
+            source_receipt: page.native_payment_for_test().source_receipt,
+        };
+        self.file.read_inner(
+            offset,
+            PageAllocation::get_mut(page).expect("unpublished native page is unique"),
+            Some((&observation, &attempt)),
+        )
+    }
+
     // Admit the concrete complete allocation before allocation and backend I/O.
     fn read_direct_into_page(
         &self,
@@ -1033,6 +1130,9 @@ impl PagedCachedFile {
             let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
             #[cfg(feature = "test-seams")]
             page.observe_payment(crate::page_payer_observation::Phase::BeforeIo);
+            #[cfg(feature = "test-seams")]
+            self.read_native_backend_for_test(offset, &mut page)?;
+            #[cfg(not(feature = "test-seams"))]
             self.file
                 .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
             return Ok(page);
@@ -1119,6 +1219,18 @@ impl PagedCachedFile {
         self.cache_loaded_page(offset, len, buffer, scan_replace, hint.is_transient())
     }
 
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    fn rejected_native_page_for_test(&self, buffer: &PageAllocation, offset: u64, len: usize) {
+        buffer
+            .observation_for_test()
+            .emit(NativePageCustodyEventForTest::Rejected {
+                allocation: PageAllocation::as_ptr(buffer) as usize,
+                cache: self.read_cache_bytes.observation_for_test().0,
+                offset,
+                len,
+            });
+    }
+
     /// Admission and publication use the same cache-capacity policy. A
     /// successful claim owns the backing before any allocation or backend I/O.
     fn reserve_read_cache_backing(
@@ -1189,7 +1301,11 @@ impl PagedCachedFile {
         } else {
             match self.reserve_read_cache_backing(len, scan_replace, &cache_lock)? {
                 Some(payment) => Some(payment),
-                None => return Ok(Self::uncached(buffer)),
+                None => {
+                    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+                    self.rejected_native_page_for_test(&buffer, offset, len);
+                    return Ok(Self::uncached(buffer));
+                }
             }
         };
         debug_assert!(
@@ -1204,6 +1320,26 @@ impl PagedCachedFile {
         };
         match inserted {
             Ok(displaced) => {
+                #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+                {
+                    buffer
+                        .observation_for_test()
+                        .emit(NativePageCustodyEventForTest::Installed {
+                            allocation: PageAllocation::as_ptr(&buffer) as usize,
+                            cache: self.read_cache_bytes.observation_for_test().0,
+                            offset,
+                            len,
+                        });
+                    if let Some(displaced) = &displaced {
+                        displaced.observation_for_test().emit(
+                            NativePageCustodyEventForTest::MapHandleEvicted {
+                                allocation: PageAllocation::as_ptr(displaced) as usize,
+                                cache: self.read_cache_bytes.observation_for_test().0,
+                                strong_handles: PageAllocation::strong_count(displaced),
+                            },
+                        );
+                    }
+                }
                 // Every alias retains the original payment until an optional
                 // source-to-cache transfer; prepaid cache pages keep their loan.
                 // Drop the stripe guard before running the opaque receipt's
@@ -1217,6 +1353,8 @@ impl PagedCachedFile {
                 Ok(PageMemory::Cached(buffer))
             }
             Err(rejected) => {
+                #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+                self.rejected_native_page_for_test(&buffer, offset, len);
                 drop(rejected);
                 drop(write_lock);
                 drop(payment);
@@ -1543,18 +1681,64 @@ impl PagedCachedFile {
             }
             if cached.is_native() {
                 let page = PageMemory::Native(cached.clone());
+                #[cfg(feature = "test-seams")]
+                cached
+                    .observation_for_test()
+                    .page_returned(&|| CachePageForTest(page.clone()));
                 return Ok(page);
             }
         }
         let mut page = PageAllocation::zeroed_native(len)?;
+        #[cfg(feature = "test-seams")]
+        let native_payment = page.native_payment_for_test();
+        #[cfg(feature = "test-seams")]
+        let native_backing = page.backing_for_test();
         let output = PageAllocation::get_mut(&mut page).expect("unpublished native page is unique");
         if let Some(cached) = cached {
             output.copy_from_slice(&cached);
         } else {
-            if let Err(error) = self.file.file.read_cause(offset, output) {
-                self.file.io_failed.store(true, Ordering::Release);
-                return Err(error.into_native());
+            #[cfg(feature = "test-seams")]
+            let (observation, attempt) = {
+                // All cache/payer guards have been released. The exclusive
+                // output borrow holds the same paid, unpublished allocation.
+                let observation = crate::native_page_observations::PageObservation::current();
+                let backing = native_backing;
+                (
+                    observation,
+                    NativeColdReadAttemptForTest {
+                        backend: &self.file.file as *const _ as usize,
+                        cache: self.read_cache_bytes.observation_for_test().0,
+                        offset,
+                        len,
+                        backing,
+                        source_receipt: native_payment.source_receipt,
+                    },
+                )
+            };
+            #[cfg(feature = "test-seams")]
+            let result = match observation.before_cold_read(&attempt) {
+                Some(error) => Err(error),
+                None => self
+                    .file
+                    .file
+                    .read_cause(offset, output)
+                    .map_err(|error| error.into_native()),
+            };
+            #[cfg(not(feature = "test-seams"))]
+            let result = self
+                .file
+                .file
+                .read_cause(offset, output)
+                .map_err(|error| error.into_native());
+            if let Err(error) = result {
+                #[cfg(feature = "test-seams")]
+                observation.emit(NativePageCustodyEventForTest::ColdReadFailed { attempt });
+                #[cfg(feature = "test-seams")]
+                observation.after_cold_read(&attempt, Err(&error));
+                return Err(error);
             }
+            #[cfg(feature = "test-seams")]
+            observation.after_cold_read(&attempt, Ok(()));
             crate::read_admission::record_backend_read(len);
         }
         // The shared cache takes custody under its actual fixed reserve; if
@@ -1574,6 +1758,12 @@ impl PagedCachedFile {
             | PageMemory::Plain(page)
             | PageMemory::Native(page) => PageMemory::Native(page),
         };
+        #[cfg(feature = "test-seams")]
+        if let PageMemory::Native(allocation) = &page {
+            allocation
+                .observation_for_test()
+                .page_returned(&|| CachePageForTest(page.clone()));
+        }
         Ok(page)
     }
 
@@ -1628,6 +1818,9 @@ impl PagedCachedFile {
         }
         // Preserve CheckedBackend's PreviousIo/DatabaseClosed/I/O value and
         // read observer; a prepared read must not invent a corruption instead.
+        #[cfg(feature = "test-seams")]
+        self.read_native_backend_for_test(offset, &mut page)?;
+        #[cfg(not(feature = "test-seams"))]
         self.file.read(
             offset,
             PageAllocation::get_mut(&mut page).expect("unpublished native page is unique"),
@@ -2840,5 +3033,41 @@ impl CachePressureFixtureForTest {
 impl ReadCachePageWindow {
     pub(crate) fn visit_latest_for_test(&self, visit: impl FnMut([u8; 8])) -> bool {
         self.arena.visit_latest_page_window_for_test(visit)
+    }
+}
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl PagedCachedFile {
+    pub(crate) fn native_cache_occupancy_for_test(
+        &self,
+    ) -> crate::native_page_observations::NativeCacheOccupancyForTest {
+        crate::native_page_observations::NativeCacheOccupancyForTest {
+            cache: self.read_cache_bytes.observation_for_test().0,
+            limit: self.max_cache_size.load(Ordering::Acquire),
+            index_bytes: self.index_bytes(),
+            read_held_bytes: self.read_cache_bytes.load(Ordering::Acquire),
+            read_fixed_bytes: self.read_cache_bytes.fixed_bytes(),
+            write_held_bytes: self.write_buffer_bytes.load(Ordering::Acquire),
+            write_fixed_bytes: self.write_buffer_bytes.fixed_bytes(),
+            read_counter: self.read_cache_bytes.observation_for_test().0,
+            write_counter: self.write_buffer_bytes.observation_for_test().0,
+            read_fixed_receipt: self.read_cache_bytes.fixed_receipt_identity_for_test(),
+            write_fixed_receipt: self.write_buffer_bytes.fixed_receipt_identity_for_test(),
+        }
+    }
+    /// Preparation for a cold guard uses the existing victim selection, with
+    /// its strong-count exclusion and no fault reset or capacity change.
+    pub(crate) fn evict_unpinned_clean_pages_for_test(
+        &self,
+    ) -> (
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+    ) {
+        let before = self.native_cache_occupancy_for_test();
+        {
+            let write = self.write_buffer.lock().unwrap();
+            self.evict_from_read_cache(usize::MAX, &write);
+        }
+        (before, self.native_cache_occupancy_for_test())
     }
 }

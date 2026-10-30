@@ -84,6 +84,8 @@ impl PendingCounts {
 }
 
 impl MembershipSummary {
+    pub(super) fn source_identity(&self) -> [u8; 32] { self.digest }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -1933,6 +1935,70 @@ pub(super) fn write_fingerprints(write: &redb::WriteTransaction) -> Result<()> {
             metadata
                 .insert(key, fingerprint.as_slice())
                 .map_err(metadata_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// The same predecessor authority check for an already admitted exclusive
+/// outer writer. Call before staging source/schema mutations in that write.
+pub(super) fn validate_in_write(write: &redb::WriteTransaction) -> Result<()> {
+    let metadata = if write
+        .table_exists(CONTENT_IDENTITY_METADATA_TABLE)
+        .map_err(metadata_error)?
+    {
+        Some(
+            write
+                .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+                .map_err(metadata_error)?,
+        )
+    } else {
+        None
+    };
+    for (definition, key) in [
+        (
+            super::vector_current_identity::CURRENT,
+            super::vector_current_identity::ROOT,
+        ),
+        (SOURCE, SOURCE_ROOT),
+        (REVERSE, REVERSE_ROOT),
+        (SUMMARY, SUMMARY_ROOT),
+        (VECTOR_PARTITION_MEMBERSHIP_TABLE, MEMBERSHIP_ROOT),
+        (VECTOR_OPEN_DIRECTORY_TABLE, OPEN_DIRECTORY_ROOT),
+    ] {
+        let actual = write
+            .table_root_fingerprint(definition)
+            .map_err(metadata_error)?;
+        let expected = metadata
+            .as_ref()
+            .map(|table| table.get(key).map_err(metadata_error))
+            .transpose()?
+            .flatten();
+        if key == super::vector_current_identity::ROOT
+            && (expected.is_some()
+                || write
+                    .table_root_fingerprint(SOURCE)
+                    .map_err(metadata_error)?
+                    .is_some())
+            && !write.table_exists(definition).map_err(metadata_error)?
+        {
+            return Err(corruption("required CURRENT identity table is missing"));
+        }
+        match expected {
+            None if actual.is_none() => {}
+            None => {
+                return Err(corruption(
+                    "membership page root has no committed fingerprint",
+                ));
+            }
+            Some(expected) if expected.value() == actual.unwrap_or([0; 32]) => {}
+            Some(_)
+                if actual.is_none() && (key == MEMBERSHIP_ROOT || key == OPEN_DIRECTORY_ROOT) => {}
+            Some(_) => {
+                return Err(corruption(
+                    "membership page root differs from its committed fingerprint",
+                ));
+            }
         }
     }
     Ok(())

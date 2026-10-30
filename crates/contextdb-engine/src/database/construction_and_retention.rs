@@ -590,6 +590,7 @@ pub(super) fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<Vecto
             k,
             candidates,
             search_mode,
+            query_policy,
             ..
         }
         | PhysicalPlan::HnswSearch {
@@ -599,6 +600,7 @@ pub(super) fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<Vecto
             k,
             candidates,
             search_mode,
+            query_policy,
             ..
         } => Some(VectorExplainShape {
             index: VectorIndexRef::new(table.clone(), column.clone()),
@@ -608,6 +610,7 @@ pub(super) fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<Vecto
                 .is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table)),
             candidates: candidates.as_deref(),
             search_mode: *search_mode,
+            query_policy: query_policy.as_ref(),
             query_expr,
         }),
         PhysicalPlan::Project { input, .. }

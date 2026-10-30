@@ -224,6 +224,7 @@ pub struct SelectBody {
     pub group_by: Vec<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub use_vector: Option<VectorSearchMode>,
+    pub vector_search_override: Option<VectorSearchOverride>,
     pub use_rank: Option<String>,
     pub limit: Option<u64>,
 }
@@ -526,6 +527,22 @@ pub enum AlterAction {
         /// `None` is the explicit `DEFAULT` spelling.
         flat_below: Option<String>,
     },
+    SetVectorSearch {
+        column: String,
+        search: Option<VectorSearchObjectives>,
+    },
+    SetVectorIvf {
+        column: String,
+        ivf: Option<VectorIvfOptions>,
+    },
+    SetVectorWith {
+        column: String,
+        policy: VectorEnginePolicyOptions,
+    },
+    ResetVectorWith {
+        column: String,
+        members: Vec<String>,
+    },
     SetVectorHnsw {
         column: String,
         /// `None` is `HNSW DEFAULT`; otherwise omitted members retain their
@@ -596,6 +613,9 @@ pub struct ColumnDef {
     pub auto_index_at: Option<String>,
     pub auto_expansion_ceiling: Option<String>,
     pub flat_below: Option<String>,
+    pub search: VectorSearchObjectives,
+    pub ivf: VectorIvfOptions,
+    pub engine_policy: VectorEnginePolicyOptions,
     pub hnsw: VectorHnswOptions,
     pub consolidation: VectorConsolidationOptions,
     pub rank_policy: Option<Box<RankPolicyAst>>,
@@ -738,4 +758,65 @@ pub struct Update {
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
+}
+
+/// Requested recall and the sizing hint for each declared partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorSearchObjectives {
+    pub target_accuracy: Option<VectorPolicyValue>,
+    pub expected_vectors: Option<VectorPolicyValue>,
+}
+/// Explicit clustered layout and query breadth declarations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorIvfOptions {
+    pub lists: Option<VectorPolicyValue>,
+    pub probes: Option<VectorPolicyValue>,
+    pub refine_factor: Option<VectorPolicyValue>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorPolicyListValue {
+    Default,
+    Values(Vec<String>),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorPolicyReferenceValue {
+    Default,
+    Reference { table: String, column: String },
+}
+/// WITH declarations retain omission separately from an explicit reset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorEnginePolicyOptions {
+    pub unknown_members: Vec<String>,
+    pub quantization: Option<Option<VectorQuantization>>,
+    pub calibration_max_k: Option<VectorPolicyValue>,
+    pub calibration_depths: Option<VectorPolicyListValue>,
+    pub probe_grid: Option<VectorPolicyValue>,
+    pub refine_factors: Option<VectorPolicyListValue>,
+    pub refine_growth: Option<VectorPolicyValue>,
+    pub calibration_samples: Option<VectorPolicyValue>,
+    pub calibration_queries: Option<VectorPolicyReferenceValue>,
+    pub min_lists: Option<VectorPolicyValue>,
+    pub vectors_per_list: Option<VectorPolicyValue>,
+    pub centroid_memory_percent: Option<VectorPolicyValue>,
+    pub training_samples: Option<VectorPolicyValue>,
+    pub training_iterations: Option<VectorPolicyValue>,
+    pub training_seed: Option<VectorPolicyValue>,
+    pub max_delta_runs: Option<VectorPolicyValue>,
+    pub write_buffer_bytes: Option<VectorPolicyValue>,
+    pub ingest_batch_keys: Option<VectorPolicyValue>,
+    pub coalesce_pages_per_step: Option<VectorPolicyValue>,
+    pub build_batch_entries: Option<VectorPolicyValue>,
+    pub remap_batch_entries: Option<VectorPolicyValue>,
+    pub directory_window_objects: Option<VectorPolicyValue>,
+    pub page_window_bytes: Option<VectorPolicyValue>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorSearchOverride {
+    Objectives {
+        target_accuracy: VectorPolicyValue,
+    },
+    Ivf {
+        probes: Option<VectorPolicyValue>,
+        refine_factor: Option<VectorPolicyValue>,
+    },
 }

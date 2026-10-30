@@ -546,6 +546,7 @@ impl ReadImageSource {
                 )),
                 physical_rows: Mutex::new(None),
                 image_config_cache: Mutex::new(HashMap::new()),
+                native_ivf_cache: Default::default(),
                 verified_ordered_runs: VerifiedOrderedRunCache::new(cache_memory),
                 _source_memory: self
                     .source_memory

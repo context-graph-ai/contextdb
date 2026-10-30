@@ -179,7 +179,7 @@ cosine_rhs = { row_vector_source | additive_expr }
 row_vector_source = { ^"ROW_VECTOR" ~ "(" ~ string ~ "," ~ string ~ "," ~ row_vector_key ~ ")" }
 row_vector_key = { parameter | bool_lit | float | integer | string }
 
-use_vector_clause = { ^"USE" ~ ^"VECTOR" ~ vector_search_mode }
+use_vector_clause = { ^"USE" ~ ^"VECTOR" ~ vector_search_mode ~ vector_query_options? }
 use_rank_clause = { ^"USE" ~ ^"RANK" ~ identifier }
 
 limit_clause = { ^"LIMIT" ~ integer }
@@ -251,7 +251,7 @@ alter_column_action = {
     ^"ALTER"
     ~ ^"COLUMN"
     ~ identifier
-    ~ (alter_column_set_max_partitions | alter_column_set_search_mode | alter_column_set_auto_index_at | alter_column_set_auto_expansion_ceiling | alter_column_set_flat_below | alter_column_set_hnsw | alter_column_set_consolidation)
+    ~ (alter_column_set_search | alter_column_set_ivf | alter_column_set_with | alter_column_reset_with | alter_column_set_max_partitions | alter_column_set_search_mode | alter_column_set_auto_index_at | alter_column_set_auto_expansion_ceiling | alter_column_set_flat_below | alter_column_set_hnsw | alter_column_set_consolidation)
 }
 alter_column_set_max_partitions = { ^"SET" ~ ^"MAX_PARTITIONS" ~ max_partitions_literal }
 alter_column_set_search_mode = { ^"SET" ~ ^"SEARCH_MODE" ~ vector_search_mode }
@@ -303,11 +303,25 @@ vector_type = {
     ~ vector_auto_expansion_ceiling_clause?
     ~ vector_flat_below_clause?
     ~ vector_hnsw_clause?
+    ~ vector_search_clause?
+    ~ vector_ivf_clause?
     ~ vector_consolidation_clause?
+    ~ vector_quantization_clause?
 }
-vector_quantization_clause = {
-    ^"WITH" ~ "(" ~ ^"quantization" ~ "=" ~ vector_quantization_value ~ ")"
-}
+vector_quantization_clause = { ^"WITH" ~ vector_policy_group }
+vector_search_clause = { ^"SEARCH" ~ vector_policy_group }
+vector_ivf_clause = { ^"IVF" ~ vector_policy_group }
+alter_column_set_search = { ^"SET" ~ ^"SEARCH" ~ (^"DEFAULT" | vector_policy_group) }
+alter_column_set_ivf = { ^"SET" ~ ^"IVF" ~ (^"DEFAULT" | vector_policy_group) }
+alter_column_set_with = { ^"SET" ~ ^"WITH" ~ vector_policy_group }
+alter_column_reset_with = { ^"RESET" ~ ^"WITH" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
+vector_query_options = { vector_policy_group }
+vector_policy_group = { "(" ~ vector_policy_member ~ ("," ~ vector_policy_member)* ~ ")" }
+vector_policy_member = { identifier ~ "=" ~ vector_engine_value }
+vector_engine_value = { vector_policy_list | vector_policy_reference | string | vector_policy_literal }
+vector_policy_list = { "[" ~ vector_policy_literal ~ ("," ~ vector_policy_literal)* ~ "]" }
+vector_policy_reference = { identifier ~ "." ~ identifier }
+vector_policy_literal = @{ ^"DEFAULT" | ("+" | "-")? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
 vector_quantization_value = @{ "'" ~ ("F32" | "SQ8" | "SQ4") ~ "'" }
 vector_partition_key_clause = {
     ^"PARTITION_KEY" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")"

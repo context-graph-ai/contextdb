@@ -419,6 +419,9 @@ fn content_size_result(
 }
 
 pub(crate) trait ReadExecutionTarget: Send + Sync {
+    fn has_native_ivf_source(&self) -> bool {
+        false
+    }
     #[cfg(any(test, feature = "test-seams"))]
     #[cfg_attr(
         any(test, feature = "test-seams"),
@@ -636,8 +639,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         plan: &PhysicalPlan,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<OwnedQueryResult> {
-        let _ = (plan, vector_copy_owner, read_memory);
+        let _ = (plan, vector_copy_owner, read_memory, checkpoint);
         Err(Error::PlanError(
             "bounded execution accepts read-only SELECT plans".to_string(),
         ))
@@ -1385,6 +1389,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         k: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
+        query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
         is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
         allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -1901,6 +1906,9 @@ impl BoundedCursorTarget {
 /// these questions.
 #[allow(clippy::too_many_arguments)]
 impl ReadExecutionTarget for Database {
+    fn has_native_ivf_source(&self) -> bool {
+        Database::has_native_ivf_source(self)
+    }
     #[cfg(any(test, feature = "test-seams"))]
     fn resident_history_database_for_test(&self) -> Result<&Database> {
         Ok(self)
@@ -2092,7 +2100,20 @@ impl ReadExecutionTarget for Database {
         plan: &PhysicalPlan,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<OwnedQueryResult> {
+        if matches!(
+            plan,
+            PhysicalPlan::ShowVectorIndexes | PhysicalPlan::ShowVectorPartitions { .. }
+        ) {
+            return execute_vector_inspection(
+                self,
+                plan,
+                vector_copy_owner,
+                read_memory.clone(),
+                checkpoint,
+            );
+        }
         // The same arms the uncapped path runs, asked of the same handle:
         // one implementation, so a budget read over a channel and the same
         // read against the file cannot drift apart.
@@ -2850,6 +2871,7 @@ impl ReadExecutionTarget for Database {
         k: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
+        query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
         is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
         allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -2870,6 +2892,7 @@ impl ReadExecutionTarget for Database {
             k,
             groups,
             mode,
+            query_breadth,
             is_reader_memory_refusal,
             allowed_search_limits,
             before_source_entry,
@@ -4030,6 +4053,8 @@ const VECTOR_INDEX_INSPECTION_COLUMNS: &[&str] = &[
     "broad_route_vectors_remaining",
     "broad_route_reason",
     "broad_route_recovery_action",
+    "recovery_action",
+    "state",
 ];
 
 const VECTOR_PARTITION_INSPECTION_COLUMNS: &[&str] = &[
@@ -4069,6 +4094,7 @@ const VECTOR_PARTITION_INSPECTION_COLUMNS: &[&str] = &[
     "desired_policy_revision",
     "serving_policy_revision",
     "recovery_action",
+    "state",
 ];
 
 fn vector_inspection_columns(columns: &[&str]) -> Vec<String> {
@@ -5349,6 +5375,12 @@ fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: old_consolidation_change_percent,
         consolidation_tombstone_percent: old_consolidation_tombstone_percent,
         consolidation_disabled: old_consolidation_disabled,
+        search_target_accuracy_hundredths: old_search_target_accuracy_hundredths,
+        search_expected_vectors: old_search_expected_vectors,
+        ivf_lists: old_ivf_lists,
+        ivf_probes: old_ivf_probes,
+        ivf_refine_factor_hundredths: old_ivf_refine_factor_hundredths,
+        vector_engine_policy: old_vector_engine_policy,
     } = old;
     let ColumnDef {
         name: new_name,
@@ -5379,8 +5411,20 @@ fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: new_consolidation_change_percent,
         consolidation_tombstone_percent: new_consolidation_tombstone_percent,
         consolidation_disabled: new_consolidation_disabled,
+        search_target_accuracy_hundredths: new_search_target_accuracy_hundredths,
+        search_expected_vectors: new_search_expected_vectors,
+        ivf_lists: new_ivf_lists,
+        ivf_probes: new_ivf_probes,
+        ivf_refine_factor_hundredths: new_ivf_refine_factor_hundredths,
+        vector_engine_policy: new_vector_engine_policy,
     } = new;
-    old_name == new_name
+    old_search_target_accuracy_hundredths == new_search_target_accuracy_hundredths
+        && old_search_expected_vectors == new_search_expected_vectors
+        && old_ivf_lists == new_ivf_lists
+        && old_ivf_probes == new_ivf_probes
+        && old_ivf_refine_factor_hundredths == new_ivf_refine_factor_hundredths
+        && old_vector_engine_policy == new_vector_engine_policy
+        && old_name == new_name
         && old_column_type == new_column_type
         && old_nullable == new_nullable
         && old_primary_key == new_primary_key
@@ -5439,6 +5483,12 @@ fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: _,
         consolidation_tombstone_percent: _,
         consolidation_disabled: _,
+        search_target_accuracy_hundredths: old_search_target_accuracy_hundredths,
+        search_expected_vectors: old_search_expected_vectors,
+        ivf_lists: old_ivf_lists,
+        ivf_probes: old_ivf_probes,
+        ivf_refine_factor_hundredths: old_ivf_refine_factor_hundredths,
+        vector_engine_policy: old_vector_engine_policy,
     } = old;
     let ColumnDef {
         name: new_name,
@@ -5469,8 +5519,20 @@ fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: _,
         consolidation_tombstone_percent: _,
         consolidation_disabled: _,
+        search_target_accuracy_hundredths: new_search_target_accuracy_hundredths,
+        search_expected_vectors: new_search_expected_vectors,
+        ivf_lists: new_ivf_lists,
+        ivf_probes: new_ivf_probes,
+        ivf_refine_factor_hundredths: new_ivf_refine_factor_hundredths,
+        vector_engine_policy: new_vector_engine_policy,
     } = new;
-    old_name == new_name
+    old_search_target_accuracy_hundredths == new_search_target_accuracy_hundredths
+        && old_search_expected_vectors == new_search_expected_vectors
+        && old_ivf_lists == new_ivf_lists
+        && old_ivf_probes == new_ivf_probes
+        && old_ivf_refine_factor_hundredths == new_ivf_refine_factor_hundredths
+        && old_vector_engine_policy == new_vector_engine_policy
+        && old_name == new_name
         && old_column_type == new_column_type
         && old_nullable == new_nullable
         && old_primary_key == new_primary_key
@@ -6182,6 +6244,20 @@ fn execute_alter_table_plan(
             set_vector_flat_below(&p.table, column, flat_below.as_deref(), &mut table_meta)?;
             validate_vector_partition_declarations(&p.table, &table_meta)?;
             vector_layout_update = Some(VectorIndexRef::new(p.table.clone(), column.clone()));
+            metadata_only_projection = Some((old_meta, table_meta));
+        }
+        AlterAction::SetVectorSearch { column, .. }
+        | AlterAction::SetVectorIvf { column, .. }
+        | AlterAction::SetVectorWith { column, .. }
+        | AlterAction::ResetVectorWith { column, .. } => {
+            let old_meta = db
+                .table_meta(&p.table)
+                .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table).into()))?;
+            refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+            let mut table_meta = old_meta.clone();
+            set_clustered_vector_policy(&p.table, &p.action, &mut table_meta)?;
+            validate_vector_partition_declarations(&p.table, &table_meta)?;
+            vector_layout_update = Some(VectorIndexRef::new(&p.table, column));
             metadata_only_projection = Some((old_meta, table_meta));
         }
         AlterAction::SetVectorHnsw { column, hnsw } => {
@@ -7016,6 +7092,7 @@ fn execute_plan_with_working_state(
             candidates,
             sort_key,
             search_mode,
+            query_policy,
             materialized_columns,
             ..
         }
@@ -7027,9 +7104,15 @@ fn execute_plan_with_working_state(
             candidates,
             sort_key,
             search_mode,
+            query_policy,
             materialized_columns,
             ..
         } => {
+            crate::database::vector_ivf::policy::validate_query(
+                table,
+                column,
+                query_policy.as_ref(),
+            )?;
             let snapshot = db.snapshot_for_read();
             let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
             let mut resolved_search_mode =
@@ -7039,6 +7122,24 @@ fn execute_plan_with_working_state(
             let partition_scope = route.scope;
             let complete_relational_route = route.complete;
             let access_candidates = route.candidates;
+            if db.has_native_ivf_source()
+                && tx.is_none()
+                && (complete_relational_route
+                    || (!route.access_filter
+                        && access_candidates
+                            .as_ref()
+                            .and_then(|plan| bounded::vector_row_filter(plan, table))
+                            .is_some()))
+            {
+                return execute_kernel_plan(
+                    db,
+                    plan,
+                    params,
+                    tx,
+                    read_memory.clone(),
+                    native_trace_refund,
+                );
+            }
             // Decide this before executing the candidate subtree.  Otherwise
             // INDEXED can quietly turn a broad WHERE clause into a table scan
             // and only then search the graph, despite promising a maintained
@@ -7932,79 +8033,8 @@ fn execute_plan_with_working_state(
                 cascade: None,
             }))
         }
-        PhysicalPlan::ShowVectorIndexes => {
-            let maintenance_policy = db.maintenance_policy();
-            let rows = db
-                .vector_inspection_infos(None, vector_copy_owner, read_memory.clone())?
-                .into_iter()
-                .map(|(declaration, info, partitions)| {
-                    vector_index_inspection_row(&declaration, info, &partitions, maintenance_policy)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(OwnedQueryResult::new(QueryResultData {
-                columns: vector_inspection_columns(VECTOR_INDEX_INSPECTION_COLUMNS),
-                rows,
-                rows_affected: 0,
-                trace: crate::database::QueryTrace::scan(),
-                cascade: None,
-            }))
-        }
-        PhysicalPlan::ShowVectorPartitions {
-            table,
-            column,
-            limit,
-            offset,
-        } => {
-            let target = match (table.as_deref(), column.as_deref()) {
-                (Some(table), Some(column)) => Some(VectorIndexRef::new(table, column)),
-                (Some(_), None) | (None, None) => None,
-                _ => {
-                    return Err(Error::PlanError(
-                        "vector partition inspection target requires both table and column"
-                            .to_owned(),
-                    ));
-                }
-            };
-            let maintenance_policy = db.maintenance_policy();
-            let mut rows = Vec::new();
-            for (declaration, info, partitions) in
-                db.vector_inspection_infos(target.as_ref(), vector_copy_owner, read_memory.clone())?
-            {
-                if table
-                    .as_deref()
-                    .is_some_and(|table| info.index.table != table)
-                {
-                    continue;
-                }
-                let partition_key_columns = declaration
-                    .partition_key_columns
-                    .as_deref()
-                    .unwrap_or_default();
-                for partition in partitions {
-                    rows.push(vector_partition_inspection_row(
-                        partition_key_columns,
-                        &info.layout,
-                        partition,
-                        maintenance_policy,
-                    )?);
-                }
-            }
-            let offset = match offset {
-                Some(value) => usize::try_from(*value).unwrap_or(usize::MAX),
-                None => 0,
-            };
-            let limit = match limit {
-                Some(value) => usize::try_from(*value).unwrap_or(usize::MAX),
-                None => usize::MAX,
-            };
-            let rows = rows.into_iter().skip(offset).take(limit).collect();
-            Ok(OwnedQueryResult::new(QueryResultData {
-                columns: vector_inspection_columns(VECTOR_PARTITION_INSPECTION_COLUMNS),
-                rows,
-                rows_affected: 0,
-                trace: crate::database::QueryTrace::scan(),
-                cascade: None,
-            }))
+        PhysicalPlan::ShowVectorIndexes | PhysicalPlan::ShowVectorPartitions { .. } => {
+            execute_vector_inspection(db, plan, vector_copy_owner, read_memory.clone(), &|| Ok(()))
         }
         PhysicalPlan::Pipeline(plans) => {
             let mut last = OwnedQueryResult::empty();
@@ -19218,6 +19248,12 @@ fn validate_vector_columns(
         if let contextdb_core::ColumnType::Vector(expected) = column.column_type
             && let Some(Value::Vector(vector)) = values.get(&column.name)
         {
+            if let Some(position) = vector.iter().position(|component| !component.is_finite()) {
+                return Err(Error::InvalidVectorValue {
+                    index: VectorIndexRef::new(table, &column.name),
+                    position,
+                });
+            }
             let got = vector.len();
             if got != expected {
                 return Err(vector_dimension_error(table, &column.name, expected, got));
@@ -19646,6 +19682,13 @@ fn coerce_vector_value(
             expected_dim,
             vector.len(),
         ));
+    }
+
+    if let Some(position) = vector.iter().position(|component| !component.is_finite()) {
+        return Err(Error::InvalidVectorValue {
+            index: VectorIndexRef::new(table, column),
+            position,
+        });
     }
 
     // A column declared with space-saving storage keeps an approximation, so
@@ -20219,8 +20262,14 @@ fn column_def_matches_canonical(
         context_id,
         scope_label,
         acl_ref,
+        search: candidate_search,
+        ivf: candidate_ivf,
+        engine_policy: candidate_engine_policy,
     } = candidate;
-    *name == canonical.name
+    candidate_search == &canonical.search
+        && candidate_ivf == &canonical.ivf
+        && candidate_engine_policy == &canonical.engine_policy
+        && *name == canonical.name
         && *data_type == canonical.data_type
         && *nullable == canonical.nullable
         && *primary_key == canonical.primary_key
@@ -21707,7 +21756,13 @@ pub(crate) fn core_column_from_ast(
         consolidation_tombstone_percent,
         consolidation_disabled,
     ) = normalized_ast_vector_declaration(table, col)?;
-    Ok(contextdb_core::ColumnDef {
+    let mut result = contextdb_core::ColumnDef {
+        search_target_accuracy_hundredths: Default::default(),
+        search_expected_vectors: Default::default(),
+        ivf_lists: Default::default(),
+        ivf_probes: Default::default(),
+        ivf_refine_factor_hundredths: Default::default(),
+        vector_engine_policy: Default::default(),
         name: col.name.clone(),
         column_type: map_column_type(&col.data_type),
         // SQL primary-key columns are implicitly NOT NULL even when the
@@ -21772,13 +21827,19 @@ pub(crate) fn core_column_from_ast(
         consolidation_change_percent,
         consolidation_tombstone_percent,
         consolidation_disabled,
-    })
+    };
+    crate::database::vector_ivf::policy::from_ast(table, &mut result, col)?;
+    Ok(result)
 }
 
 fn ast_column_from_core(col: contextdb_core::ColumnDef) -> contextdb_parser::ast::ColumnDef {
+    let (search, ivf, engine_policy) = crate::database::vector_ivf::policy::to_ast(&col);
     let is_vector = matches!(&col.column_type, ColumnType::Vector(_));
     let effective_max_partitions = col.effective_max_partitions();
     contextdb_parser::ast::ColumnDef {
+        search,
+        ivf,
+        engine_policy,
         name: col.name,
         data_type: match col.column_type {
             ColumnType::Uuid => DataType::Uuid,
@@ -22271,6 +22332,7 @@ pub(crate) fn validate_create_table_vector_declarations(
 )]
 pub(crate) fn validate_vector_partition_declarations(table: &str, meta: &TableMeta) -> Result<()> {
     for vector in &meta.columns {
+        crate::database::vector_ivf::policy::validate(table, vector)?;
         if !matches!(vector.column_type, ColumnType::Vector(_)) {
             if vector.partition_key_columns.is_some()
                 || vector.max_partitions.is_some()
@@ -23224,6 +23286,9 @@ fn project_graph_frontier_rows(
 }
 
 impl ReadExecutionTarget for BoundedCursorTarget {
+    fn has_native_ivf_source(&self) -> bool {
+        self.store.has_native_ivf_source()
+    }
     #[cfg(any(test, feature = "test-seams"))]
     fn resident_history_database_for_test(&self) -> Result<&Database> {
         self.store.resident_history_database_for_test()
@@ -23328,9 +23393,10 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         plan: &PhysicalPlan,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<OwnedQueryResult> {
         self.store
-            .store_state_answer(plan, vector_copy_owner, read_memory.clone())
+            .store_state_answer(plan, vector_copy_owner, read_memory.clone(), checkpoint)
     }
 
     fn explain_plan_without_running_it(
@@ -24062,6 +24128,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         k: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
+        query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
         is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
         allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -24081,6 +24148,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             k,
             groups,
             mode,
+            query_breadth,
             is_reader_memory_refusal,
             allowed_search_limits,
             before_source_entry,
@@ -24941,3 +25009,212 @@ mod tie_comparison_admission_tests;
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "executor/writecost_missing_index_tests.rs"]
 mod writecost_missing_index_tests;
+
+pub(crate) fn set_clustered_vector_policy(
+    table: &str,
+    action: &AlterAction,
+    meta: &mut TableMeta,
+) -> Result<()> {
+    use crate::database::vector_ivf::policy;
+    let (AlterAction::SetVectorSearch { column, .. }
+    | AlterAction::SetVectorIvf { column, .. }
+    | AlterAction::SetVectorWith { column, .. }
+    | AlterAction::ResetVectorWith { column, .. }) = action
+    else {
+        unreachable!("clustered policy action")
+    };
+    let col = meta
+        .columns
+        .iter_mut()
+        .find(|c| &c.name == column)
+        .ok_or_else(|| Error::Other(format!("column '{column}' not found").into()))?;
+    if !matches!(col.column_type, ColumnType::Vector(_)) {
+        return Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
+        ));
+    }
+    let before = col.clone();
+    match action {
+        AlterAction::SetVectorSearch { search, .. } => {
+            policy::apply_search(table, col, search.as_ref())?
+        }
+        AlterAction::SetVectorIvf { ivf, .. } => policy::apply_ivf(table, col, ivf.as_ref())?,
+        AlterAction::SetVectorWith { policy: with, .. } => policy::apply_with(table, col, with)?,
+        AlterAction::ResetVectorWith { members, .. } => policy::reset_with(table, col, members)?,
+        _ => unreachable!(),
+    }
+    if *col != before {
+        col.vector_policy_revision = next_vector_policy_revision(col.vector_policy_revision)
+            .ok_or_else(|| Error::Other("vector policy revision overflow".into()))?;
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve the existing inline native refusal without allocating an error."
+)]
+fn execute_vector_inspection(
+    db: &Database,
+    plan: &PhysicalPlan,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<OwnedQueryResult> {
+    match plan {
+        PhysicalPlan::ShowVectorIndexes => {
+            checkpoint()?;
+            let maintenance_policy = db.maintenance_policy();
+            let rows = db
+                .vector_inspection_infos(None, vector_copy_owner, read_memory.clone())?
+                .into_iter()
+                .map(|(declaration, info, partitions)| {
+                    let mut recovery = "none";
+                    let mut state = None;
+                    for partition in &partitions {
+                        if let Some(native) = db.native_ivf_inspection(
+                            &partition.partition.index,
+                            &partition.partition.partition_key,
+                            read_memory.clone(),
+                            checkpoint,
+                        )? {
+                            if native.recovery_action() == "rebuild" {
+                                recovery = "rebuild";
+                            }
+                            if let Some(note) = native.state() {
+                                if state.is_none() || note != "recorded" {
+                                    state = Some(note);
+                                }
+                            }
+                        }
+                    }
+                    let mut row = vector_index_inspection_row(
+                        &declaration,
+                        info,
+                        &partitions,
+                        maintenance_policy,
+                    )?;
+                    row.push(Value::Text(recovery.into()));
+                    row.push(state.map_or(Value::Null, |state| Value::Text(state.into())));
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(OwnedQueryResult::new(QueryResultData {
+                columns: vector_inspection_columns(VECTOR_INDEX_INSPECTION_COLUMNS),
+                rows,
+                rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
+            }))
+        }
+        PhysicalPlan::ShowVectorPartitions {
+            table,
+            column,
+            limit,
+            offset,
+        } => {
+            let target = match (table.as_deref(), column.as_deref()) {
+                (Some(table), Some(column)) => Some(VectorIndexRef::new(table, column)),
+                (Some(_), None) | (None, None) => None,
+                _ => {
+                    return Err(Error::PlanError(
+                        "vector partition inspection target requires both table and column"
+                            .to_owned(),
+                    ));
+                }
+            };
+            checkpoint()?;
+            let maintenance_policy = db.maintenance_policy();
+            let mut rows = Vec::new();
+            for (declaration, info, partitions) in
+                db.vector_inspection_infos(target.as_ref(), vector_copy_owner, read_memory.clone())?
+            {
+                if table
+                    .as_deref()
+                    .is_some_and(|table| info.index.table != table)
+                {
+                    continue;
+                }
+                let partition_key_columns = declaration
+                    .partition_key_columns
+                    .as_deref()
+                    .unwrap_or_default();
+                for partition in partitions {
+                    let native = db.native_ivf_inspection(
+                        &partition.partition.index,
+                        &partition.partition.partition_key,
+                        read_memory.clone(),
+                        checkpoint,
+                    )?;
+                    let mut row = vector_partition_inspection_row(
+                        partition_key_columns,
+                        &info.layout,
+                        partition,
+                        maintenance_policy,
+                    )?;
+                    if let Some(native) = native {
+                        let position = |name: &str| {
+                            VECTOR_PARTITION_INSPECTION_COLUMNS
+                                .iter()
+                                .position(|column| *column == name)
+                                .expect("declared inspection column")
+                        };
+                        row[position("recovery_action")] =
+                            Value::Text(native.recovery_action().into());
+                        row[position("availability_reason")] = native.state().map_or_else(
+                            || Value::Text("none".into()),
+                            |state| Value::Text(state.into()),
+                        );
+                        row[position("query_state")] = Value::Text(
+                            if native.recovery_action() == "rebuild" {
+                                "unavailable"
+                            } else if native
+                                .manifest
+                                .is_some_and(|manifest| manifest.active_lists != 0)
+                            {
+                                "ready"
+                            } else {
+                                "exact"
+                            }
+                            .into(),
+                        );
+                        row[position("base_generation")] = native
+                            .manifest
+                            .map(|manifest| {
+                                vector_inspection_u64(manifest.generation, "base_generation")
+                            })
+                            .transpose()?
+                            .unwrap_or(Value::Null);
+                    }
+                    row.push(
+                        native
+                            .and_then(|native| native.state())
+                            .map_or(Value::Null, |state| Value::Text(state.into())),
+                    );
+                    rows.push(row);
+                }
+            }
+            let offset = match offset {
+                Some(value) => usize::try_from(*value).unwrap_or(usize::MAX),
+                None => 0,
+            };
+            let limit = match limit {
+                Some(value) => usize::try_from(*value).unwrap_or(usize::MAX),
+                None => usize::MAX,
+            };
+            let rows = rows.into_iter().skip(offset).take(limit).collect();
+            Ok(OwnedQueryResult::new(QueryResultData {
+                columns: vector_inspection_columns(VECTOR_PARTITION_INSPECTION_COLUMNS),
+                rows,
+                rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
+            }))
+        }
+        _ => Err(Error::PlanError(
+            "vector inspection requires a vector SHOW plan".into(),
+        )),
+    }
+}

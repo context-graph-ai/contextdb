@@ -270,3 +270,7 @@ pub mod read_content_test_adapter;
 pub fn page_cache_floor_bytes() -> usize {
     crate::persistence::REDB_CACHE_FLOOR_BYTES
 }
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod vector_ivf_observations;

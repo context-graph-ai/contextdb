@@ -52,3 +52,6 @@ pub use page_store::CheckedWriterBackendForTest;
 
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 pub use page_store::CachePressureFixtureForTest;
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) use page_store::native_dirty_page_layout;

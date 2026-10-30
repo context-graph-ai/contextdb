@@ -12,6 +12,8 @@ struct ReserveBlock {
     reserve: Option<ControlCredit>,
     control: Option<ControlCredit>,
     writer: Option<WriterUse>,
+    #[cfg(feature = "test-seams")]
+    observation: Option<redb::native_page_observations::NativeFixedReserveObservationForTest>,
 }
 unsafe fn retain(raw: NonNull<()>) {
     unsafe { raw.cast::<ReserveBlock>().as_ref() }
@@ -27,6 +29,9 @@ struct ReserveFree {
     _reserve: Option<ControlCredit>,
     _control: Option<ControlCredit>,
     _writer: Option<WriterUse>,
+    // Last: genuine reserve/control/writer fields settle before this notification.
+    #[cfg(feature = "test-seams")]
+    _observation: Option<redb::native_page_observations::NativeFixedReserveObservationForTest>,
 }
 impl Drop for ReserveFree {
     fn drop(&mut self) {
@@ -49,6 +54,8 @@ unsafe fn finish(raw: NonNull<()>) {
         _reserve: block.reserve.take(),
         _control: block.control.take(),
         _writer: block.writer.take(),
+        #[cfg(feature = "test-seams")]
+        _observation: block.observation.take(),
     };
     unsafe { std::ptr::drop_in_place(pointer.as_ptr()) };
 }
@@ -86,6 +93,31 @@ pub(super) fn original(
     } else {
         ControlCredit::retained_startup(accountant, layout.size())
     };
+    #[cfg(feature = "test-seams")]
+    let observation_facts = {
+        let bytes = reserve
+            .observation_for_test()
+            .1
+            .checked_add(control.observation_for_test().1)
+            .ok_or_else(|| {
+                Error::NativeEngineOther(contextdb_core::read_memory::NativeRefusal::Other(
+                    "fixed cache reserve observation byte total overflow",
+                ))
+            })?;
+        let funding = reserve.funding_for_test().ok_or_else(|| {
+            Error::NativeEngineOther(contextdb_core::read_memory::NativeRefusal::Other(
+                "fixed cache reserve has no genuine funder",
+            ))
+        })?;
+        if control.funding_for_test() != Some(funding) {
+            return Err(Error::NativeEngineOther(
+                contextdb_core::read_memory::NativeRefusal::Other(
+                    "fixed cache reserve and control have different funders",
+                ),
+            ));
+        }
+        (bytes, funding.0, funding.1)
+    };
     let writer = WriterUse::retain_if_writer(accountant);
     let Some(pointer) = NonNull::new(unsafe { alloc(layout) }.cast::<ReserveBlock>()) else {
         return Err(Error::Other(
@@ -98,8 +130,22 @@ pub(super) fn original(
             reserve: Some(reserve),
             control: Some(control),
             writer,
+            #[cfg(feature = "test-seams")]
+            observation: None,
         })
     };
+    #[cfg(feature = "test-seams")]
+    unsafe {
+        (*pointer.as_ptr()).observation = Some(
+            redb::native_page_observations::observe_fixed_reserve_for_test(
+                pointer.as_ptr() as usize,
+                observation_facts.1,
+                observation_facts.2,
+                observation_facts.0,
+                layout,
+            ),
+        );
+    }
     #[cfg(test)]
     LAST_RESERVE.with(|slot| slot.set(pointer.as_ptr() as usize));
     // SAFETY: immutable original receipts and held writer use are Send + Sync;

@@ -10,6 +10,10 @@ pub struct WriterQueryWork {
     pub history: WriterHistoryWork,
     pub saved_graph_loads: u64,
     pub saved_graph_bytes: u64,
+    #[cfg(any(test, feature = "test-seams"))]
+    pub saved_generation_loads: u64,
+    #[cfg(any(test, feature = "test-seams"))]
+    pub saved_generation_bytes: u64,
     pub constraint_staged_rows_examined: u64,
     pub constraint_postings_examined: u64,
     pub captured_read_snapshot: Option<u64>,
@@ -94,6 +98,8 @@ pub fn observe<T>(operation: impl FnOnce() -> T) -> (T, WriterQueryWork) {
     let counters = WORK.with(|work| work.get().expect("observation remains installed"));
     #[cfg(any(test, feature = "test-seams"))]
     let counters = WriterQueryWork {
+        saved_generation_loads: counters.saved_graph_loads,
+        saved_generation_bytes: counters.saved_graph_bytes,
         history: WriterHistoryWork {
             allocator_regions_loaded: regions,
             ..counters.history
@@ -488,4 +494,10 @@ pub(crate) fn note_erasure_frontier_probe() {
             work.set(Some(counters));
         }
     });
+}
+
+/// The same engine-library worker identity used by ownership receipts.
+#[cfg(feature = "test-seams")]
+pub fn current_owned_worker_thread_id_for_test() -> String {
+    format!("{:?}", crate::owned_worker::current_thread_id())
 }

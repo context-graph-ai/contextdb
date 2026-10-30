@@ -2271,6 +2271,12 @@ pub(super) fn vector_min_max(vector: &[f32]) -> (f32, f32) {
 impl From<LegacyColumnDefV1> for contextdb_core::ColumnDef {
     fn from(legacy: LegacyColumnDefV1) -> Self {
         contextdb_core::ColumnDef {
+            search_target_accuracy_hundredths: None,
+            search_expected_vectors: None,
+            ivf_lists: None,
+            ivf_probes: None,
+            ivf_refine_factor_hundredths: None,
+            vector_engine_policy: Default::default(),
             name: legacy.name,
             column_type: legacy.column_type,
             nullable: legacy.nullable,

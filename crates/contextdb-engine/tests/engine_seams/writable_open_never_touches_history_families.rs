@@ -324,7 +324,7 @@ fn prepare_sidecars(path: &Path, n: usize) {
     let ddl_since = source.current_lsn();
     for ordinal in 0..n / 4 {
         let ddl = format!(
-            "ALTER TABLE items ALTER COLUMN v SET HNSW (EF_SEARCH = {})",
+            "ALTER TABLE items ALTER COLUMN v SET SEARCH (TARGET_ACCURACY = {})",
             32 + ordinal
         );
         exec(&db, &ddl);

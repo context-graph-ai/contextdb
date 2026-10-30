@@ -2733,6 +2733,7 @@ impl OwnerReadService {
         mut query_control: Option<ReadShared<QueryIngress>>,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<CompletedOwnerRequest> {
+        let _native_selection = crate::database::vector_ivf::ReadOnlySelection::enter();
         // ROWS come from the handle this connection declared itself into, so
         // every statement it runs -- of every shape -- and every page of every
         // cursor it opens meets the same row gate. Nothing here inspects the

@@ -59,3 +59,14 @@ pub mod observations;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub use memory_budget::observe_copy_reservations_for_test;
+
+#[doc(hidden)]
+pub mod ivf;
+
+#[cfg(feature = "test-seams")]
+mod build_observation;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use build_observation::{
+    NativeIndexActivityScopeForTest, VectorBuildObserver, with_vector_build_observer,
+};

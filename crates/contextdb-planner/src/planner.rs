@@ -521,6 +521,7 @@ fn plan_select_body(
             candidates: Some(Box::new(current)),
             sort_key: body.use_rank.clone(),
             search_mode: body.use_vector,
+            query_policy: body.vector_search_override.clone(),
             materialized_columns: selected_row_columns(&body.columns),
         };
     }

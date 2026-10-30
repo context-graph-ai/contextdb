@@ -85,6 +85,16 @@ pub(crate) struct TableTree {
 }
 
 impl TableTree {
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn release_optional_root_cache(&mut self) {
+        if self.mem.installed_cache_capacity() == 0 {
+            // The immutable root identity and transaction guard remain held.
+            // Later accesses verify and read that same root on demand.
+            self.tree.release_cached_root();
+            self.prepared_root = None;
+        }
+    }
+
     pub(crate) fn root(&self) -> Option<BtreeHeader> {
         self.tree.get_root()
     }

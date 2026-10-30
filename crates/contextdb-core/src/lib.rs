@@ -39,3 +39,5 @@ pub use table_meta::{
 };
 pub use traits::*;
 pub use types::*;
+
+pub use table_meta::{VectorCalibrationSource, VectorEnginePolicy};

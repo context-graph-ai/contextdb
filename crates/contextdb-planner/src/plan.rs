@@ -46,6 +46,7 @@ pub enum PhysicalPlan {
         candidates: Option<Box<PhysicalPlan>>,
         sort_key: Option<String>,
         search_mode: Option<VectorSearchMode>,
+        query_policy: Option<contextdb_parser::ast::VectorSearchOverride>,
         /// Columns whose row values the outer SELECT actually reads. `None`
         /// means `SELECT *`; an empty vector means the search answer needs no
         /// stored row value beyond its synthetic row id and score.
@@ -59,6 +60,7 @@ pub enum PhysicalPlan {
         candidates: Option<Box<PhysicalPlan>>,
         sort_key: Option<String>,
         search_mode: Option<VectorSearchMode>,
+        query_policy: Option<contextdb_parser::ast::VectorSearchOverride>,
         materialized_columns: Option<Vec<String>>,
     },
     /// Assigns one-based INT64 rank after its input predicates, before projection.

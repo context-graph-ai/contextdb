@@ -4544,6 +4544,9 @@ enum SnapshotPinSlot {
 /// once the window has passed -- see [`CursorIdleWindow`].
 struct RegisteredSnapshot {
     snapshot: SnapshotId,
+    /// An explicit pin's existing physical root. The pin keeps the strong
+    /// holder; this weak counted reference adds no second page ownership.
+    native_root: Option<crate::persistence::WriterSnapshotWeak>,
     /// SQL statements own the rows they scan before completing the rest of
     /// their read, so retention does not let a continuous stream of those
     /// short-lived registrations pin every expired row. Reader-held
@@ -10496,6 +10499,9 @@ mod authoritative_purge_kernel;
 mod bounded_reads;
 
 mod maintenance_and_limits;
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use maintenance_and_limits::MaintenancePruningMutexEventForTest;
 
 mod sync_outbound;
 
@@ -10528,6 +10534,7 @@ struct VectorExplainShape<'a> {
     restricted_candidates: bool,
     candidates: Option<&'a PhysicalPlan>,
     search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+    query_policy: Option<&'a contextdb_parser::ast::VectorSearchOverride>,
     query_expr: &'a Expr,
 }
 
@@ -10924,3 +10931,5 @@ mod last_handle_release_tests;
 
 #[cfg(all(test, feature = "test-seams", target_os = "linux"))]
 mod coexistence_guards;
+
+pub(crate) mod vector_ivf;

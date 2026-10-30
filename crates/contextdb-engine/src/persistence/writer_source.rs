@@ -284,6 +284,7 @@ pub(crate) struct WriterSnapshot {
     pub(crate) lsn: Lsn,
     accountant: crate::memory_accounting::AccountantHandle,
     _control: WriterSnapshotControl,
+    pub(crate) native_ivf_cache: super::vector_ivf::NativeIvfCache,
     erasure: parking_lot::RwLock<WriterErasure>,
     schema: Arc<WriterSchema>,
     registry: Arc<parking_lot::Mutex<Vec<WriterSnapshotWeak>>>,
@@ -315,7 +316,10 @@ pub(crate) struct PreparedWriterSnapshot {
     root: WriterSnapshotHandle,
 }
 impl PreparedWriterSnapshot {
-    pub(crate) fn activate(self, read: Arc<redb::ReadTransaction>) -> WriterSnapshotHandle {
+    pub(crate) fn activate(self, mut read: Arc<redb::ReadTransaction>) -> WriterSnapshotHandle {
+        Arc::get_mut(&mut read)
+            .expect("prepared read remains private until activation")
+            .release_optional_root_cache();
         // The read slot is private and empty until the actual lower receipt is
         // durable. The external invoice is already owned by the paired handle.
         // These moves have no allocation, provider or storage call.
@@ -694,7 +698,30 @@ impl RedbPersistence {
 
     pub(crate) fn complete_writer_schema_change(&self, schema: Option<Arc<WriterSchema>>) {
         if let Some(schema) = schema {
-            let prior = self.writer_schema.lock().replace(schema);
+            let prior = self.writer_schema.lock().replace(schema.clone());
+            if let Some(prior) = &prior {
+                for (table, old) in &prior.tables {
+                    for column in &old.meta.columns {
+                        if !matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) {
+                            continue;
+                        }
+                        let successor = schema.tables.get(table).and_then(|next| {
+                            next.meta
+                                .columns
+                                .iter()
+                                .find(|next| next.name == column.name)
+                        });
+                        if successor.is_none_or(|next| {
+                            next.column_type != column.column_type
+                                || next.quantization != column.quantization
+                                || next.partition_key_columns != column.partition_key_columns
+                        }) {
+                            self.native_ivf_cache
+                                .forget_retained_index_name(table, &column.name);
+                        }
+                    }
+                }
+            }
             drop(prior);
         }
     }
@@ -942,6 +969,7 @@ impl RedbPersistence {
                 lsn,
                 accountant,
                 _control: WriterSnapshotControl::empty(),
+                native_ivf_cache: self.native_ivf_cache.fork(),
                 erasure: parking_lot::RwLock::new(WriterErasure::default()),
                 schema,
                 registry: Arc::clone(&self.writer_snapshots),
@@ -1187,7 +1215,7 @@ impl RedbPersistence {
         })?;
         self.with_db(|db| {
             db.install_local_snapshot_provider(self.writer_root_provider());
-            let read = Arc::new(db.begin_verified_read().map_err(Self::storage_error)?);
+            let mut read = db.begin_verified_read().map_err(Self::storage_error)?;
             let identity = read.storage_snapshot_identity();
             // The scalar fact is captured from this exact immutable root during
             // publication, never inferred from a newer writer or resident image.
@@ -1200,6 +1228,8 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(error) => return Err(Self::storage_error(error)),
             };
+            read.release_optional_root_cache();
+            let read = Arc::new(read);
             let root = Arc::new(WriterSnapshot {
                 read: parking_lot::RwLock::new(Some(read)),
                 identity,
@@ -1209,6 +1239,7 @@ impl RedbPersistence {
                 lsn,
                 accountant,
                 _control: WriterSnapshotControl::from_owned(control),
+                native_ivf_cache: self.native_ivf_cache.fork(),
                 erasure: parking_lot::RwLock::new(WriterErasure::default()),
                 schema,
                 registry: Arc::clone(&self.writer_snapshots),
@@ -1246,7 +1277,7 @@ impl RedbPersistence {
         })?;
         self.with_db(|db| {
             db.install_local_snapshot_provider(self.writer_root_provider());
-            let read = Arc::new(db.begin_verified_read().map_err(Self::storage_error)?);
+            let mut read = db.begin_verified_read().map_err(Self::storage_error)?;
             let identity = read.storage_snapshot_identity();
             // The scalar fact is captured from this exact immutable root during
             // publication, never inferred from a newer writer or resident image.
@@ -1259,6 +1290,8 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(error) => return Err(Self::storage_error(error)),
             };
+            read.release_optional_root_cache();
+            let read = Arc::new(read);
             let root = WriterSnapshotHandle::native(
                 WriterSnapshot {
                     read: parking_lot::RwLock::new(Some(read)),
@@ -1269,6 +1302,7 @@ impl RedbPersistence {
                     lsn,
                     accountant,
                     _control: WriterSnapshotControl::empty(),
+                    native_ivf_cache: self.native_ivf_cache.fork(),
                     erasure: parking_lot::RwLock::new(WriterErasure::default()),
                     schema,
                     registry: Arc::clone(&self.writer_snapshots),
@@ -1829,10 +1863,13 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
+    pub(crate) fn check_table_entitlement(&self, table: &str) -> Result<()> {
         self.erasure
             .read()
-            .check_scope(Some(table), "ACL entitlement")?;
+            .check_scope(Some(table), "ACL entitlement")
+    }
+    pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
+        self.check_table_entitlement(table)?;
         RedbPersistence::verify_history_root(
             self.owner_read()?.as_ref(),
             &RedbPersistence::rel_table_name(table),

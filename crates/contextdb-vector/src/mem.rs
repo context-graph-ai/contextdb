@@ -2313,6 +2313,35 @@ impl BoundedVectorCandidateGroups {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn native_snapshot(&self) -> SnapshotId {
+        self.snapshot
+    }
+
+    /// Borrow the exact captured tuple and its already admitted eligibility
+    /// window for a native maintained search. No body or newer state is loaded.
+    #[doc(hidden)]
+    pub fn visit_native_partitions<E>(
+        &self,
+        mut visit: impl FnMut(&VectorPartitionKey, Option<&[u64]>, usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for source in &self.sources {
+            if source.allowed_count == 0 {
+                continue;
+            }
+            visit(
+                &source.partition_key,
+                if source.candidate_ids_cover_all_live {
+                    None
+                } else {
+                    source.candidate_ids.as_deref()
+                },
+                source.allowed_count,
+            )?;
+        }
+        Ok(())
+    }
+
     /// AUTO's statement cost over the exact snapshot sources this grouped
     /// search owns: the one pricing the executor routes by, so a passive
     /// EXPLAIN holding the same groups predicts the route it takes.
@@ -2482,6 +2511,16 @@ impl BoundedVectorSearchTrace {
     /// `retained_bytes`.
     pub fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Wrap the exact trace and the byte credit already held by the shared
+    /// execution kernel. The native caller admits every buffer before allocation.
+    #[doc(hidden)]
+    pub fn from_prepaid(trace: VectorSearchDebugTrace, retained_bytes: usize) -> Self {
+        Self {
+            trace,
+            retained_bytes,
+        }
     }
 
     pub fn partition_routes(&self) -> &[VectorPartitionSearchTrace] {
@@ -9725,7 +9764,7 @@ mod route_cost_tests {
     /// frozen multi-Context cell selects three Contexts of 1,250 live rows,
     /// half of them current: there the walk scored 1,866.9 of the 1,875
     /// current rows per query (mean) and answered at 44.7 ms p95 against
-    /// EXACT's 22.8 ms, paired and interleaved (debug build, ms-a2,
+    /// EXACT's 22.8 ms, paired and interleaved (debug build,
     /// `indexed_route_does_less_work_than_exact`). AUTO must compare those
     /// rows outright, while the same three partitions with no filter are
     /// still walked.

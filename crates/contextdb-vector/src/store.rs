@@ -103,6 +103,10 @@ pub struct VectorPassiveActivityCounters {
     pub sealed_generation_loads: u64,
     pub hnsw_builds: u64,
     pub hnsw_repairs_or_compactions: u64,
+    /// Actual legacy constructions plus native candidate constructions.
+    pub index_builds: u64,
+    /// Actual legacy repairs plus native coalescing/remap steps.
+    pub index_repairs_or_compactions: u64,
     pub raw_partition_evictions: u64,
     pub sealed_generation_evictions: u64,
 }
@@ -187,6 +191,8 @@ struct VectorPassiveActivity {
     sealed_generation_loads: AtomicU64,
     hnsw_builds: AtomicU64,
     hnsw_repairs_or_compactions: AtomicU64,
+    native_builds: AtomicU64,
+    native_rewrites: AtomicU64,
     raw_partition_evictions: AtomicU64,
     sealed_generation_evictions: AtomicU64,
 }
@@ -194,6 +200,8 @@ struct VectorPassiveActivity {
 #[cfg(any(test, feature = "test-seams"))]
 impl VectorPassiveActivity {
     fn snapshot(&self) -> VectorPassiveActivityCounters {
+        let legacy_builds = self.hnsw_builds.load(Ordering::SeqCst);
+        let legacy_rewrites = self.hnsw_repairs_or_compactions.load(Ordering::SeqCst);
         VectorPassiveActivityCounters {
             raw_partition_loads: self.raw_partition_loads.load(Ordering::SeqCst),
             whole_entry_slice_requests: self.whole_entry_slice_requests.load(Ordering::SeqCst),
@@ -205,11 +213,27 @@ impl VectorPassiveActivity {
                 .raw_candidate_point_body_bytes
                 .load(Ordering::SeqCst),
             sealed_generation_loads: self.sealed_generation_loads.load(Ordering::SeqCst),
-            hnsw_builds: self.hnsw_builds.load(Ordering::SeqCst),
-            hnsw_repairs_or_compactions: self.hnsw_repairs_or_compactions.load(Ordering::SeqCst),
+            hnsw_builds: legacy_builds,
+            hnsw_repairs_or_compactions: legacy_rewrites,
+            index_builds: legacy_builds
+                .checked_add(self.native_builds.load(Ordering::SeqCst))
+                .expect("vector construction observation count overflow"),
+            index_repairs_or_compactions: legacy_rewrites
+                .checked_add(self.native_rewrites.load(Ordering::SeqCst))
+                .expect("vector rewrite observation count overflow"),
             raw_partition_evictions: self.raw_partition_evictions.load(Ordering::SeqCst),
             sealed_generation_evictions: self.sealed_generation_evictions.load(Ordering::SeqCst),
         }
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl crate::build_observation::NativeIndexActivity for VectorPassiveActivity {
+    fn before_build(&self) {
+        self.native_builds.fetch_add(1, Ordering::SeqCst);
+    }
+    fn before_rewrite(&self) {
+        self.native_rewrites.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -639,6 +663,11 @@ pub struct VectorGraphGeneration {
     pub hnsw_ef_construction: u32,
 }
 
+/// The exact generation element used by the existing directory-layout witness.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub type VectorIndexGeneration = VectorGraphGeneration;
+
 /// What a store consumer may inspect without borrowing a graph.  In
 /// particular, inspection never forces a lazy graph to load or decode.
 #[doc(hidden)]
@@ -791,7 +820,61 @@ impl VectorMaintenanceFailureDetails {
             "read_vector_generation_source_page" => "read_vector_generation_source_page",
             "inspect_vector_generation_inventory" => "inspect_vector_generation_inventory",
             "prepare_hnsw_tail" => "prepare_hnsw_tail",
+            "clustered_calibration_capture" => "clustered_calibration_capture",
+            "clustered_calibration_dependency" => "clustered_calibration_dependency",
+            "clustered_calibration_metadata_control" => "clustered_calibration_metadata_control",
+            "clustered_calibration_query_identity" => "clustered_calibration_query_identity",
+            "clustered_calibration_query_output" => "clustered_calibration_query_output",
+            "clustered_calibration_sample_page" => "clustered_calibration_sample_page",
+            "clustered_calibration_source" => "clustered_calibration_source",
+            "clustered_calibration_source_range" => "clustered_calibration_source_range",
+            "clustered_calibration_source_route" => "clustered_calibration_source_route",
+            "clustered_candidate_verification_window" => "clustered_candidate_verification_window",
+            "clustered_canonical_visit" => "clustered_canonical_visit",
+            "clustered_codebook" => "clustered_codebook",
+            "clustered_descriptor_window" => "clustered_descriptor_window",
+            "clustered_erasure_controls" => "clustered_erasure_controls",
+            "clustered_erasure_slot_input" => "clustered_erasure_slot_input",
+            "clustered_layout" => "clustered_layout",
+            "clustered_manifest" => "clustered_manifest",
+            "clustered_native_seal" => "clustered_native_seal",
+            "clustered_outer_write" => "clustered_outer_write",
+            "clustered_qualification_record" => "clustered_qualification_record",
+            "clustered_qualification_selection" => "clustered_qualification_selection",
+            "clustered_query" => "clustered_query",
+            "clustered_retained_codebook" => "clustered_retained_codebook",
+            "clustered_retained_control" => "clustered_retained_control",
+            "clustered_retained_directory" => "clustered_retained_directory",
+            "clustered_retained_registry" => "clustered_retained_registry",
+            "clustered_retained_stage" => "clustered_retained_stage",
+            "clustered_served_depth" => "clustered_served_depth",
+            "clustered_source_control" => "clustered_source_control",
+            "clustered_source_range" => "clustered_source_range",
+            "clustered_writer_workspace" => "clustered_writer_workspace",
+            "maintenance_route_output" => "maintenance_route_output",
+            "exact_byte_read" => "exact_byte_read",
+            "materialize" => "materialize",
+            "native_canonical_merge" => "native_canonical_merge",
+            "native_explain_scope" => "native_explain_scope",
+            "native_partition_hits" => "native_partition_hits",
+            "native_public_results" => "native_public_results",
+            "native_vector_declaration" => "native_vector_declaration",
+            "resolve_clustered_policy" => "resolve_clustered_policy",
             _ => "vector_maintenance",
+        }
+    }
+
+    fn safe_memory_operation(operation: &contextdb_core::error::DiagnosticLabel) -> &'static str {
+        // Native static labels already name the actual refusal site. Preserve
+        // them without allocation; keep private legacy suffixes normalized.
+        match operation.static_text() {
+            Some(name)
+                if !name.starts_with("build_hnsw@")
+                    && !name.starts_with("prepare_authoritative_purge_hnsw@") =>
+            {
+                name
+            }
+            _ => Self::safe_operation(operation),
         }
     }
 
@@ -846,7 +929,7 @@ impl VectorMaintenanceFailureDetails {
                 ..
             } => Self {
                 failure: VectorMaintenanceFailure::MemoryLimit,
-                operation: Self::safe_operation(operation),
+                operation: Self::safe_memory_operation(operation),
                 requested_bytes: Some(Self::usize_as_u64(*requested_bytes)),
                 available_bytes: Some(Self::usize_as_u64(*available_bytes)),
                 current_bytes: Some(Self::usize_as_u64(
@@ -11817,6 +11900,9 @@ pub struct VectorPartitionInfo {
     pub retained_rows: usize,
     pub bytes: usize,
     pub graph_available: bool,
+    /// The same actual complete-route predicate, under the generic test name.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub indexed_available: bool,
     pub base_generation: Option<u64>,
     pub base_tx: Option<TxId>,
     pub pending_inserts: usize,
@@ -14111,6 +14197,14 @@ impl VectorStore {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn passive_activity_counters_for_test(&self) -> VectorPassiveActivityCounters {
         self.passive_activity.snapshot()
+    }
+
+    /// Bind actual native construction/rewrite events to this store's genuine
+    /// existing passive counter owner, including on a query worker thread.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn native_index_activity_scope_for_test(&self) -> crate::NativeIndexActivityScopeForTest {
+        crate::build_observation::activity_scope(self.passive_activity.clone())
     }
 
     /// Cap work spent by partitioned writes since this store opened.
@@ -20548,6 +20642,8 @@ impl VectorStore {
             retained_rows,
             bytes,
             graph_available: state.has_complete_hnsw_route(),
+            #[cfg(any(test, feature = "test-seams"))]
+            indexed_available: state.has_complete_hnsw_route(),
             base_generation,
             base_tx,
             pending_inserts,
@@ -24770,6 +24866,15 @@ impl VectorStore {
             self.try_partition_state(&partition.index, &partition.partition_key)
                 .map(|state| state.graph_generation_status())
         })
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn partition_generation_status(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> Option<VectorGraphGenerationStatus> {
+        self.partition_graph_generation_status(partition)
     }
 
     /// Retain an actionable maintenance failure for passive inspection. The

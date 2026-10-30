@@ -3737,6 +3737,20 @@ impl Database {
 
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        if let Some(result) = self.native_ivf_owner_search(
+            &index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            mode,
+            executing_owner.clone(),
+            read_memory.clone(),
+            vector_copy_owner,
+        )? {
+            return Ok(result);
+        }
+
         let (_load_transfer_funding, load_transfer) =
             self.vector_load_transfer(executing_owner.clone(), read_memory)?;
         let (rows, trace) = crate::memory_accounting::with_vector_load_reservation_transfer(
@@ -3849,43 +3863,18 @@ impl Database {
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
-            // A durable generation this search loads is retained by the store
-            // through the same reservation transfer every vector search door
-            // installs; the executing read owner funds it.
-            let (_load_transfer_funding, load_transfer) =
-                self.vector_load_transfer(executing_owner.clone(), read_memory.clone())?;
-            let (rows, trace) = crate::memory_accounting::with_vector_load_reservation_transfer(
-                &self.finalization.accountant,
-                load_transfer,
-                || {
-                    if self
-                        .vector_membership_owner()
-                        .is_some_and(|owner| owner.historical_operation())
-                    {
-                        vector_copy_owner.with_historical_durable_reads(|owner| {
-                            self.vector.search_with_mode_admission(
-                                index,
-                                query,
-                                k,
-                                effective_candidates.as_ref(),
-                                (snapshot, search_mode),
-                                owner,
-                            )
-                        })
-                    } else {
-                        self.vector.search_with_mode_owned(
-                            index,
-                            query,
-                            k,
-                            effective_candidates.as_ref(),
-                            snapshot,
-                            search_mode,
-                            executing_owner.clone(),
-                        )
-                    }
-                },
+            let (rows, trace) = self.owner_vector_search(
+                index,
+                query,
+                k,
+                effective_candidates.as_ref(),
+                snapshot,
+                search_mode,
+                executing_owner.clone(),
+                read_memory.clone(),
+                vector_copy_owner,
             )?;
-            self.publish_vector_search_trace(trace);
+            self.publish_vector_search_trace(trace.into_published());
             Ok(rows)
         })
     }
@@ -4825,12 +4814,11 @@ impl Database {
                     }
                     scored.try_push((row_id, cosine_similarity(&entry.vector, query)))?;
                 }
-                scored.sort_unstable_by(|left, right| {
-                    right
-                        .1
-                        .total_cmp(&left.1)
-                        .then_with(|| left.0.cmp(&right.0))
-                });
+                if !self.has_native_ivf_source() || staged_entries!=0 || moved_entries!=0 {
+                    scored.sort_unstable_by(|left, right| {
+                        right.1.total_cmp(&left.1).then_with(||left.0.cmp(&right.0))
+                    });
+                }
                 scored.truncate(k);
                 trace.set_final_row_ids(&scored)?;
                 trace.trace.supplemented_row_count = trace
@@ -5037,12 +5025,9 @@ impl Database {
                 }
                 scored.try_push((row_id, cosine_similarity(entry.vector(), query)))?;
             }
-            scored.sort_unstable_by(|left, right| {
-                right
-                    .1
-                    .total_cmp(&left.1)
-                    .then_with(|| left.0.cmp(&right.0))
-            });
+            if !self.has_native_ivf_source() || staged_entries!=0 || !moved.is_empty() {
+                scored.sort_unstable_by(|left,right|right.1.total_cmp(&left.1).then_with(||left.0.cmp(&right.0)));
+            }
             scored.truncate(k);
             trace.set_final_row_ids(&scored)?;
             trace.trace.supplemented_row_count = trace

@@ -957,6 +957,8 @@ impl RedbPersistence {
                 {
                     std::ptr::addr_of_mut!((*construction.source).paged_publications)
                         .write(Default::default());
+                    std::ptr::addr_of_mut!((*construction.source).native_ivf_cache)
+                        .write(Default::default());
                     construction.initialized[11] = true;
                 }
 
@@ -1163,6 +1165,8 @@ impl RedbPersistence {
 
                             {
                                 std::ptr::addr_of_mut!((*construction.source).paged_publications)
+                                    .write(Default::default());
+                                std::ptr::addr_of_mut!((*construction.source).native_ivf_cache)
                                     .write(Default::default());
                                 construction.initialized[11] = true;
                             }
@@ -1709,6 +1713,8 @@ impl RedbPersistence {
                         {
                             std::ptr::addr_of_mut!((*construction.source).paged_publications)
                                 .write(Default::default());
+                            std::ptr::addr_of_mut!((*construction.source).native_ivf_cache)
+                                .write(Default::default());
                             construction.initialized[11] = true;
                         }
 
@@ -1769,6 +1775,7 @@ impl RedbPersistence {
     }
 
     pub fn close(&self) {
+        self.native_ivf_cache.clear_retained();
         let schema = self.writer_schema.lock().take();
         drop(schema);
         let mut db = self

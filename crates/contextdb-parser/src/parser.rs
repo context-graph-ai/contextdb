@@ -287,6 +287,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     let mut group_by = Vec::new();
     let mut order_by = Vec::new();
     let mut use_vector = None;
+    let mut vector_search_override = None;
     let mut use_rank = None;
     let mut limit = None;
 
@@ -313,7 +314,43 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
                 order_by = build_order_by_clause(p)?;
             }
             Rule::use_vector_clause => {
-                use_vector = Some(build_use_vector_clause(p)?);
+                use_vector = Some(build_use_vector_clause(p.clone())?);
+                if let Some(options) = p
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::vector_query_options)
+                {
+                    let group = options.into_inner().next().expect("query policy group");
+                    let mut target = None;
+                    let mut probes = None;
+                    let mut refine_factor = None;
+                    for (name, value) in vector_group_members(group)? {
+                        match name.as_str() {
+                            "target_accuracy" => target = Some(vector_raw_value(value)),
+                            "probes" => probes = Some(vector_raw_value(value)),
+                            "refine_factor" => refine_factor = Some(vector_raw_value(value)),
+                            _ => {
+                                return Err(Error::ParseError(format!(
+                                    "unknown vector search override {}",
+                                    name.to_ascii_uppercase()
+                                )));
+                            }
+                        }
+                    }
+                    vector_search_override = if let Some(target_accuracy) = target {
+                        if probes.is_some() || refine_factor.is_some() {
+                            return Err(Error::ParseError(
+                                "TARGET_ACCURACY cannot be mixed with PROBES or REFINE_FACTOR"
+                                    .into(),
+                            ));
+                        }
+                        Some(VectorSearchOverride::Objectives { target_accuracy })
+                    } else {
+                        Some(VectorSearchOverride::Ivf {
+                            probes,
+                            refine_factor,
+                        })
+                    };
+                }
             }
             Rule::use_rank_clause => {
                 use_rank = Some(build_use_rank_clause(p)?);
@@ -342,6 +379,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     }
 
     Ok(SelectBody {
+        vector_search_override,
         distinct,
         columns,
         from,
@@ -2267,13 +2305,69 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
+    let column_name = pair
+        .clone()
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("ALTER COLUMN missing column".into()))?;
+    for action in pair.clone().into_inner() {
+        match action.as_rule() {
+            Rule::alter_column_set_search => {
+                let default = action
+                    .as_str()
+                    .trim_end()
+                    .to_ascii_uppercase()
+                    .ends_with("DEFAULT");
+                return Ok(AlterAction::SetVectorSearch {
+                    column: column_name,
+                    search: if default {
+                        None
+                    } else {
+                        Some(build_vector_search_objectives(action)?)
+                    },
+                });
+            }
+            Rule::alter_column_set_ivf => {
+                let default = action
+                    .as_str()
+                    .trim_end()
+                    .to_ascii_uppercase()
+                    .ends_with("DEFAULT");
+                return Ok(AlterAction::SetVectorIvf {
+                    column: column_name,
+                    ivf: if default {
+                        None
+                    } else {
+                        Some(build_vector_ivf_options(action)?)
+                    },
+                });
+            }
+            Rule::alter_column_set_with => {
+                return Ok(AlterAction::SetVectorWith {
+                    column: column_name,
+                    policy: build_vector_engine_policy(action)?,
+                });
+            }
+            Rule::alter_column_reset_with => {
+                return Ok(AlterAction::ResetVectorWith {
+                    column: column_name,
+                    members: action
+                        .into_inner()
+                        .map(|p| parse_identifier(p.as_str()).to_ascii_lowercase())
+                        .collect(),
+                });
+            }
+            _ => {}
+        }
+    }
     let mut column = None;
     let mut max_partitions = None;
     let mut search_mode = None;
     let mut auto_index_at = None;
-    let mut auto_expansion_ceiling = None;
-    let mut flat_below = None;
-    let mut hnsw = None;
+    let auto_expansion_ceiling = None;
+    let flat_below = None;
+    let hnsw = None;
     let mut consolidation = None;
 
     for part in pair.into_inner() {
@@ -2317,45 +2411,10 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
                 });
             }
             Rule::alter_column_set_auto_expansion_ceiling => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| {
-                        Error::ParseError(
-                            "ALTER COLUMN SET AUTO_EXPANSION_CEILING missing value".to_string(),
-                        )
-                    })?;
-                auto_expansion_ceiling = Some(match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                });
+                return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
-            Rule::alter_column_set_flat_below => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| {
-                        Error::ParseError("ALTER COLUMN SET FLAT_BELOW missing value".to_string())
-                    })?;
-                flat_below = Some(match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                });
-            }
-            Rule::alter_column_set_hnsw => {
-                let text = part.as_str();
-                let options = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::hnsw_options)
-                    .map(build_vector_hnsw_options)
-                    .transpose()?;
-                if options.is_none() && !text.to_ascii_uppercase().ends_with("DEFAULT") {
-                    return Err(Error::ParseError(
-                        "ALTER COLUMN SET HNSW missing policy or DEFAULT".to_string(),
-                    ));
-                }
-                hnsw = Some(options);
-            }
+            Rule::alter_column_set_flat_below => return Err(removed_vector_clause("FLAT_BELOW")),
+            Rule::alter_column_set_hnsw => return Err(removed_vector_clause("HNSW")),
             Rule::alter_column_set_consolidation => {
                 let text = part.as_str();
                 let mut disabled = false;
@@ -2471,6 +2530,9 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut auto_index_at = None;
     let mut auto_expansion_ceiling = None;
     let mut flat_below = None;
+    let mut search = VectorSearchObjectives::default();
+    let mut ivf = VectorIvfOptions::default();
+    let mut engine_policy = VectorEnginePolicyOptions::default();
     let mut hnsw = VectorHnswOptions::default();
     let mut consolidation = VectorConsolidationOptions::default();
     let mut rank_policy = None;
@@ -2491,7 +2553,14 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             }
             Rule::data_type => {
                 let vector_options = vector_column_options_for_data_type(&p)?;
-                quantization = vector_quantization_for_data_type(&p)?;
+                quantization = vector_options
+                    .engine_policy
+                    .quantization
+                    .flatten()
+                    .unwrap_or_default();
+                search = vector_options.search;
+                ivf = vector_options.ivf;
+                engine_policy = vector_options.engine_policy;
                 partition_key_columns = vector_options.partition_key_columns;
                 max_partitions = vector_options.max_partitions;
                 search_mode = vector_options.search_mode;
@@ -2657,6 +2726,9 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             auto_index_at,
             auto_expansion_ceiling,
             flat_below,
+            search,
+            ivf,
+            engine_policy,
             hnsw,
             consolidation,
             rank_policy,
@@ -3225,6 +3297,10 @@ struct ParsedVectorColumnOptions {
     auto_index_at: Option<String>,
     auto_expansion_ceiling: Option<String>,
     flat_below: Option<String>,
+    search: VectorSearchObjectives,
+    ivf: VectorIvfOptions,
+    has_with: bool,
+    engine_policy: VectorEnginePolicyOptions,
     hnsw: VectorHnswOptions,
     consolidation: VectorConsolidationOptions,
 }
@@ -3245,7 +3321,16 @@ fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVe
     let mut options = ParsedVectorColumnOptions::default();
     for part in vector_type.into_inner() {
         match part.as_rule() {
-            Rule::integer | Rule::vector_quantization_clause => {}
+            Rule::integer => {}
+            Rule::vector_quantization_clause => {
+                if options.has_with {
+                    return Err(Error::ParseError("duplicate WITH carrier".into()));
+                }
+                options.has_with = true;
+                options.engine_policy = build_vector_engine_policy(part)?;
+            }
+            Rule::vector_search_clause => options.search = build_vector_search_objectives(part)?,
+            Rule::vector_ivf_clause => options.ivf = build_vector_ivf_options(part)?,
             Rule::vector_partition_key_clause => {
                 options.partition_key_columns = part
                     .into_inner()
@@ -3281,34 +3366,10 @@ fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVe
                 };
             }
             Rule::vector_auto_expansion_ceiling_clause => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| {
-                        Error::ParseError("AUTO_EXPANSION_CEILING missing value".to_string())
-                    })?;
-                options.auto_expansion_ceiling = match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                };
+                return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
-            Rule::vector_flat_below_clause => {
-                let value = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::vector_policy_value)
-                    .ok_or_else(|| Error::ParseError("FLAT_BELOW missing value".to_string()))?;
-                options.flat_below = match build_vector_policy_value(value) {
-                    VectorPolicyValue::Value(value) => Some(value),
-                    VectorPolicyValue::Default => None,
-                };
-            }
-            Rule::vector_hnsw_clause => {
-                let options_pair = part
-                    .into_inner()
-                    .find(|item| item.as_rule() == Rule::hnsw_options)
-                    .ok_or_else(|| Error::ParseError("HNSW missing policy group".to_string()))?;
-                options.hnsw = build_vector_hnsw_options(options_pair)?;
-            }
+            Rule::vector_flat_below_clause => return Err(removed_vector_clause("FLAT_BELOW")),
+            Rule::vector_hnsw_clause => return Err(removed_vector_clause("HNSW")),
             Rule::vector_consolidation_clause => {
                 let declaration = part.into_inner().next().ok_or_else(|| {
                     Error::ParseError("CONSOLIDATION missing policy group".to_string())
@@ -3347,56 +3408,10 @@ fn build_vector_policy_value(pair: Pair<'_, Rule>) -> VectorPolicyValue {
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn build_vector_hnsw_options(pair: Pair<'_, Rule>) -> Result<VectorHnswOptions> {
-    let mut options = VectorHnswOptions::default();
-    for option in pair.into_inner() {
-        if option.as_rule() != Rule::hnsw_option {
-            return Err(unexpected_rule(
-                option.as_rule(),
-                "build_vector_hnsw_options",
-            ));
-        }
-        let mut parts = option.into_inner();
-        let name = parts
-            .next()
-            .ok_or_else(|| Error::ParseError("HNSW member missing name".to_string()))?;
-        let value = parts
-            .next()
-            .ok_or_else(|| Error::ParseError("HNSW member missing value".to_string()))?;
-        let member = name.as_str().to_ascii_uppercase();
-        if value.as_rule() == Rule::vector_policy_decimal && member != "SEARCH_RADIUS" {
-            return Err(Error::ParseError(format!(
-                "HNSW {} takes an integer",
-                name.as_str()
-            )));
-        }
-        let slot = match member.as_str() {
-            "M" => &mut options.m,
-            "EF_CONSTRUCTION" => &mut options.ef_construction,
-            "EF_SEARCH" => &mut options.ef_search,
-            "SEARCH_RADIUS" => &mut options.search_radius,
-            _ => {
-                return Err(Error::ParseError("unknown HNSW policy member".to_string()));
-            }
-        };
-        if slot.is_some() {
-            return Err(Error::ParseError(format!(
-                "duplicate HNSW policy member {}",
-                name.as_str()
-            )));
-        }
-        *slot = Some(build_vector_policy_value(value));
-    }
-    if options == VectorHnswOptions::default() {
-        return Err(Error::ParseError(
-            "HNSW requires at least one policy member".to_string(),
-        ));
-    }
-    Ok(options)
+fn removed_vector_clause(keyword: &str) -> Error {
+    Error::ParseError(format!(
+        "Remove the {keyword} clause: the default search policy applies; to declare a target use SEARCH (TARGET_ACCURACY = n, EXPECTED_VECTORS = n)"
+    ))
 }
 
 #[expect(
@@ -3442,42 +3457,6 @@ fn build_vector_consolidation_options(pair: Pair<'_, Rule>) -> Result<VectorCons
         ));
     }
     Ok(options)
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn vector_quantization_for_data_type(pair: &Pair<'_, Rule>) -> Result<VectorQuantization> {
-    let Some(vector_type) = pair
-        .clone()
-        .into_inner()
-        .find(|p| p.as_rule() == Rule::vector_type)
-    else {
-        return Ok(VectorQuantization::F32);
-    };
-
-    for p in vector_type.into_inner() {
-        if p.as_rule() == Rule::vector_quantization_clause {
-            let value = p
-                .into_inner()
-                .find(|part| part.as_rule() == Rule::vector_quantization_value)
-                .ok_or_else(|| Error::ParseError("missing vector quantization value".to_string()))?
-                .as_str()
-                .trim_matches('\'')
-                .to_ascii_uppercase();
-            return match value.as_str() {
-                "F32" => Ok(VectorQuantization::F32),
-                "SQ8" => Ok(VectorQuantization::SQ8),
-                "SQ4" => Ok(VectorQuantization::SQ4),
-                _ => Err(Error::ParseError(format!(
-                    "unsupported vector quantization '{value}'"
-                ))),
-            };
-        }
-    }
-
-    Ok(VectorQuantization::F32)
 }
 
 #[expect(
@@ -4861,4 +4840,167 @@ fn validate_window_spec<'a>(
         Expr::WindowRank(_) | Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
     }
     Ok(())
+}
+
+fn vector_group_members(pair: Pair<'_, Rule>) -> Result<Vec<(String, Pair<'_, Rule>)>> {
+    let group = if pair.as_rule() == Rule::vector_policy_group {
+        pair
+    } else {
+        pair.into_inner()
+            .find(|p| p.as_rule() == Rule::vector_policy_group)
+            .ok_or_else(|| Error::ParseError("missing vector policy group".into()))?
+    };
+    let mut result = Vec::new();
+    for member in group.into_inner() {
+        let mut parts = member.into_inner();
+        let name = parts
+            .next()
+            .expect("policy name")
+            .as_str()
+            .to_ascii_lowercase();
+        if result.iter().any(|(old, _)| old == &name) {
+            return Err(Error::ParseError(format!(
+                "duplicate vector policy member {}",
+                name.to_ascii_uppercase()
+            )));
+        }
+        result.push((name, parts.next().expect("policy value")));
+    }
+    Ok(result)
+}
+fn vector_raw_value(pair: Pair<'_, Rule>) -> VectorPolicyValue {
+    let raw = pair.as_str();
+    if raw.eq_ignore_ascii_case("DEFAULT") {
+        VectorPolicyValue::Default
+    } else {
+        VectorPolicyValue::Value(raw.to_owned())
+    }
+}
+fn build_vector_search_objectives(pair: Pair<'_, Rule>) -> Result<VectorSearchObjectives> {
+    let mut result = VectorSearchObjectives::default();
+    for (name, value) in vector_group_members(pair)? {
+        match name.as_str() {
+            "search_radius" => return Err(removed_vector_clause("SEARCH_RADIUS")),
+            "target_accuracy" => result.target_accuracy = Some(vector_raw_value(value)),
+            "expected_vectors" => result.expected_vectors = Some(vector_raw_value(value)),
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "unknown SEARCH member {}",
+                    name.to_ascii_uppercase()
+                )));
+            }
+        }
+    }
+    Ok(result)
+}
+fn build_vector_ivf_options(pair: Pair<'_, Rule>) -> Result<VectorIvfOptions> {
+    let mut result = VectorIvfOptions::default();
+    for (name, value) in vector_group_members(pair)? {
+        match name.as_str() {
+            "search_radius" => return Err(removed_vector_clause("SEARCH_RADIUS")),
+            "lists" => result.lists = Some(vector_raw_value(value)),
+            "probes" => result.probes = Some(vector_raw_value(value)),
+            "refine_factor" => result.refine_factor = Some(vector_raw_value(value)),
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "unknown IVF member {}",
+                    name.to_ascii_uppercase()
+                )));
+            }
+        }
+    }
+    Ok(result)
+}
+fn build_vector_engine_policy(pair: Pair<'_, Rule>) -> Result<VectorEnginePolicyOptions> {
+    let mut result = VectorEnginePolicyOptions::default();
+    for (name, value) in vector_group_members(pair)? {
+        match name.as_str() {
+            "calibration_max_k" => result.calibration_max_k = Some(vector_raw_value(value)),
+            "probe_grid" => result.probe_grid = Some(vector_raw_value(value)),
+            "refine_growth" => result.refine_growth = Some(vector_raw_value(value)),
+            "calibration_samples" => result.calibration_samples = Some(vector_raw_value(value)),
+            "min_lists" => result.min_lists = Some(vector_raw_value(value)),
+            "vectors_per_list" => result.vectors_per_list = Some(vector_raw_value(value)),
+            "centroid_memory_percent" => {
+                result.centroid_memory_percent = Some(vector_raw_value(value))
+            }
+            "training_samples" => result.training_samples = Some(vector_raw_value(value)),
+            "training_iterations" => result.training_iterations = Some(vector_raw_value(value)),
+            "training_seed" => result.training_seed = Some(vector_raw_value(value)),
+            "max_delta_runs" => result.max_delta_runs = Some(vector_raw_value(value)),
+            "write_buffer_bytes" => result.write_buffer_bytes = Some(vector_raw_value(value)),
+            "ingest_batch_keys" => result.ingest_batch_keys = Some(vector_raw_value(value)),
+            "coalesce_pages_per_step" => {
+                result.coalesce_pages_per_step = Some(vector_raw_value(value))
+            }
+            "build_batch_entries" => result.build_batch_entries = Some(vector_raw_value(value)),
+            "remap_batch_entries" => result.remap_batch_entries = Some(vector_raw_value(value)),
+            "directory_window_objects" => {
+                result.directory_window_objects = Some(vector_raw_value(value))
+            }
+            "page_window_bytes" => result.page_window_bytes = Some(vector_raw_value(value)),
+            "calibration_depths" => {
+                result.calibration_depths =
+                    Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                        VectorPolicyListValue::Default
+                    } else {
+                        let list = value.into_inner().next().expect("value");
+                        if list.as_rule() != Rule::vector_policy_list {
+                            return Err(Error::ParseError(
+                                "calibration_depths requires a list".into(),
+                            ));
+                        }
+                        VectorPolicyListValue::Values(
+                            list.into_inner().map(|p| p.as_str().to_owned()).collect(),
+                        )
+                    });
+            }
+            "refine_factors" => {
+                result.refine_factors = Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                    VectorPolicyListValue::Default
+                } else {
+                    let list = value.into_inner().next().expect("value");
+                    if list.as_rule() != Rule::vector_policy_list {
+                        return Err(Error::ParseError("refine_factors requires a list".into()));
+                    }
+                    VectorPolicyListValue::Values(
+                        list.into_inner().map(|p| p.as_str().to_owned()).collect(),
+                    )
+                });
+            }
+
+            "calibration_queries" => {
+                result.calibration_queries =
+                    Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                        VectorPolicyReferenceValue::Default
+                    } else {
+                        let reference = value.into_inner().next().expect("value");
+                        if reference.as_rule() != Rule::vector_policy_reference {
+                            return Err(Error::ParseError(
+                                "calibration_queries requires table.column".into(),
+                            ));
+                        }
+                        let mut parts = reference.into_inner();
+                        VectorPolicyReferenceValue::Reference {
+                            table: parse_identifier(parts.next().expect("table").as_str()),
+                            column: parse_identifier(parts.next().expect("column").as_str()),
+                        }
+                    });
+            }
+            "quantization" => {
+                result.quantization = Some(if value.as_str().eq_ignore_ascii_case("DEFAULT") {
+                    None
+                } else {
+                    Some(match value.as_str().trim_matches('\'') {
+                        "F32" => VectorQuantization::F32,
+                        "SQ8" => VectorQuantization::SQ8,
+                        "SQ4" => VectorQuantization::SQ4,
+                        _ => return Err(Error::ParseError("invalid quantization".into())),
+                    })
+                })
+            }
+            _ => result.unknown_members.push(name),
+        }
+    }
+    Ok(result)
 }

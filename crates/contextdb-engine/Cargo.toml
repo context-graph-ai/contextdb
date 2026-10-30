@@ -829,6 +829,11 @@ required-features = ["test-seams", "iroh"]
 name = "exact_vector_cursor_releases_only_its_reader_credit"
 path = "tests/exact_vector_cursor_releases_only_its_reader_credit.rs"
 
+[[test]]
+name = "clustered_vector_index"
+path = "tests/clustered_vector_index.rs"
+required-features = ["test-seams"]
+
 [[bin]]
 name = "memory-census"
 path = "src/bin/memory-census.rs"
@@ -837,4 +842,59 @@ required-features = ["test-seams"]
 [[test]]
 name = "import_persistence_without_observer"
 path = "tests/import_persistence_without_observer.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_query_precision"
+path = "tests/native_query_precision.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_initial_reclaim"
+path = "tests/native_initial_reclaim.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_query_overrides"
+path = "tests/native_query_overrides.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_page_damage"
+path = "tests/native_page_damage.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_calibration_window"
+path = "tests/native_calibration_window.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "hnsw_public_score"
+path = "tests/hnsw_public_score.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "hnsw_public_engine_ports"
+path = "tests/hnsw_public_engine_ports.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "first_saved_search_owned_worker"
+path = "tests/first_saved_search_owned_worker.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "native_page_public_ports"
+path = "tests/native_page_public_ports.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "checked_backend_read_faults"
+path = "tests/checked_backend_read_faults.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "shared_native_cache_capacity"
+path = "tests/shared_native_cache_capacity.rs"
 required-features = ["test-seams"]

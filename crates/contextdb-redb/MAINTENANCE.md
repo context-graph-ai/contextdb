@@ -11,6 +11,45 @@ custody guards qualify this path.
 
 # contextdb-redb maintenance
 
+The `test-seams` cold-read observation also borrows the actual admitted native
+backing at `read_direct_into_page` and at the cached-none fallthrough of
+`read_native_prepared`. Both call the same checked-backend read implementation
+as ordinary reads. The borrowed injector supplies a failure inside its existing
+read-result branch. A failed read returns its original error without setting
+the sticky I/O latch. An already-latched write or durability failure stays latched.
+Backend-read counting, error payloads and cache/payment ordering are unchanged.
+The existing bounded custody ring records the failed backing before it is freed.
+No observation allocation, page alias or payer is created by this borrowed hook.
+
+The native page capture token can re-enter its original observation scope without
+retaining a page or payer; closed reuse invalidates completeness. Actual failed
+cold reads enqueue their exact backing and source receipt in that same bounded
+ring before physical release. Guards can drain after the query with the database
+still live and distinguish the failed backing from successful metadata reads.
+
+The `test-seams` native page observations in `native_page_observations.rs` use a
+bounded test-owned scalar event ring. Real page allocation, payer transfer,
+cache installation/rejection/map eviction, physical deallocation and original
+source receipt finish enqueue their facts at those producer boundaries. Guard
+callbacks drain outside storage locks. A retained token owns only the observer
+and ring, so cross-thread last-alias release does not depend on a live TLS scope.
+Overflow, lost events after close, undelivered events and outstanding real
+backings/payments make capture incomplete. Occupancy release is distinct from
+source receipt refund; a counter is never certified as a funder. Native aliases
+expose the existing allocation and its genuine receipt. The cold-read injector
+runs only at the actual cache-miss backend read and uses its existing failure
+branch. Failed direct and prepared native reads release their failed backing and
+original invoice; the next read on the same backend may try again. A test-only
+cache lease reports actual
+limit/occupancy and invokes existing unpinned-victim eviction for cold setup.
+Fixed-reserve events distinguish the genuine process aggregate from a writer
+accountant. The engine's receipt producer exposes held bytes without its internal
+process-residue tag; observed totals use checked arithmetic before allocation.
+The final notification retains that unchanging admitted amount and runs after the
+real receipts settle; it never adds tagged words during Drop.
+These observations add no default-build fields, cache policy, payer or admission.
+Independent behavioral guards certify the lifecycle and refusal requirements.
+
 The `test-seams` native receipt observations in `native_storage_admission.rs`,
 `tree_store/page_store/page_allocation.rs` and `cached_file.rs` copy the real
 `NativePageCharge` receipt identity while borrowing the current page payer under
@@ -170,6 +209,7 @@ private cache tests still require the independently owned real-handle adoption.
 
 | Changed source | Reason |
 |---|---|
+| `src/native_page_observations.rs` (added), `src/native_storage_admission.rs`, `src/tree_store/page_store/{page_allocation,cached_file,page_manager}.rs`, `src/db.rs`, `src/lib.rs` | Test-seams-only bounded scalar custody capture at actual allocation/transfer/free/receipt finish, native-capable real aliases, separate occupancy events, installed-limit observations and existing unpinned eviction; inject cold failures at the real cached-none backend branch. Read failures propagate without setting the sticky I/O latch; write and durability handling is unchanged. No cache/admission/payer policy changes. |
 | `src/native_storage_admission.rs`, `src/lib.rs` | The test-seams-only pending-name observer borrows the real combined allocation Layout and native invoice after name construction. It admits or retains nothing and lets the engine allocator witness bind the exact original invoice to physical key teardown. |
 | `src/read_admission.rs` | Feature-internal captured native admission and prepaid thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the unscoped fallback allowance; declared scans retain their working set under the original reader admission. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
 | `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/tree_store/bounded_bytes.rs` | Feature-internal concrete movable source-credit owner and a distinct internal legacy/owned carrier. Preserve authentic credit through actual control deallocation, source-page/counter teardown and cache handoff. Keep legacy Box wrappers and the public backend trait unchanged; exact actual Layout prepayment remains with the engine factory. Upstream proposal remains unsubmitted. |
@@ -1336,3 +1376,63 @@ neither hooks nor counters and PageBlock Layout is unchanged.
 | Changed source | Reason |
 |---|---|
 | `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs` | Expose allocation-free scalar physical page construction/free/current/peak observations under test-seams; observe the actual backing constructor and post-deallocation release, with clone, earlier-free and nesting controls. |
+## Allocator admission observation for index disk guards
+
+The `test-seams`-only allocation observer reports the actual requested size,
+physical file length and minimum quota-retry growth. The read-only plan uses
+the same `minimum_growth_layout` calculation as the existing production retry;
+ordinary allocation and growth policy are unchanged. Its callback runs after
+releasing the allocator state lock. It may change an external backend ceiling,
+but must not recursively begin a transaction while the current write is active.
+
+A caller-scoped test fault can exclude existing reusable blocks for each observed
+allocation. It grows through the ordinary backend path and records the selected
+block only in the newly added suffix; existing free blocks remain free. Ending
+the scope restores ordinary reuse, including on unwind. The fork knows no index
+classes or disk policy; the engine chooses the scope and owns the ceiling.
+The observer retains no allocation registry or production state.
+
+| Changed source | Reason |
+|---|---|
+| `src/allocation_observation.rs` (added), `src/lib.rs` | Test-only scoped borrowed allocator plans, completed-allocation observations and temporary exclusion of existing reusable blocks. |
+| `src/db.rs`, `src/tree_store/page_store/page_manager.rs` | Read-only access to the allocator's real minimum retry layout; callbacks outside the allocator lock and real newly grown block selection during the scoped fault. |
+
+Upstream proposal (not submitted): optional scoped allocator observation for
+quota-boundary tests, with no production policy or default allocator change.
+Runtime proof and independent review are required before landing.
+
+The same observer also reports actual mutable-page access through `storage.write`,
+including an existing dirty extent that needs zero growth. Placement refusal,
+write admission and successful mutable backing access are separate callbacks;
+these observations describe transactional writes, not a durability/sync receipt.
+External callbacks run without the allocator lock. A synchronous borrowed observer
+scope avoids allocating an observer control for every write. Its private lifetime
+erasure is bounded by the installing call and restores the prior slot on unwind;
+pages and returned objects never retain the borrowed reference. `PageMut` gains
+no observer field and ordinary builds gain no observation state.
+
+
+## Native dirty-backing capacity quote
+
+The hidden `contextdb-internal` `WriteTransaction::native_dirty_byte_entry_layout`
+quotes a fresh byte leaf's real backing from `RawLeafBuilder::required_bytes`,
+the current file's actual base-page size and `PageAllocation::layout`. It creates
+no object, reserves no bytes and changes no allocator policy. The engine combines
+this producer-owned backing quote with its original StorageReceipt layout while
+sizing the writer workspace; actual writes still admit once on the same owner.
+
+| Changed source | Reason |
+|---|---|
+| `src/transactions.rs`, `src/tree_store/mod.rs`, `src/tree_store/page_store/mod.rs` | Pure native dirty-byte-entry backing quote using existing serialization, live page geometry and actual allocation layout; no new payer or admission. |
+
+Upstream proposal remains unsubmitted. Runtime and independent review are required.
+
+At zero installed cache capacity, verified writer snapshot setup can retire its
+optional master-root backing through ReadTransaction::release_optional_root_cache.
+This clears only Btree cached_root and TableTree prepared_root copies after
+verification/setup; the same immutable root identity and MVCC transaction guard
+remain held. Later access reads and verifies that same root on demand. Nonzero
+capacity retains the existing behavior. The engine applies this before legacy,
+native and prepared-exact writer descriptors escape. The source patch is fully
+regenerated from the checksum-verified 4.1.0 archive. Independent runtime and
+isolated producer-site proofs remain required.

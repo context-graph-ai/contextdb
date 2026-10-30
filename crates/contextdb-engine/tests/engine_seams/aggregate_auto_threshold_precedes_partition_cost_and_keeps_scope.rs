@@ -21,7 +21,7 @@ fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
         ] {
             let database = Database::open_memory();
             database.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-            database.execute("CREATE TABLE automatic_items (id INTEGER PRIMARY KEY, scope INTEGER NOT NULL, keep BOOLEAN NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 4 SEARCH_MODE AUTO AUTO_INDEX_AT 64 HNSW (EF_SEARCH = 8))", &HashMap::new()).unwrap();
+            database.execute("CREATE TABLE automatic_items (id INTEGER PRIMARY KEY, scope INTEGER NOT NULL, keep BOOLEAN NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 4 SEARCH_MODE AUTO AUTO_INDEX_AT 64 SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = DEFAULT))", &HashMap::new()).unwrap();
             database
                 .execute(
                     "CREATE INDEX automatic_scope_keep ON automatic_items (scope, keep, id)",

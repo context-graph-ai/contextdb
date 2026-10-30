@@ -8,14 +8,51 @@ pub(super) fn vector_partition_routes(
     vector: &VectorStore,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<Vec<VectorPartitionRef>> {
-    let mut routes = Vec::new();
+    let mut routes: Vec<VectorPartitionRef> = Vec::new();
     for index in vector.index_layout_infos(vector_copy_owner)? {
-        routes.extend(
-            vector
-                .partition_keys(&index.index, vector_copy_owner)?
-                .into_iter()
-                .map(|key| VectorPartitionRef::new(index.index.clone(), key)),
-        );
+        let keys = vector.partition_keys(&index.index, vector_copy_owner)?;
+        #[cfg(all(test, feature = "test-seams"))]
+        let output = (routes.len(), routes.as_ptr() as usize, routes.capacity());
+        let append = || -> Result<()> {
+            let output_capacity = routes
+                .len()
+                .checked_add(keys.len())
+                .ok_or_else(|| Error::Other("vector route output size overflow".into()))?;
+            let output_bytes = output_capacity
+                .saturating_sub(routes.capacity())
+                .checked_mul(std::mem::size_of::<VectorPartitionRef>())
+                .ok_or_else(|| Error::Other("vector route output size overflow".into()))?;
+            let index_bytes = index
+                .index
+                .table
+                .len()
+                .checked_add(index.index.column.len())
+                .and_then(|bytes| bytes.checked_mul(keys.len()))
+                .ok_or_else(|| Error::Other("vector route index size overflow".into()))?;
+            let retained_bytes = output_bytes
+                .checked_add(index_bytes)
+                .ok_or_else(|| Error::Other("vector route copy size overflow".into()))?;
+            // The keys and layout inputs remain live. Prepay both the complete
+            // destination growth and every fresh index-string clone before
+            // either allocation, using this operation's original copy owner.
+            vector_copy_owner.reserve_for_static(
+                retained_bytes,
+                "vector_copy",
+                "maintenance_route_output",
+                "Reduce selected routes or raise maintenance reader memory.",
+            )?;
+            routes.reserve_exact(keys.len());
+            for key in keys {
+                routes.push(VectorPartitionRef::new(index.index.clone(), key));
+            }
+            Ok(())
+        };
+        #[cfg(all(test, feature = "test-seams"))]
+        super::vector_public_cycle_admission_tests::with_route_output_for_test(
+            output.0, output.1, output.2, append,
+        )?;
+        #[cfg(not(all(test, feature = "test-seams")))]
+        append()?;
     }
     Ok(routes)
 }
@@ -582,6 +619,8 @@ impl MaintenanceContext {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn build_checkpoint(&self) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        crate::vector_ivf_observations::maintenance_cancel_checkpoint()?;
         #[cfg(test)]
         resident_history_test_seams::note_checkpoint();
         #[cfg(any(test, feature = "test-seams"))]
@@ -3831,9 +3870,9 @@ impl MaintenanceContext {
         // An unpublished paged build keeps advancing even when this cycle's
         // sampled inventory does not select its route.
         let unselected_paged_builds = self.unselected_paged_builds(pending_vector_partitions)?;
-        let mut vector = if !pending_vector_partitions.is_empty()
-            || !unselected_paged_builds.is_empty()
-        {
+        let mut vector = if self.persistence.is_some() {
+            self.run_native_vector_cycle(read_memory.clone())?
+        } else if !pending_vector_partitions.is_empty() || !unselected_paged_builds.is_empty() {
             // File-backed construction publishes through the durable catalog
             // first. Building a separate process-only graph here let the
             // writer call the route ready while a reader of the same
@@ -3937,7 +3976,7 @@ impl MaintenanceContext {
         // Recorded whether this cycle reclaimed anything or not -- a caller
         // that dutifully drives an empty cycle is still driving, and must
         // never trip the caller-driven backlog warning.
-        *self.last_maintenance_cycle_at.lock() = Some(std::time::Instant::now());
+        record_maintenance_attempt_finished(&self.last_maintenance_cycle_at);
         Ok(MaintenanceReport {
             pruning,
             currency,
@@ -3946,6 +3985,13 @@ impl MaintenanceContext {
             compaction,
         })
     }
+}
+
+/// Record a finished wake after its attempt-owned work has ended.
+pub(super) fn record_maintenance_attempt_finished(
+    stamp: &parking_lot::Mutex<Option<std::time::Instant>>,
+) {
+    *stamp.lock() = Some(std::time::Instant::now());
 }
 
 /// Observability: an operator must be able to see maintenance happen. Silent

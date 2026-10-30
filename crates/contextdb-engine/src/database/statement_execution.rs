@@ -2013,20 +2013,19 @@ impl Database {
     ) -> Result<(VectorSearchDisclosure, bool)> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let actual_used_hnsw = actual_trace.map(|trace| trace.used_hnsw);
-        let (facts, authorized) = self.vector_policy_facts_for_explain(
+        let actual_used_hnsw = actual_trace.map(|trace| {
+            trace.used_hnsw
+                || trace
+                    .partition_routes
+                    .iter()
+                    .any(|partition| partition.route == VectorPartitionSearchRoute::Indexed)
+        });
+        let (mut facts, authorized) = self.vector_policy_facts_for_explain(
             shape,
             snapshot,
             params,
             vector_copy_owner,
             read_memory.clone(),
-        )?;
-        let graph_allowed = self.vector_hnsw_strategy_for_explain(
-            shape,
-            snapshot,
-            params,
-            vector_copy_owner,
-            authorized.as_ref(),
         )?;
         let layout = self
             .vector_store
@@ -2034,6 +2033,76 @@ impl Database {
         let candidate_route =
             crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
         let partition_scope = &candidate_route.scope;
+        let native_routes = if self.has_native_ivf_source()
+            && facts.aggregate_allowed_vectors.is_some()
+        {
+            if let Some(trace) = actual_trace {
+                vector_copy_owner.reserve(
+                    trace
+                        .partition_routes
+                        .len()
+                        .checked_mul(std::mem::size_of::<VectorPartitionSearchTrace>())
+                        .ok_or_else(|| Error::Other("native trace route bytes overflow".into()))?,
+                )?;
+                Some(trace.partition_routes.clone())
+            } else {
+                let breadth = crate::database::vector_ivf::policy::QueryBreadth::resolve(
+                    &shape.index.table,
+                    &shape.index.column,
+                    shape.query_policy,
+                )?;
+                let mut predict = || {
+                    self.native_ivf_predict_routes(
+                        &shape.index,
+                        shape.k,
+                        facts.requested_mode,
+                        breadth,
+                        authorized.as_ref(),
+                        snapshot,
+                        read_memory.clone(),
+                        vector_copy_owner,
+                    )
+                };
+                Some(
+                    if let Some(prefixes) = partition_scope
+                        .as_ref()
+                        .and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
+                    {
+                        contextdb_vector::mem::with_selected_partition_prefixes(
+                            &shape.index,
+                            prefixes.to_vec(),
+                            predict,
+                        )?
+                    } else {
+                        predict()?
+                    },
+                )
+            }
+        } else {
+            None
+        };
+        let graph_allowed = if let Some(routes) = &native_routes {
+            let indexed = routes
+                .iter()
+                .any(|route| route.route == VectorPartitionSearchRoute::Indexed);
+            if facts.requested_mode == VectorSearchMode::Auto {
+                facts.resolved_mode = if indexed {
+                    VectorSearchMode::Indexed
+                } else {
+                    VectorSearchMode::Exact
+                };
+            }
+            indexed
+        } else {
+            self.vector_hnsw_strategy_for_explain(
+                shape,
+                snapshot,
+                params,
+                vector_copy_owner,
+                authorized.as_ref(),
+            )?
+        };
+
         // An AUTO route over an unbound key is unresolved until the key binds.
         // Only the passive explain path can reach this state: every executing
         // reader binds its parameters before any scope or route is judged.
@@ -2069,6 +2138,16 @@ impl Database {
             vector_copy_owner,
             read_memory.clone(),
         )?;
+        if let Some(routes) = &native_routes {
+            for (partition, route) in partition_hnsw.iter_mut().zip(routes) {
+                partition.route = Some(if route.route == VectorPartitionSearchRoute::Indexed {
+                    VectorSearchRoute::Indexed
+                } else {
+                    VectorSearchRoute::Exact
+                });
+                partition.reason = Some(route.reason.to_owned());
+            }
+        }
         let every_partition_uses_policy_exact = actual_trace.map_or_else(
             || {
                 !partition_hnsw.is_empty()
@@ -2770,6 +2849,7 @@ impl Database {
                 restricted_candidates,
                 candidates,
                 search_mode,
+                query_policy: None,
                 query_expr,
             },
             snapshot,
@@ -2815,6 +2895,7 @@ impl Database {
             restricted_candidates,
             candidates,
             search_mode,
+            query_policy: None,
             query_expr,
         };
         let requested_mode = self.resolved_vector_search_mode(
@@ -2832,14 +2913,29 @@ impl Database {
         let partition_scope = &candidate_route.scope;
         let filtered_exact =
             requested_mode == contextdb_core::VectorSearchMode::Auto && !candidate_route.complete;
-        let resolved_mode = match requested_mode {
-            contextdb_core::VectorSearchMode::Auto
-                if filtered_exact || aggregate_allowed_vectors < policy.auto_index_at =>
-            {
-                contextdb_core::VectorSearchMode::Exact
+        let native_indexed = self.has_native_ivf_source()
+            && partition_routes
+                .iter()
+                .any(|route| route.route == VectorPartitionSearchRoute::Indexed);
+        let used_hnsw = used_hnsw || native_indexed;
+        let resolved_mode = if self.has_native_ivf_source()
+            && requested_mode == VectorSearchMode::Auto
+        {
+            if native_indexed {
+                VectorSearchMode::Indexed
+            } else {
+                VectorSearchMode::Exact
             }
-            contextdb_core::VectorSearchMode::Auto => contextdb_core::VectorSearchMode::Indexed,
-            mode => mode,
+        } else {
+            match requested_mode {
+                contextdb_core::VectorSearchMode::Auto
+                    if filtered_exact || aggregate_allowed_vectors < policy.auto_index_at =>
+                {
+                    contextdb_core::VectorSearchMode::Exact
+                }
+                contextdb_core::VectorSearchMode::Auto => contextdb_core::VectorSearchMode::Indexed,
+                mode => mode,
+            }
         };
         let scope = match partition_scope
             .as_ref()
@@ -2850,9 +2946,7 @@ impl Database {
             _ => VectorSearchScopeShape::All,
         };
         let candidate_residual = vector_search_candidate_residual(&shape, &candidate_route);
-        let force_policy_exact = requested_mode == contextdb_core::VectorSearchMode::Exact
-            || (requested_mode == contextdb_core::VectorSearchMode::Auto
-                && (filtered_exact || aggregate_allowed_vectors < policy.auto_index_at));
+        let force_policy_exact = resolved_mode == VectorSearchMode::Exact;
         // Inspect captured pending work before retaining the output disclosure.
         // The groups already own the authorized source set and its original root.
         let (base, change, mut tail) = groups.graph_layer_presence_without_load();

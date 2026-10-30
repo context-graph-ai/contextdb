@@ -45,7 +45,13 @@ pub(crate) fn schema_capabilities_in_columns(
         if column.auto_index_at.is_some() {
             capabilities.insert(SchemaSyncCapability::VectorAutoIndexAt);
         }
-        if column.hnsw_m.is_some()
+        if column.search_target_accuracy_hundredths.is_some()
+            || column.search_expected_vectors.is_some()
+            || column.ivf_lists.is_some()
+            || column.ivf_probes.is_some()
+            || column.ivf_refine_factor_hundredths.is_some()
+            || column.vector_engine_policy != contextdb_core::VectorEnginePolicy::default()
+            || column.hnsw_m.is_some()
             || column.flat_below.is_some()
             || column.auto_expansion_ceiling.is_some()
             || column.hnsw_search_radius_millionths.is_some()

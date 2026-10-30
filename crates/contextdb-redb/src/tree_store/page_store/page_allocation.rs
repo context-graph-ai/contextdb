@@ -1,6 +1,11 @@
 //! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 //! escape independently of the payer. Native copies retain their separate owner.
 use crate::atomic_compat::AtomicUpdate as _;
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+use crate::native_page_observations::{
+    NativePageBackingForTest, NativePageCustodyEventForTest, NativePagePaymentForTest,
+    PageObservation, PaymentObservation,
+};
 use crate::read_admission::{ReadMemoryCharge, admit_read_memory};
 use crate::{Result, StorageError};
 use std::alloc::{Layout, alloc, dealloc};
@@ -204,6 +209,8 @@ pub(super) struct CachePayment {
     counter: CacheCounter,
     bytes: usize,
     fixed: bool,
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    observation: Option<PaymentObservation>,
 }
 impl CachePayment {
     #[cfg(feature = "test-seams")]
@@ -262,6 +269,8 @@ impl CachePayment {
             counter: owner,
             bytes,
             fixed: true,
+            #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+            observation: None,
         };
         #[cfg(feature = "test-seams")]
         payment.observe(crate::page_payer_observation::Phase::Reserved, 0, 0);
@@ -287,6 +296,12 @@ impl Drop for CachePayment {
     fn drop(&mut self) {
         #[cfg(feature = "test-seams")]
         self.observe(crate::page_payer_observation::Phase::BeforeRefund, 0, 0);
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let released = (
+            self.counter.block.as_ptr() as usize,
+            self.fixed_receipt_for_test(),
+            self.fixed,
+        );
         if self.fixed {
             unsafe { self.counter.block.as_ref() }
                 .fixed
@@ -296,6 +311,10 @@ impl Drop for CachePayment {
         self.counter.settle_after_free();
         #[cfg(feature = "test-seams")]
         self.observe(crate::page_payer_observation::Phase::AfterRefund, 0, 0);
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        if let Some(observation) = self.observation.take() {
+            observation.occupancy_released(released.0, released.1, released.2);
+        }
     }
 }
 
@@ -371,6 +390,8 @@ struct PageBlock {
     len_and_origin: usize,
     checksum: Mutex<Option<u128>>,
     payer: Mutex<Option<PagePayer>>,
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    observation: PageObservation,
 }
 
 impl PageBlock {
@@ -440,7 +461,31 @@ impl PageAllocation {
         // The unique, unpublished allocation was paid by the native producer.
         unsafe { page.block.as_mut() }.len_and_origin |= !(isize::MAX as usize);
         #[cfg(feature = "test-seams")]
-        crate::read_admission::record_native_page_allocation_for_test(layout.size());
+        {
+            let observation = PageObservation::current();
+            observation.backing_opened();
+            let allocation = page.block.as_ptr() as usize;
+            let block = unsafe { page.block.as_mut() };
+            block.observation = observation.clone();
+            if let Some(PagePayer::Source(ReadMemoryCharge::Native(charge))) = block
+                .payer
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                charge.bind_page_for_test(
+                    observation.clone(),
+                    allocation,
+                    layout.size(),
+                    crate::native_storage_admission::current_allocation_funder_for_test(),
+                );
+            }
+            observation.emit(NativePageCustodyEventForTest::Allocated {
+                backing: page.backing_for_test(),
+                payment: page.native_payment_for_test(),
+            });
+            crate::read_admission::record_native_page_allocation_for_test(layout.size());
+        }
         Ok(page)
     }
     #[cfg(feature = "contextdb-internal")]
@@ -469,6 +514,8 @@ impl PageAllocation {
                 len_and_origin: len,
                 checksum: Mutex::new(None),
                 payer: Mutex::new(Some(payer)),
+                #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+                observation: PageObservation::default(),
             });
             std::ptr::write_bytes(block.as_ptr().cast::<u8>().add(offset), 0, len);
         }
@@ -591,6 +638,19 @@ impl PageAllocation {
             .payer
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let old = Self::payment_snapshot_for_test(
+            slot.as_ref(),
+            Self::strong_count(self),
+            Self::layout(self.len()).expect("live layout").0.size(),
+        );
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        {
+            payment.bind_page_for_test(
+                unsafe { self.block.as_ref() }.observation.clone(),
+                self.block.as_ptr() as usize,
+            );
+        }
         let previous = slot.take();
         let refund = match previous {
             Some(PagePayer::Source(charge)) if !fixed_room => {
@@ -623,7 +683,21 @@ impl PageAllocation {
             self.block.as_ptr() as usize,
             Self::layout(self.len()).unwrap().0,
         );
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let new = Self::payment_snapshot_for_test(
+            slot.as_ref(),
+            Self::strong_count(self),
+            Self::layout(self.len()).expect("live layout").0.size(),
+        );
         drop(slot);
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        unsafe { self.block.as_ref() }.observation.emit(
+            NativePageCustodyEventForTest::PaymentTransferred {
+                backing: self.backing_for_test(),
+                old,
+                new,
+            },
+        );
         drop(refund);
     }
     /// The new claim is already reserved. Replace before dropping the old
@@ -693,6 +767,12 @@ struct PageFree {
     block: NonNull<PageBlock>,
     layout: Layout,
     _payer: Option<PagePayer>,
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    observation: PageObservation,
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    backing: NativePageBackingForTest,
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    payment: NativePagePaymentForTest,
 }
 impl Drop for PageFree {
     fn drop(&mut self) {
@@ -703,6 +783,12 @@ impl Drop for PageFree {
             self.block.as_ptr() as usize,
             self.layout,
         );
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        self.observation
+            .emit(NativePageCustodyEventForTest::BeforePhysicalFree {
+                backing: self.backing,
+                payment: self.payment,
+            });
         unsafe { dealloc(self.block.as_ptr().cast(), self.layout) };
         #[cfg(feature = "test-seams")]
         observe_payer(
@@ -713,6 +799,15 @@ impl Drop for PageFree {
         );
         #[cfg(feature = "test-seams")]
         crate::read_admission::record_page_lifetime_for_test(self.layout.size(), false);
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        {
+            self.observation
+                .emit(NativePageCustodyEventForTest::AfterPhysicalFree {
+                    backing: self.backing,
+                    payment: self.payment,
+                });
+            self.observation.backing_closed();
+        }
         // Only after physical free does Rust drop the actual source receipt or
         // refund occupancy and release its counter owner. Also runs on unwind.
     }
@@ -749,8 +844,14 @@ impl Drop for PageAllocation {
             return;
         }
         fence(Ordering::Acquire);
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let backing = self.backing_for_test();
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let payment = self.native_payment_for_test();
         let block = unsafe { self.block.as_mut() };
         let (layout, _) = Self::layout(block.len()).expect("live page has a valid Layout");
+        #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+        let observation = block.observation.clone();
         let payer = block
             .payer
             .get_mut()
@@ -760,6 +861,12 @@ impl Drop for PageAllocation {
             block: self.block,
             layout,
             _payer: payer,
+            #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+            observation,
+            #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+            backing,
+            #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+            payment,
         };
         unsafe { std::ptr::drop_in_place(self.block.as_ptr()) };
     }
@@ -1051,5 +1158,106 @@ mod physical_lifetime_observer_tests {
             (-1, -(bytes as i128))
         );
         assert_eq!((parent.peak_pages, parent.peak_bytes), (0, 0));
+    }
+}
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl CachePayment {
+    fn fixed_receipt_for_test(&self) -> Option<usize> {
+        if !self.fixed {
+            return None;
+        }
+        unsafe { self.counter.block.as_ref() }
+            .reserve
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|r| r.identity_for_test())
+    }
+    fn bind_page_for_test(&mut self, observation: PageObservation, allocation: usize) {
+        assert!(self.observation.is_none());
+        let receipt = self.fixed_receipt_for_test().unwrap_or(0);
+        self.observation = Some(PaymentObservation::new(
+            observation,
+            allocation,
+            receipt,
+            None,
+            self.bytes,
+        ));
+    }
+}
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl PageAllocation {
+    pub(crate) fn backing_for_test(&self) -> NativePageBackingForTest {
+        let len = unsafe { self.block.as_ref() }.len();
+        let (layout, offset) = Self::layout(len).expect("live page layout");
+        NativePageBackingForTest {
+            allocation: self.block.as_ptr() as usize,
+            payload: unsafe { self.block.as_ptr().cast::<u8>().add(offset) } as usize,
+            layout,
+            payload_bytes: len,
+        }
+    }
+    fn payment_snapshot_for_test(
+        payer: Option<&PagePayer>,
+        strong_handles: usize,
+        backing_bytes: usize,
+    ) -> NativePagePaymentForTest {
+        let source = match payer {
+            Some(PagePayer::Source(ReadMemoryCharge::Native(c)))
+            | Some(PagePayer::SourceCounted {
+                charge: ReadMemoryCharge::Native(c),
+                ..
+            }) => Some(c),
+            _ => None,
+        };
+        let occupancy = match payer {
+            Some(PagePayer::Cache(p)) | Some(PagePayer::SourceCounted { occupancy: p, .. }) => {
+                Some(p)
+            }
+            _ => None,
+        };
+        NativePagePaymentForTest {
+            source_receipt: source.map(|c| c.identity_for_test()),
+            fixed_cache_counter: occupancy.map(|p| p.counter.block.as_ptr() as usize),
+            fixed_cache_receipt: occupancy.and_then(CachePayment::fixed_receipt_for_test),
+            original_funder: source.and_then(|c| c.original_funder_for_test()),
+            charged_bytes: if source.is_some() {
+                backing_bytes
+            } else {
+                occupancy.map_or(0, |p| p.bytes)
+            },
+            strong_handles,
+        }
+    }
+    pub(crate) fn native_payment_for_test(&self) -> NativePagePaymentForTest {
+        let slot = unsafe { self.block.as_ref() }
+            .payer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut payment = Self::payment_snapshot_for_test(
+            slot.as_ref(),
+            Self::strong_count(self),
+            Self::layout(self.len()).expect("live layout").0.size(),
+        );
+        if payment.source_receipt.is_some() {
+            payment.charged_bytes = Self::layout(self.len()).expect("live layout").0.size();
+        }
+        payment
+    }
+    pub(crate) fn observation_for_test(&self) -> PageObservation {
+        unsafe { self.block.as_ref() }.observation.clone()
+    }
+}
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl CacheCounter {
+    pub(super) fn fixed_receipt_identity_for_test(&self) -> Option<usize> {
+        unsafe { self.block.as_ref() }
+            .reserve
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|receipt| receipt.identity_for_test())
     }
 }

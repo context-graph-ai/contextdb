@@ -3987,6 +3987,8 @@ struct RankedVectorRow {
 }
 
 struct VectorState {
+    canonical_ordered: bool,
+    query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
     #[cfg(any(test, feature = "test-seams"))]
     receipt: vector_search_receipt::SearchReceiptState,
     table: String,
@@ -4973,6 +4975,13 @@ fn select_body_capacity_bytes(
             "subquery ordering",
         )?;
     }
+    bytes = checked_size_add(
+        bytes,
+        crate::database::vector_ivf::policy::query_policy_capacity(
+            body.vector_search_override.as_ref(),
+        ),
+        "subquery vector policy",
+    )?;
     checked_size_add(bytes, optional_string_capacity(&body.use_rank), "subquery")
 }
 
@@ -5195,6 +5204,7 @@ fn physical_plan_capacity_bytes(
             query_expr,
             candidates,
             sort_key,
+            query_policy,
             materialized_columns,
             ..
         }
@@ -5204,10 +5214,16 @@ fn physical_plan_capacity_bytes(
             query_expr,
             candidates,
             sort_key,
+            query_policy,
             materialized_columns,
             ..
         } => {
             let mut bytes = checked_size_add(table.capacity(), column.capacity(), "vector plan")?;
+            bytes = checked_size_add(
+                bytes,
+                crate::database::vector_ivf::policy::query_policy_capacity(query_policy.as_ref()),
+                "vector query policy",
+            )?;
             bytes = checked_size_add(bytes, expr_capacity_bytes(query_expr)?, "vector plan")?;
             bytes = checked_size_add(bytes, optional_string_capacity(sort_key), "vector plan")?;
             if let Some(materialized_columns) = materialized_columns {
@@ -5384,6 +5400,27 @@ fn table_meta_capacity_bytes(
                 string_vec_capacity_bytes(partition_key_columns, "vector partition declaration")?,
                 "table metadata column",
             )?;
+        }
+        for values in [
+            &column.vector_engine_policy.calibration_depths,
+            &column.vector_engine_policy.refine_factors,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = checked_size_add(
+                bytes,
+                checked_size_mul(
+                    values.capacity(),
+                    std::mem::size_of::<u32>(),
+                    "vector policy list",
+                )?,
+                "table metadata policy",
+            )?;
+        }
+        if let Some(source) = &column.vector_engine_policy.calibration_queries {
+            bytes = checked_size_add(bytes, source.table.capacity(), "calibration source table")?;
+            bytes = checked_size_add(bytes, source.column.capacity(), "calibration source column")?;
         }
         if let Some(scope) = column.scope_label.as_ref() {
             match scope {
@@ -11147,6 +11184,7 @@ impl VectorState {
                                     } else {
                                         self.search_mode
                                     },
+                                    self.query_breadth,
                                     &reader_memory_refusal,
                                     allowed_search_limits,
                                     &mut || context.native_source_touch(),
@@ -11170,6 +11208,14 @@ impl VectorState {
                                         (true, Some(allowance)) => {
                                             Some(contextdb_vector::mem::RowCheck {
                                                 allowance,
+                                                check: &mut row_check,
+                                            })
+                                        }
+                                        (true, None) if db.has_native_ivf_source() => {
+                                            Some(contextdb_vector::mem::RowCheck {
+                                                // This reader declared no separate row-check ceiling.
+                                                // Each callback still pays its ordinary request work.
+                                                allowance: usize::MAX,
                                                 check: &mut row_check,
                                             })
                                         }
@@ -11200,6 +11246,11 @@ impl VectorState {
                                 trace.override_exact_reason("filtered_route_exact");
                             }
                             self.used_hnsw = trace.used_hnsw();
+                            // Native finalists have already been ordered by
+                            // canonical f64 distances and row-ID ties. Avoid
+                            // ordering them again by their exposed f32 scores.
+                            self.canonical_ordered =
+                                db.has_native_ivf_source() && self.vector_overlay.is_none();
                             if self.vector_overlay.is_some() {
                                 rows.retain_mut(|(row_id, _score)| {
                                     let Some(published) = self.overlay_publishes(*row_id) else {
@@ -11807,7 +11858,7 @@ impl VectorState {
                     .then_with(|| bounded_rank_float_desc(left.vector_score, right.vector_score))
                     .then_with(|| left.row_id.cmp(&right.row_id))
             });
-        } else {
+        } else if !self.canonical_ordered {
             self.ranked_rows.sort_by(|left, right| {
                 right
                     .vector_score
@@ -16714,6 +16765,18 @@ fn build_vector_kernel<'plan>(
     ctes: &HashMap<&'plan str, &'plan PhysicalPlan>,
     context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
+    let query_breadth = match plan {
+        PhysicalPlan::VectorSearch { query_policy, .. }
+        | PhysicalPlan::HnswSearch { query_policy, .. } => {
+            crate::database::vector_ivf::policy::QueryBreadth::resolve(
+                table,
+                column,
+                query_policy.as_ref(),
+            )?
+        }
+        _ => crate::database::vector_ivf::policy::QueryBreadth::default(),
+    };
+
     db.assert_table_read_allowed(table)?;
     let index = VectorIndexRef::new(table.to_string(), column.to_string());
     let mut schema_indexes = vec![index.clone()];
@@ -16754,11 +16817,24 @@ fn build_vector_kernel<'plan>(
     let partition_scope = route.scope;
     let access_candidates = route.candidates;
     let complete_relational_route = route.complete;
+    // The native candidate port checks a plain residual predicate against
+    // the captured row before any distance evaluation. It needs no full
+    // relational candidate scan or population-sized identity bitmap.
+    let native_residual = db.has_native_ivf_source()
+        && !access_filter
+        && context.transaction().is_none()
+        && access_candidates
+            .as_ref()
+            .and_then(|plan| vector_row_filter(plan, table))
+            .is_some();
     // Refuse before the candidate subtree gets to run.  A bounded read has a
     // ceiling, but spending that ceiling walking every row is still not an
     // INDEXED answer.  The shared check uses the same relational index choice
     // this kernel will use after the caller adds a supporting index.
-    if search_mode == contextdb_core::VectorSearchMode::Indexed && !complete_relational_route {
+    if search_mode == contextdb_core::VectorSearchMode::Indexed
+        && !complete_relational_route
+        && !native_residual
+    {
         return Err(Error::VectorFilteredRouteUnavailable {
             index: index.clone(),
             predicate_columns: super::vector_candidate_refusal_columns(
@@ -16785,11 +16861,13 @@ fn build_vector_kernel<'plan>(
     } else {
         access_candidates.as_ref()
     };
-    let forced_exact =
-        search_mode == contextdb_core::VectorSearchMode::Auto && !complete_relational_route;
-    let streamed_filter = (forced_exact && !access_filter && context.transaction().is_none())
-        .then(|| candidate_plan.and_then(|plan| vector_row_filter(plan, table)))
-        .flatten();
+    let forced_exact = search_mode == contextdb_core::VectorSearchMode::Auto
+        && !complete_relational_route
+        && !native_residual;
+    let streamed_filter =
+        ((forced_exact || native_residual) && !access_filter && context.transaction().is_none())
+            .then(|| candidate_plan.and_then(|plan| vector_row_filter(plan, table)))
+            .flatten();
     let stream_plain_filter = streamed_filter.is_some();
     let row_filter = if let Some(filter) = streamed_filter {
         Some(copy_vector_row_filter(filter, None, context)?)
@@ -17049,6 +17127,8 @@ fn build_vector_kernel<'plan>(
         columns,
         trace,
         kind: PullKind::Vector(Box::new(VectorState {
+            canonical_ordered: false,
+            query_breadth,
             #[cfg(any(test, feature = "test-seams"))]
             receipt: vector_search_receipt::SearchReceiptState::Unstarted,
             supplement_columns: Vec::new(),
@@ -17074,7 +17154,8 @@ fn build_vector_kernel<'plan>(
             search_mode,
             force_exact_for_relational_fallback: search_mode
                 == contextdb_core::VectorSearchMode::Auto
-                && !complete_relational_route,
+                && !complete_relational_route
+                && !native_residual,
             sort_key: sort_key.map(str::to_string),
             params,
             requested_search_mode,
@@ -17089,8 +17170,8 @@ fn build_vector_kernel<'plan>(
             } else {
                 VectorPreparation::Candidates(candidate_root)
             },
-            candidate_filter: (candidate_plan.is_some() && candidate_root_was_kept)
-                || directory_candidates,
+            candidate_filter: !stream_plain_filter
+                && ((candidate_plan.is_some() && candidate_root_was_kept) || directory_candidates),
             candidate_ids,
             candidate_bytes,
             row_filter,
@@ -17117,7 +17198,7 @@ fn build_vector_kernel<'plan>(
 /// The predicate of a candidate plan that is a plain scan of `table`, under
 /// any projections: the one shape whose rows a search can check one at a
 /// time with exactly the statement's own filter.
-fn vector_row_filter<'a>(plan: &'a PhysicalPlan, table: &str) -> Option<&'a Expr> {
+pub(super) fn vector_row_filter<'a>(plan: &'a PhysicalPlan, table: &str) -> Option<&'a Expr> {
     let mut plan = plan;
     while let PhysicalPlan::Project { input, .. } = plan {
         plan = input;
@@ -18307,6 +18388,11 @@ fn build_store_state(
                 context
                     .source_read_memory(BoundedWorkSource::TableScan)
                     .map_err(BoundedExecutionError::into_engine_error)?,
+                &|| {
+                    context
+                        .charge(BoundedWorkSource::TableScan, BoundedSourceTouch::IndexEntry)
+                        .map_err(BoundedExecutionError::into_engine_error)
+                },
             )
         })?
     };
@@ -19198,6 +19284,7 @@ pub(crate) fn drain_chosen_plan_with_native_trace_refund(
                 plan,
                 &mut crate::vector_read_memory::admission(read_memory.clone()),
                 read_memory.clone(),
+                &|| Ok(()),
             )
             .map_err(BoundedExecutionError::from);
     }

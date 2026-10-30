@@ -1559,7 +1559,7 @@ pub(super) fn sql_type_for_ast_column(
     _rules: &[contextdb_parser::ast::AstPropagationRule],
 ) -> String {
     let mut ty = sql_type_for_ast(&col.data_type);
-    append_ast_quantization(&mut ty, col.quantization);
+    ty.push_str(&crate::database::vector_ivf::policy::AstWith(col).to_string());
     append_ast_vector_declaration(&mut ty, col);
     if col.context_id {
         ty.push_str(" CONTEXT_ID");
@@ -1657,18 +1657,6 @@ pub(super) fn render_meta_column(
     output
 }
 
-pub(super) fn append_ast_quantization(
-    ty: &mut String,
-    quantization: contextdb_parser::ast::VectorQuantization,
-) {
-    let quantization = match quantization {
-        contextdb_parser::ast::VectorQuantization::F32 => return,
-        contextdb_parser::ast::VectorQuantization::SQ8 => "SQ8",
-        contextdb_parser::ast::VectorQuantization::SQ4 => "SQ4",
-    };
-    ty.push_str(&format!(" WITH (quantization = '{quantization}')"));
-}
-
 pub(super) fn append_ast_vector_declaration(
     ty: &mut String,
     col: &contextdb_parser::ast::ColumnDef,
@@ -1721,6 +1709,7 @@ pub(super) fn append_ast_vector_declaration(
             .unwrap_or_else(|_| flat_below.to_owned());
         ty.push_str(&format!(" FLAT_BELOW {flat_below}"));
     }
+    ty.push_str(&crate::database::vector_ivf::policy::AstGroups(col).to_string());
     append_ast_hnsw_declaration(ty, &col.hnsw);
     append_ast_consolidation_declaration(ty, &col.consolidation);
 }
@@ -2283,6 +2272,12 @@ pub(super) fn merge_sync_alter_existing_column(current: &mut ColumnDef, incoming
         current.flat_below = incoming.flat_below;
         current.auto_expansion_ceiling = incoming.auto_expansion_ceiling;
         current.hnsw_search_radius_millionths = incoming.hnsw_search_radius_millionths;
+        current.search_target_accuracy_hundredths = incoming.search_target_accuracy_hundredths;
+        current.search_expected_vectors = incoming.search_expected_vectors;
+        current.ivf_lists = incoming.ivf_lists;
+        current.ivf_probes = incoming.ivf_probes;
+        current.ivf_refine_factor_hundredths = incoming.ivf_refine_factor_hundredths;
+        current.vector_engine_policy = incoming.vector_engine_policy;
         current.hnsw_m = incoming.hnsw_m;
         current.hnsw_ef_construction = incoming.hnsw_ef_construction;
         current.hnsw_ef_search = incoming.hnsw_ef_search;
@@ -2889,6 +2884,12 @@ pub(crate) fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
     // smuggle in: every flag below defaults OFF, the honest reading of "no
     // real token seen."
     ColumnDef {
+        search_target_accuracy_hundredths: None,
+        search_expected_vectors: None,
+        ivf_lists: None,
+        ivf_probes: None,
+        ivf_refine_factor_hundredths: None,
+        vector_engine_policy: Default::default(),
         name: name.to_string(),
         column_type: ColumnType::Text,
         nullable: true,

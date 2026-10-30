@@ -3808,6 +3808,29 @@ impl WriteTransaction {
     }
 
     /// Retrieves information about storage usage in the database
+    /// Quote the actual native dirty backing for a fresh variable-byte leaf
+    /// entry. This uses the producer's serialization and the live file's page
+    /// geometry, then its concrete PageAllocation layout. It allocates and
+    /// admits nothing; callers must still fund the genuine storage receipt.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn native_dirty_byte_entry_layout(
+        &self,
+        key_bytes: usize,
+        value_bytes: usize,
+    ) -> Option<std::alloc::Layout> {
+        let body = key_bytes.checked_add(value_bytes)?;
+        // Check the fixed one-entry header arithmetic before calling the
+        // same serializer's required_bytes calculation used by LeafBuilder.
+        body.checked_add(3 * size_of::<u32>())?;
+        let serialized = crate::tree_store::RawLeafBuilder::required_bytes(1, body, None, None);
+        let pages = serialized
+            .div_ceil(self.mem.get_page_size())
+            .checked_next_power_of_two()?;
+        let bytes = pages.checked_mul(self.mem.get_page_size())?;
+        crate::tree_store::native_dirty_page_layout(bytes)
+    }
+
     pub fn stats(&self) -> Result<DatabaseStats> {
         let tables = self.tables.lock().unwrap();
         let table_tree = &tables.table_tree;
@@ -3953,6 +3976,20 @@ impl StorageStatisticsSnapshot {
 }
 
 impl ReadTransaction {
+    /// Retire optional setup copies before a verified snapshot escapes.
+    /// Its immutable identity and MVCC pins remain unchanged.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn release_optional_root_cache(&mut self) {
+        self.tree.release_optional_root_cache();
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn installed_cache_capacity(&self) -> usize {
+        self.mem.installed_cache_capacity()
+    }
+
     pub(crate) fn new(
         mem: Arc<TransactionalMemory>,
         guard: TransactionGuard,

@@ -1,5 +1,5 @@
 use super::*;
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use std::sync::atomic::AtomicUsize;
 
 const CATALOGS: TableDefinition<&[u8], &[u8]> =
@@ -7,6 +7,140 @@ const CATALOGS: TableDefinition<&[u8], &[u8]> =
 const MEMBERSHIPS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_membership");
 const JOURNAL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_partition_journal");
+
+
+// The final publication remains the original public maintenance call in each
+// fixture. Only its prerequisite advances through actual stored native phases.
+pub(super) fn native_fixture_before_publication(
+    db: &Database,
+    routes: &[VectorPartitionRef],
+    declared_source_rows: usize,
+) {
+    let bound = native_fixture_cycle_bound(db, routes, declared_source_rows);
+    for _ in 0..bound {
+        let pending = routes.iter().all(|route| {
+            db.native_ivf_publication_eligible_for_test(&route.index, &route.partition_key)
+                .unwrap()
+        });
+        if pending {
+            return;
+        }
+        let report = db.run_maintenance_cycle().unwrap();
+        assert!(
+            report.vector.first_failure.is_none(),
+            "native fixture preparation failed: {report:?}"
+        );
+    }
+    panic!("native declared phases must converge before publication within {bound} cycles");
+}
+
+pub(super) fn native_fixture_cycle_bound(
+    db: &Database,
+    routes: &[VectorPartitionRef],
+    declared_source_rows: usize,
+) -> usize {
+    routes
+        .iter()
+        .map(|route| {
+            let resolved = db
+                .native_ivf_resolved_policy_for_test(&route.index, &route.partition_key)
+                .unwrap();
+            let rows = declared_source_rows
+                .max(resolved.population as usize)
+                .max(1);
+            let ingest = rows.div_ceil(resolved.training.ingest_batch_keys.max(1));
+            let phase = rows.div_ceil(resolved.training.phase_batch_entries.max(1));
+            // Ingest and its terminal cursor, Seed, each declared training pass,
+            // Assign, Publish, Ready, plus a finite row-at-a-time remap allowance.
+            ingest + (phase + 1) * (resolved.training.iterations as usize + 4) + rows + 6
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+pub(super) fn native_fixture_ready(
+    db: &Database,
+    routes: &[VectorPartitionRef],
+    declared_source_rows: usize,
+) -> VectorMaintenanceReport {
+    for _ in 0..native_fixture_cycle_bound(db, routes, declared_source_rows) {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        assert!(
+            report.first_failure.is_none(),
+            "native fixture readiness failed: {report:?}"
+        );
+        if report.ready_partitions >= routes.len() && report.remaining_partitions == 0 {
+            return report;
+        }
+    }
+    panic!("native fixture never reported ready with no remaining partitions");
+}
+
+
+pub(super) fn native_fixture_open(path: &std::path::Path, limit: Option<usize>) -> Database {
+    let mut options = DatabaseOpenOptions {
+        memory_limit: limit,
+        maintenance_policy: MaintenancePolicy::CallerDriven,
+        ..DatabaseOpenOptions::default()
+    };
+    // Opening the deliberately oversized fixture has its own declared reader;
+    // the later measured maintenance still uses its original writer limit.
+    options.owner_reads.limits.limits.memory = 64 * 1024 * 1024;
+    Database::open_with_options(path, options).unwrap()
+}
+
+pub(super) fn native_fixture_cold_cache(db: &Database) {
+    let persistence = db.persistence.as_ref().unwrap();
+    persistence.settle_writer_cache_budget(0).unwrap();
+    assert_eq!(persistence.read_cache_observation().unwrap().unwrap().installed_capacity(), 0);
+}
+
+pub(super) fn native_fixture_control(db: &Database, route: &VectorPartitionRef) -> (Vec<u8>, Vec<u8>) {
+    db.with_native_ivf_read_for_test(&route.index, &route.partition_key, |scope| {
+        scope.with_scope_control_for_test(|_, stored, bytes| {
+            Ok((stored.scope_key.to_vec(), bytes.to_vec()))
+        })
+    }).unwrap()
+}
+
+pub(super) fn native_fixture_serving(db: &Database, route: &VectorPartitionRef) -> Option<[u8; 200]> {
+    db.native_ivf_serving_descriptor_for_test(&route.index, &route.partition_key)
+        .unwrap().map(|descriptor| descriptor.bytes)
+}
+
+pub(super) fn native_fixture_page_target(
+    db: &Database,
+    route: &VectorPartitionRef,
+    kind: contextdb_vector::ivf::storage::PageKind,
+) -> (String, Vec<u8>, Vec<u8>) {
+    let mut saved = None;
+    db.with_native_ivf_read_for_test(&route.index, &route.partition_key, |scope| {
+        scope.visit_physical_pages(&mut |page| {
+            if page.key.kind == kind && saved.is_none() {
+                saved = Some((page.storage, page.bytes.to_vec()));
+            }
+        })
+    }).unwrap();
+    let (storage, bytes) = saved.expect("the real maintained native family owns the target page");
+    let prefix = format!("ivf_{storage:016x}_");
+    db.with_native_ivf_fixture_read_for_test(|read| {
+        let mut found = None;
+        for handle in read.list_tables().unwrap() {
+            let name = handle.name();
+            if !name.starts_with(&prefix) { continue; }
+            let table = read.open_table(TableDefinition::<&[u8], &[u8]>::new(name)).unwrap();
+            for entry in table.iter().unwrap() {
+                let (key, value) = entry.unwrap();
+                if value.value() == bytes.as_slice() {
+                    assert!(found.is_none(), "the observed saved page has one physical table/key");
+                    found = Some((name.to_owned(), key.value().to_vec(), value.value().to_vec()));
+                }
+            }
+        }
+        Ok(found.expect("the captured native saved page exists in its real storage family"))
+    }).unwrap()
+}
+
 #[derive(Clone, Copy)]
 enum ColdMetadata {
     Catalog,
@@ -28,8 +162,7 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     const MALFORMED_METADATA_BYTES: usize = 9 * 1024 * 1024;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("metadata-owner.db");
-    let copy = directory.path().join("metadata-cold.db");
-    let mut db = Database::open_with_options(
+    let db = Database::open_with_options(
         &path,
         DatabaseOpenOptions {
             maintenance_policy: MaintenancePolicy::CallerDriven,
@@ -45,7 +178,7 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
     ) {
         "CREATE TABLE metadata_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 4, EF_CONSTRUCTION = 64))"
     } else {
-        "CREATE TABLE metadata_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED)"
+        "CREATE TABLE metadata_items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 16) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 16, training_iterations = 1))"
     };
     db.execute(declaration, &HashMap::new()).unwrap();
     for id in 0..16 {
@@ -200,93 +333,63 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
         db.close().unwrap();
         return;
     }
+    let native_routes = [VectorPartitionRef::new(
+        VectorIndexRef::new("metadata_items", "v"),
+        VectorPartitionKey::unpartitioned(),
+    )];
+    native_fixture_before_publication(&db, &native_routes, 16);
     assert_eq!(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         1
     );
+    native_fixture_ready(&db, &native_routes, 16);
     let partition = VectorPartitionRef::new(
         VectorIndexRef::new("metadata_items", "v"),
         VectorPartitionKey::unpartitioned(),
     );
-    let serving = db
-        .vector_store
-        .partition_graph_generation_status(&partition)
-        .unwrap();
-    let original_catalog = db
-        .persistence
-        .as_ref()
-        .unwrap()
-        .load_vector_partition_generation_catalog_for(&partition.index, &partition.partition_key)
-        .unwrap()
-        .unwrap();
-    // A separate snapshot retains the original serving authority. Reopen its
-    // metadata with no cache so the physical extent is deterministically cold.
-    db.export_snapshot(&copy).unwrap();
-    let persistence = RedbPersistence::open_with_cache(&copy, 0).unwrap();
-    let (catalog_key, catalog_bytes, _membership_key) = db
-        .persistence
-        .as_ref()
-        .unwrap()
-        .with_db(|source| {
-            let read = source.begin_read().unwrap();
-            let catalogs = read.open_table(CATALOGS).unwrap();
-            let (key, value) = catalogs.iter().unwrap().next().unwrap().unwrap();
-            let memberships = read.open_table(MEMBERSHIPS).unwrap();
-            let (membership_key, _) = memberships.iter().unwrap().next().unwrap().unwrap();
-            Ok((
-                key.value().to_vec(),
-                value.value().to_vec(),
-                membership_key.value().to_vec(),
-            ))
-        })
-        .unwrap();
-    let mut journal_key = catalog_key.clone();
-    let journal_lsn = if matches!(metadata, ColdMetadata::CoveredJournal) {
-        original_catalog.base.covered_lsn.0
-    } else {
-        original_catalog.base.covered_lsn.0 + 1
-    };
-    journal_key.extend_from_slice(&journal_lsn.to_be_bytes());
-    journal_key.extend_from_slice(&0u64.to_be_bytes());
-    let (definition, malformed_key) = match metadata {
-        ColdMetadata::GraphLifetimeNormal
-        | ColdMetadata::GraphLifetimeRepair
-        | ColdMetadata::SavedPublicationFailure => {
-            unreachable!("mapped failure row returned above")
-        }
-        ColdMetadata::Catalog => (CATALOGS, catalog_key.as_slice()),
-        ColdMetadata::CoveredJournal => (JOURNAL, journal_key.as_slice()),
-        ColdMetadata::Journal => (JOURNAL, journal_key.as_slice()),
-    };
-    persistence
-        .with_db(|destination| {
-            let write = destination.begin_write().unwrap();
-            {
-                let mut catalogs = write.open_table(CATALOGS).unwrap();
-                catalogs
-                    .insert(catalog_key.as_slice(), catalog_bytes.as_slice())
-                    .unwrap();
+    if matches!(metadata, ColdMetadata::Journal) {
+        db.execute("UPDATE metadata_items SET v = '[0,1,0]' WHERE id = 0", &HashMap::new()).unwrap();
+    }
+    if matches!(metadata, ColdMetadata::Journal | ColdMetadata::CoveredJournal) {
+        // A real policy revision starts replacement ingestion on the next cycle;
+        // it leaves the covered/uncovered row frontier itself unchanged.
+        db.execute(
+            "ALTER TABLE metadata_items ALTER COLUMN v SET WITH (training_seed = 1)",
+            &HashMap::new(),
+        ).unwrap();
+    }
+    let serving = native_fixture_serving(&db, &partition).unwrap();
+    let original_catalog = native_fixture_control(&db, &partition);
+    let (table_name, malformed_key, original_value) = match metadata {
+        ColdMetadata::Catalog => ("ivf_scopes".to_owned(), original_catalog.0.clone(), original_catalog.1.clone()),
+        ColdMetadata::Journal | ColdMetadata::CoveredJournal => {
+            let (current, covered) = db.with_native_ivf_read_for_test(&partition.index, &partition.partition_key, |scope| {
+                scope.with_scope_control_for_test(|_, stored, _| {
+                    let generation = stored.serving.expect("the original serving manifest").generation;
+                    let family = stored.families.iter().flatten().find(|family| family.generation == generation).unwrap();
+                    Ok((stored.current.frontier, family.frozen_frontier))
+                })
+            }).unwrap();
+            if matches!(metadata, ColdMetadata::Journal) {
+                assert!(current > covered, "the real committed update is outside the serving basis");
+            } else {
+                assert!(current <= covered, "the native row-version source is covered by the serving basis");
             }
-            // Invalid bytes have no bounded logical descriptor to price. The
-            // physical owner must be refused before metadata validation sees it.
-            let malformed = vec![0xff; MALFORMED_METADATA_BYTES];
-            write
-                .open_table(definition)
-                .unwrap()
-                .insert(malformed_key, malformed.as_slice())
-                .unwrap();
-            write.commit().unwrap();
-            Ok(())
-        })
-        .unwrap();
-    persistence.close();
-    drop(persistence);
-    let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(db.accountant.clone());
-    let original_persistence = db.persistence.replace(Arc::clone(&persistence)).unwrap();
+            native_fixture_page_target(&db, &partition, contextdb_vector::ivf::storage::PageKind::RowVersions)
+        }
+        _ => unreachable!("the graph-only private fixtures returned above"),
+    };
+    let definition = TableDefinition::<&[u8], &[u8]>::new(&table_name);
+    native_fixture_cold_cache(&db);
+    db.with_native_ivf_fixture_write_for_test(|write| {
+        let malformed = vec![0xff; MALFORMED_METADATA_BYTES];
+        write.open_table(definition).unwrap().insert(malformed_key.as_slice(), malformed.as_slice()).unwrap();
+        Ok(())
+    }).unwrap();
+    let persistence = Arc::clone(db.persistence.as_ref().unwrap());
     let baseline = db.accountant.usage().used;
     let snapshot_holds = db.snapshot_registry.state.lock().active.len();
-    let headroom = 512 * 1024;
+    let headroom = MALFORMED_METADATA_BYTES / 2;
     let limit = baseline + headroom;
     let largest_read = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&largest_read);
@@ -295,17 +398,26 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
     db.accountant.set_budget(Some(limit)).unwrap();
-    let report = db.run_maintenance_cycle().unwrap();
-    let details = report
-        .vector
-        .first_failure_details
-        .expect("the public cycle exposes the deferred physical owner");
-    assert_eq!(details.failure, VectorMaintenanceFailure::MemoryLimit);
-    assert_eq!(details.operation, "prepare_vector_generation");
-    assert!(details.requested_bytes.unwrap() > MALFORMED_METADATA_BYTES as u64);
-    assert!(details.available_bytes.unwrap() <= headroom as u64);
-    assert_eq!(details.budget_limit_bytes, Some(limit as u64));
-    assert_eq!(report.vector.built_partitions, 0);
+    let cycle = db.run_maintenance_cycle();
+    if matches!(metadata, ColdMetadata::Journal | ColdMetadata::CoveredJournal) {
+        assert!(
+            matches!(&cycle, Err(Error::StoreCorrupted { .. })),
+            "persistent damage to the native journal must remain a typed corruption refusal: {cycle:?}"
+        );
+        drop(cycle);
+    } else {
+        let report = cycle.unwrap();
+        let details = report
+            .vector
+            .first_failure_details
+            .expect("the public cycle exposes the deferred physical owner");
+        assert_eq!(details.failure, VectorMaintenanceFailure::MemoryLimit);
+        assert_eq!(details.operation, "exact_byte_read");
+        assert!(details.requested_bytes.unwrap() > MALFORMED_METADATA_BYTES as u64);
+        assert!(details.available_bytes.unwrap() <= headroom as u64);
+        assert_eq!(details.budget_limit_bytes, Some(limit as u64));
+        assert_eq!(report.vector.built_partitions, 0);
+    }
     assert!(db.maintenance_cycle_stamp_is_set_for_test());
     assert!(largest_read.load(Ordering::SeqCst) < MALFORMED_METADATA_BYTES);
     drop(observation);
@@ -319,23 +431,13 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
             .temporary_workspace,
         0
     );
-    assert_eq!(
-        db.vector_store
-            .partition_graph_generation_status(&partition),
-        Some(serving)
-    );
-    assert!(
-        db.vector_store
-            .partition_route_quarantine(&partition)
-            .is_none()
-    );
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
     db.accountant.set_budget(None).unwrap();
     persistence
         .with_db(|source| {
             let read = source.begin_read().unwrap();
             let table = read.open_table(definition).unwrap();
-            let value = table.get(malformed_key).unwrap().unwrap();
+            let value = table.get(malformed_key.as_slice()).unwrap().unwrap();
             assert_eq!(value.value().len(), MALFORMED_METADATA_BYTES);
             assert!(
                 value.value().iter().all(|byte| *byte == 0xff),
@@ -344,18 +446,19 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
             Ok(())
         })
         .unwrap();
-    assert_eq!(
-        original_persistence
-            .load_vector_partition_generation_catalog_for(
-                &partition.index,
-                &partition.partition_key
-            )
-            .unwrap(),
-        Some(original_catalog)
-    );
-    // The damage probe used a separate snapshot. The public writer's captured
-    // relational/vector roots still belong to its original serving authority.
-    db.persistence = Some(original_persistence);
+    // Restore only the deliberately damaged private input, then reopen its
+    // real writer so the final public control borrows the current real root.
+    db.with_native_ivf_fixture_write_for_test(|write| {
+        write.open_table(definition).unwrap().insert(malformed_key.as_slice(), original_value.as_slice()).unwrap();
+        Ok(())
+    }).unwrap();
+    drop(persistence);
+    db.close().unwrap();
+    drop(db);
+    let db = native_fixture_open(&path, None);
+    assert_eq!(native_fixture_serving(&db, &partition), Some(serving));
+    assert_eq!(native_fixture_control(&db, &partition), original_catalog);
+    assert!(db.native_ivf_catalog_for_test(&partition.index, &partition.partition_key).unwrap().is_some_and(|catalog| catalog.unserviceable.is_none() && !catalog.legacy_unserviceable));
     assert_eq!(
         db.execute(
             "SELECT id FROM metadata_items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3",
@@ -1672,4 +1775,226 @@ fn assert_saved_retry_publication(db: &Database) {
         blake3::hash(&base.graph.bytes),
         blake3::hash(&fixture.base.manifest)
     );
+}
+
+
+type RouteOutputHookForTest =
+    Box<dyn FnMut(usize, usize, usize, &mut dyn FnMut() -> Result<()>) -> Result<()>>;
+thread_local! {
+    static ROUTE_OUTPUT_HOOK_FOR_TEST: std::cell::RefCell<Option<RouteOutputHookForTest>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn with_route_output_for_test(
+    output_len: usize,
+    output_pointer: usize,
+    output_capacity: usize,
+    action: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let hook = ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| slot.borrow_mut().take());
+    let Some(mut hook) = hook else {
+        return action();
+    };
+    let mut pending = Some(action);
+    let result = hook(output_len, output_pointer, output_capacity, &mut || {
+        pending
+            .take()
+            .expect("the real route-output action runs once")()
+    });
+    assert!(
+        pending.is_none(),
+        "the observation runs the real output action"
+    );
+    ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(hook));
+    result
+}
+
+struct RouteOutputHookScopeForTest;
+impl Drop for RouteOutputHookScopeForTest {
+    fn drop(&mut self) {
+        ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| *slot.borrow_mut() = None);
+        crate::persistence::content_identity::proof_allocation_oracle_tests::disarm_source_free_watch();
+    }
+}
+
+#[test]
+fn native_route_output_refusal_releases_partial_output_preserves_serving_and_closes() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "native_route_output_refusal_releases_partial_output_preserves_serving_and_closes",
+        &[],
+    ) {
+        return;
+    }
+    use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+    use crate::vector_read_memory::{DeclaredReadMemory, statement_child_proof};
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::open_with_options(
+        directory.path().join("native-route-output.db"),
+        DatabaseOpenOptions {
+            memory_limit: Some(64 * 1024 * 1024),
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let names = ["route_first", "route_second"];
+    let routes = names.map(|table| {
+        VectorPartitionRef::new(
+            VectorIndexRef::new(table, "v"),
+            VectorPartitionKey::unpartitioned(),
+        )
+    });
+    for table in names {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 2) IVF (LISTS = 1, PROBES = 1, REFINE_FACTOR = 1.00) WITH (write_buffer_bytes = 4096, training_samples = 2, training_iterations = 1, calibration_samples = 1, calibration_depths = [1]))"),
+            &HashMap::new(),
+        ).unwrap();
+        db.execute(
+            &format!("INSERT INTO {table} VALUES (0, '[1,0,0]'), (1, '[0,1,0]')"),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+    let bound: usize = routes
+        .iter()
+        .map(|route| {
+            let resolved = db
+                .native_ivf_resolved_policy_for_test(&route.index, &route.partition_key)
+                .unwrap();
+            let rows = 2usize.max(resolved.population as usize);
+            let ingest = rows.div_ceil(resolved.training.ingest_batch_keys.max(1));
+            let phase = rows.div_ceil(resolved.training.phase_batch_entries.max(1));
+            ingest + (phase + 1) * (resolved.training.iterations as usize + 4) + rows + 6
+        })
+        .sum();
+    let mut ready = false;
+    for _ in 0..bound {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        assert!(
+            report.first_failure.is_none(),
+            "native setup refused: {report:?}"
+        );
+        if report.ready_partitions == routes.len() && report.remaining_partitions == 0 {
+            ready = true;
+            break;
+        }
+    }
+    assert!(
+        ready,
+        "declared native phases converge within their derived bound"
+    );
+    let descriptors = routes.each_ref().map(|route| {
+        db.native_ivf_serving_descriptor_for_test(&route.index, &route.partition_key)
+            .unwrap()
+            .unwrap()
+            .bytes
+    });
+    let assert_serving = || {
+        for (index, table) in names.iter().enumerate() {
+            let reader = db
+                .read_session_with_clock_for_test(
+                    contextdb_core::read_contract::ReadLimits::default(),
+                    Arc::new(crate::local_transport::ManualDeadlineClock::at(0)),
+                )
+                .unwrap();
+            let answer = reader
+                .execute(
+                    &format!(
+                        "SELECT id FROM {table} ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 2"
+                    ),
+                    &HashMap::new(),
+                )
+                .unwrap();
+            assert_eq!(answer.rows().len(), 2);
+            assert!(answer.rows().contains(&vec![Value::Int64(0)]));
+            assert!(answer.rows().contains(&vec![Value::Int64(1)]));
+            assert_eq!(
+                db.native_ivf_serving_descriptor_for_test(
+                    &routes[index].index,
+                    &routes[index].partition_key
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
+                descriptors[index],
+            );
+        }
+    };
+    assert_serving();
+    let parent = DeclaredReadMemory::from_reader_limit(64 * 1024 * 1024).unwrap();
+    let memory = parent.child().unwrap();
+    let baseline = parent.retained_bytes_for_test();
+    let state = std::rc::Rc::new(std::cell::RefCell::new((0usize, false, false, 0usize)));
+    let observed = std::rc::Rc::clone(&state);
+    let narrowed = parent.clone();
+    let hook: RouteOutputHookForTest = Box::new(move |len, pointer, capacity, action| {
+        observed.borrow_mut().0 += 1;
+        if len == 0 || observed.borrow().1 {
+            return action();
+        }
+        assert!(
+            capacity >= len && pointer != 0,
+            "the prefix is a real live output Vec"
+        );
+        observed.borrow_mut().1 = true;
+        observed.borrow_mut().3 = len;
+        oracle::watch_exact_free_for_test(
+            (
+                pointer,
+                capacity * std::mem::size_of::<VectorPartitionRef>(),
+                std::mem::align_of::<VectorPartitionRef>(),
+            ),
+            0,
+        );
+        let current = narrowed.retained_bytes_for_test();
+        let (result, _) = statement_child_proof::observe(&narrowed, current, action);
+        observed.borrow_mut().2 = result.as_ref().err().is_some_and(|error| {
+            VectorMaintenanceFailureDetails::from_error(error).failure
+                == VectorMaintenanceFailure::MemoryLimit
+        });
+        result
+    });
+    ROUTE_OUTPUT_HOOK_FOR_TEST.with(|slot| {
+        assert!(slot.borrow_mut().replace(hook).is_none());
+    });
+    let _hook_scope = RouteOutputHookScopeForTest;
+    db.clear_maintenance_cycle_stamp_for_test();
+    let outcome = db.run_maintenance_cycle_with_read_memory(memory.clone());
+    assert!(
+        state.borrow().0 >= 2 && state.borrow().1,
+        "the real partial-output admission event is delivered"
+    );
+    assert!(
+        state.borrow().3 > 0,
+        "a prior route output stays live at the refused next output"
+    );
+    assert!(
+        state.borrow().2,
+        "route output must refuse on its real original reader counter before allocating"
+    );
+    let report = outcome.unwrap();
+    assert_eq!(
+        report.vector.first_failure,
+        Some(VectorMaintenanceFailure::MemoryLimit)
+    );
+    assert!(
+        db.maintenance_cycle_stamp_is_set_for_test(),
+        "refusal still closes the maintenance cycle"
+    );
+    drop(report);
+    assert_eq!(
+        oracle::source_free_for_test(1)[0].2,
+        1,
+        "the actual partial output backing is physically freed once"
+    );
+    assert_eq!(
+        parent.retained_bytes_for_test(),
+        baseline,
+        "partial output and its inputs release the original caller's credits"
+    );
+    drop(_hook_scope);
+    assert_serving();
+    db.close().unwrap();
 }

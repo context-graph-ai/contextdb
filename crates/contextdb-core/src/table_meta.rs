@@ -923,6 +923,18 @@ pub struct ColumnDef {
     /// the maintained index and its operator-driven repair path.
     #[serde(default)]
     pub consolidation_disabled: bool,
+    #[serde(default)]
+    pub search_target_accuracy_hundredths: Option<u16>,
+    #[serde(default)]
+    pub search_expected_vectors: Option<u64>,
+    #[serde(default)]
+    pub ivf_lists: Option<u32>,
+    #[serde(default)]
+    pub ivf_probes: Option<u32>,
+    #[serde(default)]
+    pub ivf_refine_factor_hundredths: Option<u32>,
+    #[serde(default)]
+    pub vector_engine_policy: VectorEnginePolicy,
 }
 
 /// The effective `MAX_PARTITIONS` value for a partitioned vector declaration
@@ -1013,6 +1025,18 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let consolidation_tombstone_percent =
                     seq.next_element::<Option<u32>>()?.unwrap_or_default();
                 let consolidation_disabled = seq.next_element::<bool>()?.unwrap_or_default();
+                let search_target_accuracy_hundredths =
+                    seq.next_element::<Option<u16>>()?.unwrap_or_default();
+                let search_expected_vectors =
+                    seq.next_element::<Option<u64>>()?.unwrap_or_default();
+                let ivf_lists = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let ivf_probes = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let ivf_refine_factor_hundredths =
+                    seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let vector_engine_policy = seq
+                    .next_element::<VectorEnginePolicy>()?
+                    .unwrap_or_default();
+
                 Ok(ColumnDef {
                     name,
                     column_type,
@@ -1042,6 +1066,12 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     consolidation_change_percent,
                     consolidation_tombstone_percent,
                     consolidation_disabled,
+                    search_target_accuracy_hundredths,
+                    search_expected_vectors,
+                    ivf_lists,
+                    ivf_probes,
+                    ivf_refine_factor_hundredths,
+                    vector_engine_policy,
                 })
             }
 
@@ -1077,6 +1107,12 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut consolidation_change_percent: Option<Option<u32>> = None;
                 let mut consolidation_tombstone_percent: Option<Option<u32>> = None;
                 let mut consolidation_disabled: Option<bool> = None;
+                let mut search_target_accuracy_hundredths: Option<Option<u16>> = None;
+                let mut search_expected_vectors: Option<Option<u64>> = None;
+                let mut ivf_lists: Option<Option<u32>> = None;
+                let mut ivf_probes: Option<Option<u32>> = None;
+                let mut ivf_refine_factor_hundredths: Option<Option<u32>> = None;
+                let mut vector_engine_policy: Option<VectorEnginePolicy> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -1117,6 +1153,18 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "consolidation_tombstone_percent" => {
                             consolidation_tombstone_percent = Some(map.next_value()?)
                         }
+                        "search_target_accuracy_hundredths" => {
+                            search_target_accuracy_hundredths = Some(map.next_value()?)
+                        }
+                        "search_expected_vectors" => {
+                            search_expected_vectors = Some(map.next_value()?)
+                        }
+                        "ivf_lists" => ivf_lists = Some(map.next_value()?),
+                        "ivf_probes" => ivf_probes = Some(map.next_value()?),
+                        "ivf_refine_factor_hundredths" => {
+                            ivf_refine_factor_hundredths = Some(map.next_value()?)
+                        }
+                        "vector_engine_policy" => vector_engine_policy = Some(map.next_value()?),
                         "consolidation_disabled" => {
                             consolidation_disabled = Some(map.next_value()?)
                         }
@@ -1161,6 +1209,13 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     consolidation_tombstone_percent: consolidation_tombstone_percent
                         .unwrap_or_default(),
                     consolidation_disabled: consolidation_disabled.unwrap_or_default(),
+                    search_target_accuracy_hundredths: search_target_accuracy_hundredths
+                        .unwrap_or_default(),
+                    search_expected_vectors: search_expected_vectors.unwrap_or_default(),
+                    ivf_lists: ivf_lists.unwrap_or_default(),
+                    ivf_probes: ivf_probes.unwrap_or_default(),
+                    ivf_refine_factor_hundredths: ivf_refine_factor_hundredths.unwrap_or_default(),
+                    vector_engine_policy: vector_engine_policy.unwrap_or_default(),
                 })
             }
         }
@@ -1194,6 +1249,12 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "consolidation_change_percent",
             "consolidation_tombstone_percent",
             "consolidation_disabled",
+            "search_target_accuracy_hundredths",
+            "search_expected_vectors",
+            "ivf_lists",
+            "ivf_probes",
+            "ivf_refine_factor_hundredths",
+            "vector_engine_policy",
         ];
         deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
     }
@@ -1502,7 +1563,21 @@ impl ColumnDef {
                     .sum::<usize>()
             })
             .unwrap_or(0);
-        8 + self.name.len() * 16
+        let policy = &self.vector_engine_policy;
+        let policy_bytes = std::mem::size_of::<VectorEnginePolicy>()
+            .saturating_add(std::mem::size_of::<Option<u16>>())
+            .saturating_add(std::mem::size_of::<Option<u64>>())
+            .saturating_add(3 * std::mem::size_of::<Option<u32>>())
+            .saturating_add(policy.calibration_depths.as_ref().map_or(0, |v| {
+                v.capacity().saturating_mul(std::mem::size_of::<u32>())
+            }))
+            .saturating_add(policy.refine_factors.as_ref().map_or(0, |v| {
+                v.capacity().saturating_mul(std::mem::size_of::<u32>())
+            }))
+            .saturating_add(policy.calibration_queries.as_ref().map_or(0, |v| {
+                v.table.capacity().saturating_add(v.column.capacity())
+            }));
+        policy_bytes.saturating_add(8 + self.name.len() * 16)
             + self.column_type.estimated_bytes()
             + default_bytes
             + reference_bytes
@@ -1545,6 +1620,12 @@ mod vector_declaration_tests {
 
     fn vector_column() -> ColumnDef {
         ColumnDef {
+            search_target_accuracy_hundredths: None,
+            search_expected_vectors: None,
+            ivf_lists: None,
+            ivf_probes: None,
+            ivf_refine_factor_hundredths: None,
+            vector_engine_policy: Default::default(),
             name: "embedding".to_owned(),
             column_type: ColumnType::Vector(3),
             nullable: true,
@@ -1655,4 +1736,35 @@ mod vector_declaration_tests {
             assert!(!refused.is_vector_partition_key_type(), "{refused:?}");
         }
     }
+}
+
+/// Persisted optional engineering declarations; absence selects the default program.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorEnginePolicy {
+    pub calibration_max_k: Option<u64>,
+    pub calibration_depths: Option<Vec<u32>>,
+    pub probe_grid: Option<u64>,
+    pub refine_factors: Option<Vec<u32>>,
+    pub refine_growth: Option<u32>,
+    pub calibration_samples: Option<u64>,
+    pub calibration_queries: Option<VectorCalibrationSource>,
+    pub min_lists: Option<u64>,
+    pub vectors_per_list: Option<u64>,
+    pub centroid_memory_percent: Option<u32>,
+    pub training_samples: Option<u64>,
+    pub training_iterations: Option<u64>,
+    pub training_seed: Option<u64>,
+    pub max_delta_runs: Option<u64>,
+    pub write_buffer_bytes: Option<u64>,
+    pub ingest_batch_keys: Option<u64>,
+    pub coalesce_pages_per_step: Option<u64>,
+    pub build_batch_entries: Option<u64>,
+    pub remap_batch_entries: Option<u64>,
+    pub directory_window_objects: Option<u64>,
+    pub page_window_bytes: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorCalibrationSource {
+    pub table: String,
+    pub column: String,
 }

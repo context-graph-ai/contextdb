@@ -1,0 +1,12 @@
+# Independent native index public-assertion ports
+
+These guards belong to `close1-index-ports`, independently of the production index implementer. They port public portions of the frozen 53-name HNSW inventory to the native kernel and public SEARCH/IVF engine path. Production code and the existing independent guard estate are unchanged.
+
+
+There are 45 original-named public-portion guards: 41 kernel guards in this target and four original-named engine companions in `hnsw_public_engine_ports`. Two additional engine companions exercise SQ8/SQ4 insertion and all-encoding predicate results. These are not 53 complete replacement receipts: eight names lack a valid native counterpart, and the assertion map explicitly lists missing private and public observations inside partial ports. No name is retired.
+
+At checkpoint `70ff5b287909afce88c406e210b8d1cef2813bf2`, the kernel receipt is 38 PASS / 3 named FAIL; engine companions are 6 PASS after correcting only fixture declaration syntax. The three preserved RED guards concern stored-body bitwise score equality, the original selective-filter incomplete/refusal assertion, and a cancellation checkpoint before each unsuccessful member probe. Public SQL/Rust score and zero-dimensional-vector differences are separately reported for owner judgment. No assertion is rewritten to accept the observed native behavior.
+
+The custody guard here witnesses physical allocation/free and original-payer settlement for an actual native retained codebook. It does not certify the missing exact native cached-page lifecycle: original graph page alias/Weak, collision, overflow, racing-fill, upgrade-victim and fold assertions remain separately recorded. The index author is adding behavior-free real native page-custody, fixed-limit reclaim and cold-I/O seams under the manager's READY-1 scope; those remaining guards are independent follow-on work.
+
+Kernel fixture storage is copied from the established native page test fixture, with its unrelated fixed-budget implementation removed. It supplies byte pages and private fault observations; the production kernel performs all clustering, scoring, eligibility, admission and release. Its synthetic read error is not a native engine cold-I/O fault witness. Public engine fixtures drive maintenance until its actual public ready report, with no fixed cycle count or sleeps. Runtime directories and base/candidate target directories are private in the recorded runners.

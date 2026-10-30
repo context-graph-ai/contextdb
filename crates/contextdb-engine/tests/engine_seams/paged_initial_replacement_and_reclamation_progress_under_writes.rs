@@ -82,7 +82,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     let db = Arc::new(open(&path, Some(64 * 1024 * 1024)));
     exec(
         &db,
-        "CREATE TABLE building (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED HNSW (M = 16, EF_CONSTRUCTION = 32)) HISTORY ALL",
+        "CREATE TABLE building (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = DEFAULT)) HISTORY ALL",
     );
     const ROWS: usize = 1024;
     const WORKSPACE: usize = 256 * 1024;
@@ -284,7 +284,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
             )
             .unwrap()
             .unwrap()
-            .graph_available,
+            .indexed_available,
         "cancellation publishes no partial graph"
     );
     assert_eq!(
@@ -352,7 +352,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
                 )
                 .unwrap()
                 .unwrap()
-                .graph_available;
+                .indexed_available;
         }
         let mut partition_observation_owner_7 = contextdb_engine::vector_read_memory::admission(
             db.declared_reader_memory()
@@ -429,7 +429,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         reports.join("\n")
     );
     assert!(
-        info.graph_available,
+        info.indexed_available,
         "finite cycles must finish a partition exceeding the frozen workspace; repeated whole-build refusal is not durable progress"
     );
     assert!(
@@ -620,7 +620,7 @@ fn current_only_maintenance_crash_cuts() {
         let db = open(&path, Some(64 * 1024 * 1024));
         exec(
             &db,
-            "CREATE TABLE current_build (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED HNSW (M = 16, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC OFF",
+            "CREATE TABLE current_build (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = DEFAULT)) HISTORY CURRENT ONLY SYNC OFF",
         );
         for id in 0..rows {
             insert_vector(&db, "current_build", id, Some(0), 128);
@@ -715,7 +715,7 @@ fn current_only_maintenance_crash_cuts() {
             .unwrap()
             .unwrap();
         assert_eq!(
-            restored.graph_available,
+            restored.indexed_available,
             cut == "GenerationAfterRedb",
             "complete graph/catalog publication is atomic across process death: {cut}; {restored:?}"
         );
@@ -758,7 +758,7 @@ fn current_only_maintenance_crash_cuts() {
             // separate CommittedScratch arm proves that restart boundary.
         }
         let mut previous = preceding.map_or(0, |progress| progress.vectors_done);
-        let mut published = restored.graph_available;
+        let mut published = restored.indexed_available;
         for _ in 0..64 {
             let (report, work) = observe(|| db.run_maintenance_cycle());
             report.unwrap();
@@ -794,7 +794,7 @@ fn current_only_maintenance_crash_cuts() {
                     );
                     previous = progress.vectors_done;
                 }
-                published = info.graph_available;
+                published = info.indexed_available;
             }
         }
         if cut == "CommittedScratch" {
@@ -818,7 +818,7 @@ fn current_only_maintenance_crash_cuts() {
                 )
                 .unwrap()
                 .unwrap()
-                .graph_available
+                .indexed_available
         );
         let changed = cut == "Insertion";
         for scope in 0..=1 {

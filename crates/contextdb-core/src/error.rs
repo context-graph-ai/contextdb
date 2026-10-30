@@ -858,9 +858,18 @@ pub enum VectorPartitionDeclarationIssue {
 /// Safe structural reasons a per-column vector workload policy can be
 /// refused. The enclosing error identifies the column; values are omitted so
 /// bound or synced input is never echoed through the diagnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum VectorPolicyDeclarationIssue {
+    #[error("vector dimensions must be at least 1")]
+    DimensionsNotPositive,
+    #[error("unknown WITH member {member}")]
+    UnknownMember { member: String },
+    #[error("{member} has an invalid vector policy value")]
+    InvalidMember { member: &'static str },
+
+    #[error("{member} has invalid training value {value}")]
+    InvalidTrainingValue { member: &'static str, value: u64 },
     #[error("vector policy clauses require a VECTOR column")]
     RequiresVectorColumn,
     #[error("AUTO_INDEX_AT must be a positive integer")]
@@ -978,6 +987,10 @@ pub enum Error {
     ImmutableColumn { table: String, column: String },
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
+
+    /// A conditional row mutation no longer names the current committed version.
+    #[error("stale row version: expected LSN {expected}, current {current:?}")]
+    StaleRowVersion { expected: u64, current: Option<u64> },
     #[error("conditional update conflict: {count} staged update(s) no longer matched at commit")]
     ConditionalUpdateConflict { count: u64 },
     #[error("propagation aborted: {table}.{column} transition {from} -> {to} is invalid")]
@@ -991,6 +1004,11 @@ pub enum Error {
     BfsDepthExceeded(u32),
     #[error("BFS visited set exceeded limit ({0})")]
     BfsVisitedExceeded(usize),
+    #[error("vector {index:?} contains a non-finite component at position {position}")]
+    InvalidVectorValue {
+        index: VectorIndexRef,
+        position: usize,
+    },
     #[error("vector index dimension mismatch on {index}: expected {expected}, got {actual}")]
     VectorIndexDimensionMismatch {
         index: VectorIndexRef,
@@ -1007,6 +1025,11 @@ pub enum Error {
         expected_lsn: crate::types::Lsn,
         actual_created_tx: Option<TxId>,
         actual_lsn: Option<crate::types::Lsn>,
+    },
+    #[error("vector index {index} is corrupted: {reason}")]
+    IndexCorrupted {
+        index: VectorIndexRef,
+        reason: DiagnosticText,
     },
     #[error("unknown vector index {index}")]
     UnknownVectorIndex { index: VectorIndexRef },

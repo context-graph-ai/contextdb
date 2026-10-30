@@ -75,7 +75,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         },
     )
     .unwrap();
-    database.execute("CREATE TABLE reader_items (id INTEGER PRIMARY KEY, unique_key TEXT UNIQUE, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST", &HashMap::new()).unwrap();
+    database.execute("CREATE TABLE reader_items (id INTEGER PRIMARY KEY, unique_key TEXT UNIQUE, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = DEFAULT)) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST", &HashMap::new()).unwrap();
     let old_vectors = [
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
@@ -923,7 +923,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         value[axis] = 1.0;
         value
     };
-    database.execute("CREATE TABLE paged_items (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC OFF", &HashMap::new()).unwrap();
+    database.execute("CREATE TABLE paged_items (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = DEFAULT)) HISTORY CURRENT ONLY SYNC OFF", &HashMap::new()).unwrap();
     for (id, vector) in [(1, vector(0)), (2, vector(1)), (3, vector(2))] {
         database
             .execute(
@@ -1005,7 +1005,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
             )
             .unwrap()
             .unwrap();
-        if info.graph_available && info.maintenance_progress.is_none() {
+        if info.indexed_available && info.maintenance_progress.is_none() {
             break;
         }
         database.run_maintenance_cycle().unwrap();
@@ -1026,7 +1026,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         .unwrap()
         .unwrap();
     assert!(
-        published.graph_available && published.maintenance_progress.is_none(),
+        published.indexed_available && published.maintenance_progress.is_none(),
         "the native paged BASE must be finished and published before reopen: {published:?}"
     );
     assert!(
@@ -1091,7 +1091,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
             .unwrap(),
         database
             .vector_store_for_test()
-            .partition_graph_generation_status(&route),
+            .partition_generation_status(&route),
         database
             .vector_store_for_test()
             .partition_has_paged_storage(&route)

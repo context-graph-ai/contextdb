@@ -112,6 +112,9 @@ pub use types::{Key, MutInPlaceValue, TypeName, Value};
 
 pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod allocation_observation;
 pub mod backends;
 #[cfg(feature = "test-seams")]
 pub mod commit_work;
@@ -161,6 +164,10 @@ fn create_tempfile() -> tempfile::NamedTempFile {
         tempfile::NamedTempFile::new().unwrap()
     }
 }
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub mod native_page_observations;
 
 mod native_storage_admission;
 #[cfg(feature = "contextdb-internal")]

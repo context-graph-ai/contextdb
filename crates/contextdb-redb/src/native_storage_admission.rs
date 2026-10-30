@@ -27,6 +27,8 @@ unsafe impl Sync for NativeStorageCredit {}
 pub(crate) struct NativePageCharge {
     receipt: NonNull<()>,
     finish: unsafe fn(NonNull<()>),
+    #[cfg(feature = "test-seams")]
+    observation: Option<crate::native_page_observations::PaymentObservation>,
 }
 #[cfg(feature = "contextdb-internal")]
 unsafe impl Send for NativePageCharge {}
@@ -37,11 +39,34 @@ impl NativePageCharge {
     pub(crate) fn identity_for_test(&self) -> usize {
         self.receipt.as_ptr() as usize
     }
+    pub(crate) fn original_funder_for_test(&self) -> Option<usize> {
+        self.observation.as_ref().and_then(|o| o.original_funder)
+    }
+    pub(crate) fn bind_page_for_test(
+        &mut self,
+        observer: crate::native_page_observations::PageObservation,
+        allocation: usize,
+        bytes: usize,
+        original_funder: Option<usize>,
+    ) {
+        assert!(self.observation.is_none());
+        self.observation = Some(crate::native_page_observations::PaymentObservation::new(
+            observer,
+            allocation,
+            self.identity_for_test(),
+            original_funder,
+            bytes,
+        ));
+    }
 }
 #[cfg(feature = "contextdb-internal")]
 impl Drop for NativePageCharge {
     fn drop(&mut self) {
         unsafe { (self.finish)(self.receipt) };
+        #[cfg(feature = "test-seams")]
+        if let Some(observation) = self.observation.take() {
+            observation.released();
+        }
     }
 }
 impl NativeStorageCredit {
@@ -51,6 +76,8 @@ impl NativeStorageCredit {
         NativePageCharge {
             receipt: credit.receipt,
             finish: credit.finish,
+            #[cfg(feature = "test-seams")]
+            observation: None,
         }
     }
 
@@ -1344,5 +1371,20 @@ pub(crate) fn receipt_overhead_for_test() -> usize {
                     .and_then(|inspect| unsafe { inspect(scope.owner.receipt) })
             })
             .map_or(0, |(_, bytes)| bytes)
+    })
+}
+
+/// The same source callback that admitted the native page reports its funder.
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+pub(crate) fn current_allocation_funder_for_test() -> Option<usize> {
+    NATIVE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|scope| {
+                scope
+                    .allocation_funding
+                    .and_then(|inspect| unsafe { inspect(scope.owner.receipt) })
+            })
+            .map(|(funder, _)| funder)
     })
 }
