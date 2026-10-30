@@ -112,6 +112,9 @@ use contextdb_vector::store::VectorServingPolicy;
 /// The pathname that names a throwaway database rather than a file.
 const MEMORY_DATABASE_PATH: &str = ":memory:";
 
+/// The database file inside a scratch directory.
+const SCRATCH_DATABASE_FILE: &str = "scratch.contextdb";
+
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
@@ -284,6 +287,9 @@ mod policy_hold_scoped_load_tests;
 
 #[cfg(test)]
 mod received_schema_stage_tests;
+
+#[cfg(test)]
+mod scratch_database_tests;
 
 #[cfg(test)]
 mod persisted_state_snapshot_tests;

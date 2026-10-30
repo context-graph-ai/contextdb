@@ -3527,15 +3527,19 @@ pub(super) fn wait_for_open_registry_change(timeout: Duration) {
 
 pub(super) fn release_open_registry_path(path: &Path) {
     let registry = open_file_registry();
-    let mut entries = registry.entries.lock();
-    if entries
-        .get(path)
-        .copied()
-        .is_some_and(|state| state.pid() == std::process::id())
     {
-        entries.remove(path);
-        registry.waiters.notify_all();
+        let mut entries = registry.entries.lock();
+        if entries
+            .get(path)
+            .copied()
+            .is_some_and(|state| state.pid() == std::process::id())
+        {
+            entries.remove(path);
+            registry.waiters.notify_all();
+        }
     }
+    // The file is released, so a scratch database's directory can go.
+    crate::scratch::release(path);
 }
 
 pub(super) fn closed_database_error() -> Error {

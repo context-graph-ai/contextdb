@@ -21,6 +21,33 @@ impl Database {
         Self::open_constructed(path, config, PluginBinding::builtin())
     }
 
+    /// Open the scratch database that `:memory:` names: an ordinary durable
+    /// database in a fresh directory under the user data directory, owned by
+    /// the database it holds and removed when that database releases its file.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn open_in_scratch(open: impl FnOnce(&Path) -> Result<Self>) -> Result<Self> {
+        let scratch_error = |error: std::io::Error| {
+            Error::Other((format!("create scratch database directory: {error}")).into())
+        };
+        let root = crate::scratch::user_scratch_root().map_err(scratch_error)?;
+        let directory =
+            crate::scratch::ScratchDirectory::create_in(&root).map_err(scratch_error)?;
+        crate::scratch::warn_if_ram_backed(directory.path());
+        let file = directory.path().join(SCRATCH_DATABASE_FILE);
+        let key = canonical_database_path(&file)?;
+        crate::scratch::adopt(key.clone(), directory);
+        match open(&file) {
+            Ok(db) => Ok(db),
+            Err(error) => {
+                crate::scratch::release(&key);
+                Err(error)
+            }
+        }
+    }
+
     /// Open a database through the common writable-open configuration path.
     ///
     /// Every convenience opener builds its options and arrives here, so the
@@ -253,18 +280,14 @@ impl Database {
         mut carried: Option<vector_writer_session::CarriedWriterTail>,
         host_construction: DatabaseHostConstruction,
     ) -> Result<Self> {
-        let in_memory = path.as_os_str() == ":memory:";
-        // A throwaway database has no file, so a ceiling on file growth is a
-        // configuration mistake rather than a limit to enforce. Saying so
-        // before anything is created keeps the refusal free of side effects.
-        if in_memory && options.disk_limit.is_some() {
-            return Err(Error::Other(
-                (format!(
-                    "a disk limit cannot apply to '{}': an in-memory database has no file to bound",
-                    path.display()
-                ))
-                .into(),
-            ));
+        if path.as_os_str() == MEMORY_DATABASE_PATH {
+            // `:memory:` names a scratch database, not the absence of a file:
+            // an ordinary durable database in a scratch directory of its own.
+            let mut options = options;
+            options.open_disposition = OpenDisposition::CreateIfMissing;
+            return Self::open_in_scratch(|file| {
+                Self::open_configured_carrying_with_host(file, options, carried, host_construction)
+            });
         }
         let DatabaseOpenOptions {
             owner_reads,
@@ -306,19 +329,7 @@ impl Database {
             crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 owner_reads.limits.limits.memory,
             )?;
-        let mut db = if in_memory {
-            let db = Self::open_memory_internal_with_host(
-                Arc::clone(&plugin),
-                accountant,
-                declared_read_memory.clone(),
-                None,
-                None,
-                None,
-                host_construction,
-            )?;
-            observe_open_event!(test_observer, BlobRepositoryOpened);
-            db
-        } else {
+        let mut db = {
             // The observer this open was given stays in force for the whole
             // of it, so the milestones a writer reaches below the options
             // layer -- its first claim on the store, before anything about it
@@ -378,7 +389,7 @@ impl Database {
             db.route_observer = test_observer.clone();
             db.kernel_observer = test_kernel_observer;
         }
-        if !in_memory {
+        {
             db.start_cron_tickler_if_schedules_present()?;
             db.load_retention_sync_peer();
             db.reconcile_maintenance_thread();
@@ -2068,57 +2079,6 @@ impl Database {
         open_context.checkpoint()?;
 
         Ok(db)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from maintenance_and_limits.rs"
-        )
-    )]
-    pub(super) fn open_memory_internal(
-        plugin: Arc<dyn DatabasePlugin>,
-        writer_budget: WriterBudget,
-        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
-    ) -> Result<Self> {
-        Self::open_memory_internal_with_transaction_snapshot(
-            plugin,
-            writer_budget,
-            declared_read_memory,
-            None,
-        )
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
-    pub(super) fn open_memory_internal_with_transaction_snapshot(
-        plugin: Arc<dyn DatabasePlugin>,
-        writer_budget: WriterBudget,
-        declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
-        transaction_snapshot: Option<(TxId, TxId)>,
-    ) -> Result<Self> {
-        Self::open_memory_internal_with_working_graph(
-            plugin,
-            writer_budget,
-            declared_read_memory,
-            transaction_snapshot,
-            None,
-            None,
-        )
     }
 
     #[expect(

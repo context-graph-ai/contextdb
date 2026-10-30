@@ -2790,7 +2790,7 @@ impl Database {
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
     ) -> Result<Self> {
-        Self::open_memory_internal(plugin, WriterBudget::from_accountant(accountant)?, crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(OwnerReadConfig::default().limits.limits.memory)?)
+        Self::open_with_config(MEMORY_DATABASE_PATH, plugin, accountant)
     }
     }
 
@@ -4244,8 +4244,10 @@ impl Database {
         startup_disk_limit: Option<u64>,
     ) -> Result<Self> {
         let path = path.as_ref();
-        if path.as_os_str() == ":memory:" {
-            return Self::open_memory_with_plugin_and_accountant(plugin, accountant);
+        if path.as_os_str() == MEMORY_DATABASE_PATH {
+            return Self::open_in_scratch(|file| {
+                Self::open_with_config_and_disk_limit(file, plugin, accountant, startup_disk_limit)
+            });
         }
         let declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             OwnerReadConfig::default().limits.limits.memory,
@@ -4275,8 +4277,8 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     /// In-memory database with budget.
     fn open_memory_with_accountant(accountant: Arc<MemoryAccountant>) -> Self {
-        Self::open_memory_internal(Arc::new(CorePlugin), WriterBudget::from_accountant(accountant).expect("writer budget registration failed"), crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(OwnerReadConfig::default().limits.limits.memory).expect("reader root construction failed"))
-            .expect("failed to open in-memory database with accountant")
+        Self::open_with_config(MEMORY_DATABASE_PATH, Arc::new(CorePlugin), accountant)
+            .expect("failed to open scratch database with accountant")
     }
     }
 

@@ -120,6 +120,7 @@ pub mod read_session;
 #[doc(hidden)]
 pub mod read_work_probe;
 pub mod schema_enforcer;
+mod scratch;
 pub mod sync;
 pub mod sync_types;
 #[cfg(test)]

@@ -957,7 +957,7 @@ pub struct BlobRepository {
     /// that outlives its file carries none, and every media operation says so
     /// rather than inventing a store to hold it.
     persistence: Option<Arc<RedbPersistence>>,
-    ephemeral_dir: Option<Arc<tempfile::TempDir>>,
+    ephemeral_dir: Option<Arc<crate::scratch::ScratchDirectory>>,
     fences: Arc<BlobHashFenceRegistry>,
     operation_gate: Arc<BlobRepositoryOperationGate>,
     bounded_blob_bytes_read: AtomicU64,
@@ -1002,7 +1002,8 @@ impl BlobRepository {
         })
     }
 
-    /// Create a disk-bounded ephemeral repository for `Database::open_memory`.
+    /// Create a repository in a scratch directory of its own, for a database
+    /// that has no store file to hold media.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -1010,9 +1011,12 @@ impl BlobRepository {
     pub fn ephemeral() -> Result<Arc<Self>> {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_blob_repository_open();
-        let dir = Arc::new(tempfile::tempdir().map_err(|err| {
+        let scratch_error = |err: std::io::Error| {
             Error::Other((format!("create ephemeral blob repository: {err}")).into())
-        })?);
+        };
+        let root = crate::scratch::user_scratch_root().map_err(scratch_error)?;
+        let dir =
+            Arc::new(crate::scratch::ScratchDirectory::create_in(&root).map_err(scratch_error)?);
         let persistence = Arc::new(RedbPersistence::create(
             &dir.path().join("contextdb-blobs.redb"),
         )?);

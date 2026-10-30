@@ -6538,14 +6538,17 @@ impl Database {
         }
     }
 
-    /// Whether this handle has no on-disk persistence backing it (opened via
-    /// `open_memory*`). A caller-side convenience default -- e.g. the CLI's
-    /// own zero-config event/cron callback registration -- can use this to
-    /// stay scoped to ephemeral sessions and leave a file-backed store's
+    /// Whether this handle is a throwaway session: opened over `:memory:`,
+    /// whose scratch directory goes with it, or a read image with no store of
+    /// its own. A caller-side convenience default -- e.g. the CLI's own
+    /// zero-config event/cron callback registration -- can use this to stay
+    /// scoped to ephemeral sessions and leave a file-backed store's
     /// durable-until-explicitly-registered contract untouched for a later,
     /// possibly different, process to consume.
     pub fn is_memory_backed(&self) -> bool {
-        self.persistence.is_none()
+        self.persistence
+            .as_ref()
+            .is_none_or(|persistence| crate::scratch::owns(persistence.path()))
     }
 
     /// Arm one fault at one point of taking delivery. It fires once and
