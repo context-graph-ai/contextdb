@@ -61,10 +61,15 @@ fn distinct_valid_resource_flags_reach_eager_binding() {
         let root = tempfile::tempdir().expect("temporary server directory");
         let identity = root.path().join(format!("hub-{index}.key"));
         let endpoint = peer_bind_spec(&identity);
+        let db_path = root
+            .path()
+            .join(format!("hub-{index}.db"))
+            .to_string_lossy()
+            .into_owned();
         let output = Command::new(env!("CARGO_BIN_EXE_contextdb-server"))
             .args([
                 "--db-path",
-                ":memory:",
+                &db_path,
                 "--tenant-id",
                 "acme",
                 "--sync-endpoint",
