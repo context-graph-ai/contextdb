@@ -1137,6 +1137,7 @@ impl Database {
         Self::open_with_constraints(path, Some(contexts), None, None)
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn open_memory_with_contexts(
         contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
     ) -> Self {
@@ -1154,6 +1155,7 @@ impl Database {
         Self::open_with_constraints(path, None, Some(labels), None)
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn open_memory_with_scope_labels(
         labels: std::collections::BTreeSet<contextdb_core::types::ScopeLabel>,
     ) -> Self {
@@ -1171,6 +1173,7 @@ impl Database {
         Self::open_with_constraints(path, None, None, Some(principal))
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn open_memory_as_principal(principal: contextdb_core::types::Principal) -> Self {
         Self::open_memory_with_constraints(None, None, Some(principal))
     }
@@ -1196,6 +1199,7 @@ impl Database {
         )
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn open_memory_with_constraints(
         contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
         scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,

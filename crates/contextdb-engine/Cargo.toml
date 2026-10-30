@@ -119,6 +119,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "acceptance"
 path = "../../tests/acceptance.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "cdb120_partition_insert_cost"
@@ -136,6 +137,7 @@ path = "../../tests/acceptance_long_running.rs"
 [[test]]
 name = "acceptance_sync"
 path = "../../tests/acceptance_sync.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "bounded"
@@ -145,6 +147,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "durable_public_api"
 path = "tests/durable_public_api.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "engine"
@@ -199,6 +202,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "sql_surface"
 path = "tests/sql_surface.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "sync"
@@ -292,16 +296,19 @@ required-features = ["test-seams"]
 name = "engine_full_throughput"
 harness = false
 path = "../../benches/engine_full_throughput.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "mixed_workflows_pr"
 harness = false
 path = "../../benches/mixed_workflows_pr.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "subscriptions_pr"
 harness = false
 path = "../../benches/subscriptions_pr.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "rank_policy_recall"
@@ -325,6 +332,7 @@ required-features = ["test-seams"]
 name = "indexed_scan_filter_in_memory_pk_inserts"
 harness = false
 path = "../../benches/indexed_scan_filter_in_memory_pk_inserts.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "indexed_scan_filter_entity_list"
@@ -348,11 +356,13 @@ required-features = ["test-seams"]
 name = "acceptance_three_paradigm_query"
 harness = false
 path = "../../benches/acceptance_three_paradigm_query.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "sql_surface_distinct"
 harness = false
 path = "../../benches/sql_surface_distinct.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "graph_adjacency_probe"
@@ -370,11 +380,13 @@ required-features = ["test-seams"]
 name = "tier1_atomic_visibility_under_contention"
 harness = false
 path = "../../benches/tier1_atomic_visibility_under_contention.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "tier1_event_bus_throughput"
 harness = false
 path = "../../benches/tier1_event_bus_throughput.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "tier1_context_guard_overhead"
@@ -395,16 +407,19 @@ path = "../../benches/tier1_acl_overhead.rs"
 name = "tier2_commit_validate_overhead"
 harness = false
 path = "../../benches/tier2_commit_validate_overhead.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "tier2_fk_revalidation_overhead"
 harness = false
 path = "../../benches/tier2_fk_revalidation_overhead.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "tier2_state_machine_overhead"
 harness = false
 path = "../../benches/tier2_state_machine_overhead.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "commit_write_volume_scaling"
@@ -416,11 +431,13 @@ required-features = ["test-seams"]
 name = "sigterm_drain_in_flight_persistence"
 harness = false
 path = "../../benches/sigterm_drain_in_flight_persistence.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "trigger_throughput"
 harness = false
 path = "../../benches/trigger_throughput.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "version_cleanup_scaling"
@@ -437,6 +454,7 @@ required-features = ["iroh"]
 [[test]]
 name = "writecost_planner_reversed"
 path = "tests/writecost_planner_reversed.rs"
+required-features = ["test-seams"]
 
 [[example]]
 name = "custody_scale"
@@ -451,6 +469,7 @@ required-features = ["test-seams"]
 [[test]]
 name = "writecost_planner"
 path = "tests/writecost_planner.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "writecost_cycle_bound"

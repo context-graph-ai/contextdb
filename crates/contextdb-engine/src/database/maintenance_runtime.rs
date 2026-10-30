@@ -4451,10 +4451,11 @@ impl PruningRuntime {
     }
 }
 
-/// Open an in-memory database with a startup memory ceiling without exposing
+/// Open a throwaway database with a startup memory ceiling without exposing
 /// the mutable accountant that enforces it. This is a safe bootstrap surface:
 /// callers provide only the declared byte limit and every later limit change
 /// still goes through [`Database::set_memory_limit`].
+#[cfg(any(test, feature = "test-seams"))]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

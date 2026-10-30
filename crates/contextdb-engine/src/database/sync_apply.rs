@@ -49,7 +49,8 @@ impl Database {
     /// use std::thread;
     /// use uuid::Uuid;
     ///
-    /// let db = Arc::new(Database::open_memory());
+    /// let directory = tempfile::tempdir().unwrap();
+    /// let db = Arc::new(Database::open(directory.path().join("t.db")).unwrap());
     /// db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new()).unwrap();
     /// db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &HashMap::new()).unwrap();
     ///

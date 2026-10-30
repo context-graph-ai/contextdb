@@ -59,7 +59,7 @@ use contextdb_server::SyncClient;
 use contextdb_server::SyncServer;
 
 fn db() -> Arc<Database> {
-    Arc::new(Database::open_memory())
+    Arc::new(Database::open("forbidden-fixture.db").expect("open durable database"))
 }
 #[cfg(any(
     feature = "client_pull_policy_map",

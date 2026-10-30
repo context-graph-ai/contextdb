@@ -7,8 +7,7 @@
 //!
 //! # Example
 //!
-//! Open an in-memory database, create a table, insert a row, and read it
-//! back. contextdb ships no built-in tables — the schema below is only an
+//! Open a database file, create a table, insert a row, and read it back. contextdb ships no built-in tables — the schema below is only an
 //! example a caller defines for their own data:
 //!
 //! ```
@@ -16,7 +15,8 @@
 //! use std::collections::HashMap;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let db = Database::open_memory();
+//! let directory = tempfile::tempdir()?;
+//! let db = Database::open(directory.path().join("notes.db"))?;
 //! let params = HashMap::new();
 //!
 //! // An example schema — contextdb ships no built-in tables.

@@ -58,12 +58,6 @@ next_tx
 observed_index_root_damage
 open
 open_as_principal
-open_memory
-open_memory_as_principal
-open_memory_with_constraints
-open_memory_with_contexts
-open_memory_with_plugin
-open_memory_with_scope_labels
 open_with_constraints
 open_with_contexts
 open_with_options

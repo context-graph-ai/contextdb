@@ -6508,8 +6508,7 @@ impl Database {
     /// path; from ANOTHER process it is a typed `HeldByWriter` read failure
     /// whose reason names the holding process id and the store, so an operator
     /// is told what to stop rather than only that they cannot proceed. See the
-    /// "Store ownership and concurrency" section on [`Database`]. Use
-    /// [`Database::open_memory`] for an ephemeral instance.
+    /// "Store ownership and concurrency" section on [`Database`].
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -6518,6 +6517,10 @@ impl Database {
         Self::open_builtin_with_options(path, DatabaseOpenOptions::default())
     }
 
+    /// Open a throwaway database for this repository's own tests and for
+    /// consumers' test dev-dependencies. It is an ordinary durable database in
+    /// a directory of its own that goes away with the handle.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn open_memory() -> Self {
         Self::open_builtin_with_options(MEMORY_DATABASE_PATH, DatabaseOpenOptions::default())
             .expect("failed to open in-memory database")

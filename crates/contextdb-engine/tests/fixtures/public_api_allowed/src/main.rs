@@ -4,7 +4,7 @@ use contextdb_engine::Database;
 
 #[cfg(not(feature = "durable-limits"))]
 fn main() {
-    let db = Database::open_memory();
+    let db = Database::open("allowed-fixture.db").expect("open durable database");
     let _ = db.disk_limit();
     let _ = db.disk_file_size();
 }
