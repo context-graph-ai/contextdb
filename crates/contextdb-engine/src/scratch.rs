@@ -10,6 +10,12 @@
 //! directory behind with the lock free, so the next creation under the same
 //! root sweeps every directory whose lock it can take.
 //!
+//! On Unix the lock is an advisory `flock` on the lock file. On Windows the
+//! lock is the open handle itself: the lock file is opened with
+//! `share_mode(0)` (no sharing at all, not even delete), so the one successful
+//! open is the lock, a second opener gets `ERROR_SHARING_VIOLATION`, and nobody
+//! can delete or rename the file while its owner holds the handle.
+//!
 //! Scratch storage is never placed in the system temp dir, `/tmp` or
 //! `/dev/shm`: those are often RAM-backed, and RAM behind a "durable" file is
 //! memory no accountant charges.
@@ -21,6 +27,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(unix)]
 use fs2::FileExt;
 
 const LOCK_FILE: &str = ".scratch.lock";
@@ -75,10 +82,23 @@ impl ScratchDirectory {
 
 impl Drop for ScratchDirectory {
     fn drop(&mut self) {
-        // The lock stays held until the directory is gone, so a sweep cannot
-        // race this removal.
-        let _ = std::fs::remove_dir_all(&self.path);
-        drop(self.lock.take());
+        // Unix: the lock stays held until the directory is gone, so a sweep
+        // cannot race this removal.
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_dir_all(&self.path);
+            drop(self.lock.take());
+        }
+        // Windows: the lock file is open with no delete sharing, so the
+        // handle must be closed before the directory can be removed. A sweep
+        // that takes the directory in between removes it itself; this
+        // removal then finds it gone or loses a file to the sweep, and the
+        // directory ends up removed either way.
+        #[cfg(windows)]
+        {
+            drop(self.lock.take());
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -90,6 +110,7 @@ impl Drop for ScratchDirectory {
 /// any more. So after the lock is held, the locked descriptor must still be the
 /// file the directory's lock path names. If it is not, the lock is dropped and
 /// the caller starts over.
+#[cfg(unix)]
 fn open_and_lock(directory: &Path) -> io::Result<File> {
     let lock_path = directory.join(LOCK_FILE);
     let file = OpenOptions::new()
@@ -110,6 +131,37 @@ fn open_and_lock(directory: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Open the lock file of `directory` with no sharing at all. The successful
+/// open is the lock: another opener gets `ERROR_SHARING_VIOLATION` (raw OS
+/// error 32), which a sweep reads as "live, skip" and a creator reads as
+/// "start over with a new unique directory". A directory a sweep removed
+/// first makes the open fail with `NotFound`, which a creator also reads as
+/// "start over".
+///
+/// The handle denies delete and rename sharing, so once it is held the lock
+/// path cannot change underneath it; `locks_the_live_file` still proves the
+/// held handle is the file the path names.
+#[cfg(windows)]
+fn open_and_lock(directory: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let lock_path = directory.join(LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(&lock_path)?;
+    #[cfg(test)]
+    test_support::run_between_open_and_lock_hook();
+    if !locks_the_live_file(&file, &lock_path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the scratch directory was removed while its lock was taken",
+        ));
+    }
+    Ok(file)
+}
+
 /// Whether `locked` is the file `path` names right now: the same device and
 /// inode, so the directory still exists and holds this very lock file. A path
 /// that names nothing is an error of its own kind (`NotFound`), which callers
@@ -122,17 +174,38 @@ fn locks_the_live_file(locked: &File, path: &Path) -> io::Result<bool> {
     Ok(held.dev() == named.dev() && held.ino() == named.ino())
 }
 
-/// A file that is open cannot be unlinked on this platform, so a lock file
-/// that still exists at its path is the file that was locked.
-#[cfg(not(unix))]
+/// `ERROR_SHARING_VIOLATION`: the file is open elsewhere without sharing.
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+/// Whether `locked` is the file `path` names right now.
+///
+/// While `locked` is held with `share_mode(0)`, nobody can delete or rename
+/// the file it refers to. So if `path` still exists and opening it a second
+/// time fails with a sharing violation, the open that conflicts is `locked`
+/// itself, and `locked` is the live file at `path`. This is the sharing
+/// violation proof, not a comparison of file indexes from
+/// `GetFileInformationByHandle` (std does not expose that on stable). A path
+/// that names nothing is `NotFound`; a second open that succeeds means the
+/// path names some other file.
+#[cfg(windows)]
 fn locks_the_live_file(_locked: &File, path: &Path) -> io::Result<bool> {
-    std::fs::metadata(path).map(|_| true)
+    use std::os::windows::fs::OpenOptionsExt;
+    match OpenOptions::new().read(true).share_mode(0).open(path) {
+        Ok(_other) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
-/// Remove a scratch directory whose lock the caller holds. The lock file goes
-/// last and the directory is removed without recursion: a creator that opens
-/// the lock path after it is gone makes a new file there, which makes the
-/// final removal fail and leaves that creator's directory alone.
+/// Remove a scratch directory the caller has locked. The lock file goes last
+/// and the directory is removed without recursion: a creator that opens the
+/// lock path after it is gone makes a new file there, which makes the final
+/// removal fail and leaves that creator's directory alone.
+///
+/// On Windows the caller must have closed its lock handle already: the lock
+/// file is open with no delete sharing, so it cannot be removed while any
+/// handle is open.
 fn remove_locked_directory(path: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -153,6 +226,7 @@ fn remove_locked_directory(path: &Path) -> io::Result<()> {
     }
     std::fs::remove_dir(path)
 }
+
 /// Remove every directory under `root` whose lock can be taken: its owner is
 /// gone. Returns how many directories were removed.
 pub(crate) fn sweep_abandoned(root: &Path) -> usize {
@@ -171,12 +245,38 @@ pub(crate) fn sweep_abandoned(root: &Path) -> usize {
         // removed and its live-file check fails. Both make it start over with
         // a new name.
         let Ok(lock) = open_and_lock(&path) else {
+            // Unix: another owner holds the lock. Windows: a sharing
+            // violation means the directory is live. Skip it either way.
             continue;
         };
-        if remove_locked_directory(&path).is_ok() {
-            removed += 1;
+        // Unix removes the directory while holding the lock, then releases it.
+        #[cfg(unix)]
+        {
+            if remove_locked_directory(&path).is_ok() {
+                removed += 1;
+            }
+            drop(lock);
         }
-        drop(lock);
+        // Windows closes the handle first (an open handle without delete
+        // sharing blocks removing its own file), then removes the data files,
+        // the lock file, and the directory without recursion. Between the
+        // close and the removal anything may open the lock path, but a
+        // directory name is a fresh random UUID that no creator reuses: the
+        // only creator that can reach this directory is the one that made it,
+        // and it either fails to open the lock (sharing violation while this
+        // sweep held it, or `NotFound` after the removal) and starts over with
+        // a new name, or it opens a lock file in this window and holds it
+        // without sharing, which makes this sweep's lock-file removal fail,
+        // or re-creates one after it, which makes the non-recursive `rmdir`
+        // fail on a non-empty directory. In each case this sweep removes
+        // nothing that a live creator owns.
+        #[cfg(windows)]
+        {
+            drop(lock);
+            if remove_locked_directory(&path).is_ok() {
+                removed += 1;
+            }
+        }
     }
     removed
 }
@@ -391,6 +491,7 @@ mod tests {
         assert!(live.path().is_dir(), "a live owner's directory survives");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_sweep_between_the_open_and_the_lock_makes_the_creator_start_over() {
         let root = tempfile::tempdir().unwrap();
@@ -421,6 +522,87 @@ mod tests {
         );
         let entries = std::fs::read_dir(root.path()).unwrap().count();
         assert_eq!(entries, 1, "only the creator's live directory remains");
+    }
+
+    #[cfg(windows)]
+    fn is_sharing_violation(error: &io::Error) -> bool {
+        error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_identity_is_the_held_file_at_the_path() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("d");
+        std::fs::create_dir(&directory).unwrap();
+        let lock = open_and_lock(&directory).unwrap();
+        let lock_path = directory.join(LOCK_FILE);
+        assert!(locks_the_live_file(&lock, &lock_path).unwrap());
+        // A second opener is refused with a sharing violation.
+        let second = open_and_lock(&directory).unwrap_err();
+        assert!(is_sharing_violation(&second), "{second:?}");
+        // A different file at some other path is not the locked file.
+        let other = directory.join("other");
+        std::fs::write(&other, b"").unwrap();
+        assert!(!locks_the_live_file(&lock, &other).unwrap());
+        // A path that names nothing is NotFound.
+        let missing = locks_the_live_file(&lock, &directory.join("missing")).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        // The held file cannot be deleted or renamed under the handle.
+        assert!(std::fs::remove_file(&lock_path).is_err());
+        assert!(std::fs::rename(&lock_path, directory.join("moved")).is_err());
+        drop(lock);
+        assert!(std::fs::remove_file(&lock_path).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drop_closes_the_lock_before_removing_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = ScratchDirectory::create_in(root.path()).unwrap();
+        let path = directory.path().to_path_buf();
+        std::fs::write(path.join("data"), b"x").unwrap();
+        drop(directory);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sweep_removes_an_abandoned_directory_with_its_lock_file() {
+        let root = tempfile::tempdir().unwrap();
+        let abandoned = root.path().join("abandoned");
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::write(abandoned.join(LOCK_FILE), b"").unwrap();
+        std::fs::write(abandoned.join("data"), b"x").unwrap();
+        std::fs::create_dir(abandoned.join("nested")).unwrap();
+        std::fs::write(abandoned.join("nested").join("inner"), b"x").unwrap();
+        assert_eq!(sweep_abandoned(root.path()), 1);
+        assert!(!abandoned.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sweep_skips_a_live_directory_even_when_run_mid_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let swept = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+        let hook_root = root.path().to_path_buf();
+        let hook_swept = std::rc::Rc::clone(&swept);
+        // The creator has opened and holds its lock file; a sweep that runs
+        // now meets a sharing violation and leaves the directory alone.
+        test_support::on_next_open_before_lock(Box::new(move || {
+            hook_swept.set(sweep_abandoned(&hook_root));
+        }));
+        let directory = ScratchDirectory::create_in(root.path()).unwrap();
+        assert_eq!(swept.get(), 0, "the sweep must skip the live directory");
+        assert!(directory.path().is_dir());
+        assert!(directory.path().join(LOCK_FILE).is_file());
+        let refused = open_and_lock(directory.path()).unwrap_err();
+        assert!(is_sharing_violation(&refused), "{refused:?}");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(sweep_abandoned(root.path()), 0);
+        assert!(directory.path().is_dir());
     }
 
     #[test]
@@ -510,8 +692,10 @@ pub(crate) mod test_support {
     }
 
     /// Run `hook` once, on this thread, at the next `open_and_lock` between its
-    /// open and its lock. The hook is taken out before it runs, so locks it
-    /// takes itself (a sweep) do not run it again.
+    /// open and its lock. On Windows the open is the lock, so the hook runs
+    /// after the exclusive open and before the identity proof. The hook is
+    /// taken out before it runs, so locks it takes itself (a sweep) do not
+    /// run it again.
     pub(crate) fn on_next_open_before_lock(hook: Box<dyn FnOnce()>) {
         BETWEEN_OPEN_AND_LOCK.with(|slot| *slot.borrow_mut() = Some(hook));
     }
