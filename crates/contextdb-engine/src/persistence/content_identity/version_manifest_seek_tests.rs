@@ -36,6 +36,7 @@ fn store(members: &[u64]) -> (tempfile::TempDir, super::super::ProofFixtureDatab
     let database = super::super::ProofFixtureDatabase::create(root.path().join("seek.db"))
         .expect("create the proof fixture");
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     let records = members
         .iter()
@@ -225,7 +226,7 @@ fn a_damaged_removed_predecessor_is_still_authenticated() {
     let family = LogicalFamily::ChangeAndDdl;
     let write = database.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let damaged = nodes
             .iter()
             .unwrap()

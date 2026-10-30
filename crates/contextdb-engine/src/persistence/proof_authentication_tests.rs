@@ -31,6 +31,7 @@ fn fixture(
     let database = ProofFixtureDatabase::create(path).expect("create proof fixture");
     let records = (0..rows).map(|row| posting(row, false)).collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
@@ -55,7 +56,7 @@ fn damage_leaf_key(
     let family = LogicalFamily::SchemaAndIndexes;
     let write = database.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let mut target = None;
         for row in nodes.iter().unwrap() {
             let (key, value) = row.unwrap();

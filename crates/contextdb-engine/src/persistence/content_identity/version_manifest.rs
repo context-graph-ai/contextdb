@@ -1343,8 +1343,7 @@ pub(in super::super) fn writer_manifest_next(
     let root = decode_published_root(family, encoded.value())?.identity;
     drop(encoded);
     drop(roots);
-    let nodes = write
-        .open_table(CONTENT_IDENTITY_NODES_TABLE)
+    let nodes = crate::persistence::content_identity::payloads::open(&write)
         .map_err(RedbPersistence::storage_error)?;
     let target_bytes = start
         .len()
@@ -1357,7 +1356,7 @@ pub(in super::super) fn writer_manifest_next(
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn descend(
-        nodes: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        nodes: &impl CanonicalNodeSource,
         id: Option<[u8; 32]>,
         expected: [u8; 32],
         target: &[u8],

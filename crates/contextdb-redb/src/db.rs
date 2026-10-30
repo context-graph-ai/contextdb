@@ -2614,6 +2614,24 @@ impl Database {
         extents: usize,
         entries: usize,
     ) -> Result<ReclaimStep, Error> {
+        self.reclaim_deferred_step_with_hook(boundary, extents, entries, |_, _| Ok(false))
+    }
+
+    /// Join finite caller-owned garbage reclamation to the same durable step.
+    /// The hook must honor its own finite work bound and changes no reader floor.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Native refusals retain inline diagnostics."
+    )]
+    pub fn reclaim_deferred_step_with_hook(
+        &self,
+        boundary: Option<ReclaimBoundary>,
+        extents: usize,
+        entries: usize,
+        hook: impl FnOnce(&WriteTransaction, u64) -> Result<bool, StorageError>,
+    ) -> Result<ReclaimStep, Error> {
         let mut tx = self.begin_write()?;
         if self.transaction_tracker.any_savepoint_exists()
             || tx.list_persistent_savepoints()?.next().is_some()
@@ -2626,8 +2644,15 @@ impl Database {
             .transaction_tracker
             .oldest_live_read_transaction()
             .map_or(tx.transaction_id(), |id| id.next());
+        let caller_progress = hook(&tx, boundary.raw_id())?;
         if !tx.pending_free_pages_before(TransactionId::min(floor, boundary))? {
             let held = tx.pending_free_pages_before(boundary)?;
+            if caller_progress {
+                tx.set_deferred_free_budget(extents, entries);
+                tx.set_reclaim_ceiling(boundary);
+                tx.commit()?;
+                return Ok(ReclaimStep::Progressed(ReclaimBoundary(boundary)));
+            }
             tx.abort()?;
             return Ok(if held {
                 ReclaimStep::ReaderHeld

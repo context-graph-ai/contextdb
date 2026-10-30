@@ -298,12 +298,66 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
 }
 
 #[cfg(feature = "contextdb-internal")]
+impl Table<'_, u64, &'static [u8]> {
+    /// Read a root-pinned singleton location with its exact native checksum.
+    /// The caller owns and maintains the handle's binding to this table/root.
+    #[doc(hidden)]
+    pub fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'_, &'static [u8]>> {
+        self.tree.singleton_u64_at(handle, key, value_len)
+    }
+}
+#[cfg(feature = "contextdb-internal")]
+impl ReadOnlyTable<u64, &'static [u8]> {
+    pub(crate) fn new_singleton(
+        name: String,
+        root: Option<BtreeHeader>,
+        hint: PageHint,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Self {
+        Self {
+            name,
+            tree: Btree::new_lazy(root, hint, guard.clone(), mem),
+            transaction_guard: guard,
+        }
+    }
+
+    /// Read a root-pinned singleton location with its exact native checksum.
+    /// The retained table keeps the captured read root alive.
+    #[doc(hidden)]
+    pub fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'static, &'static [u8]>> {
+        self.tree.singleton_u64_at(handle, key, value_len)
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
 impl<K: Key + 'static> Table<'_, K, &'static [u8]> {
+    /// Exact byte-value capacity of a singleton base-page leaf with this key.
+    #[doc(hidden)]
+    pub fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.tree.inline_value_capacity(key_bytes)
+    }
+
+    /// Largest accepted byte-value length with this key.
+    #[doc(hidden)]
+    pub fn maximum_value_length(&self, key_bytes: usize) -> usize {
+        MAX_VALUE_LENGTH.min(MAX_PAIR_LENGTH.saturating_sub(key_bytes))
+    }
+
     /// Reserve a zero-filled byte value without a value-sized temporary buffer.
     ///
-    /// Replaces any existing value, with the same size limits and borrowed mutable
-    /// destination as `insert_reserve`. The reservation changes the transaction;
-    /// a caller that fails while filling it must abort the transaction.
+    /// Replaces any existing value, with the same limits as insert_reserve.
+    /// Failure while filling the borrowed destination must abort the transaction.
     #[doc(hidden)]
     pub fn insert_zeroed_reserve<'a>(
         &mut self,
@@ -566,6 +620,13 @@ impl<K: Key + 'static, V: Value + 'static> TableHandle for ReadOnlyTable<K, V> {
 }
 
 impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
+    /// Exact byte-value capacity of a singleton base-page leaf with this key.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.tree.inline_value_capacity(key_bytes)
+    }
+
     pub(crate) fn new(
         name: String,
         root_page: Option<BtreeHeader>,

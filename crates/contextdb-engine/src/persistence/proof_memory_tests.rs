@@ -29,6 +29,7 @@ fn committed(
         .map(|row| wide_posting(row, key_bytes))
         .collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
@@ -48,7 +49,7 @@ fn tree_height(database: &redb::Database) -> u32 {
         .unwrap()
         .root
         .expect("a committed family root");
-    let nodes = read.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let nodes = crate::persistence::content_identity::payloads::open(&read).unwrap();
     read_node(&nodes, family, root).unwrap().level
 }
 
@@ -207,7 +208,7 @@ type StoredProof = (BTreeMap<Vec<u8>, Vec<u8>>, BTreeMap<u8, Vec<u8>>);
 
 fn stored_proof(database: &redb::Database) -> StoredProof {
     let read = database.begin_read().unwrap();
-    let nodes = read.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let nodes = crate::persistence::content_identity::payloads::open(&read).unwrap();
     let roots = read.open_table(CONTENT_IDENTITY_ROOTS_TABLE).unwrap();
     (
         nodes
@@ -328,7 +329,7 @@ fn a_damaged_chunk_aborts_the_walk_and_changes_no_stored_byte() {
     // Damage an internal chunk the next walk has to read.
     let write = database.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let (key, mut value) = nodes
             .iter()
             .unwrap()
@@ -619,12 +620,11 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
 /// that window must leave the stored chunk records and bodies untouched.
 #[test]
 fn a_refused_chunk_record_is_never_inserted_before_it_is_admitted() {
-    use redb::ReadableTableMetadata;
     let directory = tempfile::tempdir().unwrap();
     let database =
         ProofFixtureDatabase::create(directory.path().join("refused-window.db")).unwrap();
     let write = database.begin_write().unwrap();
-    let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let mut table = crate::persistence::content_identity::payloads::open(&write).unwrap();
     let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(1));
     accountant
         .try_allocate(1)
@@ -702,7 +702,7 @@ fn a_refused_chunk_record_is_never_inserted_before_it_is_admitted() {
     )];
     let stored_root = decode_root(family, before.1.get(&(family as u8)).unwrap()).unwrap();
     let write = existing.begin_write().unwrap();
-    let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let mut table = crate::persistence::content_identity::payloads::open(&write).unwrap();
     let refused = update_family(
         &mut table,
         &mut scratch_admission,

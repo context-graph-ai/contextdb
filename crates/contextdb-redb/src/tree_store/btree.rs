@@ -26,6 +26,78 @@ pub(crate) type NativeRangeEntry = (
     AccessGuard<'static, &'static [u8]>,
 );
 
+#[cfg(feature = "contextdb-internal")]
+fn singleton_u64_at(
+    mem: &TransactionalMemory,
+    handle: [u8; 24],
+    key: u64,
+    value_len: usize,
+    hint: PageHint,
+) -> Result<AccessGuard<'static, &'static [u8]>> {
+    let number = PageNumber::validated_from_le_bytes(handle[..8].try_into().unwrap())
+        .filter(|number| number.to_le_bytes() == handle[..8])
+        .ok_or_else(|| crate::StorageError::Corrupted("invalid singleton page handle".into()))?;
+    if value_len > super::MAX_VALUE_LENGTH {
+        return Err(crate::StorageError::Corrupted(
+            "singleton value exceeds native limits".into(),
+        ));
+    }
+    let framing = super::btree_base::RawLeafBuilder::required_bytes(
+        1,
+        8usize
+            .checked_add(value_len)
+            .ok_or_else(|| crate::StorageError::Corrupted("singleton length overflow".into()))?,
+        Some(8),
+        None,
+    );
+    let expected = framing
+        .max(mem.get_page_size())
+        .checked_next_power_of_two()
+        .ok_or_else(|| crate::StorageError::Corrupted("singleton extent overflow".into()))?;
+    if number.page_size_bytes(mem.get_page_size().try_into().unwrap()) != expected as u64 {
+        return Err(crate::StorageError::Corrupted(
+            "singleton extent differs from its producer quote".into(),
+        ));
+    }
+    let page = mem.get_page(number, hint)?;
+    let range = super::btree_base::singleton_u64_range(&page, key)?;
+    if range.len() != value_len {
+        return Err(crate::StorageError::Corrupted(
+            "singleton value differs from its producer quote".into(),
+        ));
+    }
+    let expected = u128::from_le_bytes(handle[8..].try_into().unwrap());
+    if page_checksum(&page, Some(8), None)? != expected {
+        return Err(crate::StorageError::Corrupted(
+            "singleton payload checksum mismatch".into(),
+        ));
+    }
+    Ok(AccessGuard::with_page(page, range))
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl BtreeMut<'_, u64, &'static [u8]> {
+    pub(crate) fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'_, &'static [u8]>> {
+        singleton_u64_at(&self.mem, handle, key, value_len, PageHint::Transient)
+    }
+}
+#[cfg(feature = "contextdb-internal")]
+impl Btree<u64, &'static [u8]> {
+    pub(crate) fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'static, &'static [u8]>> {
+        singleton_u64_at(&self.mem, handle, key, value_len, PageHint::None)
+    }
+}
+
 pub(super) fn page_checksum<T: Page>(
     page: &T,
     fixed_key_size: Option<usize>,
@@ -940,6 +1012,18 @@ impl<K: Key + 'static> BtreeMut<'_, K, &'static [u8]> {
     /// Reserve an allocator-table value without building a value-sized heap buffer.
     /// A length-only source zero-fills the allocated B-tree destination. The
     /// returned guard borrows that destination; no source buffer or mapping exists.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.mem
+            .get_page_size()
+            .saturating_sub(super::btree_base::RawLeafBuilder::required_bytes(
+                1,
+                key_bytes,
+                K::fixed_width(),
+                None,
+            ))
+    }
+
     pub(crate) fn insert_zeroed_reserve(
         &mut self,
         key: &K::SelfType<'_>,
@@ -1078,6 +1162,18 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
 }
 
 impl<K: Key, V: Value> Btree<K, V> {
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.mem
+            .get_page_size()
+            .saturating_sub(super::btree_base::RawLeafBuilder::required_bytes(
+                1,
+                key_bytes,
+                K::fixed_width(),
+                None,
+            ))
+    }
+
     pub(crate) fn new(
         root: Option<BtreeHeader>,
         hint: PageHint,

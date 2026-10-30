@@ -126,7 +126,7 @@ fn assert_image(db: &redb::Database, family: LogicalFamily, records: &[ContentId
         actual == expected,
         "incremental root differs from independent sorted rebuild"
     );
-    let stored = read.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let stored = crate::persistence::content_identity::payloads::open(&read).unwrap();
     let mut count = 0;
     for row in stored.iter().unwrap() {
         let (key, bytes) = row.unwrap();
@@ -167,6 +167,7 @@ fn canonical_incremental_insert_delete_cascades_match_sorted_rebuild_and_compact
     let dir = tempfile::tempdir().unwrap();
     let mut db = ProofFixtureDatabase::create(dir.path().join("canonical.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let schema_fixture = crate::Database::open_memory();
@@ -239,6 +240,7 @@ fn large_ordered_keys_split_by_bytes_and_rejoin_after_boundary_deletions() {
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("large.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let mut records = (0..160u64)
@@ -321,6 +323,7 @@ fn wide_separator_reference_corruption_is_rejected_before_a_posting_is_used() {
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("damaged-key.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let records = (0..4u64)
@@ -340,7 +343,7 @@ fn wide_separator_reference_corruption_is_rejected_before_a_posting_is_used() {
     let target = mutation_tree_key(&records[0]).unwrap();
     let write = db.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let storage_key = node_storage_key(LogicalFamily::SchemaAndIndexes, &key_hash(&target));
         let mut damaged = nodes
             .get(storage_key.as_slice())
@@ -386,6 +389,7 @@ fn remove_then_put_coalesces_to_the_same_physical_work_as_a_value_update() {
             ProofFixtureDatabase::create(dir.path().join(format!("coalesce-{with_remove}.db")))
                 .unwrap();
         let write = db.begin_write().unwrap();
+        crate::persistence::erasure_frontiers::initialize(&write).unwrap();
         RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
         write.commit().unwrap();
         let records = (0..1000u64)
@@ -433,6 +437,7 @@ fn keys_too_large_for_a_chunk_are_authenticated_by_reference_and_rebuild_identic
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("oversized.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     // A mix the leaf rule must keep apart: ordinary keys, keys that still fit
@@ -528,6 +533,7 @@ fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
     let dir = tempfile::tempdir().unwrap();
     let db = ProofFixtureDatabase::create(dir.path().join("oversized-damage.db")).unwrap();
     let write = db.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     write.commit().unwrap();
     let records = (0..4u64)
@@ -555,7 +561,7 @@ fn a_damaged_oversized_leaf_key_is_typed_corruption_before_any_posting() {
     );
     let write = db.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let storage_key = node_storage_key(LogicalFamily::SchemaAndIndexes, &key_hash(&target));
         let mut damaged = nodes
             .get(storage_key.as_slice())

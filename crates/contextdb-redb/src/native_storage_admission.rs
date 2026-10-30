@@ -310,6 +310,46 @@ pub fn with_native_storage_admission<R>(
     };
     operation()
 }
+// This scalar limits retention only. Native allocations still use the same
+// original admission and keep their invoices through physical release.
+#[cfg(feature = "contextdb-internal")]
+thread_local! {
+    static WRITE_BUFFER_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "contextdb-internal")]
+struct RestoreWriteBufferLimit {
+    previous: Option<usize>,
+    _thread: PhantomData<*mut ()>,
+}
+#[cfg(feature = "contextdb-internal")]
+impl Drop for RestoreWriteBufferLimit {
+    fn drop(&mut self) {
+        WRITE_BUFFER_LIMIT.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Bound this writer's buffered pages without changing serving-cache capacity,
+/// page admission, or publication. Nested scopes restore their caller's window.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn with_native_storage_write_buffer_limit<R>(
+    bytes: Option<usize>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    let previous = WRITE_BUFFER_LIMIT.with(|slot| slot.replace(bytes));
+    let _restore = RestoreWriteBufferLimit {
+        previous,
+        _thread: PhantomData,
+    };
+    operation()
+}
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn native_storage_write_buffer_limit() -> Option<usize> {
+    WRITE_BUFFER_LIMIT.with(std::cell::Cell::get)
+}
+
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(

@@ -2070,9 +2070,8 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     let control_store = redb::Database::create(root.path().join("control.db")).unwrap();
     let control_write = control_store.begin_write().unwrap();
     let (_, control_peak, _) = measured(|| {
-        let mut table = control_write
-            .open_table(CONTENT_IDENTITY_NODES_TABLE)
-            .unwrap();
+        let mut table =
+            crate::persistence::content_identity::payloads::open(&control_write).unwrap();
         for record in &records {
             let blob = std::iter::once(0)
                 .chain(record.logical_key.iter().copied())
@@ -2213,6 +2212,7 @@ fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
         .map(|row| wide_posting(row, 70 * 1024))
         .collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
@@ -2319,6 +2319,7 @@ fn reset_family_fixture(path: &std::path::Path, nodes: u64) -> ProofFixtureDatab
         )
     }));
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
@@ -2343,7 +2344,7 @@ fn family_root(database: &redb::Database, family: LogicalFamily) -> Vec<u8> {
 
 fn family_node_count(database: &redb::Database, family: LogicalFamily) -> usize {
     let read = database.begin_read().unwrap();
-    let nodes = read.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let nodes = crate::persistence::content_identity::payloads::open(&read).unwrap();
     nodes
         .iter()
         .unwrap()

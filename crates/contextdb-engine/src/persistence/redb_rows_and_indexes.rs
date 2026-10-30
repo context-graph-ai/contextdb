@@ -6095,6 +6095,27 @@ impl RedbPersistence {
 
     #[expect(
         clippy::result_large_err,
+        reason = "Public Error retains inline native refusal diagnostics."
+    )]
+    pub(super) fn write_read_lineage_config_entry_in_table(
+        write_txn: &redb::WriteTransaction,
+        table: &mut redb::Table<'_, &'static str, &'static [u8]>,
+        key: &str,
+        value: Option<&[u8]>,
+    ) -> Result<()> {
+        erasure_frontiers::fold_lineage(write_txn, key, value)?;
+        Self::write_compact_config_entry_in_table(
+            write_txn,
+            table,
+            READ_LINEAGE_CONFIG_COMMITMENT_KEY,
+            Some(content_identity::CompactIndexSet::LineageIndex),
+            key,
+            value,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn write_read_custody_config_entry(
@@ -6150,6 +6171,28 @@ impl RedbPersistence {
         let mut table = write_txn
             .open_table(definition)
             .map_err(Self::storage_error)?;
+        Self::write_compact_config_entry_in_table(
+            write_txn,
+            &mut table,
+            commitment_key,
+            bound_set,
+            key,
+            value,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline native refusal diagnostics."
+    )]
+    fn write_compact_config_entry_in_table(
+        write_txn: &redb::WriteTransaction,
+        table: &mut redb::Table<'_, &'static str, &'static [u8]>,
+        commitment_key: &str,
+        bound_set: Option<content_identity::CompactIndexSet>,
+        key: &str,
+        value: Option<&[u8]>,
+    ) -> Result<()> {
         let root_guard = table
             .get(READ_OPEN_CONFIG_ROOT_KEY)
             .map_err(Self::storage_error)?

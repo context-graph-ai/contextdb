@@ -349,6 +349,13 @@ const HOLD_RELATIONS: &str = "content_identity/hold_row_head_relations";
 /// A store with `HELD_TABLES` long-named tables and one staged transaction
 /// writing one row to each, under a declared memory limit.
 fn many_table_commit(limit: usize) -> (tempfile::TempDir, Database, contextdb_core::TxId) {
+    many_table_commit_with_history(limit, 0)
+}
+
+fn many_table_commit_with_history(
+    limit: usize,
+    history: usize,
+) -> (tempfile::TempDir, Database, contextdb_core::TxId) {
     let root = tempfile::tempdir().expect("fixture directory");
     let db = Database::open(root.path().join("tables.db")).expect("open the database");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -361,6 +368,25 @@ fn many_table_commit(limit: usize) -> (tempfile::TempDir, Database, contextdb_co
             &HashMap::new(),
         )
         .expect("declare one table");
+    }
+    // Grow history in the same 32 relations, without changing the write's
+    // table set, row count, key widths or payload widths.
+    for generation in 0..history {
+        let tx = db.begin().expect("begin one historical generation");
+        for (n, table) in tables.iter().enumerate() {
+            db.execute_in_tx(
+                tx,
+                &format!("INSERT INTO {table} VALUES ($id, 'one row')"),
+                &HashMap::from([(
+                    "id".into(),
+                    Value::Uuid(uuid::Uuid::from_u128(
+                        0x5e1d << 112 | ((generation * HELD_TABLES + n) as u128),
+                    )),
+                )]),
+            )
+            .expect("stage a historical row");
+        }
+        db.commit(tx).expect("commit one historical generation");
     }
     db.set_memory_limit(Some(limit)).expect("declare the limit");
     let tx = db.begin().expect("one transaction for every table");
@@ -384,40 +410,89 @@ fn many_table_commit(limit: usize) -> (tempfile::TempDir, Database, contextdb_co
 /// the point that charge first raises it to is refused with nothing committed.
 #[test]
 fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
+    let derive_tight_from_ledger = |ledger: &[crate::memory_accounting::BudgetLedgerEntry]| {
+        let held: usize = ledger
+            .iter()
+            .filter(|entry| entry.what == HOLD_RELATIONS)
+            .map(|entry| entry.bytes)
+            .sum();
+        assert!(
+            held >= 2 * HELD_TABLES * 200,
+            "holding a relation per written table is admitted to the writer budget: {held} bytes charged as {HOLD_RELATIONS}"
+        );
+        let mut peak_before = 0;
+        let mut seen_hold = false;
+        let mut tight = None;
+        for entry in ledger {
+            if entry.what == HOLD_RELATIONS {
+                seen_hold = true;
+                if tight.is_none() && entry.used_after > peak_before {
+                    tight = Some(entry.used_after - 1);
+                }
+            } else if !seen_hold {
+                peak_before = peak_before.max(entry.used_after);
+            }
+        }
+        let tight = tight.expect("some relation charge raises the commit's peak");
+        let held_requests: Vec<usize> = ledger
+            .iter()
+            .filter(|entry| entry.what == HOLD_RELATIONS)
+            .map(|entry| entry.bytes)
+            .collect();
+        let pending_requests: Vec<usize> = ledger
+            .iter()
+            .filter(|entry| entry.what == "redb/pending_directory")
+            .map(|entry| entry.bytes)
+            .collect();
+        (tight, held_requests, pending_requests)
+    };
     let ample = 1 << 32;
     let (_root, db, tx) = many_table_commit(ample);
     watch_budget_ledger_for_test();
     db.commit(tx).expect("an ample limit commits every table");
     let ledger = take_budget_ledger_for_test();
-    let held: usize = ledger
-        .iter()
-        .filter(|entry| entry.what == HOLD_RELATIONS)
-        .map(|entry| entry.bytes)
-        .sum();
-    assert!(
-        held >= 2 * HELD_TABLES * 200,
-        "holding a relation per written table is admitted to the writer budget: \
-         {held} bytes charged as {HOLD_RELATIONS}"
-    );
-    // The first relation charge that raises the commit's usage above every
-    // earlier point of it: a limit one byte below is refused by that charge.
-    let mut high = 0;
-    let mut tight = None;
-    for entry in &ledger {
-        if entry.what == HOLD_RELATIONS && entry.used_after > high {
-            tight = Some(entry.used_after - 1);
-            break;
-        }
-        high = high.max(entry.used_after);
-    }
-    let tight = tight.expect("some relation charge raises the commit's peak");
+    let (mut tight, mut held_requests, mut pending_requests) = derive_tight_from_ledger(&ledger);
+    let hold_admission_count = held_requests.len();
+    eprintln!("MANY_TABLE_HOLD count={hold_admission_count}");
     db.close().expect("close the measured store");
 
-    let (_root, db, tx) = many_table_commit(tight);
-    let refusal = db
-        .commit(tx)
-        .expect_err("the relations do not fit the tight limit");
+    // Re-measure successful commits under their actual smaller dirty-buffer
+    // windows. A completed optional page can leave before relation holding.
+    // Once the window no longer changes, need - 1 must refuse atomically.
+    let mut refused = None;
+    for step in 0..8 {
+        let (root, db, tx) = many_table_commit(tight);
+        watch_budget_ledger_for_test();
+        let outcome = db.commit(tx);
+        let ledger = take_budget_ledger_for_test();
+        match outcome {
+            Ok(()) => {
+                let (next_tight, next_held, next_pending) = derive_tight_from_ledger(&ledger);
+                assert_eq!(
+                    next_held.len(),
+                    hold_admission_count,
+                    "every completed step charges the same held relations"
+                );
+                eprintln!("MANY_TABLE_HOLD step={step} count={}", next_held.len());
+                assert!(
+                    next_tight < tight,
+                    "successful fixed-point step must lower the derived limit: {tight} -> {next_tight}"
+                );
+                eprintln!("MANY_TABLE_REFUSAL step={step} tight={tight} next_tight={next_tight}");
+                (tight, held_requests, pending_requests) = (next_tight, next_held, next_pending);
+                db.close().expect("close the successful derivation store");
+            }
+            Err(refusal) => {
+                eprintln!("MANY_TABLE_REFUSAL step={step} tight={tight} refusal={refusal:?}");
+                refused = Some((root, db, refusal));
+                break;
+            }
+        }
+    }
+    let (_root, db, refusal) =
+        refused.expect("need - 1 converges to a refused commit under the same effective window");
     match &refusal {
         contextdb_core::Error::MemoryBudgetExceeded {
             subsystem,
@@ -427,19 +502,25 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
             budget_limit_bytes,
             ..
         } => {
-            let receipt = crate::persistence::native_storage_admission::StorageAdmissionScope::receipt_layout_for_scan_test();
-            assert_eq!(*subsystem, "redb");
-            assert_eq!(*operation, "pending_directory");
-            assert_eq!(*requested_bytes, receipt.size());
+            if *subsystem == "content_identity" && *operation == "hold_row_head_relations" {
+                assert!(held_requests.contains(requested_bytes));
+                assert!(refusal.to_string().ends_with("Hint: Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to."));
+            } else {
+                assert_eq!(*subsystem, "redb");
+                assert_eq!(*operation, "pending_directory");
+                assert!(pending_requests.contains(requested_bytes));
+            }
             assert!(*available_bytes < *requested_bytes);
             assert_eq!(*budget_limit_bytes, tight);
-            assert_eq!(
-                refusal.to_string(),
-                format!(
-                    "writing this transaction's rows to {HELD_TABLES} tables: the table roots did not fit in the declared memory ({requested_bytes} B requested, {available_bytes} B available of {budget_limit_bytes} B). Hint: Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to."
-                ),
-                "the original numeric refusal must explain the row-write work in user terms"
-            );
+            if *subsystem == "redb" {
+                assert_eq!(
+                    refusal.to_string(),
+                    format!(
+                        "writing this transaction's rows to {HELD_TABLES} tables: the table roots did not fit in the declared memory ({requested_bytes} B requested, {available_bytes} B available of {budget_limit_bytes} B). Hint: Raise MEMORY_LIMIT to admit the tables this transaction's rows are written to."
+                    ),
+                    "the original numeric refusal must explain the row-write work in user terms"
+                );
+            }
         }
         other => panic!("a typed budget refusal, not {other:?}"),
     }
@@ -469,6 +550,147 @@ fn a_commit_writing_many_tables_admits_the_relations_it_holds_open() {
     )
     .expect("the store keeps committing after the refusal");
     db.close().expect("close the refused store");
+}
+
+/// The same 32-table append must fit the workspace measured at shallow
+/// history, however much history those tables already contain. A history-0
+/// replay is the positive control for the producer-derived success ceiling.
+#[test]
+fn a_many_table_append_fits_the_shallow_history_workspace() {
+    // Row stamps enter proof hashes; one clock keeps all replay page layouts identical.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
+    let ample = 1 << 32;
+    let mut ceiling = None;
+    for history in [0, 16] {
+        let (_root, db, tx) = many_table_commit_with_history(ample, history);
+        let baseline = db.accountant().usage().used;
+        watch_budget_ledger_for_test();
+        db.commit(tx).expect("measure the complete ample append");
+        let ledger = take_budget_ledger_for_test();
+        if history == 0 {
+            ceiling = ledger.iter().map(|entry| entry.used_after).max();
+        }
+        record_many_table_ledger(history, baseline, db.accountant().usage().used, &ledger);
+        db.close().expect("close the measured ample store");
+    }
+    let ceiling = ceiling.expect("the shallow producer records its full peak");
+
+    for history in [0, 16] {
+        let (root, db, tx) = many_table_commit_with_history(ceiling, history);
+        let before = db.current_lsn();
+        let result = db.commit(tx);
+        let after = db.current_lsn();
+        eprintln!(
+            "MANY_TABLE_SHALLOW_CEILING history={history} tables={HELD_TABLES} ceiling={ceiling} result={result:?}"
+        );
+        if result.is_err() {
+            assert_eq!(after, before, "a refusal publishes no partial commit");
+        }
+        db.set_memory_limit(Some(ample))
+            .expect("fund verification reads");
+        assert_many_table_committed_rows(&db, history, result.is_ok());
+        db.close().expect("close the append store");
+        let reopened = Database::open(root.path().join("tables.db")).expect("reopen after append");
+        assert_eq!(
+            reopened.current_lsn(),
+            after,
+            "the published position survives reopen"
+        );
+        assert_many_table_committed_rows(&reopened, history, result.is_ok());
+        reopened.close().expect("close the recovered append store");
+        assert!(
+            result.is_ok(),
+            "the same 32-table append must fit the history-0 producer peak at history {history}: {result:?}"
+        );
+    }
+}
+
+// Record outside the observed commit. No allowance or admission is derived
+// from these totals; the success ceiling remains the history-0 actual peak.
+fn record_many_table_ledger(
+    history: usize,
+    baseline: usize,
+    used_after: usize,
+    ledger: &[crate::memory_accounting::BudgetLedgerEntry],
+) {
+    let mut families = std::collections::BTreeMap::<String, (usize, usize, usize, usize)>::new();
+    for entry in ledger {
+        if entry.what == "release" {
+            continue;
+        }
+        let family = families.entry(entry.what.clone()).or_default();
+        family.0 += 1;
+        family.1 += entry.bytes;
+        family.2 = family.2.max(entry.bytes);
+        family.3 = family.3.max(entry.used_after);
+    }
+    let summary = serde_json::json!({
+        "history": history,
+        "tables_written": HELD_TABLES,
+        "rows_written": HELD_TABLES,
+        "writer_baseline_after_staging": baseline,
+        "writer_used_after_commit": used_after,
+        "global_ledger_peak": ledger.iter().map(|entry| entry.used_after).max(),
+        "families_count_sum_max_request_peak_used": families,
+    });
+    eprintln!("MANY_TABLE_MEASURE_JSON {summary}");
+    if let Some(directory) = std::env::var_os("CONTEXTDB_MANY_TABLE_MEASUREMENT_DIR") {
+        let entries: Vec<_> = ledger
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "what": entry.what,
+                    "bytes": entry.bytes,
+                    "used_after": entry.used_after,
+                    "owner_identity": entry.owner_identity,
+                    "parent_identity": entry.parent_identity,
+                    "allocation": entry.allocation,
+                })
+            })
+            .collect();
+        let path = std::path::PathBuf::from(directory).join(format!("history-{history}.json"));
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "summary": summary, "ledger": entries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+fn assert_many_table_committed_rows(db: &Database, history: usize, appended: bool) {
+    for n in 0..HELD_TABLES {
+        let rows = db
+            .execute(
+                &format!(
+                    "SELECT id, payload FROM held_{n:02}_{} ORDER BY id",
+                    "x".repeat(200)
+                ),
+                &HashMap::new(),
+            )
+            .expect("read the complete committed table");
+        let mut expected: Vec<_> = (0..history)
+            .map(|generation| {
+                uuid::Uuid::from_u128(0x5e1d << 112 | ((generation * HELD_TABLES + n) as u128))
+            })
+            .collect();
+        if appended {
+            expected.push(uuid::Uuid::from_u128(0x4e1d << 112 | n as u128));
+        }
+        expected.sort();
+        assert_eq!(rows.rows().len(), expected.len(), "no partial publication");
+        for (row, id) in rows.rows().iter().zip(expected) {
+            assert_eq!(
+                row.first(),
+                Some(&Value::Uuid(id)),
+                "committed keys stay intact"
+            );
+            assert_eq!(row.get(1), Some(&Value::Text("one row".into())));
+        }
+    }
 }
 
 /// A commit writing one row into one table opens, closes and witnesses only
