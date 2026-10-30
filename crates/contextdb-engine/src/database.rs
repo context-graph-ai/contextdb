@@ -11,6 +11,8 @@ use contextdb_core::read_memory::ReadMemoryBudget as _;
 #[cfg(feature = "test-seams")]
 pub use custody_store::HeldCustodyRootForTest;
 mod erasure_frontiers;
+mod publication_registration;
+use publication_registration::{ReadPublicationReaders, ReadPublicationRegistration};
 mod schema_history_memory;
 use schema_history_memory::{PreparedSchemaHistory, SchemaHistoryMemory};
 mod graph_cursor_claims;
@@ -4151,7 +4153,7 @@ struct DatabaseOperationGuard<'a> {
 
 #[derive(Default)]
 struct ReadPublicationGateState {
-    readers: BTreeMap<String, usize>,
+    readers: ReadPublicationReaders,
     writer_scope: Option<BTreeSet<String>>,
     writer_active: bool,
     wake_generation: u64,
@@ -4168,7 +4170,7 @@ struct ReadPublicationWake(std::sync::Weak<ReadPublicationGate>);
 
 pub(crate) struct AuthoritativeReadPublicationGuard {
     gate: Arc<ReadPublicationGate>,
-    tables: BTreeSet<String>,
+    registration: Option<ReadPublicationRegistration>,
 }
 
 struct AuthoritativePurgePublicationGuard {
@@ -4746,6 +4748,7 @@ enum DurableVectorGenerationSource {
     CapturedRoot(Arc<vector_captured_serving::CapturedVectorRootLease>),
 }
 
+mod legacy_expiry_staging;
 mod maintenance_runtime;
 pub use maintenance_runtime::*;
 
@@ -4768,7 +4771,10 @@ struct MetadataAuthorizedCandidates {
 // image. A raw accountant cannot assemble a writable database.
 enum DatabaseAssemblyBudget {
     Writer(WriterBudget),
-    ReadImage(crate::memory_accounting::AccountantHandle),
+    ReadImage(
+        crate::memory_accounting::AccountantHandle,
+        contextdb_vector::MemoryBudgetOwner,
+    ),
 }
 
 // Linux x86-64 glibc 2.39 census, 1/4/16 workers and three waves: max joined

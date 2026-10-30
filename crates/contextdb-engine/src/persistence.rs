@@ -47,6 +47,7 @@ use contextdb_core::read_memory::ReadMemoryBudget as _;
 pub use historical_index_commitment::HistoricalIndexVerification;
 mod graph_history_record;
 mod graph_history_writer;
+mod graph_reclaim_decode;
 pub(crate) mod graph_read;
 pub mod holder_presence;
 #[cfg(unix)]

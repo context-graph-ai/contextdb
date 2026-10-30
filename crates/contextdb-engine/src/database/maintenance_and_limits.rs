@@ -3013,19 +3013,21 @@ impl Database {
 
     pub(crate) fn capture_authoritative_read_publication(
         &self,
-        tables: BTreeSet<String>,
+        tables: crate::executor::PublicationTables,
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: OwnerReadCancellation,
         started_ms: u64,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> crate::executor::ReadPublicationScope {
-        crate::executor::ReadPublicationScope::bounded(
+        crate::executor::ReadPublicationScope::funded(
             self.tx_mgr.current_lsn(),
             tables,
             limits,
             clock,
             cancellation,
             started_ms,
+            read_memory,
         )
     }
 

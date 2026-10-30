@@ -3816,22 +3816,30 @@ impl RedbPersistence {
         table_name: &str,
         row_id: RowId,
         meta: Option<&TableMeta>,
-        mut workspace: Option<&mut crate::memory_accounting::OwnedMemoryReservation>,
-    ) -> Result<content_identity::ContentIdentityMutation> {
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<content_identity::OriginalIdentityMutation> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let remove = || {
+            content_identity::fund_identity_mutation_from_original(
+                original,
+                table_name
+                    .len()
+                    .saturating_add(3 * std::mem::size_of::<u64>()),
+                || Ok(content_identity::remove_row_mutation(table_name, row_id)),
+            )
+        };
         let redb_name = Self::rel_table_name(table_name);
         let table_def: TableDefinition<&[u8], &[u8]> = TableDefinition::new(redb_name.as_str());
         let table = match content_size::open_rows(write_txn, table_def, meta) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Ok(content_identity::remove_row_mutation(table_name, row_id));
+                return remove();
             }
             Err(error) => return Err(Self::storage_error(error)),
         };
         let prefix = row_id.0.to_be_bytes();
         let memory = crate::read_image_memory::active_owner()?;
         let mut current = None::<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>;
-        let mut admitted_body_bytes = 0usize;
         for item in table
             .range(prefix.as_slice()..)
             .map_err(Self::storage_error)?
@@ -3840,24 +3848,9 @@ impl RedbPersistence {
             if !key.value().starts_with(&prefix) {
                 break;
             }
-            // Committed directories can omit large unindexed TEXT/JSON.
-            // Price the borrowed durable encoding before decoding it. The
-            // envelope covers the previous winner, replacement decode and
-            // canonical leaf; the caller holds it through identity publication.
-            if let Some(workspace) = workspace.as_deref_mut() {
-                let required = 1024usize
-                    .saturating_add(table_name.len().saturating_mul(8))
-                    .saturating_add(value.value().len().saturating_mul(16));
-                if required > admitted_body_bytes {
-                    workspace.try_grow_for(
-                        required - admitted_body_bytes,
-                        "retention",
-                        "prepare_prune",
-                        "Raise MEMORY_LIMIT to repair the selected retained row's durable identity.",
-                    )?;
-                    admitted_body_bytes = required;
-                }
-            }
+            // The row owner pays each decoded lifetime until its physical drop.
+            // The surviving canonical leaf is funded separately below; do not
+            // reserve another encoded-width envelope over the same decodes.
             let row_memory = memory.row_owner()?;
             let row = row_memory.scope(|| Self::decode_versioned_row(value.value(), meta))?;
             if current
@@ -3868,8 +3861,10 @@ impl RedbPersistence {
             }
         }
         match current {
-            Some(row) => content_identity::row_mutation(table_name, &row.0, meta),
-            None => Ok(content_identity::remove_row_mutation(table_name, row_id)),
+            Some(row) => {
+                content_identity::row_mutation_from_original(original, table_name, &row.0, meta)
+            }
+            None => remove(),
         }
     }
 
@@ -6923,9 +6918,7 @@ impl RedbPersistence {
         }
         // Native markers lend only their prepaid scalar diagnosis here.
         if let Some(refusal) = Self::scalar_storage_refusal(&err) {
-            return native_storage_admission::original_storage_error(
-                native_storage_admission::NativeStorageFailure::Refused(refusal),
-            );
+            return native_storage_admission::callback_storage_refusal(refusal);
         }
         if let redb::Error::AdmissionRefused(error) = err {
             return match error.downcast::<Error>() {

@@ -1929,7 +1929,7 @@ impl Database {
             relational.clone(),
             graph.clone(),
             vector.clone(),
-            DatabaseAssemblyBudget::ReadImage(accountant.clone()),
+            DatabaseAssemblyBudget::ReadImage(accountant.clone(), vector_accountant),
         )?;
         finalization.defer_loaded_state_owner();
         let composite = CompositeStore::new_with_apply_phase_pause(

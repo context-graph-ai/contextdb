@@ -498,16 +498,18 @@ pub enum DirectMetadataRequest {
     },
 }
 
-pub(crate) fn metadata_publication_tables(request: &DirectMetadataRequest) -> BTreeSet<String> {
-    match request {
+pub(crate) fn metadata_publication_tables(
+    request: &DirectMetadataRequest,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> contextdb_core::Result<crate::executor::PublicationTables> {
+    let name = match request {
         DirectMetadataRequest::DeliveryStatus { root_table }
         | DirectMetadataRequest::DeliveryOutcome { root_table, .. }
         | DirectMetadataRequest::Schema { table: root_table }
-        | DirectMetadataRequest::VerifyHistory { table: root_table } => {
-            BTreeSet::from([root_table.clone()])
-        }
-        _ => BTreeSet::from(["*".to_owned()]),
-    }
+        | DirectMetadataRequest::VerifyHistory { table: root_table } => root_table.as_str(),
+        _ => "*",
+    };
+    crate::executor::PublicationTables::try_one(owner, name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1940,10 +1942,11 @@ impl DirectFileReader {
         let read_memory = self.request_read_memory()?;
         let diagnostic = PreparedEngineDiagnostic::new(read_memory.clone())
             .map_err(crate::read_image::history_answer_error)?;
-        let tables = metadata_publication_tables(&request);
+        let tables = metadata_publication_tables(&request, read_memory.clone())
+            .map_err(crate::read_image::history_answer_error)?;
         let started_ms = self.clock.now_ms();
         let response = self.target.read_metadata(
-            read_memory,
+            read_memory.clone(),
             request,
             &self.image,
             self.limits,
@@ -1951,13 +1954,14 @@ impl DirectFileReader {
             continuation,
             cancellation,
         )?;
-        let publication = crate::executor::ReadPublicationScope::bounded(
+        let publication = crate::executor::ReadPublicationScope::funded(
             self.image.changes.current_lsn,
             tables,
             self.limits,
             Arc::clone(&self.clock),
             cancellation.clone(),
             started_ms,
+            read_memory,
         );
         self.retained_source
             .registration()

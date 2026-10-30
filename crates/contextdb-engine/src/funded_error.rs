@@ -497,6 +497,13 @@ const JSON_NATIVE_REQUEST_ALIGNMENT: usize = 8;
 // prepared return token exists on this unit-visitor/scalar-refusal bridge.
 const JSON_NATIVE_WORK_SLOTS: usize = 3;
 
+// The same dependency-calibrated failure workspace, shared by validating
+// graph reclaim visitors; their composed allocation proof is separate.
+pub(crate) fn json_native_error_workspace_bytes() -> usize {
+    JSON_NATIVE_REQUEST_BYTES * JSON_NATIVE_WORK_SLOTS
+        + contextdb_core::types::ClosedJsonReadHooks::native_message_bytes()
+}
+
 #[derive(Debug)]
 pub(crate) struct AdmittedJsonDiagnostic {
     // Destination/carrier destruction precedes native-invoice destruction.

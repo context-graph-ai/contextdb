@@ -773,7 +773,7 @@ impl ImageMemory {
                 accountant,
                 reader_budget,
                 "reader",
-                "materialize_answer",
+                "query_decode",
                 "Reduce simultaneous query memory or raise the declared reader limit.",
                 (),
             )?,
@@ -855,11 +855,17 @@ impl ImageMemory {
             hint,
         );
         payload.query_control = query_control;
+        // This allocation establishes the decoder owner; selected values are
+        // admitted later under the payload's query_decode operation.
+        let control_operation = match operation {
+            "query_decode" => "decode_owner",
+            other => other,
+        };
         let credit = match ReadCredit::try_new_owned(
             reader_budget.clone(),
             bytes,
             subsystem,
-            operation,
+            control_operation,
             hint,
         ) {
             Ok(credit) => credit,
@@ -904,7 +910,7 @@ impl ImageMemory {
             accountant,
             reader_budget,
             "reader",
-            "materialize_answer",
+            "query_decode",
             "Reduce the statement's output or raise the declared reader memory limit.",
             (),
         )
@@ -1690,12 +1696,63 @@ pub(crate) struct QueryImageCharge {
     image:
         crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
 }
+// A synchronous statement may use an image only for temporary source decodes.
+// Match the actual active image so nested execution cannot adopt another scope.
+thread_local! {
+    static TRANSIENT_ANSWER_IMAGE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+struct AnswerImageMode(usize);
+impl AnswerImageMode {
+    fn enter(image: usize) -> Self {
+        Self(TRANSIENT_ANSWER_IMAGE.with(|slot| slot.replace(image)))
+    }
+}
+impl Drop for AnswerImageMode {
+    fn drop(&mut self) {
+        TRANSIENT_ANSWER_IMAGE.with(|slot| slot.set(self.0));
+    }
+}
 impl QueryAnswerCharge {
     #[cfg(test)]
     pub(crate) fn retained_image_pointer_for_test(&self) -> usize {
         match self {
             Self::Image(charge) => &*charge.image.value as *const ImageMemory as usize,
             _ => 0,
+        }
+    }
+    /// The bounded kernel owns its returned capacities through its ReadCredit.
+    /// Source decode scratch is released at this execution boundary.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve the existing inline native refusal."
+    )]
+    pub(crate) fn execute_with_transient_image(
+        image: crate::local_transport::query_funding::Funded<ImageMemoryHandle>,
+        run: impl FnOnce(&ImageMemoryHandle) -> Result<crate::database::OwnedQueryResult>,
+    ) -> Result<crate::database::OwnedQueryResult> {
+        let _mode = AnswerImageMode::enter(&*image.value as *const ImageMemory as usize);
+        run(&image.value)
+    }
+    /// Admit legacy retention before executing a plan that needs that image.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Preserve the existing inline native refusal."
+    )]
+    pub(crate) fn execute_legacy_with_active_image(
+        run: impl FnOnce() -> Result<crate::database::OwnedQueryResult>,
+    ) -> Result<crate::database::OwnedQueryResult> {
+        let Ok(image) = active_owner() else {
+            return run();
+        };
+        let is_transient = TRANSIENT_ANSWER_IMAGE
+            .with(|slot| slot.get() == &*image as *const ImageMemory as usize);
+        if is_transient {
+            Self::execute_with_image(
+                crate::local_transport::query_funding::Funded::external(image),
+                |_| run(),
+            )
+        } else {
+            run()
         }
     }
     /// Passive pointers and the existing invoice of the actual retained image.
@@ -1739,6 +1796,7 @@ impl QueryAnswerCharge {
             &crate::read_image_memory::ImageMemoryHandle,
         ) -> Result<crate::database::OwnedQueryResult>,
     ) -> Result<crate::database::OwnedQueryResult> {
+        let _mode = AnswerImageMode::enter(0);
         use contextdb_core::read_memory::{NativeProduce, ReadCredit, ReadShared};
         let owner = image.value.owner();
         let invoice = ReadCredit::try_new_owned(
@@ -3295,18 +3353,33 @@ impl ImageMemoryHandle {
     pub(crate) fn vector_copy(&self, prepaid_bytes: usize) -> Result<ImageVectorCopy> {
         #[cfg(any(test, feature = "test-seams"))]
         let _sample = ImageSample(self);
-        let bytes =
-            ReadMemoryOwner::native_layout::<ImageVectorBudget, ImageVectorInvoice>().size();
-        self.reserve_funding(bytes)?;
-        let invoice = ImageVectorInvoice {
-            image: self.clone(),
-            bytes,
+        // A reader-backed answer already carries its original capability.
+        // The inline vector adapter retains it without allocating a second
+        // forwarding control before the prepaid charge Box.
+        let accountant = if let Some(reader) = self.reader_budget.as_ref().filter(|_| {
+            self.subsystem == "reader"
+                && matches!(self.operation, "materialize_answer" | "query_decode")
+                && matches!(
+                    self.hint,
+                    "Reduce the statement's output or raise the declared reader memory limit."
+                        | "Reduce simultaneous query memory or raise the declared reader limit."
+                )
+        }) {
+            contextdb_vector::MemoryBudgetOwner::for_answer_image(reader.clone())
+        } else {
+            let bytes =
+                ReadMemoryOwner::native_layout::<ImageVectorBudget, ImageVectorInvoice>().size();
+            self.reserve_funding(bytes)?;
+            let invoice = ImageVectorInvoice {
+                image: self.clone(),
+                bytes,
+            };
+            contextdb_vector::MemoryBudgetOwner::from(
+                ReadMemoryOwner::try_native_result(ImageVectorBudget(self.clone()), invoice)
+                    .map_err(Error::NativeEngineOther)?,
+            )
+            .preserving_read_copy_errors()
         };
-        let accountant = contextdb_vector::MemoryBudgetOwner::from(
-            ReadMemoryOwner::try_native_result(ImageVectorBudget(self.clone()), invoice)
-                .map_err(Error::NativeEngineOther)?,
-        )
-        .preserving_read_copy_errors();
         self.held
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 held.checked_sub(prepaid_bytes)

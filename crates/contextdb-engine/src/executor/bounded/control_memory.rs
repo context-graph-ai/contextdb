@@ -73,6 +73,14 @@ impl<T> ControlArc<T> {
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReadShared<ReadCredit>> {
         let owner = owner.into();
+        Self::admit_owned_observing(owner.clone(), &owner)
+    }
+    pub(super) fn admit_owned_observing(
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        original: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<ReadShared<ReadCredit>> {
+        #[cfg(not(feature = "test-seams"))]
+        let _ = original;
 
         let keeper = ReadCredit::try_new_owned(
             owner.clone(),
@@ -89,9 +97,7 @@ impl<T> ControlArc<T> {
             "Release retained read controls or raise MEMORY_LIMIT.",
         )?;
         #[cfg(feature = "test-seams")]
-        crate::vector_read_memory::statement_child_proof::funding_next(
-            payload.original_payer_for_test(),
-        );
+        crate::vector_read_memory::statement_child_proof::funding_next(original);
         ReadShared::try_from_prepaid(payload, keeper)
     }
     pub(super) fn from_prepaid(value: T, invoice: ReadShared<ReadCredit>) -> Self {
@@ -99,6 +105,20 @@ impl<T> ControlArc<T> {
         crate::vector_read_memory::statement_child_proof::funding_next(
             invoice.original_payer_for_test(),
         );
+        Self {
+            value: Arc::new(value),
+            invoice,
+        }
+    }
+    pub(super) fn from_prepaid_observing(
+        value: T,
+        invoice: ReadShared<ReadCredit>,
+        original: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Self {
+        #[cfg(not(feature = "test-seams"))]
+        let _ = original;
+        #[cfg(feature = "test-seams")]
+        crate::vector_read_memory::statement_child_proof::funding_next(original);
         Self {
             value: Arc::new(value),
             invoice,

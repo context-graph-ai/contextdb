@@ -164,7 +164,17 @@ impl std::error::Error for WireError {
 }
 impl From<NativeTerminal> for WireError {
     fn from(terminal: NativeTerminal) -> Self {
-        Self::Native(terminal)
+        use contextdb_core::read_memory::NativeRefusal;
+        match terminal {
+            terminal @ (NativeTerminal::Refused(
+                NativeRefusal::MemoryBudgetExceeded { .. }
+                | NativeRefusal::ProcessMemoryBudgetExceeded { .. },
+            )
+            | NativeTerminal::Kernel(contextdb_core::Error::MemoryBudgetExceeded {
+                ..
+            })) => Self::Resource(terminal.into_error()),
+            other => Self::Native(other),
+        }
     }
 }
 
@@ -477,6 +487,43 @@ pub(crate) fn encode_terminal(
         | NativeTerminal::Kernel(_)
         | NativeTerminal::Class(_) => return None,
     };
+    encode_borrowed_refusal(refusal, out)
+}
+
+/// The shared resource variant keeps native memory refusal serialization
+/// borrowed, including when admission failed before a reply could be allocated.
+pub(crate) fn encode_resource_memory_refusal(
+    error: &contextdb_core::Error,
+    out: &mut [u8; TERMINAL_BYTES],
+) -> Option<usize> {
+    let contextdb_core::Error::MemoryBudgetExceeded {
+        subsystem,
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+    } = error
+    else {
+        return None;
+    };
+    encode_borrowed_refusal(
+        WireRefusalRef::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint,
+        },
+        out,
+    )
+}
+
+fn encode_borrowed_refusal(
+    refusal: WireRefusalRef<'_>,
+    out: &mut [u8; TERMINAL_BYTES],
+) -> Option<usize> {
     let capacity = out.len();
     let mut cursor = std::io::Cursor::new(&mut out[..]);
     serde::Serialize::serialize(
@@ -548,6 +595,60 @@ pub fn measure_native_terminal_encodings_for_test(measure: &mut TerminalEncoding
     for (name, terminal) in &terminals {
         let mut encoded = [0u8; TERMINAL_BYTES];
         measure(name, &mut || encode_terminal(terminal, &mut encoded));
+    }
+}
+
+/// Exercise the actual Iroh Resource-memory encoder under a caller's existing
+/// allocation observer; constructing expected owned wire data is outside it.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn measure_resource_memory_refusal_encodings_for_test(
+    measure: &mut TerminalEncodingMeasure<'_>,
+) {
+    use contextdb_core::read_memory::NativeRefusal;
+    for (name, requested, available, limit) in [
+        ("reply_memory", 262_144, 19_008, 32_768),
+        ("maximum_memory", usize::MAX, 0, usize::MAX),
+    ] {
+        let terminal = NativeTerminal::Refused(NativeRefusal::MemoryBudgetExceeded {
+            subsystem: "sync_transport",
+            operation: "materialize_body",
+            requested_bytes: requested,
+            available_bytes: available,
+            budget_limit_bytes: limit,
+            hint: "legacy transport requires an admitted complete body",
+        });
+        let WireError::Resource(error) = WireError::from(terminal) else {
+            panic!("native memory refusal must reach the shared Resource wire variant");
+        };
+        let expected = WireRefusal::from_error(&error).unwrap().encode().unwrap();
+        let mut encoded = [0u8; TERMINAL_BYTES];
+        let mut written = None;
+        measure(name, &mut || {
+            written = encode_resource_memory_refusal(&error, &mut encoded);
+            written
+        });
+        let length = written.expect("resource memory refusal fits the fixed terminal buffer");
+        assert_eq!(
+            &encoded[..length],
+            expected.as_slice(),
+            "the borrowed Resource encoding is wire-identical"
+        );
+        let decoded = WireError::from(
+            WireRefusal::decode(&encoded[..length])
+                .unwrap()
+                .into_error(),
+        );
+        assert!(
+            matches!(decoded,
+                WireError::Resource(contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint
+                }) if subsystem == "sync_transport" && operation == "materialize_body"
+                    && requested_bytes == requested && available_bytes == available && budget_limit_bytes == limit
+                    && hint == "legacy transport requires an admitted complete body"
+            ),
+            "the client keeps every typed refusal field"
+        );
     }
 }
 

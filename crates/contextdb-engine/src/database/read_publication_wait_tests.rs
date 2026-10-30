@@ -68,7 +68,7 @@ fn scope(
 ) -> crate::executor::ReadPublicationScope {
     crate::executor::ReadPublicationScope {
         snapshot_lsn: Lsn(1),
-        tables: BTreeSet::from(["items".to_owned()]),
+        tables: crate::executor::PublicationTables::Unfunded(BTreeSet::from(["items".to_owned()])),
         inspection: false,
         budget: crate::executor::ReadPublicationBudget {
             clock,
@@ -77,6 +77,7 @@ fn scope(
             active_ms: 20,
         },
         read_memory: None,
+        publication_funding: None,
     }
 }
 

@@ -351,8 +351,11 @@ impl RedbPersistence {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_graph("graph_payload", "payload_decode", &[], None, None);
 
-        let edge: AdjEntry = Self::decode(encoded)?;
-        if Self::graph_fwd_key(&edge).as_slice() != p {
+        #[cfg(test)]
+        let edge = reclaim_allocation_guard::observe_decode(|| super::graph_reclaim_decode::decode(encoded))?;
+        #[cfg(not(test))]
+        let edge = super::graph_reclaim_decode::decode(encoded)?;
+        if !edge.matches_forward_key(p) {
             return Err(corrupt("reclaimed predecessor key and payload disagree"));
         }
         let ck = creation_contribution_key(p)?;
@@ -2268,5 +2271,103 @@ mod required_table_tests {
             defects.is_empty(),
             "invalid graph-proof validation: {defects:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reclaim_allocation_guard {
+    use super::*;
+    use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+
+    thread_local! {
+        static ACCOUNTANT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static RECEIPT: std::cell::Cell<Option<(usize, usize, usize, usize, usize, usize)>> = const { std::cell::Cell::new(None) };
+    }
+    pub(super) fn observe_decode<T>(decode: impl FnOnce() -> Result<T>) -> Result<T> {
+        let accountant = ACCOUNTANT.with(std::cell::Cell::get);
+        if accountant == 0 { return decode(); }
+        // The fixture pins this exact original accountant until the call returns.
+        let accountant = unsafe { &*(accountant as *const crate::memory_accounting::MemoryAccountant) };
+        let before = accountant.usage().used;
+        let ((result, physical), gap) = oracle::funded_requests(accountant, || {
+            let observation = oracle::declaration_observation();
+            let result = decode();
+            (result, observation.physical_receipt())
+        });
+        let after = accountant.usage().used;
+        RECEIPT.with(|slot| slot.set(Some((physical.0, physical.1, physical.2, gap, before, after))));
+        result
+    }
+
+    fn run(value: Value, damage_json: bool, should_succeed: bool, wide: bool, allocates: bool) {
+        let writer = crate::memory_accounting::MemoryAccountant::writer_no_limit().unwrap();
+        let owner = writer.accountant();
+        let scope =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(owner.clone()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = RedbPersistence::create(&directory.path().join("guard.db")).unwrap();
+        let edge = AdjEntry {
+            source: uuid::Uuid::from_u128(1),
+            target: uuid::Uuid::from_u128(2),
+            edge_type: "owns".into(),
+            properties: HashMap::from([("body".into(), value)]),
+            created_tx: TxId(3),
+            deleted_tx: None,
+            lsn: Lsn(4),
+        };
+        let mut bytes = bincode::serde::encode_to_vec(&edge, bincode::config::standard()).unwrap();
+        if damage_json {
+            let at = bytes.windows(7).position(|w| w == br#"{"a":1}"#).unwrap();
+            bytes[at + 5] = b'x';
+        }
+        let key = RedbPersistence::graph_fwd_key(&edge);
+        store
+            .with_db(|db| {
+                let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
+                RedbPersistence::initialize_graph_proof_tables_in_write(&write)?;
+                RedbPersistence::install_graph_creation_in_write(&write, &edge, &bytes)?;
+                store.graph_writer_window(|| {
+                    ACCOUNTANT.with(|slot| slot.set((&*owner as *const crate::memory_accounting::MemoryAccountant) as usize));
+                    RECEIPT.with(|slot| slot.set(None));
+                    let result = RedbPersistence::reclaim_graph_creation_in_write(&write, &key, &bytes);
+                    ACCOUNTANT.with(|slot| slot.set(0));
+                    let succeeded = result.is_ok();
+                    drop(result);
+                    let physical = RECEIPT.with(|slot| slot.take()).expect("actual decoder was observed");
+                    assert_eq!(succeeded, should_succeed);
+                    assert_eq!(physical.3, 0, "actual decoder allocations stay funded through physical free");
+                    assert_eq!(physical.0, 0, "decoder leaves no allocated property payload live");
+                    assert_eq!(physical.1, 0, "native decoder allocation census is fully funded");
+                    if wide { assert!(physical.2 < bytes.len(), "reclaim never copies the wide payload"); }
+                    if allocates { assert!(physical.2 > 0, "the actual parser or its error allocated"); }
+                    assert_eq!(physical.4, physical.5, "the actual decoder returns its transient invoice");
+                    Ok(())
+                })
+            })
+            .unwrap();
+        drop(store);
+        drop(scope);
+    }
+    #[test]
+    #[serial_test::serial]
+    fn actual_reclaim_borrows_wide_and_funds_json_validation() {
+        run(Value::Text("wide-body".repeat(131072)), false, true, true, false);
+        run(
+            Value::Json(serde_json::json!({"text": "a\\\"b\n", "nested": [1, {"v": true}]})),
+            false,
+            true,
+            false,
+            true,
+        );
+        run(Value::Json(serde_json::json!({"a": 1})), true, false, false, true);
+        let mut nested = serde_json::json!(0);
+        for _ in 0..120 {
+            nested = serde_json::Value::Array(vec![nested]);
+        }
+        run(Value::Json(nested.clone()), false, true, false, false);
+        for _ in 0..10 {
+            nested = serde_json::Value::Array(vec![nested]);
+        }
+        run(Value::Json(nested), false, false, false, true);
     }
 }

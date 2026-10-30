@@ -397,6 +397,15 @@ A stored value too large for a read's memory budget is refused before its source
 allocated. Opening a session need not read that value: the refusal belongs to the statement that
 selects it, on both the file and owner routes, and leaves no new charge behind.
 <!-- enforced by: direct_file_image_memory_lifetime::one_oversized_durable_value_is_refused_before_its_source_buffer_is_allocated -->
+Reader memory refusals name the allocation refused in their typed operation field.
+Each phase charges the same executing reader.
+
+| Operation | Allocation refused |
+|---|---|
+| `decode_owner` | The native control that establishes an operation's decoder owner, before stored-value decoding begins. |
+| `query_decode` | Payload storage allocated while decoding selected stored values. |
+| `materialize_answer` | Storage allocated to materialize the answer. |
+
 
 Fallible engine reads that return history-sized results use a per-operation reader child and
 admit retained output as it is built. `trigger_audit_history` and `changes_since_with_arrivals`
