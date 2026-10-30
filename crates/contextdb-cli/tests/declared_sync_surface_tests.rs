@@ -53,7 +53,8 @@ fn run_cli_at(path: &std::path::Path, input: &str, json: bool) -> (String, Strin
 }
 
 fn run_cli(input: &str, json: bool) -> (String, String) {
-    run_cli_at(std::path::Path::new(":memory:"), input, json)
+    let session_dir = tempfile::tempdir().expect("session directory");
+    run_cli_at(&session_dir.path().join("session.db"), input, json)
 }
 
 fn assert_no_role_mechanic_words(rendered: &str, surface: &str) {
@@ -107,8 +108,9 @@ fn removed_sync_commands_are_unknown_and_role_mechanic_words_are_absent() {
         ("policy", ".sync policy notes LatestWins\n.quit\n"),
         ("direction", ".sync direction notes Both\n.quit\n"),
     ] {
+        let session_dir = tempfile::tempdir().expect("session directory");
         let (status, output, error) =
-            run_cli_at_with_status(std::path::Path::new(":memory:"), command, false);
+            run_cli_at_with_status(&session_dir.path().join("session.db"), command, false);
         assert!(
             !status.success(),
             "removed .sync {name} is a scripted usage error and must exit nonzero"

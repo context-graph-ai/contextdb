@@ -10,7 +10,9 @@ use std::process::{Command, Stdio};
 
 fn run_cli(extra_args: &[&str], stdin_sql: &str) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
-    cmd.arg(":memory:");
+    let session_dir = tempfile::tempdir().expect("session directory");
+    cmd.arg(session_dir.path().join("session.db"))
+        .arg("--write");
     for a in extra_args {
         cmd.arg(a);
     }
