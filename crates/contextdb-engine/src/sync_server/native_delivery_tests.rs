@@ -2209,27 +2209,28 @@ async fn the_iroh_native_root_is_retired_by_every_way_its_serve_ends() {
     assert_eq!(installs.retained_bytes_for_test(), baseline);
 }
 
-// Finding 9: native delivery is scoped to file-backed hubs, because native
-// custody selection reads the durable committed root. An in-memory hub driven
-// by run_until_stopped keeps its Legacy delivery handler and answers exactly
-// as before; it gets no native installation and no native dispatch.
+// Finding 9: native delivery is scoped to hubs with a durable store, because
+// native custody selection reads the durable committed root. A hub opened over
+// `:memory:` has such a store (a throwaway file of its own), so run_until_stopped
+// serves it natively; it keeps no Legacy delivery handler for delivery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_in_memory_hub_keeps_legacy_delivery_under_run_until_stopped() {
+async fn a_throwaway_hub_is_durable_and_served_natively_under_run_until_stopped() {
     let world = World::with_hub_store(true);
-    assert!(world.hub_db.is_memory_backed());
+    assert!(!world.hub_db.is_memory_backed());
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);
     let hub = start_native(&world, &server).await;
-    assert!(
-        server.native_delivery.lock().unwrap().is_none(),
-        "no native installation is prepared for an in-memory hub"
+    assert_eq!(
+        server.delivery_route_for_test().0,
+        "native",
+        "a hub with a durable store is served natively"
     );
     world.bind().await;
     world.seed_outcomes(3).await;
     let fetched = within(world.client.fetch_delivery_outcomes(None))
         .await
-        .expect("Legacy delivery from an in-memory hub");
+        .expect("native delivery from a throwaway hub");
     let counts = server.delivery_route_counts_for_test();
     let legacy_exchanges = world
         .broker
@@ -2244,19 +2245,20 @@ async fn an_in_memory_hub_keeps_legacy_delivery_under_run_until_stopped() {
         counts.1
     );
     assert_eq!(fetched.len(), 3);
-    assert_eq!(counts, (0, 1));
-    assert_eq!(legacy_exchanges, 1);
+    assert_eq!(counts, (1, 0));
+    assert_eq!(legacy_exchanges, 0);
     hub.stop();
 }
 
-// Policy (owner ruling): a sync hub is a durable store; a memory-backed hub is
-// a test fixture, not a supported deployment shape. Each hub logs at
-// registration which route serves its delivery and why: an in-memory hub is
-// served by Legacy, and native delivery requires a durable store.
+// Policy (owner ruling): a sync hub is a durable store; a hub without
+// persistence is a test fixture, not a supported deployment shape. Each hub
+// logs at registration which route serves its delivery and why: native
+// delivery requires a durable store, and every hub the public surface can open
+// has one, including the throwaway one `:memory:` names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_hub_names_its_delivery_route_and_only_a_durable_hub_is_served_natively() {
     let mut lines = Vec::new();
-    for (memory_hub, route, counts) in [(true, "legacy", (0, 1)), (false, "native", (1, 0))] {
+    for (memory_hub, route, counts) in [(true, "native", (1, 0)), (false, "native", (1, 0))] {
         let world = World::with_hub_store(memory_hub);
         let requests =
             DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");

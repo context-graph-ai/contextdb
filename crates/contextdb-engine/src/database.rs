@@ -6518,8 +6518,7 @@ impl Database {
     }
 
     /// Open a throwaway database for this repository's own tests and for
-    /// consumers' test dev-dependencies. It is an ordinary durable database in
-    /// a directory of its own that goes away with the handle.
+    /// consumers' test dev-dependencies.
     #[cfg(any(test, feature = "test-seams"))]
     pub fn open_memory() -> Self {
         Self::open_builtin_with_options(MEMORY_DATABASE_PATH, DatabaseOpenOptions::default())

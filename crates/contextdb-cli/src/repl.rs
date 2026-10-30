@@ -3161,7 +3161,7 @@ fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
 /// session driven through the CLI's real per-line path does. Best-effort:
 /// a parse failure or a registration error must never turn an
 /// already-successful DDL statement into a failure the operator sees.
-/// Ephemeral (`:memory:`) sessions only -- see `Database::is_memory_backed`'s
+/// Sessions over a database with no persistence only -- see `Database::is_memory_backed`'s
 /// doc comment. A file-backed store is durable-until-explicitly-registered
 /// on purpose: a CLI script is routinely used to seed schema/data for a
 /// SEPARATE, later process (its own Rust program, possibly principal- or
@@ -3169,7 +3169,7 @@ fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
 /// registering and draining here would consume those durably-queued events
 /// out from under that later, legitimate registration before it ever gets a
 /// chance to run (acceptance `t5_16`/`t5_06`/`t5_13`/`t5_15`/`t5_31` all
-/// depend on this). An interactive/piped `:memory:` session has no later
+/// depend on this). A session with no persistence has no later
 /// process to hand off to -- it IS the whole session -- so it gets the
 /// zero-config convenience instead.
 #[expect(
@@ -3200,8 +3200,8 @@ fn register_cli_defaults_for_statement(db: &Database, sql: &str) {
 /// an unpredictable background dispatcher-thread wakeup. Bounded: a sink
 /// that will never drain (an ACL-denied item, a slow external callback that
 /// isn't ours) gives up after the bound instead of hanging the session.
-/// Costs nothing when nothing is queued -- the common case. Ephemeral
-/// (`:memory:`) sessions only, for the same reason
+/// Costs nothing when nothing is queued -- the common case. Only
+/// sessions with no persistence get it, for the same reason
 /// `register_cli_defaults_for_statement` is scoped that way.
 fn settle_cli_registered_sinks(db: &Database) {
     if !db.is_memory_backed() {
@@ -3365,7 +3365,7 @@ mod tests {
     use contextdb_parser::{Statement, parse};
 
     /// A writing session over a throwaway in-memory database — what these
-    /// fixtures drive, and the mode `:memory:` always has.
+    /// fixtures drive.
     fn writing_session(database: &Arc<Database>) -> Session {
         Session::writing(
             Arc::clone(database),
