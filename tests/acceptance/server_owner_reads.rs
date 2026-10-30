@@ -97,9 +97,9 @@ fn s02_no_owner_read_behaviour_flag_has_an_environment_alias() {
     );
 }
 
-/// A memory store has no file to serve from and no channel to place, so
-/// naming a read setting alongside one is an invalid invocation rather than a
-/// value that quietly does nothing.
+/// `:memory:` names no database file, so an invocation that names it is
+/// refused as a usage error, whatever read setting accompanies it, rather than
+/// quietly doing nothing.
 #[test]
 fn s03_a_memory_store_with_an_owner_read_flag_is_refused_at_startup() {
     ensure_release_binaries();

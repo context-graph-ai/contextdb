@@ -671,7 +671,7 @@ class SettledWorkflowControls(unittest.TestCase):
                 self.assertEqual(Path(env['CONTEXTDB_CLI']).parent, Path(env['CONTEXTDB_SERVER']).parent)
                 seen.append(args)
                 return 'PASS synthetic full smoke'
-            if ':memory:' in args:
+            if any(str(a).endswith('smoke.db') for a in args):
                 return '{"result":{"rows":[{"expr":2}]}}'
             return Path(args[0]).name + ' synthetic'
         with patch.object(c, 'command', side_effect=command):

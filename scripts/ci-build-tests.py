@@ -488,7 +488,7 @@ class AssetControls(unittest.TestCase):
                 self.assertIn('CONTEXTDB_SMOKE_DRIVER', kwargs['env'])
                 return 'PASS synthetic full smoke'
             self.assertTrue(Path(args[0]).is_file())
-            if args[1] == ':memory:':
+            if str(args[1]).endswith('smoke.db'):
                 self.assertEqual(kwargs['input'], 'SELECT 1 + 1;\n')
                 return '{"result":{"rows":[{"expr":2}]}}'
             return Path(args[0]).name + ' synthetic help/version'
@@ -557,7 +557,7 @@ python3() {
         def command(args, **kwargs):
             if args[0] == 'bash':
                 raise subprocess.CalledProcessError(1, args)
-            if ':memory:' in args:
+            if any(str(a).endswith('smoke.db') for a in args):
                 return '{"result":{"rows":[{"expr":2}]}}'
             return Path(args[0]).name + ' synthetic'
         with patch.object(c, 'command', side_effect=command):
