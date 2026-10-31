@@ -1582,6 +1582,47 @@ async fn a_lagging_edge_catches_up_in_whole_pages_and_resumes_after_a_lost_page(
     }
 }
 
+// An inspection reads every manifest, and each one carries the same binding
+// and schema signatures: they are checked once however many manifests share
+// them, so a further outcome adds only its own terminal, manifest and row
+// lineage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inspection_checks_a_signature_every_manifest_shares_once() {
+    async fn inspected(outcomes: usize) -> usize {
+        let verifications;
+        with_final_native_roots! { (requests);
+        let world = World::new();
+        let requests =
+            DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
+        let server = world.server(&requests);
+        let hub = start_native(&world, &server).await;
+        world.bind().await;
+        world.seed_outcomes_in_batches(outcomes, outcomes).await;
+        within(world.client.fetch_delivery_outcomes(None))
+            .await
+            .expect("the outcomes");
+        crate::custody::store::forget_signatures_for_test();
+        let before =
+            crate::identity::PAGING_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        let status = world
+            .edge_db
+            .delivery_status(ROOT_TABLE)
+            .expect("edge delivery status");
+        assert_eq!(status.accepted, outcomes as u64);
+        verifications = crate::identity::PAGING_VERIFICATIONS
+            .load(std::sync::atomic::Ordering::Relaxed) - before;
+        hub.stop();
+        assert_eq!(settled(&requests, native_root_bytes_for_test()), native_root_bytes_for_test());
+        }
+        verifications
+    }
+    let (fewer, more) = (2, 6);
+    assert_eq!(
+        inspected(more).await - inspected(fewer).await,
+        (more - fewer) * 3
+    );
+}
+
 // Iroh native path charges: the request body is read straight into the
 // operation's admitted allocation and the reply writer rides inside the paid
 // finish callback, so both are on the request parent while selection runs and

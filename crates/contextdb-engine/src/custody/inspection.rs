@@ -64,7 +64,10 @@ pub(crate) fn status(
     if status.disabled {
         return Ok(status);
     }
-    let records = custody_hold.retain(db.custody_table(table, read_memory.clone())?)?;
+    // Every manifest carries the same binding and schema signatures.
+    let records = custody_hold.retain(super::signature_work::scoped(&read_memory, || {
+        db.custody_table(table, read_memory.clone())
+    })?)?;
     let hub = db.retention_sync_peer();
     let authority = CurrentAuthority::read(&records, hub.as_deref());
     let manifests = records

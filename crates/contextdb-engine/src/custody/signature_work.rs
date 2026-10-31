@@ -11,9 +11,7 @@ struct Memo {
 thread_local! {
     static CURRENT: RefCell<Option<Memo>> = const { RefCell::new(None) };
 }
-#[cfg(any(test, feature = "sync-orchestration"))]
 struct Restore(Option<Memo>);
-#[cfg(any(test, feature = "sync-orchestration"))]
 impl Drop for Restore {
     fn drop(&mut self) {
         CURRENT.with(|current| *current.borrow_mut() = self.0.take());
@@ -21,7 +19,6 @@ impl Drop for Restore {
 }
 /// A closure cannot suspend: its memo never crosses an await or changes threads.
 /// Nested phases get independent owners and restore the outer phase on unwind.
-#[cfg(any(test, feature = "sync-orchestration"))]
 pub(crate) fn scoped<T>(owner: &ReadMemoryOwner, run: impl FnOnce() -> T) -> T {
     let previous = CURRENT.with(|current| {
         current.replace(Some(Memo {
