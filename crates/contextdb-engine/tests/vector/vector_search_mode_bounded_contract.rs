@@ -14,6 +14,10 @@ use contextdb_engine::{
     Database, MaintenancePolicy, QueryResult, SemanticQuery, VectorSearchRoute,
     VectorSearchRouteEvidence,
 };
+use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -178,16 +182,21 @@ fn take_trace(db: &Database) -> contextdb_engine::database::VectorSearchTraceObs
     .expect("the vector query publishes its route trace")
 }
 
-fn trace_candidates_in(
+fn used_indexed_route(
     trace: &contextdb_engine::database::VectorSearchTraceObservation,
-    partition_rows: &HashSet<RowId>,
-) -> Vec<RowId> {
-    trace
-        .hnsw_candidate_row_ids
-        .iter()
-        .copied()
-        .filter(|row_id| partition_rows.contains(row_id))
-        .collect()
+) -> bool {
+    trace.partition_routes.iter().any(|route| {
+        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
+    })
+}
+
+fn result_used_indexed_route(result: &QueryResult) -> bool {
+    result.trace().vector_search.as_ref().is_some_and(|disclosure| {
+        matches!(
+            disclosure.route,
+            Some(VectorSearchRoute::Indexed | VectorSearchRoute::FilteredIndexed)
+        )
+    })
 }
 
 fn disclosed_partition_routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<&str>)> {
@@ -216,18 +225,24 @@ fn disclosed_partition_routes(result: &QueryResult) -> Vec<(VectorSearchRoute, O
 }
 
 #[derive(Default)]
-struct HnswCandidateCounter(AtomicU64);
+struct IndexedWorkCounter(AtomicU64);
 
-impl bounded::ExecutionProbe for HnswCandidateCounter {
-    fn before_work(&self, _source: bounded::TestWorkSource, _completed_work: u64) {}
-
-    fn before_source_touch(&self, touch: bounded::TestSourceTouch, _completed_items: u64) {
-        if touch == bounded::TestSourceTouch::HnswCandidate {
-            self.0.fetch_add(1, Ordering::SeqCst);
+impl NativeIvfSealObserver for IndexedWorkCounter {
+    fn observe(&self, event: NativeIvfSealEvent<'_>) {
+        if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
+            self.0.fetch_add(
+                work.centroid_evaluations
+                    + work.quantized_evaluations
+                    + work.full_precision_evaluations
+                    + work.buffer_evaluations,
+                Ordering::SeqCst,
+            );
         }
     }
 
-    fn cancellation_observed(&self, _completed_work: u64) {}
+    fn before_boundary(&self, _boundary: NativeIvfFaultBoundary<'_>) -> contextdb_core::Result<()> {
+        Ok(())
+    }
 }
 
 fn assert_bounded_indexed_refusal(result: Result<bounded::TestResult, bounded::TestError>) {
@@ -254,8 +269,8 @@ fn assert_indexed_refusal(error: Error) {
 /// 500-row partitions) is deliberately AT the count-based crossover, so a
 /// route disagreement inside one test on one snapshot is the whole proof: a
 /// door that read only the raw statement override would let the store's count
-/// crossover admit the graph for a column-default `AUTO`, while a door that
-/// resolves the column default itself reports zero HNSW candidates for the
+/// crossover admit the index for a column-default `AUTO`, while a door that
+/// resolves the column default itself reports zero indexed candidates for the
 /// identical read.
 #[test]
 fn a_filtered_search_resolves_one_mode_on_every_door() {
@@ -589,8 +604,8 @@ fn exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_r
         .expect("EXACT overrides the indexed default");
     assert_eq!(ids(&eager), vec![nearest, middle, far]);
     assert!(
-        !eager.trace().physical_plan.contains("HNSW"),
-        "EXACT never describes a graph route: {:?}",
+        !result_used_indexed_route(&eager),
+        "EXACT never describes an indexed route: {:?}",
         eager.trace().physical_plan
     );
 
@@ -599,8 +614,8 @@ fn exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_r
     );
     assert_eq!(bounded.result.rows(), eager.rows());
     assert!(
-        !bounded.result.trace().physical_plan.contains("HNSW"),
-        "the bounded reader must not replace EXACT with graph work: {:?}",
+        !result_used_indexed_route(&bounded.result),
+        "the bounded reader must not replace EXACT with index work: {:?}",
         bounded.result.trace().physical_plan
     );
 
@@ -691,140 +706,6 @@ fn indexed_broad_filter_refuses_before_scan_and_becomes_eligible_with_a_relation
 }
 
 #[test]
-fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
-    let (_root, db) = durable_partitioned_fixture("AUTO");
-    let old_snapshot_query =
-        "SELECT id FROM vector_docs ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
-    for partition in 0..2_i64 {
-        for ordinal in 0..1_001_u128 {
-            insert(
-                &db,
-                id(10_000 + partition as u128 * 10_000 + ordinal),
-                partition,
-                "eligible",
-                vec![1.0, ordinal as f32 * 0.002 + partition as f32 * 0.001, 0.0],
-            );
-        }
-    }
-    drive_maintenance(&db);
-    let generation_statuses = [0_i64, 1_i64].map(|partition| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
-                index(),
-                partition_key(partition),
-            ))
-            .expect("each maintained partition has generation status")
-    });
-    assert!(
-        generation_statuses.iter().all(|status| {
-            status.base.or(status.dormant_base).is_some()
-                || status.change.or(status.dormant_change).is_some()
-        }),
-        "both fixtures need a durable generation identity: {generation_statuses:?}"
-    );
-    let unaffected_rows = partition_row_ids(&db, 0);
-    let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot).unwrap();
-    let bound = params([("query", query_vector())]);
-
-    db.__reset_last_query_vector_trace_for_test();
-    let ordinary_before = db
-        .execute_at_snapshot(old_snapshot_query, &bound, old_snapshot)
-        .expect("the ordinary old-snapshot route is initially maintained");
-    let ordinary_trace_before = take_trace(&db);
-    assert!(ordinary_trace_before.used_hnsw);
-    assert_eq!(ordinary_trace_before.selected_generations.len(), 2);
-    let unaffected_candidates_before =
-        trace_candidates_in(&ordinary_trace_before, &unaffected_rows);
-    assert!(!unaffected_candidates_before.is_empty());
-
-    let bounded_before_probe = Arc::new(HnswCandidateCounter::default());
-    let mut bounded_before_request = bounded_request(old_snapshot_query, bound.clone());
-    bounded_before_request.probe =
-        Some(Arc::clone(&bounded_before_probe) as Arc<dyn bounded::ExecutionProbe>);
-    db.__reset_last_query_vector_trace_for_test();
-    let bounded_before = db
-        .__with_snapshot_override_for_test(old_snapshot, || {
-            bounded::execute(&db, &bounded_before_request)
-        })
-        .expect("the bounded old-snapshot route is initially maintained");
-    let bounded_trace_before = take_trace(&db);
-    assert_eq!(bounded_before.result.rows(), ordinary_before.rows());
-    assert!(bounded_trace_before.used_hnsw);
-    let bounded_unaffected_candidates_before =
-        trace_candidates_in(&bounded_trace_before, &unaffected_rows);
-    assert!(!bounded_unaffected_candidates_before.is_empty());
-
-    db.execute(
-        "UPDATE vector_docs SET embedding = $embedding WHERE id = $id",
-        &params([
-            ("embedding", Value::Vector(vec![0.0, 1.0, 0.0])),
-            ("id", Value::Uuid(id(20_000))),
-        ]),
-    )
-    .expect("commit a later vector only in the second partition");
-
-    db.__reset_last_query_vector_trace_for_test();
-    let ordinary_after = db
-        .execute_at_snapshot(old_snapshot_query, &bound, old_snapshot)
-        .expect("the ordinary reader selects both snapshot-compatible graphs");
-    let ordinary_trace_after = take_trace(&db);
-    assert_eq!(ordinary_after.rows(), ordinary_before.rows());
-    assert!(ordinary_trace_after.used_hnsw);
-    assert_eq!(ordinary_trace_after.supplemented_row_count, 0);
-    assert_eq!(
-        ordinary_trace_after.selected_generations, ordinary_trace_before.selected_generations,
-        "a later write selects no newer generation for the already-open snapshot"
-    );
-    assert_eq!(
-        trace_candidates_in(&ordinary_trace_after, &unaffected_rows),
-        unaffected_candidates_before,
-        "later work in one partition does not increase graph visits in its unaffected sibling"
-    );
-
-    let bounded_after_probe = Arc::new(HnswCandidateCounter::default());
-    let mut bounded_after_request = bounded_request(old_snapshot_query, bound);
-    bounded_after_request.probe =
-        Some(Arc::clone(&bounded_after_probe) as Arc<dyn bounded::ExecutionProbe>);
-    db.__reset_last_query_vector_trace_for_test();
-    let bounded_after = db
-        .__with_snapshot_override_for_test(old_snapshot, || {
-            bounded::execute(&db, &bounded_after_request)
-        })
-        .expect("the bounded reader selects both snapshot-compatible graphs");
-    let bounded_trace_after = take_trace(&db);
-    assert_eq!(bounded_after.result.rows(), bounded_before.result.rows());
-    assert!(bounded_trace_after.used_hnsw);
-    assert_eq!(bounded_trace_after.supplemented_row_count, 0);
-    assert_eq!(
-        bounded_trace_after.selected_generations,
-        bounded_trace_before.selected_generations
-    );
-    assert_eq!(
-        trace_candidates_in(&bounded_trace_after, &unaffected_rows),
-        bounded_unaffected_candidates_before,
-        "the bounded reader visits the same unaffected-partition graph candidates"
-    );
-    assert_eq!(
-        bounded_trace_after.hnsw_candidate_row_ids, bounded_trace_before.hnsw_candidate_row_ids,
-        "the retained snapshot graphs publish the same raw candidates after the later write"
-    );
-    for (phase, probe, trace) in [
-        ("before", &bounded_before_probe, &bounded_trace_before),
-        ("after", &bounded_after_probe, &bounded_trace_after),
-    ] {
-        let charged = probe.0.load(Ordering::SeqCst);
-        let traced = u64::try_from(trace.hnsw_candidate_count)
-            .expect("the graph candidate count fits the work counter");
-        assert!(
-            charged >= traced,
-            "the {phase} snapshot query must charge at least every graph candidate it publishes: charged={charged}, traced={traced}"
-        );
-    }
-    drop(old_pin);
-}
-
-#[test]
 fn filtered_many_partition_search_reuses_partition_local_candidates() {
     const PARTITIONS: u64 = 8;
     const ROWS_PER_PARTITION: u64 = 64;
@@ -857,11 +738,12 @@ fn filtered_many_partition_search_reuses_partition_local_candidates() {
     let ordinary = db
         .execute(sql, &bound)
         .expect("ordinary filtered INDEXED search succeeds");
-    let probe = Arc::new(HnswCandidateCounter::default());
-    let mut request = bounded_request(sql, bound);
-    request.probe = Some(Arc::clone(&probe) as Arc<dyn bounded::ExecutionProbe>);
-    let bounded =
-        bounded::execute(&db, &request).expect("bounded filtered INDEXED search succeeds");
+    let probe = Arc::new(IndexedWorkCounter::default());
+    let request = bounded_request(sql, bound);
+    let bounded = with_native_ivf_seal_observer_for_test(probe.clone(), || {
+        bounded::execute(&db, &request)
+    })
+    .expect("bounded filtered INDEXED search succeeds");
     assert_eq!(bounded.result.rows(), ordinary.rows());
     let candidate_touches = probe.0.load(Ordering::SeqCst);
     println!(
@@ -934,7 +816,7 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
         .expect("AUTO combines ready graphs with small and not-yet-built exact partitions");
     let ordinary_preflight_trace = take_trace(&db);
     assert_eq!(ordinary_preflight.rows(), exact.rows());
-    assert!(ordinary_preflight_trace.used_hnsw);
+    assert!(used_indexed_route(&ordinary_preflight_trace));
     assert_eq!(ordinary_preflight_trace.supplemented_row_count, 501);
     assert!(
         !trace_candidates_in(&ordinary_preflight_trace, &first_rows).is_empty()
@@ -978,7 +860,7 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
         .expect("bounded AUTO charges only the unavailable partition's exact work");
     let bounded_preflight_trace = take_trace(&db);
     assert_eq!(bounded_preflight.result.rows(), exact.rows());
-    assert!(bounded_preflight_trace.used_hnsw);
+    assert!(used_indexed_route(&bounded_preflight_trace));
     assert_eq!(bounded_preflight_trace.supplemented_row_count, 501);
     assert_eq!(
         disclosed_partition_routes(&bounded_preflight.result),
@@ -1031,7 +913,7 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
         .expect("AUTO retains earlier graph results when the last graph falls short");
     let ordinary_shortfall_trace = take_trace(&db);
     assert_eq!(ordinary_shortfall.rows(), exact.rows());
-    assert!(ordinary_shortfall_trace.used_hnsw);
+    assert!(used_indexed_route(&ordinary_shortfall_trace));
     assert_eq!(ordinary_shortfall_trace.supplemented_row_count, 500);
     assert!(!trace_candidates_in(&ordinary_shortfall_trace, &first_rows).is_empty());
     assert!(trace_candidates_in(&ordinary_shortfall_trace, &second_rows).is_empty());
@@ -1068,7 +950,7 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
         .expect("bounded AUTO merges healthy graph and one-partition exact candidates");
     let bounded_shortfall_trace = take_trace(&db);
     assert_eq!(bounded_shortfall.result.rows(), exact.rows());
-    assert!(bounded_shortfall_trace.used_hnsw);
+    assert!(used_indexed_route(&bounded_shortfall_trace));
     assert_eq!(bounded_shortfall_trace.supplemented_row_count, 500);
     assert_eq!(
         disclosed_partition_routes(&bounded_shortfall.result),

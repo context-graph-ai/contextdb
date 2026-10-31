@@ -49,8 +49,7 @@ fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
 }
 
 fn graph_serial(db: &Database, index: &VectorIndexRef, scope: Uuid) -> Option<u64> {
-    db.vector_store_for_test()
-        .raw_hnsw_build_serial_for_partition_for_test(index, &partition(scope))
+    db.__debug_vector_partition_generation_for_test(index.clone(), partition(scope))
 }
 
 fn index_is_present(db: &Database, expected: &VectorIndexRef) -> bool {

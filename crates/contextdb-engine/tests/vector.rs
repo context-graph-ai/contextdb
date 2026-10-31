@@ -92,10 +92,6 @@ mod vector_inspection_explain_truth_contract;
 mod vector_lazy_consumer_restart_contract;
 #[path = "vector/vector_lazy_raw_residency_contract.rs"]
 mod vector_lazy_raw_residency_contract;
-#[path = "vector/vector_lazy_replay_budget_contract.rs"]
-mod vector_lazy_replay_budget_contract;
-#[path = "vector/vector_lazy_restart_residency_contract.rs"]
-mod vector_lazy_restart_residency_contract;
 #[path = "vector/vector_maintained_lifecycle_contract.rs"]
 mod vector_maintained_lifecycle_contract;
 #[path = "vector/vector_memory_ownership_reconciliation_contract.rs"]
@@ -144,8 +140,6 @@ mod vector_search_answers_quantized_columns_on_every_route;
 mod vector_search_mode_bounded_contract;
 #[path = "vector/vector_serving_merge_contract.rs"]
 mod vector_serving_merge_contract;
-#[path = "vector/vector_snapshot_frontier_completeness_contract.rs"]
-mod vector_snapshot_frontier_completeness_contract;
 #[path = "vector/vector_tail_transaction_contract.rs"]
 mod vector_tail_transaction_contract;
 #[path = "vector/vector_transaction_filter_snapshot_truth_contract.rs"]

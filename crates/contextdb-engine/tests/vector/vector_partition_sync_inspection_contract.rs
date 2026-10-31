@@ -71,12 +71,15 @@ const VECTOR_PARTITION_COLUMNS: &[&str] = &[
     "maintenance_vectors_done",
     "maintenance_vectors_remaining",
     "maintenance_checkpoint_tx",
-    "desired_hnsw_m",
-    "desired_hnsw_ef_construction",
-    "desired_hnsw_ef_search",
-    "serving_hnsw_m",
-    "serving_hnsw_ef_construction",
-    "serving_hnsw_ef_search",
+    "indexed_available",
+    "codebook_identity",
+    "objective_status",
+    "lists",
+    "lists_source",
+    "probes",
+    "probes_source",
+    "refine_factor",
+    "refine_factor_source",
     "declared_consolidation_mode",
     "declared_consolidation_change_percent",
     "declared_consolidation_tombstone_percent",
@@ -1184,7 +1187,7 @@ impl bounded::ExecutionProbe for AuthorizationBeforeCandidates {
     fn before_source_touch(&self, touch: TestSourceTouch, _completed_items: u64) {
         match touch {
             TestSourceTouch::AccessRow => self.access_seen.store(true, Ordering::SeqCst),
-            TestSourceTouch::BruteForceVectorCandidate | TestSourceTouch::HnswCandidate => {
+            TestSourceTouch::BruteForceVectorCandidate => {
                 assert!(
                     self.access_seen.load(Ordering::SeqCst),
                     "the Context authorization gate must run before any vector candidate is scored"

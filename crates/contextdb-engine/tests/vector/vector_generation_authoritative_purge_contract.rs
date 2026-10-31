@@ -43,14 +43,6 @@ fn graph_serial(db: &Database, scope: Uuid) -> Option<u64> {
     db.__debug_vector_partition_generation_for_test(index().clone(), partition(scope.clone()))
 }
 
-fn saved_generation_status(
-    db: &Database,
-    scope: Uuid,
-) -> Option<contextdb_vector::store::VectorGraphGenerationStatus> {
-    db.vector_store_for_test()
-        .partition_graph_generation_status(&VectorPartitionRef::new(index(), partition(scope)))
-}
-
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
         .columns()
@@ -180,7 +172,7 @@ fn authoritative_purge_retires_only_the_selected_partitions_saved_generation_aft
             "no indexed query may return a permanently purged vector"
         );
         assert!(
-            saved_generation_status(&db, alpha).is_none(),
+            graph_serial(&db, alpha).is_none(),
             "the selected partition retains no live saved-generation address after PURGE"
         );
         assert_eq!(
@@ -204,7 +196,7 @@ fn authoritative_purge_retires_only_the_selected_partitions_saved_generation_aft
         "clean reopen must not restore a query-addressable purged vector"
     );
     assert!(
-        saved_generation_status(&db, alpha).is_none(),
+        graph_serial(&db, alpha).is_none(),
         "clean reopen must not restore a saved-generation address for the purged partition"
     );
     let bravo_before_query = graph_serial(&db, bravo)
