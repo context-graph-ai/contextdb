@@ -14,6 +14,14 @@ use read_cli_support::*;
 
 const SHIPPED_RESULT_ROWS: i64 = 500;
 
+/// A work declaration below what the 12,000-vector AUTO fallback needs. The
+/// exact scan is charged per vector and dimension: on both the writer-owned and
+/// the direct-file route it first succeeds at 36,003 (12,001 x 3) and refuses
+/// below, so 50,000 no longer refuses anything. Half of that observed need
+/// refuses on both routes; the sufficient 5,000,000 runs in the same journey are
+/// the admitted positive control.
+const LOW_VECTOR_WORK: &str = "18000";
+
 fn store_of(rows: usize) -> Store {
     store_with(&create_seeded_table("bounded", rows))
 }
@@ -418,13 +426,17 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
             store.path_str(),
             "--write",
             "--json",
-            "--owner-read-work",
-            "5000000",
+            // The writer's own SELECT is governed by its own `--read-work`
+            // declaration. `--owner-read-work` is only the allowance offered
+            // to other readers, so the low declaration goes on `--read-work`;
+            // the sufficient 5,000,000 above is the admitted positive control.
+            "--read-work",
+            LOW_VECTOR_WORK,
         ],
         &format!("{query};\n"),
     );
     let direct_low_work = run_with_active_budget(
-        &[store.path_str(), "--json", "--read-work", "50000"],
+        &[store.path_str(), "--json", "--read-work", LOW_VECTOR_WORK],
         &format!("{query};\n"),
     );
     for (route, outcome, expected_route, remedy) in [
@@ -951,10 +963,31 @@ fn a_context_grouped_nearest_neighbour_answers_its_own_tuple_not_a_closer_foreig
     }
 }
 
+/// What a startup memory refusal says about itself: `(requested, available,
+/// budget)` from "requested N bytes, M available of B budget".
+fn startup_memory_refusal(outcome: &Outcome) -> (u64, u64, u64) {
+    let marker = "requested ";
+    let tail = outcome
+        .stderr
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("a startup memory refusal states what it asked for.\n{}", outcome.describe()))
+        .1;
+    let numbers: Vec<u64> = tail
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|piece| !piece.is_empty())
+        .take(3)
+        .map(|piece| piece.parse().expect("refusal figure"))
+        .collect();
+    assert_eq!(numbers.len(), 3, "{}", outcome.describe());
+    (numbers[0], numbers[1], numbers[2])
+}
+
 #[test]
 fn memory_limit_bounds_read_work_on_file_and_owner_routes_without_changing_the_store() {
     let store = store_of(64);
     let sql = "SELECT id, label FROM bounded ORDER BY label;\n";
+    // Both spellings declare the one reader memory budget.
+    let spellings = [("--memory-limit", "16M"), ("--read-memory", "16777216")];
     for owned in [false, true] {
         let owner = owned.then(|| {
             let mut owner = background(&[store.path_str(), "--write", "--json"]);
@@ -963,40 +996,48 @@ fn memory_limit_bounds_read_work_on_file_and_owner_routes_without_changing_the_s
             owner
         });
         let before = std::fs::read(&store.path).unwrap();
-        for (memory_limit, read_memory, expected) in [("128", "16777216", 128), ("16M", "128", 128)]
-        {
-            let outcome = run(
-                &[
-                    store.path_str(),
-                    "--json",
-                    "--memory-limit",
-                    memory_limit,
-                    "--read-memory",
-                    read_memory,
-                ],
-                sql,
+        let mut admitting = None;
+        for (flag, _) in spellings {
+            // A 128-byte reader cannot admit its own request control. This is
+            // the startup boundary: a typed memory refusal that names the
+            // owner it could not admit, reached before any statement runs. It
+            // is not a statement refusal and must not be rendered as one.
+            let startup = run(&[store.path_str(), "--json", flag, "128"], sql);
+            assert_eq!(startup.code, Some(1), "{}", startup.describe());
+            assert!(startup.stdout.trim().is_empty(), "{}", startup.describe());
+            assert!(
+                startup.stderr.contains("memory budget exceeded")
+                    && startup.stderr.contains("reader/request_owner"),
+                "the startup refusal names the memory budget and the owner it could not admit.\n{}",
+                startup.describe()
             );
+            assert!(
+                !startup.stderr.contains("owner_limit_exceeded"),
+                "{}",
+                startup.describe()
+            );
+            // The smallest budget that admits root and request control is what
+            // the refusal itself says it lacked: the budget, less what was
+            // free, plus what it asked for.
+            let (requested, available, budget) = startup_memory_refusal(&startup);
+            let needed = budget - available + requested;
+            assert!(needed > budget, "{}", startup.describe());
+            assert_eq!(*admitting.get_or_insert(needed), needed, "{}", startup.describe());
+        }
+        let admitting = admitting.expect("the startup refusal states the budget that admits setup");
+        let admitting_text = admitting.to_string();
+        for (flag, _) in spellings {
+            // Setup is admitted at this budget; the selected statement is what
+            // is refused, as a statement refusal naming the effective limit.
+            let outcome = run(&[store.path_str(), "--json", flag, &admitting_text], sql);
             assert_eq!(outcome.code, Some(1), "{}", outcome.describe());
             assert!(outcome.stdout.trim().is_empty(), "{}", outcome.describe());
-            if !owned && memory_limit == "128" {
-                assert!(
-                    outcome.stderr.contains("memory budget exceeded"),
-                    "{}",
-                    outcome.describe()
-                );
-                assert!(
-                    !outcome.stderr.contains("owner_limit_exceeded"),
-                    "{}",
-                    outcome.describe()
-                );
-            } else {
-                let error = limit_error(&outcome);
-                assert_eq!(error["detail"]["limit"], "memory", "{error}");
-                assert_eq!(
-                    error["detail"]["value"], expected,
-                    "the smaller declared reader budget actually refused: {error}"
-                );
-            }
+            let error = limit_error(&outcome);
+            assert_eq!(error["detail"]["limit"], "memory", "{error}");
+            assert_eq!(
+                error["detail"]["value"], admitting,
+                "the declared reader budget actually refused the statement: {error}"
+            );
         }
         let recovered = run(&[store.path_str(), "--json", "--memory-limit", "16M"], sql);
         assert_eq!(recovered.code, Some(0), "{}", recovered.describe());
