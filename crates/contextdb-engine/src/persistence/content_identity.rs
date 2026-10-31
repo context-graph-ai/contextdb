@@ -12121,7 +12121,7 @@ pub(crate) mod original_writer {
                     start: self.u64(),
                     len: self.u64(),
                 };
-                if loc.kind > 2 {
+                if loc.kind > 3 {
                     return Err(Error::Other("invalid scratch key locator".into()));
                 }
                 Ok(loc)
@@ -12140,8 +12140,8 @@ pub(crate) mod original_writer {
         }
 
         /// Raw provenance points to a complete caller key, authenticated original,
-        /// or a byte-identical resident inline copy. Wide separators keep
-        /// their complete original slice, including accepted equal encodings.
+        /// a byte-identical resident inline copy, or a key in scratch storage. Wide
+        /// separators keep their complete original slice, including accepted equal encodings.
         #[derive(Clone, Copy)]
         struct Locator {
             kind: u64,
@@ -12195,6 +12195,71 @@ pub(crate) mod original_writer {
                     key: d.key()?,
                     value: d.hash()?,
                 })
+            }
+        }
+
+        #[cfg(test)]
+        mod locator_codec_tests {
+            use super::*;
+
+            #[test]
+            fn every_locator_kind_round_trips_through_a_scratch_edit() {
+                for kind in 0..=3 {
+                    let locator = Locator {
+                        kind,
+                        id: [17; 32],
+                        hash: [29; 32],
+                        start: 0x0102_0304_0506_0708,
+                        len: 23,
+                    };
+                    let edit = Edit {
+                        key: Key {
+                            encoded: locator,
+                            raw: locator,
+                            inline: [41; INLINE_SEPARATOR_BYTES],
+                        },
+                        value: Some([53; 32]),
+                    };
+                    let mut bytes = [0; Edit::BYTES];
+                    edit.encode(&mut bytes);
+                    let decoded = Edit::decode(&bytes).unwrap();
+                    for actual in [decoded.key.encoded, decoded.key.raw] {
+                        assert_eq!(actual.kind, locator.kind);
+                        assert_eq!(actual.id, locator.id);
+                        assert_eq!(actual.hash, locator.hash);
+                        assert_eq!(actual.start, locator.start);
+                        assert_eq!(actual.len, locator.len);
+                    }
+                    assert_eq!(decoded.key.inline, edit.key.inline);
+                    assert_eq!(decoded.value, edit.value);
+                }
+            }
+
+            #[test]
+            fn unknown_locator_kinds_are_refused() {
+                for kind in [4, u64::MAX] {
+                    let mut bytes = [0; 88];
+                    Encoder {
+                        bytes: &mut bytes,
+                        at: 0,
+                    }
+                    .locator(Locator {
+                        kind,
+                        id: [0; 32],
+                        hash: [0; 32],
+                        start: 0,
+                        len: 0,
+                    });
+                    let decoded = Decoder {
+                        bytes: &bytes,
+                        at: 0,
+                    }
+                    .locator();
+                    assert!(matches!(
+                        decoded,
+                        Err(Error::Other(message)) if message == "invalid scratch key locator"
+                    ));
+                }
             }
         }
 
