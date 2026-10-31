@@ -3,9 +3,11 @@
 //! Promise (root intent, oversized units): a dependency-complete unit larger
 //! than one Iroh frame travels as resumable chunks and commits once at the
 //! hub. The CLI's final push on exit is a default path, so it meets the same
-//! promise even though it funds its ordinary reads from the session's read
-//! memory: reading the pending unit back from the store is engine work funded
-//! by the writer budget, not by that 16 MiB read limit.
+//! promise. This fixture's one record is deliberately 64 MiB wide, and
+//! reopening the store reads that record at its exact physical size, which the
+//! shipped 16 MiB owner-read allowance (the allowance the writer open funds its
+//! read preparation from) refuses by design. The test therefore declares the
+//! sufficient allowance for this wide fixture explicitly; no default changes.
 
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
@@ -85,7 +87,11 @@ fn cli(path: &std::path::Path, hub: &RunningHub, tenant: &str) -> Command {
         .arg("--write")
         .arg("--json")
         .args(["--sync-endpoint", &hub.ticket])
-        .args(["--tenant-id", tenant]);
+        .args(["--tenant-id", tenant])
+        // The 64 MiB record is read back at its exact size on reopen: declare
+        // a read allowance that funds it (the same 512 MiB the check below
+        // declares for its own lookup).
+        .args(["--owner-read-memory", OVERSIZED_READ_ALLOWANCE]);
     command
 }
 
@@ -114,6 +120,7 @@ const TENANT: &str = "oversized-exit-push";
 const PARENT_ID: &str = "dddddddd-4444-4ddd-8ddd-dddddddddddd";
 const CHILD_ID: &str = "eeeeeeee-5555-4eee-8eee-eeeeeeeeeeee";
 const BODY_BYTES: usize = 64 * 1024 * 1024;
+const OVERSIZED_READ_ALLOWANCE: &str = "536870912";
 
 fn seed_pending_oversized_unit(path: &std::path::Path) {
     let db = Database::open(path).expect("open edge store to seed it");
