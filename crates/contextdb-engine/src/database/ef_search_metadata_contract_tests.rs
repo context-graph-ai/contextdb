@@ -11,45 +11,15 @@ thread_local! {
 pub(crate) fn note_projection_rows(rows: u64) {
     PROJECTED_ROWS.with(|count| count.set(count.get().checked_add(rows).unwrap()));
 }
-fn take_projected_rows() -> u64 {
-    PROJECTED_ROWS.with(|count| count.replace(0))
-}
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
-}
-fn index(column: &str) -> VectorIndexRef {
-    VectorIndexRef::new("breadth_rows", column)
 }
 fn run(db: &Database, sql: &str) {
     db.execute(sql, &empty())
         .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
 }
-fn column(db: &Database) -> contextdb_core::ColumnDef {
-    db.table_meta("breadth_rows")
-        .unwrap()
-        .columns
-        .into_iter()
-        .find(|column| column.name == "embedding")
-        .unwrap()
-}
 fn canonical<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap()
-}
-fn record_authored(db: &Database, after: &mut Lsn, units: &mut Vec<ChangeSet>) {
-    units.push(db.changes_since(*after).unwrap());
-    *after = db.current_lsn();
-}
-fn seed(db: &Database, rows: usize) -> Vec<ChangeSet> {
-    seed_with_saved_graphs(db, rows, true)
-}
-fn visible(db: &Database) -> Vec<Vec<Value>> {
-    db.execute(
-        "SELECT id, bucket, body, embedding, compressed, marker FROM breadth_rows ORDER BY id",
-        &empty(),
-    )
-    .unwrap()
-    .rows()
-    .to_vec()
 }
 // Root equality detects even a delete/reinsert of identical logical values.
 // All selected families are established names in the frozen storage source.
@@ -131,52 +101,6 @@ fn authored_rows(db: &Database) -> Vec<(u64, u64, u64, serde_json::Value)> {
             Some((row_id.0, row.created_tx.0, lsn.0, canonical(&scalar)))
         })
         .collect()
-}
-#[cfg_attr(
-    any(test, feature = "test-seams"),
-    expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )
-)]
-fn declared_identity(db: &Database) -> Option<crate::direct_file_reader::DirectTypedImageDigest> {
-    db.persistence.as_ref().map(|p| {
-        p.with_db(|store| {
-            crate::persistence::RedbPersistence::load_content_identity_from_read(
-                &store.begin_read().unwrap(),
-            )
-        })
-        .unwrap()
-    })
-}
-#[cfg_attr(
-    any(test, feature = "test-seams"),
-    expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )
-)]
-fn assert_frontier(db: &Database) {
-    if let Some(p) = &db.persistence {
-        p.with_db(|store| {
-            let read = store.begin_read().unwrap();
-            let table = read
-                .open_table(redb::TableDefinition::<&str, u64>::new(
-                    "committed_read_lsn_bounds",
-                ))
-                .unwrap();
-            assert_eq!(
-                table.get("breadth_rows").unwrap().unwrap().value(),
-                db.current_lsn().0,
-                "metadata and authored occurrence advance the table read frontier together"
-            );
-            Ok(())
-        })
-        .unwrap();
-        let root = db.writer_read_root().unwrap().unwrap();
-        let recovery = RedbPersistence::writer_recovery_floors_in_read(&root).unwrap();
-        assert!(recovery.source_lsn_floor >= db.current_lsn().0);
-    }
 }
 
 // New function: existing declaration rows do not combine populated historical
@@ -786,66 +710,4 @@ async fn received_drop_column_keeps_each_earlier_row_body_under_its_exact_identi
         reopened.close().unwrap();
         source.close().unwrap();
     }
-}
-fn seed_with_saved_graphs(db: &Database, rows: usize, saved_graphs: bool) -> Vec<ChangeSet> {
-    let mut units = Vec::new();
-    let mut after = Lsn(0);
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    run(
-        db,
-        "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED IVF (PROBES = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
-    );
-    record_authored(db, &mut after, &mut units);
-    run(db, "CREATE INDEX breadth_bucket ON breadth_rows (bucket)");
-    record_authored(db, &mut after, &mut units);
-    for id in 1..=rows {
-        let x = id as f32;
-        db.execute("INSERT INTO breadth_rows (id, bucket, body, embedding, compressed) VALUES ($id, $bucket, $body, $vector, $vector)",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id as i64)),
-                ("bucket".into(), Value::Int64((id % 2) as i64)),
-                ("body".into(), Value::Text(format!("authored-{id}"))),
-                ("vector".into(), Value::Vector(vec![x, rows as f32 + 1.0 - x, 1.0])),
-            ])).unwrap();
-        record_authored(db, &mut after, &mut units);
-    }
-    run(
-        db,
-        "UPDATE breadth_rows SET body = 'replacement' WHERE id = 1",
-    );
-    record_authored(db, &mut after, &mut units);
-    // Populate authored custody BEFORE the narrow ALTER. An empty-family
-    // assertion would reject valid stores and miss the move-out regression.
-    run(db, "ALTER TABLE breadth_rows ADD COLUMN marker TEXT");
-    record_authored(db, &mut after, &mut units);
-    if !saved_graphs {
-        assert!(
-            graphs(db)
-                .iter()
-                .all(|(generation, _)| generation.is_none()),
-            "the pre-query control must not have a published clustered index"
-        );
-        return units;
-    }
-    for _ in 0..8 {
-        if ["embedding", "compressed"]
-            .iter()
-            .all(|name| db.__debug_vector_indexed_available_for_test(index(name)))
-        {
-            return units;
-        }
-        db.run_maintenance_cycle().unwrap();
-    }
-    panic!("fixture must have both published clustered indexes before ALTER");
-}
-fn graphs(db: &Database) -> Vec<(Option<u64>, bool)> {
-    ["embedding", "compressed"]
-        .iter()
-        .map(|name| {
-            (
-                db.__debug_vector_index_generation_for_test(index(name)),
-                db.__debug_vector_indexed_available_for_test(index(name)),
-            )
-        })
-        .collect()
 }

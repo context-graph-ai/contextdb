@@ -27,20 +27,6 @@ fn hostile_route(index: &VectorIndexRef) -> Vec<u8> {
     RedbPersistence::encode(&(index, u64::MAX)).unwrap()
 }
 
-fn membership(index: VectorIndexRef, key: VectorPartitionKey) -> VectorPartitionMembershipRecord {
-    VectorPartitionMembershipRecord {
-        index,
-        partition_key: key,
-        row_id: RowId(1),
-        row_created_tx: TxId(2),
-        row_lsn: Lsn(3),
-        vector_created_tx: TxId(2),
-        vector_lsn: Lsn(3),
-        visible_from: TxId(2),
-        deleted_tx: None,
-    }
-}
-
 #[test]
 #[serial]
 #[cfg_attr(

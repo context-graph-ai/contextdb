@@ -4121,16 +4121,6 @@ fn published_vector_maintenance_reason(reason: &'static str) -> &'static str {
     }
 }
 
-fn vector_unavailable_failure_reason(
-    failure: contextdb_vector::store::VectorMaintenanceFailure,
-) -> &'static str {
-    match failure {
-        contextdb_vector::store::VectorMaintenanceFailure::MemoryLimit
-        | contextdb_vector::store::VectorMaintenanceFailure::DiskLimit => "resource_stalled",
-        contextdb_vector::store::VectorMaintenanceFailure::BuildFailure => "build_failure",
-    }
-}
-
 fn vector_maintenance_failure_lifecycle(
     failure: contextdb_vector::store::VectorMaintenanceFailure,
     checkpoint_tx: Option<TxId>,

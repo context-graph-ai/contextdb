@@ -58,42 +58,6 @@ pub(super) fn with_source_page_admission<T>(
     )
 }
 
-/// Catalog reclamation reads cleanup evidence, not a generation being built
-/// or served. Keep its physical source owner under the cleanup operation.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn with_catalog_reclamation_source_page_admission<T>(
-    accountant: crate::memory_accounting::AccountantHandle,
-    read: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    with_source_page_admission_for(
-        accountant,
-        "prepare_vector_generation",
-        "Raise MEMORY_LIMIT before reclaiming this maintained route's catalog.",
-        read,
-    )
-}
-
-/// Covered journal deletion owns storage pages independently of any later
-/// generation installation. Its reads must not imply generation-body work.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn with_journal_cleanup_source_page_admission<T>(
-    accountant: crate::memory_accounting::AccountantHandle,
-    read: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    with_source_page_admission_for(
-        accountant,
-        "truncate_vector_partition_journal",
-        "Raise MEMORY_LIMIT before cleaning this maintained route's journal.",
-        read,
-    )
-}
-
 /// Frontier metadata can occupy an arbitrarily large physical extent even
 /// when its decoded descriptor is bounded. Charge that extent before redb
 /// allocates it, while retaining the preparation operation's early refusal.

@@ -52,11 +52,6 @@ thread_local! {
     static REFUNDED_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn refunded_on_this_thread_for_test() -> usize {
-    REFUNDED_ON_THIS_THREAD.with(std::cell::Cell::get)
-}
-
 fn aggregate_refund(bytes: usize) {
     #[cfg(test)]
     REFUNDED_ON_THIS_THREAD.with(|refunded| refunded.set(refunded.get() + bytes));
@@ -2553,12 +2548,6 @@ pub(crate) fn writer_adapter_type_layout<T>() -> Layout {
 thread_local! {
     static ACTIVATING_WRITER: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
 }
-struct ActivationScope(Option<(usize, usize)>);
-impl Drop for ActivationScope {
-    fn drop(&mut self) {
-        ACTIVATING_WRITER.with(|slot| slot.set(self.0));
-    }
-}
 struct WriterAdmission {
     _gate: Option<parking_lot::RwLockReadGuard<'static, ProcessWriterBudgetDomain>>,
     // The inherited process ceiling this admission must also fit, once a
@@ -4924,110 +4913,6 @@ impl MemoryAccountant {
             _gate: Some(gate),
             ceiling,
         }
-    }
-    // Exclusive activation validates ALL live records and admits the requesting
-    // build's complete local peak before publishing the one permanent owner.
-    // The closure only changes the existing workspace token/counters.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn activate_resident_insertion_runtime(
-        &self,
-        width: usize,
-        native_bytes: usize,
-        old_workspace: usize,
-        complete_peak: usize,
-        admit_workspace: impl FnOnce() -> contextdb_core::Result<()>,
-    ) -> contextdb_core::Result<bool> {
-        let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
-        let identity = *self
-            .writer_identity
-            .get()
-            .expect("resident insertion requires a stable association");
-        domain
-            .lookup_in(identity)
-            .expect("resident insertion requires a retained writer use");
-        if domain.native.is_some() {
-            return Ok(false);
-        }
-        let mut next = domain.writers.as_deref();
-        while let Some(record) = next {
-            let limit = record.limit.load(Ordering::SeqCst);
-            let used = record.used.load(Ordering::SeqCst);
-            // Activation has no private transition allowance on other writers.
-            let releasing = if record.stable_identity == identity {
-                old_workspace
-            } else {
-                0
-            };
-            let requested = if record.stable_identity == identity {
-                complete_peak
-            } else {
-                0
-            };
-            let local = used
-                .checked_sub(releasing)
-                .and_then(|bytes| bytes.checked_add(requested))
-                .ok_or_else(|| {
-                    contextdb_core::Error::Other("runtime activation envelope overflow".into())
-                })?;
-            // Writer limits govern each writer's own working memory only.
-            if !writer_headroom(limit, local, 0, 0).within_limit {
-                return Ok(false);
-            }
-            next = record.next.as_deref();
-        }
-        // The reservation is process memory: the post-activation aggregate,
-        // with this build's peak replacing its old workspace, must fit the
-        // inherited whole-process ceiling, never a writer's limit.
-        let ceiling = effective_ceiling(domain.ceiling);
-        let after = PROCESS_WRITER_AGGREGATE
-            .load(Ordering::SeqCst)
-            .checked_sub(old_workspace)
-            .and_then(|bytes| bytes.checked_add(complete_peak))
-            .and_then(|bytes| bytes.checked_add(native_bytes))
-            .ok_or_else(|| {
-                contextdb_core::Error::Other("runtime activation combined size overflow".into())
-            })?;
-        if after > ceiling {
-            return Ok(false);
-        }
-        let previous = ACTIVATING_WRITER
-            .with(|slot| slot.replace(Some((self as *const Self as usize, native_bytes))));
-        let scope = ActivationScope(previous);
-        admit_workspace()?;
-        drop(scope);
-        PROCESS_WRITER_AGGREGATE.fetch_add(native_bytes, Ordering::SeqCst);
-        domain.ceiling = Some(ceiling);
-        domain.native = Some(ResidentInsertionRuntime {
-            width,
-            funder_identity: self.used.as_ptr() as usize,
-            reservation: ProcessNativeReservation {
-                bytes: native_bytes,
-            },
-        });
-        // Drop the exclusive gate before bodies, spawn, joins, export or callbacks.
-        drop(domain);
-        Ok(true)
-    }
-
-    /// A fit probe may replace its own workspace, but must subtract the
-    /// retained process debit after returning only that workspace's credit.
-    pub(crate) fn available_after_releasing(&self, bytes: usize) -> Option<usize> {
-        let admission = self.writer_admission();
-        let local = writer_headroom(
-            self.limit.load(Ordering::SeqCst),
-            self.used.load(Ordering::SeqCst),
-            bytes,
-            self.private_transition_headroom(),
-        )
-        .available;
-        // The released workspace is this member's own aggregate share.
-        let process = admission
-            .process_available()
-            .map(|room| room.saturating_add(bytes));
-        min_available(local, process)
     }
 
     /// Step 2 of admission, run only for bytes this writer's own limit has

@@ -916,26 +916,6 @@ impl ImageMemory {
         )
     }
 
-    /// Partition construction streams temporary decodes on the operation's
-    /// already supplied capability. Each call has an admitted native owner;
-    /// completing one call releases its payload before the next begins.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn operation_reader_per_call(
-        accountant: crate::memory_accounting::AccountantHandle,
-        reader_budget: impl Into<ReadMemoryOwner>,
-    ) -> Result<ImageMemoryHandle> {
-        Self::operation_reader_per_call_for(
-            accountant,
-            reader_budget,
-            "vector_maintenance",
-            "prepare_vector_generation",
-            "Raise MEMORY_LIMIT before inspecting this maintained route.",
-        )
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -3448,23 +3428,6 @@ impl ImageMemoryHandle {
         }
     }
 
-    #[cfg(test)]
-    /// A separate row lifetime funded by this operation's existing capability.
-    /// The parent remains live while a selected row is being replaced.
-    /// A decoded row transferred directly into a detached write projection
-    /// is a staged write copy. It keeps the same preallocation funder and
-    /// receipt shape while naming that copy's admission at the payload boundary.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn staged_row_copy_owner(&self) -> Result<ImageMemoryHandle> {
-        self.row_owner_for(
-            "sync",
-            "stage_received_unit_row_image",
-            "Raise MEMORY_LIMIT to stage this received row copy.",
-        )
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

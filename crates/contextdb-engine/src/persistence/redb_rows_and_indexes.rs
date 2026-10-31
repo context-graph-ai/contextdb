@@ -4909,31 +4909,6 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn decode_expected_vector_partition_metadata<T: serde::de::DeserializeOwned>(
-        &self,
-        kind: VectorPartitionRecordKind,
-        encoded: &[u8],
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> Result<T> {
-        let _decode_scope = self.reader_decode_scope()?;
-        let payload =
-            vector_partition_expected_metadata_payload(kind, encoded, index, partition_key)
-                .map_err(|reason| self.vector_partition_corruption(reason))?;
-        Self::decode_exact(payload).map_err(|error| match error {
-            Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled => {
-                error
-            }
-            error => {
-                self.vector_partition_corruption(format_args!("payload decode failed: {error}"))
-            }
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn insert_vector_partition_record<T: Serialize>(
         &self,
         table: &mut redb::Table<'_, &[u8], &[u8]>,

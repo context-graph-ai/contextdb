@@ -873,28 +873,6 @@ fn observe_real_page_payer(event: redb::page_payer_observation::Observation) {
         }
     }
 }
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ReaderPayerReceiptForTest {
-    pub cache_live: usize,
-    pub cache_peak: usize,
-    pub child_live: usize,
-    pub unscoped_allocations: usize,
-    pub cache_counter_identity: usize,
-    pub cache_reserve_identity: usize,
-    pub cache_payer_mismatch: bool,
-}
-pub(crate) fn reader_payer_receipt_for_test() -> ReaderPayerReceiptForTest {
-    let measurement = MEASUREMENT.lock().unwrap();
-    ReaderPayerReceiptForTest {
-        cache_live: measurement.cache_payload_live,
-        cache_peak: measurement.cache_payload_peak,
-        child_live: measurement.payload_live - measurement.cache_payload_live,
-        unscoped_allocations: measurement.unscoped_page_allocations,
-        cache_counter_identity: measurement.cache_counter_identity,
-        cache_reserve_identity: measurement.cache_reserve_identity,
-        cache_payer_mismatch: measurement.cache_payer_mismatch,
-    }
-}
 fn observed_source_funding(counter: usize) -> usize {
     if SOURCE_COUNTER_IS_READER.with(std::cell::Cell::get) {
         (unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }.load(AtomicOrdering::SeqCst)
@@ -2767,34 +2745,6 @@ pub(crate) fn assert_graph_freed_before_workspace_refund(repair: bool) {
     });
 }
 
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_public_cycle_admission_tests.rs"
-    )
-)]
-pub(crate) fn assert_saved_export_identities(expected: usize) {
-    GRAPH_ALLOCATIONS.with(|slot| {
-        let state = slot.get().expect("identity observation scope");
-        assert_eq!(state.identity_count, expected, "four failed exports and one real successful export");
-        let identities = &state.identities[..state.identity_count];
-        for (attempt, identity) in identities.iter().enumerate() {
-            assert_eq!(identity.artifact, identity.storage);
-            assert!(identity.artifact > identity.original);
-            assert_eq!(identity.original, identities[0].original);
-            assert_eq!(identity.digest, identities[0].digest, "captured producer topology digest stays identical");
-            assert!(identity.is_base && identity.generation_len > 0 && identity.root_len > 0);
-            for previous in &identities[..attempt] {
-                assert!(identity.artifact > previous.artifact);
-                assert_ne!(&identity.generation_key[..identity.generation_len], &previous.generation_key[..previous.generation_len]);
-                assert_ne!(&identity.root_key[..identity.root_len], &previous.root_key[..previous.root_len]);
-            }
-            eprintln!("RUNTIME_PROOF_IDENTITY attempt={} original={} artifact={} storage={} source_digest={:?} generation_key={:?} root_key={:?}", attempt, identity.original, identity.artifact, identity.storage, identity.digest, &identity.generation_key[..identity.generation_len], &identity.root_key[..identity.root_len]);
-        }
-    });
-}
-
 // Owner-authorized bounded proof exception: canonical vector tests do not
 // observe allocator Layout. This uses the existing aggregate GlobalAlloc
 // oracle and preserves every existing test/assertion.
@@ -3692,11 +3642,6 @@ mod row_check_cache_ownership_contract {
         VectorIndexRef::new(table, "embedding")
     }
 
-    fn partition(key: &str) -> VectorPartitionKey {
-        VectorPartitionKey::from_values(&[Value::Text(key.to_owned())])
-            .expect("TEXT keys have one canonical partition identity")
-    }
-
     fn vector(axis: usize) -> Vec<f32> {
         match axis {
             0 => vec![1.0, 0.0, 0.0],
@@ -3871,134 +3816,6 @@ mod row_check_cache_ownership_contract {
         static PHASE_REQUEST_START: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static MIGRATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static CANCEL_DURING_MIGRATION_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    fn paid() -> usize {
-        unsafe { &*(CACHE_PAYER.get() as *const super::AtomicUsize) }
-            .load(super::AtomicOrdering::SeqCst)
-    }
-    fn cache_phase(event: u8, bytes: usize) {
-        match event {
-            0 | 3 => {
-                let n = PHASE.get();
-                assert!(n < 32);
-                PHASE.set(n + 1);
-                KIND.set(event as usize);
-                PHASES.with(|p| {
-                    let mut a = p.get();
-                    a[n] = (bytes, paid(), 0, 0, PREDICATES.get(), event as usize);
-                    p.set(a);
-                });
-            }
-            1 => {
-                if NULL_PHASE.get() == PHASE.get() {
-                    let (size, align) = NULL_LAYOUT.get();
-                    crate::vector_read_memory::native_ownership_proof::arm_refuse_one_live_layout(
-                        std::alloc::Layout::from_size_align(size, align)
-                            .expect("recorded cache layout"),
-                    );
-                }
-                super::SOURCE_REQUEST_COUNTER.set(CACHE_PAYER.get());
-                PHASE_REQUEST_START.set(super::NATIVE_REQUEST_COUNT.get());
-                super::NATIVE_REQUEST_ACTIVE.set(true);
-            }
-            2 => {
-                let selected_live_layout_was_refused = NULL_PHASE.get() == PHASE.get();
-                super::NATIVE_REQUEST_ACTIVE.set(false);
-                super::SOURCE_REQUEST_COUNTER.set(0);
-                if selected_live_layout_was_refused {
-                    // The intentional null has no cache pointer. Do not let
-                    // later error construction enter the cache allocation census.
-                    super::NATIVE_REQUEST_COUNT.set(PHASE_REQUEST_START.get());
-                    super::NATIVE_REQUEST_TOTAL.set(PHASE_REQUEST_START.get());
-                    return;
-                }
-                let n = super::NATIVE_REQUEST_COUNT.get();
-                if n == PHASE_REQUEST_START.get() {
-                    return;
-                }
-                assert!(n <= 32);
-                let request = super::NATIVE_REQUESTS.get()[n - 1];
-                PHASE_LAYOUTS.with(|layouts| {
-                    let mut recorded = layouts.get();
-                    recorded[PHASE.get() - 1] = (request.1, request.2);
-                    layouts.set(recorded);
-                });
-                let phase = PHASES.get()[PHASE.get() - 1];
-                assert!(
-                    phase.0 >= request.1,
-                    "phase admission must cover actual native Layout"
-                );
-                assert!(
-                    super::SOURCE_REQUEST_CREDIT.get()[n - 1] >= phase.1 + request.1,
-                    "entire new allocation must be prepaid while old remains live"
-                );
-                let old_live: usize = super::NATIVE_FREE
-                    .iter()
-                    .filter(|w| w.pointer.load(super::AtomicOrdering::SeqCst) != 0)
-                    .map(|w| w.bytes.load(super::AtomicOrdering::SeqCst))
-                    .sum();
-                assert!(
-                    super::SOURCE_REQUEST_CREDIT.get()[n - 1] >= old_live + request.1,
-                    "full old/new native overlap is paid"
-                );
-                eprintln!(
-                    "CACHE_PHASE number={} kind={} new_layout={} old_live={old_live} admission={} payer_before={} payer_at_allocation={}",
-                    PHASE.get(),
-                    phase.5,
-                    request.1,
-                    phase.0,
-                    phase.1,
-                    super::SOURCE_REQUEST_CREDIT.get()[n - 1]
-                );
-                super::append_source_free_for_test(&[request], CACHE_PAYER.get());
-                if REFUSE_PHASE.get() == PHASE.get() {
-                    unsafe {
-                        &*(CANCELLATION.get()
-                            as *const contextdb_core::read_contract::OwnerReadCancellation)
-                    }
-                    .cancel();
-                }
-            }
-            6 => {
-                PREDICATES.set(PREDICATES.get() + 1);
-                if LIFT.get().0 != 0 {
-                    let (a, b, c, _) = LIFT.get();
-                    LIFT.set((a, b, c, true));
-                }
-            }
-            4 => {
-                let migrated = MIGRATED.get() + 1;
-                MIGRATED.set(migrated);
-                if CANCEL_DURING_MIGRATION_AFTER.get() == migrated {
-                    unsafe {
-                        &*(CANCELLATION.get()
-                            as *const contextdb_core::read_contract::OwnerReadCancellation)
-                    }
-                    .cancel();
-                }
-            }
-            7 => {
-                let bytes = super::NATIVE_FREE
-                    .iter()
-                    .skip(1)
-                    .filter(|w| w.pointer.load(super::AtomicOrdering::SeqCst) != 0)
-                    .map(|w| w.bytes.load(super::AtomicOrdering::SeqCst))
-                    .sum();
-                LIFT.set((paid(), bytes, 0, false));
-            }
-            8 => {
-                let (before, bytes, _, _) = LIFT.get();
-                let after = paid();
-                assert_eq!(
-                    before - after,
-                    bytes,
-                    "AUTO refunds physical cache before exact predicate work"
-                );
-                LIFT.set((before, bytes, after, false));
-            }
-
-            _ => {}
-        }
     }
     fn fixture() -> Database {
         let db = Database::open_memory();

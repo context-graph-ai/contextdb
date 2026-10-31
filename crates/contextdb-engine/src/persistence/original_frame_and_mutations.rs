@@ -4997,40 +4997,5 @@ impl RedbPersistence {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(crate) fn install_source_fixture_cache_reserve_for_test(
-    database: &redb::Database,
-    accountant: &crate::memory_accounting::AccountantHandle,
-    capacity: usize,
-) -> (redb::CacheReserveOwner, usize) {
-    // Exercise the SAME settlement and genuine original invoice as the engine.
-    // No disconnected parent or numeric-only capacity discharges a source bill.
-    cache_reserve::with_preparation(accountant, true, || {
-        let bytes = database
-            .settle_startup_cache_budget(capacity)
-            .map_err(RedbPersistence::storage_error)?;
-        let reserve = cache_reserve::original(accountant, bytes, false)?;
-        let control = cache_reserve::last_reserve_for_test().1;
-        Ok((database.retain_cache_reserve(reserve), bytes + control))
-    })
-    .unwrap()
-}
-
-#[cfg(test)]
 impl RedbPersistence {
-    pub(crate) fn install_source_fixture_cache_reserve_for_test(
-        &self,
-        accountant: &crate::memory_accounting::AccountantHandle,
-        capacity: usize,
-    ) -> (redb::CacheReserveOwner, usize) {
-        let database = self.db.read().unwrap();
-        install_source_fixture_cache_reserve_for_test(
-            database.as_ref().unwrap(),
-            accountant,
-            capacity,
-        )
-    }
 }

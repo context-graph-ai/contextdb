@@ -6,9 +6,6 @@ thread_local! { static PROJECTED_ROWS: Cell<u64> = const { Cell::new(0) }; }
 pub(crate) fn note_projection_rows(rows: u64) {
     PROJECTED_ROWS.with(|count| count.set(count.get() + rows));
 }
-fn take_projected_rows() -> u64 {
-    PROJECTED_ROWS.with(|count| count.replace(0))
-}
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
 }
@@ -123,23 +120,6 @@ fn authored_rows(db: &Database) -> Vec<(u64, u64, u64, serde_json::Value)> {
             Some((row_id.0, row.created_tx.0, lsn.0, canonical(&scalar)))
         })
         .collect()
-}
-#[cfg_attr(
-    any(test, feature = "test-seams"),
-    expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )
-)]
-fn declared_identity(db: &Database) -> Option<crate::direct_file_reader::DirectTypedImageDigest> {
-    db.persistence.as_ref().map(|p| {
-        p.with_db(|store| {
-            crate::persistence::RedbPersistence::load_content_identity_from_read(
-                &store.begin_read().unwrap(),
-            )
-        })
-        .unwrap()
-    })
 }
 #[cfg_attr(
     any(test, feature = "test-seams"),
