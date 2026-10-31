@@ -498,104 +498,26 @@ fn file_backed_sql_transaction_keeps_heterogeneous_ddl_at_one_lsn_after_reopen()
     let empty = HashMap::new();
 
     let commit_lsn = {
-        // Caller-driven maintenance and no sync, subscription or sink worker:
-        // nothing but these statements moves the accountant or the process
-        // aggregate while the stage ledger is measured (run this test alone).
-        let db = Database::open_with_options(
-            &path,
-            contextdb_engine::DatabaseOpenOptions {
-                maintenance_policy: contextdb_engine::MaintenancePolicy::CallerDriven,
-                ..Default::default()
-            },
-        )
-        .expect("open file-backed database");
-        let used = || db.writer_memory_usage_for_test().used as i128;
-        let aggregate =
-            || contextdb_engine::memory_accounting::process_aggregate_bytes_for_test() as i128;
-        let (used_before, aggregate_before) = (used(), aggregate());
+        let db = Database::open(&path).expect("open file-backed database");
         db.execute("BEGIN", &empty).expect("begin DDL transaction");
-        let tx = db
-            .session_transaction_for_test()
-            .expect("BEGIN opens a session transaction");
-        let statements = [
+        db.execute(
             "CREATE TABLE authored_migration (id UUID PRIMARY KEY, body TEXT) \
              SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            &empty,
+        )
+        .expect("create table in DDL transaction");
+        db.execute(
             "CREATE TRIGGER authored_migration_insert ON authored_migration WHEN INSERT",
+            &empty,
+        )
+        .expect("create trigger in DDL transaction");
+        db.execute(
             "ALTER TABLE authored_migration ADD COLUMN detail TEXT",
-        ];
-        let mut previous = None;
-        for sql in statements {
-            let reservation = db.staged_statement_reservation_bytes_for_test(tx, sql) as i128;
-            db.execute(sql, &empty)
-                .expect("stage DDL in the transaction");
-            // Step 28's stage ledger, from just before BEGIN (BEGIN charges a
-            // Legacy host nothing): used delta = H + C + P + Kc + S and
-            // aggregate delta = H + C + P + Kc + S + Kr + Sr.
-            let ledger = db
-                .local_schema_stage_ledger_for_test(tx)
-                .expect("the transaction holds a local schema stage");
-            let owned = (ledger.hold
-                + ledger.credit
-                + ledger.payload
-                + ledger.controls_used
-                + ledger.stage_slot) as i128;
-            let deltas = (used() - used_before, aggregate() - aggregate_before);
-            assert_eq!(
-                deltas.0, owned,
-                "{sql}: used delta = H + C + P + Kc + S: {ledger:?}"
-            );
-            assert_eq!(
-                deltas.1,
-                owned + (ledger.controls_residue + ledger.stage_slot_residue) as i128,
-                "{sql}: aggregate delta = H + C + P + Kc + S + Kr + Sr: {ledger:?}"
-            );
-            assert_eq!(
-                ledger.payload,
-                ledger.draws - ledger.restores,
-                "{sql}: P = D - Rs"
-            );
-            assert_eq!(
-                ledger.image_accountant, ledger.live_accountant,
-                "{sql}: one accountant"
-            );
-            assert_eq!(
-                ledger.image_writer_identity, ledger.live_writer_identity,
-                "{sql}: one writer identity"
-            );
-            if let Some((before, before_deltas)) = previous {
-                let before: contextdb_engine::LocalSchemaStageLedgerForTest = before;
-                let before_deltas: (i128, i128) = before_deltas;
-                assert_eq!(
-                    (ledger.credit + ledger.payload) as i128
-                        - (before.credit + before.payload) as i128,
-                    reservation,
-                    "{sql}: C + P grows by exactly this statement's reservation"
-                );
-                assert_eq!(
-                    ledger.payload as i128 - before.payload as i128,
-                    (ledger.draws - before.draws) as i128
-                        - (ledger.restores - before.restores) as i128,
-                    "{sql}: P grows by this statement's D - Rs"
-                );
-                assert_eq!(
-                    (ledger.hold, ledger.controls_used, ledger.controls_residue),
-                    (before.hold, before.controls_used, before.controls_residue),
-                    "{sql}: H, Kc and Kr unchanged"
-                );
-                assert_eq!(
-                    (deltas.0 - before_deltas.0, deltas.1 - before_deltas.1),
-                    (reservation, reservation),
-                    "{sql}: used and aggregate each grow by exactly R"
-                );
-            }
-            previous = Some((ledger, deltas));
-        }
+            &empty,
+        )
+        .expect("alter table in DDL transaction");
         db.execute("COMMIT", &empty)
             .expect("commit DDL transaction");
-        assert!(
-            db.local_schema_stage_ledger_for_test(tx).is_none(),
-            "COMMIT ends the stage"
-        );
 
         let commit_lsn = assert_transactional_schema_ddl_vector(&db, "before reopen");
         db.close().expect("close file-backed database");

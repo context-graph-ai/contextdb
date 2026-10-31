@@ -1218,7 +1218,7 @@ impl OwnedPersistentCompositeStore {
             );
             self.legacy
                 .inner
-                .apply_owned_exact_with_log_entries(ws, prepared)
+                .apply_owned_exact_with_log_entries(ws, prepared, None)
         })
     }
 }
@@ -1484,7 +1484,12 @@ pub(crate) fn apply_owned_memory_store(
                 .ok_or_else(|| Error::Other("committed copy size overflow".into()))?,
         )?;
         drop(live_meta);
-        store.apply_owned_exact_with_log_entries(ws, prepared)
+        // A private image: its retention is admitted before the first publication.
+        let preadmitted = crate::memory_accounting::PreadmittedRetention::admit(
+            &store.accountant,
+            store.commit_retained_bytes(&prepared.log_entries),
+        )?;
+        store.apply_owned_exact_with_log_entries(ws, prepared, Some(preadmitted))
     })
 }
 

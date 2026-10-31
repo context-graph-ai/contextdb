@@ -2075,15 +2075,14 @@ impl CompositeStore {
             read_memory,
         )?;
         drop(live_table_meta);
-        // Inside a reservation spend scope (a private local schema image), the
-        // retention this commit makes unavoidable is pre-admitted here, at a
-        // fallible point, out of the stage credit; the apply consumes it in
-        // place of its infallible charge.
-        let preadmitted = crate::memory_accounting::PreadmittedRetention::admit_if_scoped(
+        // This store is a private image's: the retention its commit makes
+        // unavoidable is admitted here, at a fallible point, and the apply
+        // consumes it in place of its infallible charge.
+        let preadmitted = crate::memory_accounting::PreadmittedRetention::admit(
             &self.accountant,
             self.commit_retained_bytes(&log_entries),
         )?;
-        self.apply_exact_with_log_entries(ws, log_entries, partition_mutations, preadmitted)
+        self.apply_exact_with_log_entries(ws, log_entries, partition_mutations, Some(preadmitted))
     }
 
     /// What one commit's apply retains: the change-log entries and their side
@@ -2101,8 +2100,8 @@ impl CompositeStore {
         }
     }
 
-    /// Charge one commit's retention: consume its pre-admission when a spend
-    /// scope funded it, otherwise take the ordinary infallible charge.
+    /// Charge one commit's retention: consume its pre-admission on a private
+    /// image, otherwise take the charge a durable commit cannot refuse.
     fn retain_commit_bytes(
         &self,
         bytes: usize,
@@ -2710,13 +2709,8 @@ impl CompositeStore {
         &self,
         ws: &WriteSet,
         mut prepared: OwnedPreparedMemoryApply,
+        preadmitted: Option<crate::memory_accounting::PreadmittedRetention<'_>>,
     ) -> Result<()> {
-        // Pre-admit, before the first publication below, the retention this
-        // apply makes unavoidable when a spend scope funds it.
-        let preadmitted = crate::memory_accounting::PreadmittedRetention::admit_if_scoped(
-            &self.accountant,
-            self.commit_retained_bytes(&prepared.log_entries),
-        )?;
         crate::database::discard::publish_original_discard_for_apply(ws);
         let partition_mutations = prepared
             .partition_mutations

@@ -203,17 +203,17 @@ pub use database::{
     REDB_COMPACT_FRAGMENTATION_THRESHOLD, RETENTION_CLOCK_SKEW_TOLERANCE, SnapshotPin,
     StorageCompactionPolicy, StorageCompactionValue, TableSizeEstimate,
 };
-#[cfg(any(test, feature = "test-seams"))]
-#[doc(hidden)]
-pub use database::{
-    LocalSchemaStageLedgerForTest, VectorMaintenanceWorkerClockGuardForTest,
-    VectorMaintenanceWorkerCycleForTest, VectorMemoryOwnershipReceiptForTest,
-    VectorPartitionGenerationRetentionForTest, VectorPartitionJournalFileForTest,
-};
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub use database::{ReceivedUnitCopyFault, ReceivedUnitFaultPoint};
 pub use database::{SearchResult, SemanticQuery};
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use database::{
+    VectorMaintenanceWorkerClockGuardForTest, VectorMaintenanceWorkerCycleForTest,
+    VectorMemoryOwnershipReceiptForTest, VectorPartitionGenerationRetentionForTest,
+    VectorPartitionJournalFileForTest,
+};
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub use database::{reclaim_steps_last_cycle_for_test, set_reclaim_steps_per_cycle_for_test};

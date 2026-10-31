@@ -25,8 +25,6 @@ pub(crate) const OPEN_RESIDUE_TAG: usize = 1 << (usize::BITS - 1);
 )]
 pub(crate) fn admit_open_residue(bytes: usize, operation: &str) -> contextdb_core::Result<()> {
     assert!(bytes < OPEN_RESIDUE_TAG);
-    #[cfg(test)]
-    spend_scope_test_records::open_residue(operation, bytes);
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
     let ceiling = effective_ceiling(domain.ceiling);
     aggregate_try_reserve(bytes, ceiling).map_err(|available| {
@@ -3351,407 +3349,6 @@ impl Drop for AdmittedSchemaUnit<'_> {
     }
 }
 
-/// The subsystem and operation of the typed refusal a reservation spend
-/// scope returns when its prepaid credit cannot cover an admission.
-pub(crate) const RESERVATION_SPEND_SUBSYSTEM: &str = "ddl";
-pub(crate) const RESERVATION_SPEND_OPERATION: &str = "local_schema_stage";
-const RESERVATION_SPEND_HINT: &str =
-    "Reduce the schema transaction size or raise MEMORY_LIMIT before retrying.";
-
-/// The ownership ledger of one prepaid reservation's spending. `payload` is
-/// what image owners currently hold out of the credit, `draws` is every byte
-/// drawn and `restores` every byte returned inside a live scope, so
-/// `payload == draws - restores` while the stage lives.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReservationSpendLedger {
-    pub(crate) payload: usize,
-    pub(crate) draws: usize,
-    pub(crate) restores: usize,
-    /// The funding identity of this ledger's stage, assigned when a scope
-    /// first enters it. Every scope over the same ledger shares it, so an
-    /// owner funded by one statement of a stage is recognised by the next.
-    pub(crate) id: u64,
-}
-
-static NEXT_SPEND_LEDGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// The stage-funded part of one control: the ledger whose scope paid it and
-/// how many of the control's bytes that scope paid. A control without it was
-/// paid by its counter, outside any scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StageFunding {
-    ledger: u64,
-    bytes: usize,
-}
-
-impl StageFunding {
-    /// Add `more` to a control's funding record: a growth drawn inside a
-    /// scope adds to that scope's share, and a growth outside any scope adds
-    /// nothing.
-    fn grow(current: Option<Self>, more: Option<Self>) -> Option<Self> {
-        match (current, more) {
-            (current, None) => current,
-            (None, more) => more,
-            (Some(current), Some(more)) => {
-                assert_eq!(
-                    current.ledger, more.ledger,
-                    "engine invariant: one control is funded by one stage"
-                );
-                Some(Self {
-                    ledger: current.ledger,
-                    bytes: current.bytes + more.bytes,
-                })
-            }
-        }
-    }
-}
-
-/// Return a control's stage-funded bytes to the live scope of the ledger that
-/// paid them, exactly. Returns the bytes that take the ordinary counter
-/// refund: the counter-funded part always, and the stage-funded part too when
-/// no scope of its ledger is live on this thread (the image dropping outside a
-/// statement returns its payload to the live budget).
-fn spend_scope_restore_funded(
-    counter: usize,
-    funding: Option<StageFunding>,
-    bytes: usize,
-) -> usize {
-    let Some(funding) = funding else {
-        return bytes;
-    };
-    SPEND_SCOPE.with(|slot| {
-        let Some(mut entry) = slot.get() else {
-            return bytes;
-        };
-        if entry.counter != counter || entry.ledger.id != funding.ledger {
-            return bytes;
-        }
-        assert!(
-            funding.bytes <= entry.ledger.payload && funding.bytes <= bytes,
-            "engine invariant violated: a control's stage-funded {} bytes exceed the stage payload {}",
-            funding.bytes,
-            entry.ledger.payload
-        );
-        entry.ledger.payload -= funding.bytes;
-        entry.ledger.restores = entry.ledger.restores.saturating_add(funding.bytes);
-        entry.credit = entry.credit.saturating_add(funding.bytes);
-        slot.set(Some(entry));
-        bytes - funding.bytes
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SpendScopeEntry {
-    accountant: usize,
-    /// The scoped accountant's writer counter: a control credit refunds
-    /// through the counter itself, not through the accountant's release.
-    counter: usize,
-    granted: usize,
-    credit: usize,
-    ledger: ReservationSpendLedger,
-}
-
-thread_local! {
-    /// The reservation spend scope live on THIS thread, if any. A scope saves
-    /// the entry it replaced and restores it when it ends.
-    static SPEND_SCOPE: std::cell::Cell<Option<SpendScopeEntry>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Return released bytes to this thread's live spend scope when `owns`
-/// selects it, up to the payload the stage holds. Returns the excess, which
-/// is not stage-funded and takes the ordinary release.
-fn spend_scope_restore_where(owns: impl Fn(&SpendScopeEntry) -> bool, bytes: usize) -> usize {
-    SPEND_SCOPE.with(|slot| {
-        let Some(mut entry) = slot.get() else {
-            return bytes;
-        };
-        if !owns(&entry) {
-            return bytes;
-        }
-        let restored = bytes.min(entry.ledger.payload);
-        entry.ledger.payload -= restored;
-        entry.ledger.restores = entry.ledger.restores.saturating_add(restored);
-        entry.credit = entry.credit.saturating_add(restored);
-        slot.set(Some(entry));
-        let excess = bytes - restored;
-        #[cfg(any(test, feature = "test-seams"))]
-        assert_eq!(
-            excess, 0,
-            "engine invariant violated: a release of {excess} bytes inside a reservation \
-             spend scope is not funded by the stage"
-        );
-        excess
-    })
-}
-
-fn spend_scope_refusal(bytes: usize, available: usize, granted: usize) -> contextdb_core::Error {
-    contextdb_core::Error::MemoryBudgetExceeded {
-        subsystem: RESERVATION_SPEND_SUBSYSTEM.into(),
-        operation: RESERVATION_SPEND_OPERATION.into(),
-        requested_bytes: bytes,
-        available_bytes: available,
-        budget_limit_bytes: granted,
-        hint: RESERVATION_SPEND_HINT.into(),
-    }
-}
-
-fn spend_scope_native_refusal(
-    bytes: usize,
-    available: usize,
-    granted: usize,
-) -> contextdb_core::read_memory::NativeRefusal {
-    contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-        subsystem: RESERVATION_SPEND_SUBSYSTEM,
-        operation: RESERVATION_SPEND_OPERATION,
-        requested_bytes: bytes,
-        available_bytes: available,
-        budget_limit_bytes: granted,
-        hint: RESERVATION_SPEND_HINT,
-    }
-}
-
-/// Pays for a private image's payload out of a reservation the live database
-/// has already admitted, without charging `used` or the process aggregate a
-/// second time.
-///
-/// While the scope is live, an admission on this thread against the scoped
-/// accountant draws from the reservation's credit and adds to the ledger's
-/// payload; an admission larger than the remaining credit is refused with the
-/// typed `MemoryBudgetExceeded` (`ddl`, `local_schema_stage`) before anything
-/// is allocated. A release on this thread against that accountant returns the
-/// bytes to the credit, up to the payload the stage holds; those bytes stay
-/// owned by the stage. A plain `charge_retained` inside the scope is an
-/// engine-invariant violation: every retention the scoped image can reach is
-/// pre-admitted at a fallible point instead.
-///
-/// The scope mutably borrows the reservation's credit, so the reservation
-/// cannot release its admission while the image can still spend from it. The
-/// credit above `hold` is spendable; `hold` stays in the reservation.
-pub(crate) struct ReservationSpendScope<'a> {
-    credit: &'a mut usize,
-    hold: usize,
-    ledger: &'a mut ReservationSpendLedger,
-    accountant: usize,
-    previous: Option<SpendScopeEntry>,
-    _thread: std::marker::PhantomData<*const ()>,
-}
-
-impl<'a> ReservationSpendScope<'a> {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn enter(
-        accountant: &AccountantHandle,
-        credit: &'a mut usize,
-        hold: usize,
-        ledger: &'a mut ReservationSpendLedger,
-    ) -> contextdb_core::Result<Self> {
-        Self::enter_at(accountant, credit, hold, ledger)
-    }
-
-    /// The owned host's credit is the stage Original's bytes; its accountant
-    /// is that Original's held writer.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn enter_original(
-        original: &'a mut OwnedMemoryReservation,
-        hold: usize,
-        ledger: &'a mut ReservationSpendLedger,
-    ) -> contextdb_core::Result<Self> {
-        let accountant = preparation_original_writer(original)?.accountant.clone();
-        Self::enter_at(&accountant, &mut original.bytes, hold, ledger)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn enter_at(
-        target: &MemoryAccountant,
-        credit: &'a mut usize,
-        hold: usize,
-        ledger: &'a mut ReservationSpendLedger,
-    ) -> contextdb_core::Result<Self> {
-        let spendable = credit.checked_sub(hold).ok_or_else(|| {
-            contextdb_core::Error::Other("reservation spend scope holds more than it owns".into())
-        })?;
-        if ledger.id == 0 {
-            ledger.id = NEXT_SPEND_LEDGER.fetch_add(1, Ordering::SeqCst);
-        }
-        let accountant = std::ptr::from_ref(target) as usize;
-        let counter = target.used.as_ptr() as usize;
-        let previous = SPEND_SCOPE.with(|slot| {
-            slot.replace(Some(SpendScopeEntry {
-                accountant,
-                counter,
-                granted: spendable,
-                credit: spendable,
-                ledger: *ledger,
-            }))
-        });
-        Ok(Self {
-            credit,
-            hold,
-            ledger,
-            accountant,
-            previous,
-            _thread: std::marker::PhantomData,
-        })
-    }
-
-    /// Spendable credit still unspent in this scope.
-    #[cfg(test)]
-    pub(crate) fn remaining_credit(&self) -> usize {
-        SPEND_SCOPE.with(|slot| slot.get().map_or(0, |entry| entry.credit))
-    }
-
-    /// The ledger as it stands inside this scope.
-    #[cfg(test)]
-    pub(crate) fn ledger(&self) -> ReservationSpendLedger {
-        SPEND_SCOPE.with(|slot| slot.get().map_or(*self.ledger, |entry| entry.ledger))
-    }
-}
-
-impl Drop for ReservationSpendScope<'_> {
-    fn drop(&mut self) {
-        let entry = SPEND_SCOPE.with(|slot| slot.replace(self.previous));
-        let entry = entry
-            .filter(|entry| entry.accountant == self.accountant)
-            .expect("reservation spend scopes end in the order they were entered");
-        *self.credit = self.hold.saturating_add(entry.credit);
-        *self.ledger = entry.ledger;
-    }
-}
-
-/// Retention bytes pre-admitted out of a live spend scope's credit, at a
-/// fallible point before the apply that makes them unavoidable. The apply
-/// consumes it in place of the infallible `charge_retained`; dropped without
-/// being consumed, it returns its bytes as an ordinary release.
-pub(crate) struct PreadmittedRetention<'a> {
-    accountant: &'a MemoryAccountant,
-    bytes: usize,
-}
-
-impl<'a> PreadmittedRetention<'a> {
-    /// `None` when no spend scope is live for `accountant` on this thread:
-    /// the caller keeps its ordinary infallible retention charge.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn admit_if_scoped(
-        accountant: &'a MemoryAccountant,
-        bytes: usize,
-    ) -> contextdb_core::Result<Option<Self>> {
-        if !accountant.spend_scope_is_active() {
-            return Ok(None);
-        }
-        accountant.try_allocate_for(
-            bytes,
-            RESERVATION_SPEND_SUBSYSTEM,
-            RESERVATION_SPEND_OPERATION,
-            RESERVATION_SPEND_HINT,
-        )?;
-        Ok(Some(Self { accountant, bytes }))
-    }
-
-    /// The retained owner now holds these bytes; it releases them when it drops.
-    pub(crate) fn consume(mut self, bytes: usize) {
-        assert_eq!(
-            self.bytes, bytes,
-            "engine invariant: pre-admitted retention must cover exactly what the apply retains"
-        );
-        self.bytes = 0;
-    }
-}
-
-/// Unit-test records of spend-scope refusals and pre-admission needs.
-#[cfg(test)]
-pub(crate) mod spend_scope_test_records {
-    use super::*;
-
-    /// The accountant's counters at the moment a spend scope refused a draw.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct SpendRefusalRecord {
-        pub(crate) requested: usize,
-        pub(crate) available: usize,
-        pub(crate) used: usize,
-        pub(crate) aggregate: usize,
-        pub(crate) high_water: usize,
-        pub(crate) retained_charges: usize,
-        pub(crate) admitted: usize,
-    }
-
-    static REFUSALS: std::sync::Mutex<Vec<SpendRefusalRecord>> = std::sync::Mutex::new(Vec::new());
-    static DRAWS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-
-    pub(super) fn refused(accountant: &MemoryAccountant, requested: usize, available: usize) {
-        REFUSALS
-            .lock()
-            .expect("refusal records")
-            .push(SpendRefusalRecord {
-                requested,
-                available,
-                used: accountant.used.load(Ordering::SeqCst),
-                aggregate: PROCESS_WRITER_AGGREGATE.load(Ordering::SeqCst),
-                high_water: accountant.high_water_for_test.load(Ordering::SeqCst),
-                retained_charges: accountant
-                    .retained_charge_bytes_for_test
-                    .load(Ordering::SeqCst),
-                admitted: accountant.admitted_bytes_for_test.load(Ordering::SeqCst),
-            });
-    }
-
-    static OPEN_RESIDUES: std::sync::Mutex<Option<Vec<(String, usize)>>> =
-        std::sync::Mutex::new(None);
-
-    /// Record every named open-residue admission from now until the take.
-    pub(crate) fn record_open_residues() {
-        *OPEN_RESIDUES.lock().expect("open residue records") = Some(Vec::new());
-    }
-
-    pub(crate) fn take_open_residues() -> Vec<(String, usize)> {
-        OPEN_RESIDUES
-            .lock()
-            .expect("open residue records")
-            .take()
-            .unwrap_or_default()
-    }
-
-    pub(super) fn open_residue(operation: &str, bytes: usize) {
-        if let Some(records) = OPEN_RESIDUES.lock().expect("open residue records").as_mut() {
-            records.push((operation.to_owned(), bytes));
-        }
-    }
-
-    /// One successful scope draw: the credit the scope had consumed before
-    /// it, and its size.
-    pub(super) fn drew(consumed_before: usize, bytes: usize) {
-        DRAWS
-            .lock()
-            .expect("draw records")
-            .push((consumed_before, bytes));
-    }
-
-    pub(crate) fn take_refusals() -> Vec<SpendRefusalRecord> {
-        std::mem::take(&mut *REFUSALS.lock().expect("refusal records"))
-    }
-
-    pub(crate) fn take_draws() -> Vec<(usize, usize)> {
-        std::mem::take(&mut *DRAWS.lock().expect("draw records"))
-    }
-}
-
-impl Drop for PreadmittedRetention<'_> {
-    fn drop(&mut self) {
-        self.accountant.release(self.bytes);
-    }
-}
-
 #[cfg(any(test, feature = "test-seams"))]
 fn note_budget_ledger(what: &str, bytes: usize, used_after: usize) {
     BUDGET_LEDGER.with(|ledger| {
@@ -3806,6 +3403,48 @@ fn note_budget_admission(
     });
 }
 
+/// Retention bytes admitted at a fallible point before the apply that makes
+/// them unavoidable. The apply consumes it in place of the infallible
+/// `charge_retained`; dropped without being consumed, it returns its bytes.
+pub(crate) struct PreadmittedRetention<'a> {
+    accountant: &'a MemoryAccountant,
+    bytes: usize,
+}
+
+impl<'a> PreadmittedRetention<'a> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn admit(
+        accountant: &'a MemoryAccountant,
+        bytes: usize,
+    ) -> contextdb_core::Result<Self> {
+        accountant.try_allocate_for(
+            bytes,
+            "ddl",
+            "private_image_commit",
+            "Reduce the schema transaction size or raise MEMORY_LIMIT before retrying.",
+        )?;
+        Ok(Self { accountant, bytes })
+    }
+
+    /// The retained owner now holds these bytes; it releases them when it drops.
+    pub(crate) fn consume(mut self, bytes: usize) {
+        assert_eq!(
+            self.bytes, bytes,
+            "engine invariant: pre-admitted retention must cover exactly what the apply retains"
+        );
+        self.bytes = 0;
+    }
+}
+
+impl Drop for PreadmittedRetention<'_> {
+    fn drop(&mut self) {
+        self.accountant.release(std::mem::take(&mut self.bytes));
+    }
+}
+
 // One complete owned liability. Adapter controls register their own receipt;
 // the original cache reserve is named separately by persistence.
 // Its final owner extracts the bounded refund capability before dropping
@@ -3815,10 +3454,6 @@ pub(crate) struct ControlCredit {
     accountant: Option<AccountantHandle>,
     bytes: usize,
     registration: Option<(usize, usize)>,
-    /// The part of `bytes` a reservation spend scope paid, if any. Its refund
-    /// returns to that stage while the stage's scope is live; the rest goes
-    /// back to the counter that paid it.
-    funding: Option<StageFunding>,
 }
 impl ControlCredit {
     #[cfg(any(test, feature = "test-seams"))]
@@ -3909,7 +3544,6 @@ impl ControlCredit {
             accountant: Some(accountant.as_handle()),
             bytes,
             registration,
-            funding: accountant.as_handle().stage_funding(bytes),
         })
     }
     #[expect(
@@ -3926,7 +3560,6 @@ impl ControlCredit {
             accountant: Some(accountant.as_handle()),
             bytes: bytes | OPEN_RESIDUE_TAG,
             registration: None,
-            funding: None,
         })
     }
     pub(crate) fn admit_open_residue_native(
@@ -3936,8 +3569,6 @@ impl ControlCredit {
     ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
         use contextdb_core::read_memory::NativeRefusal;
         assert!(bytes < OPEN_RESIDUE_TAG);
-        #[cfg(test)]
-        spend_scope_test_records::open_residue(operation, bytes);
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         let ceiling = effective_ceiling(domain.ceiling);
         aggregate_try_reserve(bytes, ceiling).map_err(|available| {
@@ -3954,7 +3585,6 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes: bytes | OPEN_RESIDUE_TAG,
             registration: None,
-            funding: None,
         })
     }
 
@@ -3980,7 +3610,6 @@ impl ControlCredit {
             "hydrate_owned_image",
             "Raise MEMORY_LIMIT to admit the complete committed read image.",
         )?;
-        self.funding = StageFunding::grow(self.funding, accountant.stage_funding(bytes));
         accountant.change_adapter_control_receipt(bytes, true);
         self.bytes = next;
         Ok(())
@@ -4001,15 +3630,12 @@ impl ControlCredit {
                 "writer_cache_preparation",
                 "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.",
             )?;
-            let mut credit = Self::from_admitted(accountant, bytes);
-            credit.funding = accountant.stage_funding(bytes);
-            return Ok(credit);
+            return Ok(Self::from_admitted(accountant, bytes));
         }
         let mut credit = Self {
             accountant: Some(accountant.clone()),
             bytes: OPEN_RESIDUE_TAG,
             registration: None,
-            funding: None,
         };
         credit.grow_cache_preparation_native(bytes, startup)?;
         Ok(credit)
@@ -4058,8 +3684,6 @@ impl ControlCredit {
                     "writer_cache_preparation",
                     "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.",
                 )?;
-                let more = accountant.stage_funding(bytes);
-                self.funding = StageFunding::grow(self.funding, more);
             }
             accountant.change_adapter_control_receipt(bytes, true);
             self.bytes = next;
@@ -4103,7 +3727,6 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes,
             registration: accountant.prepare_control_refund().1,
-            funding: accountant.stage_funding(bytes),
         })
     }
     pub(crate) fn from_admitted(accountant: &AccountantHandle, bytes: usize) -> Self {
@@ -4114,7 +3737,6 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes,
             registration: accountant.prepare_control_refund().1,
-            funding: None,
         }
     }
     pub(crate) fn retained_startup(accountant: &AccountantHandle, bytes: usize) -> Self {
@@ -4126,7 +3748,6 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes,
             registration: accountant.prepare_control_refund().1,
-            funding: None,
         }
     }
     /// The original fixed cache invoice is named by persistence, rather than
@@ -4144,7 +3765,6 @@ impl ControlCredit {
             // No adapter receipt was registered for this cache-data invoice;
             // final release refunds only its original writer counter.
             registration: None,
-            funding: None,
         }
     }
     pub(crate) fn prepare(mut self) -> PendingControlRefund {
@@ -4160,7 +3780,6 @@ impl ControlCredit {
             counter,
             bytes,
             registration,
-            funding: self.funding.take(),
         }
     }
 }
@@ -4174,7 +3793,6 @@ impl Drop for ControlCredit {
                 counter,
                 bytes: std::mem::take(&mut self.bytes),
                 registration,
-                funding: self.funding.take(),
             });
         }
     }
@@ -4194,7 +3812,6 @@ pub(crate) struct PendingControlRefund {
     counter: WriterCounterHandle,
     bytes: usize,
     registration: Option<(usize, usize)>,
-    funding: Option<StageFunding>,
 }
 impl Drop for PendingControlRefund {
     fn drop(&mut self) {
@@ -4222,15 +3839,9 @@ impl Drop for PendingControlRefund {
                 receipt.expect("final control receipt is owned");
             }
         }
-        // A control returns its money to whoever paid it: the bytes a stage's
-        // spend scope paid go back to that stage's credit while its scope is
-        // live; bytes its counter paid go back to the counter, even inside a
-        // scope on the same counter.
-        let counter = self.counter.as_ptr() as usize;
-        let bytes = spend_scope_restore_funded(counter, self.funding, self.bytes);
         // Leaves the process aggregate exactly once, here, whether or not
         // this epoch's registration has retired (retirement never refunds).
-        let refund = self.counter.release_owned(bytes);
+        let refund = self.counter.release_owned(self.bytes);
         if !unwinding {
             refund.expect("final control refund is owned");
         }
@@ -5253,9 +4864,6 @@ impl MemoryAccountant {
         Ok(())
     }
 
-    // Only a writer registration's retirement takes this release. The
-    // registration was paid when the writer registered, never by a spend
-    // scope, so its refund always returns to the counter.
     fn release_under_exclusive_gate(&self, bytes: usize) {
         if self.used.release_owned(bytes).is_err() {
             refund_invariant_broken("exclusive lifecycle refund must be owned");
@@ -5509,10 +5117,6 @@ impl MemoryAccountant {
         if bytes == 0 {
             return Ok(());
         }
-        if let Some(drawn) = self.spend_scope_draw(bytes) {
-            return drawn
-                .map_err(|(available, granted)| spend_scope_refusal(bytes, available, granted));
-        }
 
         let admission = self.writer_admission_for_provenance(provenance);
         #[cfg(test)]
@@ -5680,21 +5284,6 @@ impl MemoryAccountant {
         operation: &str,
         hint: &str,
     ) -> contextdb_core::Result<()> {
-        if self.spend_scope_is_active() {
-            if new_bytes >= old_bytes {
-                let bytes = new_bytes - old_bytes;
-                return match self.spend_scope_draw(bytes) {
-                    Some(drawn) => drawn.map_err(|(available, granted)| {
-                        spend_scope_refusal(bytes, available, granted)
-                    }),
-                    None => Ok(()),
-                };
-            }
-            let excess = self.spend_scope_restore(old_bytes - new_bytes);
-            let _admission = self.writer_admission();
-            self.release_counter_under_admission(excess);
-            return Ok(());
-        }
         #[cfg(test)]
         let _capture_operation =
             compaction_admission_capture::Phase::operation(subsystem, operation);
@@ -5878,21 +5467,6 @@ impl MemoryAccountant {
         operation: &'static str,
         hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        if self.spend_scope_is_active() {
-            if new_bytes >= old_bytes {
-                let bytes = new_bytes - old_bytes;
-                return match self.spend_scope_draw(bytes) {
-                    Some(drawn) => drawn.map_err(|(available, granted)| {
-                        spend_scope_refusal(bytes, available, granted)
-                    }),
-                    None => Ok(()),
-                };
-            }
-            let excess = self.spend_scope_restore(old_bytes - new_bytes);
-            let _admission = self.writer_admission();
-            self.release_counter_under_admission(excess);
-            return Ok(());
-        }
         #[cfg(test)]
         let _capture_operation =
             compaction_admission_capture::Phase::operation(subsystem, operation);
@@ -6049,27 +5623,13 @@ impl MemoryAccountant {
     /// admission instead -- which is the whole point, because until these
     /// were charged what stopped an import that outgrew a declared
     /// MEMORY_LIMIT was the machine's out-of-memory kill, not the engine.
-    ///
-    /// Inside a live reservation spend scope for this accountant the charge is
-    /// an engine-invariant violation, not a resource refusal: it panics before
-    /// the counter changes. Every retention a scoped private image reaches is
-    /// pre-admitted out of the stage credit at a fallible point instead.
-    #[track_caller]
     pub fn charge_retained(&self, bytes: usize) {
         let _admission = self.writer_admission();
         self.charge_retained_under_admission(bytes);
     }
-    #[track_caller]
     fn charge_retained_under_admission(&self, bytes: usize) {
         if bytes == 0 {
             return;
-        }
-        if self.spend_scope_is_active() {
-            panic!(
-                "engine invariant violated: an infallible charge_retained of {bytes} bytes \
-                 inside a reservation spend scope; every retention a private schema image \
-                 reaches must be pre-admitted from its stage credit"
-            );
         }
         self.used.charge(bytes);
         #[cfg(test)]
@@ -6131,13 +5691,6 @@ impl MemoryAccountant {
         if bytes == 0 {
             return 0;
         }
-        let excess = self.spend_scope_restore(bytes);
-        (bytes - excess).saturating_add(self.release_counter_under_admission(excess))
-    }
-    fn release_counter_under_admission(&self, bytes: usize) -> usize {
-        if bytes == 0 {
-            return 0;
-        }
 
         let released = self.used.release_saturating(bytes);
         #[cfg(test)]
@@ -6151,67 +5704,6 @@ impl MemoryAccountant {
         #[cfg(not(any(test, feature = "test-seams")))]
         let _ = released;
         bytes.min(released)
-    }
-
-    /// This accountant's process writer identity, once it has one.
-    #[cfg(any(test, feature = "test-seams"))]
-    #[doc(hidden)]
-    pub fn writer_identity_for_test(&self) -> Option<usize> {
-        self.writer_identity.get().copied()
-    }
-
-    /// The funding record of `bytes` this accountant just admitted: the live
-    /// scope's stage when a reservation spend scope for this accountant paid
-    /// them, `None` when its counter did.
-    pub(crate) fn stage_funding(&self, bytes: usize) -> Option<StageFunding> {
-        let me = std::ptr::from_ref(self) as usize;
-        SPEND_SCOPE.with(|slot| {
-            slot.get()
-                .filter(|entry| entry.accountant == me && bytes != 0)
-                .map(|entry| StageFunding {
-                    ledger: entry.ledger.id,
-                    bytes,
-                })
-        })
-    }
-
-    /// Whether a reservation spend scope for THIS accountant is live on this thread.
-    pub(crate) fn spend_scope_is_active(&self) -> bool {
-        let me = std::ptr::from_ref(self) as usize;
-        SPEND_SCOPE.with(|slot| slot.get().is_some_and(|entry| entry.accountant == me))
-    }
-
-    /// Draw `bytes` from this thread's live spend scope for this accountant.
-    /// `None`: no such scope. `Err((available, granted))`: the credit is short,
-    /// and nothing was drawn or charged.
-    fn spend_scope_draw(&self, bytes: usize) -> Option<std::result::Result<(), (usize, usize)>> {
-        let me = std::ptr::from_ref(self) as usize;
-        SPEND_SCOPE.with(|slot| {
-            let mut entry = slot.get()?;
-            if entry.accountant != me {
-                return None;
-            }
-            if bytes > entry.credit {
-                #[cfg(test)]
-                spend_scope_test_records::refused(self, bytes, entry.credit);
-                return Some(Err((entry.credit, entry.granted)));
-            }
-            #[cfg(test)]
-            spend_scope_test_records::drew(entry.granted.saturating_sub(entry.credit), bytes);
-            entry.credit -= bytes;
-            entry.ledger.payload = entry.ledger.payload.saturating_add(bytes);
-            entry.ledger.draws = entry.ledger.draws.saturating_add(bytes);
-            slot.set(Some(entry));
-            Some(Ok(()))
-        })
-    }
-
-    /// Return released bytes to this thread's live spend scope for this
-    /// accountant, up to the payload the stage holds. Returns the excess,
-    /// which is not stage-funded and takes the ordinary release.
-    fn spend_scope_restore(&self, bytes: usize) -> usize {
-        let me = std::ptr::from_ref(self) as usize;
-        spend_scope_restore_where(|entry| entry.accountant == me, bytes)
     }
 
     pub(crate) fn register_idle_graph_reclaimer(
@@ -6531,12 +6023,6 @@ impl MemoryAccountant {
         hint: &str,
         provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
-        // Inside a reservation spend scope the draw decides alone: its
-        // refusal is the stage's typed refusal, never a cue to evict a live
-        // cache or to charge past the prepaid credit.
-        if self.spend_scope_is_active() {
-            return self.try_allocate_with_provenance(bytes, provenance);
-        }
         #[cfg(test)]
         let _capture_operation =
             compaction_admission_capture::Phase::operation(subsystem, operation);
@@ -7071,8 +6557,6 @@ impl AccountantHandle {
                     ),
                 )
             });
-        // A spend scope's refusal keeps its own typed label.
-        let scoped = self.spend_scope_is_active();
         let result = result.map_err(|error| match error {
             contextdb_core::Error::MemoryBudgetExceeded {
                 subsystem,
@@ -7081,7 +6565,7 @@ impl AccountantHandle {
                 budget_limit_bytes,
                 hint,
                 ..
-            } if !scoped => contextdb_core::Error::MemoryBudgetExceeded {
+            } => contextdb_core::Error::MemoryBudgetExceeded {
                 subsystem,
                 operation,
                 requested_bytes,
@@ -12830,32 +12314,6 @@ pub(crate) fn detach_preparation_original(
     Ok(detached)
 }
 
-/// The checks `merge_preparation_original` makes, without merging.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(crate) fn check_preparation_originals_mergeable(
-    original: &OwnedMemoryReservation,
-    credit: &OwnedMemoryReservation,
-) -> contextdb_core::Result<()> {
-    let left = preparation_original_writer(original)?;
-    let right = preparation_original_writer(credit)?;
-    if left.stable_identity != right.stable_identity
-        || left.epoch != right.epoch
-        || left.accountant.as_ptr() != right.accountant.as_ptr()
-    {
-        return Err(contextdb_core::Error::Other(
-            "original persistence credit origin mismatch".into(),
-        ));
-    }
-    original
-        .bytes
-        .checked_add(credit.bytes)
-        .ok_or_else(source_size_overflow)?;
-    Ok(())
-}
-
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -12955,13 +12413,6 @@ impl MemoryAccountant {
         bytes: usize,
         provenance: Option<&StoreAccountantHandle>,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
-        if bytes != 0
-            && let Some(drawn) = self.spend_scope_draw(bytes)
-        {
-            return drawn.map_err(|(available, granted)| {
-                spend_scope_native_refusal(bytes, available, granted)
-            });
-        }
         if bytes == 0 {
             return Ok(());
         }
@@ -13111,9 +12562,6 @@ impl MemoryAccountant {
         _observed_subsystem: &str,
         _observed_operation: &str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
-        if self.spend_scope_is_active() {
-            return self.try_allocate_with_provenance_native(bytes, provenance);
-        }
         #[cfg(test)]
         let _capture_operation = compaction_admission_capture::Phase::operation(
             _observed_subsystem,

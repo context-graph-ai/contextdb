@@ -565,19 +565,6 @@ impl<K: Eq + Hash + Copy, V, P> Drop for Token<K, V, P> {
     }
 }
 
-/// The aggregate-only open residue a private image's three stage registries
-/// name, by the same layout differences their constructors charge.
-#[cfg(test)]
-pub(super) fn private_image_open_residue_bytes_for_test() -> usize {
-    fn residue<R, O>() -> usize {
-        crate::memory_accounting::writer_adapter_type_layout::<Mutex<R>>().size()
-            - crate::memory_accounting::writer_adapter_type_layout::<Mutex<O>>().size()
-    }
-    residue::<PendingRegistry, HashMap<TxId, Pre2PendingLocalSchemaStage>>()
-        + residue::<ReceivedRegistry, HashMap<Lsn, Pre2ReceivedSchemaStage>>()
-        + residue::<LocalRegistry, HashMap<Lsn, Pre2LocalSchemaStage>>()
-}
-
 pub(super) type PendingRegistry =
     OccupiedRegistry<TxId, PendingLocalSchemaStage, Pre2PendingLocalSchemaStage>;
 pub(super) type PendingToken = Token<TxId, PendingLocalSchemaStage, Pre2PendingLocalSchemaStage>;

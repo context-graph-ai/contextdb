@@ -1098,24 +1098,13 @@ impl Database {
     ///
     /// The image runs on the live database's own accountant: the Legacy host
     /// keeps the live writer registration through `from_handle`, the owned
-    /// host keeps its Original. Its construction controls are admitted by the
-    /// ordinary allocator; its payload is paid out of `reservation`'s credit
-    /// above the stage hold, inside a spend scope, and admitted before it is
-    /// allocated.
+    /// host keeps its Original. Everything it holds is admitted by the ordinary
+    /// allocator before it is allocated.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn detached_local_schema_working_database(
-        &self,
-        reservation: &mut TemporaryMemoryReservation,
-        ledger: &mut LocalSchemaStageLedger,
-    ) -> Result<Database> {
-        #[cfg(any(test, feature = "test-seams"))]
-        let controls_before = (
-            self.finalization.accountant.usage().used,
-            crate::memory_accounting::process_aggregate_bytes_for_test(),
-        );
+    pub(super) fn detached_local_schema_working_database(&self) -> Result<Database> {
         let working = if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             self.with_preparation_original(|original| {
                 Database::open_private_working_image(
@@ -1144,19 +1133,6 @@ impl Database {
                 None,
             )?
         };
-        #[cfg(any(test, feature = "test-seams"))]
-        {
-            let used = self
-                .finalization
-                .accountant
-                .usage()
-                .used
-                .saturating_sub(controls_before.0);
-            let aggregate = crate::memory_accounting::process_aggregate_bytes_for_test()
-                .saturating_sub(controls_before.1);
-            ledger.controls_used = used;
-            ledger.controls_residue = aggregate.saturating_sub(used);
-        }
         working
             .finalization
             .local_policy_metadata_enabled
@@ -1165,20 +1141,10 @@ impl Database {
         working
             .maintenance_caller_driven
             .store(true, Ordering::SeqCst);
-        // The fallible reader setup runs before any stage credit moves, so a
-        // reader refusal leaves the reservation whole. Its child is a reader
-        // control funded outside the scope; it is released after the scope
-        // ends, so it never returns as stage credit.
-        #[cfg(test)]
-        super::statement_execution::local_schema_test_seams::preparation_fault_at(
-            super::statement_execution::local_schema_test_seams::PreparationFault::ReaderSetup,
-        )?;
         let read_memory = working.declared_reader_memory()?;
-        let hold = ledger.hold;
-        let scope = reservation.enter_spend_scope(hold, &mut ledger.spend)?;
         // The image's retained-state owner returns its metadata fold when it
-        // drops. Admit exactly that fold out of the stage credit before the
-        // clone exists, so a short credit refuses before anything is copied.
+        // drops. Admit exactly that fold before the clone exists, so a shortage
+        // refuses before anything is copied.
         let metadata_bytes =
             self.relational_store
                 .table_meta
@@ -1192,13 +1158,12 @@ impl Database {
                 });
         working.finalization.accountant.try_allocate_for(
             metadata_bytes,
-            crate::memory_accounting::RESERVATION_SPEND_SUBSYSTEM,
-            crate::memory_accounting::RESERVATION_SPEND_OPERATION,
+            "ddl",
+            "local_schema_stage",
             "Reduce the schema transaction size or raise MEMORY_LIMIT before retrying.",
         )?;
         // Until the table image holds the fold, this guard owns it: any
-        // failure before the tables are installed returns the drawn fold to
-        // the stage credit, inside the still-live scope.
+        // failure before the tables are installed returns the fold.
         let mut fold = PreadmittedMetadataFold {
             accountant: &working.finalization.accountant,
             bytes: metadata_bytes,
@@ -1232,7 +1197,7 @@ impl Database {
         fold.transfer_to_image();
         drop(fold);
         // The admitted fold must be exactly what the image now holds, or its
-        // drop would refund a different figure than the stage paid.
+        // drop would refund a different figure than was admitted.
         let held_bytes =
             working
                 .relational_store
@@ -1266,10 +1231,7 @@ impl Database {
         super::statement_execution::local_schema_test_seams::preparation_fault_at(
             super::statement_execution::local_schema_test_seams::PreparationFault::AfterRegistration,
         )?;
-        // Every helper that admitted out of the scope returns inside it; the
-        // reader child, funded before the scope, is released after it.
         drop(vector_copy_owner);
-        drop(scope);
         drop(read_memory);
         Ok(working)
     }
@@ -7001,10 +6963,9 @@ pub(super) fn received_schema_requires_durable_receiver() -> Error {
     )
 }
 
-/// The local schema image's metadata fold between its draw from the stage
-/// credit and the moment the table image holds it. Dropped while it still owns
-/// the fold (a failure before the tables are installed), it returns the fold;
-/// inside the live spend scope that restores the stage credit it came from.
+/// The local schema image's metadata fold between its admission and the
+/// moment the table image holds it. Dropped while it still owns the fold (a
+/// failure before the tables are installed), it returns the fold.
 struct PreadmittedMetadataFold<'a> {
     accountant: &'a crate::memory_accounting::AccountantHandle,
     bytes: usize,

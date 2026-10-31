@@ -5211,32 +5211,6 @@ impl OwnedEventBusHandle {
             window_refused: state.is_some_and(|s| s.window_refused),
         }
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    /// The bytes the owned commit-event stage map holds for its capacity.
-    /// The map is created empty; the first ordinary owned commit grows it to
-    /// one slot, and that capacity is kept for later commits.
-    /// Returns the map's live stages, its capacity, the bytes its allocation
-    /// holds, and what `native_map_plan` prices for that capacity.
-    #[cfg(test)]
-    pub(super) fn stage_map_for_test(&self) -> (usize, usize, usize, usize) {
-        let map = self.data().stages.lock();
-        let capacity = map.values.capacity();
-        let priced = if capacity == 0 {
-            0
-        } else {
-            crate::memory_accounting::native_map_plan::<
-                Lsn,
-                OwnedEventShared<OwnedCommitEventStage>,
-            >(capacity)
-            .expect("a live map's capacity has a plan")
-            .layout
-            .size()
-        };
-        (map.values.len(), capacity, map.allocation.bytes(), priced)
-    }
 
     pub(super) fn stage_owned_commit_events(
         &self,
