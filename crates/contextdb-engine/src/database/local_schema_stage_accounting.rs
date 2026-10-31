@@ -1286,6 +1286,215 @@ mod local_schema_stage_accounting {
         mixed_owner_refunds(Host::Owned);
     }
 
+    // Plain-release exception. A byte count admitted by a non-stage owner
+    // outside the statement scope is released through the scoped accountant's
+    // plain `release` while the stage payload exceeds it: the release moves
+    // from stage payload to stage credit and neither counter changes. The
+    // ledger then understates the image payload by exactly that count until
+    // the transaction ends, and the transaction's end (COMMIT or ROLLBACK)
+    // must still return every byte exactly once, across a second scope over
+    // the same stage.
+    const EXTERNAL_BYTES: usize = 1000;
+
+    #[derive(Debug)]
+    struct PlainSnapshot {
+        ledger: LocalSchemaStageLedgerForTest,
+        used: i128,
+        aggregate: i128,
+    }
+
+    #[derive(Debug)]
+    struct PlainScope {
+        entry: crate::memory_accounting::ReservationSpendLedger,
+        entry_credit: usize,
+        entry_used: usize,
+        exit: crate::memory_accounting::ReservationSpendLedger,
+        exit_credit: usize,
+        exit_used: usize,
+    }
+
+    #[derive(Debug)]
+    struct PlainRun {
+        staged: PlainSnapshot,
+        admitted: PlainSnapshot,
+        probed: PlainSnapshot,
+        later: PlainSnapshot,
+        scope: Option<PlainScope>,
+        /// After COMMIT: the deltas against the pre-BEGIN counters and the
+        /// absolute live `used`. After ROLLBACK: nothing, the run asserts
+        /// the counters settled at the pre-BEGIN baseline itself.
+        committed: Option<((i128, i128), usize)>,
+    }
+
+    fn plain_snapshot(db: &Database, outer: Base, tx: TxId, what: &str) -> PlainSnapshot {
+        let ledger = db
+            .local_schema_stage_ledger_for_test(tx)
+            .unwrap_or_else(|| panic!("{what}: a local schema stage is pending"));
+        let (used, aggregate) = deltas(db, outer);
+        // Each run opens its own database, so the accountant address and the
+        // writer identity differ between runs; the accounts are what compare.
+        let ledger = LocalSchemaStageLedgerForTest {
+            image_accountant: 0,
+            live_accountant: 0,
+            image_writer_identity: None,
+            live_writer_identity: None,
+            ..ledger
+        };
+        PlainSnapshot { ledger, used, aggregate }
+    }
+
+    fn plain_release_run(host: Host, external: bool, commit: bool) -> PlainRun {
+        let fixture = open_host(host);
+        let db = &fixture.db;
+        let outer = base(db);
+        let (tx, before) = begin(db);
+        db.execute(STATEMENTS[0], &EMPTY()).unwrap();
+        ledger(db, before, "before any external admission");
+        let staged = plain_snapshot(db, outer, tx, "staged");
+        if external {
+            db.finalization
+                .accountant
+                .try_allocate(EXTERNAL_BYTES)
+                .expect("the external owner is admitted outside the scope");
+        }
+        let admitted = plain_snapshot(db, outer, tx, "admitted");
+        let seen = Arc::new(Mutex::new(None));
+        if external {
+            let probe_seen = seen.clone();
+            seams::arm_scope_probe(move |probe| {
+                let entry = probe.ledger();
+                let entry_credit = probe.remaining_credit();
+                let entry_used = probe.used();
+                probe.release(EXTERNAL_BYTES);
+                *probe_seen.lock() = Some(PlainScope {
+                    entry,
+                    entry_credit,
+                    entry_used,
+                    exit: probe.ledger(),
+                    exit_credit: probe.remaining_credit(),
+                    exit_used: probe.used(),
+                });
+            });
+        }
+        db.execute(PROBED, &EMPTY()).unwrap();
+        let probed = plain_snapshot(db, outer, tx, "probed");
+        // The later statement crosses a second scope over the same stage.
+        db.execute(STATEMENTS[2], &EMPTY()).unwrap();
+        let later = plain_snapshot(db, outer, tx, "later");
+        if !external {
+            ledger(db, before, "control, after the later statement");
+        }
+        let scope = seen.lock().take();
+        assert_eq!(scope.is_some(), external, "{host:?}: the probe ran exactly when armed");
+        assert_eq!(
+            db.finalization.accountant.underflow_count_for_test(),
+            0,
+            "{host:?}: no release underflowed before the transaction ended"
+        );
+        let committed = if commit {
+            db.execute("COMMIT", &EMPTY()).unwrap();
+            assert!(db.local_schema_stage_ledger_for_test(tx).is_none());
+            Some((deltas(db, outer), db.finalization.accountant.usage().used))
+        } else {
+            db.execute("ROLLBACK", &EMPTY()).unwrap();
+            assert_settled(db, outer, tx, &format!("{host:?} after rollback"));
+            assert!(db.table_meta("authored_migration").is_none());
+            assert!(db.table_meta("probed").is_none());
+            None
+        };
+        assert_eq!(
+            db.finalization.accountant.underflow_count_for_test(),
+            0,
+            "{host:?}: no release underflowed at the transaction's end"
+        );
+        PlainRun { staged, admitted, probed, later, scope, committed }
+    }
+
+    fn plain_release_balances_at_stage_end(host: Host) {
+        let control = plain_release_run(host, false, true);
+        let run = plain_release_run(host, true, true);
+        let x = EXTERNAL_BYTES as i128;
+        let scope = run.scope.as_ref().expect("the probe ran inside the scope");
+
+        // The release happened while the stage payload exceeded x, and it
+        // moved x from payload to credit, leaving both counters alone.
+        assert!(
+            scope.entry.payload > EXTERNAL_BYTES,
+            "{host:?}: stage payload {} exceeds the external {EXTERNAL_BYTES} bytes",
+            scope.entry.payload
+        );
+        assert_eq!(scope.exit.payload, scope.entry.payload - EXTERNAL_BYTES, "{host:?}: payload falls by x");
+        assert_eq!(scope.exit.restores, scope.entry.restores + EXTERNAL_BYTES, "{host:?}: Rs rises by x");
+        assert_eq!(scope.exit.draws, scope.entry.draws, "{host:?}: D does not move");
+        assert_eq!(scope.exit_credit, scope.entry_credit + EXTERNAL_BYTES, "{host:?}: credit rises by x");
+        assert_eq!(scope.exit_used, scope.entry_used, "{host:?}: the live counter does not move");
+
+        // Admission outside the scope charges both counters by x and moves
+        // no stage account.
+        assert_eq!(run.staged.ledger, control.staged.ledger, "{host:?}: same stage before the admission");
+        assert_eq!((run.staged.used, run.staged.aggregate), (control.staged.used, control.staged.aggregate));
+        assert_eq!(run.admitted.ledger, run.staged.ledger, "{host:?}: the admission moves no stage account");
+        assert_eq!(
+            (run.admitted.used - run.staged.used, run.admitted.aggregate - run.staged.aggregate),
+            (x, x),
+            "{host:?}: the admission charges used and the aggregate by exactly x"
+        );
+
+        // After the probed statement and after the later statement the
+        // stage differs from the control by exactly the attribution: x moved
+        // from payload to credit and into the restore total, with the
+        // counters still holding x above the control.
+        for (name, with, without) in [
+            ("probed", &run.probed, &control.probed),
+            ("later", &run.later, &control.later),
+        ] {
+            assert_eq!(with.ledger.payload + EXTERNAL_BYTES, without.ledger.payload, "{host:?} {name}: payload is x lower");
+            assert_eq!(with.ledger.credit, without.ledger.credit + EXTERNAL_BYTES, "{host:?} {name}: credit is x higher");
+            assert_eq!(with.ledger.restores, without.ledger.restores + EXTERNAL_BYTES, "{host:?} {name}: Rs is x higher");
+            assert_eq!(with.ledger.draws, without.ledger.draws, "{host:?} {name}: D is equal");
+            assert_eq!(with.ledger.hold, without.ledger.hold, "{host:?} {name}: H is equal");
+            assert_eq!(with.ledger.controls_used, without.ledger.controls_used, "{host:?} {name}: Kc is equal");
+            assert_eq!(with.ledger.controls_residue, without.ledger.controls_residue, "{host:?} {name}: Kr is equal");
+            assert_eq!(with.ledger.stage_slot, without.ledger.stage_slot, "{host:?} {name}: S is equal");
+            assert_eq!(with.ledger.stage_slot_residue, without.ledger.stage_slot_residue, "{host:?} {name}: Sr is equal");
+            assert_eq!(with.used, without.used + x, "{host:?} {name}: used is the control's plus x");
+            assert_eq!(with.aggregate, without.aggregate + x, "{host:?} {name}: the aggregate is the control's plus x");
+        }
+
+        // COMMIT: exact live and process totals equal the control's.
+        let (with_deltas, with_used) = run.committed.expect("committed");
+        let (without_deltas, without_used) = control.committed.expect("committed");
+        assert_eq!(with_deltas, without_deltas, "{host:?}: COMMIT deltas (used, aggregate) equal the control's");
+        assert_eq!(with_used, without_used, "{host:?}: COMMIT live used equals the control's");
+
+        eprintln!(
+            "{host:?}: plain release x={EXTERNAL_BYTES} entry payload={} credit={} \
+             | before COMMIT with x (used, aggregate) later={:?} control later={:?} \
+             | COMMIT deltas with x={with_deltas:?} control={without_deltas:?} \
+             | COMMIT live used with x={with_used} control={without_used}",
+            scope.entry.payload,
+            scope.entry_credit,
+            (run.later.used, run.later.aggregate),
+            (control.later.used, control.later.aggregate),
+        );
+
+        // ROLLBACK returns exactly to the baseline taken before the external
+        // admission; the run asserts that itself.
+        let rolled_back = plain_release_run(host, true, false);
+        assert!(rolled_back.committed.is_none());
+        assert_eq!(rolled_back.later.ledger, run.later.ledger, "{host:?}: the same stage reaches ROLLBACK");
+    }
+
+    #[test]
+    fn local_schema_plain_release_of_an_external_admission_balances_at_stage_end_on_the_legacy_host() {
+        plain_release_balances_at_stage_end(Host::Legacy);
+    }
+
+    #[test]
+    fn local_schema_plain_release_of_an_external_admission_balances_at_stage_end_on_the_owned_host() {
+        plain_release_balances_at_stage_end(Host::Owned);
+    }
+
     /// Statements staged before the one a late shortage refuses, the refused
     /// statement, and a later statement that must still succeed.
     const LATE_CASES: [(&str, &[&str]); 6] = [
