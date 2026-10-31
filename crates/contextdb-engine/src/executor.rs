@@ -4728,9 +4728,8 @@ fn vector_partition_inspection_row(
         Value::Text(query_state.to_owned()),
         Value::Text(
             native
-                .map_or(lifecycle.availability_reason, |native| {
-                    native.state().unwrap_or("none")
-                })
+                .and_then(|native| native.state())
+                .unwrap_or(lifecycle.availability_reason)
                 .to_owned(),
         ),
         Value::Text(lifecycle.maintenance_state.to_owned()),
