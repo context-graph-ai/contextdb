@@ -31,7 +31,6 @@ use uuid::Uuid;
 
 const MAX_MAINTENANCE_CYCLES: usize = 16;
 const SAFETY_TIMEOUT: Duration = Duration::from_secs(5);
-const FINITE_CLEANUP_BUDGET: usize = 64 * 1024 * 1024;
 const RECEIVED_TENANT: &str = "vector-memory-ownership-reconciliation";
 const RECEIVED_SCHEMA: &str = "CREATE TABLE received_items (
     id UUID PRIMARY KEY,
@@ -155,77 +154,6 @@ fn indexed_result(
         ]),
     )
     .expect("the production indexed SQL door serves the selected partition")
-}
-
-#[derive(Clone, Copy)]
-struct FrozenClock;
-
-impl DeadlineClock for FrozenClock {
-    fn now_ms(&self) -> u64 {
-        0
-    }
-
-    fn wait_until(&self, _deadline_ms: u64) -> DeadlineWait<'_> {
-        Box::pin(async {})
-    }
-}
-
-fn roomy_read_limits() -> ReadLimits {
-    ReadLimits {
-        result_rows: 1_000,
-        result_bytes: 16 * 1024 * 1024,
-        work: 10_000_000,
-        active_ms: 1_000_000,
-        memory: 128 * 1024 * 1024,
-        cursor_page_rows: 128,
-        cursor_page_bytes: 4 * 1024 * 1024,
-        cursor_idle_ms: 10_000,
-        cursor_lifetime_ms: 100_000,
-    }
-}
-
-fn bounded_indexed_request(query: Vec<f32>) -> bounded::BoundedReadRequest {
-    bounded::BoundedReadRequest::new(
-        "SELECT id, embedding FROM load_items WHERE scope = 'alpha' \
-         ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
-        params([("query", Value::Vector(query))]),
-        roomy_read_limits(),
-        Arc::new(FrozenClock),
-    )
-}
-
-struct CancelOnDormantPrecharge {
-    expected_bytes: u64,
-    cancellation: OwnerReadCancellation,
-    observed: AtomicBool,
-    held_before: AtomicU64,
-    cancellation_observed: AtomicBool,
-}
-
-impl bounded::ExecutionProbe for CancelOnDormantPrecharge {
-    fn before_work(&self, _source: bounded::TestWorkSource, _completed_work: u64) {}
-
-    fn after_temporary_reservation(
-        &self,
-        source: bounded::TestWorkSource,
-        reserved_bytes: u64,
-        held_temporary_bytes: u64,
-    ) {
-        if source == bounded::TestWorkSource::VectorCandidates
-            && reserved_bytes == self.expected_bytes
-            && !self.observed.swap(true, Ordering::SeqCst)
-        {
-            self.held_before.store(
-                held_temporary_bytes.saturating_sub(reserved_bytes),
-                Ordering::SeqCst,
-            );
-            self.cancellation.cancel();
-        }
-    }
-
-    fn cancellation_observed(&self, _completed_work: u64) {
-        self.cancellation_observed.store(true, Ordering::SeqCst);
-    }
 }
 
 fn assert_exact_vector(
@@ -404,43 +332,6 @@ macro_rules! assert_exact_reconciliation {
 fn open_with_accountant(path: &std::path::Path, accountant: Arc<MemoryAccountant>) -> Database {
     Database::open_with_config(path, Arc::new(CorePlugin), accountant)
         .expect("open the durable fixture with the caller accountant")
-}
-
-fn run_maintenance_with_journal_cleanup_paused(
-    db: &Arc<Database>,
-    accountant: &MemoryAccountant,
-) -> (
-    VectorMemoryOwnershipReceiptForTest,
-    usize,
-    MaintenanceReport,
-) {
-    let pause = db.__arm_one_shot_vector_journal_cleanup_pause_for_test();
-    let worker_db = Arc::clone(db);
-    let (result_tx, result_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        result_tx
-            .send(worker_db.run_maintenance_cycle())
-            .expect("cleanup result receiver remains live");
-    });
-    if !pause.wait_until_reached(SAFETY_TIMEOUT) {
-        pause.release();
-        let _ = result_rx.recv_timeout(SAFETY_TIMEOUT);
-        worker
-            .join()
-            .expect("cleanup worker exits after an unreached pause is released");
-        panic!("maintenance did not reach the live journal-cleanup allocation pause");
-    }
-    let active = receipt!(db);
-    let accountant_used = accountant.usage().used;
-    pause.release();
-    let report = result_rx
-        .recv_timeout(SAFETY_TIMEOUT)
-        .expect("released journal cleanup returns before the safety timeout")
-        .expect("released journal cleanup completes its finite maintenance cycle");
-    worker
-        .join()
-        .expect("journal-cleanup maintenance worker exits after release");
-    (active, accountant_used, report)
 }
 
 /// Restart must retain only dormant descriptors until one partition is used;

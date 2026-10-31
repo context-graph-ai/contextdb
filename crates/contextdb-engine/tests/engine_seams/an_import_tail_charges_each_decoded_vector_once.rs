@@ -513,18 +513,6 @@ fn options(limit: usize) -> DatabaseOpenOptions {
     }
 }
 
-const CRASH_LIMIT: usize = 16 * 1024 * 1024;
-const CRASH_SUFFIX_ROWS: usize = 480;
-
-fn nearest(db: &Database, query: Vec<f32>) -> Vec<Vec<Value>> {
-    db.execute(
-        "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-        &HashMap::from([("q".into(), Value::Vector(query))]),
-    )
-    .unwrap()
-    .rows().to_vec()
-}
-
 fn absorb_quantized(quantization: &str) {
     const QUANTIZED_DIMENSION: usize = 64;
     let root = tempfile::tempdir().unwrap();

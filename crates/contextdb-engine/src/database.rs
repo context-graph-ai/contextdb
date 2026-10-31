@@ -4681,8 +4681,6 @@ enum DatabaseAssemblyBudget {
 // live malloc objects. Add the whole requested live stack separately. Native
 // qualification must reconcile the complete process with the writer ceiling.
 
-const VECTOR_GENERATION_PERSISTENCE_COPIES: usize = 6;
-
 #[derive(Default)]
 pub(crate) struct RetentionDeferredEdges {
     nodes: HashSet<NodeId>,
@@ -4753,12 +4751,6 @@ pub(crate) struct MaintenanceContext {
     snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     finalization: Arc<StoreFinalization>,
     pending_local_schema_stages: Arc<Mutex<schema_stage_registry::PendingRegistry>>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct VectorPartitionPublicationOutcome {
-    published: bool,
-    cleanup_failure: Option<VectorMaintenanceFailureDetails>,
 }
 
 struct MaintenanceCleanup {

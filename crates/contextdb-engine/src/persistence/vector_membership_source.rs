@@ -3755,59 +3755,6 @@ impl DurableReverseMembershipSource {
     }
 }
 
-fn canonical_partition_allocation_bounds(key: &VectorPartitionKey) -> Option<(usize, usize)> {
-    let mut len = 0usize;
-    let mut cap = 0usize;
-
-    let simulate_grow = |len: &mut usize, cap: &mut usize, additional: usize| -> Option<()> {
-        let req = len.checked_add(additional)?;
-        if req > *cap {
-            let doubled = cap.checked_mul(2)?;
-            let mut new_cap = if *cap == 0 { 8 } else { doubled };
-            if new_cap < req {
-                new_cap = req;
-            }
-            *cap = new_cap;
-        }
-        *len = req;
-        Some(())
-    };
-
-    simulate_grow(&mut len, &mut cap, 1)?;
-    simulate_grow(&mut len, &mut cap, 8)?;
-
-    for component in key.components() {
-        match component {
-            contextdb_core::VectorPartitionComponent::Uuid(_) => {
-                simulate_grow(&mut len, &mut cap, 1)?;
-                simulate_grow(&mut len, &mut cap, 16)?;
-            }
-            contextdb_core::VectorPartitionComponent::Text(value) => {
-                simulate_grow(&mut len, &mut cap, 1)?;
-                simulate_grow(&mut len, &mut cap, 8)?;
-                simulate_grow(&mut len, &mut cap, value.len())?;
-            }
-            contextdb_core::VectorPartitionComponent::Integer(_) => {
-                simulate_grow(&mut len, &mut cap, 1)?;
-                simulate_grow(&mut len, &mut cap, 8)?;
-            }
-            contextdb_core::VectorPartitionComponent::Boolean(_) => {
-                simulate_grow(&mut len, &mut cap, 1)?;
-                simulate_grow(&mut len, &mut cap, 1)?;
-            }
-            contextdb_core::VectorPartitionComponent::Timestamp(_) => {
-                simulate_grow(&mut len, &mut cap, 1)?;
-                simulate_grow(&mut len, &mut cap, 8)?;
-            }
-            contextdb_core::VectorPartitionComponent::TxId(_) => {
-                simulate_grow(&mut len, &mut cap, 1)?;
-                simulate_grow(&mut len, &mut cap, 8)?;
-            }
-        }
-    }
-    Some((len, cap))
-}
-
 use crate::persistence::writer_source::WriterSnapshotHandle;
 
 /// The exact count-header producer must authenticate but not decode a later

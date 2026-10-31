@@ -40,7 +40,6 @@ const F32_INDEX_THRESHOLD: usize = 1_000;
 const MAINTENANCE_CYCLES: usize = 64;
 const VECTOR_REFUSAL_HEADROOM_BYTES: usize = 8 * 1024;
 const SELECTED_SCOPE: u128 = 0xA110_0000_0000_0000_0000_0000_0000_0001;
-const OTHER_SCOPE: u128 = 0xA110_0000_0000_0000_0000_0000_0000_0002;
 
 #[derive(Clone, Copy)]
 struct FrozenClock;
@@ -221,10 +220,6 @@ fn selected_scope() -> Uuid {
     Uuid::from_u128(SELECTED_SCOPE)
 }
 
-fn other_scope() -> Uuid {
-    Uuid::from_u128(OTHER_SCOPE)
-}
-
 fn index() -> VectorIndexRef {
     VectorIndexRef::new("vector_truth", "embedding")
 }
@@ -232,10 +227,6 @@ fn index() -> VectorIndexRef {
 fn partition(scope: Uuid) -> VectorPartitionKey {
     VectorPartitionKey::from_values(&[Value::Uuid(scope)])
         .expect("a UUID partition key has a canonical public identity")
-}
-
-fn partition_ref(scope: Uuid) -> VectorPartitionRef {
-    VectorPartitionRef::new(index(), partition(scope))
 }
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {

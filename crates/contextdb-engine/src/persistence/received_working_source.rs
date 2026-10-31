@@ -294,20 +294,6 @@ impl WorkingReadSource {
     pub(crate) fn root(&self) -> WriterSnapshotHandle {
         self.root.clone()
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn vector_reader_memory(
-        &self,
-    ) -> Result<crate::read_image_memory::ImageMemoryHandle> {
-        self.context(|context| {
-            crate::read_image_memory::ImageMemory::operation_reader(
-                context.original.accountant().clone(),
-                self.budget.clone(),
-            )
-        })
-    }
 
     #[expect(
         clippy::result_large_err,
@@ -1452,35 +1438,6 @@ impl WorkingReadSource {
             });
         }
         Ok(())
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn read_vector_lineage(
-        &self,
-        captured: &WorkingVectorCapture,
-        key: &[u8],
-    ) -> Result<Option<writer_source::WriterWindow<VectorIndexRef>>> {
-        self.check_vector_capture(captured)?;
-        let result = self.read_vector_record(
-            super::received_working_vector::WORKING_VECTOR_LINEAGE,
-            Bound::Included(key),
-            Bound::Included(key),
-            false,
-            |_key, encoded| RedbPersistence::decode::<VectorIndexRef>(encoded),
-        )?;
-        self.check_vector_capture(captured)?;
-        if result
-            .as_ref()
-            .is_some_and(|window| window.position.as_ref() != key)
-        {
-            return Err(Error::StoreCorrupted {
-                path: "received working vector lineage".into(),
-                reason: "lineage point read escaped its key".into(),
-            });
-        }
-        Ok(result)
     }
 
     #[expect(

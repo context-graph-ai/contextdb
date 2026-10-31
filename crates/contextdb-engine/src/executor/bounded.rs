@@ -2094,79 +2094,6 @@ impl RequestContext {
         }
     }
 
-    /// Move `bytes` of this request's load credit to `destination`, the owner
-    /// that keeps a cold-loaded vector graph after this request ends. The
-    /// destination admits first, with no lock of this request held, because
-    /// admitting can reclaim vector caches; this request's credit is then split
-    /// off and given back in one step, so the graph is never unfunded. The
-    /// search that calls this holds `vector_copies`, so it is never touched
-    /// here, and the move must hold past cancellation and the statement
-    /// ceiling, so it never reserves.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn transfer_graph_credit(
-        &self,
-        destination: &crate::memory_accounting::MemoryAccountant,
-        bytes: usize,
-    ) -> contextdb_core::Result<()> {
-        #[cfg(any(test, feature = "test-seams"))]
-        self.observe_graph_credit_transfer(
-            GraphCreditTransferPhase::BeforeDestination,
-            destination,
-            bytes,
-        );
-        let original = self.state().memory.owner();
-        destination.transfer_vector_load_reservation(&original, bytes, |prepaid, moved| {
-            #[cfg(any(test, feature = "test-seams"))]
-            self.observe_graph_credit_transfer(
-                GraphCreditTransferPhase::DestinationAdmitted,
-                destination,
-                bytes,
-            );
-            let split = self.split_kernel_credit(bytes, false)?;
-            if prepaid {
-                // transfer sets the credit to zero before invoking its Drop
-                // observer. The destination owns cleanup if that observer unwinds.
-                *moved = true;
-                split.transfer();
-            } else {
-                drop(split);
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            self.observe_graph_credit_transfer(
-                GraphCreditTransferPhase::SourceSplit,
-                destination,
-                bytes,
-            );
-            Ok(())
-        })
-    }
-
-    /// Report where one graph credit move stands to this read's probe. It
-    /// reads this request's credit under a brief `state` lock and the
-    /// destination's usage, and calls the probe with no lock of this request
-    /// held; it never touches `vector_copies`.
-    #[cfg(any(test, feature = "test-seams"))]
-    fn observe_graph_credit_transfer(
-        &self,
-        phase: GraphCreditTransferPhase,
-        destination: &crate::memory_accounting::MemoryAccountant,
-        bytes: usize,
-    ) {
-        let Some(probe) = self.probe() else {
-            return;
-        };
-        let request_credit = self.state().memory.bytes();
-        probe.graph_credit_transfer(GraphCreditTransferCut {
-            phase,
-            bytes,
-            request_credit,
-            destination_used: destination.usage().used,
-        });
-    }
-
     /// The terminal answer for a caller that withdrew its read while the
     /// snapshot registration was parked behind an in-flight removal pass.
     fn withdrawn_failure(&self) -> BoundedExecutionError {
@@ -2860,27 +2787,6 @@ impl RequestContext {
 
     fn can_charge_more_work(&self) -> bool {
         self.state().telemetry.work_units < self.limits.work && cursor_replay_work_available()
-    }
-
-    /// Give the graph traversal a finite ceiling derived from the work this
-    /// request still owns. The normal callbacks remain the aggregate guard;
-    /// these values also prevent the filtered graph algorithm from wandering
-    /// indefinitely while looking for allowed row ids.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn remaining_vector_graph_work(&self) -> std::result::Result<usize, BoundedExecutionError> {
-        self.check_final_boundary()?;
-        let remaining = {
-            let state = self.state();
-            self.limits
-                .work
-                .checked_sub(state.telemetry.work_units)
-                .filter(|remaining| *remaining > 0)
-                .ok_or_else(|| Self::limit_failure(ReadFailureLimit::Work, self.limits.work))?
-        };
-        Ok(usize::try_from(remaining).unwrap_or(usize::MAX))
     }
 
     /// Whether an operator should stop here and finish on a later fetch.
@@ -16498,27 +16404,6 @@ pub struct GraphCreditTransferCut {
     pub destination_used: usize,
 }
 
-/// The callback a cold vector graph load uses to hand its load credit to the
-/// graph's owner. It owns `funding`, the charge for its own allocation, until
-/// its last clone drops. The prototype and the funded callback are both built
-/// here, so they share one closure type and one layout.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn graph_credit_transfer(
-    context: ControlArc<RequestContext>,
-    funding: SourcePageCharge,
-) -> impl Fn(&crate::memory_accounting::MemoryAccountant, usize) -> contextdb_core::Result<()>
-+ Send
-+ Sync
-+ 'static {
-    move |destination: &crate::memory_accounting::MemoryAccountant, bytes: usize| {
-        let _funding = &funding;
-        context.transfer_graph_credit(destination, bytes)
-    }
-}
-
 /// Whether a refusal is this reader's own memory limit. An AUTO search that
 /// cannot afford its graph answers with the exact scan only for this refusal;
 /// a work, time, cancellation or any other failure still ends the read.
@@ -16532,51 +16417,6 @@ fn reader_memory_refusal(error: &BoundedExecutionError) -> bool {
                     if detail.limit == ReadFailureLimit::Memory
             )
     )
-}
-
-/// The transfer callback, charged to this request before it is allocated. A
-/// stack prototype with an empty charge gives the closure's exact layout; the
-/// allocation is that layout behind the `Arc` header. The callback carries a
-/// live charge for exactly those bytes, so this read's ceiling keeps counting
-/// them for as long as the callback lives.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn funded_graph_credit_transfer(
-    context: &ControlArc<RequestContext>,
-) -> std::result::Result<
-    crate::local_transport::query_funding::Funded<super::VectorLoadReservationTransfer>,
-    BoundedExecutionError,
-> {
-    let prototype = graph_credit_transfer(
-        context.clone(),
-        SourcePageCharge {
-            _credit: ReadCredit::new(context.reader_budget.clone()),
-            live: context.live_source_pages.clone(),
-            funding: context.request_funding.clone(),
-            bytes: 0,
-        },
-    );
-    let bytes = std::alloc::Layout::new::<[usize; 2]>()
-        .extend(std::alloc::Layout::for_value(&prototype))
-        .map(|(layout, _)| layout.pad_to_align().size())
-        .map_err(|_| Error::Other(("vector load transfer layout overflows".to_string()).into()))?;
-    drop(prototype);
-    let mut funding = context.admit_live_charge(
-        BoundedWorkSource::VectorCandidates,
-        bytes,
-        "fund_vector_load_transfer",
-    )?;
-    let credit = funding._credit.try_split_off(bytes)?;
-    let transfer: super::VectorLoadReservationTransfer =
-        Arc::new(graph_credit_transfer(context.clone(), funding));
-    // All raw aliases are consumed by the synchronous search/TLS scope.
-    // This keeper remains outside that scope through return and unwind.
-    Ok(crate::local_transport::query_funding::Funded {
-        value: transfer,
-        credit: Some(credit),
-    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -4047,64 +4047,6 @@ impl RedbPersistence {
         key
     }
 
-    pub(super) fn vector_partition_catalog_key_from_parts(
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> Vec<u8> {
-        Self::vector_partition_prefix(index, partition_key)
-    }
-
-    pub(super) fn vector_partition_base_generation_key_from_parts(
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        generation_id: u64,
-    ) -> Vec<u8> {
-        let mut key = Self::vector_partition_prefix_with_suffix_capacity(index, partition_key, 8);
-        key.extend_from_slice(&generation_id.to_be_bytes());
-        key
-    }
-
-    pub(super) fn vector_partition_change_generation_key_from_parts(
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        base_generation_id: u64,
-        change_generation_id: u64,
-    ) -> Vec<u8> {
-        let mut key = Self::vector_partition_prefix_with_suffix_capacity(index, partition_key, 16);
-        key.extend_from_slice(&base_generation_id.to_be_bytes());
-        key.extend_from_slice(&change_generation_id.to_be_bytes());
-        key
-    }
-
-    pub(super) fn vector_partition_graph_page_key(root_key: &[u8], page: u32) -> Vec<u8> {
-        let mut key = Vec::with_capacity(root_key.len().saturating_add(4));
-        key.extend_from_slice(root_key);
-        key.extend_from_slice(&page.to_be_bytes());
-        key
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn insert_preencoded_immutable_vector_partition_record(
-        table: &mut redb::Table<'_, &[u8], &[u8]>,
-        key: &[u8],
-        encoded: &[u8],
-        persistence: &Self,
-    ) -> Result<()> {
-        if let Some(existing) = table.get_bounded(key).map_err(Self::storage_error)? {
-            if existing.value() != encoded {
-                return Err(persistence.vector_partition_corruption(
-                    "one immutable generation identity has conflicting payload bytes",
-                ));
-            }
-            return Ok(());
-        }
-        table.insert(key, encoded).map_err(Self::storage_error)?;
-        Ok(())
-    }
-
     // The transaction, table codec, and two record projections are the one
     // atomic durable rename operation; bundling them would hide that boundary.
     #[allow(clippy::too_many_arguments)]
@@ -4632,37 +4574,6 @@ impl RedbPersistence {
         Self::ensure_open_vector_directory_in_write(write_txn)
     }
 
-    // Physical pages share the manifest table but append an ordinal to a root.
-    // Recognize only the two generation suffixes and the compact-root namespace;
-    // every other key must still pass the typed manifest decoder.
-    pub(super) fn is_vector_partition_graph_page_record_key(key: &[u8]) -> bool {
-        if key.starts_with(&[0xff, b'V', b'G']) {
-            return key.len() == 40 && matches!(key[3], 0xb0 | 0xc0);
-        }
-        let mut remaining = key;
-        for _ in 0..3 {
-            let Some(length_bytes) = remaining.get(..8) else {
-                return false;
-            };
-            let Ok(length) = usize::try_from(u64::from_be_bytes(
-                length_bytes
-                    .try_into()
-                    .expect("eight-byte component length"),
-            )) else {
-                return false;
-            };
-            let Some(component_end) = 8usize.checked_add(length) else {
-                return false;
-            };
-            let Some(suffix) = remaining.get(component_end..) else {
-                return false;
-            };
-            remaining = suffix;
-        }
-        (remaining.len() == 13 && remaining[8] == 0xb0)
-            || (remaining.len() == 21 && remaining[16] == 0xc0)
-    }
-
     // Call only after admitting the manifest and producer-key scratch. The
     // envelope authenticates the value; this binds it to its physical root.
 
@@ -4677,46 +4588,6 @@ impl RedbPersistence {
             && membership.row_lsn == identity.row_lsn
             && membership.vector_created_tx == identity.vector_created_tx
             && membership.vector_lsn == identity.vector_lsn
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn remove_vector_partition_prefix_records_in_write<T>(
-        &self,
-        write_txn: &redb::WriteTransaction,
-        definition: TableDefinition<&'static [u8], &'static [u8]>,
-        kind: VectorPartitionRecordKind,
-        prefix: &[u8],
-        key_for: impl Fn(&T) -> Vec<u8>,
-    ) -> Result<()>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let mut table = match write_txn.open_table(definition) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(error) => return Err(Self::storage_error(error)),
-        };
-        let mut keys = Vec::new();
-        for entry in table.range(prefix..).map_err(Self::storage_error)? {
-            let (key, value) = entry.map_err(Self::storage_error)?;
-            if !key.value().starts_with(prefix) {
-                break;
-            }
-            let record: T = self.decode_vector_partition_record(kind, value.value())?;
-            if key_for(&record).as_slice() != key.value() {
-                return Err(self.vector_partition_corruption(
-                    "partition generation key does not match its checksummed payload",
-                ));
-            }
-            keys.push(key.value().to_vec());
-        }
-        for key in keys {
-            table.remove(key.as_slice()).map_err(Self::storage_error)?;
-        }
-        Ok(())
     }
 
     #[expect(
@@ -5923,42 +5794,6 @@ impl RedbPersistence {
             .get()
             .expect("decode accountant published")
             .accountant())
-    }
-
-    /// A route's maintained pending counters as `(covered_tx, inserts,
-    /// tombstones)`: the serving frontier's and, while a replacement builds,
-    /// its candidate's.
-    #[cfg(any(test, feature = "test-seams"))]
-    #[allow(clippy::type_complexity)]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
-        )
-    )]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub(crate) fn vector_pending_counters_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Result<((TxId, u64, u64), Option<(TxId, u64, u64)>)> {
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            let summary = vector_membership_pages::read_partition_summary(&read, partition)?;
-            let counts = |counts: &vector_membership_pages::PendingCounts| {
-                (counts.covered_tx, counts.pending_inserts, counts.tombstones)
-            };
-            Ok((
-                counts(&summary.pending),
-                summary.candidate_pending.as_ref().map(counts),
-            ))
-        })
     }
 
     /// Read routes install their reader owner before entering here, and a

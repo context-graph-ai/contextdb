@@ -86,19 +86,6 @@ fn physical_roots(db: &Database) -> BTreeMap<String, Option<Option<[u8; 32]>>> {
         })
         .unwrap()
 }
-fn assert_binding_unchanged(
-    db: &Database,
-    before: &Option<crate::persistence::VectorSchemaBinding>,
-) {
-    let after = db
-        .persistence
-        .as_ref()
-        .map(|p| p.vector_schema_binding(&index("embedding")).unwrap());
-    assert_eq!(
-        &after, before,
-        "breadth cannot invent a column incarnation or table generation"
-    );
-}
 
 // Address every immutable authored row occurrence through the same source
 // lookup the production history exporter uses. Scalar values remain comparable

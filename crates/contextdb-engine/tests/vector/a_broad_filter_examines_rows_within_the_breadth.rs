@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 const DIMENSION: usize = 16;
 const ROWS: usize = 3_000;
-const M: usize = 8;
 const BREADTH: usize = 32;
 const LIMIT: usize = 10;
 

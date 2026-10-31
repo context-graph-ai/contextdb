@@ -2852,36 +2852,6 @@ const RECEIVED_VECTOR_COUNTS: TableDefinition<&[u8], u64> =
     TableDefinition::new("__received_vector_partition_counts");
 
 impl RedbPersistence {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn received_vector_body_in_write_original(
-        &self,
-        frame: &OriginalPersistenceFrame<'_>,
-        write: &redb::WriteTransaction,
-        member: &VectorPartitionMembershipRecord,
-    ) -> Result<Option<VectorEntry>> {
-        frame.reserve(
-            member
-                .index
-                .table
-                .len()
-                .saturating_add(member.index.column.len())
-                .saturating_add(34),
-        )?;
-        let key = Self::vector_identity_key(
-            &member.index,
-            member.row_id,
-            member.vector_created_tx,
-            member.vector_lsn,
-        );
-        let bodies = write
-            .open_table(RECEIVED_VECTOR_BODIES)
-            .map_err(Self::storage_error)?;
-        let value = bodies.get(key.as_slice()).map_err(Self::storage_error)?;
-        value.map(|value| frame.decode(value.value())).transpose()
-    }
 }
 
 impl RedbPersistence {

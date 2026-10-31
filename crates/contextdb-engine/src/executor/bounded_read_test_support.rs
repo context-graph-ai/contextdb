@@ -126,9 +126,6 @@ impl BoundedExecutionProbe for ProbeAdapter {
         self.0.cancellation_observed(completed_work);
     }
 
-    fn graph_credit_transfer(&self, cut: GraphCreditTransferCut) {
-        self.0.graph_credit_transfer(cut);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

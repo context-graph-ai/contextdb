@@ -853,64 +853,6 @@ impl RedbPersistence {
         })
     }
 
-    /// Materialize only the admitted raw prefix, holding one decoded
-    /// membership at a time rather than a partition-sized metadata clone.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn load_vector_partition_entries_at_frontier(
-        &self,
-        partition: &VectorPartitionRef,
-        covered_tx: TxId,
-        dimension: usize,
-        raw_count: usize,
-    ) -> Result<Vec<VectorEntry>> {
-        let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            let memberships = match read.open_byte_table_bounded(VECTOR_PARTITION_MEMBERSHIP_TABLE)
-            {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut entries = Vec::with_capacity(raw_count);
-            for record in memberships
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-            {
-                let (key, value) = record.map_err(Self::storage_error)?;
-                if !key.value().starts_with(&prefix) {
-                    break;
-                }
-                let membership: VectorPartitionMembershipRecord = self
-                    .decode_expected_vector_partition_metadata(
-                        VectorPartitionRecordKind::Membership,
-                        value.value(),
-                        &partition.index,
-                        &partition.partition_key,
-                    )?;
-                if Self::vector_partition_membership_key(&membership).as_slice() != key.value() {
-                    return Err(self.vector_partition_corruption(
-                        "maintenance membership key disagrees with its payload",
-                    ));
-                }
-                if membership.vector_created_tx > covered_tx {
-                    continue;
-                }
-                let mut body = self.load_vector_entries_for_memberships_in_read(
-                    &read,
-                    std::slice::from_ref(&membership),
-                    dimension,
-                    None,
-                )?;
-                entries.push(body.pop().expect("one membership loads one body"));
-            }
-            Ok(entries)
-        })
-    }
-
     /// Load only membership versions for one row in one exact partition.
     /// The durable key is partition-first and then row-first, so unrelated
     /// rows in even a very large partition are never decoded for a point
@@ -1363,13 +1305,6 @@ impl RedbPersistence {
         )
     }
 
-    pub(crate) fn vector_journal_cleanup_key_reservation(
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> usize {
-        Self::vector_partition_physical_key_bound(index, partition_key, 16).saturating_mul(3)
-    }
-
     #[cfg(any(test, feature = "test-seams"))]
     #[cfg_attr(
         any(test, feature = "test-seams"),
@@ -1461,182 +1396,6 @@ impl RedbPersistence {
             graph_commit_result
         }
         .map_err(Self::storage_error)
-    }
-
-    /// Count raw membership versions separately from the selected live graph
-    /// points. Tombstone records describe absence and are never another point.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn vector_partition_maintenance_entry_counts(
-        &self,
-        partition: &VectorPartitionRef,
-        covered_tx: TxId,
-        after_lsn: Option<Lsn>,
-    ) -> Result<(usize, usize)> {
-        let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            let table = match read.open_byte_table_bounded(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((0, 0)),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut raw = 0usize;
-            let mut selected = 0usize;
-            for entry in table
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-            {
-                let (key, value) = entry.map_err(Self::storage_error)?;
-                #[cfg(any(test, feature = "test-seams"))]
-                crate::database::resident_history_test_seams::note(|work| {
-                    work.maintenance_source_visits += 1
-                });
-                if !key.value().starts_with(&prefix) {
-                    break;
-                }
-                let record: VectorPartitionMembershipRecord = self
-                    .decode_expected_vector_partition_metadata(
-                        VectorPartitionRecordKind::Membership,
-                        value.value(),
-                        &partition.index,
-                        &partition.partition_key,
-                    )?;
-                if Self::vector_partition_membership_key(&record).as_slice() != key.value() {
-                    return Err(self.vector_partition_corruption(
-                        "maintenance membership key disagrees with its payload",
-                    ));
-                }
-                if record.vector_created_tx > covered_tx {
-                    continue;
-                }
-                raw = raw.checked_add(1).ok_or_else(|| {
-                    self.vector_partition_corruption("maintenance raw count overflow")
-                })?;
-                if record.deleted_tx.is_none_or(|tx| tx > covered_tx)
-                    && after_lsn.is_none_or(|lsn| record.vector_lsn > lsn)
-                {
-                    selected = selected.checked_add(1).ok_or_else(|| {
-                        self.vector_partition_corruption("maintenance graph count overflow")
-                    })?;
-                }
-            }
-            Ok((raw, selected))
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn vector_partition_uncovered_tombstone_entry_count(
-        &self,
-        partition: &VectorPartitionRef,
-        after_lsn: Lsn,
-        covered_lsn: Lsn,
-        mut admit_identities: impl FnMut(usize) -> Result<()>,
-    ) -> Result<usize> {
-        if after_lsn >= covered_lsn {
-            return Ok(0);
-        }
-        let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            let table = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut lower = prefix.clone();
-            lower.extend_from_slice(&(after_lsn.0 + 1).to_be_bytes());
-            let upper = if let Some(next) = covered_lsn.0.checked_add(1) {
-                let mut key = prefix.clone();
-                key.extend_from_slice(&next.to_be_bytes());
-                key
-            } else {
-                writer_source::prefix_end(&prefix).ok_or_else(|| {
-                    self.vector_partition_corruption("journal prefix has no upper bound")
-                })?
-            };
-            let mut identities = BTreeSet::new();
-            for entry in table
-                .range(lower.as_slice()..upper.as_slice())
-                .map_err(Self::storage_error)?
-            {
-                let (key, value) = entry.map_err(Self::storage_error)?;
-                #[cfg(any(test, feature = "test-seams"))]
-                crate::database::resident_history_test_seams::note(|work| {
-                    work.maintenance_source_visits += 1
-                });
-                if !key.value().starts_with(&prefix) {
-                    break;
-                }
-                let record: VectorPartitionJournalRecord = self
-                    .decode_expected_vector_partition_metadata(
-                        VectorPartitionRecordKind::Journal,
-                        value.value(),
-                        &partition.index,
-                        &partition.partition_key,
-                    )?;
-                if Self::vector_partition_journal_key(&record).as_slice() != key.value() {
-                    return Err(self.vector_partition_corruption(
-                        "maintenance journal key disagrees with its payload",
-                    ));
-                }
-                if record.lsn <= after_lsn || record.lsn > covered_lsn {
-                    continue;
-                }
-                if let VectorPartitionJournalChange::Tombstone(tombstone) = record.change {
-                    let membership = tombstone.membership;
-                    // BTree nodes are admitted before each possible insertion.
-                    admit_identities(identities.len().saturating_add(1))?;
-                    identities.insert((
-                        membership.row_id,
-                        membership.vector_created_tx,
-                        membership.vector_lsn,
-                    ));
-                }
-            }
-            Ok(identities.len())
-        })
-    }
-
-    /// The column declaration in force at an operation's captured root.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn vector_layout_in_read(
-        read: &redb::ReadTransaction,
-        index: &VectorIndexRef,
-        owner: &mut contextdb_vector::VectorCopyAdmission,
-    ) -> Result<contextdb_vector::store::VectorIndexLayout> {
-        let meta = Self::load_table_meta_in_read_txn(read, &index.table)?;
-        if let Some(column) = meta.as_ref().and_then(|meta| {
-            meta.columns
-                .iter()
-                .find(|column| column.name == index.column)
-        }) {
-            if let Some(names) = &column.partition_key_columns {
-                let bytes = names
-                    .iter()
-                    .fold(
-                        names.len().checked_mul(std::mem::size_of::<String>()),
-                        |bytes, name| bytes.and_then(|bytes| bytes.checked_add(name.len())),
-                    )
-                    .ok_or_else(|| Error::Other("captured layout size overflow".into()))?;
-                // Admit before the layout clones its retained strings.
-                owner.reserve(bytes)?;
-            }
-            if let Some(layout) = crate::database::vector_index_layout_from_column(column) {
-                return Ok(layout);
-            }
-        }
-        Err(vector_membership_source::damage(
-            "captured serving root does not declare this vector column",
-        ))
     }
 
     /// Seek strictly after the complete covered LSN cohort, including every
@@ -1831,77 +1590,6 @@ impl RedbPersistence {
         })
     }
 
-    /// Resolve the immutable vector bodies named by uncovered tombstones.
-    /// Delete-only generation publication needs those bodies as non-visible
-    /// graph carriers even though they are absent from the live entry set.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn load_vector_partition_uncovered_tombstone_entries(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        covered_lsn: Lsn,
-        through_lsn: Lsn,
-        expected_dimension: usize,
-    ) -> Result<Vec<VectorEntry>> {
-        let Some((lower, upper)) = Self::vector_partition_journal_suffix_bounds(
-            index,
-            partition_key,
-            covered_lsn,
-            Some(through_lsn),
-        )?
-        else {
-            return Ok(Vec::new());
-        };
-        let memberships = self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            let journal = match read_txn.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut memberships = BTreeMap::new();
-            for item in journal
-                .range(lower.as_slice()..upper.as_slice())
-                .map_err(Self::storage_error)?
-            {
-                let (key, value) = item.map_err(Self::storage_error)?;
-                #[cfg(test)]
-                bounded_journal_suffix_tests::note_examined();
-                let record: VectorPartitionJournalRecord = self
-                    .decode_expected_vector_partition_metadata(
-                        VectorPartitionRecordKind::Journal,
-                        value.value(),
-                        index,
-                        partition_key,
-                    )?;
-                if Self::vector_partition_journal_key(&record).as_slice() != key.value() {
-                    return Err(self.vector_partition_corruption(
-                        "maintenance journal key disagrees with its payload",
-                    ));
-                }
-                if record.lsn <= covered_lsn || record.lsn > through_lsn {
-                    continue;
-                }
-                if let VectorPartitionJournalChange::Tombstone(tombstone) = record.change {
-                    let membership = tombstone.membership;
-                    memberships.insert(
-                        (
-                            membership.row_id,
-                            membership.vector_created_tx,
-                            membership.vector_lsn,
-                        ),
-                        membership,
-                    );
-                }
-            }
-            Ok(memberships.into_values().collect::<Vec<_>>())
-        })?;
-        self.load_vector_entries_for_memberships(&memberships, expected_dimension, None)
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2060,22 +1748,6 @@ impl RedbPersistence {
     // Preserve the existing framing-only fixture entry. An unbound frame can
     // never pass the transactional publication guard.
 
-    pub(super) fn vector_partition_key_heap_bytes(key: &VectorPartitionKey) -> usize {
-        key.estimated_bytes()
-            .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
-    }
-
-    pub(super) fn vector_partition_route_heap_bytes(
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> usize {
-        index
-            .table
-            .capacity()
-            .saturating_add(index.column.capacity())
-            .saturating_add(Self::vector_partition_key_heap_bytes(partition_key))
-    }
-
     /// Upper-bound heap retained by one decoded vector persistence record.
     /// Route inspection runs before owned decoding and proves the complete
     /// stored component count exists, removing serde's hostile length-hint
@@ -2092,46 +1764,6 @@ impl RedbPersistence {
         encoded_bytes
             .saturating_mul(std::mem::size_of::<VectorPartitionComponent>().saturating_add(1))
             .saturating_add(inline_bytes)
-    }
-
-    pub(super) fn vector_partition_physical_key_bound(
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        suffix_bytes: usize,
-    ) -> usize {
-        index
-            .table
-            .len()
-            .saturating_add(index.column.len())
-            .saturating_add(partition_key.estimated_bytes())
-            .saturating_add(24)
-            .saturating_add(suffix_bytes)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn resize_vector_cleanup_workspace(
-        workspace: &mut VectorWorkspaceReservation,
-        bytes: usize,
-        operation: &str,
-    ) -> Result<()> {
-        #[cfg(any(test, feature = "test-seams"))]
-        crate::vector_observations::observe_workspace_resize_for_test(
-            workspace.retained_bytes(),
-            bytes,
-            if operation == "finalize_repaired_vector_partition" {
-                "repair_cleanup"
-            } else {
-                "normal_cleanup"
-            },
-        );
-        workspace.resize(
-            bytes,
-            operation,
-            "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before cleaning this maintained route.",
-        )
     }
 
     /// Resolve every durable row-version pairing for the selected vector

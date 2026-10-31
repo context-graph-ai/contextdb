@@ -443,22 +443,6 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn vector_schema_binding(
-        &self,
-        index: &VectorIndexRef,
-    ) -> Result<VectorSchemaBinding> {
-        self.with_db(|db| {
-            Self::vector_schema_binding_in_read(
-                &db.begin_read().map_err(Self::storage_error)?,
-                index,
-            )
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn vector_schema_binding_in_read(
         read: &redb::ReadTransaction,
         index: &VectorIndexRef,
@@ -568,39 +552,6 @@ impl RedbPersistence {
         })
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn validate_vector_schema_binding_in_read(
-        read: &redb::ReadTransaction,
-        index: &VectorIndexRef,
-        expected: VectorSchemaBinding,
-    ) -> Result<()> {
-        if Self::vector_schema_binding_in_read(read, index)? != expected {
-            return Err(vector_paged::corruption(
-                "saved graph column incarnation disagrees with its captured schema",
-            ));
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn validate_vector_schema_binding_in_write(
-        write: &redb::WriteTransaction,
-        index: &VectorIndexRef,
-        expected: VectorSchemaBinding,
-    ) -> Result<()> {
-        if Self::vector_schema_binding_in_write(write, index)? != expected {
-            return Err(vector_paged::corruption(
-                "prepared graph column incarnation is stale after schema change",
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl WriterSnapshotHandle {

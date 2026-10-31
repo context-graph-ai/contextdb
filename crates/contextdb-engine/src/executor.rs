@@ -3909,10 +3909,6 @@ pub(crate) trait BoundedExecutionProbe: Send + Sync {
         held_temporary_bytes: u64,
     );
     fn cancellation_observed(&self, completed_work: u64);
-    /// One cold vector graph load's credit move, observed on the real
-    /// transfer before the destination admits, after it admits, and after
-    /// this read's credit is split off.
-    fn graph_credit_transfer(&self, _cut: bounded::GraphCreditTransferCut) {}
 }
 
 #[cfg(any(test, feature = "test-seams"))]

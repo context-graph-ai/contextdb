@@ -4964,26 +4964,6 @@ impl RedbPersistence {
 }
 
 impl RetainedReadSource {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn vector_physical_frontier(
-        &self,
-    ) -> Result<(redb::StorageSnapshotIdentity, SnapshotId, Lsn)> {
-        if self.registration.snapshot.storage_snapshot != self.snapshot
-            || self.registration.registration.is_none()
-        {
-            return Err(vector_paged::corruption(
-                "image vector holder has no authentic registration",
-            ));
-        }
-        Ok((
-            self.snapshot,
-            self.logical_frontier,
-            self.graph_lsn_frontier,
-        ))
-    }
 }
 
 #[cfg(all(test, feature = "test-seams"))]

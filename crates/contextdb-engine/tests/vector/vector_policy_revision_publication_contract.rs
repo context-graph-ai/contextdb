@@ -14,9 +14,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const SAFETY_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_MAINTENANCE_CYCLES: usize = 32;
-
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
 }
@@ -50,76 +47,6 @@ fn axis(axis: usize) -> Vec<f32> {
     vector
 }
 
-fn ids(result: &QueryResult) -> Vec<Uuid> {
-    let id_column = result
-        .columns()
-        .iter()
-        .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
-        .expect("the vector projection has id");
-    result
-        .rows()
-        .iter()
-        .map(|row| match row.get(id_column) {
-            Some(Value::Uuid(id)) => *id,
-            value => panic!("vector query returned a non-UUID id: {value:?}"),
-        })
-        .collect()
-}
-
-fn column(result: &QueryResult, name: &str) -> usize {
-    result
-        .columns()
-        .iter()
-        .position(|column| column == name)
-        .unwrap_or_else(|| panic!("inspection omits {name}: {:?}", result.columns()))
-}
-
-fn value<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
-    result
-        .rows()
-        .get(row)
-        .and_then(|row| row.get(column(result, name)))
-        .unwrap_or_else(|| panic!("inspection omits row {row} field {name}: {result:?}"))
-}
-
-fn int(result: &QueryResult, row: usize, name: &str) -> i64 {
-    match value(result, row, name) {
-        Value::Int64(value) => *value,
-        value => panic!("inspection {name} is an integer: {value:?}"),
-    }
-}
-
-fn partition_row(db: &Database) -> QueryResult {
-    db.execute(
-        "SHOW VECTOR_PARTITIONS FOR revision_docs.embedding",
-        &empty(),
-    )
-    .expect("inspect revision policy detail")
-}
-
-fn index_row(db: &Database) -> QueryResult {
-    db.execute("SHOW VECTOR_INDEXES", &empty())
-        .expect("inspect revision policy summary")
-}
-
-fn single_partition_row(result: &QueryResult) -> usize {
-    assert_eq!(result.rows().len(), 1, "one declared partition detail row");
-    0
-}
-
-fn indexed_query(db: &Database) -> Vec<Uuid> {
-    ids(&db
-        .execute(
-            "SELECT id FROM revision_docs WHERE scope_id = $scope \
-             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3",
-            &params([
-                ("scope", Value::Uuid(scope())),
-                ("query", Value::Vector(axis(0))),
-            ]),
-        )
-        .expect("INDEXED query reaches the existing maintained route"))
-}
-
 fn create_current_control(db: &Database) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
@@ -146,55 +73,6 @@ fn create_current_control(db: &Database) {
         )
         .expect("seed current maintained route control");
     }
-}
-
-fn drive_until_indexed(db: &Database) -> u64 {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        if let Some(serial) = db.__debug_vector_index_generation_for_test(index()) {
-            return serial;
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite caller-driven maintenance cycle returns");
-    }
-    panic!("caller-driven maintenance did not publish the current maintained route")
-}
-
-fn assert_current_control(db: &Database) -> u64 {
-    let serial = drive_until_indexed(db);
-    assert_eq!(
-        indexed_query(db),
-        vec![
-            Uuid::from_u128(0x6111),
-            Uuid::from_u128(0x6112),
-            Uuid::from_u128(0x6113),
-        ],
-        "the existing complete graph remains an INDEXED serving route"
-    );
-    assert_eq!(
-        db.__debug_vector_index_generation_for_test(index()),
-        Some(serial),
-        "the current control query must not create a replacement graph"
-    );
-    serial
-}
-
-fn alter_auto_index_at(db: &Database, value: i64) {
-    db.execute(
-        &format!("ALTER TABLE revision_docs ALTER COLUMN embedding SET AUTO_INDEX_AT {value}"),
-        &empty(),
-    )
-    .expect("AUTO_INDEX_AT applies to newly opened queries without topology rebuild");
-}
-
-fn append_unchanged_captured_suffix(db: &Database) {
-    db.execute(
-        "UPDATE revision_docs SET embedding = $embedding WHERE id = $id",
-        &params([
-            ("id", Value::Uuid(Uuid::from_u128(0x6111))),
-            ("embedding", Value::Vector(axis(0))),
-        ]),
-    )
-    .expect("rewrite one unchanged vector into the captured suffix");
 }
 
 #[test]

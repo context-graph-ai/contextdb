@@ -1953,8 +1953,6 @@ static PROCESS_WRITER_BUDGET_DOMAIN: parking_lot::RwLock<ProcessWriterBudgetDoma
         writers: None,
         next_identity: 1,
     });
-pub(crate) static RESIDENT_INSERTION_BUILD_LEASE: parking_lot::Mutex<()> =
-    parking_lot::Mutex::new(());
 
 // Explicit engine custody. The accountant's OnceLock is a stable association
 // key; the active epoch and count live only in the admitted domain record.

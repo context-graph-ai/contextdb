@@ -78,24 +78,6 @@ impl DatabaseAssemblyBudget {
     }
 }
 
-impl VectorPartitionPublicationOutcome {
-    pub(super) fn published() -> Self {
-        Self {
-            published: true,
-            cleanup_failure: None,
-        }
-    }
-
-    pub(super) fn published_with_cleanup_failure(error: &Error) -> Self {
-        Self {
-            published: true,
-            cleanup_failure: Some(
-                VectorMaintenanceFailureDetails::from_published_cleanup_error(error),
-            ),
-        }
-    }
-}
-
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -324,24 +306,6 @@ impl MaintenanceContext {
         write: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
         publish_direct_metadata(&self.tx_mgr, write)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn retain_published_vector_cleanup_failure(
-        &self,
-        partition: &VectorPartitionRef,
-        error: &Error,
-    ) -> Result<VectorPartitionPublicationOutcome> {
-        let outcome = VectorPartitionPublicationOutcome::published_with_cleanup_failure(error);
-        let details = outcome
-            .cleanup_failure
-            .expect("a cleanup-failure outcome carries its retained detail");
-        self.vector
-            .record_partition_maintenance_failure_details(partition, details)?;
-        Ok(outcome)
     }
 
     /// Reclaim the deferred-free backlog in at most `RECLAIM_STEPS_PER_CYCLE` bounded durable

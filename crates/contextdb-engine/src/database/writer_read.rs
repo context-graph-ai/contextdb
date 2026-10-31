@@ -230,27 +230,6 @@ pub(super) fn scoped_root_for_manager(
     })
 }
 
-/// Publication preloads its newly committed generation, before the enclosing
-/// maintenance operation's earlier root can see it. Restore that root afterward.
-pub(super) fn suspend_root_for_manager(
-    manager: &DatabaseTransactionHost,
-) -> Option<WriterRootScope> {
-    ROOT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot
-            .as_ref()
-            .is_some_and(|(id, _, _, _)| *id == manager.identity())
-        {
-            Some(WriterRootScope {
-                prior: slot.take(),
-                _same_thread: std::marker::PhantomData,
-            })
-        } else {
-            None
-        }
-    })
-}
-
 /// Preserve the consumer's typed refusal across the storage callback's shared
 /// core-error boundary; the private sentinel never reaches the caller.
 #[expect(

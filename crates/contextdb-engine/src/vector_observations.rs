@@ -33,22 +33,6 @@ pub enum VectorJournalReplayWork {
     },
 }
 
-pub(crate) fn observe_reads(
-    index: &contextdb_core::VectorIndexRef,
-    key: &contextdb_core::VectorPartitionKey,
-    covered_lsn: Lsn,
-) -> redb::BackendReadObservation {
-    let index = index.clone();
-    let key = key.clone();
-    redb::observe_backend_reads(Arc::new(move |bytes| {
-        emit(
-            &index,
-            &key,
-            covered_lsn,
-            VectorJournalReplayWork::Read { bytes },
-        );
-    }))
-}
 #[derive(Clone, Debug)]
 pub struct VectorJournalReplayEvent {
     pub partition: VectorPartitionRef,
@@ -86,28 +70,6 @@ pub(crate) fn emit(
             covered_lsn,
             work,
         });
-    }
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn observe_saved_topology_export(
-    partition: &VectorPartitionRef,
-    covered_lsn: Lsn,
-    is_base: bool,
-    generation_id: u64,
-    bytes: &[u8],
-) {
-    if OBSERVER.with(|slot| slot.borrow().is_some()) {
-        emit(
-            &partition.index,
-            &partition.partition_key,
-            covered_lsn,
-            VectorJournalReplayWork::SavedTopologyExport {
-                is_base,
-                generation_id,
-                bytes: Arc::from(bytes),
-            },
-        );
     }
 }
 
@@ -193,66 +155,6 @@ impl Drop for VectorGraphWorkspaceObservationForTest {
     }
 }
 
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn observe_graph_buffer_for_test(kind: VectorGraphBufferKindForTest, bytes: &Vec<u8>) {
-    if bytes.capacity() != 0 {
-        emit_graph_workspace_for_test(VectorGraphWorkspaceEventForTest::GraphBuffers {
-            kind,
-            pointer: bytes.as_ptr() as usize,
-            capacity: bytes.capacity(),
-        });
-    }
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn observe_export_identity_for_test(
-    original_generation_id: u64,
-    artifact_generation_id: u64,
-    storage_id: u64,
-    is_base: bool,
-    source_digest: [u8; 32],
-    generation_key: &[u8],
-    root_key: &[u8],
-) {
-    // Key addresses are borrowed only during the synchronous callback. The
-    // fixed inline event adds no allocation or production observation.
-    emit_graph_workspace_for_test(VectorGraphWorkspaceEventForTest::ExportIdentity {
-        original_generation_id,
-        artifact_generation_id,
-        storage_id,
-        is_base,
-        source_digest,
-        generation_key_pointer: generation_key.as_ptr() as usize,
-        generation_key_len: generation_key.len(),
-        root_key_pointer: root_key.as_ptr() as usize,
-        root_key_len: root_key.len(),
-    });
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn observe_workspace_resize_for_test(
-    previous: usize,
-    next: usize,
-    operation: &'static str,
-) {
-    if next < previous {
-        emit_graph_workspace_for_test(VectorGraphWorkspaceEventForTest::WorkspaceResize {
-            previous,
-            next,
-            operation,
-        });
-    }
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-fn emit_graph_workspace_for_test(event: VectorGraphWorkspaceEventForTest) {
-    let observer = GRAPH_WORKSPACE_OBSERVER.with(|slot| slot.borrow().clone());
-    if let Some(observer) = observer {
-        observer(&event);
-    }
-}
-
 /// One boundary of an import-tail suffix load, as the writer accountant and
 /// the active decode owner see it.
 #[cfg(any(test, feature = "test-seams"))]
@@ -330,33 +232,6 @@ impl Drop for ImportTailLoadObservationForTest {
     }
 }
 
-#[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
-    )
-)]
-pub(crate) fn import_tail_load_observed() -> bool {
-    IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.borrow().is_some())
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
-    )
-)]
-pub(crate) fn emit_import_tail_load_for_test(
-    event: &ImportTailLoadForTest,
-) -> Option<Option<usize>> {
-    let observer = IMPORT_TAIL_LOAD_OBSERVER.with(|slot| slot.borrow().clone());
-    observer.and_then(|observer| observer(event))
-}
-
 /// Called on the import's thread between replacement-build steps, after
 /// every commit and partition gate is released: a test may commit there.
 /// It receives the bytes the import's own decode owner still holds at that
@@ -393,51 +268,12 @@ impl Drop for ImportRebuildStepObservationForTest {
     }
 }
 
-#[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
-    )
-)]
-pub(crate) fn emit_import_rebuild_step_for_test(import_decode_held: usize) {
-    let observer = IMPORT_REBUILD_STEP_OBSERVER.with(|slot| slot.borrow().clone());
-    if let Some(observer) = observer {
-        observer(import_decode_held);
-    }
-}
-
 // Membership records decoded to count a build's live inputs at its
 // frontier, in total and while a build start held the commit lock.
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static BUILD_START_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MEMBERSHIP_COUNT_DECODES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) struct BuildStartLockForTest(bool);
-#[cfg(any(test, feature = "test-seams"))]
-impl Drop for BuildStartLockForTest {
-    fn drop(&mut self) {
-        BUILD_START_LOCK_HELD.with(|held| held.set(self.0));
-    }
-}
-
-/// Marks the span in which a paged build start holds the commit lock.
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn enter_build_start_lock_for_test() -> BuildStartLockForTest {
-    BuildStartLockForTest(BUILD_START_LOCK_HELD.with(|held| held.replace(true)))
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn note_membership_count_decode_for_test() {
-    let locked = BUILD_START_LOCK_HELD.with(std::cell::Cell::get);
-    MEMBERSHIP_COUNT_DECODES.with(|count| {
-        let (total, under_lock) = count.get();
-        count.set((total + 1, under_lock + usize::from(locked)));
-    });
 }
 
 /// `(total, under the build start's commit lock)` membership decodes made

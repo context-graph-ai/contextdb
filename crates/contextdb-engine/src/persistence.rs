@@ -1399,10 +1399,6 @@ enum InspectedPersistedVector {
     },
 }
 
-/// Journal records one step of T2 reads: the whole of the reopen retry, and
-/// one committed transaction of every other caller's cleanup.
-pub(crate) const VECTOR_JOURNAL_CLEANUP_STEP_RECORDS: usize = 64;
-
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     static VECTOR_JOURNAL_CLEANUP_RECORDS_READ: std::cell::Cell<u64> =
@@ -1758,16 +1754,6 @@ pub mod read_persistence_test_scaffold {
         let _restore =
             Restore(RETAINED_GRAPH_PAGE_READ_OBSERVER.with(|slot| slot.replace(Some(observer))));
         operation()
-    }
-
-    pub(super) fn note_retained_graph_page_read_for_test(
-        observation: RetainedGraphPageReadObservation,
-    ) {
-        let observer = RETAINED_GRAPH_PAGE_READ_OBSERVER
-            .with(|slot| slot.borrow().as_ref().map(std::sync::Arc::clone));
-        if let Some(observer) = observer {
-            observer(observation);
-        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

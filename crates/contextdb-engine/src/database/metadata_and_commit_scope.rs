@@ -2418,12 +2418,6 @@ pub(super) fn vector_journal_cleanup_step_gap_pause_for_test() -> Arc<ApplyPhase
         .clone()
 }
 
-/// Pause between two committed steps of a vector journal cleanup.
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn maybe_pause_between_vector_journal_cleanup_steps_for_test() {
-    vector_journal_cleanup_step_gap_pause_for_test().maybe_pause();
-}
-
 #[cfg(any(test, feature = "test-seams"))]
 pub(super) fn vector_journal_cleanup_pause_for_test() -> Arc<ApplyPhasePause> {
     VECTOR_JOURNAL_CLEANUP_PAUSE
@@ -2436,16 +2430,6 @@ pub(super) fn vector_repair_snapshot_sample_transition_pause_for_test() -> Arc<A
     VECTOR_REPAIR_SNAPSHOT_SAMPLE_TRANSITION_PAUSE
         .get_or_init(|| Arc::new(ApplyPhasePause::new()))
         .clone()
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn maybe_pause_vector_journal_cleanup_for_test() {
-    vector_journal_cleanup_pause_for_test().maybe_pause();
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(super) fn maybe_pause_vector_repair_snapshot_sample_transition_for_test() {
-    vector_repair_snapshot_sample_transition_pause_for_test().maybe_pause();
 }
 
 #[cfg(test)]

@@ -110,14 +110,6 @@ fn partitioned_fixture(search_mode: &str) -> Database {
     db
 }
 
-fn durable_partitioned_fixture(search_mode: &str) -> (TempDir, Database) {
-    let root = TempDir::new().expect("create a durable vector-route fixture directory");
-    let db = Database::open(root.path().join("vector-route.redb"))
-        .expect("open the durable vector-route fixture");
-    declare_partitioned_fixture(&db, search_mode);
-    (root, db)
-}
-
 fn declare_partitioned_fixture(db: &Database, search_mode: &str) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
@@ -143,34 +135,6 @@ fn drive_maintenance(db: &Database) {
     }
 }
 
-fn index() -> VectorIndexRef {
-    VectorIndexRef::new("vector_docs", "embedding")
-}
-
-fn partition_key(partition: i64) -> VectorPartitionKey {
-    VectorPartitionKey::from_values(&[Value::Int64(partition)])
-        .expect("an integer is a valid partition identity")
-}
-
-fn partition_row_ids(db: &Database, partition: i64) -> HashSet<RowId> {
-    let vector_fixture_reader_1 = db
-        .declared_reader_memory()
-        .expect("admit the vector fixture reader");
-    let mut vector_fixture_copy_1 =
-        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
-
-    db.vector_store_for_test()
-        .entries_for_partition(
-            &index(),
-            &partition_key(partition),
-            &mut vector_fixture_copy_1,
-        )
-        .expect("inspect the deterministic partition fixture")
-        .into_iter()
-        .map(|entry| entry.row_id)
-        .collect()
-}
-
 fn take_trace(db: &Database) -> contextdb_engine::database::VectorSearchTraceObservation {
     {
         let seam_read_memory = db
@@ -180,14 +144,6 @@ fn take_trace(db: &Database) -> contextdb_engine::database::VectorSearchTraceObs
             .expect("read the admitted trace observation")
     }
     .expect("the vector query publishes its route trace")
-}
-
-fn used_indexed_route(
-    trace: &contextdb_engine::database::VectorSearchTraceObservation,
-) -> bool {
-    trace.partition_routes.iter().any(|route| {
-        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
-    })
 }
 
 fn result_used_indexed_route(result: &QueryResult) -> bool {
@@ -243,13 +199,6 @@ impl NativeIvfSealObserver for IndexedWorkCounter {
     fn before_boundary(&self, _boundary: NativeIvfFaultBoundary<'_>) -> contextdb_core::Result<()> {
         Ok(())
     }
-}
-
-fn assert_bounded_indexed_refusal(result: Result<bounded::TestResult, bounded::TestError>) {
-    assert!(
-        matches!(&result, Err(bounded::TestError::Engine(message)) if message.contains("no complete maintained route")),
-        "bounded INDEXED must refuse the whole request without rows: {result:?}"
-    );
 }
 
 fn assert_indexed_refusal(error: Error) {

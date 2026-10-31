@@ -156,17 +156,6 @@ fn result_ids(result: &QueryResult) -> Vec<Uuid> {
         .collect()
 }
 
-fn row_id_for_uuid(db: &Database, id: Uuid) -> RowId {
-    db.scan("raw_residency_items", db.snapshot())
-        .expect("scan the deterministic relational fixture")
-        .into_iter()
-        .find_map(|row| match row.values.get("id") {
-            Some(Value::Uuid(found)) if *found == id => Some(row.row_id),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("raw-residency row {id} exists"))
-}
-
 fn many_scope(ordinal: usize) -> Uuid {
     Uuid::from_u128(0xCA11_0000_0000_0000_0000_0000_0000_0000 + ordinal as u128)
 }

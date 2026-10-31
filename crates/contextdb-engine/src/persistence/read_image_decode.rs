@@ -1341,61 +1341,6 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for InspectedSequence<T> {
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn prevalidate_persisted_vector_entry(bytes: &[u8], dimension: usize) -> Result<()> {
-    type Entry<'a> = (
-        &'a str,
-        &'a str,
-        RowId,
-        InspectedPersistedVector,
-        TxId,
-        Option<TxId>,
-        Lsn,
-    );
-    let ((_, _, _, vector, _, _, _), consumed) = bincode::serde::borrow_decode_from_slice::<
-        Entry<'_>,
-        _,
-    >(bytes, bincode::config::standard())
-    .map_err(|_| vector_paged::corruption("fixed vector body cannot be decoded"))?;
-    if consumed != bytes.len() {
-        return Err(vector_paged::corruption(
-            "fixed vector body has trailing bytes",
-        ));
-    }
-    let valid_dimension = match vector {
-        InspectedPersistedVector::F32(values) => values.count == dimension,
-        InspectedPersistedVector::SQ8 { len, payload, .. } => {
-            len as usize == dimension && payload.count == dimension
-        }
-        InspectedPersistedVector::SQ4 { len, payload, .. } => {
-            len as usize == dimension && payload.count == dimension.div_ceil(2)
-        }
-    };
-    if !valid_dimension {
-        return Err(vector_paged::corruption(
-            "fixed vector body has an invalid payload dimension",
-        ));
-    }
-    Ok(())
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn decode_image_vector_entry(
-    bytes: &[u8],
-    dimension: usize,
-) -> Result<PersistedVectorEntry> {
-    let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-    prevalidate_persisted_vector_entry(bytes, dimension)?;
-    RedbPersistence::decode_exact(bytes)
-        .map_err(|_| vector_paged::corruption("fixed vector body cannot be decoded"))
-}
-
 pub(super) fn inspect_vector_partition_metadata_route(
     payload: &[u8],
 ) -> std::result::Result<usize, contextdb_core::error::DiagnosticText> {
@@ -1792,11 +1737,6 @@ pub(super) fn vector_partition_expected_metadata_payload<'a>(
         )?;
     }
     Ok(payload)
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-pub(super) fn note_vector_journal_cleanup_record_read() {
-    VECTOR_JOURNAL_CLEANUP_RECORDS_READ.with(|read| read.set(read.get() + 1));
 }
 
 /// Journal records T2 has read on this thread since the last call.

@@ -788,21 +788,6 @@ fn continuation_sources_cold(
     })
 }
 
-struct PagedStatementPause {
-    pause: StatementPause,
-    registered: Arc<AtomicU64>,
-}
-impl bounded::ExecutionProbe for PagedStatementPause {
-    fn before_work(&self, _: bounded::TestWorkSource, _: u64) {}
-    fn after_source_capture(&self) {
-        self.pause.after_source_capture();
-    }
-    fn registered_snapshot_for_test(&self, snapshot: contextdb_core::SnapshotId) {
-        self.registered.store(snapshot.0, Ordering::SeqCst);
-    }
-    fn cancellation_observed(&self, _: u64) {}
-}
-
 // Decode the one published BASE while the writer is closed. This checks the
 // actual saved graph format, rather than a transient in-memory paging flag.
 
