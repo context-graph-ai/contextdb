@@ -1018,10 +1018,6 @@ fn own_bytes(request: &[u8], reply: &[u8]) -> u64 {
     (request.len() + payload + outcome_bytes) as u64
 }
 
-/// Both worlds start from the same position class (MessagePack u32), so the
-/// ten pending outcomes after the cursor encode to the same number of bytes.
-const PADDED_POSITION: u64 = 1 << 16;
-
 /// The first position of the MessagePack u16 class, which ends at 65,536.
 /// Both worlds of the bounded form start here and must stay inside it.
 const U16_PADDED_POSITION: u64 = 1 << 8;
@@ -1077,7 +1073,7 @@ async fn cursor_scaling(prior: usize, padded: u64, cursor: CursorLimits) -> Scal
     world.bind().await;
     world.seed_outcomes(prior).await;
     hub.stop().await;
-    // A fresh edge catches up page by page under the shipped limits.
+    // A fresh edge catches up page by page under the hub's cursor limits.
     eprintln!("S4_SCALE prior={prior} paged catch-up");
     let catch_up = native_pages(&world, None);
     let cursor = catch_up
@@ -1170,13 +1166,17 @@ fn describe(pages: &[Page]) -> String {
 // declared cursor page size; each page examines at most page + 1 orders,
 // releases every request byte, and charges the same peak wherever it sits in
 // history. The ten outcomes after a cursor examine exactly ten orders whether
-// 10 or 10,010 precede it.
+// 10 or two full pages and one more precede it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_request_examines_only_the_orders_after_it() {
+    let cursor = CursorLimits {
+        active_ms: Some(UNBINDING_ACTIVE_MS),
+        page_rows: None,
+    };
     cursor_request_examines_only_the_orders_after_it(
-        PADDED_POSITION,
-        10_010,
-        CursorLimits::SHIPPED,
+        U16_PADDED_POSITION,
+        2 * cursor.page_rows() + 1,
+        cursor,
     )
     .await;
 }
