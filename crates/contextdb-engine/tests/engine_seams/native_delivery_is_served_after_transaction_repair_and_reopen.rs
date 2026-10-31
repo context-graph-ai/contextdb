@@ -3,6 +3,7 @@
 //! transaction, so after a reopen one native delivery request is accepted and
 //! answers every recorded outcome exactly.
 use crate::custody_fixture::*;
+use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureKind};
 use contextdb_core::{Error, TenantId};
 use contextdb_engine::Database;
 use contextdb_server::InProcessBroker;
@@ -56,13 +57,23 @@ async fn native_delivery_is_served_after_transaction_repair_and_reopen() {
     let refused = client.fetch_delivery_outcomes(None).await;
     let counts = hub.server.delivery_route_counts_for_test();
     println!("S3_MARKER refused={refused:?} counts={counts:?}");
-    assert!(
-        matches!(
-            &refused,
-            Err(Error::SyncError(message))
-                if message == "native reader admission unsupported: custody/durable_group_index"
-        ),
-        "an incomplete index is refused by the native route with exactly this text, never served: {refused:?}"
+    // The refusal is the typed owner-route refusal, naming the inspection the
+    // native route could not answer; it is never a string and never a served
+    // answer.
+    let Err(Error::ReadFailure(failure)) = &refused else {
+        panic!("an incomplete index is refused by the native route, never served: {refused:?}");
+    };
+    assert_eq!(
+        failure.kind(),
+        ReadFailureKind::OwnerRouteUnsupported,
+        "the refusal is the typed owner-route refusal: {refused:?}"
+    );
+    let ReadFailureDetail::OwnerRouteUnsupported(detail) = failure.detail() else {
+        panic!("the refusal carries the owner-route detail: {refused:?}");
+    };
+    assert_eq!(
+        detail.inspection, "custody/durable_group_index",
+        "the refusal names the incomplete index that was refused: {refused:?}"
     );
     assert_eq!(counts, (1, 0), "no Legacy fetch answered in its place");
     hub.stop();
