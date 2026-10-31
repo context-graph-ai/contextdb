@@ -39,6 +39,8 @@ impl WriteSession<'_> {
                     .iter()
                     .find(|column| column.name == index.column)
                     .ok_or_else(corrupt)?;
+                #[cfg(not(feature = "test-seams"))]
+                let _ = persistence;
                 #[cfg(feature = "test-seams")]
                 let test_column = persistence.native_ivf_test_column(column)?;
                 #[cfg(feature = "test-seams")]

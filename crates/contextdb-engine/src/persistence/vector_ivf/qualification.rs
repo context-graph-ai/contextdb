@@ -70,6 +70,7 @@ impl RerankSummary {
         };
         Ok(())
     }
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn mean(self) -> f64 {
         self.total as f64 / f64::from(self.samples)
     }
@@ -347,6 +348,7 @@ impl PageSource<'_> {
             _ => Err(corrupt()),
         }
     }
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn qualification_sample_work(
         &self,
         depth_ordinal: u32,

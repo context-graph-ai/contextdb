@@ -1777,6 +1777,7 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 /// Authenticated decode of one ordered source companion for the paged builder.
 #[expect(
     clippy::result_large_err,

@@ -5,6 +5,7 @@ use crate::persistence::vector_ivf::{
     retained::Selection,
 };
 impl Database {
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn native_ivf_inspection(
         &self,
         index: &VectorIndexRef,

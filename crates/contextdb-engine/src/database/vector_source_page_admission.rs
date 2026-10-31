@@ -31,6 +31,7 @@ impl Drop for SourcePageCharge {
     }
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 /// Admit the actual extent before redb allocates it. Uncached pages retain
 /// the charge until their last handle drops; cached pages hand ownership to
 /// the writer's already-reserved fixed page cache. Decode/build reservations
