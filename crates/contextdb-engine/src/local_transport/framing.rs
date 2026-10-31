@@ -1931,15 +1931,6 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         // effective_auto_index_at, auto_index_at_source
         self.u64()?;
         self.string()?;
-        // effective_flat_below, flat_below_source
-        self.u64()?;
-        self.string()?;
-        // effective_search_radius_millionths, search_radius_source
-        self.u64()?;
-        self.string()?;
-        // effective_auto_expansion_ceiling, auto_expansion_ceiling_source
-        self.u64()?;
-        self.string()?;
         self.strings()?;
         self.string()?;
         if self.option()? {
@@ -1960,7 +1951,7 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         if partitions > self.remaining() {
             return Self::malformed();
         }
-        self.charge::<crate::read_contract::CanonicalVectorPartitionHnswDisclosure>(partitions)?;
+        self.charge::<crate::read_contract::CanonicalVectorPartitionDisclosure>(partitions)?;
         for _ in 0..partitions {
             self.string()?;
             if self.option()? {
@@ -1969,10 +1960,15 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             if self.option()? {
                 self.string()?;
             }
-            self.u64()?;
-            self.u64()?;
-            self.u64()?;
-            self.string()?;
+            // lists, probes and refine factor, each with its source.
+            for _ in 0..3 {
+                if self.option()? {
+                    self.u64()?;
+                }
+                if self.option()? {
+                    self.string()?;
+                }
+            }
             self.u64()?;
         }
         // global_candidate_budget, admission_evaluations,

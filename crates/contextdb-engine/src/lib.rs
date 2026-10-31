@@ -193,7 +193,7 @@ pub use database::{
 };
 pub use database::{
     CascadeReport, Database, ExplainOutput, ExportReport, IndexCandidate, QueryResult, QueryTrace,
-    VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,
+    VectorPartitionDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,
     VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchRouteEvidence,
     VectorSearchScopeShape, VectorSearchTailState,
 };

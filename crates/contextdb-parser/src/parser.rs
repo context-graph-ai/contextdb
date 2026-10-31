@@ -2367,7 +2367,6 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     let mut auto_index_at = None;
     let auto_expansion_ceiling = None;
     let flat_below = None;
-    let hnsw = None;
     let mut consolidation = None;
 
     for part in pair.into_inner() {
@@ -2450,7 +2449,6 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             && search_mode.is_none()
             && auto_index_at.is_none()
             && flat_below.is_none()
-            && hnsw.is_none()
             && consolidation.is_none()
         {
             Ok(AlterAction::SetVectorAutoExpansionCeiling {
@@ -2467,7 +2465,6 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
         return if max_partitions.is_none()
             && search_mode.is_none()
             && auto_index_at.is_none()
-            && hnsw.is_none()
             && consolidation.is_none()
         {
             Ok(AlterAction::SetVectorFlatBelow { column, flat_below })
@@ -2477,27 +2474,20 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             ))
         };
     }
-    match (
-        max_partitions,
-        search_mode,
-        auto_index_at,
-        hnsw,
-        consolidation,
-    ) {
-        (Some(max_partitions), None, None, None, None) => Ok(AlterAction::SetVectorMaxPartitions {
+    match (max_partitions, search_mode, auto_index_at, consolidation) {
+        (Some(max_partitions), None, None, None) => Ok(AlterAction::SetVectorMaxPartitions {
             column,
             max_partitions,
         }),
-        (None, Some(search_mode), None, None, None) => Ok(AlterAction::SetVectorSearchMode {
+        (None, Some(search_mode), None, None) => Ok(AlterAction::SetVectorSearchMode {
             column,
             search_mode,
         }),
-        (None, None, Some(auto_index_at), None, None) => Ok(AlterAction::SetVectorAutoIndexAt {
+        (None, None, Some(auto_index_at), None) => Ok(AlterAction::SetVectorAutoIndexAt {
             column,
             auto_index_at,
         }),
-        (None, None, None, Some(hnsw), None) => Ok(AlterAction::SetVectorHnsw { column, hnsw }),
-        (None, None, None, None, Some(consolidation)) => Ok(AlterAction::SetVectorConsolidation {
+        (None, None, None, Some(consolidation)) => Ok(AlterAction::SetVectorConsolidation {
             column,
             consolidation,
         }),
@@ -2533,7 +2523,6 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut search = VectorSearchObjectives::default();
     let mut ivf = VectorIvfOptions::default();
     let mut engine_policy = VectorEnginePolicyOptions::default();
-    let mut hnsw = VectorHnswOptions::default();
     let mut consolidation = VectorConsolidationOptions::default();
     let mut rank_policy = None;
     let mut context_id = false;
@@ -2567,7 +2556,6 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                 auto_index_at = vector_options.auto_index_at;
                 auto_expansion_ceiling = vector_options.auto_expansion_ceiling;
                 flat_below = vector_options.flat_below;
-                hnsw = vector_options.hnsw;
                 consolidation = vector_options.consolidation;
                 data_type = Some(build_data_type(p)?);
             }
@@ -2729,7 +2717,6 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             search,
             ivf,
             engine_policy,
-            hnsw,
             consolidation,
             rank_policy,
             context_id,
@@ -3301,7 +3288,6 @@ struct ParsedVectorColumnOptions {
     ivf: VectorIvfOptions,
     has_with: bool,
     engine_policy: VectorEnginePolicyOptions,
-    hnsw: VectorHnswOptions,
     consolidation: VectorConsolidationOptions,
 }
 

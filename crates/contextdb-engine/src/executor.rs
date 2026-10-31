@@ -7065,18 +7065,6 @@ fn execute_plan_with_working_state(
             query_policy,
             materialized_columns,
             ..
-        }
-        | PhysicalPlan::HnswSearch {
-            table,
-            column,
-            query_expr,
-            k,
-            candidates,
-            sort_key,
-            search_mode,
-            query_policy,
-            materialized_columns,
-            ..
         } => {
             crate::database::vector_ivf::policy::validate_query(
                 table,
@@ -9939,8 +9927,7 @@ pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Resul
                 validate_filter_predicate_columns(&columns.condition, plan, condition)?;
             }
         }
-        PhysicalPlan::VectorSearch { candidates, .. }
-        | PhysicalPlan::HnswSearch { candidates, .. } => {
+        PhysicalPlan::VectorSearch { candidates, .. } => {
             if let Some(candidates) = candidates {
                 validate_plan_columns(db, candidates)?;
             }
@@ -10024,7 +10011,7 @@ fn plan_output_columns(db: &Database, plan: &PhysicalPlan) -> Option<Vec<String>
         PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
             scan_output_columns(db, table)
         }
-        PhysicalPlan::VectorSearch { table, .. } | PhysicalPlan::HnswSearch { table, .. } => {
+        PhysicalPlan::VectorSearch { table, .. } => {
             let mut columns = scan_output_columns(db, table)?;
             columns.push("score".to_string());
             Some(columns)
@@ -10303,8 +10290,7 @@ fn plan_anchor_table(plan: &PhysicalPlan) -> Option<String> {
     match plan {
         PhysicalPlan::Scan { table, .. }
         | PhysicalPlan::IndexScan { table, .. }
-        | PhysicalPlan::VectorSearch { table, .. }
-        | PhysicalPlan::HnswSearch { table, .. } => Some(table.clone()),
+        | PhysicalPlan::VectorSearch { table, .. } => Some(table.clone()),
         PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Distinct { input }
@@ -10341,9 +10327,6 @@ fn known_relation_names(plan: &PhysicalPlan) -> Vec<String> {
         // picking one, since this is only ever consulted as a permissive
         // whitelist alongside a column list for the same shape.
         PhysicalPlan::VectorSearch {
-            table, candidates, ..
-        }
-        | PhysicalPlan::HnswSearch {
             table, candidates, ..
         } => {
             let mut names = vec![table.clone()];

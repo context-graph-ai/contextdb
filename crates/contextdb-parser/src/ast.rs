@@ -543,12 +543,6 @@ pub enum AlterAction {
         column: String,
         members: Vec<String>,
     },
-    SetVectorHnsw {
-        column: String,
-        /// `None` is `HNSW DEFAULT`; otherwise omitted members retain their
-        /// current declarations and member `DEFAULT` values clear one member.
-        hnsw: Option<VectorHnswOptions>,
-    },
     SetVectorConsolidation {
         column: String,
         /// `None` is `CONSOLIDATION DEFAULT`; otherwise omitted members
@@ -616,24 +610,11 @@ pub struct ColumnDef {
     pub search: VectorSearchObjectives,
     pub ivf: VectorIvfOptions,
     pub engine_policy: VectorEnginePolicyOptions,
-    pub hnsw: VectorHnswOptions,
     pub consolidation: VectorConsolidationOptions,
     pub rank_policy: Option<Box<RankPolicyAst>>,
     pub context_id: bool,
     pub scope_label: Option<Box<ScopeLabelConstraint>>,
     pub acl_ref: Option<Box<AclConstraint>>,
-}
-
-/// One parsed grouped HNSW declaration. The outer option on each member
-/// distinguishes omission (retain the current declaration) from a named
-/// value; a named `DEFAULT` is represented by [`VectorPolicyValue::Default`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VectorHnswOptions {
-    pub m: Option<VectorPolicyValue>,
-    pub ef_construction: Option<VectorPolicyValue>,
-    pub ef_search: Option<VectorPolicyValue>,
-    /// Kept as written; a decimal is legal for this member only.
-    pub search_radius: Option<VectorPolicyValue>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

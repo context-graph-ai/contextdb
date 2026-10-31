@@ -37,8 +37,8 @@ pub use table_meta::{
     ForeignKeyReference, HistoryPolicy, IndexDecl, IndexKind, MaintainedCounts, PropagationRule,
     RankPolicy, RetainUnit, ScopeLabelKind, SingleColumnForeignKey, SortDirection,
     StateMachineConstraint, SyncDirection, TableMeta, VectorQuantization,
-    parse_search_radius_millionths, render_maintained_count_columns,
-    render_search_radius_millionths, render_sql_identifier,
+    render_maintained_count_columns,
+    render_sql_identifier,
 };
 pub use traits::*;
 pub use types::*;

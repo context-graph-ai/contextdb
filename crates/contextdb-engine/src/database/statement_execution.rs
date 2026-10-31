@@ -1711,22 +1711,12 @@ impl Database {
             output.push_str(&format!(
                 "\nvector_policy requested_mode: {} resolved_mode: {} \
                  aggregate_allowed_vectors: {} effective_auto_index_at: {} \
-                 auto_index_at_source: {} effective_flat_below: {} flat_below_source: {} \
-                 effective_search_radius: {} search_radius_source: {} \
-                 effective_auto_expansion_ceiling: {} auto_expansion_ceiling_source: {}",
+                 auto_index_at_source: {}",
                 disclosure.requested_mode,
                 disclosure.resolved_mode,
                 render_optional_count(disclosure.aggregate_allowed_vectors),
                 disclosure.effective_auto_index_at,
                 disclosure.auto_index_at_source,
-                disclosure.effective_flat_below,
-                disclosure.flat_below_source,
-                contextdb_core::render_search_radius_millionths(
-                    disclosure.effective_search_radius_millionths as u32
-                ),
-                disclosure.search_radius_source,
-                disclosure.effective_auto_expansion_ceiling,
-                disclosure.auto_expansion_ceiling_source,
             ));
         }
         Ok(output)
@@ -1822,19 +1812,20 @@ impl Database {
                 )
             })
             .transpose()?;
-        let uses_hnsw = vector_inspection
+        let uses_indexed = vector_inspection
             .as_ref()
-            .is_some_and(|(disclosure, graph_allowed)| {
+            .is_some_and(|(disclosure, indexed_available)| {
                 matches!(
                     disclosure.route,
                     Some(VectorSearchRoute::Indexed | VectorSearchRoute::FilteredIndexed)
                 ) && disclosure.refusal.is_none()
-                    && *graph_allowed
+                    && *indexed_available
             });
         let vector_disclosure = vector_inspection.map(|(disclosure, _)| disclosure);
-        if uses_hnsw {
-            physical_plan = physical_plan.replace("VectorSearch(", "HNSWSearch(");
-            physical_plan = physical_plan.replace("VectorSearch {", "HNSWSearch {");
+        if uses_indexed {
+            physical_plan = annotate_vector_search_strategy(physical_plan, "Indexed");
+            physical_plan =
+                physical_plan.replace("VectorSearch {", "VectorSearch { strategy: Indexed,");
         } else {
             physical_plan = annotate_vector_search_strategy(physical_plan, "BruteForce");
             physical_plan =
@@ -2044,7 +2035,7 @@ impl Database {
             },
             None => Some(count()?),
         };
-        let policy = layout.resolve_policy(aggregate_allowed_vectors.unwrap_or(0), shape.k);
+        let policy = layout.resolve_policy();
         let filtered_exact =
             requested_mode == contextdb_core::VectorSearchMode::Auto && !candidate_route.complete;
         let resolved_mode = match (requested_mode, aggregate_allowed_vectors) {
@@ -2092,12 +2083,11 @@ impl Database {
     ) -> Result<(VectorSearchDisclosure, bool)> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let actual_used_hnsw = actual_trace.map(|trace| {
-            trace.used_hnsw
-                || trace
-                    .partition_routes
-                    .iter()
-                    .any(|partition| partition.route == VectorPartitionSearchRoute::Indexed)
+        let actual_indexed = actual_trace.map(|trace| {
+            trace
+                .partition_routes
+                .iter()
+                .any(|partition| partition.route == VectorPartitionSearchRoute::Indexed)
         });
         let (mut facts, authorized) = self.vector_policy_facts_for_explain(
             shape,
@@ -2160,7 +2150,7 @@ impl Database {
         } else {
             None
         };
-        let graph_allowed = if let Some(routes) = &native_routes {
+        let indexed_available = if let Some(routes) = &native_routes {
             let indexed = routes
                 .iter()
                 .any(|route| route.route == VectorPartitionSearchRoute::Indexed);
@@ -2173,13 +2163,7 @@ impl Database {
             }
             indexed
         } else {
-            self.vector_hnsw_strategy_for_explain(
-                shape,
-                snapshot,
-                params,
-                vector_copy_owner,
-                authorized.as_ref(),
-            )?
+            false
         };
 
         // An AUTO route over an unbound key is unresolved until the key binds.
@@ -2203,9 +2187,8 @@ impl Database {
         let candidate_residual = vector_search_candidate_residual(shape, &candidate_route);
         let filtered_exact = facts.requested_mode == contextdb_core::VectorSearchMode::Auto
             && !candidate_route.complete;
-        let mut partition_hnsw = self.vector_partition_hnsw_disclosure(
+        let mut partitions = self.vector_partition_disclosure(
             &shape.index,
-            shape.k,
             authorized.as_ref(),
             snapshot,
             partition_scope.as_ref(),
@@ -2218,7 +2201,7 @@ impl Database {
             read_memory.clone(),
         )?;
         if let Some(routes) = &native_routes {
-            for (partition, route) in partition_hnsw.iter_mut().zip(routes) {
+            for (partition, route) in partitions.iter_mut().zip(routes) {
                 partition.route = Some(if route.route == VectorPartitionSearchRoute::Indexed {
                     VectorSearchRoute::Indexed
                 } else {
@@ -2229,8 +2212,8 @@ impl Database {
         }
         let every_partition_uses_policy_exact = actual_trace.map_or_else(
             || {
-                !partition_hnsw.is_empty()
-                    && partition_hnsw
+                !partitions.is_empty()
+                    && partitions
                         .iter()
                         .all(|partition| partition.route == Some(VectorSearchRoute::Exact))
             },
@@ -2246,10 +2229,10 @@ impl Database {
             && (facts.resolved_mode == contextdb_core::VectorSearchMode::Exact
                 || (facts.requested_mode == contextdb_core::VectorSearchMode::Auto
                     && (every_partition_uses_policy_exact
-                        || actual_used_hnsw == Some(false)
-                        || (actual_used_hnsw.is_none() && !graph_allowed))));
+                        || actual_indexed == Some(false)
+                        || (actual_indexed.is_none() && !indexed_available))));
         if exact_route && !every_partition_uses_policy_exact {
-            for partition in &mut partition_hnsw {
+            for partition in &mut partitions {
                 partition.route = Some(VectorSearchRoute::Exact);
             }
         }
@@ -2284,8 +2267,8 @@ impl Database {
             )
         } else if !exact_route
             && facts.resolved_mode == contextdb_core::VectorSearchMode::Indexed
-            && actual_used_hnsw != Some(true)
-            && !graph_allowed
+            && actual_indexed != Some(true)
+            && !indexed_available
         {
             (
                 Some("indexed_route_unavailable".to_string()),
@@ -2315,33 +2298,16 @@ impl Database {
         } else if facts.requested_mode == contextdb_core::VectorSearchMode::Auto
             && every_partition_uses_policy_exact
         {
-            Some(contextdb_vector::mem::AUTO_STATEMENT_EXHAUSTIVE_REASON.to_string())
+            Some(common_partition_reason(&partitions))
         } else if exact_route && facts.requested_mode == contextdb_core::VectorSearchMode::Auto {
             Some("maintained_index_unavailable".to_string())
         } else {
             None
         };
-        let mut layers = || {
-            self.vector.graph_layer_presence_without_load(
-                &shape.index,
-                authorized.as_ref(),
-                snapshot,
-                vector_copy_owner,
-            )
-        };
-        let (base, change, mut tail) = if let Some(prefixes) = partition_scope
-            .as_ref()
-            .and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
-        {
-            contextdb_vector::mem::with_selected_partition_prefixes(
-                &shape.index,
-                prefixes.to_vec(),
-                layers,
-            )?
-        } else {
-            layers()?
-        };
-        tail |= self.vector_pending_tail_without_load(
+        // The clustered index is one base generation; it has no separate change layer.
+        let base = indexed_available;
+        let change = false;
+        let tail = self.vector_pending_tail_without_load(
             &shape.index,
             authorized.as_ref(),
             snapshot,
@@ -2354,9 +2320,6 @@ impl Database {
         )?;
         vector_copy_owner.reserve(
             facts.policy.auto_index_at_source.len()
-                + layout.flat_below_source().len()
-                + layout.search_radius_source().len()
-                + layout.auto_expansion_ceiling_source().len()
                 + actual_trace
                     .and_then(|trace| trace.budget_receipt)
                     .map_or(0, |receipt| receipt.budget_terminal.len()),
@@ -2373,13 +2336,6 @@ impl Database {
                 aggregate_allowed_vectors: facts.aggregate_allowed_vectors,
                 effective_auto_index_at: facts.policy.auto_index_at,
                 auto_index_at_source: facts.policy.auto_index_at_source.to_owned(),
-                effective_flat_below: layout.effective_flat_below(),
-                flat_below_source: layout.flat_below_source().to_owned(),
-                effective_search_radius_millionths: layout.effective_search_radius_millionths()
-                    as usize,
-                search_radius_source: layout.search_radius_source().to_owned(),
-                effective_auto_expansion_ceiling: layout.effective_auto_expansion_ceiling(),
-                auto_expansion_ceiling_source: layout.auto_expansion_ceiling_source().to_owned(),
                 partition_key_columns: layout.partition_key_columns,
                 scope,
                 route,
@@ -2407,7 +2363,7 @@ impl Database {
                     Expr::Literal(_) | Expr::Parameter(_) => VectorQuerySourceDisclosure::Vector,
                     _ => VectorQuerySourceDisclosure::Unknown,
                 },
-                partition_hnsw,
+                partitions,
                 global_candidate_budget: actual_trace.and_then(|trace| {
                     trace
                         .budget_receipt
@@ -2436,7 +2392,7 @@ impl Database {
                         .map(|receipt| receipt.budget_terminal.to_owned())
                 }),
             },
-            graph_allowed,
+            indexed_available,
         ))
     }
 
@@ -2499,14 +2455,17 @@ impl Database {
     /// as the length of the list, the very count `aggregate_allowed_vectors`
     /// withholds for that same unnamed scope. A bound key, or no key
     /// predicate at all, reports each partition the caller actually named.
+    ///
+    /// Each partition carries the index members its column declares, with
+    /// provenance. A member the declaration leaves to the engine is absent:
+    /// it is chosen per query and no single value is true for the partition.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn vector_partition_hnsw_disclosure(
+    pub(super) fn vector_partition_disclosure(
         &self,
         index: &VectorIndexRef,
-        k: usize,
         authorized: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
         scope: Option<&crate::executor::VectorPartitionScope>,
@@ -2517,330 +2476,175 @@ impl Database {
         actual_routes: Option<&[VectorPartitionSearchTrace]>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<Vec<VectorPartitionHnswDisclosure>> {
+    ) -> Result<Vec<VectorPartitionDisclosure>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        // Adaptive graph effort and serving topology can encode the complete
-        // partition population. These numeric fields have no redacted value;
-        // omit them for constrained callers instead of inventing an effort
-        // based on the authorized subset that the graph did not actually use.
+        // Declared members can describe the complete partition population's
+        // configuration; constrained callers get no per-partition entries.
         if self.bounded_read_requires_candidate_filter(&index.table)? {
             return Ok(Vec::new());
         }
         let layout =
             contextdb_vector::scoped_index_layout(&self.vector_store, index, vector_copy_owner)?;
+        let revision = layout.resolve_policy().policy_revision;
+        let declared = self.declared_ivf_members(index)?;
         let prefixes = match scope {
             None => None,
             Some(scope) => match scope.resolved_prefixes() {
                 Some(prefixes) => Some(prefixes),
                 None => {
-                    let policy = layout.resolve_policy(0, k);
-                    return Ok(vec![VectorPartitionHnswDisclosure {
-                        partition: "<redacted:1>".to_owned(),
-                        route: None,
-                        reason: None,
-                        hnsw_m: policy.hnsw_m,
-                        hnsw_ef_construction: policy.hnsw_ef_construction,
-                        hnsw_ef_search: policy.hnsw_ef_search,
-                        ef_search_source: policy.ef_search_source.to_owned(),
-                        policy_revision: policy.policy_revision,
-                    }]);
+                    return Ok(vec![declared.entry(
+                        "<redacted:1>".to_owned(),
+                        None,
+                        None,
+                        revision,
+                    )]);
                 }
             },
         };
+        let route_of = |route: VectorPartitionSearchRoute| match route {
+            VectorPartitionSearchRoute::Exact => VectorSearchRoute::Exact,
+            VectorPartitionSearchRoute::Indexed if filtered => VectorSearchRoute::FilteredIndexed,
+            VectorPartitionSearchRoute::Indexed => VectorSearchRoute::Indexed,
+        };
         if let (Some(groups), Some(routes)) = (groups, actual_routes) {
             // Completed execution already chose every route. Stream its pinned
-            // groups directly; prediction's admitted/cost vectors are absent.
+            // groups directly.
             let mut count = 0usize;
-            let mut bytes = 0usize;
-            groups.visit_nonempty_partitions(&mut |_, live, _| {
-                let route = routes.get(count).ok_or_else(|| {
-                    Error::Other("executed vector route receipt ended before disclosure".into())
-                })?;
+            groups.visit_nonempty_partitions(|_, _| {
                 count += 1;
-                let policy = layout.resolve_policy(live, k);
-                bytes = bytes
-                    .checked_add(std::mem::size_of::<VectorPartitionHnswDisclosure>())
-                    .and_then(|n| n.checked_add("<redacted:".len() + count.ilog10() as usize + 2))
-                    .and_then(|n| n.checked_add(route.reason.len()))
-                    .and_then(|n| n.checked_add(policy.ef_search_source.len()))
-                    .ok_or_else(|| Error::Other("vector disclosure capacity overflow".into()))?;
                 Ok::<(), Error>(())
             })?;
             if count != routes.len() {
                 return Err(Error::Other(
-                    "executed vector route receipt exceeds its groups".into(),
+                    "executed vector route receipt does not match its groups".into(),
                 ));
             }
-            vector_copy_owner.reserve_for(
-                contextdb_vector::mem::admission_bytes("explain_partition_disclosure", bytes),
-                "vector_search",
-                "explain_partition_disclosure",
-                "Narrow the inspected scope or raise MEMORY_LIMIT.",
-            )?;
-            let mut result = Vec::with_capacity(count);
-            groups.visit_nonempty_partitions(
-                &mut |_, live, serving: Option<VectorServingPolicy>| {
-                    use std::fmt::Write as _;
-                    let route = &routes[result.len()];
-                    let mut policy = layout.resolve_policy(live, k);
-                    if let Some(serving) = serving {
-                        policy.hnsw_m = serving.hnsw_m;
-                        policy.hnsw_ef_construction = serving.hnsw_ef_construction;
-                        policy.policy_revision = serving.policy_revision;
-                    }
-                    let ordinal = result.len() + 1;
-                    let mut partition =
-                        String::with_capacity("<redacted:".len() + ordinal.ilog10() as usize + 2);
-                    write!(&mut partition, "<redacted:{ordinal}>").expect("exact string capacity");
-                    result.push(VectorPartitionHnswDisclosure {
-                        partition,
-                        route: Some(match route.route {
-                            VectorPartitionSearchRoute::Exact => VectorSearchRoute::Exact,
-                            VectorPartitionSearchRoute::Indexed if filtered => {
-                                VectorSearchRoute::FilteredIndexed
-                            }
-                            VectorPartitionSearchRoute::Indexed => VectorSearchRoute::Indexed,
-                        }),
-                        reason: Some(route.reason.to_owned()),
-                        hnsw_m: policy.hnsw_m,
-                        hnsw_ef_construction: policy.hnsw_ef_construction,
-                        hnsw_ef_search: policy.hnsw_ef_search,
-                        ef_search_source: policy.ef_search_source.to_owned(),
-                        policy_revision: policy.policy_revision,
-                    });
-                    Ok::<(), Error>(())
-                },
-            )?;
-            return Ok(result);
-        }
-        let mut disclosure = Vec::new();
-        let mut actual_position = 0usize;
-        let mut disclose_partition = |visible: usize,
-                                      live_count: usize,
-                                      serving: Option<VectorServingPolicy>,
-                                      statement_exhaustive: bool|
-         -> Result<()> {
-            if visible == 0 {
-                return Ok(());
-            }
-            let mut policy = layout.resolve_policy(live_count, k);
-            if let Some(serving) = serving {
-                policy.hnsw_m = serving.hnsw_m;
-                policy.hnsw_ef_construction = serving.hnsw_ef_construction;
-                policy.policy_revision = serving.policy_revision;
-            }
-            let (route, reason) = if let Some(actual_routes) = actual_routes {
-                let actual = actual_routes.get(actual_position).ok_or_else(|| {
-                    Error::Other(
-                        ("executed vector partition route receipt ended before disclosure"
-                            .to_string())
-                        .into(),
-                    )
-                })?;
-                actual_position += 1;
-                (
-                    match actual.route {
-                        VectorPartitionSearchRoute::Exact => VectorSearchRoute::Exact,
-                        VectorPartitionSearchRoute::Indexed if filtered => {
-                            VectorSearchRoute::FilteredIndexed
-                        }
-                        VectorPartitionSearchRoute::Indexed => VectorSearchRoute::Indexed,
-                    },
-                    Some(actual.reason.to_owned()),
-                )
-            } else {
-                let exact_reason = if requested_mode == contextdb_core::VectorSearchMode::Exact {
-                    Some("exact_requested")
-                } else if requested_mode == contextdb_core::VectorSearchMode::Auto {
-                    // AUTO decides once for the statement, never per
-                    // partition, so every partition predicts the same route.
-                    if statement_exhaustive {
-                        Some(contextdb_vector::mem::AUTO_STATEMENT_EXHAUSTIVE_REASON)
-                    } else if force_exact {
-                        Some("predicted_exact_route")
-                    } else if layout.serves_flat(live_count) {
-                        Some(contextdb_vector::mem::PARTITION_BELOW_FLAT_THRESHOLD_REASON)
-                    } else {
-                        None
-                    }
-                } else if force_exact {
-                    Some("predicted_exact_route")
-                } else if layout.serves_flat(live_count) {
-                    // The comparator execution applies to the same captured,
-                    // pre-filter live count.
-                    Some(contextdb_vector::mem::PARTITION_BELOW_FLAT_THRESHOLD_REASON)
-                } else {
-                    None
-                };
-                if let Some(reason) = exact_reason {
-                    (VectorSearchRoute::Exact, Some(reason.to_owned()))
-                } else if filtered {
-                    (
-                        VectorSearchRoute::FilteredIndexed,
-                        Some("predicted_indexed_route".to_owned()),
-                    )
-                } else {
-                    (
-                        VectorSearchRoute::Indexed,
-                        Some("predicted_indexed_route".to_owned()),
-                    )
-                }
-            };
-            disclosure.push(VectorPartitionHnswDisclosure {
-                partition: format!("<redacted:{}>", disclosure.len() + 1),
-                route: Some(route),
-                reason,
-                hnsw_m: policy.hnsw_m,
-                hnsw_ef_construction: policy.hnsw_ef_construction,
-                hnsw_ef_search: policy.hnsw_ef_search,
-                ef_search_source: policy.ef_search_source.to_owned(),
-                policy_revision: policy.policy_revision,
-            });
-            Ok(())
-        };
-        // Every disclosed partition first, so AUTO's one statement-wide route
-        // can be predicted from the aggregate before any partition reports it.
-        let mut admitted = Vec::<(usize, usize, Option<VectorServingPolicy>)>::new();
-        let mut passive_costs = Vec::<contextdb_vector::mem::AutoPartitionCost>::new();
-        let mut collect = |visible: usize,
-                           live_count: usize,
-                           serving: Option<VectorServingPolicy>|
-         -> Result<()> {
-            if visible != 0 {
-                admitted.push((visible, live_count, serving));
-            }
-            Ok(())
-        };
-        if let Some(groups) = groups {
-            // Completed execution owns snapshot-pinned sources, including a
-            // historical-only partition selected by an old snapshot. Build
-            // disclosure from those same sources so its route receipts cannot
-            // be compared with a newer live-only inspection projection.
-            let mut nonempty = 0usize;
-            groups.visit_nonempty_partitions(&mut |_, _, _| {
-                nonempty += 1;
-                Ok::<(), Error>(())
-            })?;
+            let reasons = routes.iter().map(|route| route.reason.len()).sum::<usize>();
             vector_copy_owner.reserve_for(
                 contextdb_vector::mem::admission_bytes(
                     "explain_partition_disclosure",
-                    nonempty.saturating_mul(EXPLAIN_PARTITION_DISCLOSURE_BYTES),
+                    count
+                        .saturating_mul(EXPLAIN_PARTITION_DISCLOSURE_BYTES)
+                        .saturating_add(reasons),
                 ),
                 "vector_search",
                 "explain_partition_disclosure",
                 "Narrow the inspected scope or raise MEMORY_LIMIT.",
             )?;
-            groups.visit_nonempty_partitions(&mut collect)?;
-        } else {
-            let mut partitions =
-                contextdb_vector::ScopedVectorCopy::new(vector_copy_owner, |scratch| {
-                    self.vector_partition_infos_for_prefixes(
+            return Ok(routes
+                .iter()
+                .enumerate()
+                .map(|(position, route)| {
+                    declared.entry(
+                        format!("<redacted:{}>", position + 1),
+                        Some(route_of(route.route)),
+                        Some(route.reason.to_owned()),
+                        revision,
+                    )
+                })
+                .collect());
+        }
+        let mut disclosure = Vec::new();
+        let mut actual_position = 0usize;
+        let mut partitions = contextdb_vector::ScopedVectorCopy::new(vector_copy_owner, |scratch| {
+            self.vector_partition_infos_for_prefixes(index, prefixes, scratch, read_memory.clone())
+        })?;
+        partitions.sort_by(|left, right| {
+            left.partition
+                .partition_key
+                .cmp(&right.partition.partition_key)
+        });
+        for partition in partitions.into_iter() {
+            let visible = contextdb_vector::mem::with_selected_partition_prefixes(
+                index,
+                vec![partition.partition.partition_key.clone()],
+                || {
+                    self.vector.authorized_visible_count_without_build(
                         index,
-                        prefixes,
-                        scratch,
-                        read_memory.clone(),
+                        authorized,
+                        snapshot,
+                        vector_copy_owner,
+                    )
+                },
+            )?;
+            if visible == 0 {
+                continue;
+            }
+            vector_copy_owner.reserve_for(
+                contextdb_vector::mem::admission_bytes(
+                    "explain_partition_disclosure",
+                    EXPLAIN_PARTITION_DISCLOSURE_BYTES,
+                ),
+                "vector_search",
+                "explain_partition_disclosure",
+                "Narrow the inspected scope or raise MEMORY_LIMIT.",
+            )?;
+            let (route, reason) = if let Some(actual_routes) = actual_routes {
+                let actual = actual_routes.get(actual_position).ok_or_else(|| {
+                    Error::Other(
+                        "executed vector partition route receipt ended before disclosure".into(),
                     )
                 })?;
-            partitions.sort_by(|left, right| {
-                left.partition
-                    .partition_key
-                    .cmp(&right.partition.partition_key)
-            });
-            for partition in partitions.into_iter() {
-                let visible = contextdb_vector::mem::with_selected_partition_prefixes(
-                    index,
-                    vec![partition.partition.partition_key.clone()],
-                    || {
-                        self.vector.authorized_visible_count_without_build(
-                            index,
-                            authorized,
-                            snapshot,
-                            vector_copy_owner,
-                        )
-                    },
-                )?;
-                if visible == 0 {
-                    continue;
-                }
-                // Authorization determines whether this partition is disclosed.
-                // Search effort uses its complete live population, and topology
-                // belongs to the snapshot's published chain rather than desired DDL.
-                #[cfg(any(test, feature = "test-seams"))]
-                PASSIVE_DISCLOSURE_HIDDEN_WORK.with(|work| {
-                    let (counts, states) = work.get();
-                    work.set((counts.saturating_add(1), states));
-                });
-                let live_count = contextdb_vector::mem::with_selected_partition_prefixes(
-                    index,
-                    vec![partition.partition.partition_key.clone()],
-                    || {
-                        self.vector.authorized_visible_count_without_build(
-                            index,
-                            None,
-                            snapshot,
-                            vector_copy_owner,
-                        )
-                    },
-                )?;
-                #[cfg(any(test, feature = "test-seams"))]
-                PASSIVE_DISCLOSURE_HIDDEN_WORK.with(|work| {
-                    let (counts, states) = work.get();
-                    work.set((counts, states.saturating_add(1)));
-                });
-                let state = self
-                    .vector_store
-                    .partition_state(index, &partition.partition.partition_key)?;
-                vector_copy_owner.reserve_for(
-                    contextdb_vector::mem::admission_bytes(
-                        "explain_partition_disclosure",
-                        EXPLAIN_PARTITION_DISCLOSURE_BYTES,
-                    ),
-                    "vector_search",
-                    "explain_partition_disclosure",
-                    "Narrow the inspected scope or raise MEMORY_LIMIT.",
-                )?;
-                passive_costs.push(state.auto_partition_cost(
-                    snapshot,
-                    visible,
-                    live_count,
-                    layout.resolve_policy(live_count, k).hnsw_m,
-                    layout.serves_flat(live_count),
-                ));
-                collect(visible, live_count, state.snapshot_serving_policy(snapshot))?;
-            }
-        }
-        let statement_exhaustive = actual_routes.is_none()
-            && requested_mode == contextdb_core::VectorSearchMode::Auto
-            && match groups {
-                // The very sources the executor prices, so the prediction is its route.
-                Some(groups) => groups.auto_statement_cost(&layout, k).prefers_exhaustive,
-                None => {
-                    let statement_live = admitted
-                        .iter()
-                        .map(|(_, live, _)| *live)
-                        .fold(0usize, usize::saturating_add);
-                    contextdb_vector::mem::auto_statement_cost(
-                        layout.resolve_policy(statement_live, k).hnsw_ef_search,
-                        k,
-                        layout.effective_auto_expansion_ceiling(),
-                        passive_costs.iter().copied(),
-                    )
-                    .prefers_exhaustive
-                }
+                actual_position += 1;
+                (route_of(actual.route), Some(actual.reason.to_owned()))
+            } else if requested_mode == contextdb_core::VectorSearchMode::Exact {
+                (VectorSearchRoute::Exact, Some("exact_requested".to_owned()))
+            } else if force_exact {
+                (
+                    VectorSearchRoute::Exact,
+                    Some("predicted_exact_route".to_owned()),
+                )
+            } else if filtered {
+                (
+                    VectorSearchRoute::FilteredIndexed,
+                    Some("predicted_indexed_route".to_owned()),
+                )
+            } else {
+                (
+                    VectorSearchRoute::Indexed,
+                    Some("predicted_indexed_route".to_owned()),
+                )
             };
-        for (visible, live_count, serving) in admitted {
-            disclose_partition(visible, live_count, serving, statement_exhaustive)?;
+            disclosure.push(declared.entry(
+                format!("<redacted:{}>", disclosure.len() + 1),
+                Some(route),
+                reason,
+                revision,
+            ));
         }
         if let Some(actual_routes) = actual_routes
             && actual_position != actual_routes.len()
         {
             return Err(Error::Other(
-                ("executed vector partition route receipt outlived disclosure scope".to_string())
-                    .into(),
+                "executed vector partition route receipt outlived disclosure scope".into(),
             ));
         }
         Ok(disclosure)
+    }
+
+    /// The IVF members this column declares, read from its authored
+    /// declaration and nothing else.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn declared_ivf_members(&self, index: &VectorIndexRef) -> Result<DeclaredIvfMembers> {
+        let column = self
+            .table_meta(&index.table)
+            .and_then(|meta| {
+                meta.columns
+                    .into_iter()
+                    .find(|column| column.name == index.column)
+            })
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        Ok(DeclaredIvfMembers {
+            lists: column.ivf_lists,
+            probes: column.ivf_probes,
+            refine_factor_hundredths: column.ivf_refine_factor_hundredths,
+        })
     }
 
     /// Whether the selected authorized route has committed work newer than
@@ -2960,7 +2764,6 @@ impl Database {
         aggregate_allowed_vectors: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         partition_routes: &[VectorPartitionSearchTrace],
-        used_hnsw: bool,
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -2986,7 +2789,7 @@ impl Database {
         let layout = self
             .vector_store
             .index_layout(&shape.index, vector_copy_owner)?;
-        let policy = layout.resolve_policy(aggregate_allowed_vectors, shape.k);
+        let policy = layout.resolve_policy();
         let candidate_route =
             crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
         let partition_scope = &candidate_route.scope;
@@ -2996,7 +2799,6 @@ impl Database {
             && partition_routes
                 .iter()
                 .any(|route| route.route == VectorPartitionSearchRoute::Indexed);
-        let used_hnsw = used_hnsw || native_indexed;
         let resolved_mode = if self.has_native_ivf_source()
             && requested_mode == VectorSearchMode::Auto
         {
@@ -3028,11 +2830,11 @@ impl Database {
         let force_policy_exact = resolved_mode == VectorSearchMode::Exact;
         // Inspect captured pending work before retaining the output disclosure.
         // The groups already own the authorized source set and its original root.
-        let (base, change, mut tail) = groups.graph_layer_presence_without_load();
-        tail |= groups.has_pending_tail_without_load(vector_copy_owner)?;
-        let partition_hnsw = self.vector_partition_hnsw_disclosure(
+        let base = native_indexed;
+        let change = false;
+        let tail = groups.has_pending_tail_without_load(vector_copy_owner)?;
+        let partitions = self.vector_partition_disclosure(
             &shape.index,
-            shape.k,
             None,
             snapshot,
             partition_scope.as_ref(),
@@ -3045,7 +2847,7 @@ impl Database {
             read_memory.clone(),
         )?;
         let route = if resolved_mode == contextdb_core::VectorSearchMode::Exact
-            || (!used_hnsw && requested_mode == contextdb_core::VectorSearchMode::Auto)
+            || (!native_indexed && requested_mode == contextdb_core::VectorSearchMode::Auto)
         {
             VectorSearchRoute::Exact
         } else if candidate_residual != VectorSearchResidual::None {
@@ -3067,9 +2869,6 @@ impl Database {
         };
         vector_copy_owner.reserve(
             policy.auto_index_at_source.len()
-                + layout.flat_below_source().len()
-                + layout.search_radius_source().len()
-                + layout.auto_expansion_ceiling_source().len()
                 + budget_receipt.map_or(0, |receipt| receipt.budget_terminal.len()),
         )?;
         Ok(VectorSearchDisclosure {
@@ -3079,13 +2878,6 @@ impl Database {
             aggregate_allowed_vectors: Some(aggregate_allowed_vectors),
             effective_auto_index_at: policy.auto_index_at,
             auto_index_at_source: policy.auto_index_at_source.to_owned(),
-            effective_flat_below: layout.effective_flat_below(),
-            flat_below_source: layout.flat_below_source().to_owned(),
-            effective_search_radius_millionths: layout.effective_search_radius_millionths()
-                as usize,
-            search_radius_source: layout.search_radius_source().to_owned(),
-            effective_auto_expansion_ceiling: layout.effective_auto_expansion_ceiling(),
-            auto_expansion_ceiling_source: layout.auto_expansion_ceiling_source().to_owned(),
             partition_key_columns: layout.partition_key_columns,
             scope,
             route: Some(route),
@@ -3113,7 +2905,7 @@ impl Database {
                 Expr::Literal(_) | Expr::Parameter(_) => VectorQuerySourceDisclosure::Vector,
                 _ => VectorQuerySourceDisclosure::Unknown,
             },
-            partition_hnsw,
+            partitions,
             global_candidate_budget: budget_receipt.map(|receipt| receipt.global_candidate_budget),
             admission_evaluations: budget_receipt.map(|receipt| receipt.admission_evaluations),
             expansion_evaluations: budget_receipt.map(|receipt| receipt.expansion_evaluations),
@@ -3127,8 +2919,6 @@ impl Database {
         &self,
         trace: contextdb_vector::mem::OwnedVectorSearchTrace,
     ) {
-        self.last_vector_search_used_hnsw
-            .store(trace.used_hnsw(), Ordering::SeqCst);
         #[cfg(feature = "test-seams")]
         crate::vector_read_memory::statement_child_proof::trace_published(
             &trace,
@@ -3139,55 +2929,12 @@ impl Database {
     }
 
     pub(crate) fn clear_last_vector_search_trace(&self) {
-        self.last_vector_search_used_hnsw
-            .store(false, Ordering::SeqCst);
         #[cfg(feature = "test-seams")]
         crate::vector_read_memory::statement_child_proof::trace_cleared(
             self.last_vector_search_trace.read().as_ref(),
         );
         let prior = self.last_vector_search_trace.write().take();
         drop(prior);
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn vector_hnsw_strategy_for_explain(
-        &self,
-        shape: &VectorExplainShape,
-        snapshot: SnapshotId,
-        params: &HashMap<String, Value>,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        authorized: Option<&RoaringTreemap>,
-    ) -> Result<bool> {
-        let candidate_route =
-            crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
-        let partition_scope = &candidate_route.scope;
-        let mut eligible = || {
-            self.vector.try_hnsw_eligible_without_build(
-                &shape.index,
-                authorized,
-                snapshot,
-                vector_copy_owner,
-            )
-        };
-
-        // Candidate completeness is disclosed separately. An unbound,
-        // structurally covering key still reports its prepared route shape;
-        // lack of a binding is not loss of a maintained graph.
-        if let Some(prefixes) = partition_scope
-            .as_ref()
-            .and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
-        {
-            contextdb_vector::mem::with_selected_partition_prefixes(
-                &shape.index,
-                prefixes.to_vec(),
-                eligible,
-            )
-        } else {
-            eligible()
-        }
     }
 
     #[expect(
@@ -4216,5 +3963,48 @@ pub(super) mod local_schema_test_seams {
         Err(Error::Other(
             "injected local schema preparation fault".into(),
         ))
+    }
+}
+
+/// The IVF members a vector column declares; an undeclared member is
+/// chosen by the engine and has no single disclosed value.
+#[derive(Clone, Copy)]
+struct DeclaredIvfMembers {
+    lists: Option<u32>,
+    probes: Option<u32>,
+    refine_factor_hundredths: Option<u32>,
+}
+
+impl DeclaredIvfMembers {
+    fn entry(
+        self,
+        partition: String,
+        route: Option<VectorSearchRoute>,
+        reason: Option<String>,
+        policy_revision: u64,
+    ) -> VectorPartitionDisclosure {
+        let source = |member: Option<u32>| member.map(|_| "declared".to_owned());
+        VectorPartitionDisclosure {
+            partition,
+            route,
+            reason,
+            lists: self.lists,
+            lists_source: source(self.lists),
+            probes: self.probes,
+            probes_source: source(self.probes),
+            refine_factor_hundredths: self.refine_factor_hundredths,
+            refine_factor_source: source(self.refine_factor_hundredths),
+            policy_revision,
+        }
+    }
+}
+
+/// The one reason every disclosed partition shares, or the mixed marker.
+fn common_partition_reason(partitions: &[VectorPartitionDisclosure]) -> String {
+    let mut reasons = partitions.iter().filter_map(|partition| partition.reason.as_deref());
+    match reasons.next() {
+        Some(first) if reasons.all(|reason| reason == first) => first.to_owned(),
+        Some(_) => "mixed_partition_routes".to_owned(),
+        None => "none".to_owned(),
     }
 }

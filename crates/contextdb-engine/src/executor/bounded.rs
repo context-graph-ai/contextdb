@@ -5203,16 +5203,6 @@ fn physical_plan_capacity_bytes(
             query_policy,
             materialized_columns,
             ..
-        }
-        | PhysicalPlan::HnswSearch {
-            table,
-            column,
-            query_expr,
-            candidates,
-            sort_key,
-            query_policy,
-            materialized_columns,
-            ..
         } => {
             let mut bytes = checked_size_add(table.capacity(), column.capacity(), "vector plan")?;
             bytes = checked_size_add(
@@ -5808,13 +5798,6 @@ pub(crate) fn vector_search_disclosure_capacity_bytes(
         disclosure.auto_index_at_source.capacity(),
         "trace vector disclosure box",
     )?;
-    for source in [
-        &disclosure.flat_below_source,
-        &disclosure.search_radius_source,
-        &disclosure.auto_expansion_ceiling_source,
-    ] {
-        bytes = checked_size_add(bytes, source.capacity(), "trace vector policy source")?;
-    }
     bytes = checked_size_add(
         bytes,
         strings_capacity_bytes(
@@ -5837,23 +5820,29 @@ pub(crate) fn vector_search_disclosure_capacity_bytes(
     bytes = checked_size_add(
         bytes,
         checked_size_mul(
-            disclosure.partition_hnsw.capacity(),
-            std::mem::size_of::<crate::database::VectorPartitionHnswDisclosure>(),
+            disclosure.partitions.capacity(),
+            std::mem::size_of::<crate::database::VectorPartitionDisclosure>(),
             "trace vector partition disclosures",
         )?,
         "trace vector disclosure",
     )?;
-    for partition in &disclosure.partition_hnsw {
+    for partition in &disclosure.partitions {
         bytes = checked_size_add(
             bytes,
             partition.partition.capacity(),
             "trace vector partition disclosure",
         )?;
-        bytes = checked_size_add(
-            bytes,
-            partition.ef_search_source.capacity(),
-            "trace vector partition disclosure",
-        )?;
+        for source in [
+            &partition.lists_source,
+            &partition.probes_source,
+            &partition.refine_factor_source,
+        ] {
+            bytes = checked_size_add(
+                bytes,
+                optional_string_capacity(source),
+                "trace vector partition disclosure",
+            )?;
+        }
         bytes = checked_size_add(
             bytes,
             optional_string_capacity(&partition.reason),
@@ -12828,8 +12817,7 @@ fn ensure_supported_plan(plan: &PhysicalPlan) -> std::result::Result<(), Bounded
         } => start_candidates
             .as_deref()
             .map_or(Ok(()), ensure_supported_plan),
-        PhysicalPlan::VectorSearch { candidates, .. }
-        | PhysicalPlan::HnswSearch { candidates, .. } => {
+        PhysicalPlan::VectorSearch { candidates, .. } => {
             candidates.as_deref().map_or(Ok(()), ensure_supported_plan)
         }
         PhysicalPlan::IndexScan { .. } | PhysicalPlan::CteRef { .. } => Ok(()),
@@ -13101,8 +13089,7 @@ fn preflight_plan_indexes(
             }
             Ok(())
         }
-        PhysicalPlan::VectorSearch { candidates, .. }
-        | PhysicalPlan::HnswSearch { candidates, .. } => {
+        PhysicalPlan::VectorSearch { candidates, .. } => {
             if let Some(candidates) = candidates {
                 preflight_plan_indexes(db, candidates, params, snapshot, context)?;
             }
@@ -13146,7 +13133,7 @@ fn enter_vector_read(
 fn plan_needs_vector_read(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::Limit { count: 0, .. } => false,
-        PhysicalPlan::VectorSearch { k, .. } | PhysicalPlan::HnswSearch { k, .. } => *k != 0,
+        PhysicalPlan::VectorSearch { k, .. } => *k != 0,
         PhysicalPlan::WindowRank { input, .. }
         | PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Filter { input, .. }
@@ -15412,16 +15399,6 @@ fn build_kernel_with_ctes<'plan>(
             sort_key,
             search_mode,
             ..
-        }
-        | PhysicalPlan::HnswSearch {
-            table,
-            column,
-            query_expr,
-            k,
-            candidates,
-            sort_key,
-            search_mode,
-            ..
         } => build_vector_kernel(
             db,
             plan,
@@ -16651,8 +16628,7 @@ fn build_vector_kernel<'plan>(
     context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
     let query_breadth = match plan {
-        PhysicalPlan::VectorSearch { query_policy, .. }
-        | PhysicalPlan::HnswSearch { query_policy, .. } => {
+        PhysicalPlan::VectorSearch { query_policy, .. } => {
             crate::database::vector_ivf::policy::QueryBreadth::resolve(
                 table,
                 column,
@@ -16996,11 +16972,7 @@ fn build_vector_kernel<'plan>(
     let mut columns = vec!["row_id".to_string()];
     columns.extend(schema_columns.iter().cloned());
     columns.push("score".to_string());
-    let operator = if matches!(plan, PhysicalPlan::HnswSearch { .. }) {
-        "HNSWSearch"
-    } else {
-        "VectorSearch"
-    };
+    let operator = "VectorSearch";
     let restricted_candidates =
         candidates.is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table));
     let trace = vector_search_trace_with_source(operator, candidate_trace, query_vector_source);
@@ -19302,12 +19274,6 @@ fn visit_publication_tables(
                 visit(table)?;
             }
             PhysicalPlan::VectorSearch {
-                table,
-                query_expr,
-                candidates,
-                ..
-            }
-            | PhysicalPlan::HnswSearch {
                 table,
                 query_expr,
                 candidates,

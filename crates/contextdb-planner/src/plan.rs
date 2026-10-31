@@ -52,17 +52,6 @@ pub enum PhysicalPlan {
         /// stored row value beyond its synthetic row id and score.
         materialized_columns: Option<Vec<String>>,
     },
-    HnswSearch {
-        table: String,
-        column: String,
-        query_expr: Expr,
-        k: u64,
-        candidates: Option<Box<PhysicalPlan>>,
-        sort_key: Option<String>,
-        search_mode: Option<VectorSearchMode>,
-        query_policy: Option<contextdb_parser::ast::VectorSearchOverride>,
-        materialized_columns: Option<Vec<String>>,
-    },
     /// Assigns one-based INT64 rank after its input predicates, before projection.
     /// Runtime binds columns against input schema and selects the actual Sort/Index route.
     WindowRank {
@@ -190,22 +179,6 @@ impl PhysicalPlan {
             } => {
                 format!(
                     "VectorSearch(table={}, column={}, k={}{}{})",
-                    table,
-                    column,
-                    k,
-                    query_source_prefix(query_expr),
-                    query_source_suffix(query_expr)
-                )
-            }
-            PhysicalPlan::HnswSearch {
-                table,
-                column,
-                query_expr,
-                k,
-                ..
-            } => {
-                format!(
-                    "HNSWSearch(table={}, column={}, k={}{}{})",
                     table,
                     column,
                     k,

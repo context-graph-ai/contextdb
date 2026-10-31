@@ -860,7 +860,6 @@ pub mod inline_phases {
         Planning,
         CandidateDrain,
         Grouping,
-        Hnsw,
         Adapter,
         Rescore,
         Materialize,
@@ -885,12 +884,11 @@ pub mod inline_phases {
         ResidentF32Distance,
         ResidentQuantizedDistance,
     }
-    const N: usize = 27;
+    const N: usize = 26;
     const NAMES: [&str; N] = [
         "planning",
         "candidate_drain",
         "grouping",
-        "hnsw",
         "adapter",
         "rescore",
         "materialize",

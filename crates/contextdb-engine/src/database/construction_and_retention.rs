@@ -592,16 +592,6 @@ pub(super) fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<Vecto
             search_mode,
             query_policy,
             ..
-        }
-        | PhysicalPlan::HnswSearch {
-            table,
-            column,
-            query_expr,
-            k,
-            candidates,
-            search_mode,
-            query_policy,
-            ..
         } => Some(VectorExplainShape {
             index: VectorIndexRef::new(table.clone(), column.clone()),
             k: usize::try_from(*k).unwrap_or(usize::MAX),

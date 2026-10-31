@@ -87,12 +87,6 @@ struct BorrowedVector<'a> {
     aggregate_allowed_vectors: Option<u64>,
     effective_auto_index_at: u64,
     auto_index_at_source: &'a str,
-    effective_flat_below: u64,
-    flat_below_source: &'a str,
-    effective_search_radius_millionths: u64,
-    search_radius_source: &'a str,
-    effective_auto_expansion_ceiling: u64,
-    auto_expansion_ceiling_source: &'a str,
     partition_key_columns: &'a [String],
     scope: &'a str,
     route: Option<&'a str>,
@@ -104,7 +98,7 @@ struct BorrowedVector<'a> {
     refusal: &'a Option<String>,
     recovery: &'a Option<String>,
     query_source: &'a str,
-    partition_hnsw: Partitions<'a>,
+    partitions: Partitions<'a>,
     global_candidate_budget: Option<u64>,
     admission_evaluations: Option<u64>,
     expansion_evaluations: Option<u64>,
@@ -112,7 +106,7 @@ struct BorrowedVector<'a> {
     layers_admitted: Option<u64>,
     budget_terminal: &'a Option<String>,
 }
-struct Partitions<'a>(&'a [VectorPartitionHnswDisclosure]);
+struct Partitions<'a>(&'a [VectorPartitionDisclosure]);
 impl Serialize for Partitions<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.0.iter().map(|p| {
@@ -120,10 +114,12 @@ impl Serialize for Partitions<'_> {
                 &p.partition,
                 p.route.map(|r| r.as_str()),
                 &p.reason,
-                p.hnsw_m as u64,
-                p.hnsw_ef_construction as u64,
-                p.hnsw_ef_search as u64,
-                &p.ef_search_source,
+                p.lists,
+                &p.lists_source,
+                p.probes,
+                &p.probes_source,
+                p.refine_factor_hundredths,
+                &p.refine_factor_source,
                 p.policy_revision,
             )
         }))
@@ -138,12 +134,6 @@ impl<'a> From<&'a VectorSearchDisclosure> for BorrowedVector<'a> {
             aggregate_allowed_vectors: d.aggregate_allowed_vectors.map(|n| n as u64),
             effective_auto_index_at: d.effective_auto_index_at as u64,
             auto_index_at_source: &d.auto_index_at_source,
-            effective_flat_below: d.effective_flat_below as u64,
-            flat_below_source: &d.flat_below_source,
-            effective_search_radius_millionths: d.effective_search_radius_millionths as u64,
-            search_radius_source: &d.search_radius_source,
-            effective_auto_expansion_ceiling: d.effective_auto_expansion_ceiling as u64,
-            auto_expansion_ceiling_source: &d.auto_expansion_ceiling_source,
             partition_key_columns: &d.partition_key_columns,
             scope: d.scope.as_str(),
             route: d.route.map(|r| r.as_str()),
@@ -155,7 +145,7 @@ impl<'a> From<&'a VectorSearchDisclosure> for BorrowedVector<'a> {
             refusal: &d.refusal,
             recovery: &d.recovery,
             query_source: d.query_source.as_str(),
-            partition_hnsw: Partitions(&d.partition_hnsw),
+            partitions: Partitions(&d.partitions),
             global_candidate_budget: d.global_candidate_budget.map(|n| n as u64),
             admission_evaluations: d.admission_evaluations.map(|n| n as u64),
             expansion_evaluations: d.expansion_evaluations.map(|n| n as u64),

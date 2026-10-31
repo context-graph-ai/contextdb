@@ -1989,23 +1989,29 @@ pub enum VectorQuerySourceDisclosure {
 /// one selected partition. Its key is an ordinal redaction. Restricted callers
 /// receive no per-partition entries: adaptive values could reveal hidden sizes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VectorPartitionHnswDisclosure {
+pub struct VectorPartitionDisclosure {
     pub partition: String,
     /// Work selected for this partition after aggregate AUTO admission.
     /// `None` is reserved for a partition scope that has not been bound yet.
     pub route: Option<VectorSearchRoute>,
     /// Why this partition selected `route`; absent only while scope is unbound.
     pub reason: Option<String>,
-    pub hnsw_m: usize,
-    pub hnsw_ef_construction: usize,
-    pub hnsw_ef_search: usize,
-    pub ef_search_source: String,
+    /// The declared list count. Absent when the declaration leaves it to the
+    /// engine, because no single value is true for the partition.
+    pub lists: Option<u32>,
+    pub lists_source: Option<String>,
+    /// The declared probe count; absent when chosen per query.
+    pub probes: Option<u32>,
+    pub probes_source: Option<String>,
+    /// The declared refine factor in hundredths; absent when chosen per query.
+    pub refine_factor_hundredths: Option<u32>,
+    pub refine_factor_source: Option<String>,
     pub policy_revision: u64,
 }
 
 /// Per-result vector route facts. Partition values, row ids, and bound values
 /// are redacted. The aggregate count covers authorized identities only;
-/// restricted callers receive no per-partition adaptive HNSW settings.
+/// restricted callers receive no per-partition entries.
 ///
 /// The planner resolves partition scope only after parameters are bound. A
 /// passive explain of a statement whose partition key is still an unbound
@@ -2022,18 +2028,6 @@ pub struct VectorSearchDisclosure {
     pub aggregate_allowed_vectors: Option<usize>,
     pub effective_auto_index_at: usize,
     pub auto_index_at_source: String,
-    /// The column's effective `FLAT_BELOW` and where it comes from: a
-    /// partition with fewer captured live rows is served flat.
-    pub effective_flat_below: usize,
-    pub flat_below_source: String,
-    /// The column's effective HNSW `SEARCH_RADIUS`, in millionths, and where
-    /// it comes from.
-    pub effective_search_radius_millionths: usize,
-    pub search_radius_source: String,
-    /// The column's effective `AUTO_EXPANSION_CEILING`, in percent, and where
-    /// it comes from.
-    pub effective_auto_expansion_ceiling: usize,
-    pub auto_expansion_ceiling_source: String,
     pub partition_key_columns: Vec<String>,
     pub scope: VectorSearchScopeShape,
     pub route: Option<VectorSearchRoute>,
@@ -2048,7 +2042,7 @@ pub struct VectorSearchDisclosure {
     /// One redacted entry per selected authorized partition. Values are
     /// resolved from that partition's snapshot-visible size; no key value is
     /// representable here.
-    pub partition_hnsw: Vec<VectorPartitionHnswDisclosure>,
+    pub partitions: Vec<VectorPartitionDisclosure>,
     pub global_candidate_budget: Option<usize>,
     pub admission_evaluations: Option<usize>,
     pub expansion_evaluations: Option<usize>,
@@ -4683,14 +4677,10 @@ mod maintenance_runtime;
 pub use maintenance_runtime::*;
 
 /// What one disclosed partition costs an EXPLAIN before its entries are
-/// pushed: its admitted figures, its AUTO price and its disclosure entry,
-/// doubled for `Vec` growth, plus its three short text fields (redacted
-/// label, reason and policy source).
-const EXPLAIN_PARTITION_DISCLOSURE_BYTES: usize = 2
-    * (std::mem::size_of::<(usize, usize, Option<VectorServingPolicy>)>()
-        + std::mem::size_of::<contextdb_vector::mem::AutoPartitionCost>()
-        + std::mem::size_of::<VectorPartitionHnswDisclosure>())
-    + 128;
+/// pushed: its disclosure entry, doubled for `Vec` growth, plus its short
+/// text fields (redacted label, reason and member sources).
+const EXPLAIN_PARTITION_DISCLOSURE_BYTES: usize =
+    2 * std::mem::size_of::<VectorPartitionDisclosure>() + 128;
 
 struct MetadataAuthorizedCandidates {
     ids: Option<RoaringTreemap>,

@@ -1641,12 +1641,6 @@ fn write_vector_search_disclosure(
     bytes
         .count(disclosure.effective_auto_index_at as u64)
         .text(&disclosure.auto_index_at_source)
-        .count(disclosure.effective_flat_below as u64)
-        .text(&disclosure.flat_below_source)
-        .count(disclosure.effective_search_radius_millionths as u64)
-        .text(&disclosure.search_radius_source)
-        .count(disclosure.effective_auto_expansion_ceiling as u64)
-        .text(&disclosure.auto_expansion_ceiling_source)
         .count(disclosure.partition_key_columns.len() as u64);
     for column in &disclosure.partition_key_columns {
         bytes.text(column);
@@ -1688,8 +1682,8 @@ fn write_vector_search_disclosure(
             crate::database::VectorQuerySourceDisclosure::RedactedRowKey => 1,
             crate::database::VectorQuerySourceDisclosure::Unknown => 2,
         })
-        .count(disclosure.partition_hnsw.len() as u64);
-    for partition in &disclosure.partition_hnsw {
+        .count(disclosure.partitions.len() as u64);
+    for partition in &disclosure.partitions {
         bytes
             .text(&partition.partition)
             .tag(match partition.route {
@@ -1698,12 +1692,22 @@ fn write_vector_search_disclosure(
                 Some(crate::database::VectorSearchRoute::Indexed) => 2,
                 Some(crate::database::VectorSearchRoute::FilteredIndexed) => 3,
             })
-            .optional_text(partition.reason.as_deref())
-            .count(partition.hnsw_m as u64)
-            .count(partition.hnsw_ef_construction as u64)
-            .count(partition.hnsw_ef_search as u64)
-            .text(&partition.ef_search_source)
-            .count(partition.policy_revision);
+            .optional_text(partition.reason.as_deref());
+        for (member, source) in [
+            (partition.lists, &partition.lists_source),
+            (partition.probes, &partition.probes_source),
+            (
+                partition.refine_factor_hundredths,
+                &partition.refine_factor_source,
+            ),
+        ] {
+            match member {
+                Some(value) => bytes.tag(1).count(u64::from(value)),
+                None => bytes.tag(0),
+            };
+            bytes.optional_text(source.as_deref());
+        }
+        bytes.count(partition.policy_revision);
     }
     for count in [
         disclosure.global_candidate_budget,
@@ -1760,15 +1764,6 @@ fn read_vector_search_disclosure(
     let effective_auto_index_at =
         usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?;
     let auto_index_at_source = bytes.text()?;
-    let effective_flat_below =
-        usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?;
-    let flat_below_source = bytes.text()?;
-    let effective_search_radius_millionths =
-        usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?;
-    let search_radius_source = bytes.text()?;
-    let effective_auto_expansion_ceiling =
-        usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?;
-    let auto_expansion_ceiling_source = bytes.text()?;
     let column_count = bytes.element_count()?;
     let mut partition_key_columns = bytes.vector(column_count)?;
     for _ in 0..column_count {
@@ -1815,24 +1810,37 @@ fn read_vector_search_disclosure(
         _ => return Err(invalid_metadata_payload()),
     };
     let partition_count = bytes.element_count()?;
-    let mut partition_hnsw = bytes.vector(partition_count)?;
+    let mut partitions = bytes.vector(partition_count)?;
     for _ in 0..partition_count {
-        partition_hnsw.push(crate::database::VectorPartitionHnswDisclosure {
-            partition: bytes.text()?,
-            route: match bytes.tag()? {
+        let partition = bytes.text()?;
+        let route = match bytes.tag()? {
+            0 => None,
+            1 => Some(crate::database::VectorSearchRoute::Exact),
+            2 => Some(crate::database::VectorSearchRoute::Indexed),
+            3 => Some(crate::database::VectorSearchRoute::FilteredIndexed),
+            _ => return Err(invalid_metadata_payload()),
+        };
+        let reason = bytes.optional_text()?;
+        let mut members = [(None, None), (None, None), (None, None)];
+        for member in &mut members {
+            let value = match bytes.tag()? {
                 0 => None,
-                1 => Some(crate::database::VectorSearchRoute::Exact),
-                2 => Some(crate::database::VectorSearchRoute::Indexed),
-                3 => Some(crate::database::VectorSearchRoute::FilteredIndexed),
+                1 => Some(u32::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?),
                 _ => return Err(invalid_metadata_payload()),
-            },
-            reason: bytes.optional_text()?,
-            hnsw_m: usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?,
-            hnsw_ef_construction: usize::try_from(bytes.count()?)
-                .map_err(|_| invalid_metadata_payload())?,
-            hnsw_ef_search: usize::try_from(bytes.count()?)
-                .map_err(|_| invalid_metadata_payload())?,
-            ef_search_source: bytes.text()?,
+            };
+            *member = (value, bytes.optional_text()?);
+        }
+        let [lists, probes, refine] = members;
+        partitions.push(crate::database::VectorPartitionDisclosure {
+            partition,
+            route,
+            reason,
+            lists: lists.0,
+            lists_source: lists.1,
+            probes: probes.0,
+            probes_source: probes.1,
+            refine_factor_hundredths: refine.0,
+            refine_factor_source: refine.1,
             policy_revision: bytes.count()?,
         });
     }
@@ -1852,12 +1860,6 @@ fn read_vector_search_disclosure(
         aggregate_allowed_vectors,
         effective_auto_index_at,
         auto_index_at_source,
-        effective_flat_below,
-        flat_below_source,
-        effective_search_radius_millionths,
-        search_radius_source,
-        effective_auto_expansion_ceiling,
-        auto_expansion_ceiling_source,
         partition_key_columns,
         scope,
         route,
@@ -1869,7 +1871,7 @@ fn read_vector_search_disclosure(
         refusal,
         recovery,
         query_source,
-        partition_hnsw,
+        partitions,
         global_candidate_budget: budget_counts[0],
         admission_evaluations: budget_counts[1],
         expansion_evaluations: budget_counts[2],

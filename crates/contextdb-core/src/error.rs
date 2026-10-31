@@ -882,16 +882,6 @@ pub enum VectorPolicyDeclarationIssue {
     FlatBelowOutOfRange,
     #[error("AUTO_EXPANSION_CEILING must be an integer percent from 1 through 100")]
     AutoExpansionCeilingOutOfRange,
-    #[error(
-        "HNSW SEARCH_RADIUS must be a decimal from 0 through 2 with at most six decimal places"
-    )]
-    SearchRadiusOutOfRange,
-    #[error("HNSW policy values must be positive integers")]
-    HnswValueNotPositive,
-    #[error("an HNSW policy value is outside the persisted numeric range")]
-    HnswValueOutOfRange,
-    #[error("HNSW EF_CONSTRUCTION must be at least M")]
-    EfConstructionBelowM,
     #[error("vector consolidation percentages must be integers from 1 through 100")]
     ConsolidationPercentOutOfRange,
 }

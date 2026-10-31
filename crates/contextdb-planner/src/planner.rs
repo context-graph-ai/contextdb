@@ -528,7 +528,7 @@ fn plan_select_body(
 
     // Guarded by `!uses_vector_search` so the vector-similarity path
     // (`ORDER BY <col> <=> <query> [USE RANK ...]`) is untouched: it was
-    // already turned into a VectorSearch/HnswSearch above and never reaches
+    // already turned into a VectorSearch above and never reaches
     // these rules.
     if !body.order_by.is_empty() && !uses_vector_search {
         let keys = body

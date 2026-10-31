@@ -13,7 +13,7 @@ use crate::local_transport::{
     preflight_metadata_page_payload,
 };
 use crate::{
-    QueryResult, QueryTrace, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
+    QueryResult, QueryTrace, VectorPartitionDisclosure, VectorQuerySourceDisclosure,
     VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
     VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
@@ -131,14 +131,16 @@ impl CanonicalMaintainedCountDisclosure {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CanonicalVectorPartitionHnswDisclosure {
+pub struct CanonicalVectorPartitionDisclosure {
     pub partition: String,
     pub route: Option<String>,
     pub reason: Option<String>,
-    pub hnsw_m: u64,
-    pub hnsw_ef_construction: u64,
-    pub hnsw_ef_search: u64,
-    pub ef_search_source: String,
+    pub lists: Option<u32>,
+    pub lists_source: Option<String>,
+    pub probes: Option<u32>,
+    pub probes_source: Option<String>,
+    pub refine_factor_hundredths: Option<u32>,
+    pub refine_factor_source: Option<String>,
     pub policy_revision: u64,
 }
 
@@ -150,12 +152,6 @@ pub struct CanonicalVectorSearchDisclosure {
     pub aggregate_allowed_vectors: Option<u64>,
     pub effective_auto_index_at: u64,
     pub auto_index_at_source: String,
-    pub effective_flat_below: u64,
-    pub flat_below_source: String,
-    pub effective_search_radius_millionths: u64,
-    pub search_radius_source: String,
-    pub effective_auto_expansion_ceiling: u64,
-    pub auto_expansion_ceiling_source: String,
     pub partition_key_columns: Vec<String>,
     pub scope: String,
     pub route: Option<String>,
@@ -167,7 +163,7 @@ pub struct CanonicalVectorSearchDisclosure {
     pub refusal: Option<String>,
     pub recovery: Option<String>,
     pub query_source: String,
-    pub partition_hnsw: Vec<CanonicalVectorPartitionHnswDisclosure>,
+    pub partitions: Vec<CanonicalVectorPartitionDisclosure>,
     #[serde(default)]
     pub global_candidate_budget: Option<u64>,
     #[serde(default)]
@@ -193,13 +189,6 @@ impl From<&VectorSearchDisclosure> for CanonicalVectorSearchDisclosure {
                 .map(|count| count as u64),
             effective_auto_index_at: disclosure.effective_auto_index_at as u64,
             auto_index_at_source: disclosure.auto_index_at_source.clone(),
-            effective_flat_below: disclosure.effective_flat_below as u64,
-            flat_below_source: disclosure.flat_below_source.clone(),
-            effective_search_radius_millionths: disclosure.effective_search_radius_millionths
-                as u64,
-            search_radius_source: disclosure.search_radius_source.clone(),
-            effective_auto_expansion_ceiling: disclosure.effective_auto_expansion_ceiling as u64,
-            auto_expansion_ceiling_source: disclosure.auto_expansion_ceiling_source.clone(),
             partition_key_columns: disclosure.partition_key_columns.clone(),
             scope: disclosure.scope.as_str().to_owned(),
             route: disclosure.route.map(|route| route.as_str().to_owned()),
@@ -217,17 +206,19 @@ impl From<&VectorSearchDisclosure> for CanonicalVectorSearchDisclosure {
             rescore_evaluations: disclosure.rescore_evaluations.map(|count| count as u64),
             layers_admitted: disclosure.layers_admitted.map(|count| count as u64),
             budget_terminal: disclosure.budget_terminal.clone(),
-            partition_hnsw: disclosure
-                .partition_hnsw
+            partitions: disclosure
+                .partitions
                 .iter()
-                .map(|partition| CanonicalVectorPartitionHnswDisclosure {
+                .map(|partition| CanonicalVectorPartitionDisclosure {
                     partition: partition.partition.clone(),
                     route: partition.route.map(|route| route.as_str().to_owned()),
                     reason: partition.reason.clone(),
-                    hnsw_m: partition.hnsw_m as u64,
-                    hnsw_ef_construction: partition.hnsw_ef_construction as u64,
-                    hnsw_ef_search: partition.hnsw_ef_search as u64,
-                    ef_search_source: partition.ef_search_source.clone(),
+                    lists: partition.lists,
+                    lists_source: partition.lists_source.clone(),
+                    probes: partition.probes,
+                    probes_source: partition.probes_source.clone(),
+                    refine_factor_hundredths: partition.refine_factor_hundredths,
+                    refine_factor_source: partition.refine_factor_source.clone(),
                     policy_revision: partition.policy_revision,
                 })
                 .collect(),
@@ -300,19 +291,6 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
             effective_auto_index_at: usize::try_from(disclosure.effective_auto_index_at)
                 .map_err(|_| ())?,
             auto_index_at_source: disclosure.auto_index_at_source,
-            effective_flat_below: usize::try_from(disclosure.effective_flat_below)
-                .map_err(|_| ())?,
-            flat_below_source: disclosure.flat_below_source,
-            effective_search_radius_millionths: usize::try_from(
-                disclosure.effective_search_radius_millionths,
-            )
-            .map_err(|_| ())?,
-            search_radius_source: disclosure.search_radius_source,
-            effective_auto_expansion_ceiling: usize::try_from(
-                disclosure.effective_auto_expansion_ceiling,
-            )
-            .map_err(|_| ())?,
-            auto_expansion_ceiling_source: disclosure.auto_expansion_ceiling_source,
             partition_key_columns: disclosure.partition_key_columns,
             scope,
             route,
@@ -350,10 +328,10 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
                 .transpose()
                 .map_err(|_| ())?,
             budget_terminal: disclosure.budget_terminal,
-            partition_hnsw: {
-                let mut partitions = Vec::with_capacity(disclosure.partition_hnsw.len());
-                for partition in disclosure.partition_hnsw {
-                    partitions.push(VectorPartitionHnswDisclosure {
+            partitions: {
+                let mut partitions = Vec::with_capacity(disclosure.partitions.len());
+                for partition in disclosure.partitions {
+                    partitions.push(VectorPartitionDisclosure {
                         partition: partition.partition,
                         route: partition
                             .route
@@ -366,12 +344,12 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
                             })
                             .transpose()?,
                         reason: partition.reason,
-                        hnsw_m: usize::try_from(partition.hnsw_m).map_err(|_| ())?,
-                        hnsw_ef_construction: usize::try_from(partition.hnsw_ef_construction)
-                            .map_err(|_| ())?,
-                        hnsw_ef_search: usize::try_from(partition.hnsw_ef_search)
-                            .map_err(|_| ())?,
-                        ef_search_source: partition.ef_search_source,
+                        lists: partition.lists,
+                        lists_source: partition.lists_source,
+                        probes: partition.probes,
+                        probes_source: partition.probes_source,
+                        refine_factor_hundredths: partition.refine_factor_hundredths,
+                        refine_factor_source: partition.refine_factor_source,
                         policy_revision: partition.policy_revision,
                     });
                 }
@@ -644,10 +622,12 @@ struct QueryPartitionView<'a> {
     partition: &'a str,
     route: Option<&'a str>,
     reason: Option<&'a str>,
-    hnsw_m: u64,
-    hnsw_ef_construction: u64,
-    hnsw_ef_search: u64,
-    ef_search_source: &'a str,
+    lists: Option<u32>,
+    lists_source: Option<&'a str>,
+    probes: Option<u32>,
+    probes_source: Option<&'a str>,
+    refine_factor_hundredths: Option<u32>,
+    refine_factor_source: Option<&'a str>,
     policy_revision: u64,
 }
 #[derive(Serialize)]
@@ -658,12 +638,6 @@ struct QueryVectorView<'a> {
     aggregate_allowed_vectors: Option<u64>,
     effective_auto_index_at: u64,
     auto_index_at_source: &'a str,
-    effective_flat_below: u64,
-    flat_below_source: &'a str,
-    effective_search_radius_millionths: u64,
-    search_radius_source: &'a str,
-    effective_auto_expansion_ceiling: u64,
-    auto_expansion_ceiling_source: &'a str,
     partition_key_columns: &'a [String],
     scope: &'a str,
     route: Option<&'a str>,
@@ -675,7 +649,7 @@ struct QueryVectorView<'a> {
     refusal: Option<&'a str>,
     recovery: Option<&'a str>,
     query_source: &'a str,
-    partition_hnsw: QueryPartitionSequence<'a>,
+    partitions: QueryPartitionSequence<'a>,
     global_candidate_budget: Option<u64>,
     admission_evaluations: Option<u64>,
     expansion_evaluations: Option<u64>,
@@ -821,7 +795,7 @@ impl Serialize for QueryCandidateSequence<'_> {
         sequence.end()
     }
 }
-struct QueryPartitionSequence<'a>(&'a [VectorPartitionHnswDisclosure]);
+struct QueryPartitionSequence<'a>(&'a [VectorPartitionDisclosure]);
 impl Serialize for QueryPartitionSequence<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
@@ -831,10 +805,12 @@ impl Serialize for QueryPartitionSequence<'_> {
                 partition: &partition.partition,
                 route: partition.route.map(|route| route.as_str()),
                 reason: partition.reason.as_deref(),
-                hnsw_m: partition.hnsw_m as u64,
-                hnsw_ef_construction: partition.hnsw_ef_construction as u64,
-                hnsw_ef_search: partition.hnsw_ef_search as u64,
-                ef_search_source: &partition.ef_search_source,
+                lists: partition.lists,
+                lists_source: partition.lists_source.as_deref(),
+                probes: partition.probes,
+                probes_source: partition.probes_source.as_deref(),
+                refine_factor_hundredths: partition.refine_factor_hundredths,
+                refine_factor_source: partition.refine_factor_source.as_deref(),
                 policy_revision: partition.policy_revision,
             })?;
         }
@@ -919,13 +895,6 @@ impl<'a> From<&'a VectorSearchDisclosure> for QueryVectorView<'a> {
                 .map(|count| count as u64),
             effective_auto_index_at: disclosure.effective_auto_index_at as u64,
             auto_index_at_source: disclosure.auto_index_at_source.as_str(),
-            effective_flat_below: disclosure.effective_flat_below as u64,
-            flat_below_source: disclosure.flat_below_source.as_str(),
-            effective_search_radius_millionths: disclosure.effective_search_radius_millionths
-                as u64,
-            search_radius_source: disclosure.search_radius_source.as_str(),
-            effective_auto_expansion_ceiling: disclosure.effective_auto_expansion_ceiling as u64,
-            auto_expansion_ceiling_source: disclosure.auto_expansion_ceiling_source.as_str(),
             partition_key_columns: disclosure.partition_key_columns.as_slice(),
             scope: disclosure.scope.as_str(),
             route: disclosure.route.map(|route| route.as_str()),
@@ -943,7 +912,7 @@ impl<'a> From<&'a VectorSearchDisclosure> for QueryVectorView<'a> {
             rescore_evaluations: disclosure.rescore_evaluations.map(|count| count as u64),
             layers_admitted: disclosure.layers_admitted.map(|count| count as u64),
             budget_terminal: disclosure.budget_terminal.as_deref(),
-            partition_hnsw: QueryPartitionSequence(&disclosure.partition_hnsw),
+            partitions: QueryPartitionSequence(&disclosure.partitions),
         }
     }
 }

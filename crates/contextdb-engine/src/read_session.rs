@@ -6008,8 +6008,8 @@ fn trace_restoration_bytes(trace: &crate::read_contract::CanonicalQueryTrace) ->
         )?;
         bytes = add(
             bytes,
-            vector.partition_hnsw.len(),
-            std::mem::size_of::<crate::VectorPartitionHnswDisclosure>(),
+            vector.partitions.len(),
+            std::mem::size_of::<crate::VectorPartitionDisclosure>(),
         )?;
     }
     if let Some(count) = &trace.maintained_count {

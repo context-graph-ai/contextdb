@@ -1729,20 +1729,26 @@ impl std::fmt::Display for VectorSearchDisclosure {
         } else {
             self.partition_key_columns.join(",")
         };
-        let partition_hnsw = self
-            .partition_hnsw
+        let optional = |value: Option<u32>, source: &Option<String>| match (value, source) {
+            (Some(value), Some(source)) => format!("{value}({source})"),
+            _ => "null".to_owned(),
+        };
+        let partitions = self
+            .partitions
             .iter()
             .map(|partition| {
                 format!(
-                    "partition={} route={} reason={} hnsw_m={} hnsw_ef_construction={} hnsw_ef_search={} \
-                     ef_search_source={} policy_revision={}",
+                    "partition={} route={} reason={} lists={} probes={} refine_factor={} \
+                     policy_revision={}",
                     partition.partition,
                     partition.route.map_or("null", VectorSearchRoute::as_str),
                     partition.reason.as_deref().unwrap_or("none"),
-                    partition.hnsw_m,
-                    partition.hnsw_ef_construction,
-                    partition.hnsw_ef_search,
-                    partition.ef_search_source,
+                    optional(partition.lists, &partition.lists_source),
+                    optional(partition.probes, &partition.probes_source),
+                    optional(
+                        partition.refine_factor_hundredths,
+                        &partition.refine_factor_source
+                    ),
                     partition.policy_revision,
                 )
             })
@@ -1751,26 +1757,16 @@ impl std::fmt::Display for VectorSearchDisclosure {
         write!(
             formatter,
             "vector_search route_evidence={} requested_mode={} resolved_mode={} aggregate_allowed_vectors={} \
-             effective_auto_index_at={} auto_index_at_source={} effective_flat_below={} \
-             flat_below_source={} effective_search_radius={} search_radius_source={} \
-             effective_auto_expansion_ceiling={} auto_expansion_ceiling_source={} \
+             effective_auto_index_at={} auto_index_at_source={} \
              partition_key={} scope={} route={} \
              base={} change={} tail={} merge=global residual={} fallback={} refusal={} recovery={} \
-             query_source={} partition_hnsw=[{}]",
+             query_source={} partitions=[{}]",
             self.route_evidence.as_str(),
             self.requested_mode,
             self.resolved_mode,
             render_optional_count(self.aggregate_allowed_vectors),
             self.effective_auto_index_at,
             self.auto_index_at_source,
-            self.effective_flat_below,
-            self.flat_below_source,
-            contextdb_core::render_search_radius_millionths(
-                self.effective_search_radius_millionths as u32
-            ),
-            self.search_radius_source,
-            self.effective_auto_expansion_ceiling,
-            self.auto_expansion_ceiling_source,
             partition_key,
             self.scope.as_str(),
             self.route.map_or("null", VectorSearchRoute::as_str),
@@ -1782,7 +1778,7 @@ impl std::fmt::Display for VectorSearchDisclosure {
             self.refusal.as_deref().unwrap_or("none"),
             self.recovery.as_deref().unwrap_or("none"),
             self.query_source.as_str(),
-            partition_hnsw,
+            partitions,
         )
     }
 }
