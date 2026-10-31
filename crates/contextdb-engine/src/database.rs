@@ -2086,13 +2086,7 @@ pub struct RetainedVectorSearchTrace {
 #[derive(Debug)]
 pub struct VectorSearchTraceObservation {
     pub index: VectorIndexRef,
-    pub used_hnsw: bool,
-    pub hnsw_len: Option<usize>,
-    pub hnsw_candidate_count: usize,
-    pub hnsw_candidate_row_ids: Vec<RowId>,
     pub supplemented_row_count: usize,
-    pub hnsw_ef_search: Option<usize>,
-    pub selected_generations: Vec<contextdb_vector::store::VectorGraphGeneration>,
     pub final_row_ids: Vec<RowId>,
     pub partition_routes: Vec<contextdb_vector::mem::VectorPartitionSearchTrace>,
     pub fallback_reason: Option<&'static str>,
@@ -6831,7 +6825,6 @@ impl Database {
                     std::ptr::addr_of_mut!((*construction.source).vector).write(
                         self.tx_mgr.vector_executor(
                             self.vector_store.clone(),
-                            Arc::new(OnceLock::new()),
                             contextdb_vector::MemoryBudgetOwner::clone(
                                 &self.finalization.vector_accountant,
                             ),

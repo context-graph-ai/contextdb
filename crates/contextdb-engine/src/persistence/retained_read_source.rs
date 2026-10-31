@@ -2674,7 +2674,7 @@ impl RetainedReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn begin_read(&self) -> Result<redb::ReadTransaction> {
+    pub(crate) fn begin_read(&self) -> Result<redb::ReadTransaction> {
         if self.registration.snapshot.storage_snapshot != self.snapshot {
             return Err(crate::funded_error::corruption_text(
                 Ok(self.read_memory.clone()),

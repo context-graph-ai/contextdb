@@ -5949,34 +5949,18 @@ pub struct VectorIndexLayout {
     pub max_partitions: Option<u32>,
     pub search_mode: VectorSearchMode,
     pub auto_index_at: Option<u32>,
-    /// The declared per-partition live-row count below which a partition is
-    /// served from its maintained flat representation; `None` is the default.
-    pub flat_below: Option<u32>,
-    /// The declared most of its walk budget, in percent, AUTO expects one
-    /// partition's graph search to spend; `None` is the default.
-    pub auto_expansion_ceiling: Option<u32>,
-    pub hnsw_m: Option<u32>,
-    pub hnsw_ef_construction: Option<u32>,
-    pub hnsw_ef_search: Option<u32>,
-    /// The declared search radius in millionths; `None` is the default.
-    pub hnsw_search_radius_millionths: Option<u32>,
     pub policy_revision: u64,
     pub consolidation_change_percent: Option<u32>,
     pub consolidation_tombstone_percent: Option<u32>,
     pub consolidation_disabled: bool,
 }
 
-/// One authoritative policy resolution used by routing, graph construction,
-/// search admission, inspection, and publication validation.
+/// One authoritative policy resolution used by routing and inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedVectorPolicy {
     pub auto_index_at: usize,
-    pub hnsw_m: usize,
-    pub hnsw_ef_construction: usize,
-    pub hnsw_ef_search: usize,
     pub policy_revision: u64,
     pub auto_index_at_source: &'static str,
-    pub ef_search_source: &'static str,
 }
 
 impl VectorIndexLayout {
@@ -5994,12 +5978,6 @@ impl VectorIndexLayout {
             max_partitions,
             search_mode,
             auto_index_at: None,
-            flat_below: None,
-            auto_expansion_ceiling: None,
-            hnsw_m: None,
-            hnsw_ef_construction: None,
-            hnsw_ef_search: None,
-            hnsw_search_radius_millionths: None,
             policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
             consolidation_change_percent: None,
             consolidation_tombstone_percent: None,
@@ -6007,18 +5985,8 @@ impl VectorIndexLayout {
         }
     }
 
-    pub fn with_policy(
-        mut self,
-        auto_index_at: Option<u32>,
-        hnsw_m: Option<u32>,
-        hnsw_ef_construction: Option<u32>,
-        hnsw_ef_search: Option<u32>,
-        policy_revision: u64,
-    ) -> Self {
+    pub fn with_policy(mut self, auto_index_at: Option<u32>, policy_revision: u64) -> Self {
         self.auto_index_at = auto_index_at;
-        self.hnsw_m = hnsw_m;
-        self.hnsw_ef_construction = hnsw_ef_construction;
-        self.hnsw_ef_search = hnsw_ef_search;
         self.policy_revision = policy_revision.max(contextdb_core::DEFAULT_VECTOR_POLICY_REVISION);
         self
     }
@@ -6031,21 +5999,6 @@ impl VectorIndexLayout {
         self.consolidation_change_percent = change_percent;
         self.consolidation_tombstone_percent = tombstone_percent;
         self.consolidation_disabled = false;
-        self
-    }
-
-    pub fn with_flat_below(mut self, flat_below: Option<u32>) -> Self {
-        self.flat_below = flat_below;
-        self
-    }
-
-    pub fn with_auto_expansion_ceiling(mut self, percent: Option<u32>) -> Self {
-        self.auto_expansion_ceiling = percent;
-        self
-    }
-
-    pub fn with_search_radius_millionths(mut self, millionths: Option<u32>) -> Self {
-        self.hnsw_search_radius_millionths = millionths;
         self
     }
 
@@ -6066,12 +6019,6 @@ impl VectorIndexLayout {
             max_partitions: None,
             search_mode: VectorSearchMode::Auto,
             auto_index_at: None,
-            flat_below: None,
-            auto_expansion_ceiling: None,
-            hnsw_m: None,
-            hnsw_ef_construction: None,
-            hnsw_ef_search: None,
-            hnsw_search_radius_millionths: None,
             policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
             consolidation_change_percent: None,
             consolidation_tombstone_percent: None,
@@ -6119,93 +6066,12 @@ impl VectorIndexLayout {
         )
     }
 
-    /// The live-row count below which a partition is served from its
-    /// maintained flat representation rather than its graph. The default is 0,
-    /// never flat, until the walk-versus-scan crossover is measured.
-    pub fn effective_flat_below(&self) -> usize {
-        self.flat_below
-            .map_or(HNSW_DEFAULT_FLAT_BELOW, |value| value as usize)
-    }
-
-    /// Where [`Self::effective_flat_below`] comes from.
-    pub fn flat_below_source(&self) -> &'static str {
-        if self.flat_below.is_some() {
-            "declared"
-        } else {
-            "compatibility_profile"
-        }
-    }
-
-    /// Whether a partition whose captured live count is `live` is served flat:
-    /// strictly below the threshold, so a partition at it walks its graph.
-    pub fn serves_flat(&self, live: usize) -> bool {
-        live < self.effective_flat_below()
-    }
-
-    /// Resolve the policy for one partition size and one requested top-k.
-    /// The topology members use the partition's live count; AUTO routing uses
-    /// `effective_auto_index_at` against the separately aggregated allowed
+    /// Resolve the policy that routing and inspection read. AUTO routing
+    /// compares `auto_index_at` against the separately aggregated allowed
     /// count at the caller.
-    /// How far past its beam's edge distance a graph walk keeps expanding,
-    /// as a fraction of that distance, before the edge ends it.
-    pub fn resolve_search_radius(&self) -> f32 {
-        self.hnsw_search_radius_millionths
-            .map_or(HNSW_DEFAULT_SEARCH_RADIUS, |millionths| {
-                millionths as f32 / 1_000_000.0
-            })
-    }
-
-    /// The effective search radius in millionths, as receipts disclose it.
-    pub fn effective_search_radius_millionths(&self) -> u32 {
-        self.hnsw_search_radius_millionths
-            .unwrap_or(HNSW_DEFAULT_SEARCH_RADIUS_MILLIONTHS)
-    }
-
-    /// Where [`Self::resolve_search_radius`] comes from.
-    pub fn search_radius_source(&self) -> &'static str {
-        if self.hnsw_search_radius_millionths.is_some() {
-            "declared"
-        } else {
-            "compatibility_profile"
-        }
-    }
-
-    /// The most of its walk budget, in percent, AUTO expects one partition's
-    /// graph search to spend.
-    pub fn effective_auto_expansion_ceiling(&self) -> usize {
-        self.auto_expansion_ceiling
-            .map_or(AUTO_DEFAULT_EXPANSION_CEILING_PERCENT, |percent| {
-                percent as usize
-            })
-    }
-
-    /// Where [`Self::effective_auto_expansion_ceiling`] comes from.
-    pub fn auto_expansion_ceiling_source(&self) -> &'static str {
-        if self.auto_expansion_ceiling.is_some() {
-            "declared"
-        } else {
-            "compatibility_profile"
-        }
-    }
-
-    pub fn resolve_policy(&self, live_vectors: usize, k: usize) -> ResolvedVectorPolicy {
-        let (profile_m, profile_ef_construction, profile_ef_search) =
-            compatibility_hnsw_profile(live_vectors, self.quantization);
-        let (hnsw_ef_search, ef_search_source) = match self.hnsw_ef_search {
-            Some(declared) if (declared as usize) < k => (k, "declared_raised_to_k"),
-            Some(declared) => (declared as usize, "declared"),
-            None => (
-                profile_ef_search.max(k.saturating_mul(10)).max(1),
-                "compatibility_profile",
-            ),
-        };
+    pub fn resolve_policy(&self) -> ResolvedVectorPolicy {
         ResolvedVectorPolicy {
             auto_index_at: self.effective_auto_index_at(),
-            hnsw_m: self.hnsw_m.map_or(profile_m, |value| value as usize),
-            hnsw_ef_construction: self
-                .hnsw_ef_construction
-                .map_or(profile_ef_construction, |value| value as usize),
-            hnsw_ef_search,
             policy_revision: self
                 .policy_revision
                 .max(contextdb_core::DEFAULT_VECTOR_POLICY_REVISION),
@@ -6214,19 +6080,7 @@ impl VectorIndexLayout {
             } else {
                 "compatibility_profile"
             },
-            ef_search_source,
         }
-    }
-
-    /// Validate every compatibility size band so a partial declaration can
-    /// never become invalid merely because a partition crosses a threshold.
-    pub fn hnsw_policy_is_valid(&self) -> bool {
-        [0, HNSW_MEDIUM_PROFILE_START, HNSW_LARGE_PROFILE_START]
-            .into_iter()
-            .all(|count| {
-                let resolved = self.resolve_policy(count, 1);
-                resolved.hnsw_ef_construction >= resolved.hnsw_m
-            })
     }
 
     pub fn is_partitioned(&self) -> bool {
@@ -6253,44 +6107,6 @@ impl VectorIndexLayout {
                     .map(|column| column.capacity())
                     .sum::<usize>(),
             )
-    }
-}
-
-/// The search radius every index resolves to: a walk keeps expanding heads
-/// up to 2% past its beam's edge distance. The previous default was 0, which
-/// ended the walk at the edge.
-const HNSW_DEFAULT_SEARCH_RADIUS: f32 = 0.02;
-/// [`HNSW_DEFAULT_SEARCH_RADIUS`] in millionths, as receipts disclose it.
-const HNSW_DEFAULT_SEARCH_RADIUS_MILLIONTHS: u32 = 20_000;
-/// The default most of its walk budget, in percent, AUTO expects one
-/// partition's graph search to spend. Measured shares: 315-1,364 of 3,200
-/// (10-43%) on a 2,048-row corpus; about 9,700 of 19,200 (50%) at 12,500 rows
-/// on the file route; 1,287-1,428 of 19,200 (7%) on the frozen 10,000-row
-/// single-Context corpus (`single_context_search_radius_work_diagnostic`).
-/// The previous ceiling was 100%, reached at 20,000 admitted rows.
-pub const AUTO_DEFAULT_EXPANSION_CEILING_PERCENT: usize = 25;
-/// The default `FLAT_BELOW`: 0, so no partition is served flat until a
-/// declaration says so. A measured default replaces it only after the
-/// walk-versus-scan crossover is recorded.
-const HNSW_DEFAULT_FLAT_BELOW: usize = 0;
-const HNSW_MEDIUM_PROFILE_START: usize = 5_001;
-const HNSW_LARGE_PROFILE_START: usize = 50_001;
-
-fn compatibility_hnsw_profile(
-    count: usize,
-    quantization: VectorQuantization,
-) -> (usize, usize, usize) {
-    match quantization {
-        VectorQuantization::F32 => match count {
-            0..=2_500 => (16, 200, 10),
-            n if n < HNSW_MEDIUM_PROFILE_START => (16, 200, 20),
-            n if n < HNSW_LARGE_PROFILE_START => (24, 400, 400),
-            _ => (16, 200, 200),
-        },
-        VectorQuantization::SQ8 | VectorQuantization::SQ4 => match count {
-            n if n < HNSW_MEDIUM_PROFILE_START => (8, 32, count.clamp(32, 96)),
-            _ => (12, 64, 128),
-        },
     }
 }
 
@@ -13799,7 +13615,7 @@ impl VectorStore {
             maintenance_progress: maintenance_inspection.progress,
             maintenance_failure: maintenance_failure_details.map(|details| details.failure),
             maintenance_failure_details,
-            desired_policy: layout.resolve_policy(live_rows, 1),
+            desired_policy: layout.resolve_policy(),
             maintenance_policy_revision: state.maintenance_policy_revision(),
         }
     }

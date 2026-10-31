@@ -7017,7 +7017,6 @@ impl Database {
         // Every fallible preparation, including the captured writer schema,
         // precedes durability. Move the successor payloads into an infallible
         // callback that runs before the postcommit observation boundary.
-        let mut published_policy = None;
         let publish = || {
             let old = {
                 let mut metadata = self.relational_store.table_meta.write();
@@ -7033,7 +7032,7 @@ impl Database {
                 // Apply the already admitted layout after durable success.
                 // A consolidation recheck belongs outside this committed
                 // write's sticky admission scope, never inside publication.
-                published_policy = self.vector_store.publish_policy_layout_update(prepared);
+                self.vector_store.publish_policy_layout_update(prepared);
             }
         };
         let result = if let Some(persistence) = &self.persistence {

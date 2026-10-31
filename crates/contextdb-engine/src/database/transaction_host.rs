@@ -1861,12 +1861,6 @@ impl RetainedVectorSearchTrace {
             .saturating_add(trace.index.column.capacity())
             .saturating_add(
                 trace
-                    .hnsw_candidate_row_ids
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<RowId>()),
-            )
-            .saturating_add(
-                trace
                     .final_row_ids
                     .capacity()
                     .saturating_mul(std::mem::size_of::<RowId>()),
@@ -1879,9 +1873,6 @@ impl RetainedVectorSearchTrace {
                         contextdb_vector::mem::VectorPartitionSearchTrace,
                     >()),
             )
-            .saturating_add(trace.selected_generations.capacity().saturating_mul(
-                std::mem::size_of::<contextdb_vector::store::VectorGraphGeneration>(),
-            ))
     }
     #[expect(
         clippy::result_large_err,
@@ -1947,15 +1938,6 @@ impl VectorSearchTraceObservation {
                 .saturating_add(trace.index().column.len())
                 .saturating_add(
                     trace
-                        .hnsw_candidate_row_ids()
-                        .len()
-                        .saturating_mul(std::mem::size_of::<RowId>()),
-                )
-                .saturating_add(trace.selected_generations().len().saturating_mul(
-                    std::mem::size_of::<contextdb_vector::store::VectorGraphGeneration>(),
-                ))
-                .saturating_add(
-                    trace
                         .final_row_ids()
                         .len()
                         .saturating_mul(std::mem::size_of::<RowId>()),
@@ -1972,13 +1954,7 @@ impl VectorSearchTraceObservation {
         )?;
         Ok(Self {
             index: trace.index().clone(),
-            used_hnsw: trace.used_hnsw(),
-            hnsw_len: trace.hnsw_len(),
-            hnsw_candidate_count: trace.hnsw_candidate_count(),
-            hnsw_candidate_row_ids: trace.hnsw_candidate_row_ids().to_vec(),
             supplemented_row_count: trace.supplemented_row_count(),
-            hnsw_ef_search: trace.hnsw_ef_search(),
-            selected_generations: trace.selected_generations().to_vec(),
             final_row_ids: trace.final_row_ids().to_vec(),
             partition_routes: trace.partition_routes().to_vec(),
             fallback_reason: trace.fallback_reason(),

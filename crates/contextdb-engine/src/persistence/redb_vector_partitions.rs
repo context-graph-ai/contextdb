@@ -1713,69 +1713,6 @@ impl RedbPersistence {
         ))
     }
 
-        let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            let catalogs =
-                match read.open_byte_table_bounded(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
-                    Ok(table) => table,
-                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                    Err(error) => return Err(Self::storage_error(error)),
-                };
-            let Some(value) = catalogs
-                .get_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-            else {
-                return Ok(None);
-            };
-            let catalog: VectorPartitionGenerationCatalogRecord = self
-                .decode_expected_vector_partition_metadata(
-                    VectorPartitionRecordKind::GenerationCatalog,
-                    value.value(),
-                    &partition.index,
-                    &partition.partition_key,
-                )?;
-            if catalog.index != partition.index || catalog.partition_key != partition.partition_key
-            {
-                return Ok(None);
-            }
-            let mut digest = blake3::Hasher::new();
-            digest.update(value.value());
-            match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
-                Ok(table) => {
-                    let upper = writer_source::prefix_end(&prefix).ok_or_else(|| {
-                        self.vector_partition_corruption("journal prefix has no upper bound")
-                    })?;
-                    if let Some(entry) = table
-                        .range(prefix.as_slice()..upper.as_slice())
-                        .map_err(Self::storage_error)?
-                        .next_back()
-                    {
-                        let (key, value) = entry.map_err(Self::storage_error)?;
-                        let record: VectorPartitionJournalRecord = self
-                            .decode_vector_partition_record(
-                                VectorPartitionRecordKind::Journal,
-                                value.value(),
-                            )?;
-                        if record.index != partition.index
-                            || record.partition_key != partition.partition_key
-                            || Self::vector_partition_journal_key(&record).as_slice() != key.value()
-                        {
-                            return Err(self.vector_partition_corruption(
-                                "tail frontier journal identity mismatch",
-                            ));
-                        }
-                        digest.update(key.value());
-                        digest.update(value.value());
-                    }
-                }
-                Err(redb::TableError::TableDoesNotExist(_)) => {}
-                Err(error) => return Err(Self::storage_error(error)),
-            }
-            Ok(Some(*digest.finalize().as_bytes()))
-        })
-    }
-
     /// Seek strictly after the complete covered LSN cohort, including every
     /// ordinal of that LSN. A finite upper frontier also ends after its whole
     /// cohort. Both keys stay inside this route's canonical prefix.
@@ -1805,7 +1742,7 @@ impl RedbPersistence {
             upper
         } else {
             writer_source::prefix_end(&prefix).ok_or_else(|| {
-                Self::captured_generation_corruption("journal route has no upper bound")
+                vector_membership_source::damage("journal route has no upper bound")
             })?
         };
         Ok(Some((lower, upper)))

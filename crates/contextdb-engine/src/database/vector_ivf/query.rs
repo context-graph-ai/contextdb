@@ -127,7 +127,7 @@ impl Database {
         let policy_limit = contextdb_vector::mem::search_policy_limit();
         let rank_pool = mode != VectorSearchMode::Exact && policy_limit.is_some();
         let mut capacity = k;
-        let mut pool_growth = ReadCredit::new(memory.clone());
+        let mut pool_growth = contextdb_core::read_memory::ReadCredit::new(memory.clone());
         let score_bytes = k
             .checked_mul(std::mem::size_of::<(RowId, f32)>())
             .ok_or_else(|| E::from(Error::Other("native score workspace overflow".into())))?;
