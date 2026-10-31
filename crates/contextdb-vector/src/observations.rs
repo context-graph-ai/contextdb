@@ -9,10 +9,6 @@ pub struct VectorBacklog {
     pub tombstones: usize,
 }
 impl VectorBacklog {
-    pub(crate) fn include(&mut self, other: Self) {
-        self.inserts = self.inserts.max(other.inserts);
-        self.tombstones = self.tombstones.max(other.tombstones);
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -47,28 +43,5 @@ pub struct VectorPublicationObservation {
 impl Drop for VectorPublicationObservation {
     fn drop(&mut self) {
         OBSERVER.with(|slot| slot.replace(self.previous.take()));
-    }
-}
-pub(crate) fn emit(event: &VectorBasePublicationEvent) {
-    let observer = OBSERVER.with(|slot| slot.borrow().clone());
-    if let Some(observer) = observer {
-        observer(event);
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct BaseBacklog {
-    pub generation: u64,
-    pub covered_tx: u64,
-    pub pending: VectorBacklog,
-    pub high_water: VectorBacklog,
-    pub total_high_water: usize,
-}
-impl BaseBacklog {
-    pub fn record_high_water(&mut self) {
-        self.high_water.include(self.pending);
-        self.total_high_water = self
-            .total_high_water
-            .max(self.pending.inserts.saturating_add(self.pending.tombstones));
     }
 }

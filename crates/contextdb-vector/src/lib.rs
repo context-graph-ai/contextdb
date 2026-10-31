@@ -1,6 +1,5 @@
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub mod auto_planning_test_seams;
 pub mod cosine;
 pub mod mem;
 mod memory_budget;

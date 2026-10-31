@@ -100,32 +100,6 @@ pub fn admission_bytes(_site: &'static str, bytes: usize) -> usize {
     bytes
 }
 
-#[cfg(feature = "test-seams")]
-thread_local! {
-    static AFTER_WALK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(feature = "test-seams")]
-fn run_after_walk_hook_for_test() {
-    let hook = AFTER_WALK_HOOK.with(|slot| slot.borrow_mut().take());
-    if let Some(mut hook) = hook {
-        hook();
-    }
-}
-
-/// Run `hook` once on this thread, in the next union search, after its walk
-/// has given its tail guards back and before its candidates are resolved and
-/// any disconnection is reported: the window a publication can land in.
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
-pub fn with_after_walk_hook_for_test<R>(hook: Box<dyn FnMut()>, search: impl FnOnce() -> R) -> R {
-    AFTER_WALK_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
-    let result = search();
-    AFTER_WALK_HOOK.with(|slot| slot.borrow_mut().take());
-    result
-}
-
 /// Ask the next reservation of the named admission on this thread to be
 /// refused, once.
 #[cfg(feature = "test-seams")]

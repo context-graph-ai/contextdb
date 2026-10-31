@@ -17,6 +17,10 @@ use contextdb_core::{
     VectorQuantization, VectorSearchMode,
 };
 use parking_lot::{Mutex, RwLock};
+#[cfg(any(test, feature = "test-seams"))]
+use parking_lot::Condvar;
+#[cfg(any(test, feature = "test-seams"))]
+use std::sync::OnceLock;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -5665,14 +5669,6 @@ impl IndexState {
         }
         self.pending_marks.lock().note(&identity);
         directory.push(identity);
-        #[cfg(feature = "test-seams")]
-        {
-            let mut backlog = self.base_backlog.lock();
-            if entry.deleted_tx.is_none() && entry.created_tx.0 > backlog.covered_tx {
-                backlog.pending.inserts += 1;
-                backlog.record_high_water();
-            }
-        }
         let mut by_row = self.raw_directory_by_row.write();
         let positions = by_row.entry(entry.row_id).or_default();
         let at = positions.partition_point(|position| {
@@ -5744,20 +5740,6 @@ impl IndexState {
             let previous = entry.deleted_tx;
             if previous.is_some_and(|previous| previous <= boundary) {
                 continue;
-            }
-            #[cfg(feature = "test-seams")]
-            {
-                let mut backlog = self.base_backlog.lock();
-                if previous.is_none() && entry.created_tx.0 > backlog.covered_tx {
-                    backlog.pending.inserts = backlog.pending.inserts.saturating_sub(1);
-                }
-                if previous.is_some_and(|previous| previous.0 > backlog.covered_tx) {
-                    backlog.pending.tombstones = backlog.pending.tombstones.saturating_sub(1);
-                }
-                if boundary.0 > backlog.covered_tx {
-                    backlog.pending.tombstones += 1;
-                }
-                backlog.record_high_water();
             }
             entry.deleted_tx = Some(boundary);
             entry.membership.deleted_tx = Some(boundary.max(entry.membership.visible_from));
@@ -5881,28 +5863,6 @@ impl IndexState {
             });
         }
         released
-    }
-
-    /// Capture durable serving metadata once, then freeze the actual registry
-    /// serving chain when this is the writer's current physical publication.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn capture_serving_selection(
-        &self,
-        snapshot: SnapshotId,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<Option<Arc<CapturedVectorServingSelection>>> {
-        self.capture_serving_selection_with_work(snapshot, owner, &mut || true)
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn pause_graph_callback_for_test(&self) {
-        if let Some(slot) = self.graph_callback_pause.lock().clone() {
-            slot.pause_after(0);
-        }
     }
 
     #[expect(
@@ -8864,34 +8824,6 @@ impl VectorStore {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
-    pub fn arm_graph_callback_pause_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-        _phase: VectorGraphCallbackPhaseForTest,
-    ) -> VectorLifecyclePauseHandle {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self
-                .partition_state(&partition.index, &partition.partition_key)
-                .expect("an armed graph callback pause names an existing partition");
-            let slot = state
-                .graph_callback_pause
-                .lock()
-                .get_or_insert_with(|| Arc::new(MaintenanceProgressPauseSlot::new()))
-                .clone();
-            let generation = slot.arm(0);
-            VectorLifecyclePauseHandle { slot, generation }
-        })
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn try_generation_publication_lock_for_test(&self, partition: &VectorPartitionRef) -> bool {
-        self.try_partition_state(&partition.index, &partition.partition_key)
-            .is_some_and(|state| state.generation_publication.try_lock().is_some())
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
     pub fn try_partition_maintenance_lock_for_test(&self, partition: &VectorPartitionRef) -> bool {
         self.try_partition_state(&partition.index, &partition.partition_key)
             .is_some_and(|state| state.maintenance.try_lock().is_some())
@@ -9743,136 +9675,6 @@ impl VectorStore {
         }
     }
 
-    /// Inspect only the suffix owned by this operation's captured source.
-    /// This test seam never installs a graph or changes resident inspection.
-    #[cfg(any(test, feature = "test-seams"))]
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn inspect_captured_vector_suffix_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-        snapshot: SnapshotId,
-        owner: &mut VectorCopyAdmission,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Option<CapturedVectorSuffixInspectionForTest>> {
-        checkpoint()?;
-        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
-        else {
-            return Ok(None);
-        };
-        let Some(selection) = state.capture_serving_selection(snapshot, owner)? else {
-            return Ok(None);
-        };
-        checkpoint()?;
-        let suffix = selection
-            .suffix
-            .as_ref()
-            .expect("captured suffix was bound once");
-        if let Some(stream) = suffix.loader.as_streamed() {
-            let policy = stream.policy_for_test().ok_or_else(|| {
-                Error::Other("captured suffix has no authenticated policy".into())
-            })?;
-            let mut points = 0usize;
-            let mut digest = 0xcbf2_9ce4_8422_2325u64;
-            let mut replayed = stream.covered_lsn();
-            stream.stream_tail(
-                &mut |entry| {
-                    checkpoint()?;
-                    replayed = replayed.max(entry.row_lsn);
-                    let tx = TxId::from_snapshot(snapshot);
-                    if entry.visible_from <= tx
-                        && entry.deleted_tx.is_none_or(|deleted| deleted > tx)
-                    {
-                        points += 1;
-                        // The streamed suffix has no graph. Hash its actual ordered
-                        // membership and body identities, without inventing topology.
-                        for word in [
-                            entry.row_id.0,
-                            entry.row_created_tx.0,
-                            entry.row_lsn.0,
-                            entry.vector_created_tx.0,
-                            entry.vector_lsn.0,
-                            entry.visible_from.0,
-                        ] {
-                            for byte in word.to_le_bytes() {
-                                digest ^= u64::from(byte);
-                                digest = digest.wrapping_mul(0x100_0000_01b3);
-                            }
-                        }
-                    }
-                    Ok(true)
-                },
-                owner,
-            )?;
-            checkpoint()?;
-            return Ok(Some(CapturedVectorSuffixInspectionForTest {
-                base: selection.inspection.base,
-                change: selection.inspection.change,
-                points,
-                policy,
-                topology_digest: digest,
-                replayed_through_lsn: replayed,
-            }));
-        }
-        let mut scratch = owner.scratch();
-        scratch.reserve(suffix.load_bytes)?;
-        let mut interrupted = None;
-        let loaded = suffix.loader.load(suffix.load_bytes, &mut |request| {
-            let result = checkpoint().and_then(|()| match request {
-                DormantVectorLoadRequest::Reserve(bytes) => scratch.reserve(bytes),
-                _ => Ok(()),
-            });
-            if let Err(error) = result {
-                interrupted = Some(error);
-                false
-            } else {
-                true
-            }
-        });
-        let loaded = match loaded {
-            Ok(loaded) => loaded,
-            Err(error) => return Err(interrupted.unwrap_or(error)),
-        };
-        if let Some(error) = interrupted {
-            return Err(error);
-        }
-        let Some(tail) = loaded.tail else {
-            return Ok(None);
-        };
-        checkpoint()?;
-        // The existing mutable-graph digest copies one point's finite
-        // neighborhood at a time (sixteen levels, at most 2M each).
-        scratch.reserve(
-            16usize.saturating_mul(
-                std::mem::size_of::<Vec<usize>>().saturating_add(
-                    tail.graph
-                        .policy_values()
-                        .0
-                        .saturating_mul(2)
-                        .saturating_mul(32),
-                ),
-            ),
-        )?;
-        let inspected = CapturedVectorSuffixInspectionForTest {
-            base: selection.inspection.base,
-            change: selection.inspection.change,
-            points: tail.graph.len(),
-            policy: tail.graph.policy_values(),
-            topology_digest: tail.graph.graph_topology_digest_for_test(),
-            replayed_through_lsn: tail.replayed_through_lsn,
-        };
-        // LoadedVectorFreshTail is a plain transfer record. Keep the complete
-        // caller reservation until its actual graph is freed; no adoption or
-        // resident registry charge is created by this one-shot inspection.
-        drop(tail);
-        drop(selection);
-        drop(scratch);
-        Ok(Some(inspected))
-    }
-
     /// Cheap read-only pre-check for
     /// [`Self::retire_snapshot_free_partition_states`] and
     /// [`IndexState::reclaim_snapshot_free_graph_generations`]: whether any
@@ -10308,11 +10110,6 @@ impl VectorStore {
     #[cfg(feature = "test-seams")]
     pub(crate) fn pause_registry(&self) -> &crate::test_seam::PauseRegistry {
         &self.pause_registry
-    }
-
-    #[cfg(feature = "test-seams")]
-    pub(crate) fn graph_candidate_caps(&self) -> &crate::test_seam::GraphCandidateCapRegistry {
-        &self.graph_candidate_caps
     }
 
     #[expect(
@@ -14243,35 +14040,6 @@ impl VectorStore {
                 *state.durable_counts.lock() = prepared.summary;
                 state.apply_durable_pending_events(&prepared.events);
                 state.reclassify_limit();
-                #[cfg(feature = "test-seams")]
-                {
-                    let mut backlog = state.base_backlog.lock();
-                    let covered = backlog.covered_tx;
-                    for event in &prepared.events {
-                        match *event {
-                            DurableMembershipEvent::Opened(created) => {
-                                if created.0 > covered {
-                                    backlog.pending.inserts += 1;
-                                }
-                            }
-                            DurableMembershipEvent::Closed { created, deleted } => {
-                                if created.0 > covered {
-                                    backlog.pending.inserts =
-                                        backlog.pending.inserts.saturating_sub(1);
-                                }
-                                if deleted.0 > covered {
-                                    backlog.pending.tombstones += 1;
-                                }
-                            }
-                            DurableMembershipEvent::PublishedClosed(deleted) => {
-                                if deleted.0 > covered {
-                                    backlog.pending.tombstones += 1;
-                                }
-                            }
-                        }
-                    }
-                    backlog.record_high_water();
-                }
             }
         }
     }
@@ -16807,94 +16575,6 @@ impl VectorStore {
         self.with_partition_maintenance(&partition.index, &partition.partition_key, publish)
     }
 
-    /// Called after the durable catalog commit while the engine commit lock
-    /// and this partition's maintenance boundary still exclude publishers.
-    #[cfg(feature = "test-seams")]
-    #[doc(hidden)]
-    pub fn observe_durable_base_publication(
-        &self,
-        partition: &VectorPartitionRef,
-        generation: u64,
-        covered_tx: TxId,
-        durable_pending: (usize, usize),
-    ) {
-        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
-        else {
-            return;
-        };
-        if state.is_durable() {
-            let after = crate::observations::VectorBacklog {
-                inserts: durable_pending.0,
-                tombstones: durable_pending.1,
-            };
-            let mut backlog = state.base_backlog.lock();
-            if backlog.generation == generation {
-                return;
-            }
-            backlog.record_high_water();
-            let event = crate::observations::VectorBasePublicationEvent {
-                partition: partition.clone(),
-                previous_generation: backlog.generation,
-                generation,
-                covered_tx,
-                pending_before: backlog.pending,
-                pending_after: after,
-                previous_generation_high_water: backlog.high_water,
-                previous_generation_total_high_water: backlog.total_high_water,
-                generation_high_water: after,
-            };
-            *backlog = crate::observations::BaseBacklog {
-                generation,
-                covered_tx: covered_tx.0,
-                pending: after,
-                high_water: after,
-                total_high_water: after.inserts.saturating_add(after.tombstones),
-            };
-            drop(backlog);
-            crate::observations::emit(&event);
-            return;
-        }
-        let directory = state.raw_directory.read();
-        let mut backlog = state.base_backlog.lock();
-        if backlog.generation == generation {
-            return;
-        }
-        let count = |covered: u64| crate::observations::VectorBacklog {
-            inserts: directory
-                .iter()
-                .filter(|entry| entry.deleted_tx.is_none() && entry.created_tx.0 > covered)
-                .count(),
-            tombstones: directory
-                .iter()
-                .filter(|entry| entry.deleted_tx.is_some_and(|tx| tx.0 > covered))
-                .count(),
-        };
-        backlog.pending = count(backlog.covered_tx);
-        backlog.record_high_water();
-        let after = count(covered_tx.0);
-        let event = crate::observations::VectorBasePublicationEvent {
-            partition: partition.clone(),
-            previous_generation: backlog.generation,
-            generation,
-            covered_tx,
-            pending_before: backlog.pending,
-            pending_after: after,
-            previous_generation_high_water: backlog.high_water,
-            previous_generation_total_high_water: backlog.total_high_water,
-            generation_high_water: after,
-        };
-        *backlog = crate::observations::BaseBacklog {
-            generation,
-            covered_tx: covered_tx.0,
-            pending: after,
-            high_water: after,
-            total_high_water: after.inserts.saturating_add(after.tombstones),
-        };
-        drop(backlog);
-        drop(directory);
-        crate::observations::emit(&event);
-    }
-
     /// Retain an actionable maintenance failure for passive inspection. The
     /// engine calls this when durable generation work fails outside the vector
     /// crate (for example disk admission); only a later successful generation
@@ -16976,19 +16656,6 @@ impl VectorStore {
             let state = self.partition_state(&partition.index, &partition.partition_key)?;
             state.clear_maintenance_failure();
             Ok(())
-        })
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn partition_superseded_generation_retention_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> (usize, usize) {
-        self.with_bulk_read(|| {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .map(|state| state.superseded_generation_retention_for_test())
-                .unwrap_or((0, 0))
         })
     }
 
@@ -20850,8 +20517,3 @@ mod reverse_probe_lifetime_tests {
 #[cfg(test)]
 mod page_cache_budget_tests;
 
-#[cfg(any(test, feature = "test-seams"))]
-mod physical;
-#[cfg(any(test, feature = "test-seams"))]
-#[doc(hidden)]
-pub use physical::{PhysicalOwnerLocation, PhysicalRawPayload, PhysicalVectorOwnerView};
