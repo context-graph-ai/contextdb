@@ -1,45 +1,30 @@
-//! The automatic mode decides between the graph walk and exhaustive comparison
-//! once for the whole statement, so splitting the same rows across more
-//! Contexts never changes which route answers or what it costs.
+//! The automatic mode decides between the clustered index and exhaustive
+//! comparison once for the whole statement, so splitting the same rows across
+//! more Contexts never changes which route answers or what it costs.
 //!
-//! A find is one search producing one top k. The walk it would run spends at
-//! most one budget `B = cap(EF_SEARCH, k) x M_max0`, `M_max0` being the widest
-//! admitted graph's layer-0 maximum degree (`2 x M`), however many Contexts
-//! the rows sit in; the exhaustive route compares every admitted row once. So
-//! `AUTO` weighs the walk's `B` evaluations against the admitted rows'
-//! comparisons, each at its measured unit cost, and picks the cheaper for the
-//! statement. A decision made per Context instead flips as the same rows are
-//! split more finely: a Context small enough to compare outright is compared,
-//! and the one statement runs the exhaustive route over some Contexts and the
-//! walk over others.
-//!
-//! Every expected figure here is computed from the declared numbers and the
-//! measured unit costs the approved crossover carries, never read back from
-//! the implementation.
+//! A find is one search producing one top k. `AUTO` compares the statement's
+//! aggregate admitted rows with the declared `AUTO_INDEX_AT` and picks one
+//! route for the whole statement. A decision made per Context instead flips as
+//! the same rows are split more finely: a Context small enough to compare
+//! outright is compared, and the one statement runs the exhaustive route over
+//! some Contexts and the index over others.
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::{Database, MaintenancePolicy, VectorSearchRoute};
-use contextdb_vector::hnsw::with_union_search_receipts;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 const DIMENSIONS: usize = 16;
 const LIMIT: usize = 10;
-/// The breadth and degree the column declares; every graph is built at `M`.
-const DECLARED_EF_SEARCH: usize = 400;
-const DECLARED_M: usize = 16;
+/// The aggregate admitted row count at which `AUTO` leaves exhaustive comparison.
+const DECLARED_AUTO_INDEX_AT: usize = 1_000;
 const SPLITS: [usize; 3] = [1, 8, 64];
-/// Both corpora are cheaper to compare in memory at this breadth. The graph
-/// side of the crossover is exercised by the larger route-cost fixtures.
+/// One corpus below the declared threshold and one above it, each split so
+/// that every Context alone is below it.
 const CORPORA: [usize; 2] = [512, 2_048];
-
-/// The measured walk cost and in-memory exact comparison cost, in nanoseconds.
-/// The latter is 3,400 ns on the release 2,000-row calibration used by AUTO.
-const WALK_EVALUATION_NANOS: u128 = 5_300;
-const EXHAUSTIVE_COMPARISON_NANOS: u128 = 3_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
@@ -47,24 +32,12 @@ enum Route {
     Exhaustive,
 }
 
-/// HNSW builds its bottom layer with twice the declared degree.
-fn layer0_max_degree(declared_m: usize) -> usize {
-    2 * declared_m
-}
-
-/// The one budget a walk over the statement may spend.
-fn walk_budget() -> usize {
-    DECLARED_EF_SEARCH.max(LIMIT) * layer0_max_degree(DECLARED_M)
-}
-
 /// The statement-level decision, from the aggregate admitted rows alone.
 fn expected_route(aggregate_allowed: usize) -> Route {
-    let walk = walk_budget() as u128 * WALK_EVALUATION_NANOS;
-    let exhaustive = aggregate_allowed as u128 * EXHAUSTIVE_COMPARISON_NANOS;
-    if exhaustive <= walk {
-        Route::Exhaustive
-    } else {
+    if aggregate_allowed >= DECLARED_AUTO_INDEX_AT {
         Route::Walk
+    } else {
+        Route::Exhaustive
     }
 }
 
@@ -158,8 +131,8 @@ fn fixture(rows: usize, partitions: usize) -> Database {
             "CREATE TABLE split_rows (id INT PRIMARY KEY, context_id UUID NOT NULL, \
              generation_id UUID NOT NULL, \
              embedding VECTOR({DIMENSIONS}) PARTITION_KEY (context_id, generation_id) \
-             MAX_PARTITIONS 64 SEARCH_MODE AUTO AUTO_INDEX_AT 1 \
-             IVF (PROBES = {DECLARED_EF_SEARCH}))"
+             MAX_PARTITIONS 64 SEARCH_MODE AUTO AUTO_INDEX_AT {DECLARED_AUTO_INDEX_AT} \
+             IVF (PROBES = 400))"
         ),
         &HashMap::new(),
     )
@@ -235,12 +208,6 @@ struct Observed {
     routes: Vec<Route>,
     rows: usize,
     exhaustive_comparisons: u64,
-    walk_evaluations: u64,
-    searches: usize,
-    walk_admission: usize,
-    walk_expansion: usize,
-    walk_budget: usize,
-    walk_terminal: Option<&'static str>,
 }
 
 fn observe(rows: usize, partitions: usize) -> Observed {
@@ -250,8 +217,7 @@ fn observe(rows: usize, partitions: usize) -> Observed {
     let mut request =
         bounded::BoundedReadRequest::new(sql, params, limits(), Arc::new(FrozenClock));
     request.probe = Some(counter.clone());
-    let (executed, receipts) = with_union_search_receipts(|| bounded::execute(&db, &request));
-    let executed = executed.expect("the automatic find answers");
+    let executed = bounded::execute(&db, &request).expect("the automatic find answers");
     let disclosure = executed
         .result
         .trace()
@@ -267,17 +233,10 @@ fn observe(rows: usize, partitions: usize) -> Observed {
             other => panic!("every admitted Context reports its executed route, got {other:?}"),
         })
         .collect();
-    let receipt = receipts.first();
     Observed {
         routes,
         rows: executed.result.rows().len(),
         exhaustive_comparisons: counter.count(bounded::TestSourceTouch::BruteForceVectorCandidate),
-        walk_evaluations: counter.count(bounded::TestSourceTouch::HnswCandidate),
-        searches: receipts.len(),
-        walk_admission: receipt.map_or(0, |receipt| receipt.admission_evaluations),
-        walk_expansion: receipt.map_or(0, |receipt| receipt.expansion_evaluations),
-        walk_budget: receipt.map_or(0, |receipt| receipt.budget),
-        walk_terminal: receipt.map(|receipt| receipt.terminal),
     }
 }
 
@@ -296,8 +255,7 @@ fn auto_takes_the_aggregate_route_however_the_rows_are_split() {
             let cell = format!("{corpus} rows over {partitions} Contexts");
             let observed = observe(corpus, partitions);
             println!(
-                "auto_split_decision {cell} expected={expected:?} B={} observed={observed:?}",
-                walk_budget()
+                "auto_split_decision {cell} expected={expected:?} observed={observed:?}"
             );
             decisions.push((partitions, observed.routes.clone()));
             if observed.rows != LIMIT {
@@ -325,50 +283,13 @@ fn auto_takes_the_aggregate_route_however_the_rows_are_split() {
                             observed.exhaustive_comparisons
                         ));
                     }
-                    if observed.searches != 0 || observed.walk_evaluations != 0 {
-                        failures.push(format!(
-                            "{cell}: the exhaustive route walks no graph, but {} searches spent \
-                             {} graph evaluations",
-                            observed.searches, observed.walk_evaluations
-                        ));
-                    }
                 }
                 Route::Walk => {
-                    if observed.searches != 1 {
-                        failures.push(format!(
-                            "{cell}: the walk is one search over the scope, saw {}",
-                            observed.searches
-                        ));
-                    }
-                    if observed.walk_budget != walk_budget() {
-                        failures.push(format!(
-                            "{cell}: the walk was given {} evaluations, the declared numbers \
-                             allow {}",
-                            observed.walk_budget,
-                            walk_budget()
-                        ));
-                    }
-                    if observed.walk_expansion > walk_budget() {
-                        failures.push(format!(
-                            "{cell}: the walk spent {} evaluations past opening its layers, \
-                             more than its budget {}",
-                            observed.walk_expansion,
-                            walk_budget()
-                        ));
-                    }
-                    if observed.walk_terminal == Some("refused") {
-                        failures.push(format!(
-                            "{cell}: the walk was refused, so another route answered"
-                        ));
-                    }
                     if observed.exhaustive_comparisons != 0 {
                         failures.push(format!(
-                            "{cell}: the walk compared {} rows exhaustively as well",
+                            "{cell}: the indexed route compared {} rows exhaustively as well",
                             observed.exhaustive_comparisons
                         ));
-                    }
-                    if observed.walk_admission + observed.walk_expansion == 0 {
-                        failures.push(format!("{cell}: the walk evaluated nothing"));
                     }
                 }
             }

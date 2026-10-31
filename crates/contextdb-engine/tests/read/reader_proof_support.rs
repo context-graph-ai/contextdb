@@ -138,14 +138,15 @@ pub fn seed_working_set(path: &Path) {
 #[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by read")]
 pub fn finish_maintenance(db: &Database, partitions: usize) {
     for _ in 0..64 {
-        db.run_maintenance_cycle()
-            .expect("drive actual caller-owned generation build/reclaim");
-        let s = db.vector_store_for_test().hnsw_maintenance_status();
-        if s.ready_partitions == partitions && s.remaining_partitions == 0 {
+        let report = db
+            .run_maintenance_cycle()
+            .expect("drive actual caller-owned index build/reclaim")
+            .vector;
+        if report.ready_partitions == partitions && report.remaining_partitions == 0 {
             return;
         }
     }
-    panic!("maintenance did not publish the fixture's {partitions} generations");
+    panic!("maintenance did not publish the fixture's {partitions} indexes");
 }
 
 #[allow(

@@ -65,11 +65,11 @@ fn q() -> HashMap<String, Value> {
     HashMap::from([("q".into(), Value::Vector(vec![1., 0., 0.]))])
 }
 #[derive(Default)]
-struct GraphObservation {
+struct BuildObservation {
     builds: AtomicU64,
 }
-impl contextdb_vector::hnsw::HnswBuildObserver for GraphObservation {
-    fn before_hnsw_build(&self) {
+impl contextdb_vector::VectorBuildObserver for BuildObservation {
+    fn before_vector_build(&self) {
         self.builds.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -77,9 +77,9 @@ fn seed(path: &Path) {
     seed_rows(path, 1250);
 }
 fn seed_rows(path: &Path, rows: i64) {
-    seed_rows_with_observer(path, rows, Arc::new(GraphObservation::default()));
+    seed_rows_with_observer(path, rows, Arc::new(BuildObservation::default()));
 }
-fn seed_rows_with_observer(path: &Path, rows: i64, builds: Arc<GraphObservation>) {
+fn seed_rows_with_observer(path: &Path, rows: i64, builds: Arc<BuildObservation>) {
     let db = Database::open(path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute("CREATE TABLE continuity_vectors (id INTEGER PRIMARY KEY, payload TEXT, embedding VECTOR(3)) HISTORY ALL", &HashMap::new()).unwrap();
@@ -97,7 +97,7 @@ fn seed_rows_with_observer(path: &Path, rows: i64, builds: Arc<GraphObservation>
         .unwrap();
     }
     db.commit(tx).unwrap();
-    contextdb_vector::hnsw::with_hnsw_build_observer(builds.clone(), || {
+    contextdb_vector::with_vector_build_observer(builds.clone(), || {
         fixture::finish_maintenance(&db, 1)
     });
     assert!(
@@ -625,11 +625,11 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("lazy.db");
     let runtime = fixture::runtime(root.path());
-    let graph = Arc::new(GraphObservation::default());
+    let graph = Arc::new(BuildObservation::default());
     seed_rows_with_observer(&path, 10_000, graph.clone());
     assert!(
         graph.builds.load(Ordering::SeqCst) > 0,
-        "the exact observer used below sees a real fixture graph build"
+        "the exact observer used below sees a real fixture index build"
     );
     graph.builds.store(0, Ordering::SeqCst);
     // Independent baseline reader closes before the tested readers open; neither
@@ -651,7 +651,7 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     let auto_routes = Arc::new(fixture::Routes::default());
     let indexed_routes = Arc::new(fixture::Routes::default());
     let (auto, indexed) = ReadSession::with_runtime_directory_for_test(&runtime, || {
-        contextdb_vector::hnsw::with_hnsw_build_observer(graph.clone(), || {
+        contextdb_vector::with_vector_build_observer(graph.clone(), || {
             (
                 fixture::open_file(&path, roomy(), auto_routes.clone()),
                 fixture::open_file(&path, roomy(), indexed_routes.clone()),
@@ -676,10 +676,10 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
         let backend_observation = redb::observe_backend_reads(Arc::new(move |bytes| {
             observed_bytes.fetch_add(bytes as u64, Ordering::SeqCst);
         }));
-        let answer = contextdb_vector::hnsw::with_hnsw_build_observer(graph.clone(), || {
+        let answer = contextdb_vector::with_vector_build_observer(graph.clone(), || {
             reader.execute(&SQL.replace("AUTO", mode), &q())
         })
-        .expect("first lazy graph load under writer ownership must serve the original snapshot");
+        .expect("first lazy index load under writer ownership must serve the original snapshot");
         drop(backend_observation);
         assert!(
             backend_bytes.load(Ordering::SeqCst) > 0,
@@ -688,7 +688,7 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
         assert_eq!(
             graph.builds.load(Ordering::SeqCst),
             0,
-            "read-open/query never rebuilds the graph"
+            "read-open/query never rebuilds the index"
         );
         let expected = if mode == "AUTO" {
             &before_auto

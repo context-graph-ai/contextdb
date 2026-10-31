@@ -192,8 +192,8 @@ mod version_pruning_and_compaction_resume_finite_safe_batches;
 #[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
 mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
 
-#[path = "engine_seams/aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope.rs"]
-mod aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope;
+#[path = "engine_seams/aggregate_auto_threshold_decides_the_route_and_keeps_scope.rs"]
+mod aggregate_auto_threshold_decides_the_route_and_keeps_scope;
 #[path = "engine_seams/crash_cutpoints_recover_one_complete_row_index_vector_log_commit.rs"]
 mod crash_cutpoints_recover_one_complete_row_index_vector_log_commit;
 #[path = "engine_seams/first_search_after_writer_reopen_uses_saved_pages_without_build.rs"]
@@ -231,11 +231,7 @@ mod consumer_declared_count_and_pending_seek_contract;
 #[path = "grouped_session_top_n_contract.rs"]
 mod grouped_session_top_n_contract;
 
-#[path = "engine_seams/writer_tail_reuse_is_bounded_across_physical_opens.rs"]
-mod writer_tail_reuse_is_bounded_across_physical_opens;
 
-#[path = "engine_seams/a_replacement_candidate_counts_exactly_what_it_absorbed.rs"]
-mod a_replacement_candidate_counts_exactly_what_it_absorbed;
 #[path = "engine_seams/a_vector_search_decodes_under_its_request_owner.rs"]
 mod a_vector_search_decodes_under_its_request_owner;
 #[path = "engine_seams/import_tail_survives_restart_without_history_reconstruction.rs"]

@@ -215,7 +215,7 @@ fn seed_one_partition(path: &std::path::Path, runtime: &std::path::Path) {
             .expect("inspect partition readiness");
         if !ready.is_empty()
             && ready.iter().all(|partition| {
-                db.__debug_vector_partition_indexed_for_test(
+                admin.__debug_vector_partition_indexed_for_test(
                     partition.partition.index.clone(),
                     partition.partition.partition_key.clone(),
                 )

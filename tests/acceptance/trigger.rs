@@ -291,29 +291,25 @@ fn reopened_rollback_audit_failure(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(feature = "test-seams")]
-struct HnswBaseline {
+struct IndexedBaseline {
     point_count: usize,
-    layer0_points: usize,
     dimension: usize,
-    has_layer0_edges: bool,
-    raw_entry_counts: Vec<(RowId, usize)>,
+    indexed_available: bool,
+    row_ids: Vec<RowId>,
 }
 
 #[cfg(feature = "test-seams")]
-impl HnswBaseline {
+impl IndexedBaseline {
     fn row_ids(&self) -> Vec<RowId> {
-        self.raw_entry_counts
-            .iter()
-            .map(|(row_id, _)| *row_id)
-            .collect()
+        self.row_ids.clone()
     }
 }
 
 #[cfg(feature = "test-seams")]
-fn hnsw_baseline_failure(
+fn indexed_baseline_failure(
     db: &Database,
     index: VectorIndexRef,
-    expected: &HnswBaseline,
+    expected: &IndexedBaseline,
     label: &str,
 ) -> Option<String> {
     let warm = db.execute(
@@ -348,26 +344,15 @@ fn hnsw_baseline_failure(
     let mut vector_fixture_copy_2 =
         contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
 
-    let actual = HnswBaseline {
+    let actual = IndexedBaseline {
         point_count: info.live_rows,
-        layer0_points: info.live_rows,
         dimension: db
             .vector_store_for_test()
             .index_layout(&index, &mut vector_fixture_copy_2)
             .map(|layout| layout.dimension)
             .unwrap_or(0),
-        has_layer0_edges: info.graph_available,
-        raw_entry_counts: expected
-            .row_ids()
-            .into_iter()
-            .map(|row_id| {
-                (
-                    row_id,
-                    db.__debug_vector_hnsw_raw_entry_count_for_row_for_test(index.clone(), row_id)
-                        .unwrap_or(0),
-                )
-            })
-            .collect(),
+        indexed_available: db.__debug_vector_indexed_available_for_test(index.clone()),
+        row_ids: expected.row_ids(),
     };
     if warm
         .as_ref()
@@ -375,15 +360,8 @@ fn hnsw_baseline_failure(
         .unwrap_or(true)
         || &actual != expected
     {
-        let raw_mismatches = expected
-            .raw_entry_counts
-            .iter()
-            .zip(actual.raw_entry_counts.iter())
-            .filter(|(expected, actual)| expected != actual)
-            .take(8)
-            .collect::<Vec<_>>();
         return Some(format!(
-            "{label} raw HNSW baseline changed for {index:?}; warm_empty={}, expected={expected:?}, actual={actual:?}, raw_mismatches_sample={raw_mismatches:?}",
+            "{label} indexed baseline changed for {index:?}; warm_empty={}, expected={expected:?}, actual={actual:?}",
             warm.as_ref()
                 .map(|hits| hits.rows().is_empty())
                 .unwrap_or(true)
@@ -399,7 +377,7 @@ fn reopened_rollback_absence_failure(
     since: Lsn,
     table_counts: &[(&str, usize)],
     edge_absence: Option<(Uuid, &str)>,
-    vector_absence: Option<(VectorIndexRef, Vec<RowId>, HnswBaseline)>,
+    vector_absence: Option<(VectorIndexRef, Vec<RowId>, IndexedBaseline)>,
 ) -> Option<String> {
     let reopened = Database::open(path).unwrap();
     let mut failures = Vec::new();
@@ -417,18 +395,17 @@ fn reopened_rollback_absence_failure(
             failures.push(format!("{edge_type} edges for {source}: got {edge_count}"));
         }
     }
-    if let Some((index, row_ids, expected_hnsw)) = vector_absence {
+    if let Some((index, row_ids, expected_indexed)) = vector_absence {
         let live_vector_leaks = live_vector_rows(&reopened, row_ids.iter().copied());
-        let raw_hnsw_leaks = hnsw_raw_leaks(&reopened, index.clone(), row_ids);
-        let hnsw_failure = hnsw_baseline_failure(
+        let indexed_failure = indexed_baseline_failure(
             &reopened,
             index.clone(),
-            &expected_hnsw,
+            &expected_indexed,
             &format!("{label} durable reopen"),
         );
-        if !live_vector_leaks.is_empty() || !raw_hnsw_leaks.is_empty() || hnsw_failure.is_some() {
+        if !live_vector_leaks.is_empty() || indexed_failure.is_some() {
             failures.push(format!(
- "vector leaks for {index:?}: live={live_vector_leaks:?}, raw_hnsw={raw_hnsw_leaks:?}, hnsw_failure={hnsw_failure:?}"
+ "vector leaks for {index:?}: live={live_vector_leaks:?}, indexed_failure={indexed_failure:?}"
             ));
         }
     }
@@ -497,25 +474,22 @@ fn fired_trigger_history(
 }
 
 #[cfg(feature = "test-seams")]
-const HNSW_FIXTURE_ROWS: usize = 1_001;
+const INDEXED_FIXTURE_ROWS: usize = 1_001;
 
 #[cfg(feature = "test-seams")]
-fn warm_hnsw_fixture(
+fn warm_indexed_fixture(
     db: &Database,
     index: VectorIndexRef,
     expected_rows: usize,
     baseline_row_ids: Vec<RowId>,
     label: &str,
-) -> HnswBaseline {
+) -> IndexedBaseline {
     for _ in 0..16 {
-        if db
-            .__debug_vector_hnsw_stats(index.clone())
-            .is_some_and(|stats| stats.point_count == expected_rows)
-        {
+        if db.__debug_vector_indexed_available_for_test(index.clone()) {
             break;
         }
         db.run_maintenance_cycle()
-            .expect("deterministically materialize fixture HNSW");
+            .expect("deterministically materialize fixture clustered index");
     }
     let warm = db
         .execute(
@@ -528,7 +502,7 @@ fn warm_hnsw_fixture(
         .unwrap();
     assert!(
         !warm.rows().is_empty(),
-        "{label} HNSW warmup query must return fixture rows"
+        "{label} indexed warmup query must return fixture rows"
     );
     let vector_fixture_reader_3 = db
         .declared_reader_memory()
@@ -550,8 +524,8 @@ fn warm_hnsw_fixture(
         "{label} fixture must retain every maintained vector row; info={info:?}"
     );
     assert!(
-        info.graph_available,
-        "{label} fixture must publish a maintained graph generation; info={info:?}"
+        db.__debug_vector_indexed_available_for_test(index.clone()),
+        "{label} fixture must publish a maintained clustered index; info={info:?}"
     );
     let vector_fixture_reader_4 = db
         .declared_reader_memory()
@@ -559,40 +533,23 @@ fn warm_hnsw_fixture(
     let mut vector_fixture_copy_4 =
         contextdb_engine::vector_read_memory::admission(vector_fixture_reader_4.clone());
 
-    let baseline = HnswBaseline {
+    let baseline = IndexedBaseline {
         point_count: info.live_rows,
-        layer0_points: info.live_rows,
         dimension: db
             .vector_store_for_test()
             .index_layout(&index, &mut vector_fixture_copy_4)
             .unwrap()
             .dimension,
-        has_layer0_edges: true,
-        raw_entry_counts: baseline_row_ids
-            .into_iter()
-            .map(|row_id| {
-                (
-                    row_id,
-                    db.__debug_vector_hnsw_raw_entry_count_for_row_for_test(index.clone(), row_id)
-                        .expect("fixture row must be present in raw HNSW graph"),
-                )
-            })
-            .collect(),
+        indexed_available: true,
+        row_ids: baseline_row_ids,
     };
-    assert!(
-        baseline
-            .raw_entry_counts
-            .iter()
-            .all(|(_, count)| *count == 0),
-        "{label} sealed maintained generation must not retain a duplicate mutable HNSW entry; baseline={baseline:?}"
-    );
     baseline
 }
 
 #[cfg(feature = "test-seams")]
-fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
+fn seed_sibling_indexed_vectors(db: &Database) -> (usize, u64, IndexedBaseline) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    for idx in 0..HNSW_FIXTURE_ROWS {
+    for idx in 0..INDEXED_FIXTURE_ROWS {
         db.execute(
             "INSERT INTO sibling_vectors (id, content, embedding) VALUES ($id, $content, $embedding)",
             &HashMap::from([
@@ -602,7 +559,7 @@ fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
                 ),
                 (
                     "content".to_string(),
-                    Value::Text(format!("hnsw-baseline-{idx}")),
+                    Value::Text(format!("indexed-baseline-{idx}")),
                 ),
                 ("embedding".to_string(), Value::Vector(vec![0.0, 0.2, 0.98])),
             ]),
@@ -612,26 +569,26 @@ fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
     let index = VectorIndexRef::new("sibling_vectors", "embedding");
     let rows = db
         .scan("sibling_vectors", db.snapshot())
-        .expect("HNSW fixture must create sibling vector rows");
+        .expect("indexed fixture must create sibling vector rows");
     let max_row_id = rows
         .iter()
         .map(|row| row.row_id.0)
         .max()
-        .expect("HNSW fixture must create sibling vector rows");
-    let baseline = warm_hnsw_fixture(
+        .expect("indexed fixture must create sibling vector rows");
+    let baseline = warm_indexed_fixture(
         db,
         index,
-        HNSW_FIXTURE_ROWS,
+        INDEXED_FIXTURE_ROWS,
         rows.into_iter().map(|row| row.row_id).collect(),
         "cold apply rollback",
     );
-    (HNSW_FIXTURE_ROWS, max_row_id, baseline)
+    (INDEXED_FIXTURE_ROWS, max_row_id, baseline)
 }
 
 #[cfg(feature = "test-seams")]
-fn seed_host_audit_hnsw(db: &Database) -> (usize, u64, HnswBaseline) {
+fn seed_host_audit_indexed(db: &Database) -> (usize, u64, IndexedBaseline) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    for idx in 0..HNSW_FIXTURE_ROWS {
+    for idx in 0..INDEXED_FIXTURE_ROWS {
         db.execute(
             "INSERT INTO host_audits (id, write_id, note, embedding) VALUES ($id, $write_id, $note, $embedding)",
             &HashMap::from([
@@ -652,35 +609,20 @@ fn seed_host_audit_hnsw(db: &Database) -> (usize, u64, HnswBaseline) {
     let index = VectorIndexRef::new("host_audits", "embedding");
     let rows = db
         .scan("host_audits", db.snapshot())
-        .expect("HNSW fixture must create host audit vector rows");
+        .expect("indexed fixture must create host audit vector rows");
     let max_row_id = rows
         .iter()
         .map(|row| row.row_id.0)
         .max()
-        .expect("HNSW fixture must create host audit vector rows");
-    let baseline = warm_hnsw_fixture(
+        .expect("indexed fixture must create host audit vector rows");
+    let baseline = warm_indexed_fixture(
         db,
         index,
-        HNSW_FIXTURE_ROWS,
+        INDEXED_FIXTURE_ROWS,
         rows.into_iter().map(|row| row.row_id).collect(),
         "cascade rollback",
     );
-    (HNSW_FIXTURE_ROWS, max_row_id, baseline)
-}
-
-#[cfg(feature = "test-seams")]
-fn hnsw_raw_leaks<I>(db: &Database, index: VectorIndexRef, row_ids: I) -> Vec<(RowId, usize)>
-where
-    I: IntoIterator<Item = RowId>,
-{
-    row_ids
-        .into_iter()
-        .filter_map(|row_id| {
-            db.__debug_vector_hnsw_raw_entry_count_for_row_for_test(index.clone(), row_id)
-                .filter(|count| *count > 0)
-                .map(|count| (row_id, count))
-        })
-        .collect()
+    (INDEXED_FIXTURE_ROWS, max_row_id, baseline)
 }
 
 #[cfg(feature = "test-seams")]
@@ -762,10 +704,10 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
         &empty(),
     )
     .unwrap();
-    let (sibling_hnsw_count, sibling_hnsw_max_row_id, sibling_hnsw_baseline) =
-        seed_sibling_hnsw_vectors(&db);
-    let sibling_hnsw_index = VectorIndexRef::new("sibling_vectors", "embedding");
-    let cold_remote_vector_row_id = RowId::from_raw_wire(sibling_hnsw_max_row_id + 64);
+    let (sibling_indexed_count, sibling_indexed_max_row_id, sibling_indexed_baseline) =
+        seed_sibling_indexed_vectors(&db);
+    let sibling_indexed_index = VectorIndexRef::new("sibling_vectors", "embedding");
+    let cold_remote_vector_row_id = RowId::from_raw_wire(sibling_indexed_max_row_id + 64);
     db.execute(
         "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
         &empty(),
@@ -832,41 +774,35 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     );
     let cold_row_id = row_id_for_column_uuid(&db, "sibling_vectors", "id", uuid(0x198));
-    let mut cold_vector_probe_rows = candidate_row_ids_after(sibling_hnsw_max_row_id);
+    let mut cold_vector_probe_rows = candidate_row_ids_after(sibling_indexed_max_row_id);
     cold_vector_probe_rows.extend(cold_row_id);
     cold_vector_probe_rows.push(cold_remote_vector_row_id);
     let cold_vector_leaks = live_vector_rows(&db, cold_vector_probe_rows.iter().copied());
-    let cold_hnsw_raw_leaks = hnsw_raw_leaks(
+    let cold_indexed_failure = indexed_baseline_failure(
         &db,
-        sibling_hnsw_index.clone(),
-        cold_vector_probe_rows.iter().copied(),
-    );
-    let cold_hnsw_failure = hnsw_baseline_failure(
-        &db,
-        sibling_hnsw_index.clone(),
-        &sibling_hnsw_baseline,
+        sibling_indexed_index.clone(),
+        &sibling_indexed_baseline,
         "cold gate apply rollback",
     );
     if !matches!(
         sync_gated,
         Err(Error::EngineNotInitialized { ref operation }) if operation.contains("apply_changes")
     ) || count_rows(&db, "sibling_writes") != 1
-        || count_rows(&db, "sibling_vectors") != sibling_hnsw_count
+        || count_rows(&db, "sibling_vectors") != sibling_indexed_count
         || count_rows(&db, "host_writes") != 0
         || db
             .edge_count(uuid(0x199), "COLD_APPLY_LEAK", db.snapshot())
             .unwrap()
             != 0
         || !cold_vector_leaks.is_empty()
-        || !cold_hnsw_raw_leaks.is_empty()
-        || cold_hnsw_failure.is_some()
+        || cold_indexed_failure.is_some()
         || changeset_has_data(
             &db.changes_since(sync_since)
                 .expect("read the declared changes"),
         )
     {
         failures.push(format!(
-            "sync apply into trigger-attached tables must fail closed atomically until callbacks are ready; got {sync_gated:?}, sibling_rows={}, sibling_vector_rows={}, host_rows={}, leaked_edges={}, leaked_vector_rows={cold_vector_leaks:?}, leaked_hnsw_rows={cold_hnsw_raw_leaks:?}, hnsw_failure={cold_hnsw_failure:?}, leaked_changes={:?}",
+            "sync apply into trigger-attached tables must fail closed atomically until callbacks are ready; got {sync_gated:?}, sibling_rows={}, sibling_vector_rows={}, host_rows={}, leaked_edges={}, leaked_vector_rows={cold_vector_leaks:?}, indexed_failure={cold_indexed_failure:?}, leaked_changes={:?}",
             count_rows(&db, "sibling_writes"),
             count_rows(&db, "sibling_vectors"),
             count_rows(&db, "host_writes"),
@@ -952,14 +888,14 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
         sync_since,
         &[
             ("sibling_writes", 1),
-            ("sibling_vectors", sibling_hnsw_count),
+            ("sibling_vectors", sibling_indexed_count),
             ("host_writes", 0),
         ],
         Some((uuid(0x199), "COLD_APPLY_LEAK")),
         Some((
-            sibling_hnsw_index.clone(),
+            sibling_indexed_index.clone(),
             cold_vector_probe_rows,
-            sibling_hnsw_baseline,
+            sibling_indexed_baseline,
         )),
     ) {
         failures.push(failure);
@@ -5609,9 +5545,9 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
         let path = tmp.path().join("unique_rollback.redb");
         let db = Database::open(&path).unwrap();
         setup_host_tables(&db);
-        let (audit_hnsw_count, audit_hnsw_max_row_id, audit_hnsw_baseline) =
-            seed_host_audit_hnsw(&db);
-        let audit_hnsw_index = VectorIndexRef::new("host_audits", "embedding");
+        let (audit_indexed_count, audit_indexed_max_row_id, audit_indexed_baseline) =
+            seed_host_audit_indexed(&db);
+        let audit_indexed_index = VectorIndexRef::new("host_audits", "embedding");
         let rollback_vector_rows = Arc::new(Mutex::new(Vec::new()));
         let captured_rollback_vector_rows = rollback_vector_rows.clone();
         db.register_trigger_callback("host_write_trigger", move |db_handle, ctx| {
@@ -5665,18 +5601,13 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
         let since = db.current_lsn();
         let result = db.execute(host_insert_sql(), &insert_host_params(uuid(20), "dup"));
         let leaked_changes = db.changes_since(since).expect("read the declared changes");
-        let mut rollback_probe_rows = candidate_row_ids_after(audit_hnsw_max_row_id);
+        let mut rollback_probe_rows = candidate_row_ids_after(audit_indexed_max_row_id);
         rollback_probe_rows.extend(rollback_vector_rows.lock().unwrap().iter().copied());
         let leaked_vector_rows = live_vector_rows(&db, rollback_probe_rows.iter().copied());
-        let leaked_hnsw_rows = hnsw_raw_leaks(
+        let indexed_failure = indexed_baseline_failure(
             &db,
-            audit_hnsw_index.clone(),
-            rollback_probe_rows.iter().copied(),
-        );
-        let hnsw_failure = hnsw_baseline_failure(
-            &db,
-            audit_hnsw_index.clone(),
-            &audit_hnsw_baseline,
+            audit_indexed_index.clone(),
+            &audit_indexed_baseline,
             "cascade UNIQUE violation rollback",
         );
         if !matches!(
@@ -5684,18 +5615,17 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             Err(Error::UniqueViolation { ref table, ref column })
                 if table == "host_audits" && column == "write_id"
         ) || count_rows(&db, "host_writes") != 0
-            || count_rows(&db, "host_audits") != audit_hnsw_count
+            || count_rows(&db, "host_audits") != audit_indexed_count
             || db
                 .edge_count(uuid(20), "ROLLBACK_EDGE", db.snapshot())
                 .unwrap()
                 != 0
             || !leaked_vector_rows.is_empty()
-            || !leaked_hnsw_rows.is_empty()
-            || hnsw_failure.is_some()
+            || indexed_failure.is_some()
             || changeset_has_data(&leaked_changes)
         {
             failures.push(format!(
- "cascade UNIQUE violation must abort firing plus relational/graph/vector cascade writes without historical leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, leaked_hnsw_rows={leaked_hnsw_rows:?}, hnsw_failure={hnsw_failure:?}, leaked_changes={leaked_changes:?}",
+ "cascade UNIQUE violation must abort firing plus relational/graph/vector cascade writes without historical leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, indexed_failure={indexed_failure:?}, leaked_changes={leaked_changes:?}",
                 count_rows(&db, "host_writes"),
                 count_rows(&db, "host_audits"),
                 db.edge_count(uuid(20), "ROLLBACK_EDGE", db.snapshot())
@@ -5714,9 +5644,9 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             &path,
             "cascade UNIQUE violation",
             since,
-            &[("host_writes", 0), ("host_audits", audit_hnsw_count)],
+            &[("host_writes", 0), ("host_audits", audit_indexed_count)],
             Some((uuid(20), "ROLLBACK_EDGE")),
-            Some((audit_hnsw_index, rollback_probe_rows, audit_hnsw_baseline)),
+            Some((audit_indexed_index, rollback_probe_rows, audit_indexed_baseline)),
         ) {
             failures.push(failure);
         }
@@ -5734,9 +5664,9 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
         let path = tmp.path().join("callback_err_rollback.redb");
         let db = Database::open(&path).unwrap();
         setup_host_tables(&db);
-        let (audit_hnsw_count, audit_hnsw_max_row_id, audit_hnsw_baseline) =
-            seed_host_audit_hnsw(&db);
-        let audit_hnsw_index = VectorIndexRef::new("host_audits", "embedding");
+        let (audit_indexed_count, audit_indexed_max_row_id, audit_indexed_baseline) =
+            seed_host_audit_indexed(&db);
+        let audit_indexed_index = VectorIndexRef::new("host_audits", "embedding");
         let rollback_vector_rows = Arc::new(Mutex::new(Vec::new()));
         let captured_rollback_vector_rows = rollback_vector_rows.clone();
         db.register_trigger_callback("host_write_trigger", move |db_handle, ctx| {
@@ -5791,18 +5721,13 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             &insert_host_params(uuid(25), "callback-error"),
         );
         let leaked_changes = db.changes_since(since).expect("read the declared changes");
-        let mut rollback_probe_rows = candidate_row_ids_after(audit_hnsw_max_row_id);
+        let mut rollback_probe_rows = candidate_row_ids_after(audit_indexed_max_row_id);
         rollback_probe_rows.extend(rollback_vector_rows.lock().unwrap().iter().copied());
         let leaked_vector_rows = live_vector_rows(&db, rollback_probe_rows.iter().copied());
-        let leaked_hnsw_rows = hnsw_raw_leaks(
+        let indexed_failure = indexed_baseline_failure(
             &db,
-            audit_hnsw_index.clone(),
-            rollback_probe_rows.iter().copied(),
-        );
-        let hnsw_failure = hnsw_baseline_failure(
-            &db,
-            audit_hnsw_index.clone(),
-            &audit_hnsw_baseline,
+            audit_indexed_index.clone(),
+            &audit_indexed_baseline,
             "callback Err rollback",
         );
         if !matches!(
@@ -5811,18 +5736,17 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
                 if trigger_name == "host_write_trigger"
                     && reason.contains("callback-error-after-side-effects")
         ) || count_rows(&db, "host_writes") != 0
-            || count_rows(&db, "host_audits") != audit_hnsw_count
+            || count_rows(&db, "host_audits") != audit_indexed_count
             || db
                 .edge_count(uuid(25), "ERR_ROLLBACK_EDGE", db.snapshot())
                 .unwrap()
                 != 0
             || !leaked_vector_rows.is_empty()
-            || !leaked_hnsw_rows.is_empty()
-            || hnsw_failure.is_some()
+            || indexed_failure.is_some()
             || changeset_has_data(&leaked_changes)
         {
             failures.push(format!(
- "callback-returned Err after relational/graph/vector side effects must roll back the firing tx without live, raw-HNSW, or changelog leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, leaked_hnsw_rows={leaked_hnsw_rows:?}, hnsw_failure={hnsw_failure:?}, leaked_changes={leaked_changes:?}",
+ "callback-returned Err after relational/graph/vector side effects must roll back the firing tx without live-row or changelog leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, indexed_failure={indexed_failure:?}, leaked_changes={leaked_changes:?}",
                 count_rows(&db, "host_writes"),
                 count_rows(&db, "host_audits"),
                 db.edge_count(uuid(25), "ERR_ROLLBACK_EDGE", db.snapshot())
@@ -5841,9 +5765,9 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             &path,
             "callback Err after side effects",
             since,
-            &[("host_writes", 0), ("host_audits", audit_hnsw_count)],
+            &[("host_writes", 0), ("host_audits", audit_indexed_count)],
             Some((uuid(25), "ERR_ROLLBACK_EDGE")),
-            Some((audit_hnsw_index, rollback_probe_rows, audit_hnsw_baseline)),
+            Some((audit_indexed_index, rollback_probe_rows, audit_indexed_baseline)),
         ) {
             failures.push(failure);
         }

@@ -6,11 +6,11 @@ use contextdb_core::read_contract::{
 };
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey, VectorQuantization};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
-use contextdb_engine::{Database, MaintenancePolicy};
-use contextdb_vector::hnsw::{
-    HnswCandidateDistanceEvent, HnswCandidateObserver, HnswQuerySelfScoreEvent,
-    HnswQuerySelfScoreObserver, with_hnsw_candidate_observer, with_hnsw_query_self_score_observer,
+use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
 };
+use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_vector::mem::{
     BoundedCandidateGroupingEventForTest, BoundedCandidateGroupingFaultForTest,
     BoundedCandidateGroupingObserverForTest, NativeVectorScoreObserver,
@@ -31,9 +31,21 @@ const CURRENT_ROWS_PER_CONTEXT: usize = 125;
 
 struct DistanceCounter(AtomicU64);
 
-impl HnswCandidateObserver for DistanceCounter {
-    fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
-        self.0.fetch_add(1, Ordering::SeqCst);
+impl NativeIvfSealObserver for DistanceCounter {
+    fn observe(&self, event: NativeIvfSealEvent<'_>) {
+        if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
+            self.0.fetch_add(
+                work.centroid_evaluations
+                    + work.quantized_evaluations
+                    + work.full_precision_evaluations
+                    + work.buffer_evaluations,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn before_boundary(&self, _boundary: NativeIvfFaultBoundary<'_>) -> contextdb_core::Result<()> {
+        Ok(())
     }
 }
 
@@ -67,61 +79,13 @@ impl BoundedCandidateGroupingObserverForTest for GroupingCounter {
     }
 }
 
-#[derive(Default)]
-struct QuerySelfScoreCounter {
-    f32: AtomicU64,
-    sq8: AtomicU64,
-    sq4: AtomicU64,
-}
-
-impl QuerySelfScoreCounter {
-    fn count(&self, quantization: VectorQuantization) -> u64 {
-        match quantization {
-            VectorQuantization::F32 => self.f32.load(Ordering::SeqCst),
-            VectorQuantization::SQ8 => self.sq8.load(Ordering::SeqCst),
-            VectorQuantization::SQ4 => self.sq4.load(Ordering::SeqCst),
-        }
-    }
-
-    fn total(&self) -> u64 {
-        self.f32.load(Ordering::SeqCst)
-            + self.sq8.load(Ordering::SeqCst)
-            + self.sq4.load(Ordering::SeqCst)
-    }
-
-    fn by_representation(&self) -> [u64; 3] {
-        [
-            self.count(VectorQuantization::F32),
-            self.count(VectorQuantization::SQ8),
-            self.count(VectorQuantization::SQ4),
-        ]
-    }
-}
-
-impl HnswQuerySelfScoreObserver for QuerySelfScoreCounter {
-    fn after_query_self_score_charge(&self, event: HnswQuerySelfScoreEvent) {
-        assert!(
-            event.dimension() > 0,
-            "a graph query representation has dimensions"
-        );
-        match event.quantization() {
-            VectorQuantization::F32 => &self.f32,
-            VectorQuantization::SQ8 => &self.sq8,
-            VectorQuantization::SQ4 => &self.sq4,
-        }
-        .fetch_add(1, Ordering::SeqCst);
-    }
-}
-
 struct ChargedQuery {
     result: bounded::TestResult,
     distance_evaluations: u64,
-    query_self_score_computations: u64,
-    query_self_scores_by_representation: [u64; 3],
     row_directory_lookups: u64,
     snapshot_visibility_probes: u64,
     placements: u64,
-    used_hnsw: bool,
+    used_indexed_route: bool,
 }
 
 struct FrozenClock;
@@ -230,7 +194,6 @@ fn query(db: &Database, partitions: usize) -> ChargedQuery {
     let graph = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let native = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let grouping = Arc::new(GroupingCounter::default());
-    let query_self_scores = Arc::new(QuerySelfScoreCounter::default());
     let mut params = HashMap::from([
         (
             "query".into(),
@@ -249,8 +212,8 @@ fn query(db: &Database, partitions: usize) -> ChargedQuery {
         generations.push(format!("${generation}"));
     }
     let result = with_bounded_candidate_grouping_observer_for_test(grouping.clone(), || {
-        with_hnsw_query_self_score_observer(query_self_scores.clone(), || {
-            with_hnsw_candidate_observer(graph.clone(), || {
+        
+            with_native_ivf_seal_observer_for_test(graph.clone(), || {
                 with_native_vector_score_observer_for_test(native.clone(), || {
                     bounded::execute(
                         db,
@@ -269,15 +232,13 @@ fn query(db: &Database, partitions: usize) -> ChargedQuery {
                     )
                 })
             })
-        })
+        
     })
     .expect("the bounded filtered query succeeds");
     ChargedQuery {
-        used_hnsw: db.__debug_last_query_vector_used_indexed_route_for_test(),
+        used_indexed_route: db.__debug_last_query_vector_used_indexed_route_for_test(),
         result,
         distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
-        query_self_score_computations: query_self_scores.total(),
-        query_self_scores_by_representation: query_self_scores.by_representation(),
         row_directory_lookups: grouping.row_directory_lookups.load(Ordering::SeqCst),
         snapshot_visibility_probes: grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
         placements: grouping.placements.load(Ordering::SeqCst),
@@ -291,8 +252,7 @@ fn honest_charge_range(query: &ChargedQuery, selected_candidates: usize) -> (u64
         .trace()
         .rows_examined
         .saturating_add(selected_candidates as u64)
-        .saturating_add(query.distance_evaluations)
-        .saturating_add(query.query_self_score_computations);
+        .saturating_add(query.distance_evaluations);
     // Publishing each returned row performs one separately charged point read.
     let upper = lower.saturating_add(query.result.result.rows().len() as u64);
     (lower, upper)
@@ -301,7 +261,7 @@ fn honest_charge_range(query: &ChargedQuery, selected_candidates: usize) -> (u64
 fn assert_independent_charge_bound(label: &str, query: &ChargedQuery, selected_candidates: usize) {
     assert!(
         query.distance_evaluations > 0,
-        "{label} must reach a native or HNSW distance observation before its charge is bounded"
+        "{label} must reach a native distance observation before its charge is bounded"
     );
     assert_eq!(
         query.row_directory_lookups, selected_candidates as u64,
@@ -318,7 +278,7 @@ fn assert_independent_charge_bound(label: &str, query: &ChargedQuery, selected_c
     let (lower, upper) = honest_charge_range(query, selected_candidates);
     assert!(
         (lower..=upper).contains(&query.result.telemetry.work_units),
-        "{label} charged work must include examined rows + candidate placements + independently observed distances + actual query self scores, and may add only one point read per returned row: work={}, range={lower}..={upper}, telemetry={:?}",
+        "{label} charged work must include examined rows + candidate placements + independently observed distances, and may add only one point read per returned row: work={}, range={lower}..={upper}, telemetry={:?}",
         query.result.telemetry.work_units,
         query.result.telemetry,
     );
@@ -398,7 +358,6 @@ fn grouped_query_with_fault(
     let graph = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let native = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let grouping = Arc::new(GroupingCounter::default());
-    let query_self_scores = Arc::new(QuerySelfScoreCounter::default());
     let mut params = HashMap::from([
         ("query".into(), Value::Vector(vec![1.0, 0.0, 0.0])),
         ("kind".into(), Value::Text("eligible".to_owned())),
@@ -426,8 +385,8 @@ fn grouped_query_with_fault(
     };
     let execute = || {
         with_bounded_candidate_grouping_observer_for_test(grouping.clone(), || {
-            with_hnsw_query_self_score_observer(query_self_scores.clone(), || {
-                with_hnsw_candidate_observer(graph.clone(), || {
+            
+                with_native_ivf_seal_observer_for_test(graph.clone(), || {
                     with_native_vector_score_observer_for_test(native.clone(), || {
                         bounded::execute(
                             db,
@@ -440,7 +399,7 @@ fn grouped_query_with_fault(
                         )
                     })
                 })
-            })
+            
         })
     };
     let result = match fault {
@@ -449,11 +408,9 @@ fn grouped_query_with_fault(
     }
     .expect("the fixed candidate scope remains affordable");
     ChargedQuery {
-        used_hnsw: db.__debug_last_query_vector_used_indexed_route_for_test(),
+        used_indexed_route: db.__debug_last_query_vector_used_indexed_route_for_test(),
         result,
         distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
-        query_self_score_computations: query_self_scores.total(),
-        query_self_scores_by_representation: query_self_scores.by_representation(),
         row_directory_lookups: grouping.row_directory_lookups.load(Ordering::SeqCst),
         snapshot_visibility_probes: grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
         placements: grouping.placements.load(Ordering::SeqCst),
@@ -580,29 +537,9 @@ fn score_fixture() -> (tempfile::TempDir, Database) {
         for partition in 0..SCORE_PARTITIONS {
             let key = VectorPartitionKey::from_values(&[Value::Int64(partition as i64)])
                 .expect("integer partition key");
-            let status = db
-                .vector_store_for_test()
-                .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
-                    index.clone(),
-                    key.clone(),
-                ))
-                .expect("the score route remains present");
-            assert!(status.base.is_some(), "the score query spans a sealed base");
-            assert_eq!(
-                status.fresh_tail_entries, 0,
-                "the durable suffix remains deferred until its captured search loads it"
-            );
-            let journal = db.__debug_vector_partition_journal_file_for_test(
-                &contextdb_vector::VectorPartitionRef::new(index.clone(), key),
-            );
-            assert_eq!(
-                journal
-                    .physical_record_lsns
-                    .iter()
-                    .filter(|lsn| **lsn > journal.truncated_through_lsn)
-                    .count(),
-                1,
-                "the captured score query spans one durable fresh entry in each partition",
+            assert!(
+                db.__debug_vector_partition_indexed_for_test(index.clone(), key),
+                "the score query spans a published index"
             );
         }
     }
@@ -613,10 +550,9 @@ fn representation_query(db: &Database, column: &str, mode: &str) -> ChargedQuery
     let graph = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let native = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let grouping = Arc::new(GroupingCounter::default());
-    let query_self_scores = Arc::new(QuerySelfScoreCounter::default());
     let result = with_bounded_candidate_grouping_observer_for_test(grouping.clone(), || {
-        with_hnsw_query_self_score_observer(query_self_scores.clone(), || {
-            with_hnsw_candidate_observer(graph.clone(), || {
+        
+            with_native_ivf_seal_observer_for_test(graph.clone(), || {
                 with_native_vector_score_observer_for_test(native.clone(), || {
                     bounded::execute(
                         db,
@@ -635,15 +571,13 @@ fn representation_query(db: &Database, column: &str, mode: &str) -> ChargedQuery
                     )
                 })
             })
-        })
+        
     })
     .unwrap_or_else(|error| panic!("bounded {column} {mode} score query: {error:?}"));
     ChargedQuery {
-        used_hnsw: db.__debug_last_query_vector_used_indexed_route_for_test(),
+        used_indexed_route: db.__debug_last_query_vector_used_indexed_route_for_test(),
         result,
         distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
-        query_self_score_computations: query_self_scores.total(),
-        query_self_scores_by_representation: query_self_scores.by_representation(),
         row_directory_lookups: grouping.row_directory_lookups.load(Ordering::SeqCst),
         snapshot_visibility_probes: grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
         placements: grouping.placements.load(Ordering::SeqCst),
@@ -745,12 +679,12 @@ fn one_thousand_candidates_are_grouped_once_across_eight_or_sixty_four_partition
             "partition fanout cannot alter the fixed 1,000-candidate answer in {mode} mode"
         );
         assert_eq!(
-            eight_query.used_hnsw,
+            eight_query.used_indexed_route,
             mode == "INDEXED",
             "the eight-partition {mode} arm must exercise its declared route"
         );
         assert_eq!(
-            sixty_four_query.used_hnsw,
+            sixty_four_query.used_indexed_route,
             mode == "INDEXED",
             "the sixty-four-partition {mode} arm must exercise its declared route"
         );
@@ -787,26 +721,26 @@ fn one_thousand_candidates_are_grouped_once_across_eight_or_sixty_four_partition
 }
 
 #[test]
-fn graph_query_self_score_is_charged_once_per_compatible_representation() {
+fn indexed_duplicates_keep_complete_recall_and_canonical_order_per_representation() {
     let (_directory, db) = score_fixture();
     let expected_ids = (0..SCORE_DUPLICATE_ROWS - SCORE_PARTITIONS)
         .chain(SCORE_BASE_ROWS..SCORE_BASE_ROWS + SCORE_PARTITIONS)
         .map(|id| vec![Value::Int64(id as i64)])
         .collect::<Vec<_>>();
-    for (column, quantization, representation_slot) in [
-        ("f32_embedding", VectorQuantization::F32, 0),
-        ("sq8_embedding", VectorQuantization::SQ8, 1),
-        ("sq4_embedding", VectorQuantization::SQ4, 2),
+    for (column, quantization) in [
+        ("f32_embedding", VectorQuantization::F32),
+        ("sq8_embedding", VectorQuantization::SQ8),
+        ("sq4_embedding", VectorQuantization::SQ4),
     ] {
         let exact = representation_query(&db, column, "EXACT");
         let indexed = representation_query(&db, column, "INDEXED");
         assert!(
-            !exact.used_hnsw,
+            !exact.used_indexed_route,
             "{column} EXACT must stay on the exact route"
         );
         assert!(
-            indexed.used_hnsw,
-            "{column} INDEXED must traverse the sealed and fresh graph layers"
+            indexed.used_indexed_route,
+            "{column} INDEXED must search the clustered index"
         );
         assert_eq!(
             exact.result.result.rows(),
@@ -816,17 +750,7 @@ fn graph_query_self_score_is_charged_once_per_compatible_representation() {
         assert_eq!(
             indexed.result.result.rows(),
             exact.result.result.rows(),
-            "{quantization:?} graph duplicate correction must preserve complete recall and canonical order"
-        );
-        assert_eq!(
-            exact.query_self_score_computations, 0,
-            "the exact route does not run HNSW duplicate correction"
-        );
-        let mut expected_counts = [0_u64; 3];
-        expected_counts[representation_slot] = 1;
-        assert_eq!(
-            indexed.query_self_scores_by_representation, expected_counts,
-            "{quantization:?} computes and charges one correctly tagged query self score across all partitions and layers"
+            "{quantization:?} indexed duplicate handling must preserve complete recall and canonical order"
         );
         assert_independent_charge_bound(
             &format!("{quantization:?} exact score route"),

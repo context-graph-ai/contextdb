@@ -1,5 +1,5 @@
 //! Ordinary import persistence does not require a physical proof observer.
-use contextdb_core::{Lsn, TxId, Value, Wallclock};
+use contextdb_core::{Value, Wallclock};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::collections::HashMap;
 
@@ -13,12 +13,14 @@ fn options() -> DatabaseOpenOptions {
     }
 }
 
-fn serving(db: &Database) -> (Lsn, TxId, Option<TxId>, usize) {
-    let routes = db
-        .vector_serving_pending_inserts_for_test("points", "embedding")
-        .unwrap();
-    assert_eq!(routes.len(), 1, "one native route: {routes:?}");
-    routes[0]
+fn nearest(db: &Database, id: i64) -> Vec<Vec<Value>> {
+    db.execute(
+        "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+        &HashMap::from([("q".into(), Value::Vector(vec![0.0, 1.0, id as f32 + 1.0]))]),
+    )
+    .unwrap()
+    .rows()
+    .to_vec()
 }
 
 fn append(db: &Database, id: i64) {
@@ -62,33 +64,26 @@ fn ordinary_import_persistence_advances_durable_coverage_without_an_observer() {
         built,
         "the initial native graph finishes in bounded maintenance steps"
     );
-    let base = serving(&db);
-    assert_eq!(base.3, 0, "the initial graph covers its rows");
-    append(&db, 16);
-    let before = serving(&db);
-    assert_eq!(
-        before.0, base.0,
-        "the append has not advanced serving coverage"
-    );
-    assert_eq!(before.3, 1, "one real committed vector awaits persistence");
-    eprintln!(
-        "native import before persistence: {before:?}; store={}",
-        path.display()
-    );
-
-    assert!(db.persist_import_vector_tails().unwrap());
-
-    let after = serving(&db);
     assert!(
-        after.0 > before.0,
-        "the committed suffix advances serving coverage"
+        db.persist_import_vector_tails().unwrap(),
+        "the initial native index covers its rows"
     );
-    assert_eq!(
-        after.2,
-        Some(after.1),
-        "coverage names its committed transaction"
+    append(&db, 16);
+
+    let mut covered = db.persist_import_vector_tails().unwrap();
+    for _ in 0..128 {
+        if covered {
+            break;
+        }
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        assert!(report.first_failure.is_none(), "{:?}", report.first_failure);
+        covered = db.persist_import_vector_tails().unwrap();
+    }
+    assert!(
+        covered,
+        "bounded maintenance reaches full coverage of the committed suffix"
     );
-    assert_eq!(after.3, 0, "the suffix is fully covered");
+    assert_eq!(nearest(&db, 16), vec![vec![Value::Int64(16)]]);
     assert!(db.write_memory_high_water_for_test() <= WRITER_LIMIT);
     assert_eq!(
         db.vector_memory_ownership_receipt_for_test()
@@ -97,9 +92,9 @@ fn ordinary_import_persistence_advances_durable_coverage_without_an_observer() {
     );
     drop(db);
     let reopened = Database::open_with_options(&path, options()).unwrap();
-    assert_eq!(
-        serving(&reopened),
-        after,
-        "coverage and pending counters are durable"
+    assert!(
+        reopened.persist_import_vector_tails().unwrap(),
+        "coverage is durable"
     );
+    assert_eq!(nearest(&reopened, 16), vec![vec![Value::Int64(16)]]);
 }

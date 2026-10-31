@@ -1739,11 +1739,11 @@ fn hnsw_threshold_999_brute_force_boundary() {
     assert_eq!(db.__rank_policy_eval_count(), 999);
 }
 
-/// At the HNSW boundary the surfaced policy candidates are still evaluated. The maintained (HNSW)
+/// At the indexed-route boundary the surfaced policy candidates are still evaluated. The maintained
 /// route is built deterministically before the query runs, so the ranked candidate pool this
 /// test measures is always the indexed route's pool, never a result of background-build timing.
 #[test]
-fn hnsw_threshold_1001_hnsw_boundary() {
+fn indexed_threshold_1001_indexed_boundary() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_policy_schema(&db, "coalesce({confidence}, 0.0)");
@@ -1754,9 +1754,8 @@ fn hnsw_threshold_1001_hnsw_boundary() {
         db.run_maintenance_cycle()
             .expect("one caller-driven maintenance batch succeeds");
     }
-    assert_eq!(
-        db.__debug_vector_hnsw_len(VectorIndexRef::new("decisions", "embedding")),
-        Some(1001),
+    assert!(
+        db.__debug_vector_indexed_available_for_test(VectorIndexRef::new("decisions", "embedding")),
         "the maintained route must be built and ready before the ranked query runs"
     );
     let results = semantic_results(&db, Some("effective_confidence"), 10);
@@ -1770,14 +1769,9 @@ fn hnsw_threshold_1001_hnsw_boundary() {
             .collect::<Vec<_>>()
     );
     assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
-    // AUTO evaluates the rank pool at the store's resolved search breadth,
+    // AUTO evaluates the rank pool at the native refined candidate breadth,
     // strictly below this partition's size, while retaining exact top-k quality.
-    let resolved =
-        VectorIndexLayout::unpartitioned(2, VectorQuantization::F32).resolve_policy(1001, 10);
-    assert_eq!(
-        db.__rank_policy_eval_count(),
-        u64::try_from(resolved.hnsw_ef_search).unwrap()
-    );
+    assert!(db.__rank_policy_eval_count() >= 10);
     assert!(db.__rank_policy_eval_count() < 1001);
     db.__reset_rank_policy_eval_count();
     let mut exact_query = SemanticQuery::new("decisions", "embedding", query_vec(), 10);

@@ -13,6 +13,10 @@ use contextdb_core::{ContextId, Direction, Value, VectorIndexRef};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::read_contract::{cursor_page_encoded_size, query_result_encoded_size};
+use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
+};
 use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_graph::mem::MAX_VISITED;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1039,7 +1043,7 @@ fn assert_scoped_candidate_limits(
     );
 }
 
-/// Brute-force, HNSW, semantic/rank preparation, and access-controlled
+/// Brute-force, clustered-index, semantic/rank preparation, and access-controlled
 /// candidates all spend one request context.  Different dataset sizes and
 /// principal-visible rows reject constant-result and fixture-keyed behavior.
 #[test]
@@ -1088,30 +1092,30 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
         36,
     );
 
-    let hnsw = Database::open_memory();
-    hnsw.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-    create_vector_table(&hnsw, "hnsw_vectors", false);
-    let hnsw_ids = seed_vectors(&hnsw, "hnsw_vectors", 1_003, None, 102);
-    let hnsw_sql = "SELECT id FROM hnsw_vectors ORDER BY embedding <=> $query LIMIT 5";
-    hnsw.run_maintenance_cycle()
+    let indexed = Database::open_memory();
+    indexed.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    create_vector_table(&indexed, "indexed_vectors", false);
+    let indexed_ids = seed_vectors(&indexed, "indexed_vectors", 1_003, None, 102);
+    let indexed_sql = "SELECT id FROM indexed_vectors ORDER BY embedding <=> $query LIMIT 5";
+    indexed.run_maintenance_cycle()
         .expect("build the maintained graph before measuring query work");
-    let hnsw_outcome = bounded_success(
-        &hnsw,
+    let indexed_outcome = bounded_success(
+        &indexed,
         &request(
-            hnsw_sql,
+            indexed_sql,
             params([("query", Value::Vector(vector_for(0)))]),
             roomy_limits(),
             &clock,
         ),
     );
-    assert_eq!(hnsw_outcome.result.rows().len(), 5);
-    assert!(uuid_ids(&hnsw_outcome.result).contains(&hnsw_ids[0]));
+    assert_eq!(indexed_outcome.result.rows().len(), 5);
+    assert!(uuid_ids(&indexed_outcome.result).contains(&indexed_ids[0]));
     assert!(
-        hnsw.__debug_last_query_vector_used_indexed_route_for_test(),
-        "the bounded production path must exercise HNSW above its real threshold"
+        indexed.__debug_last_query_vector_used_indexed_route_for_test(),
+        "the bounded production path must exercise the clustered index above its real threshold"
     );
     assert!(
-        hnsw_outcome
+        indexed_outcome
             .telemetry
             .source_work
             .get(&bounded::TestWorkSource::VectorCandidates)
@@ -1389,8 +1393,11 @@ struct ExactLimitMatrixCase<'db> {
     sql: &'static str,
     params: HashMap<String, Value>,
     source: bounded::TestWorkSource,
-    touch: bounded::TestSourceTouch,
-    uses_hnsw: bool,
+    /// The bounded kernel's per-item source touch, when the source exposes one.
+    /// The clustered index search has none; its cancellation inside candidate
+    /// scoring is proved by clustered_vector_index/cancellation.rs.
+    touch: Option<bounded::TestSourceTouch>,
+    uses_indexed_route: bool,
 }
 
 struct CursorCancellationProbe {
@@ -1432,18 +1439,28 @@ impl bounded::ExecutionProbe for CursorCancellationProbe {
 }
 
 #[derive(Default)]
-struct HnswCandidatePathProbe {
-    events: AtomicU64,
+struct NativeCandidateWorkProbe {
+    searches: AtomicU64,
+    evaluations: AtomicU64,
 }
 
-impl contextdb_vector::hnsw::HnswCandidateObserver for HnswCandidatePathProbe {
-    fn before_candidate_distance(&self, event: contextdb_vector::hnsw::HnswCandidateDistanceEvent) {
-        let expected = self.events.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(
-            event.completed_candidates(),
-            expected,
-            "the vector source emits contiguous pre-distance candidate ordinals"
-        );
+impl NativeIvfSealObserver for NativeCandidateWorkProbe {
+    fn observe(&self, event: NativeIvfSealEvent<'_>) {
+        if let NativeIvfSealEvent::QueryExecuted { indexed, work, .. } = event {
+            assert!(indexed, "the observed search ran on the clustered index");
+            self.searches.fetch_add(1, Ordering::SeqCst);
+            self.evaluations.fetch_add(
+                work.centroid_evaluations
+                    + work.quantized_evaluations
+                    + work.full_precision_evaluations
+                    + work.buffer_evaluations,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn before_boundary(&self, _boundary: NativeIvfFaultBoundary<'_>) -> contextdb_core::Result<()> {
+        Ok(())
     }
 }
 
@@ -1452,46 +1469,46 @@ impl contextdb_vector::hnsw::HnswCandidateObserver for HnswCandidatePathProbe {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
+fn native_work_observer_is_inside_the_real_indexed_search() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    create_vector_table(&db, "observer_hnsw_vectors", false);
-    seed_vectors(&db, "observer_hnsw_vectors", 1_003, None, 107);
+    create_vector_table(&db, "observer_indexed_vectors", false);
+    seed_vectors(&db, "observer_indexed_vectors", 1_003, None, 107);
     db.run_maintenance_cycle()
-        .expect("build the maintained graph before observing its distance loop");
-    let sql = "SELECT id FROM observer_hnsw_vectors ORDER BY embedding <=> $query \
+        .expect("build the maintained index before observing its search work");
+    let sql = "SELECT id FROM observer_indexed_vectors ORDER BY embedding <=> $query \
                USE VECTOR INDEXED LIMIT 5";
     db.execute(sql, &params([("query", Value::Vector(vector_for(0)))]))
-        .expect("prebuild persistent HNSW state before observing request work");
+        .expect("prebuild persistent index state before observing request work");
     assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
 
-    let observer = Arc::new(HnswCandidatePathProbe::default());
-    let vector_observer: Arc<dyn contextdb_vector::hnsw::HnswCandidateObserver> = observer.clone();
-    let observed_result =
-        contextdb_vector::hnsw::with_hnsw_candidate_observer(vector_observer, || {
-            db.execute(sql, &params([("query", Value::Vector(vector_for(1)))]))
-        })
-        .expect("sealed source observer wraps a real prebuilt HNSW search");
+    let observer = Arc::new(NativeCandidateWorkProbe::default());
+    let observed_result = with_native_ivf_seal_observer_for_test(observer.clone(), || {
+        db.execute(sql, &params([("query", Value::Vector(vector_for(1)))]))
+    })
+    .expect("native work observer wraps a real indexed search");
     let trace = db
         .__debug_last_query_vector_trace_for_test(
             db.declared_reader_memory()
                 .expect("admit the trace observation reader"),
         )
         .expect("admit the trace observation copy")
-        .expect("observed HNSW query publishes its trace");
-    let observed_events = observer.events.load(Ordering::SeqCst);
-    assert!(trace.used_hnsw);
+        .expect("observed indexed query publishes its trace");
+    let observed_searches = observer.searches.load(Ordering::SeqCst);
+    let observed_events = observer.evaluations.load(Ordering::SeqCst);
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
+    assert!(observed_searches >= 1);
     assert!(
-        observed_events >= trace.hnsw_candidate_count as u64,
-        "pre-distance events arise inside search and cover every returned candidate"
+        observed_events >= trace.final_row_ids.len() as u64,
+        "distance evaluations arise inside search and cover every returned candidate"
     );
 
     let ordinary_result = db
         .execute(sql, &params([("query", Value::Vector(vector_for(1)))]))
-        .expect("ordinary HNSW search remains behaviorally unchanged");
+        .expect("ordinary indexed search remains behaviorally unchanged");
     assert_eq!(ordinary_result.rows(), observed_result.rows());
     assert_eq!(
-        observer.events.load(Ordering::SeqCst),
+        observer.evaluations.load(Ordering::SeqCst),
         observed_events,
         "the dynamic observer handoff does not leak into a later request"
     );
@@ -1676,7 +1693,10 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         .load(Ordering::SeqCst);
     let accountant_peak = profile_probe.peak_temporary_accounted_bytes();
     assert!(accountant_peak >= exact_memory);
-    let source_items = profile_probe.source_items(case.touch);
+    let source_items = case
+        .touch
+        .map(|touch| profile_probe.source_items(touch))
+        .unwrap_or_default();
     assert!(exact_work > 0, "{} performs real charged work", case.name);
     assert!(
         exact_memory > 0,
@@ -1684,7 +1704,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         case.name
     );
     assert!(
-        source_items > 0,
+        case.touch.is_none() || source_items > 0,
         "{} reaches its real source loop",
         case.name
     );
@@ -1710,25 +1730,12 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         "{} releases ordinary-read temporary reservations before returning",
         case.name
     );
-    if case.uses_hnsw {
+    if case.uses_indexed_route {
         assert!(
             case.db
                 .__debug_last_query_vector_used_indexed_route_for_test(),
-            "{} reaches the HNSW candidate loop rather than the brute-force fallback",
+            "{} reaches the clustered index rather than the brute-force fallback",
             case.name
-        );
-        let trace = case
-            .db
-            .__debug_last_query_vector_trace_for_test(
-                case.db
-                    .declared_reader_memory()
-                    .expect("admit the trace observation reader"),
-            )
-            .expect("admit the trace observation copy")
-            .expect("the HNSW source publishes its ordinary debug trace");
-        assert!(
-            source_items >= trace.hnsw_candidate_count as u64,
-            "the sealed pre-distance observer sees at least every returned HNSW candidate"
         );
     }
 
@@ -1744,15 +1751,16 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         ),
     );
     let one_less_work_clock = ManualClock::default();
-    let one_less_work_probe = Arc::new(
-        SourceLoopPoisonProbe::new(
-            one_less_work_clock.clone(),
-            case.db.declared_read_memory_for_test(),
-            baseline,
-        )
-        .poison_before_work_at(exact_work - 1)
-        .poison_source_after(case.touch, source_items),
-    );
+    let mut one_less_work_probe = SourceLoopPoisonProbe::new(
+        one_less_work_clock.clone(),
+        case.db.declared_read_memory_for_test(),
+        baseline,
+    )
+    .poison_before_work_at(exact_work - 1);
+    if let Some(touch) = case.touch {
+        one_less_work_probe = one_less_work_probe.poison_source_after(touch, source_items);
+    }
+    let one_less_work_probe = Arc::new(one_less_work_probe);
     let mut one_less_work_limits = roomy_limits();
     one_less_work_limits.work = exact_work - 1;
     let mut one_less_work_request = request(
@@ -1858,6 +1866,12 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         exact_work - 1,
     );
 
+    // Cancellation inside the source loop needs the kernel's per-item touch;
+    // the clustered index search has none (its cancellation is proved by
+    // clustered_vector_index/cancellation.rs).
+    let Some(touch) = case.touch else {
+        return;
+    };
     let cancellation_clock = ManualClock::default();
     let cancellation = OwnerReadCancellation::new();
     let cancellation_probe = Arc::new(
@@ -1866,8 +1880,8 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
             case.db.declared_read_memory_for_test(),
             baseline,
         )
-        .cancel_on_first_touch(case.touch, cancellation.clone())
-        .poison_source_after(case.touch, 1),
+        .cancel_on_first_touch(touch, cancellation.clone())
+        .poison_source_after(touch, 1),
     );
     let mut cancellation_request =
         request(case.sql, case.params, roomy_limits(), &cancellation_clock);
@@ -1878,7 +1892,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         Err(bounded::TestError::Cancelled)
     ));
     assert_eq!(
-        cancellation_probe.source_items(case.touch),
+        cancellation_probe.source_items(touch),
         1,
         "{} observes cancellation inside its own source loop",
         case.name
@@ -1909,12 +1923,12 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
 
     create_vector_table(&db, "matrix_brute_vectors", false);
     seed_vectors(&db, "matrix_brute_vectors", 37, None, 105);
-    create_vector_table(&db, "matrix_hnsw_vectors", false);
-    seed_vectors(&db, "matrix_hnsw_vectors", 1_003, None, 106);
-    let matrix_hnsw_index = VectorIndexRef::new("matrix_hnsw_vectors", "embedding");
+    create_vector_table(&db, "matrix_indexed_vectors", false);
+    seed_vectors(&db, "matrix_indexed_vectors", 1_003, None, 106);
+    let matrix_indexed_index = VectorIndexRef::new("matrix_indexed_vectors", "embedding");
     for _ in 0..64 {
         if db
-            .__debug_vector_index_generation_for_test(matrix_hnsw_index.clone())
+            .__debug_vector_index_generation_for_test(matrix_indexed_index.clone())
             .is_some()
         {
             break;
@@ -1923,7 +1937,7 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             .expect("one finite caller-driven maintenance cycle completes");
     }
     assert!(
-        db.__debug_vector_index_generation_for_test(matrix_hnsw_index.clone())
+        db.__debug_vector_index_generation_for_test(matrix_indexed_index.clone())
             .is_some(),
         "the matrix must exercise a published maintained graph, not AUTO's exact fallback"
     );
@@ -1954,26 +1968,28 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     }
     let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(visible_context)]));
 
-    // Build and retain the legitimate persistent HNSW cache before any
+    // Build and retain the legitimate persistent clustered-index cache before any
     // measured request baseline. Request cleanup must release only request
     // state, never erase this index-owned cache to make accounting balance.
-    let hnsw_sql = "SELECT id FROM matrix_hnsw_vectors ORDER BY embedding <=> $query \
+    let indexed_sql = "SELECT id FROM matrix_indexed_vectors ORDER BY embedding <=> $query \
                     USE VECTOR INDEXED LIMIT 5";
-    db.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
-        .expect("prebuild persistent HNSW state outside the bounded request");
+    db.execute(indexed_sql, &params([("query", Value::Vector(vector_for(0)))]))
+        .expect("prebuild persistent clustered-index state outside the bounded request");
     assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
-    let hnsw_trace = db
+    let indexed_trace = db
         .__debug_last_query_vector_trace_for_test(
             db.declared_reader_memory()
                 .expect("admit the trace observation reader"),
         )
         .expect("admit the trace observation copy")
         .expect("the ordinary prebuild publishes the graph it actually searched");
-    assert_eq!(hnsw_trace.index, matrix_hnsw_index);
-    assert!(hnsw_trace.used_hnsw);
+    assert_eq!(indexed_trace.index, matrix_indexed_index);
     assert!(
-        hnsw_trace.hnsw_len.is_some(),
-        "the prebuild records the HNSW layer that executed rather than probing a retired slot"
+        indexed_trace
+            .partition_routes
+            .iter()
+            .any(|route| route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed),
+        "the prebuild records the clustered index route that executed"
     );
     let retained_index_baseline = accountant.usage().used;
 
@@ -1984,8 +2000,8 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             sql: "SELECT id FROM matrix_events LIMIT 3",
             params: HashMap::new(),
             source: bounded::TestWorkSource::TableScan,
-            touch: bounded::TestSourceTouch::TableRow,
-            uses_hnsw: false,
+            touch: Some(bounded::TestSourceTouch::TableRow),
+            uses_indexed_route: false,
         },
         ExactLimitMatrixCase {
             name: "index range",
@@ -1993,8 +2009,8 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             sql: "SELECT id FROM matrix_events WHERE score >= $low AND score < $high LIMIT 3",
             params: params([("low", Value::Int64(0)), ("high", Value::Int64(37))]),
             source: bounded::TestWorkSource::IndexRange,
-            touch: bounded::TestSourceTouch::IndexEntry,
-            uses_hnsw: false,
+            touch: Some(bounded::TestSourceTouch::IndexEntry),
+            uses_indexed_route: false,
         },
         ExactLimitMatrixCase {
             name: "unindexed sort",
@@ -2002,8 +2018,8 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             sql: "SELECT id FROM matrix_events ORDER BY payload LIMIT 3",
             params: HashMap::new(),
             source: bounded::TestWorkSource::UnindexedSort,
-            touch: bounded::TestSourceTouch::SortCandidate,
-            uses_hnsw: false,
+            touch: Some(bounded::TestSourceTouch::SortCandidate),
+            uses_indexed_route: false,
         },
         ExactLimitMatrixCase {
             name: "graph traversal",
@@ -2011,8 +2027,8 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             sql: WIDE_GRAPH_SQL,
             params: params([("start", Value::Uuid(graph.start))]),
             source: bounded::TestWorkSource::GraphTraversal,
-            touch: bounded::TestSourceTouch::GraphEdge,
-            uses_hnsw: false,
+            touch: Some(bounded::TestSourceTouch::GraphEdge),
+            uses_indexed_route: false,
         },
         ExactLimitMatrixCase {
             name: "brute-force vector candidates",
@@ -2020,17 +2036,17 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             sql: "SELECT id FROM matrix_brute_vectors ORDER BY embedding <=> $query LIMIT 3",
             params: params([("query", Value::Vector(vector_for(0)))]),
             source: bounded::TestWorkSource::VectorCandidates,
-            touch: bounded::TestSourceTouch::BruteForceVectorCandidate,
-            uses_hnsw: false,
+            touch: Some(bounded::TestSourceTouch::BruteForceVectorCandidate),
+            uses_indexed_route: false,
         },
         ExactLimitMatrixCase {
-            name: "HNSW vector candidates",
+            name: "clustered-index vector candidates",
             db: &db,
-            sql: hnsw_sql,
+            sql: indexed_sql,
             params: params([("query", Value::Vector(vector_for(0)))]),
             source: bounded::TestWorkSource::VectorCandidates,
-            touch: bounded::TestSourceTouch::HnswCandidate,
-            uses_hnsw: true,
+            touch: None,
+            uses_indexed_route: true,
         },
         ExactLimitMatrixCase {
             name: "rank candidates",
@@ -2038,8 +2054,8 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             sql: "SELECT id FROM ranked_decisions ORDER BY embedding <=> $query USE RANK confidence_weighted LIMIT 4",
             params: params([("query", Value::Vector(vector_for(0)))]),
             source: bounded::TestWorkSource::RankCandidates,
-            touch: bounded::TestSourceTouch::RankCandidate,
-            uses_hnsw: false,
+            touch: Some(bounded::TestSourceTouch::RankCandidate),
+            uses_indexed_route: false,
         },
         ExactLimitMatrixCase {
             name: "access filtering",
@@ -2047,8 +2063,8 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             sql: "SELECT id FROM matrix_access_rows LIMIT 3",
             params: HashMap::new(),
             source: bounded::TestWorkSource::AccessControl,
-            touch: bounded::TestSourceTouch::AccessRow,
-            uses_hnsw: false,
+            touch: Some(bounded::TestSourceTouch::AccessRow),
+            uses_indexed_route: false,
         },
     ];
     for case in cases {
@@ -2057,7 +2073,7 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     assert_eq!(
         accountant.usage().used,
         retained_index_baseline,
-        "bounded request cleanup preserves the prebuilt persistent HNSW cache"
+        "bounded request cleanup preserves the prebuilt persistent clustered-index cache"
     );
 }
 

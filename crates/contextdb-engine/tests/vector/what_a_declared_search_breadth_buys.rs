@@ -221,7 +221,7 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
         !infos.is_empty()
             && infos
                 .iter()
-                .all(|partition| db.__debug_vector_partition_indexed_for_test(
+                .all(|partition| admin.__debug_vector_partition_indexed_for_test(
                     partition.partition.index.clone(),
                     partition.partition.partition_key.clone()
                 )),

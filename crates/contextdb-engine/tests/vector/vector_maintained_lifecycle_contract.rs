@@ -358,7 +358,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
         .explain(auto_sql)
         .expect("explain the initial AUTO route");
     assert!(
-        !before_explain.contains("HNSWSearch"),
+        !before_explain.contains("strategy=Indexed"),
         "explain cannot promise an unpublished route: {before_explain}"
     );
     let unavailable = db
@@ -410,7 +410,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
         .explain(auto_sql)
         .expect("explain the published AUTO route");
     assert!(
-        ready_explain.contains("HNSWSearch"),
+        ready_explain.contains("strategy=Indexed"),
         "explain must report the same published route execution can use: {ready_explain}"
     );
     db.__reset_last_query_vector_trace_for_test();

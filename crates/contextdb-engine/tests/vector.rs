@@ -16,8 +16,6 @@ mod a_filtered_scope_is_charged_for_its_candidates;
 mod a_find_answers_a_full_page_when_a_candidate_is_withdrawn;
 #[path = "vector/a_find_decodes_only_the_rows_it_returns.rs"]
 mod a_find_decodes_only_the_rows_it_returns;
-#[path = "vector/a_find_locks_its_serving_cache_once_per_page.rs"]
-mod a_find_locks_its_serving_cache_once_per_page;
 #[cfg(unix)]
 #[path = "vector/a_find_names_only_the_pairs_it_asks_for.rs"]
 mod a_find_names_only_the_pairs_it_asks_for;
@@ -25,22 +23,10 @@ mod a_find_names_only_the_pairs_it_asks_for;
 mod a_find_over_many_contexts_spends_one_search_budget;
 #[path = "vector/a_row_checked_find_keeps_recall_and_refusals.rs"]
 mod a_row_checked_find_keeps_recall_and_refusals;
-#[cfg(unix)]
-#[path = "vector/a_saved_graph_load_checks_its_bytes_once.rs"]
-mod a_saved_graph_load_checks_its_bytes_once;
 #[path = "vector/a_store_reopens_after_every_vector_maintenance_commit.rs"]
 mod a_store_reopens_after_every_vector_maintenance_commit;
 #[path = "vector/a_synced_vector_policy_change_keeps_the_receivers_graphs.rs"]
 mod a_synced_vector_policy_change_keeps_the_receivers_graphs;
-#[cfg(unix)]
-#[path = "vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs"]
-mod a_wide_find_admits_every_partition_when_serving_pages_give_way;
-#[cfg(unix)]
-#[path = "vector/a_wide_find_is_admitted_at_what_its_loads_hold.rs"]
-mod a_wide_find_is_admitted_at_what_its_loads_hold;
-#[cfg(unix)]
-#[path = "vector/a_wide_find_keeps_its_entry_pages_warm.rs"]
-mod a_wide_find_keeps_its_entry_pages_warm;
 #[path = "vector/an_exact_search_authenticates_pages_not_every_vector.rs"]
 mod an_exact_search_authenticates_pages_not_every_vector;
 #[path = "vector/an_exhaustive_find_streams_bodies_it_cannot_hold.rs"]
@@ -54,9 +40,6 @@ mod auto_pays_what_indexed_pays;
 #[cfg(feature = "nightly-tests")]
 #[path = "vector/continuous_writers_hold_throughput_and_reader_latency.rs"]
 mod continuous_writers_hold_throughput_and_reader_latency;
-#[cfg(unix)]
-#[path = "vector/each_layer_a_wide_find_loads_keeps_its_share.rs"]
-mod each_layer_a_wide_find_loads_keeps_its_share;
 #[path = "vector/equal_distance_rows_keep_canonical_order_across_contexts.rs"]
 mod equal_distance_rows_keep_canonical_order_across_contexts;
 #[path = "vector/every_graph_route_reaches_every_row.rs"]

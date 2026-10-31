@@ -1706,9 +1706,11 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
         "search_mode",
         "declared_auto_index_at",
         "effective_auto_index_at",
-        "declared_hnsw_m",
-        "declared_hnsw_ef_construction",
-        "declared_hnsw_ef_search",
+        "declared_target_accuracy",
+        "declared_expected_vectors",
+        "declared_lists",
+        "declared_probes",
+        "declared_refine_factor",
         "declared_consolidation_mode",
         "declared_consolidation_change_percent",
         "declared_consolidation_tombstone_percent",
@@ -1724,6 +1726,8 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
         "durable_index_bytes",
         "charged_index_bytes",
         "query_state",
+        "indexed_available",
+        "objective_status",
         "maintenance_state",
         "maintenance_vectors_total",
         "maintenance_vectors_done",
@@ -2152,9 +2156,11 @@ fn nv16d_show_vector_indexes_on_empty_database_returns_empty_with_header() {
         "search_mode",
         "declared_auto_index_at",
         "effective_auto_index_at",
-        "declared_hnsw_m",
-        "declared_hnsw_ef_construction",
-        "declared_hnsw_ef_search",
+        "declared_target_accuracy",
+        "declared_expected_vectors",
+        "declared_lists",
+        "declared_probes",
+        "declared_refine_factor",
         "declared_consolidation_mode",
         "declared_consolidation_change_percent",
         "declared_consolidation_tombstone_percent",
@@ -2170,6 +2176,8 @@ fn nv16d_show_vector_indexes_on_empty_database_returns_empty_with_header() {
         "durable_index_bytes",
         "charged_index_bytes",
         "query_state",
+        "indexed_available",
+        "objective_status",
         "maintenance_state",
         "maintenance_vectors_total",
         "maintenance_vectors_done",
@@ -2488,9 +2496,9 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
 }
 
 #[test]
-fn nv_deferred_hnsw_build_per_index() {
+fn nv_deferred_index_build_per_index() {
     // Queries are observers: one caller-driven wake builds every needy index,
-    // and each column receives its own graph and routing policy.
+    // and each column receives its own clustered index and routing policy.
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
@@ -2515,7 +2523,7 @@ fn nv_deferred_hnsw_build_per_index() {
         v
     }
 
-    // Populate vector_text well past HNSW_THRESHOLD (1000); leave vector_vision small.
+    // Populate vector_text well past the indexed-route threshold (1000); leave vector_vision small.
     let mut text_target_id = None;
     for i in 0..1500 {
         let id = Uuid::new_v4();
@@ -2579,7 +2587,7 @@ fn nv_deferred_hnsw_build_per_index() {
     let vision_bytes_before = vision_bytes_before.unwrap();
     assert!(
         text_bytes_before >= text_payload_floor,
-        "vector_text bytes must account for the stored vector payload before HNSW build; got {text_bytes_before}"
+        "vector_text bytes must account for the stored vector payload before the index build; got {text_bytes_before}"
     );
     assert!(
         vision_bytes_before >= vision_payload_floor,
@@ -2605,14 +2613,15 @@ fn nv_deferred_hnsw_build_per_index() {
     let id_idx = r1.columns().iter().position(|c| c == "id").unwrap();
     assert_eq!(r1.rows()[0][id_idx], Value::Uuid(text_id));
     assert_eq!(db.accountant().usage().used, used_before_text_build);
-    assert_eq!(
-        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_text")),
-        None,
+    assert!(
+        !db.__debug_vector_indexed_available_for_test(VectorIndexRef::new("evidence", "vector_text")),
         "a query must not build vector_text"
     );
-    assert_eq!(
-        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_vision")),
-        None,
+    assert!(
+        !db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+            "evidence",
+            "vector_vision"
+        )),
         "a query on vector_text must not build vector_vision"
     );
 
@@ -2621,54 +2630,30 @@ fn nv_deferred_hnsw_build_per_index() {
     let used_after_text_build = db.accountant().usage().used;
     assert!(
         used_after_text_build > used_before_text_build,
-        "caller-driven maintenance must materialize an accountant-tracked HNSW build; used before={used_before_text_build}, after={used_after_text_build}"
-    );
-    assert_eq!(
-        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_text")),
-        Some(1500),
-        "vector_text must have a real HNSW graph containing exactly its 1500 vectors, not synthetic bytes or a global graph"
-    );
-    let text_graph_stats = db
-        .__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_text"))
-        .expect("vector_text HNSW graph stats after first search");
-    assert_eq!(
-        text_graph_stats.point_count, 1500,
-        "vector_text HNSW graph must expose real graph point count, not just a built flag"
-    );
-    assert_eq!(
-        text_graph_stats.layer0_points, 1500,
-        "the base HNSW layer must contain every vector_text entry"
-    );
-    assert_eq!(
-        text_graph_stats.dimension, 4,
-        "vector_text HNSW graph must be built with the vector_text dimension"
+        "caller-driven maintenance must materialize an accountant-tracked index build; used before={used_before_text_build}, after={used_after_text_build}"
     );
     assert!(
-        text_graph_stats.layer0_neighbor_edges > 0,
-        "vector_text HNSW graph must expose actual layer-0 neighbor links; got {text_graph_stats:?}"
+        db.__debug_vector_indexed_available_for_test(VectorIndexRef::new("evidence", "vector_text")),
+        "vector_text must have a published clustered index, not synthetic bytes or a global index"
     );
-    assert_eq!(
-        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_vision")),
-        Some(1),
-        "the same maintenance wake gives vector_vision its own one-point graph"
+    assert!(
+        db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+            "evidence",
+            "vector_vision"
+        )),
+        "the same maintenance wake gives vector_vision its own clustered index"
     );
-    let vision_graph_stats = db
-        .__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_vision"))
-        .expect("vector_vision has its own maintained graph");
-    assert_eq!(vision_graph_stats.point_count, 1);
-    assert_eq!(vision_graph_stats.layer0_points, 1);
-    assert_eq!(vision_graph_stats.dimension, 8);
     let text_bytes_after = vector_index_bytes("vector_text")
-        .expect("SHOW VECTOR_INDEXES must list vector_text after HNSW build");
+        .expect("SHOW VECTOR_INDEXES must list vector_text after the index build");
     let vision_bytes_after_maintenance = vector_index_bytes("vector_vision")
-        .expect("SHOW VECTOR_INDEXES must list vector_vision after text HNSW build");
+        .expect("SHOW VECTOR_INDEXES must list vector_vision after the text index build");
     assert!(
         text_bytes_after > text_bytes_before,
-        "vector_text SHOW bytes must increase after HNSW build; before={text_bytes_before}, after={text_bytes_after}"
+        "vector_text SHOW bytes must increase after the index build; before={text_bytes_before}, after={text_bytes_after}"
     );
     assert!(
         vision_bytes_after_maintenance > vision_bytes_before,
-        "the all-needy wake charges vector_vision's independent graph; before={vision_bytes_before}, after={vision_bytes_after_maintenance}"
+        "the all-needy wake charges vector_vision's independent index; before={vision_bytes_before}, after={vision_bytes_after_maintenance}"
     );
 
     let vision_trace = db
@@ -2676,13 +2661,12 @@ fn nv_deferred_hnsw_build_per_index() {
         .expect("vision explain");
     assert!(
         vision_trace.contains("VectorSearch")
-            && !vision_trace.contains("HNSWSearch")
             && vision_trace.contains("vector_vision"),
-        "small vector_vision index must not inherit vector_text's HNSW build state; got: {vision_trace}"
+        "small vector_vision index must not inherit vector_text's index build state; got: {vision_trace}"
     );
 
     // AUTO still chooses exact for the one-row column even though maintenance
-    // has prepared its independent graph for a future threshold crossing.
+    // has prepared its independent index for a future threshold crossing.
     let used_before_vision_search = db.accountant().usage().used;
     let r2 = db
         .execute(
@@ -2693,27 +2677,29 @@ fn nv_deferred_hnsw_build_per_index() {
     assert_eq!(
         r2.rows()[0][id_idx],
         Value::Uuid(vision_id),
-        "vision search must succeed independently of vector_text's HNSW build state"
+        "vision search must succeed independently of vector_text's index build state"
     );
     let used_after_vision_search = db.accountant().usage().used;
     assert_eq!(
         used_after_vision_search, used_before_vision_search,
-        "searching the below-threshold vector_vision index must not perform an HNSW allocation"
+        "searching the below-threshold vector_vision index must not perform an index allocation"
     );
     assert_eq!(
         vector_index_bytes("vector_vision")
             .expect("SHOW VECTOR_INDEXES must list vector_vision after its own search"),
         vision_bytes_after_maintenance,
-        "below-threshold vector_vision search must not allocate or replace its maintained graph"
+        "below-threshold vector_vision search must not allocate or replace its maintained index"
     );
     let used_before_second_wake = db.accountant().usage().used;
     db.run_maintenance_cycle()
         .expect("a second wake finds no remaining needy index");
     assert_eq!(db.accountant().usage().used, used_before_second_wake);
-    assert_eq!(
-        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_vision")),
-        Some(1),
-        "the second index receives its own maintained graph"
+    assert!(
+        db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+            "evidence",
+            "vector_vision"
+        )),
+        "the second index receives its own maintained clustered index"
     );
 }
 

@@ -289,7 +289,7 @@ fn membership_retained_and_final_free(
             && trace_provider.ordinal < token.ordinal
     );
 
-    // Six possible P buffers, B, At, Kt, An and Kn. N is parent-owned.
+    // Four possible P buffers, B, At, Kt, An and Kn. N is parent-owned.
     let mut child = [None; 11];
     let mut count = 0;
     let mut payload_bytes = 0usize;
@@ -299,9 +299,6 @@ fn membership_retained_and_final_free(
         Layout::array::<contextdb_vector::mem::VectorPartitionSearchTrace>(trace.capacities[2])
             .unwrap(),
         Layout::array::<contextdb_core::RowId>(trace.capacities[3]).unwrap(),
-        Layout::array::<contextdb_core::RowId>(trace.capacities[4]).unwrap(),
-        Layout::array::<contextdb_vector::store::VectorIndexGeneration>(trace.capacities[5])
-            .unwrap(),
     ];
     for ((payload, bytes, align), expected) in trace.allocations.into_iter().zip(payload_layouts) {
         assert_eq!((bytes, align), (expected.size(), expected.align()));

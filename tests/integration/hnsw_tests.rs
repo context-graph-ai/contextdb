@@ -117,9 +117,8 @@ fn setup_items_table(db: &Database, dimension: usize) {
 
 fn drive_hnsw_maintenance(db: &Database) {
     let index = VectorIndexRef::new("items", "embedding");
-    let expected = db.scan("items", db.snapshot()).unwrap().len();
     for _ in 0..32 {
-        if db.__debug_vector_hnsw_len(index.clone()) == Some(expected) {
+        if db.__debug_vector_indexed_available_for_test(index.clone()) {
             return;
         }
         db.run_maintenance_cycle()
@@ -174,7 +173,7 @@ fn h01_below_threshold_uses_vector_search() {
         .expect("query");
 
     assert!(explain.contains("VectorSearch"));
-    assert!(!explain.contains("HNSWSearch"));
+    assert!(!explain.contains("strategy=Indexed"));
     assert_eq!(results.len(), 5);
 
     let result_ids = results.iter().map(|r| r.0).collect::<Vec<_>>();
@@ -193,7 +192,7 @@ fn h02_at_threshold_explain_shows_hnsw_search() {
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain");
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert!(!explain.contains("VectorSearch"));
 }
 
@@ -228,8 +227,8 @@ fn h03_transition_across_threshold_switches_explain() {
         .expect("explain after");
 
     assert!(explain_before.contains("VectorSearch"));
-    assert!(!explain_before.contains("HNSWSearch"));
-    assert!(explain_after.contains("HNSWSearch"));
+    assert!(!explain_before.contains("strategy=Indexed"));
+    assert!(explain_after.contains("strategy=Indexed"));
 }
 
 #[test]
@@ -244,7 +243,7 @@ fn h04_hnsw_recall_is_at_least_ninety_five_percent() {
         .expect("explain");
     let avg_recall = measure_avg_recall(&db, &all_vectors, 10, 5_000..5_020);
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert!(avg_recall >= 0.95, "avg recall was {avg_recall}");
 }
 
@@ -264,7 +263,7 @@ fn h05_hnsw_recall_is_stable_after_reopen() {
         .expect("explain");
     let avg_recall = measure_avg_recall(&db2, &all_vectors, 10, 5_000..5_020);
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert!(avg_recall >= 0.95, "avg recall was {avg_recall}");
 }
 
@@ -307,7 +306,7 @@ fn h06_deleted_vectors_are_excluded_under_hnsw() {
         )
         .expect("query");
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert_eq!(results.len(), 10);
     for (rid, _) in &results {
         assert!(!deleted_rids.contains(rid));
@@ -375,7 +374,7 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
         )
         .expect("query");
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     for (rid, _) in &results {
         assert!(tx1_rids.contains(rid));
     }
@@ -407,7 +406,7 @@ fn h08_prefiltered_search_respects_candidate_bitmap() {
         )
         .expect("query");
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert!(results.len() <= 10);
     for (rid, _) in &results {
         assert!(candidates.contains(rid.0));
@@ -490,7 +489,7 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
         .expect("post query");
     let post_ids = post_results.iter().map(|r| r.0).collect::<HashSet<_>>();
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert_eq!(pre_ids, post_ids);
 }
 
@@ -619,7 +618,7 @@ fn h12_insert_after_hnsw_activation_is_searchable() {
         )
         .expect("query");
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, rid_new);
     assert!(results[0].1 > 0.99);
@@ -637,7 +636,7 @@ fn h13_exact_threshold_has_hnsw_and_high_recall() {
         .expect("explain");
     let avg_recall = measure_avg_recall(&db, &all_vectors, 10, 5_000..5_020);
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert!(avg_recall >= 0.95, "avg recall was {avg_recall}");
 }
 
@@ -675,7 +674,7 @@ fn h14_all_deleted_vectors_return_empty_results() {
         )
         .expect("query");
 
-    assert!(!explain.contains("HNSWSearch"));
+    assert!(!explain.contains("strategy=Indexed"));
     assert!(results.is_empty());
 }
 
@@ -743,7 +742,7 @@ fn h15_single_surviving_vector_is_returned() {
         )
         .expect("query");
 
-    assert!(!explain.contains("HNSWSearch"));
+    assert!(!explain.contains("strategy=Indexed"));
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, survivor_rid);
 }
@@ -808,7 +807,7 @@ fn h17_below_threshold_explain_stays_vector_search() {
         .expect("explain");
 
     assert!(explain.contains("VectorSearch"));
-    assert!(!explain.contains("HNSWSearch"));
+    assert!(!explain.contains("strategy=Indexed"));
 }
 
 #[test]
@@ -867,7 +866,7 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
     db.commit(tx_commit).expect("commit tx");
     let snapshot = db.snapshot();
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("strategy=Indexed"));
     assert!(
         db.point_lookup("items", "id", &Value::Uuid(uuid_commit), snapshot)
             .expect("point lookup")
@@ -975,7 +974,7 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
     let explain_pre = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain");
-    assert!(explain_pre.contains("HNSWSearch"));
+    assert!(explain_pre.contains("strategy=Indexed"));
 
     let tx2 = db.begin_or_panic();
     for i in 0..10 {
@@ -1019,7 +1018,7 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
         )
         .expect("bfs");
 
-    assert!(explain_post.contains("HNSWSearch"));
+    assert!(explain_post.contains("strategy=Indexed"));
     assert_eq!(results.len(), 10);
     assert!(row.is_some());
     assert!(bfs.nodes.iter().any(|node| node.id == all_uuids[10]));

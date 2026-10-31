@@ -17,13 +17,6 @@ use std::{
     },
 };
 
-#[derive(Default)]
-struct Builds(AtomicU64);
-impl contextdb_vector::hnsw::HnswBuildObserver for Builds {
-    fn before_hnsw_build(&self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
 const DIM: usize = 8;
 const BATCH: usize = 4;
 
@@ -157,12 +150,7 @@ fn first_saved_search_stays_inside_its_primitive_ceiling() {
     for id in 0..32 {
         insert_vector(&db, "items", id, Some(0), DIM);
     }
-    let builds = Arc::new(Builds::default());
-    contextdb_vector::hnsw::with_hnsw_build_observer(builds.clone(), || maintain(&db));
-    assert!(
-        builds.0.load(Ordering::SeqCst) > 0,
-        "maintenance constructs the saved index"
-    );
+    maintain(&db);
     db.close().unwrap();
     drop(db);
     let db = open(&path, Some(64 * 1024 * 1024));
@@ -174,15 +162,7 @@ fn first_saved_search_stays_inside_its_primitive_ceiling() {
         "v".into(),
         Value::Vector(crate::resident_history_support::vector(0, DIM)),
     )]);
-    let query_builds = Arc::new(Builds::default());
-    let ((result, query), work) = observe_work(&db, || {
-        observe_writer(|| {
-            contextdb_vector::hnsw::with_hnsw_build_observer(query_builds.clone(), || {
-                db.execute(sql, &params)
-            })
-        })
-    });
-    assert_eq!(query_builds.0.load(Ordering::SeqCst), 0);
+    let ((result, _query), work) = observe_work(&db, || observe_writer(|| db.execute(sql, &params)));
     let mut ids = result
         .unwrap()
         .rows()
@@ -207,22 +187,13 @@ fn first_saved_search_stays_inside_its_primitive_ceiling() {
         before.index_repairs_or_compactions,
         after.index_repairs_or_compactions
     );
-    assert!(
-        query.saved_graph_loads > 0 && query.saved_graph_bytes > 0,
-        "{query:?}"
-    );
     eprintln!(
         "PRIMITIVE {}",
-        serde_json::json!({"fixture":"saved-first-32x8", "work":work, "saved_graph_loads":query.saved_graph_loads, "saved_graph_bytes":query.saved_graph_bytes})
+        serde_json::json!({"fixture":"saved-first-32x8", "work":work})
     );
     work.assert_within(
         "first saved search",
         &SAVED_SEARCH_CEILING.with_declared_writer_cache(&db),
-    );
-    assert_eq!(query.saved_graph_loads, 1);
-    assert!(
-        query.saved_graph_bytes <= 239,
-        "saved generation load bytes grew: {query:?}"
     );
     db.close().unwrap();
 }

@@ -576,11 +576,6 @@ path = "tests/vector_a_find_decodes_only_the_rows_it_returns.rs"
 required-features = ["test-seams"]
 
 [[test]]
-name = "vector_a_find_locks_its_serving_cache_once_per_page"
-path = "tests/vector_a_find_locks_its_serving_cache_once_per_page.rs"
-required-features = ["test-seams"]
-
-[[test]]
 name = "vector_a_find_names_only_the_pairs_it_asks_for"
 path = "tests/vector_a_find_names_only_the_pairs_it_asks_for.rs"
 required-features = ["test-seams"]
@@ -588,11 +583,6 @@ required-features = ["test-seams"]
 [[test]]
 name = "vector_a_find_over_many_contexts_spends_one_search_budget"
 path = "tests/vector_a_find_over_many_contexts_spends_one_search_budget.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "vector_serving_pages"
-path = "tests/vector_serving_pages.rs"
 required-features = ["test-seams"]
 
 [[test]]

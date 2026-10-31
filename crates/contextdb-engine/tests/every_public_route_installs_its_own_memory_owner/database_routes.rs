@@ -8,14 +8,13 @@ use super::fixture::{
 };
 use super::{Row, call, call_unit};
 use contextdb_core::types::{ContextId, Principal, ScopeLabel};
-use contextdb_core::{Incarnation, Lsn, TenantId, Value, VectorPartitionKey};
+use contextdb_core::{Incarnation, Lsn, TenantId, Value};
 use contextdb_engine::database::{DeliveryManifest, SnapshotInspector};
 use contextdb_engine::plugin::CorePlugin;
 use contextdb_engine::sync_types::NaturalKey;
 use contextdb_engine::vector_read_memory::DeclaredReadMemory;
 use contextdb_engine::{
     Database, DatabaseOpenOptions, SemanticQuery, SinkEvent, TriggerAuditFilter,
-    VectorPartitionRef, WriterVectorSession,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -125,20 +124,6 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let (_dir, path) = Store::closed();
                 call(|| Database::open_with_options(&path, DatabaseOpenOptions::default()))
-            },
-        },
-        Row {
-            route: "contextdb_engine::Database::open_with_writer_vector_session",
-            drive: || {
-                let (_dir, path) = Store::closed();
-                let session = WriterVectorSession::default();
-                call(|| {
-                    Database::open_with_writer_vector_session(
-                        &path,
-                        DatabaseOpenOptions::default(),
-                        &session,
-                    )
-                })
             },
         },
         Row {
@@ -600,43 +585,6 @@ pub fn rows() -> Vec<Row> {
                 let row = store.row_id(1);
                 let snapshot = store.db.snapshot();
                 call(|| store.db.live_vector_entry(row, snapshot))
-            },
-        },
-        Row {
-            route: "contextdb_engine::Database::detach_writer_vector_session",
-            drive: || {
-                let (_dir, path) = Store::closed();
-                let session = WriterVectorSession::default();
-                let db = Database::open_with_writer_vector_session(
-                    &path,
-                    DatabaseOpenOptions::default(),
-                    &session,
-                )
-                .expect("fixture session open");
-                run(
-                    &db,
-                    "INSERT INTO notes (id, bucket, body, embedding) VALUES (46, 0, 'tail', [5.0, 1.0, 0.5])",
-                );
-                let route =
-                    VectorPartitionRef::new(notes_index(), VectorPartitionKey::unpartitioned());
-                call_unit(|| db.detach_writer_vector_session(&session, &route))
-            },
-        },
-        Row {
-            route: "contextdb_engine::Database::reattach_writer_vector_session",
-            drive: || {
-                let (_dir, path) = Store::closed();
-                let session = WriterVectorSession::default();
-                let db = Database::open_with_writer_vector_session(
-                    &path,
-                    DatabaseOpenOptions::default(),
-                    &session,
-                )
-                .expect("fixture session open");
-                let route =
-                    VectorPartitionRef::new(notes_index(), VectorPartitionKey::unpartitioned());
-                db.detach_writer_vector_session(&session, &route);
-                call_unit(|| db.reattach_writer_vector_session(&session))
             },
         },
         // History and change feeds.

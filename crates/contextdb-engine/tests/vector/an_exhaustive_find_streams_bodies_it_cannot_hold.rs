@@ -23,7 +23,6 @@ use contextdb_engine::{
     Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
     ReadSessionOptions, VectorSearchRoute,
 };
-use contextdb_vector::VectorPartitionRef;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
@@ -148,7 +147,7 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path) {
             .expect("inspect partition readiness");
         if ready.len() == PARTITIONS
             && ready.iter().all(|partition| {
-                db.__debug_vector_partition_indexed_for_test(
+                admin.__debug_vector_partition_indexed_for_test(
                     partition.partition.index.clone(),
                     partition.partition.partition_key.clone(),
                 )
@@ -159,6 +158,38 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path) {
         }
     }
     panic!("every partition must publish a maintained route before the read is measured");
+}
+
+/// Flip actual bytes of the partition's serving codebook, then close.
+#[cfg(unix)]
+fn damage_codebook(
+    path: &std::path::Path,
+    index: &VectorIndexRef,
+    tuple: &VectorPartitionKey,
+) {
+    use contextdb_vector::ivf::storage::PageKind;
+    let db = Database::open(path).expect("open the store to damage one index");
+    let manifest = db
+        .native_ivf_serving_descriptor_for_test(index, tuple)
+        .expect("inspect the serving descriptor")
+        .expect("the partition serves a generation")
+        .manifest;
+    let mut target = None;
+    db.with_native_ivf_read_for_test(index, tuple, |scope| {
+        scope.visit_physical_pages(&mut |page| {
+            if target.is_none()
+                && page.key.generation == manifest.generation
+                && page.key.kind == PageKind::Codebook
+            {
+                target = Some((page.storage, page.key));
+            }
+        })
+    })
+    .expect("locate the actual codebook page");
+    let (storage, key) = target.expect("the serving generation holds a codebook page");
+    db.corrupt_native_ivf_page_for_test(storage, key, true, 0, 1)
+        .expect("flip actual codebook bytes");
+    db.close().expect("close the damaged store");
 }
 
 fn statement() -> (String, HashMap<String, Value>) {
@@ -264,12 +295,8 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     // Room for everything the find needs except one partition's vectors whole.
     let budget = opened_bytes + ONE_RAW_PARTITION_BYTES / 2;
     let reader = open_reader(&path, &runtime, budget);
-    let store = reader
-        .file_vector_store_for_test()
-        .expect("a file-route reader searches its own vector store");
-    // Every graph comes back empty, so every partition is answered by comparing
-    // its rows -- the exhaustive route this proof is about.
-    let _short = store.cap_graph_candidates_for_test(&index, 0);
+    // The exhaustive route this proof is about compares every row.
+    let sql = sql.replace(" LIMIT ", " USE VECTOR EXACT LIMIT ");
     let before = reader
         .file_vector_passive_activity_for_test()
         .expect("a file-route reader reports its vector activity");
@@ -307,30 +334,24 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
         "the reader never holds more than it declared: peak {peak} against {budget}",
     );
 
-    drop(_short);
     drop(reader);
-    let damaged = VectorPartitionRef::new(
-        index,
-        VectorPartitionKey::from_values(&[
+    damage_codebook(
+        &path,
+        &index,
+        &VectorPartitionKey::from_values(&[
             Value::Uuid(context_id(0)),
             Value::Uuid(generation_id(0)),
         ])
         .expect("the damaged partition has one canonical key"),
     );
-    Database::__corrupt_vector_partition_saved_graph_for_test(&path, &damaged)
-        .expect("flip one byte in a saved graph without changing any row body");
     let damaged_reader = open_reader(&path, &runtime, budget);
-    let exact_sql = sql.replace(" LIMIT ", " USE VECTOR EXACT LIMIT ");
     let exact = damaged_reader
-        .execute(&exact_sql, &params)
+        .execute(&sql, &params)
         .expect("EXACT reads authoritative bodies when a graph is damaged");
     assert_eq!(ids(&exact.rows()), oracle);
-    let damaged_store = damaged_reader
-        .file_vector_store_for_test()
-        .expect("the damaged reader still has a vector store");
-    let _short = damaged_store.cap_graph_candidates_for_test(&damaged.index, 0);
+    let auto_sql = sql.replace(" USE VECTOR EXACT ", " ");
     let auto = damaged_reader
-        .execute(&sql, &params)
+        .execute(&auto_sql, &params)
         .expect("AUTO can compare authoritative bodies after graph damage");
     assert_eq!(ids(&auto.rows()), oracle);
     assert_eq!(
@@ -339,6 +360,6 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
             .as_ref()
             .and_then(|search| search.route),
         Some(VectorSearchRoute::Exact),
-        "the damaged graph cannot provide an exact fallback answer"
+        "the damaged index cannot serve, so AUTO compares the authoritative bodies"
     );
 }

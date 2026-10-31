@@ -355,7 +355,7 @@ fn an_explained_statement_survives_the_wire() {
     });
     survives_the_wire(&MetadataBody::Explain {
         sql: "SELECT id FROM documents ORDER BY embedding <=> $query LIMIT 2".to_owned(),
-        physical_plan: "Project -> HNSWSearch".to_owned(),
+        physical_plan: "Project -> VectorSearch".to_owned(),
         index: None,
         vector_search: Some(VectorSearchDisclosure {
             route_evidence: VectorSearchRouteEvidence::PassivePrediction,
@@ -364,12 +364,6 @@ fn an_explained_statement_survives_the_wire() {
             aggregate_allowed_vectors: Some(1_024),
             effective_auto_index_at: 1_000,
             auto_index_at_source: "declared".to_owned(),
-            effective_flat_below: 0,
-            flat_below_source: "compatibility_profile".to_owned(),
-            effective_search_radius_millionths: 20_000,
-            search_radius_source: "compatibility_profile".into(),
-            effective_auto_expansion_ceiling: 25,
-            auto_expansion_ceiling_source: "compatibility_profile".into(),
             partition_key_columns: vec!["scope_id".to_owned()],
             scope: VectorSearchScopeShape::Few,
             route: Some(VectorSearchRoute::FilteredIndexed),
@@ -387,11 +381,16 @@ fn an_explained_statement_survives_the_wire() {
             rescore_evaluations: None,
             layers_admitted: None,
             budget_terminal: None,
-            partition_hnsw: vec![VectorPartitionDisclosure {
+            partitions: vec![VectorPartitionDisclosure {
                 partition: "<redacted:1>".to_owned(),
                 route: Some(VectorSearchRoute::FilteredIndexed),
                 reason: Some("predicted_indexed_route".to_owned()),
-                ef_search_source: "declared".to_owned(),
+                lists: None,
+            lists_source: None,
+            probes: None,
+            probes_source: None,
+            refine_factor_hundredths: None,
+            refine_factor_source: None,
                 policy_revision: 7,
             }],
         }),

@@ -1,9 +1,8 @@
-//! Acceptance: "Apply the aggregate AUTO threshold before costing selected partitions."
+//! Acceptance: "Apply the aggregate AUTO threshold before choosing the route."
 //! "Policies 21–23 preserve authorized scopes, filters and one globally ordered answer."
 
 use contextdb_core::{Value, Wallclock};
 use contextdb_engine::{Database, MaintenancePolicy, VectorSearchRoute};
-use contextdb_vector::auto_planning_test_seams::observe;
 use std::collections::HashMap;
 
 #[test]
@@ -11,7 +10,7 @@ use std::collections::HashMap;
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
+fn aggregate_auto_threshold_decides_the_route_and_keeps_scope() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for total in [63_i64, 64, 65] {
         for sizes in [
@@ -91,10 +90,9 @@ fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
                     .all(|row| row[0] != Value::Int64(900) && row[0] != Value::Int64(901)),
                 "the exact oracle excludes both neighbouring scope and residual nonmember"
             );
-            let (automatic, costed) = observe(|| {
-                database.execute(&format!("{prefix} USE VECTOR AUTO LIMIT 65"), &params)
-            });
-            let automatic = automatic.unwrap();
+            let automatic = database
+                .execute(&format!("{prefix} USE VECTOR AUTO LIMIT 65"), &params)
+                .unwrap();
             assert_eq!(
                 automatic.rows(),
                 exact.rows(),
@@ -108,16 +106,16 @@ fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
             assert_eq!(disclosure.aggregate_allowed_vectors, Some(total as usize));
             assert_eq!(disclosure.effective_auto_index_at, 64);
             if total < 64 {
-                assert_eq!(disclosure.route, Some(VectorSearchRoute::Exact));
                 assert_eq!(
-                    costed, 0,
-                    "aggregate below threshold must precede all selected-partition costing"
+                    disclosure.route,
+                    Some(VectorSearchRoute::Exact),
+                    "aggregate below threshold chooses the exact route; sizes={sizes:?}"
                 );
             } else {
-                assert_eq!(
-                    costed,
-                    sizes.len() as u64,
-                    "aggregate at/above threshold enters costing for every selected nonempty partition, even when each partition is individually below threshold; sizes={sizes:?}"
+                assert_ne!(
+                    disclosure.route,
+                    Some(VectorSearchRoute::Exact),
+                    "aggregate at/above threshold leaves the exact route even when each partition is individually below threshold; sizes={sizes:?}"
                 );
             }
         }

@@ -6973,6 +6973,76 @@ fn concurrent_distinct_table_sql_updates_yield_correct_vector_recall() {
 }
 
 #[cfg(feature = "test-seams")]
+struct PauseNativeBuild {
+    index: VectorIndexRef,
+    reached: mpsc::Sender<()>,
+    release: std::sync::Mutex<mpsc::Receiver<()>>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-seams")]
+impl contextdb_engine::vector_ivf_observations::NativeIvfSealObserver for PauseNativeBuild {
+    fn observe(&self, _event: contextdb_engine::vector_ivf_observations::NativeIvfSealEvent<'_>) {}
+
+    fn before_boundary(
+        &self,
+        boundary: contextdb_engine::vector_ivf_observations::NativeIvfFaultBoundary<'_>,
+    ) -> contextdb_core::Result<()> {
+        if let contextdb_engine::vector_ivf_observations::NativeIvfFaultBoundary::BeforeScopeWrite {
+            scope,
+            ..
+        } = boundary
+        {
+            if *scope.index == self.index && self.armed.swap(false, Ordering::SeqCst) {
+                self.reached.send(()).unwrap();
+                let _ = self.release.lock().unwrap().recv();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A maintenance cycle held inside the clustered build of one index, at the
+/// first native scope write, until `release` is sent.
+#[cfg(feature = "test-seams")]
+struct PausedNativeBuild {
+    release: mpsc::Sender<()>,
+    done: mpsc::Receiver<contextdb_core::Result<contextdb_engine::MaintenanceReport>>,
+}
+
+#[cfg(feature = "test-seams")]
+fn pause_native_build(db: &Arc<Database>, index: &VectorIndexRef) -> PausedNativeBuild {
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let pause = Arc::new(PauseNativeBuild {
+        index: index.clone(),
+        reached: reached_tx,
+        release: std::sync::Mutex::new(release_rx),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let db = db.clone();
+    thread::spawn(move || {
+        done_tx
+            .send(
+                contextdb_engine::vector_ivf_observations::with_native_ivf_seal_observer_for_test(
+                    pause,
+                    || db.run_maintenance_cycle(),
+                ),
+            )
+            .unwrap();
+    });
+    assert!(
+        reached_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok(),
+        "the maintenance cycle reaches the clustered build of the paused index"
+    );
+    PausedNativeBuild {
+        release: release_tx,
+        done: done_rx,
+    }
+}
+
+#[cfg(feature = "test-seams")]
 #[test]
 fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
     let db = Arc::new(Database::open_memory());
@@ -6980,19 +7050,7 @@ fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
     let ids = seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
     let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
-    let vector_store = db.vector_store_for_test();
-    let text_partition = contextdb_vector::VectorPartitionRef::new(
-        text_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let text_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
-    let (done_text_tx, done_text_rx) = mpsc::channel();
-    let db_text = db.clone();
-    thread::spawn(move || {
-        done_text_tx.send(db_text.run_maintenance_cycle()).unwrap();
-    });
-    assert!(text_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let text_build = pause_native_build(&db, &text_ref);
 
     let target_id = ids[3];
     let (done_vision_tx, done_vision_rx) = mpsc::channel();
@@ -7017,10 +7075,12 @@ fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
             .unwrap();
     });
     let vision_first = done_vision_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
-    let vision_hnsw_before_release = vector_store.has_hnsw_index_for(&vision_ref);
-    let text_still_paused = done_text_rx.try_recv();
-    text_pause.release();
-    done_text_rx
+    let vision_indexed_before_release =
+        db.__debug_vector_indexed_available_for_test(vision_ref.clone());
+    let text_still_paused = text_build.done.try_recv();
+    text_build.release.send(()).unwrap();
+    text_build
+        .done
         .recv_timeout(PER_INDEX_SQL_TIMEOUT)
         .unwrap()
         .unwrap();
@@ -7031,43 +7091,26 @@ fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
 
     assert_eq!(vision_id, target_id);
     assert!(
-        !vision_hnsw_before_release,
-        "the concurrent query must not build the sibling graph"
+        !vision_indexed_before_release,
+        "the concurrent query must not build the sibling index"
     );
     assert!(matches!(text_still_paused, Err(TryRecvError::Empty)));
-    assert!(vector_store.has_hnsw_index_for(&text_ref));
+    assert!(db.__debug_vector_indexed_available_for_test(text_ref));
     assert!(
-        vector_store.has_hnsw_index_for(&vision_ref),
-        "after the paused text build resumes, the same wake services the needy sibling graph"
+        db.__debug_vector_indexed_available_for_test(vision_ref),
+        "after the paused text build resumes, the same wake services the needy sibling index"
     );
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() {
-    use contextdb_vector::test_seam::PauseWindow;
-
     let db = Arc::new(Database::open_memory());
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
-    let vector_store = db.vector_store_for_test();
-    let text_partition = contextdb_vector::VectorPartitionRef::new(
-        text_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let build_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
-    let (done_build_tx, done_build_rx) = mpsc::channel();
-    let db_build = db.clone();
-    thread::spawn(move || {
-        done_build_tx
-            .send(db_build.run_maintenance_cycle())
-            .unwrap();
-    });
-    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let text_build = pause_native_build(&db, &text_ref);
 
-    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Ddl);
     let (started_drop_tx, started_drop_rx) = mpsc::channel();
     let (done_drop_tx, done_drop_rx) = mpsc::channel();
     let db_drop = db.clone();
@@ -7077,27 +7120,13 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
         done_drop_tx.send(result).unwrap();
     });
     assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
-    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    build_pause.release();
-    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     // Table-changing SQL cannot retire a vector state while maintenance owns
-    // that same state. It reaches the DDL pause only after maintenance exits.
-    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
-    let mut index_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-        db.declared_reader_memory()
-            .expect("admit the index observation reader"),
-    );
-
-    let ref_present_during_pause = vector_store
-        .index_infos(&mut index_observation_owner_1)
-        .expect("inspect the declared vector indexes")
-        .iter()
-        .any(|info| info.index == text_ref);
+    // that same state.
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    ddl_pause.release();
+    text_build.release.send(()).unwrap();
+    let build_result = text_build.done.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
-    assert!(ref_present_during_pause);
     assert!(
         db.execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
             .is_err()
@@ -7108,36 +7137,19 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
         per_index_top_id(&db, "evidence", "vector_vision", per_index_axis3(1)),
         Uuid::from_u128(10_000)
     );
-    assert!(!vector_store.has_hnsw_index_for(&text_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(text_ref));
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() {
-    use contextdb_vector::test_seam::PauseWindow;
-
     let db = Arc::new(Database::open_memory());
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let old_ref = VectorIndexRef::new("evidence", "vector_text");
     let new_ref = VectorIndexRef::new("evidence", "vector_text_v2");
-    let vector_store = db.vector_store_for_test();
-    let old_partition = contextdb_vector::VectorPartitionRef::new(
-        old_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let build_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&old_partition, PER_INDEX_SQL_ROWS);
-    let (done_build_tx, done_build_rx) = mpsc::channel();
-    let db_build = db.clone();
-    thread::spawn(move || {
-        done_build_tx
-            .send(db_build.run_maintenance_cycle())
-            .unwrap();
-    });
-    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let old_build = pause_native_build(&db, &old_ref);
 
-    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&old_ref, PauseWindow::Ddl);
     let (started_rename_tx, started_rename_rx) = mpsc::channel();
     let (done_rename_tx, done_rename_rx) = mpsc::channel();
     let db_rename = db.clone();
@@ -7158,29 +7170,10 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
         done_rename_rx.try_recv(),
         Err(TryRecvError::Empty)
     ));
-    build_pause.release();
-    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
-    // The rename cannot enter this DDL pause until the maintenance-owned
-    // traversal releases the old vector state.
-    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
-    let mut index_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
-        db.declared_reader_memory()
-            .expect("admit the index observation reader"),
-    );
-
-    let old_ref_present_during_pause = vector_store
-        .index_infos(&mut index_observation_owner_2)
-        .expect("inspect the declared vector indexes")
-        .iter()
-        .any(|info| info.index == old_ref);
-    assert!(matches!(
-        done_rename_rx.try_recv(),
-        Err(TryRecvError::Empty)
-    ));
-    ddl_pause.release();
+    old_build.release.send(()).unwrap();
+    let build_result = old_build.done.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let rename_result = done_rename_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
-    assert!(old_ref_present_during_pause);
     assert!(
         db.execute(
             "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
@@ -7194,8 +7187,8 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
         per_index_top_id(&db, "evidence", "vector_text_v2", per_index_axis3(0)),
         Uuid::from_u128(10_000)
     );
-    assert!(!vector_store.has_hnsw_index_for(&old_ref));
-    assert!(vector_store.has_hnsw_index_for(&new_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(old_ref));
+    assert!(db.__debug_vector_indexed_available_for_test(new_ref));
 }
 
 #[test]
@@ -8540,31 +8533,13 @@ fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() 
 #[cfg(feature = "test-seams")]
 #[test]
 fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
-    use contextdb_vector::test_seam::PauseWindow;
-
     let db = Arc::new(Database::open_memory());
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
     let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
-    let table_ref = VectorIndexRef::new("evidence", "*");
-    let vector_store = db.vector_store_for_test();
-    let text_partition = contextdb_vector::VectorPartitionRef::new(
-        text_ref.clone(),
-        contextdb_core::VectorPartitionKey::unpartitioned(),
-    );
-    let build_pause =
-        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
-    let (done_build_tx, done_build_rx) = mpsc::channel();
-    let db_build = db.clone();
-    thread::spawn(move || {
-        done_build_tx
-            .send(db_build.run_maintenance_cycle())
-            .unwrap();
-    });
-    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let text_build = pause_native_build(&db, &text_ref);
 
-    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&table_ref, PauseWindow::Ddl);
     let (started_drop_tx, started_drop_rx) = mpsc::channel();
     let (done_drop_tx, done_drop_rx) = mpsc::channel();
     let db_drop = db.clone();
@@ -8574,15 +8549,11 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
         done_drop_tx.send(result).unwrap();
     });
     assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
-    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    build_pause.release();
-    let _ = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     // DROP TABLE cannot retire a vector state while maintenance owns that
-    // same state. The table-level DDL pause is reachable only after the
-    // maintenance batch releases it; no query is allowed to start the build.
-    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    // same state; no query is allowed to start the build.
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    ddl_pause.release();
+    text_build.release.send(()).unwrap();
+    let _ = text_build.done.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
     drop_result.unwrap().unwrap();
@@ -8590,8 +8561,8 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
         db.execute("SELECT id FROM evidence LIMIT 1", &empty())
             .is_err()
     );
-    assert!(!vector_store.has_hnsw_index_for(&text_ref));
-    assert!(!vector_store.has_hnsw_index_for(&vision_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(text_ref));
+    assert!(!db.__debug_vector_indexed_available_for_test(vision_ref));
 }
 
 // ============================================================
@@ -8664,7 +8635,19 @@ fn prv_seed_docs(db: &Database) -> PrvFixture {
     f
 }
 
-fn prv_seed_hnsw_docs(db: &Database, rows: usize) -> PrvFixture {
+fn prv_used_indexed_route(result: &contextdb_engine::QueryResult) -> bool {
+    result.trace().vector_search.as_ref().is_some_and(|disclosure| {
+        matches!(
+            disclosure.route,
+            Some(
+                contextdb_engine::VectorSearchRoute::Indexed
+                    | contextdb_engine::VectorSearchRoute::FilteredIndexed
+            )
+        )
+    })
+}
+
+fn prv_seed_indexed_docs(db: &Database, rows: usize) -> PrvFixture {
     let f = prv_seed_docs(db);
     for idx in 4..rows {
         let id = Uuid::from_u128(0x7200_0000_0000_0000_0000_0000_0000_0000 + idx as u128);
@@ -8672,7 +8655,7 @@ fn prv_seed_hnsw_docs(db: &Database, rows: usize) -> PrvFixture {
         prv_insert_doc(
             db,
             id,
-            &format!("hnsw-{idx}"),
+            &format!("indexed-{idx}"),
             vec![
                 angle.sin().abs(),
                 angle.cos().abs(),
@@ -9202,36 +9185,36 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 
-    let hnsw_db = Database::open_memory();
-    let hnsw_f = prv_seed_hnsw_docs(&hnsw_db, 1024);
+    let indexed_db = Database::open_memory();
+    let indexed_f = prv_seed_indexed_docs(&indexed_db, 1024);
     // The query's explain reports the actual route per partition. The first
-    // maintained graph for a column is built only by a maintenance cycle
+    // maintained index for a column is built only by a maintenance cycle
     // (`docs/query-language.md` INDEXED section); before one
-    // runs, AUTO's exact fallback is truthfully labelled exact, not HNSW. Drive one cycle so
-    // this fixture's 1,024-row partition has a maintained graph before asserting the HNSW
-    // label below.
-    hnsw_db.run_maintenance_cycle().unwrap();
-    let hnsw_literal = hnsw_db
+    // runs, AUTO's exact fallback is truthfully labelled exact, not indexed. Drive one cycle so
+    // this fixture's 1,024-row partition has a maintained index before asserting the indexed
+    // route below.
+    indexed_db.run_maintenance_cycle().unwrap();
+    let indexed_literal = indexed_db
         .execute(
             &prv_literal_query(""),
-            &params(vec![("query", Value::Vector(hnsw_f.source_vec.clone()))]),
+            &params(vec![("query", Value::Vector(indexed_f.source_vec.clone()))]),
         )
         .unwrap();
     assert!(
-        hnsw_literal.trace().physical_plan.contains("HNSWSearch"),
-        "literal-vector HNSW oracle must use the HNSW path, got {:?}",
-        hnsw_literal.trace()
+        prv_used_indexed_route(&indexed_literal),
+        "literal-vector indexed oracle must use the indexed path, got {:?}",
+        indexed_literal.trace()
     );
-    let hnsw_persisted = prv_expect_query_ok(
-        hnsw_db.execute(
+    let indexed_persisted = prv_expect_query_ok(
+        indexed_db.execute(
             &prv_row_vector_query(""),
-            &params(vec![("query_id", Value::Uuid(hnsw_f.source))]),
+            &params(vec![("query_id", Value::Uuid(indexed_f.source))]),
         ),
-        "persisted row vector HNSW parity query",
+        "persisted row vector indexed parity query",
     );
-    prv_assert_same_signature(&hnsw_literal, &hnsw_persisted);
+    prv_assert_same_signature(&indexed_literal, &indexed_persisted);
     assert_eq!(
-        hnsw_persisted.trace().query_vector_source,
+        indexed_persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 }
@@ -9269,8 +9252,7 @@ fn prv_05_row_vector_query_respects_candidate_filter() {
     assert_eq!(result.rows().len(), 1);
     assert_eq!(prv_uuid_at(&result, 0, "id"), f.mid);
     assert!(
-        result.trace().physical_plan.contains("VectorSearch")
-            || result.trace().physical_plan.contains("HNSWSearch"),
+        result.trace().physical_plan.contains("VectorSearch"),
         "trace must show candidate plan feeding vector search, got {:?}",
         result.trace()
     );
@@ -9604,7 +9586,7 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     });
     let db = Database::open_memory_with_plugin(counters.clone()).unwrap();
     db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-    let f = prv_seed_hnsw_docs(&db, 1024);
+    let f = prv_seed_indexed_docs(&db, 1024);
     db.execute("CREATE TRIGGER prv08_tr ON docs WHEN UPDATE", &empty())
         .unwrap();
     db.execute(
@@ -9629,12 +9611,11 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     db.complete_initialization().unwrap();
     let index = VectorIndexRef::new("docs", "embedding");
     db.run_maintenance_cycle()
-        .expect("caller-driven maintenance builds the graph before the read-only probe");
-    let before_hnsw_len = db.__debug_vector_hnsw_len(index.clone());
-    let before_hnsw_stats = db.__debug_vector_hnsw_stats(index.clone());
+        .expect("caller-driven maintenance builds the index before the read-only probe");
+    let before_index_generation = db.__debug_vector_index_generation_for_test(index.clone());
     assert!(
-        before_hnsw_len.is_some() && before_hnsw_stats.is_some(),
-        "read-only probe must exercise an already-built HNSW graph"
+        before_index_generation.is_some() && db.__debug_vector_indexed_available_for_test(index.clone()),
+        "read-only probe must exercise an already-built clustered index"
     );
     let sink_deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sink_deliveries_for_callback = sink_deliveries.clone();
@@ -9673,8 +9654,11 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     assert_eq!(db.committed_watermark(), before_watermark);
     assert_eq!(db.current_lsn(), before_lsn);
     assert_eq!(db.sink_metrics("prv08_sink"), before_sink);
-    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), before_hnsw_len);
-    assert_eq!(db.__debug_vector_hnsw_stats(index), before_hnsw_stats);
+    assert_eq!(
+        db.__debug_vector_index_generation_for_test(index),
+        before_index_generation,
+        "the read-only probe publishes no new index generation"
+    );
     assert!(
         db.changes_since(before_lsn)
             .expect("read the declared changes")
@@ -9723,7 +9707,7 @@ fn prv_09_existing_literal_and_parameter_cosine_distance_unchanged() {
 }
 
 #[test]
-fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
+fn prv_10_row_vector_composes_with_use_rank_and_emits_indexed_route_when_active() {
     let small_db = Database::open_memory();
     let small_f = prv_seed_rank_policy_docs(&small_db, 4);
     let small_literal = small_db
@@ -9733,9 +9717,8 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
         )
         .unwrap();
     assert!(
-        small_literal.trace().physical_plan.contains("VectorSearch")
-            && !small_literal.trace().physical_plan.contains("HNSWSearch"),
-        "small literal USE RANK query must exercise the non-HNSW path, got {:?}",
+        small_literal.trace().physical_plan.contains("VectorSearch"),
+        "small literal USE RANK query must exercise the non-indexed path, got {:?}",
         small_literal.trace()
     );
     let small_persisted = prv_expect_query_ok(
@@ -9754,10 +9737,10 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
     let db = Database::open_memory();
     let f = prv_seed_rank_policy_docs(&db, 1024);
     // The query's explain reports the actual route per partition. The first
-    // maintained graph for a column is built only by a maintenance cycle
-    // (`docs/query-language.md` INDEXED section), so drive one before asserting the HNSW label.
+    // maintained index for a column is built only by a maintenance cycle
+    // (`docs/query-language.md` INDEXED section), so drive one before asserting the indexed route.
     // AUTO may still truthfully compare a small three-dimensional layout exactly when that is
-    // cheaper than a graph walk, so the large queries ask for the maintained route with
+    // cheaper than an index walk, so the large queries ask for the maintained route with
     // `USE VECTOR INDEXED`, placed after the vector ordering and before `USE RANK`.
     db.run_maintenance_cycle().unwrap();
     let literal = db
@@ -9767,8 +9750,8 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
         )
         .unwrap();
     assert!(
-        literal.trace().physical_plan.contains("HNSWSearch"),
-        "literal USE RANK query must report actual HNSW path before ROW_VECTOR parity is accepted, got {:?}",
+        prv_used_indexed_route(&literal),
+        "literal USE RANK query must report the actual indexed route before ROW_VECTOR parity is accepted, got {:?}",
         literal.trace()
     );
     let persisted = prv_expect_query_ok(
@@ -9780,8 +9763,8 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
     );
     prv_assert_same_signature(&literal, &persisted);
     assert!(
-        persisted.trace().physical_plan.contains("HNSWSearch"),
-        "persisted USE RANK query must report actual HNSW path, got {:?}",
+        prv_used_indexed_route(&persisted),
+        "persisted USE RANK query must report the actual indexed route, got {:?}",
         persisted.trace()
     );
     assert_eq!(
@@ -10355,11 +10338,11 @@ fn prv_26_row_vector_use_rank_overfetch_includes_active_tx_vector_inserts() {
 
 #[test]
 #[cfg(feature = "test-seams")]
-fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
+fn prv_27_row_vector_explain_does_not_materialize_the_index() {
     let db = Database::open_memory();
-    let f = prv_seed_hnsw_docs(&db, 1000);
+    let f = prv_seed_indexed_docs(&db, 1000);
     let index = VectorIndexRef::new("docs", "embedding");
-    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), None);
+    assert!(!db.__debug_vector_indexed_available_for_test(index.clone()));
 
     let explain = db
         .explain(&format!(
@@ -10368,14 +10351,11 @@ fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
         ))
         .unwrap();
     assert!(
-        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
-        "EXPLAIN must still describe the vector operator without building HNSW: {explain}"
+        explain.contains("VectorSearch"),
+        "EXPLAIN must still describe the vector operator without building the index: {explain}"
     );
-    assert_eq!(
-        db.__debug_vector_hnsw_len(index),
-        None,
-        "EXPLAIN must be read-only and must not lazily materialize HNSW state"
-    );
+    assert!(!db.__debug_vector_indexed_available_for_test(index),
+        "EXPLAIN must be read-only and must not lazily materialize the clustered index");
 }
 
 #[test]
@@ -10383,9 +10363,9 @@ fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
 fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building() {
     let covering_db = Database::open_memory();
     covering_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-    let f = prv_seed_hnsw_docs(&covering_db, 1000);
+    let f = prv_seed_indexed_docs(&covering_db, 1000);
     let index = VectorIndexRef::new("docs", "embedding");
-    assert_eq!(covering_db.__debug_vector_hnsw_len(index.clone()), None);
+    assert!(!covering_db.__debug_vector_indexed_available_for_test(index.clone()));
 
     let covering_explain = covering_db
         .explain(
@@ -10398,13 +10378,10 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
             && covering_explain.contains("strategy=BruteForce")
             && covering_explain.contains("route=exact")
             && covering_explain.contains("fallback=filtered_route_exact"),
-        "filtered EXPLAIN must describe the read-only exact fallback without inventing a graph: {covering_explain}"
+        "filtered EXPLAIN must describe the read-only exact fallback without inventing an index: {covering_explain}"
     );
-    assert_eq!(
-        covering_db.__debug_vector_hnsw_len(index.clone()),
-        None,
-        "covering EXPLAIN must derive strategy without building HNSW"
-    );
+    assert!(!covering_db.__debug_vector_indexed_available_for_test(index.clone()),
+        "covering EXPLAIN must derive strategy without building the index");
 
     let covering_result = covering_db
         .execute(
@@ -10417,9 +10394,8 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         covering_result
             .trace()
             .physical_plan
-            .contains("VectorSearch")
-            && !covering_result.trace().physical_plan.contains("HNSWSearch"),
-        "a query cannot build HNSW and must use the same exact fallback EXPLAIN predicted: {:?}",
+            .contains("VectorSearch"),
+        "a query cannot build the index and must use the same exact fallback EXPLAIN predicted: {:?}",
         covering_result.trace().physical_plan
     );
     assert!(
@@ -10432,12 +10408,9 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
 
     let fallback_db = Database::open_memory();
     fallback_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
-    let fallback = prv_seed_hnsw_docs(&fallback_db, 5001);
+    let fallback = prv_seed_indexed_docs(&fallback_db, 5001);
     let fallback_index = VectorIndexRef::new("docs", "embedding");
-    assert_eq!(
-        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
-        None
-    );
+    assert!(!fallback_db.__debug_vector_indexed_available_for_test(fallback_index.clone()));
 
     let fallback_explain = fallback_db
         .explain(
@@ -10448,13 +10421,10 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
     assert!(
         fallback_explain.contains("VectorSearch")
             && fallback_explain.contains("strategy=BruteForce"),
-        "filtered EXPLAIN must match runtime fallback when the effective search width cannot cover the graph: {fallback_explain}"
+        "filtered EXPLAIN must match runtime fallback when the effective search width cannot cover the index: {fallback_explain}"
     );
-    assert_eq!(
-        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
-        None,
-        "fallback EXPLAIN must not build HNSW"
-    );
+    assert!(!fallback_db.__debug_vector_indexed_available_for_test(fallback_index.clone()),
+        "fallback EXPLAIN must not build the index");
 
     let fallback_result = fallback_db
         .execute(
@@ -10467,9 +10437,8 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         fallback_result
             .trace()
             .physical_plan
-            .contains("VectorSearch")
-            && !fallback_result.trace().physical_plan.contains("HNSWSearch"),
-        "a caller-driven query cannot build HNSW and must use the exact fallback: {:?}",
+            .contains("VectorSearch"),
+        "a caller-driven query cannot build the index and must use the exact fallback: {:?}",
         fallback_result.trace().physical_plan
     );
     assert!(
@@ -10581,7 +10550,7 @@ fn prv_14_row_vector_query_renders_in_explain_without_vector_bytes() {
     }
     let explain = explain_result.unwrap();
     assert!(
-        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
+        explain.contains("VectorSearch"),
         "EXPLAIN must render the selected vector path, got {explain}"
     );
     assert!(explain.contains("docs"));

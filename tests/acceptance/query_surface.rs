@@ -1198,10 +1198,10 @@ fn f113_explain_shows_graph_bfs_operator_for_graph_traversal() {
     assert!(explain.contains("GraphBfs"));
 }
 
-/// I inserted 1000+ vectors and ran EXPLAIN on a vector query, and the plan showed HNSWSearch instead of brute-force.
+/// I inserted 1000+ vectors and ran EXPLAIN on a vector query, and the plan showed the vector search operator instead of brute-force.
 #[test]
 #[cfg(feature = "test-seams")]
-fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
+fn f114_explain_shows_vector_search_operator_for_vector_ann_query() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
@@ -1213,27 +1213,22 @@ fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
         insert_embedding(&db, Uuid::new_v4(), vec![1.0, 0.0, 0.0]);
     }
     for _ in 0..32 {
-        if db.__debug_vector_hnsw_len(contextdb_core::VectorIndexRef::new(
+        if db.__debug_vector_indexed_available_for_test(contextdb_core::VectorIndexRef::new(
             "embeddings",
             "embedding",
-        )) == Some(1_000)
-        {
+        )) {
             break;
         }
         db.run_maintenance_cycle()
             .expect("one finite caller-driven maintenance cycle succeeds");
     }
-    assert_eq!(
-        db.__debug_vector_hnsw_len(contextdb_core::VectorIndexRef::new(
-            "embeddings",
-            "embedding",
-        )),
-        Some(1_000)
-    );
+    assert!(db.__debug_vector_indexed_available_for_test(
+        contextdb_core::VectorIndexRef::new("embeddings", "embedding",)
+    ));
     let explain = db
         .explain("SELECT * FROM embeddings ORDER BY embedding <=> $query LIMIT 10")
         .expect("vector explain");
-    assert!(explain.contains("HNSWSearch"));
+    assert!(explain.contains("VectorSearch("));
 }
 
 /// I subscribed to a table and inserted a row, and the subscription fired.
