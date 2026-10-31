@@ -393,11 +393,7 @@ fn detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges() 
         );
         drop(state);
         let released = store
-            .prune_row_ids(
-                &HashSet::from([RowId(1)]),
-                budget.as_ref(),
-                &mut executing_admission,
-            )
+            .prune_row_ids(&HashSet::from([RowId(1)]), &mut executing_admission)
             .unwrap();
         budget.release(released);
         assert_eq!(store.raw_payload_bytes.load(Ordering::SeqCst), body_bytes);

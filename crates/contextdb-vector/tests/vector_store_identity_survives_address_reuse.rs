@@ -19,8 +19,8 @@
 use contextdb_core::{VectorIndexRef, VectorQuantization};
 use contextdb_vector::{MemoryBudget, VectorStore};
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Default)]
 struct FixtureColumnOwner {
@@ -61,7 +61,7 @@ fn a_thousand_stores_built_and_dropped_in_turn_each_carry_a_different_identity()
     let declared_column_owner = Arc::new(FixtureColumnOwner::default());
 
     for ordinal in 0..STORES {
-        let store = VectorStore::new(Arc::new(OnceLock::new()));
+        let store = VectorStore::new();
         // Registering takes the index's maintenance lock and pushes this
         // store onto the thread's held-locks stack, then gives both back --
         // the traffic the guards are about.
@@ -102,8 +102,8 @@ fn a_thousand_stores_built_and_dropped_in_turn_each_carry_a_different_identity()
     // its own lock: if a name left behind by a dropped store were handed to a
     // live one, this is where a lock held by the first would be mistaken for
     // one held by the second.
-    let first = VectorStore::new(Arc::new(OnceLock::new()));
-    let second = VectorStore::new(Arc::new(OnceLock::new()));
+    let first = VectorStore::new();
+    let second = VectorStore::new();
     let shared = VectorIndexRef::new("docs", "embedding");
     first
         .register_index(

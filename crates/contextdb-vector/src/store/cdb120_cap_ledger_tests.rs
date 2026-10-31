@@ -178,12 +178,11 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Pretend a saved graph covers everything through `covered`, so no
-    /// pending tombstone keeps the cap-time sweep away from the route.
-    fn cover(&self, k: u64, covered: u64) {
-        let state = self.state(k);
-        state.inspection_generation_id.store(1, Ordering::SeqCst);
-        state.inspection_base_tx.store(covered, Ordering::SeqCst);
+    /// Settle route `k`'s pending durability marks, so no pending tombstone
+    /// keeps the cap-time sweep away from the route (the sweep has no
+    /// authority to discard an untouched route's pending repair work).
+    fn settle(&self, k: u64) {
+        *self.state(k).pending_marks.lock() = ResidentPendingMarks::default();
     }
 }
 
@@ -270,7 +269,7 @@ fn cdb120_ledger_equals_a_recount_after_every_kind_of_publication() {
 
     let retired = f
         .store
-        .retire_snapshot_free_partition_states(&[], f.budget.as_ref(), &mut f.admission())
+        .retire_snapshot_free_partition_states(&[], &mut f.admission())
         .unwrap();
     assert!(retired >= 1, "the unheld emptied route retires");
     let audit = f.audit("retirement to historical-only");
@@ -304,7 +303,7 @@ fn make_historical(f: &mut Fixture) {
             f.delete(k, row_of(k), TxId(2), 1, &[]);
         }
         f.store
-            .retire_snapshot_free_partition_states(&[], f.budget.as_ref(), &mut f.admission())
+            .retire_snapshot_free_partition_states(&[], &mut f.admission())
             .unwrap();
         assert!(
             f.state(wave).is_historical_only(),
@@ -332,13 +331,13 @@ fn edge_fixture(with_reclaimable: bool, extra_history: u64) -> Fixture {
         for n in 0..=extra_history {
             f.delete(30, 500_000 + n, TxId(11), 10, &[SnapshotId(10)]);
         }
-        f.cover(30, 15);
+        f.settle(30);
     }
     for k in (10..13).chain(20..22) {
         f.delete(k, row_of(k), TxId(15), 10, &[HOLD]);
     }
     for k in 10..13 {
-        f.cover(k, 15);
+        f.settle(k);
     }
     f
 }
@@ -460,7 +459,7 @@ fn cdb120_edge_confirms_a_candidate_with_one_probe_however_long_its_first_rows_p
             f.delete(1_000 + h, SHARED_ROW, TxId(tx + 1), tx, &[]);
             tx += 2;
             f.store
-                .retire_snapshot_free_partition_states(&[], f.budget.as_ref(), &mut f.admission())
+                .retire_snapshot_free_partition_states(&[], &mut f.admission())
                 .unwrap();
         }
         assert_eq!(f.audit("history routes retired").occupied, 0);
@@ -477,7 +476,7 @@ fn cdb120_edge_confirms_a_candidate_with_one_probe_however_long_its_first_rows_p
             tx,
             &[SnapshotId(tx)],
         );
-        f.cover(candidate_key, tx + 5);
+        f.settle(candidate_key);
         let audit = f.audit("candidate is the only counted-empty route");
         assert_eq!(audit.occupied, CAP as usize);
         assert_eq!(audit.empty_counted, vec![key(candidate_key)]);

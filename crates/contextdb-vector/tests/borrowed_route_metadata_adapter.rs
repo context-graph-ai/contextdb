@@ -9,8 +9,7 @@ use contextdb_core::{
 use contextdb_vector::{
     MemoryBudget, PartitionedVectorDelete, PartitionedVectorEntry, VectorCopyAdmission,
     VectorIndexLayout, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
-    VectorPartitionRef, VectorPartitionSourceMaintenanceMetadata, VectorRouteQuarantineReason,
-    VectorStore,
+    VectorPartitionRef, VectorPartitionSourceMaintenanceMetadata, VectorStore,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -174,7 +173,6 @@ fn failure() -> VectorMaintenanceFailureDetails {
 fn empty_metadata() -> VectorPartitionSourceMaintenanceMetadata {
     VectorPartitionSourceMaintenanceMetadata {
         historical_only: false,
-        quarantine: None,
         failure: None,
     }
 }
@@ -243,7 +241,7 @@ fn fixed_metadata_can_be_sampled_from_source_and_publication_views() {
         })
         .unwrap();
     // The source view has ended before the adapter takes maintenance.
-    assert!(store.apply_partition_source_maintenance_metadata(&index, &state, None, None));
+    assert!(store.apply_partition_source_maintenance_metadata(&index, &state, None));
 }
 
 #[test]
@@ -262,28 +260,20 @@ fn scalar_marks_and_none_leave_existing_fields_and_serving_state_intact() {
         .unwrap();
     let state = store.state(&index).unwrap();
     let partition = VectorPartitionRef::new(index.clone(), VectorPartitionKey::unpartitioned());
-    let before = store.partition_graph_generation_status(&partition);
     let failure = failure();
-    assert!(store.apply_partition_source_maintenance_metadata(&index, &state, Some(failure), None));
-    assert_eq!(state.source_maintenance_metadata().quarantine, None);
-    assert!(store.apply_partition_source_maintenance_metadata(
-        &index,
-        &state,
-        None,
-        Some(VectorRouteQuarantineReason::CorruptChanges),
-    ));
+    assert!(store.apply_partition_source_maintenance_metadata(&index, &state, Some(failure)));
+    assert_eq!(state.source_maintenance_metadata().failure, Some(failure));
+    assert!(store.apply_partition_source_maintenance_metadata(&index, &state, None,));
     let marked = VectorPartitionSourceMaintenanceMetadata {
         historical_only: false,
-        quarantine: Some(VectorRouteQuarantineReason::CorruptChanges),
         failure: Some(failure),
     };
     assert_eq!(state.source_maintenance_metadata(), marked);
-    assert!(store.apply_partition_source_maintenance_metadata(&index, &state, None, None));
+    assert!(store.apply_partition_source_maintenance_metadata(&index, &state, None));
     store
         .record_partition_maintenance_error(&partition, &Error::ReadCancelled)
         .unwrap();
     assert_eq!(state.source_maintenance_metadata(), marked);
-    assert_eq!(store.partition_graph_generation_status(&partition), before);
 }
 
 #[test]
@@ -305,18 +295,12 @@ fn removed_index_rejects_its_sampled_source() {
         store
             .deregister_index(
                 &index,
-                declared_column_owner.as_ref(),
                 &mut VectorCopyAdmission::new(executing_owner.clone())
             )
             .unwrap()
             .is_empty()
     );
-    assert!(!store.apply_partition_source_maintenance_metadata(
-        &index,
-        &sampled,
-        Some(failure()),
-        Some(VectorRouteQuarantineReason::CorruptBase),
-    ));
+    assert!(!store.apply_partition_source_maintenance_metadata(&index, &sampled, Some(failure()),));
     assert_eq!(sampled.source_maintenance_metadata(), empty_metadata());
     assert!(!store.contains_index(&index));
 }
@@ -346,19 +330,13 @@ fn replacement_column_rejects_the_old_state_without_marking_the_new_source() {
         .unwrap();
     let replacement = store.state(&index).unwrap();
     assert!(!Arc::ptr_eq(&sampled, &replacement));
-    assert!(!store.apply_partition_source_maintenance_metadata(
-        &index,
-        &sampled,
-        Some(failure()),
-        Some(VectorRouteQuarantineReason::CorruptBase),
-    ));
+    assert!(!store.apply_partition_source_maintenance_metadata(&index, &sampled, Some(failure()),));
     assert_eq!(sampled.source_maintenance_metadata(), empty_metadata());
     assert_eq!(replacement.source_maintenance_metadata(), empty_metadata());
     assert!(store.apply_partition_source_maintenance_metadata(
         &index,
         &replacement,
         Some(failure()),
-        None,
     ));
 }
 
@@ -389,17 +367,11 @@ fn removed_and_recreated_partition_rejects_the_old_state_in_the_same_column() {
         .prune_row_ids_in_indexes(
             &HashSet::from([RowId(1)]),
             std::slice::from_ref(&index),
-            declared_column_owner.as_ref(),
             &mut VectorCopyAdmission::new(executing_owner.clone()),
         )
         .unwrap();
     assert!(store.try_partition_state(&index, &key).is_none());
-    assert!(!store.apply_partition_source_maintenance_metadata(
-        &index,
-        &sampled,
-        Some(failure()),
-        None
-    ));
+    assert!(!store.apply_partition_source_maintenance_metadata(&index, &sampled, Some(failure())));
     insert_partition_fixture(
         &store,
         &declared_column_owner,
@@ -409,12 +381,7 @@ fn removed_and_recreated_partition_rejects_the_old_state_in_the_same_column() {
     .unwrap();
     let replacement = store.partition_state(&index, &key).unwrap();
     assert!(!Arc::ptr_eq(&sampled, &replacement));
-    assert!(!store.apply_partition_source_maintenance_metadata(
-        &index,
-        &sampled,
-        Some(failure()),
-        Some(VectorRouteQuarantineReason::CorruptBase),
-    ));
+    assert!(!store.apply_partition_source_maintenance_metadata(&index, &sampled, Some(failure()),));
     assert_eq!(sampled.source_maintenance_metadata(), empty_metadata());
     assert_eq!(replacement.source_maintenance_metadata(), empty_metadata());
 }
@@ -443,12 +410,7 @@ fn renamed_index_rejects_the_old_name_even_when_that_name_is_reused() {
         )
         .unwrap()
         .publish();
-    assert!(!store.apply_partition_source_maintenance_metadata(
-        &old,
-        &sampled,
-        Some(failure()),
-        None
-    ));
+    assert!(!store.apply_partition_source_maintenance_metadata(&old, &sampled, Some(failure())));
     store
         .register_index(
             old.clone(),
@@ -458,21 +420,11 @@ fn renamed_index_rejects_the_old_name_even_when_that_name_is_reused() {
         )
         .unwrap();
     let replacement = store.state(&old).unwrap();
-    assert!(!store.apply_partition_source_maintenance_metadata(
-        &old,
-        &sampled,
-        Some(failure()),
-        Some(VectorRouteQuarantineReason::IncompatibleFormat),
-    ));
+    assert!(!store.apply_partition_source_maintenance_metadata(&old, &sampled, Some(failure()),));
     assert_eq!(replacement.source_maintenance_metadata(), empty_metadata());
     assert_eq!(sampled.source_maintenance_metadata(), empty_metadata());
     assert!(Arc::ptr_eq(&store.state(&renamed).unwrap(), &sampled));
-    assert!(store.apply_partition_source_maintenance_metadata(
-        &renamed,
-        &sampled,
-        Some(failure()),
-        None
-    ));
+    assert!(store.apply_partition_source_maintenance_metadata(&renamed, &sampled, Some(failure())));
 }
 
 #[test]
@@ -519,7 +471,6 @@ fn scalar_marking_preserves_historical_only_sources() {
         store
             .retire_snapshot_free_partition_states(
                 &[],
-                declared_column_owner.as_ref(),
                 &mut VectorCopyAdmission::new(executing_owner.clone())
             )
             .unwrap(),
@@ -527,16 +478,10 @@ fn scalar_marking_preserves_historical_only_sources() {
     );
     let source = store.partition_state(&index, &key).unwrap();
     assert!(source.source_maintenance_metadata().historical_only);
-    assert!(store.apply_partition_source_maintenance_metadata(
-        &index,
-        &source,
-        Some(failure()),
-        None
-    ));
+    assert!(store.apply_partition_source_maintenance_metadata(&index, &source, Some(failure())));
     let metadata = source.source_maintenance_metadata();
     assert!(metadata.historical_only);
     assert_eq!(metadata.failure, Some(failure()));
-    assert_eq!(metadata.quarantine, None);
     assert!(
         store
             .partition_keys(
@@ -566,13 +511,7 @@ fn successful_ordinary_publication_clears_an_adapter_failure() {
     store
         .register_index_with_layout(
             index.clone(),
-            VectorIndexLayout::unpartitioned(2, VectorQuantization::F32).with_policy(
-                Some(1),
-                Some(4),
-                Some(64),
-                Some(16),
-                1,
-            ),
+            VectorIndexLayout::unpartitioned(2, VectorQuantization::F32).with_policy(Some(1), 1),
             declared_column_owner.clone(),
             &mut VectorCopyAdmission::new(executing_owner.clone()),
         )
@@ -585,26 +524,18 @@ fn successful_ordinary_publication_clears_an_adapter_failure() {
     )
     .unwrap();
     let sampled = store.state(&index).unwrap();
-    assert!(store.apply_partition_source_maintenance_metadata(
-        &index,
-        &sampled,
-        Some(failure()),
-        None
-    ));
-    let budget = Arc::new(Budget::default());
-    let report = store
-        .run_hnsw_maintenance_cycle(
-            budget.clone(),
-            &mut VectorCopyAdmission::new(executing_owner.clone()),
-        )
+    assert!(store.apply_partition_source_maintenance_metadata(&index, &sampled, Some(failure())));
+    // The engine clears the mark once the matching durable publication has
+    // succeeded.
+    store
+        .clear_partition_maintenance_failure(&VectorPartitionRef::new(
+            index.clone(),
+            VectorPartitionKey::unpartitioned(),
+        ))
         .unwrap();
-    assert_eq!(report.built_partitions, 1);
     assert_eq!(sampled.source_maintenance_metadata().failure, None);
-    assert!(store.has_hnsw_index_for(&index));
-    assert!(store.apply_partition_source_maintenance_metadata(&index, &sampled, None, None));
+    assert!(store.apply_partition_source_maintenance_metadata(&index, &sampled, None));
     assert_eq!(sampled.source_maintenance_metadata().failure, None);
-    store.clear_hnsw(budget.as_ref());
-    assert_eq!(budget.used.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -633,8 +564,12 @@ fn giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding() {
     let source = store.partition_state(&index, &key).unwrap();
     let details = failure();
     assert_eq!(details.failure, VectorMaintenanceFailure::MemoryLimit);
+    // A typed key is shared by reference, so a plain clone never allocates;
+    // the control is a deep copy of its components.
     let (_, clone_allocations) = count_large_allocations(GIANT, || {
-        std::hint::black_box(key.clone());
+        std::hint::black_box(VectorPartitionKey::from_components(
+            key.components().to_vec(),
+        ));
     });
     let (_, encoding_allocations) = count_large_allocations(GIANT, || {
         std::hint::black_box(key.canonical_bytes());
@@ -659,7 +594,6 @@ fn giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding() {
                     &index,
                     &source,
                     Some(details),
-                    None,
                 );
                 (applied, source.source_maintenance_metadata())
             })
@@ -667,7 +601,6 @@ fn giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding() {
         .unwrap();
     assert!(applied);
     assert_eq!(metadata.failure, Some(details));
-    assert_eq!(metadata.quarantine, None);
     assert_eq!(
         allocations, 0,
         "retaining a scalar failure cannot clone or encode the giant key"

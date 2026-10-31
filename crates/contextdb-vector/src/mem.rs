@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::memory_budget::MemoryBudget;
 use crate::store::VectorStore;
 use contextdb_core::read_contract::ReadFailure;
 use contextdb_core::*;

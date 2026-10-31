@@ -1,4 +1,14 @@
 use super::*;
+use crate::quantized::StoredVector;
+
+/// The F32 body a stored vector shares, if it is an F32 vector (the pointer
+/// identity several payload tests compare).
+fn f32_slice(vector: &StoredVector) -> Option<&[f32]> {
+    match vector {
+        StoredVector::F32(payload) => Some(payload),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Default)]
 struct Budget {
@@ -289,11 +299,7 @@ fn shared_cross_partition_body_survives_source_removal_and_final_external_holder
     );
     drop(source_state);
     let released = store
-        .prune_row_ids(
-            &HashSet::from([RowId(1)]),
-            budget.as_ref(),
-            &mut executing_admission,
-        )
+        .prune_row_ids(&HashSet::from([RowId(1)]), &mut executing_admission)
         .unwrap();
     budget.release(released);
     assert_eq!(
@@ -992,7 +998,7 @@ fn loaded_owned_promotion_refusal_preserves_reservations_then_moves_each_body_wi
     let pointers = state.with_entries(|entries| {
         entries
             .iter()
-            .map(|entry| entry.vector.as_f32_slice().unwrap().as_ptr())
+            .map(|entry| f32_slice(&entry.vector).unwrap().as_ptr())
             .collect::<Vec<_>>()
     });
     let metadata = store
@@ -1018,7 +1024,7 @@ fn loaded_owned_promotion_refusal_preserves_reservations_then_moves_each_body_wi
     assert_eq!(store.raw_payload_header_bytes.load(Ordering::SeqCst), 0);
     state.with_entries(|entries| {
         for (entry, pointer) in entries.iter().zip(&pointers) {
-            assert_eq!(entry.vector.as_f32_slice().unwrap().as_ptr(), *pointer);
+            assert_eq!(f32_slice(&entry.vector).unwrap().as_ptr(), *pointer);
             assert!(entry.vector.payload_identity().is_none());
             assert!(!entry.vector.payload_is_charged());
         }
@@ -1035,7 +1041,7 @@ fn loaded_owned_promotion_refusal_preserves_reservations_then_moves_each_body_wi
     );
     state.with_entries(|entries| {
         for (entry, pointer) in entries.iter().zip(pointers) {
-            assert_eq!(entry.vector.as_f32_slice().unwrap().as_ptr(), pointer);
+            assert_eq!(f32_slice(&entry.vector).unwrap().as_ptr(), pointer);
             assert!(entry.vector.payload_identity().is_some());
             assert!(entry.vector.payload_is_charged());
         }
@@ -1081,9 +1087,7 @@ fn mixed_already_accounted_open_admits_only_new_headers_and_transfers_live_count
         .with_stored_by_row_id(RowId(1), |entry| entry.vector.payload_identity())
         .unwrap();
     let owned_pointer = state
-        .with_stored_by_row_id(RowId(2), |entry| {
-            entry.vector.as_f32_slice().unwrap().as_ptr()
-        })
+        .with_stored_by_row_id(RowId(2), |entry| f32_slice(&entry.vector).unwrap().as_ptr())
         .unwrap();
     assert_eq!(old_bodies.load(Ordering::SeqCst), 2 * body_bytes);
     assert_eq!(old_headers.load(Ordering::SeqCst), header_bytes);
@@ -1136,11 +1140,7 @@ fn mixed_already_accounted_open_admits_only_new_headers_and_transfers_live_count
     );
     assert_eq!(
         state
-            .with_stored_by_row_id(RowId(2), |entry| entry
-                .vector
-                .as_f32_slice()
-                .unwrap()
-                .as_ptr())
+            .with_stored_by_row_id(RowId(2), |entry| f32_slice(&entry.vector).unwrap().as_ptr())
             .unwrap(),
         owned_pointer
     );
@@ -1209,11 +1209,9 @@ fn retained_owned_clone_requires_its_own_body_charge_and_never_copies_a_charge_t
     assert!(!held.vector.payload_is_charged());
     assert!(held.vector.payload_identity().is_none());
     let source_pointer = state
-        .with_stored_by_row_id(RowId(1), |entry| {
-            entry.vector.as_f32_slice().unwrap().as_ptr()
-        })
+        .with_stored_by_row_id(RowId(1), |entry| f32_slice(&entry.vector).unwrap().as_ptr())
         .unwrap();
-    assert_ne!(held.vector.as_f32_slice().unwrap().as_ptr(), source_pointer);
+    assert_ne!(f32_slice(&held.vector).unwrap().as_ptr(), source_pointer);
     held.vector.adopt_raw_charge(
         budget.clone(),
         store.raw_payload_bytes.clone(),
@@ -1418,11 +1416,7 @@ fn prove_owned_source_copy_and_pruning(quantization: VectorQuantization) {
         header_bytes
     );
     let released = store
-        .prune_row_ids(
-            &HashSet::from([RowId(1)]),
-            budget.as_ref(),
-            &mut executing_admission,
-        )
+        .prune_row_ids(&HashSet::from([RowId(1)]), &mut executing_admission)
         .unwrap();
     budget.release(released);
     assert_eq!(store.raw_payload_bytes.load(Ordering::SeqCst), body_bytes);
@@ -1431,7 +1425,6 @@ fn prove_owned_source_copy_and_pruning(quantization: VectorQuantization) {
     let released = store
         .prune_row_ids(
             &HashSet::from([RowId(2), RowId(3)]),
-            budget.as_ref(),
             &mut executing_admission,
         )
         .unwrap();
@@ -1874,7 +1867,7 @@ fn publish_received(
             VectorCopyAdmission::new(executing.clone()),
         )
         .unwrap();
-    store.publish_prepared_received_schema(publication, declared.clone());
+    store.publish_prepared_received_schema(publication);
 }
 
 #[test]

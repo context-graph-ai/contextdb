@@ -68,7 +68,7 @@ fn install_received(
         )
         .unwrap();
     if whole_registry {
-        store.publish_prepared_received_schema(publication, budget.clone());
+        store.publish_prepared_received_schema(publication);
     } else {
         let affected_tables = HashSet::from([index.table.clone()]);
         let mut admission = VectorCopyAdmission::new(budget.clone());
@@ -79,7 +79,7 @@ fn install_received(
                 &mut admission,
             )
             .unwrap();
-        store.publish_prepared_received_schema_tables(prepared, budget.clone());
+        store.publish_prepared_received_schema_tables(prepared);
     }
 }
 
@@ -456,7 +456,7 @@ fn disjoint_body_placements_survive_resident_and_received_export_restore() {
                     VectorCopyAdmission::new(owner.clone()),
                 )
                 .unwrap();
-            store.publish_prepared_received_schema(prepared, owner.clone());
+            store.publish_prepared_received_schema(prepared);
         } else {
             store
                 .replace_loaded_partitioned_vectors(

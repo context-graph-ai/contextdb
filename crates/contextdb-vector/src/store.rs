@@ -455,12 +455,6 @@ impl MaintenanceProgressPauseSlot {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Partitions a failure recheck on this thread looked at.
-    static FAILURE_RECHECK_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 thread_local! {
     static HELD_MAINTENANCE_LOCKS: RefCell<Vec<(StoreId, VectorIndexRef, VectorPartitionKey)>> = const { RefCell::new(Vec::new()) };
     static HELD_BULK_READ_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
@@ -3214,14 +3208,6 @@ impl IndexState {
         // allocation before later eviction makes them positional again.
         *self.raw_loader.write() = Some(loader);
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_membership_source_for_test(
-        &self,
-        source: Arc<dyn RawVectorMembershipSource>,
-    ) {
-        *self.durable_memberships.write() = Some(source.into());
     }
 
     pub(crate) fn durable_membership_source(
@@ -17769,7 +17755,6 @@ mod tests {
     pub(super) struct CountingMemoryBudget {
         limit: Option<usize>,
         live_bytes: AtomicUsize,
-        build_reservation_bytes: AtomicUsize,
         refuse_directory_growth: AtomicBool,
     }
 
@@ -17784,10 +17769,6 @@ mod tests {
         fn live_bytes(&self) -> usize {
             self.live_bytes.load(Ordering::SeqCst)
         }
-
-        fn build_reservation_bytes(&self) -> usize {
-            self.build_reservation_bytes.load(Ordering::SeqCst)
-        }
     }
 
     impl MemoryBudget for CountingMemoryBudget {
@@ -17798,9 +17779,6 @@ mod tests {
             operation: &str,
             hint: &str,
         ) -> Result<()> {
-            if operation.starts_with("build_hnsw@") {
-                self.build_reservation_bytes.store(bytes, Ordering::SeqCst);
-            }
             loop {
                 let used = self.live_bytes.load(Ordering::SeqCst);
                 let available = if operation == "prepare_vector_directory_growth"
@@ -17843,38 +17821,6 @@ mod tests {
         fn available_bytes(&self) -> Option<usize> {
             self.limit
                 .map(|limit| limit.saturating_sub(self.live_bytes()))
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct RefuseSampledBuildMemoryBudget {
-        live_bytes: AtomicUsize,
-    }
-
-    impl MemoryBudget for RefuseSampledBuildMemoryBudget {
-        fn try_allocate_for(
-            &self,
-            bytes: usize,
-            subsystem: &str,
-            operation: &str,
-            hint: &str,
-        ) -> Result<()> {
-            if operation.starts_with("build_hnsw@") {
-                return Err(Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.to_owned().into(),
-                    operation: operation.to_owned().into(),
-                    requested_bytes: bytes,
-                    available_bytes: 0,
-                    budget_limit_bytes: self.live_bytes.load(Ordering::SeqCst),
-                    hint: hint.to_owned().into(),
-                });
-            }
-            self.live_bytes.fetch_add(bytes, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn release(&self, bytes: usize) {
-            self.live_bytes.fetch_sub(bytes, Ordering::SeqCst);
         }
     }
 
@@ -18017,7 +17963,6 @@ mod tests {
                 RowId(7),
                 SnapshotId(3),
                 &[1.0, 0.0],
-                None,
                 &mut executing_admission,
             )
             .unwrap();
@@ -18034,7 +17979,6 @@ mod tests {
                 RowId(7),
                 SnapshotId(3),
                 &[1.0, 0.0],
-                None,
                 &mut || {
                     checkpoints += 1;
                     Ok::<(), Error>(())
@@ -18066,7 +18010,6 @@ mod tests {
             RowId(7),
             SnapshotId(3),
             &[1.0, 0.0],
-            None,
             &mut || {
                 cancellation_checkpoints += 1;
                 if cancellation_checkpoints == 4 {
@@ -18126,7 +18069,6 @@ mod tests {
                     RowId(9),
                     SnapshotId(5),
                     &query,
-                    None,
                     &mut executing_admission,
                 )
                 .unwrap()
@@ -18316,7 +18258,7 @@ mod tests {
             let result = if superseded {
                 store.prune_superseded_versions(&versions, &mut admission)
             } else {
-                store.prune_row_ids(&HashSet::from([RowId(7)]), body.as_ref(), &mut admission)
+                store.prune_row_ids(&HashSet::from([RowId(7)]), &mut admission)
             };
             let refused = result.is_err();
             let released = match result {
@@ -18340,7 +18282,7 @@ mod tests {
                     let released = if superseded {
                         store.prune_superseded_versions(&versions, &mut retry)
                     } else {
-                        store.prune_row_ids(&HashSet::from([RowId(7)]), body.as_ref(), &mut retry)
+                        store.prune_row_ids(&HashSet::from([RowId(7)]), &mut retry)
                     }
                     .unwrap();
                     drop(retry);
@@ -18505,7 +18447,7 @@ mod tests {
         let result = if superseded {
             store.prune_superseded_versions(&versions, &mut admission)
         } else {
-            store.prune_row_ids(&HashSet::from([RowId(7)]), body.as_ref(), &mut admission)
+            store.prune_row_ids(&HashSet::from([RowId(7)]), &mut admission)
         };
         assert!(
             matches!(result, Err(Error::MemoryBudgetExceeded { requested_bytes, .. }) if requested_bytes == cleanup_bytes)
@@ -18533,7 +18475,7 @@ mod tests {
         let released = if superseded {
             store.prune_superseded_versions(&versions, &mut retry)
         } else {
-            store.prune_row_ids(&HashSet::from([RowId(7)]), body.as_ref(), &mut retry)
+            store.prune_row_ids(&HashSet::from([RowId(7)]), &mut retry)
         }
         .unwrap();
         assert_eq!(released, 0);
@@ -18893,11 +18835,7 @@ mod tests {
         let result = if superseded {
             store.prune_superseded_versions(&versions, &mut admission)
         } else {
-            store.prune_row_ids(
-                &HashSet::from([RowId(7)]),
-                bodies[0].as_ref(),
-                &mut admission,
-            )
+            store.prune_row_ids(&HashSet::from([RowId(7)]), &mut admission)
         };
         assert!(matches!(
             result,
@@ -18974,7 +18912,7 @@ mod tests {
         let released = if superseded {
             store.prune_superseded_versions(&versions, &mut retry)
         } else {
-            store.prune_row_ids(&HashSet::from([RowId(7)]), bodies[0].as_ref(), &mut retry)
+            store.prune_row_ids(&HashSet::from([RowId(7)]), &mut retry)
         }
         .unwrap();
         assert_eq!(
@@ -19643,11 +19581,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 store
-                    .retire_snapshot_free_partition_states(
-                        &[],
-                        accountant.as_ref(),
-                        &mut executing_admission
-                    )
+                    .retire_snapshot_free_partition_states(&[], &mut executing_admission)
                     .unwrap(),
                 1
             );
@@ -19658,11 +19592,7 @@ mod tests {
             );
 
             let released = store
-                .prune_row_ids(
-                    &HashSet::from([RowId(7)]),
-                    accountant.as_ref(),
-                    &mut executing_admission,
-                )
+                .prune_row_ids(&HashSet::from([RowId(7)]), &mut executing_admission)
                 .unwrap();
             accountant.release(released);
             assert!(
@@ -19937,101 +19867,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_only_declaration_update_scans_only_failed_routes_after_the_write_gate() {
-        let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-        let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
-        let store = VectorStore::default();
-        let index = index();
-        let layout = partitioned_layout(8).with_policy(Some(1), Some(4), Some(64), Some(16), 1);
-        store
-            .register_index_with_layout(
-                index.clone(),
-                layout.clone(),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        store
-            .apply_partitioned_inserts(
-                (0..4)
-                    .map(|row| {
-                        partitioned_entry(
-                            &index,
-                            &text_key(format!("scope-{row}")),
-                            row + 1,
-                            TxId(row + 1),
-                            [1.0, row as f32],
-                        )
-                    })
-                    .collect(),
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-
-        let inspected_entries = || {
-            store
-                .try_column(&index)
-                .unwrap()
-                .partition_snapshots()
-                .into_iter()
-                .map(|(_, state)| state.raw_directory_entries_inspected.load(Ordering::SeqCst))
-                .sum::<u64>()
-        };
-        let before_inspection = inspected_entries();
-        assert_eq!(
-            store
-                .partition_infos(&index, &mut executing_admission)
-                .unwrap()
-                .len(),
-            4
-        );
-        let before_update = inspected_entries();
-        assert!(
-            before_update > before_inspection,
-            "the counter observes the production raw-directory inspection path"
-        );
-
-        store
-            .register_index_with_layout(
-                index.clone(),
-                layout.with_policy(Some(1), Some(4), Some(64), Some(32), 2),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        assert_eq!(
-            inspected_entries(),
-            before_update,
-            "an EF_SEARCH declaration swap cannot inspect any vector body or directory entry"
-        );
-
-        let failed_partition = VectorPartitionRef::new(index.clone(), text_key("scope-0"));
-        store
-            .record_partition_maintenance_failure(
-                &failed_partition,
-                VectorMaintenanceFailure::BuildFailure,
-            )
-            .unwrap();
-        let before_failure_recheck = inspected_entries();
-        store
-            .register_index_with_layout(
-                index.clone(),
-                partitioned_layout(8).with_policy(Some(1), Some(4), Some(64), Some(48), 3),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        assert_eq!(
-            inspected_entries(),
-            before_failure_recheck + 1,
-            "the shared-gate recheck scans only the one route carrying a retained failure"
-        );
-    }
-
-    #[test]
     fn recording_a_failure_for_an_absent_partition_is_a_noop() {
         let declared_column_owner = Arc::new(CountingMemoryBudget::default());
         let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
@@ -20143,18 +19978,6 @@ mod tests {
             store
                 .record_partition_maintenance_error(&partition, &Error::ReadCancelled)
                 .unwrap();
-            let accountant = Arc::new(CountingMemoryBudget::default());
-            let cancelled = store.run_hnsw_maintenance_cycle_with(
-                accountant.clone(),
-                &mut || Err(Error::ReadCancelled),
-                &mut executing_admission,
-            );
-            assert!(matches!(cancelled, Err(Error::ReadCancelled)));
-            assert_eq!(
-                accountant.live_bytes(),
-                0,
-                "cancellation releases build workspace"
-            );
             assert!(
                 store
                     .partition_info(&index, &partition_key, &mut executing_admission)
@@ -20201,20 +20024,18 @@ mod tests {
             }
         }
 
-        let report = store
-            .run_hnsw_maintenance_cycle(
-                crate::memory_budget::unlimited_memory_budget(),
-                &mut executing_admission,
-            )
+        // The engine clears the mark once the matching durable publication has
+        // succeeded; nothing short of that clears it.
+        store
+            .clear_partition_maintenance_failure(&partition)
             .unwrap();
-        assert_eq!(report.built_partitions, 1);
         assert_eq!(
             store
                 .partition_info(&index, &partition_key, &mut executing_admission)
                 .unwrap()
                 .and_then(|info| info.maintenance_failure),
             None,
-            "only a successful graph publication clears the retained failure"
+            "only a successful publication clears the retained failure"
         );
     }
 }
