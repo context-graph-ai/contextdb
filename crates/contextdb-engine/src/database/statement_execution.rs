@@ -2796,7 +2796,8 @@ impl Database {
             match requested_mode {
                 contextdb_core::VectorSearchMode::Auto
                     if filtered_exact
-                        || aggregate_allowed_vectors.is_some_and(|count| count < policy.auto_index_at) =>
+                        || aggregate_allowed_vectors
+                            .is_some_and(|count| count < policy.auto_index_at) =>
                 {
                     contextdb_core::VectorSearchMode::Exact
                 }

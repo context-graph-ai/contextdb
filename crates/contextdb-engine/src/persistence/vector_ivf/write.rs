@@ -1433,7 +1433,7 @@ impl WritePages for WriteOperation<'_, '_, '_> {
         self.check_cancel()?;
         self.scope
             .ensure_family(manifest.generation, &mut self.workspace.borrow_mut())?;
-        let (before, source_snapshot) = {
+        let (before, source_snapshot, newly_serving) = {
             let mut record = self.scope.record.borrow_mut();
             let slot = record
                 .families
@@ -1448,10 +1448,15 @@ impl WritePages for WriteOperation<'_, '_, '_> {
             family.manifest = Some(manifest.into());
             family.committed_through_lsn = self.scope.session.row_commit_lsn.0;
             let source_snapshot = family.source_snapshot;
+            let newly_serving = !record
+                .serving
+                .map(|serving| serving.manifest())
+                .transpose()?
+                .is_some_and(|serving| serving.generation == manifest.generation);
             record.serving = Some(manifest.into());
-            (before, source_snapshot)
+            (before, source_snapshot, newly_serving)
         };
-        if manifest.generation != 0 && before.is_none() {
+        if manifest.generation != 0 && newly_serving {
             // The build generation starts serving: its counts become the
             // partition's pending counts. Tail and remap manifests keep them.
             let partition = contextdb_vector::VectorPartitionRef::new(
