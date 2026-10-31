@@ -84,19 +84,7 @@ fn durable_generation_id(db: &Database, scope: Uuid) -> Option<u64> {
 }
 
 fn graph_available(db: &Database, scope: Uuid) -> bool {
-    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-        db.declared_reader_memory()
-            .expect("admit the partition observation reader"),
-    );
-
-    db.vector_store_for_test()
-        .partition_info(
-            &index(),
-            &partition(scope),
-            &mut partition_observation_owner_1,
-        )
-        .unwrap()
-        .is_some_and(|info| info.graph_available)
+    db.__debug_vector_partition_indexed_for_test(index().clone(), partition(scope).clone())
 }
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {

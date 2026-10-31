@@ -1439,8 +1439,7 @@ fn old_snapshot_indexed_uses_its_retained_generation_and_ignores_unselected_grow
         "unselected growth does not load, build, or publish another selected-partition generation"
     );
     assert_eq!(
-        db.vector_store_for_test()
-            .raw_hnsw_build_serial_for_partition_for_test(&index(), &partition(selected_scope()),),
+        db.__debug_vector_partition_generation_for_test(index().clone(), partition(selected_scope(.clone())),),
         selected_build_serial_before,
         "unselected growth cannot rebuild the selected partition's graph"
     );

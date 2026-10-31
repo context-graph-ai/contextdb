@@ -18,8 +18,6 @@ mod disk_budget_persistence_tests;
 mod engine_owned_ledger_policy_tests;
 #[path = "engine/engine_tests.rs"]
 mod engine_tests;
-#[path = "engine/hnsw_rebuild_determinism_tests.rs"]
-mod hnsw_rebuild_determinism_tests;
 #[path = "engine/indexed_equality_cursor_delivers_every_row.rs"]
 mod indexed_equality_cursor_delivers_every_row;
 #[path = "engine/integer_negation_overflow_tests.rs"]

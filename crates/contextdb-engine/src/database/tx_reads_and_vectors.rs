@@ -5789,6 +5789,39 @@ impl Database {
             .max()
     }
 
+    /// The published clustered-index generation of one partition, or `None`
+    /// while the partition has none.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __debug_vector_partition_generation_for_test(
+        &self,
+        index: VectorIndexRef,
+        partition: VectorPartitionKey,
+    ) -> Option<u64> {
+        let _operation = self.assert_open_operation();
+        let read_memory = self.declared_reader_memory().expect("declared reader memory");
+        self.native_ivf_inspection(&index, &partition, read_memory, &|| Ok(()))
+            .expect("native inspection")
+            .and_then(|native| native.manifest)
+            .filter(|manifest| manifest.active_lists != 0)
+            .map(|manifest| manifest.generation)
+    }
+
+    /// Whether one partition has a usable clustered index.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __debug_vector_partition_indexed_for_test(
+        &self,
+        index: VectorIndexRef,
+        partition: VectorPartitionKey,
+    ) -> bool {
+        let _operation = self.assert_open_operation();
+        let read_memory = self.declared_reader_memory().expect("declared reader memory");
+        self.native_ivf_inspection(&index, &partition, read_memory, &|| Ok(()))
+            .expect("native inspection")
+            .is_some_and(|native| native.available())
+    }
+
     /// Whether every populated partition of `index` has a usable clustered
     /// index, and at least one is populated.
     #[doc(hidden)]
