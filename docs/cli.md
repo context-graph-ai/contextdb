@@ -671,7 +671,7 @@ counts for that route, `maintenance_reason=tombstones`, and
 
 Rows are in stable `(table, column, canonical_partition_key)` order. Each reports its key, live and
 retained rows, serving base generation/transaction, tail and tombstone counts, durable and charged
-bytes, availability, maintenance state and progress checkpoint, and a recovery action. The empty
+bytes, availability, maintenance state and progress checkpoint, and a recovery action. `maintenance_checkpoint_tx` reports the actual maintenance progress/failure checkpoint when available; while idle with a published base it reports that base's source transaction, and otherwise it is NULL. The empty
 key `{}` is the one unpartitioned layout; it appears even before its first vector. An empty
 partitioned column has no detail row until a key tuple receives a vector.
 

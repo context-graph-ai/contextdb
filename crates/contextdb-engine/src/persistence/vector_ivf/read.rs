@@ -544,6 +544,14 @@ impl<'a> PageSource<'a> {
         }
         entries.checked_mul(PAGE_BYTES as u64).ok_or_else(corrupt)
     }
+    /// The source snapshot the selected published generation was built from.
+    pub(super) fn base_tx(&self, generation: u64) -> Result<u64> {
+        let record = self.record.borrow();
+        Ok(record
+            .family(generation)
+            .ok_or_else(corrupt)?
+            .source_snapshot)
+    }
     fn family_slot(&self, generation: u64) -> Option<usize> {
         self.record
             .borrow()

@@ -4560,8 +4560,18 @@ fn vector_index_inspection_row(
                 info.layout.effective_consolidation_tombstone_percent(),
             ))
         },
-        Value::Null,
-        Value::Null,
+        native
+            .iter()
+            .flatten()
+            .filter_map(|native| native.base_tx)
+            .min()
+            .map_or(Ok(Value::Null), |tx| vector_inspection_u64(tx, "oldest_base_tx"))?,
+        native
+            .iter()
+            .flatten()
+            .filter_map(|native| native.base_tx)
+            .max()
+            .map_or(Ok(Value::Null), |tx| vector_inspection_u64(tx, "newest_base_tx"))?,
         vector_inspection_usize(pending_inserts, "pending_inserts")?,
         vector_inspection_usize(tombstones, "tombstones")?,
         vector_inspection_usize(durable_vector_bytes, "durable_vector_bytes")?,
@@ -4675,7 +4685,9 @@ fn vector_partition_inspection_row(
             .map(|manifest| vector_inspection_u64(manifest.generation, "base_generation"))
             .transpose()?
             .unwrap_or(Value::Null),
-        Value::Null,
+        native
+            .and_then(|native| native.base_tx)
+            .map_or(Ok(Value::Null), |tx| vector_inspection_u64(tx, "base_tx"))?,
         vector_inspection_usize(partition.pending_inserts, "pending_inserts")?,
         vector_inspection_usize(partition.tombstones, "tombstones")?,
         vector_inspection_usize(partition.durable_vector_bytes, "durable_vector_bytes")?,
@@ -4701,7 +4713,13 @@ fn vector_partition_inspection_row(
             lifecycle.vectors_remaining,
             "maintenance_vectors_remaining",
         )?,
-        vector_inspection_optional_tx(lifecycle.checkpoint_tx, "maintenance_checkpoint_tx")?,
+        match (lifecycle.checkpoint_tx, native.and_then(|native| native.base_tx)) {
+            (Some(checkpoint), _) => vector_inspection_u64(checkpoint.0, "maintenance_checkpoint_tx")?,
+            (None, Some(base_tx)) if lifecycle.maintenance_state == "idle" => {
+                vector_inspection_u64(base_tx, "maintenance_checkpoint_tx")?
+            }
+            _ => Value::Null,
+        },
         Value::Bool(indexed_available),
         native
             .and_then(|native| native.codebook())

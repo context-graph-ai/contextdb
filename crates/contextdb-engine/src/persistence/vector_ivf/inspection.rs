@@ -29,6 +29,9 @@ pub(crate) struct Inspection {
     /// Bytes of the selected generation's persisted index tables; absent
     /// while nothing is published.
     pub durable_index_bytes: Option<u64>,
+    /// The source snapshot of the selected published generation; absent
+    /// while nothing is published.
+    pub base_tx: Option<u64>,
 }
 impl Inspection {
     /// A published index that can serve this partition.
@@ -85,11 +88,16 @@ pub(crate) fn inspect(
         .filter(|manifest| manifest.active_lists != 0)
         .map(|manifest| source.durable_index_bytes(manifest.generation))
         .transpose()?;
+    let base_tx = manifest
+        .filter(|manifest| manifest.active_lists != 0)
+        .map(|manifest| source.base_tx(manifest.generation))
+        .transpose()?;
     Ok(Some(Inspection {
         manifest,
         catalog,
         objective,
         durable_index_bytes,
+        base_tx,
     }))
 }
 /// The declared objective judged only by evidence for this generation and
