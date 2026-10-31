@@ -38,6 +38,8 @@ mod disk_ceiling;
 mod exact_and_indexed_work;
 #[path = "clustered_vector_index/graph_option_refusal.rs"]
 mod graph_option_refusal;
+#[path = "clustered_vector_index/import_tail_coverage.rs"]
+mod import_tail_coverage;
 #[path = "clustered_vector_index/index_corruption.rs"]
 mod index_corruption;
 #[path = "clustered_vector_index/native_candidate_port.rs"]
