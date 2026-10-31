@@ -93,3 +93,25 @@ impl RedbPersistence {
         })
     }
 }
+
+/// Whether the captured native root holds a usable published index that
+/// covers every committed vector of this tuple, including its committed write
+/// buffer. A tuple with no committed vector is covered.
+pub(crate) fn covered(
+    root: &super::super::vector_paged::CapturedPagedRoot,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
+    index: &VectorIndexRef,
+    tuple: &VectorPartitionKey,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<bool> {
+    let authority = read::NativeAuthority::open_uncached(root, memory)?;
+    let Some(source) = read::PageSource::open(&authority, index, tuple, checkpoint, &|_| Ok(()))?
+    else {
+        let route = RedbPersistence::vector_partition_prefix(index, tuple);
+        return Ok(authority.source_summary(&route)?.live_entries == 0);
+    };
+    if source.source_summary.live_entries == 0 {
+        return Ok(true);
+    }
+    Ok(source.canonical_ready() && source.manifest(0)?.is_some_and(|m| m.active_lists != 0))
+}

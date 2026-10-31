@@ -1321,11 +1321,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>;
 
-    /// The row checks a statement over `index` may spend checking its filter
-    /// row by row, or `None` where this target cannot size it.
-        Ok(None)
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
