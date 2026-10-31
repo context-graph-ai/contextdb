@@ -186,15 +186,28 @@ fn a_non_interactive_session_keeps_process_termination() {
 
     // The precondition this journey rests on, witnessed on the running child:
     // SIGINT is neither ignored nor blocked, so the signal below has its
-    // ordinary meaning. (The fixture sets this before exec; here the kernel
-    // confirms it.)
-    if let Some((ignored, blocked)) = session.sigint_state() {
-        assert!(
-            !ignored && !blocked,
-            "the scripted session must start with SIGINT at its default disposition and \
-             unblocked (ignored={ignored}, blocked={blocked}).\ntranscript:\n{}",
-            session.transcript()
-        );
+    // ordinary meaning. The fixture sets this before exec; the kernel confirms
+    // it. A session launched as a background job inherits an ignored SIGINT
+    // unless the fixture resets it.
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", session.pid()))
+            .expect("read the child's signal state");
+        let sigint = 1u64 << (libc::SIGINT - 1);
+        for field in ["SigIgn:", "SigBlk:"] {
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+                .unwrap_or_else(|| panic!("the child's {field} mask is readable:\n{status}"));
+            assert_eq!(
+                mask & sigint,
+                0,
+                "the scripted session must start with SIGINT at its default disposition and \
+                 unblocked ({field} {mask:#x}).\ntranscript:\n{}",
+                session.transcript()
+            );
+        }
     }
 
     session.interrupt();

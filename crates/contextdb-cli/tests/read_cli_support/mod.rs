@@ -767,29 +767,6 @@ impl Background {
         assert!(status.success(), "failed to signal the background session");
     }
 
-    /// The running child's SIGINT state as the kernel reports it: whether
-    /// SIGINT is ignored (`SigIgn`) and whether it is blocked (`SigBlk`).
-    /// `None` where /proc does not describe processes. The cancellation journey
-    /// asserts both are false before it sends the signal, so its termination
-    /// claim rests on a witnessed precondition.
-    #[allow(
-        dead_code,
-        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation"
-    )]
-    pub fn sigint_state(&self) -> Option<(bool, bool)> {
-        let status = std::fs::read_to_string(format!("/proc/{}/status", self.pid())).ok()?;
-        let mask = |field: &str| -> Option<bool> {
-            let hex = status
-                .lines()
-                .find_map(|line| line.strip_prefix(field))?
-                .trim();
-            let bits = u64::from_str_radix(hex, 16).ok()?;
-            // Signal n occupies bit n - 1.
-            Some(bits & (1 << (libc::SIGINT - 1)) != 0)
-        };
-        Some((mask("SigIgn:")?, mask("SigBlk:")?))
-    }
-
     /// Block until `marker` appears. Waits on an output event; the watchdog only
     /// turns a hang into a readable failure.
     #[allow(

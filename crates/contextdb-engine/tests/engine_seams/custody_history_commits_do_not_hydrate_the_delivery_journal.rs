@@ -23,6 +23,7 @@ const ARM: &str = "CONTEXTDB_CUSTODY_HISTORY_UNITS";
 const FIXTURE: &str = "CONTEXTDB_CUSTODY_HISTORY_FIXTURE";
 const TENANT: &str = "custody-history";
 const CEILING: usize = 64 * 1024 * 1024;
+
 const SETTLING_SLACK: usize = 1024 * 1024;
 /// Regression sensitivity of the live-allocation comparison, not a
 /// boundedness proof: the RED resident journal differs by megabytes between
@@ -296,7 +297,7 @@ fn checkpoint(db: &Database, commits: usize, start: (u64, u64, u64, u64)) -> Che
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Arm {
-    /// Writer cache page occupancy right after saturation (its fixed share is CEILING/16).
+    /// Writer cache page occupancy right after saturation (its capacity is the production-derived cache share).
     cache_occupancy: usize,
     /// Live allocation once the cache is saturated, before any measured commit.
     allocated_start: usize,
@@ -567,15 +568,28 @@ fn custody_history_commits_do_not_hydrate_the_delivery_journal() {
     }
     // 5. Live allocation, with the writer cache saturated and every moving
     // owner attributed at each growth checkpoint.
+    // The writer cache's page capacity under CEILING, from the derivation
+    // production sizes the cache with, not a restated fraction of the ceiling.
+    let cache_share =
+        contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(CEILING));
     for (_, arm) in &arms {
+        // Saturation is observed, not assumed from a byte window: a cache with
+        // room evicts nothing, so real evictions before the first measured
+        // commit mean the pressure rows filled the declared share. Occupancy
+        // then sits within the largest page the cache could not admit of its
+        // capacity, and never above it.
         assert!(
-            arm.cache_occupancy >= CEILING / 16 - 4096 && arm.cache_occupancy <= CEILING / 16,
-            "the writer cache has saturated its fixed share before measuring: {arms:?}"
+            arm.checkpoints[0].cache_evictions > 0,
+            "the cache pressure displaced pages, so the writer cache is saturated before measuring: {arms:?}"
+        );
+        assert!(
+            arm.cache_occupancy <= cache_share,
+            "the writer cache never exceeds its declared share {cache_share}: {arms:?}"
         );
         for c in &arm.checkpoints {
             assert!(
-                c.cache_occupancy <= CEILING / 16,
-                "the cache never exceeds its share while measuring: {arms:?}"
+                c.cache_occupancy <= cache_share,
+                "the cache never exceeds its share {cache_share} while measuring: {arms:?}"
             );
         }
         // Within one arm, once the first commits have warmed the writer, the
