@@ -1653,31 +1653,6 @@ A query may raise its own target for one statement with
 `USE VECTOR INDEXED (TARGET_ACCURACY = n)`.
 <!-- enforced by: crates/contextdb-engine/tests/clustered_vector_index/parse_surface.rs::explicit_members_render_canonically_and_round_trip -->
 
-`AUTO_EXPANSION_CEILING` follows `AUTO_INDEX_AT` in the canonical order. It is the most of its walk
-budget, in percent from 1 through 100, `AUTO` expects one partition's graph search to spend when it
-prices the walk against comparing every allowed row; omitted, it is 25. A lower ceiling makes the
-walk look cheaper and a higher one makes comparison look cheaper. Both `SEARCH_RADIUS` and
-`AUTO_EXPANSION_CEILING` persist, render in `.schema`, travel with schema replay and sync, and are
-disclosed with their source (`declared` or `compatibility_profile`) by `EXPLAIN` and every executed
-route receipt. Neither revises the graph topology.
-<!-- enforced by: search_radius_and_expansion_ceiling_are_declared_policy::both_numbers_are_declared_persisted_replayed_and_disclosed, search_radius_and_expansion_ceiling_are_declared_policy::a_declared_search_radius_changes_the_walk_and_the_default_is_unchanged, search_radius_and_expansion_ceiling_are_declared_policy::a_declared_expansion_ceiling_changes_the_auto_route_and_the_default_is_unchanged -->
-
-`FLAT_BELOW` follows `AUTO_INDEX_AT` in the canonical order. It is a per-partition live-row count:
-a partition whose live vectors (counted at the reader's snapshot, before any residual filter) are
-strictly fewer than it is served by its maintained flat representation, every allowed row compared
-exactly, instead of by its graph; a partition at or above it walks its graph. Graphs stay maintained
-for every partition, so crossing the threshold in either direction needs no rebuild. `FLAT_BELOW 0`
-declares that no partition is served flat; omitting the clause leaves the default, which is also 0
-until a measured default is adopted. The value persists, renders in `.schema`, and travels with
-schema replay and sync. `EXPLAIN` and every executed route receipt name the effective value and its
-source, and each flat partition's route as `exact` with the reason `partition_below_flat_threshold`.
-`AUTO` prices a flat partition at its exact comparisons when it chooses a route.
-A read already active keeps the graph it can walk: a reader whose snapshot predates later commits,
-deletes or a maintenance rebuild still walks the graph state compatible with its snapshot, and a graph retired by a rebuild is released once no active
-reader needs it.
-<!-- enforced by: flat_route_below_declared_threshold::reaching_the_flat_threshold_moves_new_readers_to_the_graph_only, flat_route_below_declared_threshold::a_reader_pinned_before_a_rebuild_keeps_its_graph_until_it_finishes -->
-<!-- enforced by: flat_route_below_declared_threshold::flat_below_is_declared_validated_altered_and_reset, flat_route_below_declared_threshold::an_explicit_zero_flat_threshold_is_declared_and_never_flat, flat_route_below_declared_threshold::a_partition_at_the_flat_threshold_walks_its_graph, flat_route_below_declared_threshold::explain_predicts_the_flat_route_execution_takes, flat_route_below_declared_threshold::flat_below_travels_with_create_alter_and_reset_through_replay, flat_route_below_declared_threshold::auto_over_declared_flat_partitions_does_no_more_work_than_exact -->
-
 `CONSOLIDATION` controls when maintenance rebuilds an otherwise healthy graph. `CHANGE_PERCENT`
 counts pending inserts plus tombstones against the live-plus-retained partition population;
 `TOMBSTONE_PERCENT` counts tombstones alone. Because tombstones are part of total change, the
@@ -1720,7 +1695,7 @@ cannot publish over a newer declaration. An explicit value that resolves to the 
 retains its authored identity without forcing a redundant build. Explicit `AUTO_INDEX_AT`, `SEARCH`,
 `IVF`, and `CONSOLIDATION` values persist, participate in schema identity, and render in this
 canonical order.
-<!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_policy_declaration_contract::partial_alters_member_defaults_and_group_defaults_change_only_the_declared_policy, vector_policy_declaration_contract::invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection, vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_revision_publication_contract::explicit_current_defaults_keep_their_identity_without_rebuilding_matching_graphs -->
+<!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_policy_declaration_contract::partial_alters_member_defaults_and_group_defaults_change_only_the_declared_policy, vector_policy_declaration_contract::invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection -->
 
 An operator can raise the limit online, but cannot lower it below live-plus-retained use:
 
@@ -1781,14 +1756,14 @@ LIMIT 10;
 `USE VECTOR` is legal only with vector ordering. The selected mode covers the whole requested
 scope: if any required layout cannot satisfy `INDEXED`, the query refuses rather than omit that
 layout or return a partial list. A missing or empty authorized tuple is a complete empty result.
-<!-- enforced by: vector_partition_syntax_contract::vector_search_override_follows_vector_ordering_and_precedes_rank_and_limit, vector_partition_query_contract::every_use_vector_mode_refuses_a_non_vector_ordering_query, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer, vector_search_mode_bounded_contract::auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks -->
+<!-- enforced by: vector_partition_syntax_contract::vector_search_override_follows_vector_ordering_and_precedes_rank_and_limit, vector_partition_query_contract::every_use_vector_mode_refuses_a_non_vector_ordering_query, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer -->
 
 Initial graph construction and repair run only through maintenance. Declarations, writes, database
 open, and queries do not wait for a full build. Engine-owned maintenance advances in the background;
 caller-driven hosts advance it with `Database::run_maintenance_cycle` or CLI `.maintenance run`.
 While a required indexed route is unavailable, `INDEXED` refuses and `AUTO` may compare exactly only
 inside its existing budget. Ordinary relational/graph reads and admitted writes remain usable.
-<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors -->
+<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader -->
 
 Rows that store the same vector — bit for bit, or differing only in the sign of a zero; for a quantized
 column, the same quantized bytes — share one point of the maintained graph, and each is still answered
@@ -1811,7 +1786,7 @@ rebuild replaced that graph while the search ran, the report sets nothing aside.
 its own proof that nothing unreached can enter the answer is not such a walk: a row its graph does not
 connect can be missing from that answer, as any approximate search can miss a row, and recall is
 measured across queries.
-<!-- enforced by: graph_identity_rows_share_one_point::zero_distance_families_share_one_reachable_point, rows_sharing_a_graph_point_answer_per_row::rows_sharing_one_graph_point_are_answered_per_row_and_per_snapshot, a_disconnected_graph_partition_is_compared_exactly::a_live_row_the_graph_does_not_connect_refuses_indexed_and_is_compared_by_auto, a_disconnected_graph_partition_is_compared_exactly::reached_rows_superseded_versions_cannot_hide_an_unreached_row, a_disconnected_graph_partition_is_compared_exactly::deleted_history_does_not_move_a_connected_partition_off_its_graph, a_disconnected_graph_partition_is_compared_exactly::a_detected_cut_off_sets_the_partition_aside_until_maintenance_rebuilds_it, a_disconnected_graph_partition_is_compared_exactly::a_cut_off_that_recurs_is_repaired_each_time_without_retuning, a_disconnected_graph_partition_is_compared_exactly::a_report_landing_after_a_rebuild_sets_nothing_aside, a_disconnected_graph_partition_is_compared_exactly::several_disconnected_partitions_are_flagged_in_one_admitted_array -->
+<!-- enforced by: a_disconnected_graph_partition_is_compared_exactly::deleted_history_does_not_move_a_connected_partition_off_its_graph -->
 
 For an exhaustive `AUTO` query over dormant raw partitions, a refused whole-partition load can
 fall back to reading one stored vector at a time, preserving the exact answer without installing
@@ -1827,7 +1802,7 @@ layout. A named tuple that does not exist returns no rows and never broadens to 
 ContextDB searches selected layouts independently, then merges candidates by score before `USE RANK`
 and `LIMIT`. The result is one global top-k, with the existing ascending row-id tie-break for equal
 scores — never one limit per layout and never iteration-order results.
-<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::equivalent_or_partition_scope_keeps_cross_partition_row_id_ties, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer, vector_serving_merge_contract::global_ties_keep_internal_row_order_across_partition_load_permutations -->
+<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::equivalent_or_partition_scope_keeps_cross_partition_row_id_ties, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer -->
 
 `WHERE` filters still decide which rows are allowed inside that scope. A small allowed set may be
 compared exactly under `AUTO`; a large one needs a bounded filtered-index route. If ContextDB has

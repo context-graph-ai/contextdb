@@ -101,7 +101,7 @@ See [Query Language](query-language.md).
   See [CLI Reference](cli.md).
 - **All-scope vector search is bounded, not a promise to load every layout at once.** The engine
   fans out under the reader's work, memory, and cancellation limits and either returns one complete
-  global answer or refuses honestly. <!-- enforced by: vector_search_mode_bounded_contract::exact_memory_admission_uses_selected_authorized_rows_as_unrelated_vectors_grow, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates, vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure --> The edge-device memory target is `SET MEMORY_LIMIT 2G`
+  global answer or refuses honestly. <!-- enforced by: vector_search_mode_bounded_contract::exact_memory_admission_uses_selected_authorized_rows_as_unrelated_vectors_grow, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates --> The edge-device memory target is `SET MEMORY_LIMIT 2G`
   (CLI `--memory-limit 2G`), exactly **2147483648 bytes**. <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes --> Charged vector/index bytes and
   whole-process RSS, including build/repair/restart lifecycle work, are reported separately. See
   [Architecture](architecture.md) and [CLI Reference](cli.md).

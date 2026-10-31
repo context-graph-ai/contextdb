@@ -139,7 +139,7 @@ One key equality searches one layout; finite `IN`/`OR` searches a few; a prefix 
 searches all authorized layouts. ContextDB merges them by score before `LIMIT`, so this always means
 one best-answer list, not one list per layout. If one required layout cannot satisfy `INDEXED`, the
 whole query refuses — it never silently omits a layout.
-<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_search_mode_bounded_contract::auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks -->
+<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer -->
 
 Check which one is live:
 
@@ -162,7 +162,7 @@ alter them online with `ALTER TABLE ... ALTER COLUMN ... SET ...`. Use
 canonical syntax, `DEFAULT` behavior, rendering, and defaults. Inspection separates the desired
 layout from the serving index and its build revision. `PROBES` takes effect immediately; the
 serving breadth follows current query policy even if that build revision is older.
-<!-- enforced by: vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_resolver_contract::declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor, vector_serving_merge_contract::query_policy_discloses_serving_snapshot_and_full_partition_search_breadth -->
+<!-- enforced by: vector_serving_merge_contract::query_policy_discloses_serving_snapshot_and_full_partition_search_breadth -->
 
 When `AUTO` chooses exhaustive comparison and a dormant raw partition cannot fit in memory,
 it can read one stored vector at a time and return the same exact answer. This does not switch
@@ -183,7 +183,7 @@ Initial graph construction and repair advance only through maintenance, never in
 as a full build that declarations, writes, or open must wait for. Loaded generations stay sealed;
 tombstones exclude obsolete versions until replacement publication, while pinned old snapshots
 keep their compatible view. Retention can defer physical reclamation until those readers finish.
-<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_generation_quarantine_compaction_lock_contract::pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_superseded_bytes, tests/integration/retention_tests.rs::retention_defers_reclaim_without_breaking_vector_search -->
+<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, tests/integration/retention_tests.rs::retention_defers_reclaim_without_breaking_vector_search -->
 
 Inspect lifecycle without triggering work (these commands require an unrestricted admin handle;
 a constrained caller uses the redacted `.explain`, which omits per-partition adaptive settings):

@@ -117,7 +117,7 @@ audio, or policy embeddings with different dimensions and quantization choices.
 - A commit updates the durable base/change/tail lifecycle for the affected layout. Inserts enter a
   fresh searchable tail; deletes and replacements add tombstones. Searches merge the valid base,
   sealed committed changes, and tail under one MVCC snapshot.
-  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_current_identity_admission_refuses_the_complete_transaction_before_durability -->
+  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_tail_transaction_contract::local_current_identity_admission_refuses_the_complete_transaction_before_durability -->
 - `AUTO_INDEX_AT`, `SEARCH` (`TARGET_ACCURACY`, `EXPECTED_VECTORS`) and `IVF` (`LISTS`, `PROBES`, `REFINE_FACTOR`) are declarable per-column
   workload policy; silence keeps the compatibility profile. `AUTO` applies its effective threshold
   to the aggregate allowed set, while `EXACT` and `INDEXED` remain explicit whole-query contracts.
@@ -125,7 +125,7 @@ audio, or policy embeddings with different dimensions and quantization choices.
   <!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_search_mode_bounded_contract::auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible -->
 - Filtered and broad searches stay bounded. Selected layouts are searched independently with a
   global candidate heap, then one final top-k; the engine does not load every selected graph at once.
-  <!-- enforced by: vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates, vector_lazy_raw_residency_contract::indexed_many_partition_reads_point_load_only_visible_versioned_candidates -->
+  <!-- enforced by: vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates -->
 - Indexed routes have an acceptance target of at least 95% recall-at-10 against `EXACT` on the
   same stored column.
   <!-- enforced by: vector_held_out_native_reference::held_out_unfiltered_native_reference_recovers_the_required_neighbors, vector_serving_merge_contract::held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectivities -->
@@ -547,7 +547,7 @@ Single-file storage via redb:
 - On open: relational rows load with table-local index maintenance. Vector lifecycle metadata opens
   first; valid base and change graphs and raw-vector pages are loaded or mapped only for the active
   working set, rather than rebuilding every vector index.
-  <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_lazy_consumer_restart_contract::point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector -->
+  <!-- enforced by: vector_lazy_consumer_restart_contract::point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector -->
 - Crash-safe: redb provides atomic transactions
 - Committed row bodies: a file-backed store keeps key, index, constraint and policy columns and
   values up to 1 KiB resident; larger text/JSON values and vectors stay only in redb. Anything that
@@ -577,7 +577,7 @@ A deletion does not remove a node from a sealed graph in place. Search excludes 
 and resolves candidates against the snapshot's authoritative vector. Maintenance publishes a
 replacement that omits obsolete entries; an already-open snapshot keeps its compatible generation
 until it releases its pin.
-<!-- enforced by: vector_generation_quarantine_compaction_lock_contract::later_mutations_publish_a_new_generation_truncate_only_covered_journal_and_replay_the_suffix, vector_resource_maintenance_contract::replacement_refusal_precedes_workspace_and_keeps_the_serving_generation, vector_generation_authoritative_purge_replacement_contract::partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route, vector_generation_quarantine_compaction_lock_contract::pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_superseded_bytes, vector_partition_restart_contract::an_open_old_snapshot_and_a_later_historical_snapshot_keep_their_complete_vector_views -->
+<!-- enforced by: vector_partition_restart_contract::an_open_old_snapshot_and_a_later_historical_snapshot_keep_their_complete_vector_views -->
 
 Restart validates lightweight lifecycle metadata, keeps the last valid generation available, and
 replays only verified changes after that generation into a new mutable tail as needed. It does not
@@ -585,74 +585,21 @@ reconstruct every vector before serving the first query. A corrupt or incompatib
 is quarantined; a maintained indexed query for that layout refuses until repair, while `AUTO` may use
 exact work only within the active budget. Repair and first build run through maintenance outside the
 query path, so an older valid route and ordinary relational/graph reads remain usable.
-<!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_lazy_replay_budget_contract::first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_ceiling, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors, vector_generation_quarantine_compaction_lock_contract::newer_catalog_format_quarantines_only_that_route, vector_generation_quarantine_compaction_lock_contract::corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds, vector_generation_quarantine_compaction_lock_contract::caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart, vector_generation_quarantine_compaction_lock_contract::engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle -->
+<!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild -->
 
-Opening a store reads at most 64 records of each route's change journal, whatever the number of
-changes waiting to be indexed. Damage to a later change record is reported by the first indexed read
-or maintenance pass that touches it; until then `SHOW VECTOR_PARTITIONS` reports the route `ready`.
-From then the route is quarantined with `availability_reason = corrupt_changes`: an indexed query
-refuses with the route unavailable, `AUTO` answers exactly only within the active budget, and repair
-starts at the next engine-owned maintenance wake (every 60 seconds by default) or the next
-caller-driven cycle, and needs the memory and disk of a rebuild. No indexed answer is served from a
-damaged change record.
-<!-- enforced by: opening_a_store_does_a_bounded_vector_journal_cleanup::the_open_reads_the_same_journal_records_however_long_the_suffix_is, opening_a_store_does_a_bounded_vector_journal_cleanup::damage_past_the_first_uncovered_record_is_reported_by_the_first_indexed_read -->
+<!-- enforced by: crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_materialization_preserves_all_representations_and_snapshot_intervals, crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_refuses_inconsistent_metadata_before_body_materialization -->
 
-A logical import can carry an owned mutable vector tail across physical writer closes. Each reopen
-validates the committed generation, journal frontier, schema and store identity, then charges the
-working set to that writer; a mismatch or refused cache admission drops it and uses ordinary recovery.
-The carried tail holds no store source or lock and is released at import end, error or eviction.
-<!-- enforced by: writer_tail_reuse_is_bounded_across_physical_opens::repeated_writer_opens_reuse_tail_without_reexamining_n_or_four_n_history, writer_tail_reuse_is_bounded_across_physical_opens::another_writer_between_opens_invalidates_tail_and_its_answer_is_exact, writer_tail_reuse_is_bounded_across_physical_opens::optional_tail_never_refuses_an_open_that_fits_without_it -->
-
-Journal suffix admission and replay seek past the entire covered LSN cohort. They authenticate
-selected records without decoding already-covered history; a finite upper frontier includes every
-ordinal of its LSN, and a maximal covered frontier has an empty suffix.
-<!-- enforced by: crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::fixed_journal_suffix_selection_does_not_examine_n_or_four_n_covered_records, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::suffix_seek_includes_all_ordinals_and_excludes_later_cohorts, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::suffix_seek_still_authenticates_each_selected_record, crates/contextdb-engine/src/persistence/bounded_journal_suffix_tests.rs::both_tail_loaders_and_delete_carrier_selection_seek_past_covered_history -->
-
-Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
-Generation admission counts raw versions separately from selected live graph points at one committed
-frontier. Ordinary resident generations price and copy only their consumed frontier-live entries,
-with an optional LSN boundary for a change graph. Selection preserves every retained membership,
-MVCC interval and canonical digest, including when writes advance after the captured frontier;
-refusal precedes body copying. Tombstone metadata does not add ordinary graph points. Full cold
-snapshots and delete-only carriers retain their raw-history path; change graphs use the actual live
-delta and the existing delete-only carrier rule.
-<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::a_retained_raw_body_has_decode_scratch_even_without_live_graph_points, vector_generation_admission_contract::retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
-<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_preserves_retained_canonical_digests, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_writes, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_admits_history_below_the_full_copy_bound_and_refuses_before_bodies, crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_materialization_preserves_all_representations_and_snapshot_intervals, crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_refuses_inconsistent_metadata_before_body_materialization -->
-
-A resident partition snapshot funds its copies without a generation-owned decoder. Dormant or
-evicted raw partitions admit loader decode scratch separately; direct cold reads and delete-only
-carriers retain the generation decoder's 1 MiB serde scratch floor as well as declared-body scratch,
-even when retained history has no live graph points.
-<!-- enforced by: crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_f32_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_sq8_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_sq4_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::direct_cold_and_delete_carrier_generations_keep_the_decode_floor, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases -->
-
-Construction owns the raw snapshot, selected input and
-builder workspace; after input clones drop, encoding owns the builder and one checked codec
-envelope bound and encoder scratch. After the builder drops, the raw snapshot coexists with the
-candidate. The state digest equals the BLAKE3 hash of the canonical encoding of sorted snapshot-live entries
-(the proof checks byte identity, not streaming or peak allocation). After the raw snapshot drops, persistence
-owns the candidate and its encoding, validation and durable-write copies. Only change publication
-loads the prior base. The shared accountant atomically replaces each phase's held charge without
-exposing its capacity or charging both phases; refusal leaves the old charge intact.
-<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::streamed_state_digest_preserves_the_canonical_live_entry_encoding, vector_generation_admission_contract::encoding_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::candidate_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::growing_persistence_transitions_refuse_atomically_for_base_and_change_publication, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
-Page preparation
-retains one graph body and frames each physical key and page only during insertion. Reader-held
-old generations remain charged until their final holder releases them.
-<!-- enforced by: crates/contextdb-engine/src/persistence/generation_admission_tests.rs::near_extent_sized_page_roots_are_streamed_and_every_disk_key_is_counted, vector_generation_admission_contract::multiple_pinned_generations_remain_charged_until_their_final_snapshot_release -->
-An immutable candidate refines only its graph-page frame bound: sequential base/change page
-insertion needs the larger frame, rather than their sum, and no frame for empty graph bytes.
-The conservative constructor and payload bounds still apply.
-<!-- enforced by: crates/contextdb-engine/src/persistence/vector_streamed_frame_tests.rs::concrete_streamed_frame_covers_exact_capacities_and_root_edges, crates/contextdb-engine/src/persistence/vector_streamed_frame_tests.rs::candidate_streamed_frame_is_sequential_max_and_empty_zero, vector_generation_admission_contract::fresh_ten_thousand_dense_vectors_publish_and_restart_under_writer_limit, vector_generation_admission_contract::tiny_limit_refuses_with_typed_details_without_partial_generation -->
 Actual Redb source extents
 are admitted before allocation independently of decode/build workspace; uncached pages retain
 that charge until their final access guard drops.
 Their pages are mapped or loaded for the active working set and can be evicted when idle; an active
 query pins what it needs. When a declared `MEMORY_LIMIT` cannot admit a selected graph, idle graph
 chains are reclaimed in least-recently-used order only until the complete load fits. Without a
-declared memory limit, loaded graphs remain resident. <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_resource_maintenance_contract::unlimited_memory_keeps_loaded_graphs_warm_across_search_and_idle_maintenance, vector_resource_maintenance_contract::working_set_releases_other_partitions_before_the_next_selected_load --> A read session searching saved graphs keeps the graph pages it filled warm across repeated
+declared memory limit, loaded graphs remain resident. <!-- enforced by: vector_resource_maintenance_contract::unlimited_memory_keeps_loaded_graphs_warm_across_search_and_idle_maintenance, vector_resource_maintenance_contract::working_set_releases_other_partitions_before_the_next_selected_load --> A read session searching saved graphs keeps the graph pages it filled warm across repeated
 queries when its declared memory covers every selected graph's pages: after the first wide query,
 repeating it reads no further pages. Under a tighter declaration the selected graphs share the
 remaining memory, and a declaration too small to hold the graphs a query needs is refused with
-`MemoryBudgetExceeded` while its charge stays within the declaration. <!-- enforced by: a_wide_find_keeps_its_entry_pages_warm::repeated_wide_finds_stop_filling_pages_within_the_declared_memory, a_wide_find_keeps_its_entry_pages_warm::a_short_declaration_keeps_its_charge_and_refuses_missing_topologies --> Charged bytes are ContextDB's memory-accountant
+`MemoryBudgetExceeded` while its charge stays within the declaration.  Charged bytes are ContextDB's memory-accountant
 view, not a claim about the operating system's physical mapped pages. Disk budget covers durable
 vector and index state before a write is accepted. The memory target is the product declaration
 `SET MEMORY_LIMIT 2G`, exactly 2147483648 bytes. <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes --> Whole-process RSS, which also covers opening,
@@ -747,7 +694,7 @@ return before later partitions advance. Validation, key collection and deletion 
 every 64 records and before commit. Uncommitted cleanup aborts, temporary reservations
 release, earlier committed cleanup remains valid across restart, and the interrupted cycle receives
 no closing stamp.
-<!-- enforced by: vector_resource_maintenance_contract::refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition, vector_resource_maintenance_contract::dropping_a_sampled_vector_column_does_not_abort_cycle_closing, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservations, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_on_restart, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_frontier, crates/contextdb-engine/src/persistence/bounded_catalog_tests.rs::journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion -->
+<!-- enforced by: vector_resource_maintenance_contract::dropping_a_sampled_vector_column_does_not_abort_cycle_closing -->
 
 Public and background cycles use an admitted committed catalog inventory, separate from startup
 inspection. A caller-refused singleton body permits the root-pinned cursor to continue to siblings;
@@ -760,21 +707,7 @@ before allocation, releases partial work on refusal and retries from a fresh inv
 The cursor continues when a refused giant body follows a healthy catalog and can still discover a
 later durable-only catalog. Closing route-slot refusal preserves publication and skips removal;
 wide typed route metadata is admitted before a cold catalog lookup.
-<!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_continues_after_refused_singleton_in_every_sibling_position, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_navigation_refusal_is_terminal_and_has_no_backend_read, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_incomplete_container_sample_preserves_serving_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_sampled_route_slot_refusal_drops_partial_work_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_candidate_slot_refusal_drops_partial_work_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_closing_route_slot_refusal_preserves_publication_and_skips_removal, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_candidate_sort_heap_refusal_releases_and_retries_stably, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_cold_covered_cleanup_refusal_keeps_serving_and_closes, crates/contextdb-vector/tests/borrowed_route_metadata_adapter.rs::giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding -->
-
-Frontier metadata can reject unrelated extents through charged bounded windows; selected or
-possibly matching metadata admits the complete physical extent before backend read or decoding,
-using `prepare_vector_generation`. Generation-body admission starts after construction reservation
-succeeds. Cleanup-only journal pages use `truncate_vector_partition_journal`; catalog reclamation
-uses the preparation operation. Unknown invalid catalogs do not quarantine unrelated routes;
-miskeyed authenticated catalogs quarantine their canonical route, and raised limits retry fresh.
-<!-- enforced by: crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_catalog_extent_refuses_during_preparation_before_decode, crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_journal_extent_refuses_during_frontier_count_before_decode, crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_membership_extent_refuses_before_fallback_count_decode, crates/contextdb-engine/src/database/vector_quarantine_inventory_admission_tests.rs::missing_catalog_inventory_admits_cold_oversized_source_after_construction, crates/contextdb-engine/src/database/vector_quarantine_inventory_admission_tests.rs::corrupt_catalog_inventory_admits_cold_oversized_source_after_construction, crates/contextdb-engine/src/database/vector_source_page_admission.rs::cleanup_page_admissions_keep_typed_attribution_and_release_their_source_owner, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_small_unknown_invalid_catalog_does_not_quarantine, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_miskey_before_valid_catalog_quarantines_canonical_route, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_possible_match_blocks_until_raised_limit_retries_fresh -->
-
-A covered-journal refusal skips only that route's build and keeps its serving/catalog state while a
-sibling publishes. An incomplete `INDEXED` frontier refuses; `AUTO` uses that partition's complete
-exact fallback and preserves the sibling's indexed route. Historical raw-only routes with uncovered
-deletes remain candidates and physically clean their journals before retirement.
-<!-- enforced by: crates/contextdb-engine/src/database/vector_retry_frontier_integrity_tests.rs::cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_progress, vector_delete_only_journal_progress_contract::delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirement, vector_delete_only_journal_progress_contract::delete_only_final_route_truncates_covered_history_before_snapshot_release_can_retire_it -->
+<!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_continues_after_refused_singleton_in_every_sibling_position, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_navigation_refusal_is_terminal_and_has_no_backend_read, crates/contextdb-vector/tests/borrowed_route_metadata_adapter.rs::giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding -->
 
 **Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. Each open store prepays `ReadLimits::SHIPPED_SNAPSHOT_PIN_SLOTS` (64) pin slots. Further pins charge their exact registration bytes against the store's declared reader memory and release that charge at unpin; `pin_snapshot` returns the typed `snapshot_pin` memory refusal only when that budget cannot fund another pin. Dropping a prepaid pin returns its slot. Pin admission has no fixed count ceiling. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
 
