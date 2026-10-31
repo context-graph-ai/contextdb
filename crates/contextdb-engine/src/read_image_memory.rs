@@ -3853,7 +3853,9 @@ mod admitted_reader_tests {
         let funded = budget(1 << 20);
         let first = reader(&funded).unwrap();
         assert_eq!(funded.held.load(Ordering::SeqCst), control);
-        assert_eq!(first.held(), control);
+        // The payload counter starts at zero; the control is charged to the
+        // external budget through the native block, not to the payload.
+        assert_eq!(first.held(), 0);
         let second = first.clone();
         let third = first.clone();
         drop(first);
@@ -3874,7 +3876,12 @@ mod admitted_reader_tests {
         let refused = memory.decode_msgpack::<String>(&long);
         assert!(matches!(refused, Err(Error::MemoryBudgetExceeded { .. })));
         assert!(memory.failure.lock().is_none());
-        assert_eq!(memory.held(), control);
+        assert_eq!(memory.held(), 0, "a refused decode leaves no payload bytes");
+        assert_eq!(
+            funded.held.load(Ordering::SeqCst),
+            control,
+            "the admitted control stays charged until the last holder is dropped"
+        );
         let malformed = memory.decode_msgpack::<String>(&[0xc1]);
         match malformed {
             Err(Error::SyncError(text)) => assert_eq!(text, ADMITTED_CODEC_ERROR),
