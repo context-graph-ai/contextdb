@@ -20,6 +20,10 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
 }
 
+#[cfg(test)]
+pub(crate) static NATIVE_COMPANION_COLLECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) enum Selector<'a> {
     Prefix(&'a str),
     Group(&'a str),
@@ -111,12 +115,33 @@ impl Source<'_> {
         Ok(())
     }
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn same_text(
+    earlier: &NativeSelectionHold<NativeBuffer>,
+    next: &NativeSelectionHold<NativeBuffer>,
+) -> Selected<bool> {
+    let (earlier, next) = (earlier.as_slice(), next.as_slice());
+    if earlier.len() != next.len() {
+        return Ok(false);
+    }
+    for (earlier, next) in earlier.iter().zip(next) {
+        if earlier.text()? != next.text()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 impl Source<'_> {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn collect(&self, selectors: &[Selector<'_>]) -> Selected<NativeCustodySelection> {
+        #[cfg(test)]
+        NATIVE_COMPANION_COLLECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if selectors
             .iter()
             .any(|selector| matches!(selector, Selector::Group(_)))
@@ -145,14 +170,17 @@ impl Source<'_> {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn validate_companions(&self, selection: &NativeCustodySelection) -> Selected<()> {
+        // Members of one submission name the same companions at this one pinned
+        // root, so a run of them collects those companions once; each member
+        // still verifies against them.
+        let mut collected = None;
         for selected in selection.windows() {
             let view = selected.view()?;
             let record = view.record()?;
             let owner = self.operation.owner();
             let mut text = NativeSelectionHold::try_new(&owner, 2)?;
-            let mut selectors = NativeSelectionHold::try_new(&owner, 2)?;
             match record {
-                RecordView::Control(_) => selectors.retain(Selector::Group("authority"))?,
+                RecordView::Control(_) => {}
                 RecordView::Terminal { record: t, .. } => {
                     text.retain(NativeBuffer::format(
                         &owner,
@@ -193,15 +221,35 @@ impl Source<'_> {
                 }
                 _ => continue,
             }
-            for key in text.as_slice() {
-                let key = key.text()?;
-                selectors.retain(if key.starts_with("delivery_") {
-                    Selector::Prefix(key)
-                } else {
-                    Selector::Group(key)
-                })?;
+            let unchanged = match &collected {
+                Some((earlier, _)) => same_text(earlier, &text)?,
+                None => false,
+            };
+            if unchanged {
+                drop(text);
+            } else {
+                // The earlier companions return their funds before these exist.
+                collected = None;
+                let companions = {
+                    let mut selectors = NativeSelectionHold::try_new(&owner, 2)?;
+                    if text.as_slice().is_empty() {
+                        selectors.retain(Selector::Group("authority"))?;
+                    }
+                    for key in text.as_slice() {
+                        let key = key.text()?;
+                        selectors.retain(if key.starts_with("delivery_") {
+                            Selector::Prefix(key)
+                        } else {
+                            Selector::Group(key)
+                        })?;
+                    }
+                    self.collect(selectors.as_slice())?
+                };
+                collected = Some((text, companions));
             }
-            let companions = self.collect(selectors.as_slice())?;
+            let Some((_, companions)) = &collected else {
+                return Err(Invalid::Canonical.into());
+            };
             let mut views = NativeSelectionHold::try_new(&owner, companions.windows().len())?;
             for window in companions.windows() {
                 views.retain(window.view()?)?;

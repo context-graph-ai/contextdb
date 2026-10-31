@@ -1623,6 +1623,36 @@ async fn an_inspection_checks_a_signature_every_manifest_shares_once() {
     );
 }
 
+// A submission's members name the same companions at one pinned root, so a
+// larger outcome collects them no more often. Collecting them once per member
+// made page selection quadratic in the outcome's size, and a 150-member outcome
+// ran past the transport's request timeout.
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_larger_outcome_collects_its_companions_no_more_often() {
+    use crate::database::native_custody_selection::NATIVE_COMPANION_COLLECTS;
+    async fn collects(members: usize) -> u64 {
+        let hub = IrohHub::start_seeded(
+            crate::vector_read_memory::ReadRequestProvider::native(Arc::new(
+                PerRequestProvider::new(LIMIT),
+            )),
+            None,
+            members,
+        )
+        .await;
+        let before = NATIVE_COMPANION_COLLECTS.load(std::sync::atomic::Ordering::Relaxed);
+        let fetched = within(hub.client.fetch_delivery_outcomes(None))
+            .await
+            .expect("the outcomes");
+        assert_eq!(fetched.len(), 4);
+        let collects =
+            NATIVE_COMPANION_COLLECTS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        hub.stop().await;
+        collects
+    }
+    assert_eq!(collects(4).await, collects(16).await);
+}
+
 // Iroh native path charges: the request body is read straight into the
 // operation's admitted allocation and the reply writer rides inside the paid
 // finish callback, so both are on the request parent while selection runs and
@@ -3968,8 +3998,7 @@ impl crate::vector_read_memory::NativeReadRequestBudgetProvider for PerRequestPr
 // page whose excluded next candidate is the large outcome is built from its
 // fitting outcome alone and succeeds, the large outcome is counted but never
 // built, and as the first outcome of its own page it refuses with the typed
-// page-byte limit, never a memory refusal from building it. Run in release:
-// a debug build verifies the large outcome slower than the request timeout.
+// page-byte limit, never a memory refusal from building it.
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_page_that_fits_is_built_alone_before_a_much_larger_excluded_outcome() {
