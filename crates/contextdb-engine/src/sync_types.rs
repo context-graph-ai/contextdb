@@ -19,7 +19,6 @@ pub enum SchemaSyncCapability {
     VectorPartitioning,
     VectorSearchMode,
     VectorAutoIndexAt,
-    VectorHnswPolicy,
     MaintainedIndexCounts,
 }
 
@@ -45,24 +44,6 @@ pub(crate) fn schema_capabilities_in_columns(
         if column.auto_index_at.is_some() {
             capabilities.insert(SchemaSyncCapability::VectorAutoIndexAt);
         }
-        if column.search_target_accuracy_hundredths.is_some()
-            || column.search_expected_vectors.is_some()
-            || column.ivf_lists.is_some()
-            || column.ivf_probes.is_some()
-            || column.ivf_refine_factor_hundredths.is_some()
-            || column.vector_engine_policy != contextdb_core::VectorEnginePolicy::default()
-            || column.hnsw_m.is_some()
-            || column.flat_below.is_some()
-            || column.auto_expansion_ceiling.is_some()
-            || column.hnsw_search_radius_millionths.is_some()
-            || column.hnsw_ef_construction.is_some()
-            || column.hnsw_ef_search.is_some()
-            || column.consolidation_change_percent.is_some()
-            || column.consolidation_tombstone_percent.is_some()
-            || column.consolidation_disabled
-        {
-            capabilities.insert(SchemaSyncCapability::VectorHnswPolicy);
-        }
     }
     capabilities
 }
@@ -73,7 +54,6 @@ impl std::fmt::Display for SchemaSyncCapability {
             Self::VectorPartitioning => "vector partitioning",
             Self::VectorSearchMode => "declared vector search mode",
             Self::VectorAutoIndexAt => "declared vector AUTO_INDEX_AT policy",
-            Self::VectorHnswPolicy => "declared vector HNSW policy",
             Self::MaintainedIndexCounts => "declared maintained index-prefix counts",
         })
     }

@@ -3081,10 +3081,6 @@ impl Database {
             );
             let mut next = old.clone();
             Self::apply_sync_alter_to_projected_table_meta(name, &mut next, incoming, constraints);
-            // The existing exhaustive comparator checks every remaining field.
-            for (before, after) in old.columns.iter().zip(&mut next.columns) {
-                after.hnsw_ef_search = before.hnsw_ef_search;
-            }
             if !crate::executor::metadata_equal_except_consolidation(old, &next) {
                 return Ok(false);
             }

@@ -1267,7 +1267,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         aggregate_allowed_vectors: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         partition_routes: &[contextdb_vector::VectorPartitionSearchTrace],
-        used_hnsw: bool,
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
 
@@ -2665,7 +2664,6 @@ impl ReadExecutionTarget for Database {
         aggregate_allowed_vectors: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         partition_routes: &[contextdb_vector::VectorPartitionSearchTrace],
-        used_hnsw: bool,
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
 
@@ -2685,7 +2683,6 @@ impl ReadExecutionTarget for Database {
             aggregate_allowed_vectors,
             groups,
             partition_routes,
-            used_hnsw,
             fallback_reason,
             budget_receipt,
             vector_copy_owner,
@@ -5219,9 +5216,6 @@ fn execute_create_table_plan(
 
 // Exhaustive destructuring makes every new metadata field a compile-time
 // classification decision. Only explicitly selected policy fields may bypass projection.
-fn metadata_equal_except_ef_search(old: &TableMeta, new: &TableMeta) -> bool {
-    metadata_equal_by_column(old, new, column_equal_except_ef_search)
-}
 
 pub(crate) fn metadata_equal_except_consolidation(old: &TableMeta, new: &TableMeta) -> bool {
     metadata_equal_by_column(old, new, column_equal_except_consolidation)
@@ -5302,114 +5296,6 @@ fn metadata_equal_by_column(
             .all(|(old, new)| equal(old, new))
 }
 
-fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
-    let ColumnDef {
-        name: old_name,
-        column_type: old_column_type,
-        nullable: old_nullable,
-        primary_key: old_primary_key,
-        unique: old_unique,
-        default: old_default,
-        references: old_references,
-        expires: old_expires,
-        immutable: old_immutable,
-        quantization: old_quantization,
-        rank_policy: old_rank_policy,
-        context_id: old_context_id,
-        scope_label: old_scope_label,
-        acl_ref: old_acl_ref,
-        partition_key_columns: old_partition_key_columns,
-        max_partitions: old_max_partitions,
-        search_mode: old_search_mode,
-        auto_index_at: old_auto_index_at,
-        flat_below: old_flat_below,
-        auto_expansion_ceiling: old_auto_expansion_ceiling,
-        hnsw_m: old_hnsw_m,
-        hnsw_ef_construction: old_hnsw_ef_construction,
-        hnsw_ef_search: _,
-        hnsw_search_radius_millionths: old_hnsw_search_radius_millionths,
-        vector_policy_revision: old_vector_policy_revision,
-        consolidation_change_percent: old_consolidation_change_percent,
-        consolidation_tombstone_percent: old_consolidation_tombstone_percent,
-        consolidation_disabled: old_consolidation_disabled,
-        search_target_accuracy_hundredths: old_search_target_accuracy_hundredths,
-        search_expected_vectors: old_search_expected_vectors,
-        ivf_lists: old_ivf_lists,
-        ivf_probes: old_ivf_probes,
-        ivf_refine_factor_hundredths: old_ivf_refine_factor_hundredths,
-        vector_engine_policy: old_vector_engine_policy,
-    } = old;
-    let ColumnDef {
-        name: new_name,
-        column_type: new_column_type,
-        nullable: new_nullable,
-        primary_key: new_primary_key,
-        unique: new_unique,
-        default: new_default,
-        references: new_references,
-        expires: new_expires,
-        immutable: new_immutable,
-        quantization: new_quantization,
-        rank_policy: new_rank_policy,
-        context_id: new_context_id,
-        scope_label: new_scope_label,
-        acl_ref: new_acl_ref,
-        partition_key_columns: new_partition_key_columns,
-        max_partitions: new_max_partitions,
-        search_mode: new_search_mode,
-        auto_index_at: new_auto_index_at,
-        flat_below: new_flat_below,
-        auto_expansion_ceiling: new_auto_expansion_ceiling,
-        hnsw_m: new_hnsw_m,
-        hnsw_ef_construction: new_hnsw_ef_construction,
-        hnsw_ef_search: _,
-        hnsw_search_radius_millionths: new_hnsw_search_radius_millionths,
-        vector_policy_revision: new_vector_policy_revision,
-        consolidation_change_percent: new_consolidation_change_percent,
-        consolidation_tombstone_percent: new_consolidation_tombstone_percent,
-        consolidation_disabled: new_consolidation_disabled,
-        search_target_accuracy_hundredths: new_search_target_accuracy_hundredths,
-        search_expected_vectors: new_search_expected_vectors,
-        ivf_lists: new_ivf_lists,
-        ivf_probes: new_ivf_probes,
-        ivf_refine_factor_hundredths: new_ivf_refine_factor_hundredths,
-        vector_engine_policy: new_vector_engine_policy,
-    } = new;
-    old_search_target_accuracy_hundredths == new_search_target_accuracy_hundredths
-        && old_search_expected_vectors == new_search_expected_vectors
-        && old_ivf_lists == new_ivf_lists
-        && old_ivf_probes == new_ivf_probes
-        && old_ivf_refine_factor_hundredths == new_ivf_refine_factor_hundredths
-        && old_vector_engine_policy == new_vector_engine_policy
-        && old_name == new_name
-        && old_column_type == new_column_type
-        && old_nullable == new_nullable
-        && old_primary_key == new_primary_key
-        && old_unique == new_unique
-        && old_default == new_default
-        && old_references == new_references
-        && old_expires == new_expires
-        && old_immutable == new_immutable
-        && old_quantization == new_quantization
-        && old_rank_policy == new_rank_policy
-        && old_context_id == new_context_id
-        && old_scope_label == new_scope_label
-        && old_acl_ref == new_acl_ref
-        && old_partition_key_columns == new_partition_key_columns
-        && old_max_partitions == new_max_partitions
-        && old_search_mode == new_search_mode
-        && old_auto_index_at == new_auto_index_at
-        && old_flat_below == new_flat_below
-        && old_auto_expansion_ceiling == new_auto_expansion_ceiling
-        && old_hnsw_m == new_hnsw_m
-        && old_hnsw_ef_construction == new_hnsw_ef_construction
-        && old_hnsw_search_radius_millionths == new_hnsw_search_radius_millionths
-        && old_vector_policy_revision == new_vector_policy_revision
-        && old_consolidation_change_percent == new_consolidation_change_percent
-        && old_consolidation_tombstone_percent == new_consolidation_tombstone_percent
-        && old_consolidation_disabled == new_consolidation_disabled
-}
-
 fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
     let ColumnDef {
         name: old_name,
@@ -5432,10 +5318,6 @@ fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
         auto_index_at: old_auto_index_at,
         flat_below: old_flat_below,
         auto_expansion_ceiling: old_auto_expansion_ceiling,
-        hnsw_m: old_hnsw_m,
-        hnsw_ef_construction: old_hnsw_ef_construction,
-        hnsw_ef_search: old_hnsw_ef_search,
-        hnsw_search_radius_millionths: old_hnsw_search_radius_millionths,
         vector_policy_revision: old_vector_policy_revision,
         consolidation_change_percent: _,
         consolidation_tombstone_percent: _,
@@ -5468,10 +5350,6 @@ fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
         auto_index_at: new_auto_index_at,
         flat_below: new_flat_below,
         auto_expansion_ceiling: new_auto_expansion_ceiling,
-        hnsw_m: new_hnsw_m,
-        hnsw_ef_construction: new_hnsw_ef_construction,
-        hnsw_ef_search: new_hnsw_ef_search,
-        hnsw_search_radius_millionths: new_hnsw_search_radius_millionths,
         vector_policy_revision: new_vector_policy_revision,
         consolidation_change_percent: _,
         consolidation_tombstone_percent: _,
@@ -5509,10 +5387,6 @@ fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
         && old_auto_index_at == new_auto_index_at
         && old_flat_below == new_flat_below
         && old_auto_expansion_ceiling == new_auto_expansion_ceiling
-        && old_hnsw_m == new_hnsw_m
-        && old_hnsw_ef_construction == new_hnsw_ef_construction
-        && old_hnsw_ef_search == new_hnsw_ef_search
-        && old_hnsw_search_radius_millionths == new_hnsw_search_radius_millionths
         && old_vector_policy_revision == new_vector_policy_revision
 }
 
@@ -6230,17 +6104,6 @@ fn execute_alter_table_plan(
             vector_layout_update = Some(VectorIndexRef::new(&p.table, column));
             metadata_only_projection = Some((old_meta, table_meta));
         }
-        AlterAction::SetVectorHnsw { column, hnsw } => {
-            let old_meta = db
-                .table_meta(&p.table)
-                .ok_or_else(|| Error::Other((format!("table '{}' not found", p.table)).into()))?;
-            refuse_engine_owned_reserved_name_column_alter(&p.table)?;
-            let mut table_meta = old_meta.clone();
-            set_vector_hnsw(&p.table, column, hnsw.as_ref(), &mut table_meta)?;
-            validate_vector_partition_declarations(&p.table, &table_meta)?;
-            vector_layout_update = Some(VectorIndexRef::new(p.table.clone(), column.clone()));
-            metadata_only_projection = Some((old_meta, table_meta));
-        }
         AlterAction::SetVectorConsolidation {
             column,
             consolidation,
@@ -6473,17 +6336,14 @@ fn execute_alter_table_plan(
                     read_memory.clone(),
                 )?;
             }
-            // Classify the resolved declaration, not the partial SET HNSW AST:
-            // DEFAULT can also clear topology or radius. Restatements still
-            // author a DDL occurrence even when the effective breadth is equal.
+            // Restatements still author a DDL occurrence even when the
+            // effective breadth is equal.
             let consolidation_only =
                 matches!(&p.action, AlterAction::SetVectorConsolidation { .. })
                     && metadata_equal_except_consolidation(&old_meta, &projected_meta);
-            let ef_search_only = matches!(&p.action, AlterAction::SetVectorHnsw { .. })
-                && metadata_equal_except_ef_search(&old_meta, &projected_meta);
             if tx.is_none()
                 && db.allows_local_vector_policy_metadata_publication()
-                && (ef_search_only || consolidation_only)
+                && consolidation_only
             {
                 let index = vector_layout_update
                     .as_ref()
@@ -7223,7 +7083,6 @@ fn execute_plan_with_working_state(
                 if forced_exact_for_relational_fallback {
                     mark_filtered_exact_route(&mut route_trace);
                 }
-                let used_hnsw = route_trace.used_hnsw;
                 drop(_vector_memory);
                 let schema_columns = db.table_meta(table).map(|meta| {
                     meta.columns
@@ -7255,11 +7114,7 @@ fn execute_plan_with_working_state(
                     })
                     .collect();
                 let mut trace = vector_search_trace_with_source(
-                    if used_hnsw {
-                        "HNSWSearch"
-                    } else {
-                        "VectorSearch"
-                    },
+                    "VectorSearch",
                     candidate_trace,
                     query_vector_source,
                 );
@@ -7321,7 +7176,6 @@ fn execute_plan_with_working_state(
             if forced_exact_for_relational_fallback {
                 mark_filtered_exact_route(&mut route_trace);
             }
-            let used_hnsw = route_trace.used_hnsw;
             drop(_vector_memory);
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
@@ -7376,11 +7230,7 @@ fn execute_plan_with_working_state(
                 .collect();
 
             let mut trace = vector_search_trace_with_source(
-                if used_hnsw {
-                    "HNSWSearch"
-                } else {
-                    "VectorSearch"
-                },
+                "VectorSearch",
                 candidate_trace,
                 query_vector_source,
             );
@@ -20209,7 +20059,6 @@ fn column_def_matches_canonical(
         auto_index_at,
         auto_expansion_ceiling,
         flat_below,
-        hnsw,
         consolidation,
         rank_policy,
         context_id,
@@ -20240,7 +20089,6 @@ fn column_def_matches_canonical(
         && *auto_index_at == canonical.auto_index_at
         && *auto_expansion_ceiling == canonical.auto_expansion_ceiling
         && *flat_below == canonical.flat_below
-        && *hnsw == canonical.hnsw
         && *consolidation == canonical.consolidation
         && rank_policy.is_none()
         && canonical.rank_policy.is_none()
@@ -21702,9 +21550,6 @@ pub(crate) fn core_column_from_ast(
         max_partitions,
         search_mode,
         auto_index_at,
-        hnsw_m,
-        hnsw_ef_construction,
-        hnsw_ef_search,
         consolidation_change_percent,
         consolidation_tombstone_percent,
         consolidation_disabled,
@@ -21767,15 +21612,6 @@ pub(crate) fn core_column_from_ast(
             .as_deref()
             .map(|raw| parse_vector_flat_below(table, &col.name, raw))
             .transpose()?,
-        hnsw_m,
-        hnsw_ef_construction,
-        hnsw_ef_search,
-        hnsw_search_radius_millionths: match col.hnsw.search_radius.as_ref() {
-            Some(contextdb_parser::ast::VectorPolicyValue::Value(raw)) => {
-                Some(parse_vector_search_radius(table, &col.name, raw)?)
-            }
-            _ => None,
-        },
         vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
         consolidation_change_percent,
         consolidation_tombstone_percent,
@@ -21836,22 +21672,6 @@ fn ast_column_from_core(col: contextdb_core::ColumnDef) -> contextdb_parser::ast
         auto_index_at: col.auto_index_at.map(|value| value.to_string()),
         auto_expansion_ceiling: col.auto_expansion_ceiling.map(|value| value.to_string()),
         flat_below: col.flat_below.map(|value| value.to_string()),
-        hnsw: contextdb_parser::ast::VectorHnswOptions {
-            search_radius: col.hnsw_search_radius_millionths.map(|value| {
-                contextdb_parser::ast::VectorPolicyValue::Value(
-                    contextdb_core::render_search_radius_millionths(value),
-                )
-            }),
-            m: col
-                .hnsw_m
-                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
-            ef_construction: col
-                .hnsw_ef_construction
-                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
-            ef_search: col
-                .hnsw_ef_search
-                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
-        },
         consolidation: contextdb_parser::ast::VectorConsolidationOptions {
             change_percent: col
                 .consolidation_change_percent
@@ -21993,45 +21813,16 @@ fn parse_vector_auto_expansion_ceiling(table: &str, column: &str, raw: &str) -> 
     }
 }
 
-/// HNSW `SEARCH_RADIUS` takes a decimal from 0 through 2 with at most six
-/// decimal places, held exactly in millionths.
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn parse_vector_search_radius(table: &str, column: &str, raw: &str) -> Result<u32> {
-    contextdb_core::parse_search_radius_millionths(raw).ok_or_else(|| {
-        invalid_vector_policy_declaration(
-            table,
-            column,
-            contextdb_core::VectorPolicyDeclarationIssue::SearchRadiusOutOfRange,
-        )
-    })
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn parse_vector_policy_u32(
-    table: &str,
-    column: &str,
-    raw: &str,
-    auto_index_at: bool,
-) -> Result<u32> {
+fn parse_vector_policy_u32(table: &str, column: &str, raw: &str) -> Result<u32> {
     use contextdb_core::VectorPolicyDeclarationIssue as Issue;
 
     let raw = raw.trim();
-    let not_positive = if auto_index_at {
-        Issue::AutoIndexAtNotPositive
-    } else {
-        Issue::HnswValueNotPositive
-    };
-    let out_of_range = if auto_index_at {
-        Issue::AutoIndexAtOutOfRange
-    } else {
-        Issue::HnswValueOutOfRange
-    };
+    let not_positive = Issue::AutoIndexAtNotPositive;
+    let out_of_range = Issue::AutoIndexAtOutOfRange;
     if raw.starts_with('-') {
         return Err(invalid_vector_policy_declaration(
             table,
@@ -22052,23 +21843,6 @@ fn parse_vector_policy_u32(
             column,
             out_of_range,
         )),
-    }
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn parsed_hnsw_member(
-    table: &str,
-    column: &str,
-    member: Option<&contextdb_parser::ast::VectorPolicyValue>,
-) -> Result<Option<u32>> {
-    match member {
-        None | Some(contextdb_parser::ast::VectorPolicyValue::Default) => Ok(None),
-        Some(contextdb_parser::ast::VectorPolicyValue::Value(raw)) => {
-            parse_vector_policy_u32(table, column, raw, false).map(Some)
-        }
     }
 }
 
@@ -22097,50 +21871,10 @@ fn parsed_consolidation_member(
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn validate_resolved_hnsw_policy(
-    table: &str,
-    column: &str,
-    quantization: contextdb_core::VectorQuantization,
-    hnsw_m: Option<u32>,
-    hnsw_ef_construction: Option<u32>,
-    hnsw_ef_search: Option<u32>,
-) -> Result<()> {
-    let layout = contextdb_vector::store::VectorIndexLayout::new(
-        1,
-        quantization,
-        Vec::new(),
-        None,
-        contextdb_core::VectorSearchMode::Auto,
-    )
-    .with_policy(
-        None,
-        hnsw_m,
-        hnsw_ef_construction,
-        hnsw_ef_search,
-        contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
-    );
-    if layout.hnsw_policy_is_valid() {
-        Ok(())
-    } else {
-        Err(invalid_vector_policy_declaration(
-            table,
-            column,
-            contextdb_core::VectorPolicyDeclarationIssue::EfConstructionBelowM,
-        ))
-    }
-}
-
 type NormalizedAstVectorDeclaration = (
     Option<Vec<String>>,
     Option<u32>,
     contextdb_core::VectorSearchMode,
-    Option<u32>,
-    Option<u32>,
-    Option<u32>,
     Option<u32>,
     Option<u32>,
     Option<u32>,
@@ -22161,7 +21895,6 @@ fn normalized_ast_vector_declaration(
     let has_policy_clause = col.auto_index_at.is_some()
         || col.auto_expansion_ceiling.is_some()
         || col.flat_below.is_some()
-        || col.hnsw != contextdb_parser::ast::VectorHnswOptions::default()
         || col.consolidation != contextdb_parser::ast::VectorConsolidationOptions::default();
     if !matches!(col.data_type, DataType::Vector(_)) {
         if has_policy_clause {
@@ -22182,9 +21915,6 @@ fn normalized_ast_vector_declaration(
             None,
             None,
             contextdb_core::VectorSearchMode::Auto,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -22216,12 +21946,8 @@ fn normalized_ast_vector_declaration(
     let auto_index_at = col
         .auto_index_at
         .as_deref()
-        .map(|raw| parse_vector_policy_u32(table, &col.name, raw, true))
+        .map(|raw| parse_vector_policy_u32(table, &col.name, raw))
         .transpose()?;
-    let hnsw_m = parsed_hnsw_member(table, &col.name, col.hnsw.m.as_ref())?;
-    let hnsw_ef_construction =
-        parsed_hnsw_member(table, &col.name, col.hnsw.ef_construction.as_ref())?;
-    let hnsw_ef_search = parsed_hnsw_member(table, &col.name, col.hnsw.ef_search.as_ref())?;
     let consolidation_change_percent =
         parsed_consolidation_member(table, &col.name, col.consolidation.change_percent.as_ref())?;
     let consolidation_tombstone_percent = parsed_consolidation_member(
@@ -22230,22 +21956,11 @@ fn normalized_ast_vector_declaration(
         col.consolidation.tombstone_percent.as_ref(),
     )?;
     let consolidation_disabled = col.consolidation.disabled;
-    validate_resolved_hnsw_policy(
-        table,
-        &col.name,
-        map_vector_quantization(col.quantization),
-        hnsw_m,
-        hnsw_ef_construction,
-        hnsw_ef_search,
-    )?;
     Ok((
         partition_key_columns,
         max_partitions,
         search_mode,
         auto_index_at,
-        hnsw_m,
-        hnsw_ef_construction,
-        hnsw_ef_search,
         consolidation_change_percent,
         consolidation_tombstone_percent,
         consolidation_disabled,
@@ -22293,10 +22008,6 @@ pub(crate) fn validate_vector_partition_declarations(table: &str, meta: &TableMe
                 || vector.auto_index_at.is_some()
                 || vector.flat_below.is_some()
                 || vector.auto_expansion_ceiling.is_some()
-                || vector.hnsw_search_radius_millionths.is_some()
-                || vector.hnsw_m.is_some()
-                || vector.hnsw_ef_construction.is_some()
-                || vector.hnsw_ef_search.is_some()
                 || vector.consolidation_change_percent.is_some()
                 || vector.consolidation_tombstone_percent.is_some()
                 || vector.consolidation_disabled
@@ -22317,24 +22028,6 @@ pub(crate) fn validate_vector_partition_declarations(table: &str, meta: &TableMe
                 contextdb_core::VectorPolicyDeclarationIssue::AutoIndexAtNotPositive,
             ));
         }
-        if vector.hnsw_m == Some(0)
-            || vector.hnsw_ef_construction == Some(0)
-            || vector.hnsw_ef_search == Some(0)
-        {
-            return Err(invalid_vector_policy_declaration(
-                table,
-                &vector.name,
-                contextdb_core::VectorPolicyDeclarationIssue::HnswValueNotPositive,
-            ));
-        }
-        validate_resolved_hnsw_policy(
-            table,
-            &vector.name,
-            vector.quantization,
-            vector.hnsw_m,
-            vector.hnsw_ef_construction,
-            vector.hnsw_ef_search,
-        )?;
         if vector
             .consolidation_change_percent
             .is_some_and(|value| !(1..=100).contains(&value))
@@ -22549,7 +22242,7 @@ pub(crate) fn set_vector_auto_index_at(
         ));
     }
     vector.auto_index_at = raw
-        .map(|raw| parse_vector_policy_u32(table, column, raw, true))
+        .map(|raw| parse_vector_policy_u32(table, column, raw))
         .transpose()?;
     Ok(())
 }
@@ -22613,81 +22306,6 @@ pub(crate) fn set_vector_flat_below(
     vector.flat_below = raw
         .map(|raw| parse_vector_flat_below(table, column, raw))
         .transpose()?;
-    Ok(())
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(crate) fn set_vector_hnsw(
-    table: &str,
-    column: &str,
-    changes: Option<&contextdb_parser::ast::VectorHnswOptions>,
-    meta: &mut TableMeta,
-) -> Result<()> {
-    let vector = meta
-        .columns
-        .iter_mut()
-        .find(|candidate| candidate.name == column)
-        .ok_or_else(|| Error::ColumnNotFound {
-            table: table.to_owned(),
-            column: column.to_owned(),
-        })?;
-    if !matches!(vector.column_type, ColumnType::Vector(_)) {
-        return Err(invalid_vector_policy_declaration(
-            table,
-            column,
-            contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
-        ));
-    }
-
-    let old_topology = (vector.hnsw_m, vector.hnsw_ef_construction);
-    match changes {
-        None => {
-            vector.hnsw_m = None;
-            vector.hnsw_ef_construction = None;
-            vector.hnsw_ef_search = None;
-            vector.hnsw_search_radius_millionths = None;
-        }
-        Some(changes) => {
-            if let Some(member) = changes.m.as_ref() {
-                vector.hnsw_m = parsed_hnsw_member(table, column, Some(member))?;
-            }
-            if let Some(member) = changes.ef_construction.as_ref() {
-                vector.hnsw_ef_construction = parsed_hnsw_member(table, column, Some(member))?;
-            }
-            if let Some(member) = changes.ef_search.as_ref() {
-                vector.hnsw_ef_search = parsed_hnsw_member(table, column, Some(member))?;
-            }
-            if let Some(member) = changes.search_radius.as_ref() {
-                vector.hnsw_search_radius_millionths = match member {
-                    contextdb_parser::ast::VectorPolicyValue::Value(raw) => {
-                        Some(parse_vector_search_radius(table, column, raw)?)
-                    }
-                    contextdb_parser::ast::VectorPolicyValue::Default => None,
-                };
-            }
-        }
-    }
-    validate_resolved_hnsw_policy(
-        table,
-        column,
-        vector.quantization,
-        vector.hnsw_m,
-        vector.hnsw_ef_construction,
-        vector.hnsw_ef_search,
-    )?;
-    if old_topology != (vector.hnsw_m, vector.hnsw_ef_construction) {
-        vector.vector_policy_revision = next_vector_policy_revision(vector.vector_policy_revision)
-            .ok_or_else(|| {
-                invalid_vector_policy_declaration(
-                    table,
-                    column,
-                    contextdb_core::VectorPolicyDeclarationIssue::HnswValueOutOfRange,
-                )
-            })?;
-    }
     Ok(())
 }
 
@@ -23921,7 +23539,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         aggregate_allowed_vectors: usize,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         partition_routes: &[contextdb_vector::VectorPartitionSearchTrace],
-        used_hnsw: bool,
         fallback_reason: Option<&'static str>,
         budget_receipt: Option<contextdb_vector::mem::VectorSearchBudgetReceipt>,
 
@@ -23940,7 +23557,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             aggregate_allowed_vectors,
             groups,
             partition_routes,
-            used_hnsw,
             fallback_reason,
             budget_receipt,
             vector_copy_owner,

@@ -2851,7 +2851,6 @@ impl SchemaCapabilities {
             SchemaSyncCapability::VectorPartitioning,
             SchemaSyncCapability::VectorSearchMode,
             SchemaSyncCapability::VectorAutoIndexAt,
-            SchemaSyncCapability::VectorHnswPolicy,
             SchemaSyncCapability::MaintainedIndexCounts,
         ]
         .into_iter()

@@ -4052,7 +4052,6 @@ struct VectorState {
     ranked_container_bytes: usize,
     output: VecDeque<PulledRow>,
     output_container_bytes: usize,
-    used_hnsw: bool,
     /// What this handle's own open transaction changes about the vectors this
     /// search can see. `None` whenever no transaction is open or it has
     /// touched nothing about this index -- which is every read of a committed
@@ -4335,23 +4334,7 @@ impl PullNode {
             PullKind::Scan(state) => state.next(db, context),
             PullKind::Graph(state) => state.next(db, context),
             PullKind::Vector(state) => {
-                let next = state.next(db, context, &mut self.trace);
-                if state.used_hnsw {
-                    // Runs on every row, so it has to say the same thing the
-                    // second time it runs as the first. A catch-all that
-                    // rewrote the label to the bare operator dropped the
-                    // candidate source on the row after the one that earned
-                    // the upgrade, which is how a read that scanned a table
-                    // before searching it came back describing no scan at
-                    // all. A label already upgraded is left exactly as it is.
-                    self.trace.physical_plan = match self.trace.physical_plan {
-                        "IndexScan -> VectorSearch" => "IndexScan -> HNSWSearch",
-                        "Scan -> VectorSearch" => "Scan -> HNSWSearch",
-                        "VectorSearch" => "HNSWSearch",
-                        already_named => already_named,
-                    };
-                }
-                next
+                state.next(db, context, &mut self.trace)
             }
             PullKind::Project(state) => state.next(db, context),
             PullKind::Sort(state) => state.next(db, context),
@@ -10253,7 +10236,6 @@ impl VectorState {
                 aggregate_allowed_vectors,
                 groups,
                 trace.partition_routes(),
-                trace.used_hnsw(),
                 trace.fallback_reason(),
                 trace.budget_receipt(),
                 vector_copy_owner,
@@ -11115,7 +11097,7 @@ impl VectorState {
                             None => Ok(true),
                         };
                         let ranked_limit = self.sort_key.as_ref().map(|_| self.k);
-                        let search = || context.with_vector_copies(|vector_copy_owner| {
+                        let mut search = || context.with_vector_copies(|vector_copy_owner| {
                             db.bounded_vector_search(
                                 &self.index,
                                 parameter_query_vector(&self.query_expr, &self.params)
@@ -17044,7 +17026,6 @@ fn build_vector_kernel<'plan>(
             ranked_container_bytes: 0,
             output: VecDeque::new(),
             output_container_bytes: 0,
-            used_hnsw: false,
             vector_overlay,
             overlay_bytes,
         })),

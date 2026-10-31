@@ -1546,15 +1546,6 @@ impl Database {
                         )
                         .ok()?;
                     }
-                    AlterAction::SetVectorHnsw { column, hnsw } => {
-                        crate::executor::set_vector_hnsw(
-                            &at.table,
-                            column,
-                            hnsw.as_ref(),
-                            &mut meta,
-                        )
-                        .ok()?;
-                    }
                     AlterAction::SetVectorConsolidation {
                         column,
                         consolidation,

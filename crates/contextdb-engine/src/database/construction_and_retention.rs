@@ -1158,21 +1158,12 @@ pub(crate) fn vector_index_layout_from_column(column: &ColumnDef) -> Option<Vect
             column.effective_max_partitions(),
             column.search_mode,
         )
-        .with_policy(
-            column.auto_index_at,
-            column.hnsw_m,
-            column.hnsw_ef_construction,
-            column.hnsw_ef_search,
-            column.vector_policy_revision,
-        )
+        .with_policy(column.auto_index_at, column.vector_policy_revision)
         .with_consolidation_policy(
             column.consolidation_change_percent,
             column.consolidation_tombstone_percent,
         )
-        .with_consolidation_disabled(column.consolidation_disabled)
-        .with_flat_below(column.flat_below)
-        .with_auto_expansion_ceiling(column.auto_expansion_ceiling)
-        .with_search_radius_millionths(column.hnsw_search_radius_millionths),
+        .with_consolidation_disabled(column.consolidation_disabled),
     )
 }
 

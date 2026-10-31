@@ -5746,13 +5746,6 @@ impl Database {
             .with_index_layout(index, |layout| layout.quantization.storage_bytes(dimension))
     }
 
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_last_query_vector_used_hnsw_for_test(&self) -> bool {
-        let _operation = self.assert_open_operation();
-        self.last_vector_search_used_hnsw.load(Ordering::SeqCst)
-    }
-
     /// Borrow the current trace's receipt and original payer without copying its payload.
     #[doc(hidden)]
     #[cfg(feature = "test-seams")]

@@ -125,22 +125,6 @@ impl std::fmt::Display for MetadataQuoted<'_> {
         Ok(())
     }
 }
-struct MetadataRadius(u32);
-impl std::fmt::Display for MetadataRadius {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "{}", self.0 / 1_000_000)?;
-        let mut fraction = self.0 % 1_000_000;
-        if fraction != 0 {
-            let mut width = 6;
-            while fraction.is_multiple_of(10) {
-                fraction /= 10;
-                width -= 1;
-            }
-            write!(out, ".{fraction:0width$}")?;
-        }
-        Ok(())
-    }
-}
 pub(crate) struct MetadataColumn<'a>(
     pub(crate) &'a contextdb_core::ColumnDef,
     pub(crate) &'a [contextdb_core::PropagationRule],
@@ -176,26 +160,6 @@ impl std::fmt::Display for MetadataColumn<'_> {
                 write!(out, " FLAT_BELOW {value}")?;
             }
             write!(out, "{}", crate::database::vector_ivf::policy::Groups(col))?;
-            let mut first = true;
-            for (name, value) in [
-                ("M", col.hnsw_m),
-                ("EF_CONSTRUCTION", col.hnsw_ef_construction),
-                ("EF_SEARCH", col.hnsw_ef_search),
-            ] {
-                if let Some(value) = value {
-                    out.write_str(if first { " HNSW (" } else { ", " })?;
-                    first = false;
-                    write!(out, "{name} = {value}")?;
-                }
-            }
-            if let Some(value) = col.hnsw_search_radius_millionths {
-                out.write_str(if first { " HNSW (" } else { ", " })?;
-                first = false;
-                write!(out, "SEARCH_RADIUS = {}", MetadataRadius(value))?;
-            }
-            if !first {
-                out.write_str(")")?;
-            }
             if col.consolidation_disabled {
                 out.write_str(" CONSOLIDATION NONE")?;
             } else {

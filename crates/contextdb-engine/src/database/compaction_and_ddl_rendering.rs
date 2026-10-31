@@ -1664,47 +1664,7 @@ pub(super) fn append_ast_vector_declaration(
         ty.push_str(&format!(" FLAT_BELOW {flat_below}"));
     }
     ty.push_str(&crate::database::vector_ivf::policy::AstGroups(col).to_string());
-    append_ast_hnsw_declaration(ty, &col.hnsw);
     append_ast_consolidation_declaration(ty, &col.consolidation);
-}
-
-pub(super) fn append_ast_hnsw_declaration(
-    ty: &mut String,
-    policy: &contextdb_parser::ast::VectorHnswOptions,
-) {
-    let render =
-        |name: &str, value: &Option<contextdb_parser::ast::VectorPolicyValue>| -> Option<String> {
-            match value.as_ref()? {
-                contextdb_parser::ast::VectorPolicyValue::Default => None,
-                contextdb_parser::ast::VectorPolicyValue::Value(value) => {
-                    let value = value
-                        .parse::<u32>()
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|_| value.clone());
-                    Some(format!("{name} = {value}"))
-                }
-            }
-        };
-    let members = [
-        render("M", &policy.m),
-        render("EF_CONSTRUCTION", &policy.ef_construction),
-        render("EF_SEARCH", &policy.ef_search),
-        match policy.search_radius.as_ref() {
-            Some(contextdb_parser::ast::VectorPolicyValue::Value(value)) => Some(format!(
-                "SEARCH_RADIUS = {}",
-                contextdb_core::parse_search_radius_millionths(value)
-                    .map(contextdb_core::render_search_radius_millionths)
-                    .unwrap_or_else(|| value.clone())
-            )),
-            _ => None,
-        },
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    if !members.is_empty() {
-        ty.push_str(&format!(" HNSW ({})", members.join(", ")));
-    }
 }
 
 pub(super) fn append_ast_consolidation_declaration(
@@ -2218,37 +2178,21 @@ pub(super) fn merge_sync_alter_existing_column(current: &mut ColumnDef, incoming
         // A synced ALTER carries that moment's full column declaration, so an
         // absent policy member means "no longer declared" and clears the
         // receiver's override, exactly as `SET ... DEFAULT` does locally.
-        let previous_topology = (current.hnsw_m, current.hnsw_ef_construction);
         current.partition_key_columns = incoming.partition_key_columns.clone();
         current.max_partitions = incoming.max_partitions;
         current.search_mode = incoming.search_mode;
         current.auto_index_at = incoming.auto_index_at;
         current.flat_below = incoming.flat_below;
         current.auto_expansion_ceiling = incoming.auto_expansion_ceiling;
-        current.hnsw_search_radius_millionths = incoming.hnsw_search_radius_millionths;
         current.search_target_accuracy_hundredths = incoming.search_target_accuracy_hundredths;
         current.search_expected_vectors = incoming.search_expected_vectors;
         current.ivf_lists = incoming.ivf_lists;
         current.ivf_probes = incoming.ivf_probes;
         current.ivf_refine_factor_hundredths = incoming.ivf_refine_factor_hundredths;
         current.vector_engine_policy = incoming.vector_engine_policy;
-        current.hnsw_m = incoming.hnsw_m;
-        current.hnsw_ef_construction = incoming.hnsw_ef_construction;
-        current.hnsw_ef_search = incoming.hnsw_ef_search;
         current.consolidation_change_percent = incoming.consolidation_change_percent;
         current.consolidation_tombstone_percent = incoming.consolidation_tombstone_percent;
         current.consolidation_disabled = incoming.consolidation_disabled;
-        // The receiver owns its own revision counter: the wire carries
-        // rendered SQL, not a revision, so `incoming.vector_policy_revision`
-        // is always the default and is never copied. Advance on exactly the
-        // axes the local ALTER door advances on, which schedules the
-        // receiver's own bounded replacement build.
-        if previous_topology != (current.hnsw_m, current.hnsw_ef_construction)
-            && let Some(next) =
-                crate::executor::next_vector_policy_revision(current.vector_policy_revision)
-        {
-            current.vector_policy_revision = next;
-        }
     }
     if incoming.primary_key {
         current.primary_key = true;
@@ -2864,10 +2808,6 @@ pub(crate) fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
         auto_index_at: None,
         flat_below: None,
         auto_expansion_ceiling: None,
-        hnsw_m: None,
-        hnsw_ef_construction: None,
-        hnsw_ef_search: None,
-        hnsw_search_radius_millionths: None,
         vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
         consolidation_change_percent: None,
         consolidation_tombstone_percent: None,
