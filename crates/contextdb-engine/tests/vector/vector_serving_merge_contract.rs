@@ -840,12 +840,16 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
-    struct Distances(AtomicUsize, AtomicUsize);
+    struct Distances(AtomicUsize, AtomicUsize, AtomicUsize);
     impl NativeIvfSealObserver for Distances {
         fn observe(&self, event: NativeIvfSealEvent<'_>) {
             if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
                 self.1
                     .fetch_add(work.exact_score_count as usize, Ordering::SeqCst);
+                self.2.fetch_add(
+                    (work.centroid_evaluations + work.quantized_evaluations) as usize,
+                    Ordering::SeqCst,
+                );
                 self.0.fetch_add(
                     (work.centroid_evaluations
                         + work.quantized_evaluations
@@ -995,7 +999,10 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                     "current membership bounds graph distance work"
                 );
             } else {
-                assert_eq!(distances.0.load(Ordering::SeqCst), 0);
+                // AUTO compares the allowed current rows exactly: it scores exactly
+                // that membership and walks no clustered index.
+                assert_eq!(distances.1.load(Ordering::SeqCst), 32);
+                assert_eq!(distances.2.load(Ordering::SeqCst), 0);
             }
             let request = bounded::BoundedReadRequest::new(
                 &sql,

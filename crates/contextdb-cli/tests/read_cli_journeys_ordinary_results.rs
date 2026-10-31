@@ -875,11 +875,39 @@ fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_rou
             .is_some_and(|bytes| bytes > 0),
         "the read-only catalog exposes the durable graph: {reader_inspection_row}"
     );
+    // Independent metadata-only control: a store with the same declarations and
+    // committed vectors whose index was never published charges only the index
+    // metadata. Opening the saved image must charge exactly that, never the body.
+    let control_store = auto_vector_store(1_024);
+    let control = run(
+        &[control_store.path_str(), "--json"],
+        "SHOW VECTOR_INDEXES;\n",
+    );
+    assert_eq!(
+        control.code,
+        Some(0),
+        "the unpublished control inspects.\n{}",
+        control.describe()
+    );
+    let control_inspection_row = inspection_row_for(&result_documents(&control));
+    assert_eq!(
+        control_inspection_row["durable_index_bytes"],
+        serde_json::Value::Null,
+        "the control has no published index: {control_inspection_row}"
+    );
+    assert_eq!(
+        reader_inspection_row["charged_index_bytes"], control_inspection_row["charged_index_bytes"],
+        "opening the committed image registers only the index metadata; it must not load the index body. \
+         control={control_inspection_row} reader={reader_inspection_row}"
+    );
+    assert_eq!(
+        reader_inspection_row["charged_index_bytes"], writer_inspection_row["charged_index_bytes"],
+        "both doors charge the same index metadata: writer={writer_inspection_row} reader={reader_inspection_row}"
+    );
     assert!(
         reader_inspection_row["charged_index_bytes"].as_i64()
-            < writer_inspection_row["charged_index_bytes"].as_i64(),
-        "opening the committed image registers only the durable descriptor; it must not load the graph body. \
-         writer={writer_inspection_row} reader={reader_inspection_row}"
+            < reader_inspection_row["durable_index_bytes"].as_i64(),
+        "the charge stays below the durable index it describes: {reader_inspection_row}"
     );
 
     let vector_results = |documents: &[serde_json::Value]| {
