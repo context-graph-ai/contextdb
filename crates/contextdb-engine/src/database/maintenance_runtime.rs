@@ -521,39 +521,6 @@ impl MaintenanceContext {
         publish_direct_metadata(&self.tx_mgr, write)
     }
 
-    /// T2 for maintenance: the covered journal prefix is removed one bounded
-    /// committed step at a time, each under its own commit-lock hold, so a
-    /// write admitted while a backlog remains commits between steps instead
-    /// of waiting for the whole cleanup. `decode` installs the decode owner a
-    /// step runs under, if the caller has one.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn truncate_vector_journal_in_published_steps(
-        &self,
-        persistence: &RedbPersistence,
-        catalog: &VectorPartitionGenerationCatalogRecord,
-        workspace: &mut contextdb_vector::VectorWorkspaceReservation,
-        mut decode: impl FnMut() -> Result<Option<crate::read_image_memory::ImageMemoryScope>>,
-    ) -> Result<bool> {
-        loop {
-            let (complete, removed) = self.publish_direct_metadata(|| {
-                let _decode = decode()?;
-                persistence.truncate_vector_partition_journal_step_with_checkpoint(
-                    catalog,
-                    workspace,
-                    || self.build_checkpoint(),
-                )
-            })?;
-            if complete || removed == 0 {
-                return Ok(complete);
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            maybe_pause_between_vector_journal_cleanup_steps_for_test();
-            self.build_checkpoint()?;
-        }
-    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -662,229 +629,6 @@ impl MaintenanceContext {
             hint: "Reduce retained file-backed data or raise DISK_LIMIT before writing more data."
                 .into(),
         })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg(test)]
-    pub(super) fn retry_one_vector_journal_truncation(
-        &self,
-        persistence: &RedbPersistence,
-        catalog: &VectorPartitionGenerationCatalogRecord,
-    ) -> Result<()> {
-        vector_source_page_admission::with_source_page_admission(
-            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-            || {
-                self.retry_one_vector_journal_truncation_with_source_admission(persistence, catalog)
-            },
-        )
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg(test)]
-    pub(super) fn retry_one_vector_journal_truncation_with_source_admission(
-        &self,
-        persistence: &RedbPersistence,
-        catalog: &VectorPartitionGenerationCatalogRecord,
-    ) -> Result<()> {
-        let mut cleanup_workspace = self.vector.reserve_workspace_static(
-            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-            0,
-            "truncate_vector_partition_journal",
-            "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before cleaning this maintained route.",
-        )?;
-        self.retry_one_vector_journal_truncation_in_workspace(
-            persistence,
-            catalog,
-            &mut cleanup_workspace,
-        )
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn retry_one_vector_journal_truncation_in_workspace(
-        &self,
-        persistence: &RedbPersistence,
-        catalog: &VectorPartitionGenerationCatalogRecord,
-        cleanup_workspace: &mut contextdb_vector::VectorWorkspaceReservation,
-    ) -> Result<()> {
-        self.truncate_vector_journal_in_published_steps(
-            persistence,
-            catalog,
-            cleanup_workspace,
-            || Ok(None),
-        )
-        .map(|_| ())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn retry_vector_journal_truncations(
-        &self,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<VectorJournalCleanupRetryOutcome> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        self.build_checkpoint()?;
-        let persistence = &self.persistence;
-        let stream = self.maintenance_catalog_stream()?;
-        #[cfg(test)]
-        vector_journal_cleanup_cancellation_tests::after_inventory_capture_for_test(
-            stream.lazy_cursor_memory_ownership_for_test(),
-        );
-        self.build_checkpoint()?;
-        let mut outcome = VectorJournalCleanupRetryOutcome {
-            first_failure_details: None,
-            failed_partitions: FailedMaintenancePartitions::default(),
-        };
-        let mut terminal = None;
-        let inventory = self.visit_maintenance_catalog_stream(stream, |entry| {
-          let retain = (|| {
-            if terminal.is_some() {
-                return false;
-            }
-            if let Err(error) = self.build_checkpoint() {
-                terminal = Some(error);
-                return false;
-            }
-            let catalog = &entry.catalog;
-            let mut route_memory =
-                crate::memory_accounting::OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
-            let heap = RedbPersistence::maintenance_vector_catalog_heap_bytes(catalog);
-            let route_admission = route_memory.try_grow_for(
-                heap,
-                "vector_maintenance",
-                "prepare_vector_generation",
-                "Raise MEMORY_LIMIT before inspecting this maintained route.",
-            );
-            let retry = route_admission.and_then(|()| {
-                let partition =
-                    VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone());
-                let partition_state_present = self.tx_mgr.with_commit_lock(|| {
-                    self.vector
-                        .try_partition_state(&partition.index, &partition.partition_key)
-                        .is_some_and(|state| !state.source_maintenance_metadata().historical_only)
-                });
-                let selected = catalog.change.unwrap_or(catalog.base).generation_id;
-                let installed = self
-                    .vector
-                    .partition_graph_generation_status(&partition)
-                    .is_some_and(|status| {
-                        [
-                            status.base,
-                            status.change,
-                            status.dormant_base,
-                            status.dormant_change,
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .any(|generation| generation.generation_id == selected)
-                    });
-                // The same catalog workspace funds route keys before the
-                // identity probe; pending cleanup keeps its early operation.
-                entry.workspace.resize(
-                    heap.saturating_add(RedbPersistence::vector_journal_cleanup_key_reservation(
-                        &catalog.index,
-                        &catalog.partition_key,
-                    )),
-                    if entry.pending_cleanup {
-                        "truncate_vector_partition_journal"
-                    } else {
-                        "prepare_vector_generation"
-                    },
-                    "Raise MEMORY_LIMIT before inspecting this maintained route.",
-                )?;
-                let cleanup_only = !partition_state_present
-                    || installed
-                    || self.vector.partition_route_quarantine(&partition).is_some();
-                let covered = if cleanup_only {
-                    vector_source_page_admission::with_preparation_source_page_admission(
-                        crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                        || persistence.vector_partition_has_covered_journal_records(catalog),
-                    )
-                } else {
-                    Ok(true)
-                };
-                let completed = match covered {
-                    Ok(false) => Ok(()),
-                    Err(
-                        error @ (Error::MemoryBudgetExceeded { .. }
-                        | Error::ReadCancelled
-                        | Error::PublicationInterrupted),
-                    ) => Err(error),
-                    _ => {
-                        let retry = || {
-                            self.retry_one_vector_journal_truncation_in_workspace(
-                                persistence,
-                                catalog,
-                                &mut entry.workspace,
-                            )
-                        };
-                        if cleanup_only {
-                            vector_source_page_admission::with_journal_cleanup_source_page_admission(
-                                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                                retry,
-                            )
-                        } else {
-                            vector_source_page_admission::with_source_page_admission(
-                                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                                retry,
-                            )
-                        }
-                    }
-                };
-                if completed.is_ok() && partition_state_present {
-                    self.vector.clear_partition_maintenance_failure(&partition)?;
-                }
-                completed
-            });
-            #[cfg(test)]
-            vector_journal_cleanup_cancellation_tests::after_retry_for_test(catalog);
-            // A completed T2 stays committed, but a stop must reach the
-            // caller before a later route or the cycle's closing work starts.
-            let retry = self.build_checkpoint().and(retry);
-            match retry {
-                Ok(()) => false,
-                Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
-                    terminal = Some(error);
-                    false
-                }
-                Err(error) => {
-                    let details =
-                        VectorMaintenanceFailureDetails::from_published_cleanup_error(&error);
-                    self.record_catalog_metadata_failure(catalog, details);
-                    outcome.first_failure_details.get_or_insert(details);
-                    // Cleanup locals are gone. Retain only this authenticated
-                    // catalog's actual heap; its route blocks a build this cycle.
-                    if let Err(shrink_error) = entry.workspace.resize(
-                        heap,
-                        "truncate_vector_partition_journal",
-                        "Raise MEMORY_LIMIT before cleaning this maintained route.",
-                    ) {
-                        terminal = Some(shrink_error);
-                    }
-                    true
-                }
-            }
-          })();
-          Ok(retain)
-        })?;
-        outcome.first_failure_details = outcome.first_failure_details.or(inventory.failures.first);
-        if let Some(error) = terminal {
-            return Err(error);
-        }
-        outcome.failed_partitions.inventory = Some(inventory);
-        outcome.failed_partitions.sources = Some(Arc::clone(&self.vector));
-        Ok(outcome)
     }
 
     pub(super) fn file_bytes(&self) -> Option<u64> {
@@ -1947,7 +1691,6 @@ impl MaintenanceContext {
     /// does run.
     pub(super) fn vector_partition_retirement_is_possible(&self) -> bool {
         self.vector.has_snapshot_free_retirement_candidate()
-            || self.vector.has_retired_graph_generations()
             || self
                 .snapshot_registry
                 .no_snapshots_besides_construction_floors()
@@ -1960,94 +1703,27 @@ impl MaintenanceContext {
     pub(super) fn retire_snapshot_free_vector_partitions(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<MaintenanceMetadataFailures> {
+    ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let mut maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
         if !self.vector_partition_retirement_is_possible() {
-            return Ok(MaintenanceMetadataFailures::default());
+            return Ok(());
         }
-        self.tx_mgr.with_maintenance_publication(|publication| {
+        self.tx_mgr.with_maintenance_publication(|_publication| {
             #[cfg(any(test, feature = "test-seams"))]
             self.snapshot_free_retirement_pass_count
                 .fetch_add(1, Ordering::SeqCst);
             let active_removal_pass = self
                 .snapshot_registry
                 .begin_vector_removal_pass(self.tx_mgr.current_tx_max());
-            let registered = active_removal_pass.registered_snapshots();
-            // This is a fresh authenticated sample inside the removal boundary,
-            // before any catalog-driven removal or resident retirement.
-            let (mut inventory, mut retired) =
-                self.reclaim_closing_source_graphs_locked(registered)?;
-            if !inventory.complete {
-                return Ok(inventory.failures);
-            }
-            retired = retired.saturating_add(self.vector.retire_snapshot_free_partition_states(
-                registered,
-                self.finalization.accountant.as_ref(),
+            self.vector.retire_snapshot_free_partition_states(
+                active_removal_pass.registered_snapshots(),
                 &mut maintenance_vector_copy_owner,
-            )?);
-            if registered.is_empty() || retired != 0 {
-                self.reclaim_catalogs_locked(
-                    &mut inventory,
-                    publication,
-                    active_removal_pass.registered_snapshots(),
-                )?;
-            }
-            Ok(inventory.failures)
+            )?;
+            Ok(())
         })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn reclaim_snapshot_free_vector_graphs(
-        &self,
-    ) -> Result<MaintenanceMetadataFailures> {
-        if !self.vector.has_retired_graph_generations() {
-            return Ok(MaintenanceMetadataFailures::default());
-        }
-        self.tx_mgr.with_maintenance_publication(|publication| {
-            let active_removal_pass = self
-                .snapshot_registry
-                .begin_vector_removal_pass(self.tx_mgr.current_tx_max());
-            let (mut inventory, reclaimed) = self
-                .reclaim_closing_source_graphs_locked(active_removal_pass.registered_snapshots())?;
-            if !inventory.complete {
-                return Ok(inventory.failures);
-            }
-            if reclaimed != 0 {
-                self.reclaim_catalogs_locked(
-                    &mut inventory,
-                    publication,
-                    active_removal_pass.registered_snapshots(),
-                )?;
-            }
-            Ok(inventory.failures)
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn vector_partitions_requiring_build(&self) -> Result<MaintenanceBuildCandidates> {
-        self.maintenance_build_candidates()
-    }
-
-    /// Metadata workspace a maintained route admits before it inspects its
-    /// catalog or frontier: route keys, decoded count metadata and bounded
-    /// catalog clones. It owns no vector body.
-    pub(super) fn vector_route_inventory_bytes(partition: &VectorPartitionRef) -> usize {
-        partition
-            .partition_key
-            .estimated_bytes()
-            .saturating_add(partition.index.table.len())
-            .saturating_add(partition.index.column.len())
-            .saturating_add(1024)
-            .saturating_mul(64)
     }
 
     #[expect(
@@ -2072,140 +1748,13 @@ impl MaintenanceContext {
         crate::memory_accounting::observe_inherited_process_ceiling();
         let mut maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
-        // Release obsolete graphs before another partition allocates its
-        // replacement. Pending route/journal work still forbids retiring the
-        // route itself; the snapshot guard independently protects old graphs.
-        let mut cycle_failures = self.reclaim_snapshot_free_vector_graphs()?;
-        match self.reclaim_paged_vector_storage() {
-            Ok(()) => {}
-            Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
-                return Err(error);
-            }
-            Err(error) => {
-                cycle_failures
-                    .first
-                    .get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
-            }
-        }
-        // Idempotent T2 retry never clears or rebuilds a healthy route. Newer
-        // journal suffix records remain outside each catalog's covered LSN. A
-        // local retry refusal is retained in the report while the rest of the
-        // fixed cycle continues.
-        let VectorJournalCleanupRetryOutcome {
-            first_failure_details: cleanup_retry_failure,
-            failed_partitions: cleanup_retry_failed_partitions,
-        } = self.retry_vector_journal_truncations(read_memory.clone())?;
-        cycle_failures.first = cycle_failures.first.or(cleanup_retry_failure);
         let pruning = self.run_pruning_within_cycle(read_memory.clone())?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;
-        let currency = match self.run_currency(gate, read_memory.clone()) {
-            Ok(report) => report,
-            Err(error @ Error::MemoryBudgetExceeded { .. }) if cycle_failures.first.is_some() => {
-                let details = VectorMaintenanceFailureDetails::from_error(&error);
-                CurrencyCompactionReport {
-                    first_failure: Some(details.failure),
-                    first_failure_details: Some(details),
-                    ..CurrencyCompactionReport::default()
-                }
-            }
-            Err(error) => return Err(error),
-        };
-        let candidate_sample = Some(self.vector_partitions_requiring_build()?);
-        if let Some(sample) = candidate_sample.as_ref() {
-            cycle_failures.first = cycle_failures.first.or(sample.failures.first);
-        }
-        let pending_vector_partitions = candidate_sample
-            .as_ref()
-            .map(|sample| sample.candidates.as_slice())
-            .unwrap_or(&[]);
-        // An unpublished paged build keeps advancing even when this cycle's
-        // sampled inventory does not select its route.
-        let unselected_paged_builds = self.unselected_paged_builds(pending_vector_partitions)?;
-        // Step 41 deletes this selection with the graph bodies below it.
-        let graph_route_store = Some(&self.persistence);
-        let mut vector = if graph_route_store.is_some() {
-            self.run_native_vector_cycle(read_memory.clone())?
-        } else if !pending_vector_partitions.is_empty() || !unselected_paged_builds.is_empty() {
-            // File-backed construction publishes through the durable catalog
-            // first. Building a separate process-only graph here let the
-            // writer call the route ready while a reader of the same
-            // committed store still saw `initial_build`.
-            let mut built_partitions = 0usize;
-            let mut built_indexes = HashSet::new();
-            let mut first_failure_details = cycle_failures.first;
-            for partition in pending_vector_partitions
-                .iter()
-                .map(|candidate| &candidate.partition)
-                .chain(unselected_paged_builds.iter())
-            {
-                if cleanup_retry_failed_partitions.contains(partition) {
-                    continue;
-                }
-                let outcome =
-                    match self.persist_built_vector_partition(partition, read_memory.clone()) {
-                        Ok(outcome) => outcome,
-                        Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
-                            return Err(error);
-                        }
-                        Err(error) => {
-                            self.vector
-                                .record_partition_maintenance_error(partition, &error)?;
-                            first_failure_details.get_or_insert_with(|| {
-                                VectorMaintenanceFailureDetails::from_error(&error)
-                            });
-                            continue;
-                        }
-                    };
-                if let Some(failure) = outcome.cleanup_failure {
-                    first_failure_details.get_or_insert(failure);
-                }
-                // A repair can make its replacement catalog durable while the
-                // worker is being stopped. Keep that publication authoritative,
-                // but observe the stop before counting success or beginning any
-                // later reclamation, retirement, compaction, or cycle stamping.
-                self.build_checkpoint()?;
-                if !outcome.published {
-                    continue;
-                }
-                built_partitions = built_partitions.saturating_add(1);
-                built_indexes.insert(partition.index.clone());
-                first_failure_details =
-                    first_failure_details.or(self.reclaim_snapshot_free_vector_graphs()?.first);
-            }
-            let mut report = self.vector.hnsw_maintenance_status();
-            report.built_partitions = built_partitions;
-            report.built_indexes = built_indexes.len();
-            report.first_failure = first_failure_details.map(|details| details.failure);
-            report.first_failure_details = first_failure_details;
-            report
-        } else if graph_route_store.is_some() {
-            let mut report = self.vector.hnsw_maintenance_status();
-            let first_failure_details = cycle_failures.first.or(report.first_failure_details);
-            report.first_failure = first_failure_details.map(|details| details.failure);
-            report.first_failure_details = first_failure_details;
-            report
-        } else {
-            self.vector.run_hnsw_maintenance_cycle_with(
-                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-                &mut || self.build_checkpoint(),
-                &mut maintenance_vector_copy_owner,
-            )?
-        };
-        // A replacement first publishes the prior graph as a retired snapshot
-        // chain. Reclaim only after publication, under the registry's removal
-        // guard, so active readers keep that route and unselected generations
-        // do not linger until another maintenance wake.
-        vector.first_failure_details = cycle_failures.first.or(vector.first_failure_details);
-        vector.first_failure_details = vector
-            .first_failure_details
-            .or(self.reclaim_snapshot_free_vector_graphs()?.first);
+        let currency = self.run_currency(gate, read_memory.clone())?;
+        let mut vector = self.run_native_vector_cycle(read_memory.clone())?;
         // Retirement is independent of whether another partition had work,
-        // but follows this wake's durable generation publications. That lets
-        // a delete-only route first represent and truncate its final journal
-        // prefix, then releases it even while a sibling keeps producing work.
-        vector.first_failure_details = vector.first_failure_details.or(self
-            .retire_snapshot_free_vector_partitions(read_memory.clone())?
-            .first);
+        // but follows this wake's durable publications.
+        self.retire_snapshot_free_vector_partitions(read_memory.clone())?;
         vector.first_failure = vector.first_failure_details.map(|details| details.failure);
         // Reclaim the deferred-free backlog before compaction, so compaction sees the free space.
         self.reclaim_deferred_storage()?;

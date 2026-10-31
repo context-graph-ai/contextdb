@@ -703,12 +703,6 @@ impl RedbPersistence {
             Self::f32_witness_index(ws, partition_mutations, &vector_quantization, |bytes| {
                 frame.reserve(bytes)
             })?;
-        let prepared_local_erasure_vector_generations = options
-            .local_erasure
-            .as_ref()
-            .map(|erasure| self.prepare_authoritative_purge_vector_generations(erasure.projection))
-            .transpose()?
-            .unwrap_or_default();
         for (key, value) in schema_ddl
             .event_bus
             .into_iter()
@@ -1736,10 +1730,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                 self.apply_local_erasure(
                     &write_txn,
                     erasure.projection,
-                    &prepared_local_erasure_vector_generations,
                     None,
-                    erasure.accountant.clone(),
-                    erasure.operation,
                     has_discard_history.then_some(&frame),
                 )?;
             }
@@ -2312,16 +2303,6 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 }
 
                 if stage.replace_vectors {
-                    // Authenticate the old fixed inputs while their raw bodies and
-                    // source companions still belong to the committed image.
-                    let previous = db.begin_read().map_err(Self::storage_error)?;
-                    self.reconcile_paged_builds_for_image_in_write(
-                        &write_txn,
-                        partition_image.as_ref().expect("prepared vector image"),
-                        &previous,
-                        stage,
-                        Some(&frame),
-                    )?;
                     self.remove_vector_entries_matching_in_write(&write_txn, &|index| {
                         stage.affected_tables.contains(&index.table)
                     })?;

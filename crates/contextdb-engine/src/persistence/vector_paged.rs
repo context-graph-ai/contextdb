@@ -103,6 +103,76 @@ impl CapturedPagedRoot {
 }
 
 impl RedbPersistence {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn admit_vector_image_build_route(
+        &self,
+        key: &[u8],
+        stored_bytes: usize,
+    ) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
+        self.prepare_proof_owner()?;
+        Self::admit_vector_image_build_route_with_owner(self.proof_accountant(), key, stored_bytes)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn admit_vector_image_build_route_with_owner(
+        accountant: Option<crate::memory_accounting::AccountantHandle>,
+        key: &[u8],
+        stored_bytes: usize,
+    ) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
+        if stored_bytes != 0 && accountant.is_none() {
+            return Err(corruption(
+                "vector image record has no operation memory owner",
+            ));
+        }
+        accountant
+            .map(|accountant| {
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    accountant,
+                    key.len()
+                        .saturating_add(stored_bytes)
+                        .saturating_mul(64)
+                        .saturating_add(8192),
+                    "vector",
+                    "replace_vector_image_build",
+                    "Raise MEMORY_LIMIT to reconcile vector construction with this image.",
+                )
+            })
+            .transpose()
+    }
+
+    /// Writer serving readers capture the published writer snapshot.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn set_paged_root_capture<R: Into<WriterSnapshotHandle> + 'static>(
+        &self,
+        capture: Arc<dyn Fn() -> Result<R> + Send + Sync>,
+        scoped_capture: ScopedWriterRootCapture,
+    ) {
+        let _ = self.scoped_vector_root_capture.set(scoped_capture);
+        let capture: PagedRootCapture =
+            Arc::new(move || CapturedPagedRoot::from_writer(capture()?.into()));
+        let _ = self.paged_root_capture.set(capture);
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn paged_root_capture(&self) -> Result<PagedRootCapture> {
+        self.paged_root_capture
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::Other("paged vector serving has no captured writer root".into()))
+    }
+
     /// The first durable construction floor after `after`, in key order,
     /// from its own read.
     #[expect(

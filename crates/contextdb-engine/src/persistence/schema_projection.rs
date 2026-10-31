@@ -1803,9 +1803,6 @@ impl RedbPersistence {
                     .insert(Self::meta_key(name).as_str(), encoded.bytes.as_slice())
                     .map_err(Self::storage_error)?;
             }
-            for (from, to) in &vector_renames {
-                self.rename_vector_partition_generation_index_in_write(&write, from, to)?;
-            }
             vector_membership_pages::ensure_declared_routes(
                 &write,
                 name,
@@ -3257,10 +3254,7 @@ impl RedbPersistence {
         tables: &HashSet<String>,
         lsn: Lsn,
     ) -> Result<()> {
-        let accountant =
-            crate::memory_accounting::persistence_original_projection(original.original)?
-                .as_handle();
-        self.prepare_vector_partition_image_replacement_in_write(write, tables, accountant)?;
+        self.prepare_vector_partition_image_replacement_in_write(write, tables)?;
         let mut ordinal = 0_u64;
         self.visit_complete_vector_image_memberships(
             write,

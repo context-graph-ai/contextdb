@@ -3086,7 +3086,6 @@ impl RedbPersistence {
         &self,
         write_txn: &redb::WriteTransaction,
         affected_tables: &HashSet<String>,
-        accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<()> {
         self.prepare_proof_owner()?;
         let matches = |index: &VectorIndexRef| affected_tables.contains(&index.table);
@@ -3108,29 +3107,6 @@ impl RedbPersistence {
             VectorPartitionRecordKind::Tombstone,
             &matches,
         )?;
-        self.remove_vector_partition_records_matching_in_write::<VectorPartitionBaseGenerationRecord>(
-            write_txn,
-            VECTOR_PARTITION_BASE_GENERATION_TABLE,
-            VectorPartitionRecordKind::BaseGeneration,
-            &matches,
-        )?;
-        self.remove_vector_partition_records_matching_in_write::<VectorPartitionChangeGenerationRecord>(
-            write_txn,
-            VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
-            VectorPartitionRecordKind::ChangeGeneration,
-            &matches,
-        )?;
-        self.remove_vector_partition_records_matching_in_write::<VectorPartitionGenerationCatalogRecord>(
-            write_txn,
-            VECTOR_PARTITION_GENERATION_CATALOG_TABLE,
-            VectorPartitionRecordKind::GenerationCatalog,
-            &matches,
-        )?;
-        self.remove_vector_partition_graph_pages_matching_in_write(
-            write_txn,
-            Some(accountant.clone()),
-            &matches,
-        )?;
         for table in affected_tables {
             vector_membership_pages::remove_routes_matching(
                 write_txn,
@@ -3139,9 +3115,6 @@ impl RedbPersistence {
                 self.proof_accountant(),
             )?;
         }
-        // Seed surviving fixed frontiers before replaying membership transitions,
-        // so the rebuilt candidate counts include exactly post-frontier changes.
-        self.seed_paged_image_frontiers_in_write(write_txn, affected_tables, accountant)?;
         Ok(())
     }
 }

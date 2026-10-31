@@ -34,7 +34,6 @@ mod vector_generation_decode_owner_tests;
 mod vector_import_tail;
 #[cfg(test)]
 mod vector_journal_cleanup_cancellation_tests;
-mod vector_maintenance_inventory;
 #[cfg(all(test, feature = "test-seams"))]
 mod vector_public_cycle_admission_tests;
 #[cfg(test)]
@@ -56,9 +55,6 @@ pub(crate) mod writer_ownership_receipt;
 pub(crate) mod writer_read;
 #[cfg(test)]
 mod writer_row_charge_tests;
-use vector_maintenance_inventory::{
-    FailedMaintenancePartitions, MaintenanceBuildCandidates, MaintenanceMetadataFailures,
-};
 // Compare held units even before their first custody outcome.
 mod custody_incumbent;
 pub(crate) mod discard;
@@ -79,13 +75,9 @@ use crate::executor::{
 };
 use crate::memory_accounting::{MemoryAccountant, OwnedMemoryReservation, WriterBudget};
 use crate::persistence::{
-    AuthoritativePurgePersistenceProjection,
-    LocalSchemaPersistenceProjection, ReadOnlyVectorGenerationSource,
-    ReceivedSchemaPersistenceProjection, RedbPersistence, VectorPartitionBaseGenerationRecord,
-    VectorPartitionChangeGenerationRecord, VectorPartitionGenerationCandidate,
-    VectorPartitionGenerationCatalogRecord, VectorPartitionGenerationDescriptor,
-    VectorPartitionGraphBytes, VectorPartitionMembershipRecord, VectorPartitionVersionIdentity,
-    VectorPartitionVersionSelector,
+    AuthoritativePurgePersistenceProjection, LocalSchemaPersistenceProjection,
+    ReceivedSchemaPersistenceProjection, RedbPersistence, VectorPartitionMembershipRecord,
+    VectorPartitionVersionIdentity, VectorPartitionVersionSelector,
 };
 use crate::persistent_store::PersistentCompositeStore;
 use crate::plugin::{
@@ -103,7 +95,6 @@ use crate::read_session::{
     ReadSessionTestObserver,
 };
 use crate::schema_enforcer::validate_dml;
-use contextdb_vector::store::VectorServingPolicy;
 
 /// The pathname that names a throwaway database rather than a file.
 const MEMORY_DATABASE_PATH: &str = ":memory:";
@@ -223,17 +214,13 @@ use contextdb_tx::{
     RelationalDeletePredicate, TransactionManager, WriteSet, WriteSetApplicator,
     row_matches_delete_predicates,
 };
-#[cfg(any(test, feature = "test-seams"))]
-use contextdb_vector::HnswGraphStats;
 use contextdb_vector::store::{
-    DormantRawVectorLoader, DormantRawVectorPartition, DormantVectorGraphGeneration,
-    DormantVectorGraphLoader, DormantVectorLoadRequest, LoadedRawVectorCandidate,
-    LoadedRawVectorPartition, LoadedVectorFreshTail, LoadedVectorGraphGeneration,
-    RawVectorBodyScan, RawVectorDirectoryEntry, VectorGraphGeneration, VectorPartitionRef,
-    VectorRouteQuarantineReason,
+    DormantRawVectorLoader, DormantRawVectorPartition, DormantVectorLoadRequest,
+    LoadedRawVectorCandidate, LoadedRawVectorPartition, RawVectorBodyScan,
+    RawVectorDirectoryEntry, VectorPartitionRef,
 };
 use contextdb_vector::{
-    HnswIndex, MemVectorExecutor, MemoryBudget, PartitionedVectorEntry, PreparedVectorPublication,
+    MemVectorExecutor, MemoryBudget, PartitionedVectorEntry, PreparedVectorPublication,
     VectorIndexLayout, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
     VectorMaintenanceReport, VectorPartitionSearchRoute, VectorPartitionSearchTrace,
     VectorSearchDebugTrace, VectorStore, VectorVersionIdentity, cosine_similarity,
@@ -4830,12 +4817,6 @@ pub(crate) struct MaintenanceContext {
 struct VectorPartitionPublicationOutcome {
     published: bool,
     cleanup_failure: Option<VectorMaintenanceFailureDetails>,
-}
-
-#[derive(Debug, Default)]
-struct VectorJournalCleanupRetryOutcome {
-    first_failure_details: Option<VectorMaintenanceFailureDetails>,
-    failed_partitions: FailedMaintenancePartitions,
 }
 
 struct MaintenanceCleanup {

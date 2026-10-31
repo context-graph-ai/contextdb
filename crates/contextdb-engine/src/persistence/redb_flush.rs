@@ -12,11 +12,7 @@ impl RedbPersistence {
         affected_tables: &HashSet<String>,
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<()> {
-        self.prepare_vector_partition_image_replacement_in_write(
-            write_txn,
-            affected_tables,
-            accountant,
-        )?;
+        self.prepare_vector_partition_image_replacement_in_write(write_txn, affected_tables)?;
         if !image.memberships.is_empty() {
             let mut table = write_txn
                 .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
@@ -293,12 +289,6 @@ impl RedbPersistence {
             Self::f32_witness_index(ws, partition_mutations, &vector_quantization, |bytes| {
                 f32_witness_owner.reserve(bytes)
             })?;
-        let prepared_local_erasure_vector_generations = options
-            .local_erasure
-            .as_ref()
-            .map(|erasure| self.prepare_authoritative_purge_vector_generations(erasure.projection))
-            .transpose()?
-            .unwrap_or_default();
         let native_original = if has_native_changes {
             Some(self.require_decode_original()?.preparation_original()?)
         } else {
@@ -1350,10 +1340,7 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                 self.apply_local_erasure(
                     &write_txn,
                     erasure.projection,
-                    &prepared_local_erasure_vector_generations,
                     None,
-                    erasure.accountant.clone(),
-                    erasure.operation,
                     None,
                 )?;
             }
@@ -2005,16 +1992,6 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
 
             if stage.replace_vectors {
-                // Authenticate the old fixed inputs while their raw bodies and
-                // source companions still belong to the committed image.
-                let previous = db.begin_read().map_err(Self::storage_error)?;
-                self.reconcile_paged_builds_for_image_in_write(
-                    &write_txn,
-                    partition_image.as_ref().expect("prepared vector image"),
-                    &previous,
-                    stage,
-                    None,
-                )?;
                 self.remove_vector_entries_matching_in_write(&write_txn, &|index| {
                     stage.affected_tables.contains(&index.table)
                 })?;

@@ -187,18 +187,6 @@ impl RedbPersistence {
                     ))
                 },
             )?;
-            // These graphs were built against the damaged visibility order.
-            // Keep authoritative values and replay records; maintenance owns
-            // rebuilding verified generations after this abnormal repair.
-            for definition in [
-                VECTOR_PARTITION_BASE_GENERATION_TABLE,
-                VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
-                VECTOR_PARTITION_GENERATION_CATALOG_TABLE,
-            ] {
-                write
-                    .delete_table(definition)
-                    .map_err(Self::storage_error)?;
-            }
             {
                 let mut config = write
                     .open_table(CONFIG_TABLE)

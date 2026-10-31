@@ -952,7 +952,6 @@ impl RedbPersistence {
             orphaned_source_lsn_rows,
             None,
             &[],
-            &Vec::new(),
             &[],
         )
     }

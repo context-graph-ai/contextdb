@@ -568,27 +568,6 @@ pub(super) fn read_partition_summary(
         Err(redb::TableError::TableDoesNotExist(_)) => {}
         Err(error) => return Err(metadata_error(error)),
     }
-    match read.open_byte_table_bounded(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
-        Ok(table) => {
-            if table
-                .get_bounded(key.as_slice())
-                .map_err(metadata_error)?
-                .is_some()
-            {
-                if partition.partition_key.is_unpartitioned() {
-                    return Err(corruption(
-                        "membership summary is missing beside a generation catalog",
-                    ));
-                }
-                // Authoritative memberships were proven absent above. Reclaim
-                // keeps this catalog while a retired generation chain is pinned;
-                // its partitioned summary has already retired atomically.
-                return Ok(MembershipSummary::default());
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(error) => return Err(metadata_error(error)),
-    }
     Ok(MembershipSummary::default())
 }
 
@@ -1144,27 +1123,6 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
         .map_err(metadata_error)?
         .is_some();
     let mut partition = read_summary(&partition_key)?;
-    if !existing_partition {
-        let catalogs = write
-            .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
-            .map_err(metadata_error)?;
-        if let Some(value) = catalogs
-            .get_bounded(partition_key.as_slice())
-            .map_err(metadata_error)?
-        {
-            let catalog: VectorPartitionGenerationCatalogRecord =
-                decode_vector_partition_record_payload_checked(
-                    VectorPartitionRecordKind::GenerationCatalog,
-                    value.value(),
-                )
-                .map_err(|failure| failure.into_error(corruption))?;
-            partition.pending.covered_tx = catalog.change.unwrap_or(catalog.base).covered_tx;
-            partition.base_pending = catalog.change.map(|_| PendingCounts {
-                covered_tx: catalog.base.covered_tx,
-                ..Default::default()
-            });
-        }
-    }
     if source.len().map_err(metadata_error)? != global.entries
         || reverse.len().map_err(metadata_error)? != global.entries
     {

@@ -2045,163 +2045,20 @@ impl DurableMembershipSource {
 
     // Compare physical user-tree headers, independent of logical TxId and
     // of the Arc wrapper used to materialize a retained root.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn captured_catalog_required(&self, root: &MembershipRoot) -> Result<bool> {
-        let Some(captured) = &root.writer else {
-            return Ok(false);
-        };
-        if let MembershipOwner::Writable(persistence) = &self.owner
-            && let Some(operation) = persistence
-                .scoped_vector_root_capture
-                .get()
-                .map(|capture| capture())
-                .transpose()?
-                .flatten()
-            && operation.storage_identity() != captured.storage_identity()
-        {
-            return Err(damage("membership catalog escaped its operation capture"));
-        }
-        let published = (self
-            .published_root
-            .as_ref()
-            .ok_or_else(|| damage("writer publication has no root capture"))?)(
-        )?
-        .ok_or_else(|| damage("writer publication has no durable root"))?;
-        Ok(captured.storage_identity().user_root != published.storage_identity().user_root)
-    }
 
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn inspection_in_root(
-        &self,
-        root: &MembershipRoot,
-        generations: Option<(
-            VectorPartitionGenerationDescriptor,
-            Option<VectorPartitionGenerationDescriptor>,
-        )>,
-        serving_covered: Option<TxId>,
-    ) -> Result<RawVectorInspectionSnapshot> {
-        let mut summary = self.read_pending_metadata(root)?;
-        let retired_empty = !self.partition.partition_key.is_unpartitioned()
-            && summary == vector_membership_pages::MembershipSummary::default();
-        let (base, change) = generations.map_or((None, None), |(base, change)| {
-            let identity = |generation: VectorPartitionGenerationDescriptor| {
-                contextdb_vector::store::VectorGraphGeneration {
-                    generation_id: generation.generation_id,
-                    covered_tx: generation.covered_tx,
-                    covered_lsn: generation.covered_lsn,
-                    durable_bytes: generation.durable_bytes,
-                    policy_revision: generation.policy_revision,
-                    hnsw_m: generation.hnsw_m,
-                    hnsw_ef_construction: generation.hnsw_ef_construction,
-                }
-            };
-            (Some(identity(base)), change.map(identity))
-        });
-        let covered = change
-            .or(base)
-            .map_or(summary.pending.covered_tx, |generation| {
-                generation.covered_tx
-            });
-        // Serving metadata and counters are committed together. A candidate
-        // matching some other frontier cannot authenticate this catalog.
-        if retired_empty {
-            // A pinned retired catalog outlives its removed summary. The read
-            // helper validated authoritative membership absence on this root.
-            summary.pending.covered_tx = covered;
-        } else if summary.pending.covered_tx != covered {
-            return Err(damage(
-                "pending summary disagrees with captured catalog frontier",
-            ));
-        }
-        let captured_catalog = self.captured_catalog_required(root)?;
-        let frontier = if captured_catalog || generations.is_none() {
-            covered
-        } else {
-            serving_covered.unwrap_or(covered)
-        };
-        let mut frontier = frontier;
-        if let (Some(base), Some(change)) = (base, change)
-            && change.generation_id & super::vector_paged::MUTABLE_STORAGE != 0
-        {
-            let mut native_metadata =
-                contextdb_vector::VectorCopyAdmission::new(self.accountant.vector_budget()?);
-            native_metadata.reserve(16 * 1024 + self.window_bytes())?;
-            let record = RedbPersistence::load_vector_partition_change_generation_in_read(
-                &root.read,
-                &self.partition.index,
-                &self.partition.partition_key,
-                base.generation_id,
-                change.generation_id,
-            )?;
-            let meta = super::vector_paged::PagedGenerationMeta::decode(&record.graph.bytes)?;
-            if meta.page_set.pages == super::vector_paged::MUTABLE_PAGE_SET {
-                // Native tail publication advances serving coverage while
-                // retaining the base's default consolidation counters.
-                frontier = base.covered_tx;
-            }
-        }
-        let (pending_inserts, tombstones) = Self::pending_counts_for(&summary, Some(frontier))?;
+    fn inspection_in_root(&self, root: &MembershipRoot) -> Result<RawVectorInspectionSnapshot> {
+        let summary = self.read_pending_metadata(root)?;
+        let (pending_inserts, tombstones) =
+            Self::pending_counts_for(&summary, Some(summary.pending.covered_tx))?;
         Ok(RawVectorInspectionSnapshot::new(
-            captured_catalog,
             summary_counts(&summary)?,
-            base,
-            change,
             pending_inserts,
             tombstones,
-            {
-                let frontier = base.map_or(TxId(0), |generation| generation.covered_tx);
-                [
-                    &summary.pending,
-                    summary.base_pending.as_ref().unwrap_or(&summary.pending),
-                ]
-                .into_iter()
-                .find(|counts| counts.covered_tx == frontier)
-                .map(|counts| (counts.pending_inserts as usize, counts.tombstones as usize))
-            },
         ))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn catalog_frontier(&self, root: &MembershipRoot) -> Result<Option<TxId>> {
-        let generations = self.catalog_generations(root)?;
-        Ok(generations.map(|(base, change)| change.unwrap_or(base).covered_tx))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn catalog_generations(
-        &self,
-        root: &MembershipRoot,
-    ) -> Result<
-        Option<(
-            VectorPartitionGenerationDescriptor,
-            Option<VectorPartitionGenerationDescriptor>,
-        )>,
-    > {
-        match RedbPersistence::vector_partition_generation_descriptors_in_read(
-            &root.read,
-            &self.partition.index,
-            &self.partition.partition_key,
-        )
-        .map_err(vector_membership_pages::typed_metadata_error)
-        {
-            Ok(generations) => Ok(generations),
-            // Catalog damage belongs to its route. The caller has already
-            // authenticated the membership summary at this captured root.
-            Err(Error::StoreCorrupted { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
     }
 
     fn window_bytes(&self) -> usize {
@@ -2306,39 +2163,6 @@ impl DurableMembershipSource {
         let _window = self.pending_metadata_window(owner)?;
         let root = capture()?;
         let summary = self.read_pending_metadata(&root)?;
-        let covered = if self.captured_catalog_required(&root)? {
-            let frontier = self
-                .catalog_frontier(&root)?
-                .unwrap_or(summary.pending.covered_tx);
-            if summary.pending.covered_tx != frontier {
-                return Err(damage(
-                    "pending summary disagrees with captured catalog frontier",
-                ));
-            }
-            Some(frontier)
-        } else {
-            covered
-        };
-        let mut covered = covered;
-        if let Some((base, Some(change))) = self.catalog_generations(&root)?
-            && change.generation_id & super::vector_paged::MUTABLE_STORAGE != 0
-            && covered == Some(change.covered_tx)
-        {
-            let mut metadata =
-                contextdb_vector::VectorCopyAdmission::new(self.accountant.vector_budget()?);
-            metadata.reserve(16 * 1024 + self.window_bytes())?;
-            let record = RedbPersistence::load_vector_partition_change_generation_in_read(
-                &root.read,
-                &self.partition.index,
-                &self.partition.partition_key,
-                base.generation_id,
-                change.generation_id,
-            )?;
-            let meta = super::vector_paged::PagedGenerationMeta::decode(&record.graph.bytes)?;
-            if meta.page_set.pages == super::vector_paged::MUTABLE_PAGE_SET {
-                covered = Some(base.covered_tx);
-            }
-        }
         Self::pending_counts_for(&summary, covered).map(Some)
     }
 
@@ -2402,17 +2226,6 @@ impl DurableMembershipSource {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(error) => return Err(vector_membership_pages::metadata_error(error)),
         };
-        let catalog = RedbPersistence::vector_partition_generation_descriptors_in_read(
-            &root.read,
-            &self.partition.index,
-            &self.partition.partition_key,
-        )?;
-        let floor = catalog.map_or(Lsn(0), |(base, change)| change.unwrap_or(base).covered_lsn);
-        if after_lsn < floor {
-            return Err(damage(
-                "captured suffix replay starts below the journal truncation floor",
-            ));
-        }
         let prefix = RedbPersistence::vector_partition_prefix(
             &self.partition.index,
             &self.partition.partition_key,
@@ -3003,172 +2816,6 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         }
     }
 
-    fn capture_serving_selection(
-        &self,
-        snapshot: SnapshotId,
-        frozen_base: Option<&contextdb_vector::store::VectorGraphGeneration>,
-        frozen_change: Option<&contextdb_vector::store::VectorGraphGeneration>,
-        owner: &mut contextdb_vector::VectorCopyAdmission,
-    ) -> Result<contextdb_vector::store::CapturedVectorServingSelection> {
-        let _window = self.pending_metadata_window(owner)?;
-        operation_checkpoint()?;
-        let root = if let Some(context) = operation_for(&self.owner) {
-            context.root.clone()
-        } else {
-            match &self.owner {
-                MembershipOwner::Writable(persistence) => {
-                    let writer =
-                        persistence
-                            .scoped_vector_root_capture
-                            .get()
-                            .ok_or_else(|| {
-                                damage("writable vector serving has no scoped root supplier")
-                            })?()?
-                        .ok_or_else(|| {
-                            damage("writable vector serving has no operation-scoped root")
-                        })?;
-                    writer.check_table_scope(&self.partition.index.table)?;
-                    let read = writer.owner_read()?;
-                    if read.storage_snapshot_identity().user_root
-                        != writer.storage_identity().user_root
-                    {
-                        return Err(damage("serving read escaped its operation physical root"));
-                    }
-                    vector_membership_pages::validate_in_read(&read)?;
-                    MembershipRoot {
-                        read,
-                        writer: Some(writer),
-                        retained: None,
-                    }
-                }
-                MembershipOwner::Retained(_) => self.owner.capture()?,
-            }
-        };
-        root.check_scope(&self.partition.index.table)?;
-        // Unlike passive inspection, serving cannot turn catalog corruption
-        // into catalog absence or substitute a raw-only/fresh-root route.
-        let generations = RedbPersistence::vector_partition_generation_descriptors_in_read(
-            &root.read,
-            &self.partition.index,
-            &self.partition.partition_key,
-        )
-        .map_err(vector_membership_pages::typed_metadata_error)?;
-        let mut inspection = self.inspection_in_root(&root, generations, None)?;
-        let frozen_lsn = frozen_change
-            .or(frozen_base)
-            .map_or(Lsn(0), |layer| layer.covered_lsn);
-        let catalog_floor =
-            generations.map_or(Lsn(0), |(base, change)| change.unwrap_or(base).covered_lsn);
-        if generations.is_none() || (!inspection.captured_catalog && frozen_lsn < catalog_floor) {
-            // The catalog can commit and its journal prefix be truncated before
-            // the registry installs. Serve that same root's coherent catalog,
-            // never replay its missing prefix against the frozen predecessor.
-            inspection.captured_catalog = true;
-        }
-        if inspection
-            .change
-            .or(inspection.base)
-            .is_some_and(|generation| generation.covered_tx > TxId::from_snapshot(snapshot))
-        {
-            return Err(Error::VectorIndexedRouteUnavailable {
-                index: self.partition.index.clone(),
-            });
-        }
-        let frontier = root
-            .writer
-            .as_ref()
-            .map(|writer| writer.snapshot)
-            .or_else(|| root.retained.as_ref().map(|source| source.logical_frontier));
-        if self.owner.historical_operation() || frontier != Some(snapshot) {
-            // Current pending counts exclude later-deleted memberships that
-            // remain visible to this snapshot. Count exact intervals with one
-            // admitted cursor window on this already captured physical root.
-            let covered_tx = inspection
-                .change
-                .or(inspection.base)
-                .map_or(TxId(0), |generation| generation.covered_tx);
-            let mut scratch = owner.scratch();
-            scratch.reserve_for(self.window_bytes(), "vector", "membership_window", HINT)?;
-            let mut cursor = MembershipCursor {
-                owner: self.owner.clone(),
-                selected_identity: None,
-                root: root.clone(),
-                partition: self.partition.clone(),
-                prefix: RedbPersistence::vector_partition_prefix(
-                    &self.partition.index,
-                    &self.partition.partition_key,
-                ),
-                range: None,
-                last_success: None,
-                done: false,
-                max_bytes: self.window_bytes(),
-                seen: 0,
-                expected: Some(inspection.summary.entries),
-            };
-            let mut inserts = 0usize;
-            loop {
-                let _decode = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-                let _record = crate::read_image_memory::active_owner()?
-                    .row_owner()?
-                    .enter();
-                let mut interrupted = None;
-                let next = cursor.next_record(&mut |request| match request {
-                    DormantVectorLoadRequest::Reserve(bytes) => match scratch.reserve(bytes) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            interrupted = Some(error);
-                            false
-                        }
-                    },
-                    _ => true, // next_record checkpoints the operation before each read.
-                });
-                if let Some(error) = interrupted {
-                    return Err(error);
-                }
-                let Some(record) = next? else {
-                    break;
-                };
-                if record.visible_from > covered_tx && visible(&record, snapshot) {
-                    inserts = inserts
-                        .checked_add(1)
-                        .ok_or_else(|| damage("snapshot pending insert count overflow"))?;
-                }
-            }
-            inspection.pending_inserts = inserts;
-        }
-        if generations.is_none() {
-            let summary = self.read_pending_metadata(&root)?;
-            if summary.pending.covered_tx != TxId(0) {
-                return Err(damage(
-                    "missing captured catalog has a nonempty serving frontier",
-                ));
-            }
-        }
-        match &self.owner {
-            MembershipOwner::Writable(persistence) => persistence
-                .captured_vector_serving_selection_in_read(
-                    root.read,
-                    root.writer,
-                    root.retained,
-                    &self.partition,
-                    generations,
-                    inspection,
-                    snapshot,
-                    owner,
-                ),
-            MembershipOwner::Retained(source) => source.captured_vector_serving_selection_in_read(
-                root.read,
-                root.writer,
-                root.retained,
-                &self.partition,
-                generations,
-                inspection,
-                snapshot,
-                owner,
-            ),
-        }
-    }
-
     fn for_renamed_index(
         &self,
         index: &VectorIndexRef,
@@ -3440,7 +3087,6 @@ impl RawVectorMembershipSource for DurableMembershipSource {
 
     fn inspection_snapshot(
         &self,
-        serving_covered: Option<TxId>,
         owner: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<RawVectorInspectionSnapshot>> {
         let _window = self.pending_metadata_window(owner)?;
@@ -3454,9 +3100,7 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         } else {
             self.owner.capture()?
         };
-        let generations = self.catalog_generations(&root)?;
-        self.inspection_in_root(&root, generations, serving_covered)
-            .map(Some)
+        self.inspection_in_root(&root).map(Some)
     }
 
     fn visit_identities(
