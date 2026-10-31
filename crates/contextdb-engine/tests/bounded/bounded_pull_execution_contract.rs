@@ -1474,8 +1474,14 @@ fn native_work_observer_is_inside_the_real_indexed_search() {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_vector_table(&db, "observer_indexed_vectors", false);
     seed_vectors(&db, "observer_indexed_vectors", 1_003, None, 107);
-    db.run_maintenance_cycle()
-        .expect("build the maintained index before observing its search work");
+    for _ in 0..2_100 {
+        let report = db
+            .run_maintenance_cycle()
+            .expect("build the maintained index before observing its search work");
+        if report.vector.remaining_partitions == 0 {
+            break;
+        }
+    }
     let sql = "SELECT id FROM observer_indexed_vectors ORDER BY embedding <=> $query \
                USE VECTOR INDEXED LIMIT 5";
     db.execute(sql, &params([("query", Value::Vector(vector_for(0)))]))

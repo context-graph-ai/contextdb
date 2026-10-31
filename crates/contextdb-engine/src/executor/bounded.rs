@@ -11101,7 +11101,30 @@ impl VectorState {
                             None => search()?,
                         }
                     };
+                    // A ranked AUTO read whose every partition resolved to the
+                    // exact route inherits that route's candidate meaning: the
+                    // formula runs over every allowed stored vector before the
+                    // final LIMIT. The pool the native call was handed (the
+                    // original limit) can have cut the best-scoring row, so
+                    // such an answer is dropped and the read repeats over the
+                    // whole pool below, as the transaction route does.
                     match searched {
+                        super::BoundedVectorSearchOutcome::Complete((rows, retained_bytes), trace)
+                            if self.sort_key.is_some()
+                                && self.search_mode == contextdb_core::VectorSearchMode::Auto
+                                && !self.force_exact_for_relational_fallback
+                                && rows.len() >= self.candidate_k
+                                && !trace.partition_routes().iter().any(|route| {
+                                    route.route
+                                        == contextdb_vector::VectorPartitionSearchRoute::Indexed
+                                }) =>
+                        {
+                            let trace_bytes = trace.retained_bytes();
+                            drop(trace);
+                            drop(rows);
+                            context.release(trace_bytes)?;
+                            context.release(retained_bytes)?;
+                        }
                         super::BoundedVectorSearchOutcome::Complete(
                             (mut rows, retained_bytes),
                             mut trace,

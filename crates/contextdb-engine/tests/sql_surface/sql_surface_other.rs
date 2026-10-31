@@ -9742,7 +9742,11 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_indexed_route_when_active(
     // AUTO may still truthfully compare a small three-dimensional layout exactly when that is
     // cheaper than an index walk, so the large queries ask for the maintained route with
     // `USE VECTOR INDEXED`, placed after the vector ordering and before `USE RANK`.
-    db.run_maintenance_cycle().unwrap();
+    for _ in 0..2_100 {
+        if db.run_maintenance_cycle().unwrap().vector.remaining_partitions == 0 {
+            break;
+        }
+    }
     let literal = db
         .execute(
             "SELECT id, score FROM docs ORDER BY embedding <=> $query USE VECTOR INDEXED USE RANK weighted LIMIT 3",

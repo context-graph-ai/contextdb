@@ -270,7 +270,7 @@ fn opening_and_searching_are_charged_against_the_declared_work() {
         .expect("the runtime directory is private to its owner");
     let path = directory.path().join("declared-work.db");
     seed(&path, &runtime);
-    declare_breadth(&path, &runtime, 400);
+    declare_breadth(&path, &runtime, 16);
 
     let (sql, params) = statement(PARTITIONS);
     for work in [300_u64, 600, 1_200, 2_400, 4_800, 9_600, 20_000] {

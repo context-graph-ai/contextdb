@@ -1212,7 +1212,7 @@ fn f114_explain_shows_vector_search_operator_for_vector_ann_query() {
     for _ in 0..1000 {
         insert_embedding(&db, Uuid::new_v4(), vec![1.0, 0.0, 0.0]);
     }
-    for _ in 0..32 {
+    for _ in 0..2_100 {
         if db.__debug_vector_indexed_available_for_test(contextdb_core::VectorIndexRef::new(
             "embeddings",
             "embedding",

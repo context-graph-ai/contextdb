@@ -235,11 +235,18 @@ fn vector_select_and_with_explain_publish_passive_route_facts_even_when_indexed_
         assert_eq!(vector["layers"]["tail"], "present");
         let partitions = vector["partitions"]
             .as_array()
-            .expect("effective HNSW policy is structured per redacted partition");
+            .expect("effective native policy is structured per redacted partition");
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0]["partition"], "<redacted:1>");
-        assert!(partitions[0]["hnsw_ef_search"].as_u64().is_some());
-        assert!(partitions[0]["ef_search_source"].as_str().is_some());
+        // The fixture declares no IVF member, so each is unknown (null).
+        for member in ["lists", "probes", "refine_factor"] {
+            assert!(partitions[0][member].is_null(), "{member} is undeclared");
+            assert!(
+                partitions[0][format!("{member}_source")].is_null(),
+                "{member} has no declared source"
+            );
+        }
+        assert!(partitions[0]["policy_revision"].as_u64().is_some());
     }
 
     let (human_code, human_stdout, human_stderr) = run_cli(&[], &format!("{setup}{select}"));
@@ -257,7 +264,7 @@ fn vector_select_and_with_explain_publish_passive_route_facts_even_when_indexed_
         "recovery=run vector maintenance and retry",
         "tail=present",
         "partition=<redacted:1>",
-        "hnsw_ef_search=",
+        "policy_revision=",
     ] {
         assert!(
             human_stdout.contains(fact),

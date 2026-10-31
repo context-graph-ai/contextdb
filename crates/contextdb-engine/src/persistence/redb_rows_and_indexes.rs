@@ -4519,6 +4519,73 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    pub(super) fn rename_vector_partition_index_in_write(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        from: &VectorIndexRef,
+        to: &VectorIndexRef,
+    ) -> Result<()> {
+        self.prepare_proof_owner()?;
+        if from == to {
+            return Ok(());
+        }
+        self.rename_vector_partition_records_in_write::<VectorPartitionMembershipRecord>(
+            write_txn,
+            VECTOR_PARTITION_MEMBERSHIP_TABLE,
+            VectorPartitionRecordKind::Membership,
+            from,
+            to,
+            |record, to| {
+                record.index = to.clone();
+                Ok(())
+            },
+            Self::vector_partition_membership_key,
+        )?;
+        vector_membership_pages::rename_pending_routes(
+            write_txn,
+            from,
+            to,
+            self.proof_accountant(),
+        )?;
+        self.rename_vector_partition_records_in_write::<VectorPartitionTombstoneRecord>(
+            write_txn,
+            VECTOR_PARTITION_TOMBSTONE_TABLE,
+            VectorPartitionRecordKind::Tombstone,
+            from,
+            to,
+            |record, to| {
+                record.membership.index = to.clone();
+                Ok(())
+            },
+            Self::vector_partition_tombstone_key,
+        )?;
+        self.rename_vector_partition_records_in_write::<VectorPartitionJournalRecord>(
+            write_txn,
+            VECTOR_PARTITION_JOURNAL_TABLE,
+            VectorPartitionRecordKind::Journal,
+            from,
+            to,
+            |record, to| {
+                record.index = to.clone();
+                match &mut record.change {
+                    VectorPartitionJournalChange::Upsert(membership) => {
+                        membership.index = to.clone()
+                    }
+                    VectorPartitionJournalChange::Tombstone(tombstone) => {
+                        tombstone.membership.index = to.clone()
+                    }
+                }
+                Ok(())
+            },
+            Self::vector_partition_journal_key,
+        )?;
+        Self::ensure_open_vector_directory_in_write(write_txn)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn remove_vector_partition_records_matching_all_in_write(
         &self,
         write_txn: &redb::WriteTransaction,

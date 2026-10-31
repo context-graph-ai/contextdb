@@ -2551,7 +2551,7 @@ fn nv_deferred_index_build_per_index() {
     )
     .expect("vision insert");
 
-    let vector_index_bytes = |column: &str| -> Option<i64> {
+    let vector_index_int = |column: &str, field: &str| -> Option<i64> {
         let indexes = db
             .execute("SHOW VECTOR_INDEXES", &empty_params())
             .expect("show vector indexes");
@@ -2560,7 +2560,7 @@ fn nv_deferred_index_build_per_index() {
             .iter()
             .position(|c| c == "column")
             .unwrap();
-        let bytes_idx = indexes.columns().iter().position(|c| c == "bytes").unwrap();
+        let bytes_idx = indexes.columns().iter().position(|c| c == field).unwrap();
         indexes
             .rows()
             .iter()
@@ -2571,6 +2571,9 @@ fn nv_deferred_index_build_per_index() {
             })
     };
 
+    let vector_index_bytes = |column: &str| vector_index_int(column, "bytes");
+    // The stored payload is durable file bytes; `bytes` counts only what is charged to memory.
+    let stored_vector_bytes = |column: &str| vector_index_int(column, "durable_vector_bytes");
     let text_payload_floor = 1500_i64 * 4_i64 * std::mem::size_of::<f32>() as i64;
     let vision_payload_floor = 8_i64 * std::mem::size_of::<f32>() as i64;
     let text_bytes_before = vector_index_bytes("vector_text");
@@ -2585,13 +2588,15 @@ fn nv_deferred_index_build_per_index() {
     );
     let text_bytes_before = text_bytes_before.unwrap();
     let vision_bytes_before = vision_bytes_before.unwrap();
+    let text_stored = stored_vector_bytes("vector_text").unwrap_or_default();
+    let vision_stored = stored_vector_bytes("vector_vision").unwrap_or_default();
     assert!(
-        text_bytes_before >= text_payload_floor,
-        "vector_text bytes must account for the stored vector payload before the index build; got {text_bytes_before}"
+        text_stored >= text_payload_floor,
+        "vector_text durable_vector_bytes must account for the stored vector payload before the index build; got {text_stored}"
     );
     assert!(
-        vision_bytes_before >= vision_payload_floor,
-        "small vector_vision bytes must account for its payload before maintenance; got {vision_bytes_before}"
+        vision_stored >= vision_payload_floor,
+        "small vector_vision durable_vector_bytes must account for its payload before maintenance; got {vision_stored}"
     );
 
     // Searching either column before maintenance must not build either graph.

@@ -75,7 +75,7 @@ fn fixture(db: &Database, rows_per_partition: &[usize]) {
         &format!(
             "CREATE TABLE flat_docs (id UUID PRIMARY KEY, partition_id INTEGER NOT NULL, \
              embedding VECTOR({DIMENSION}) PARTITION_KEY (partition_id) MAX_PARTITIONS 8 \
-             SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))"
+             SEARCH_MODE INDEXED AUTO_INDEX_AT 1)"
         ),
         &empty(),
     )
@@ -608,7 +608,7 @@ fn a_held_reader_answers_exactly_at_its_own_snapshot_after_the_declaration_chang
     let exact_before = answer_at(&db, "EXACT", held);
     assert_eq!(answer_at(&db, "INDEXED", held), exact_before);
     db.execute(
-        "ALTER TABLE flat_docs ALTER COLUMN embedding SET IVF (PROBES = 100)",
+        "ALTER TABLE flat_docs ALTER COLUMN embedding SET IVF (PROBES = 8)",
         &empty(),
     )
     .expect("change the declared breadth");

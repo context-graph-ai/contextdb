@@ -468,11 +468,6 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
     let db = Database::open(&path).expect("open file-backed store");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_lang_partitioned_table(&db);
-    db.execute(
-        "ALTER TABLE restart_items ALTER COLUMN embedding SET IVF (PROBES = 200)",
-        &empty(),
-    )
-    .expect("keep the filtered restart fixture wider than its graph search breadth");
 
     let mut ids_by_rank = seed_lang_scope(&db, scope_a, 0);
     ids_by_rank.extend(seed_lang_scope(&db, scope_b, LANG_ROWS_PER_SCOPE));

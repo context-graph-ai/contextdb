@@ -368,9 +368,13 @@ fn a_declared_small_breadth_still_preserves_useful_top_ten_quality() {
         )
         .expect("seed one graph candidate");
     }
-    for _ in 0..4 {
-        db.run_maintenance_cycle()
+    for _ in 0..2_100 {
+        let report = db
+            .run_maintenance_cycle()
             .expect("publish both maintained routes");
+        if report.vector.remaining_partitions == 0 {
+            break;
+        }
     }
 
     let query = params([("query", Value::Vector(vec![1.0, 120.0, 1.0]))]);

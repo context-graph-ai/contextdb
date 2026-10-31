@@ -1803,6 +1803,9 @@ impl RedbPersistence {
                     .insert(Self::meta_key(name).as_str(), encoded.bytes.as_slice())
                     .map_err(Self::storage_error)?;
             }
+            for (from, to) in &vector_renames {
+                self.rename_vector_partition_index_in_write(&write, from, to)?;
+            }
             vector_membership_pages::ensure_declared_routes(
                 &write,
                 name,

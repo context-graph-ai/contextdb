@@ -314,9 +314,9 @@ fn ce04_vectors_round_trip_search_results_equal() {
             "search_mode",
             "declared_auto_index_at",
             "effective_auto_index_at",
-            "declared_hnsw_m",
-            "declared_hnsw_ef_construction",
-            "declared_hnsw_ef_search",
+            "declared_lists",
+            "declared_probes",
+            "declared_refine_factor",
         ];
         let positions = stable_catalog_columns.map(|name| {
             result
