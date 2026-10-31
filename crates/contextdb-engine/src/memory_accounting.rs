@@ -5827,16 +5827,6 @@ impl MemoryAccountant {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn arm_tail_admission_failure_for_test(&self) {
-        self.tail_admission_failure.store(1, Ordering::SeqCst);
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn tail_admission_failure_consumed_for_test(&self) -> bool {
-        self.tail_admission_failure.load(Ordering::SeqCst) == 2
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn arm_current_identity_admission_failure_for_test(&self) {
         self.tail_admission_failure.store(3, Ordering::SeqCst);
     }
@@ -6021,22 +6011,6 @@ impl MemoryAccountant {
                 hint: ("Injected current vector identity publication admission exhaustion."
                     .to_owned())
                 .into(),
-            });
-        }
-        #[cfg(any(test, feature = "test-seams"))]
-        if operation == "prepare_hnsw_tail"
-            && self
-                .tail_admission_failure
-                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            return Err(contextdb_core::Error::MemoryBudgetExceeded {
-                subsystem: (subsystem.to_owned()).into(),
-                operation: (operation.to_owned()).into(),
-                requested_bytes: bytes,
-                available_bytes: 0,
-                budget_limit_bytes: self.used.load(Ordering::SeqCst),
-                hint: ("Injected fresh-tail admission exhaustion.".to_owned()).into(),
             });
         }
         let mut allocation = self.try_allocate_with_provenance(bytes, provenance);
@@ -12477,24 +12451,6 @@ impl MemoryAccountant {
                         available_bytes: 0,
                         budget_limit_bytes: self.used.load(Ordering::SeqCst),
                         hint: "Injected current vector identity publication admission exhaustion.",
-                    },
-                );
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            if operation == "prepare_hnsw_tail"
-                && self
-                    .tail_admission_failure
-                    .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
-                return Err(
-                    contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                        subsystem,
-                        operation,
-                        requested_bytes: bytes,
-                        available_bytes: 0,
-                        budget_limit_bytes: self.used.load(Ordering::SeqCst),
-                        hint: "Injected fresh-tail admission exhaustion.",
                     },
                 );
             }

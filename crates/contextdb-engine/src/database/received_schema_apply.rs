@@ -3596,9 +3596,9 @@ impl Database {
         );
         // A layout change that keeps the vectors' storage shape (dimension,
         // quantization and partition key) is policy only: search mode,
-        // AUTO_INDEX_AT, MAX_PARTITIONS, HNSW or consolidation. A local ALTER
+        // AUTO_INDEX_AT, MAX_PARTITIONS or consolidation. A local ALTER
         // applies it to the live column in place and keeps every partition
-        // and graph, so the received ALTER does the same: it neither seeds a
+        // and index, so the received ALTER does the same: it neither seeds a
         // vector replacement nor makes this unit copy the vectors.
         let policy_only = |index: &VectorIndexRef| match (
             live_vector_layouts.get(index),

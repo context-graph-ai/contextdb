@@ -129,11 +129,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The engine format values written beside the independently versioned HNSW
-/// byte envelope. A loader refuses either mismatch before exposing a route.
-pub(crate) const VECTOR_GRAPH_ALGORITHM_VERSION: u16 = 1;
-pub(crate) const VECTOR_GRAPH_FORMAT_VERSION: u16 = 1;
-
 /// One private replay slot per authenticated edge identity. A later request
 /// from the same edge can exist on the ordinary client path only after the
 /// preceding response was received, so replacing this slot is the existing
@@ -1249,7 +1244,7 @@ struct ReceivedStagingAccessCleanup {
 
 /// A read-only memory settlement plan.  Unlike [`PreparedMemorySwap`], this
 /// contains no accountant and performs no allocation; it makes the vector
-/// payload/HNSW retirement visible to the future atomic commit kernel.
+/// payload retirement visible to the future atomic commit kernel.
 #[derive(Debug, Clone, Copy)]
 struct PreparedMemorySwapAccounting {
     old_bytes: usize,

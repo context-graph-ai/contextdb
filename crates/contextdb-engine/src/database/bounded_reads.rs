@@ -2554,7 +2554,7 @@ impl Database {
         })
     }
 
-    /// Run the bounded HNSW source and return the admitted rows with the bytes
+    /// Run the bounded vector source and return the admitted rows with the bytes
     /// still charged for them. The debug trace is moved into the last-search
     /// slot rather than copied: its row-id vectors and index names were
     /// admitted through the request's memory callbacks, so a copy would

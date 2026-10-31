@@ -998,7 +998,7 @@ impl PreparedMemorySwap {
         }
     }
 
-    /// `retired_bytes_released_by_store` is the HNSW allocation owned by the
+    /// `retired_bytes_released_by_store` is the vector allocation owned by the
     /// outgoing vector registry.  The registry tears it down after the swap,
     /// so the reservation covers the part of the old image that remains
     /// charged until this guard settles the relational/graph/vector payload

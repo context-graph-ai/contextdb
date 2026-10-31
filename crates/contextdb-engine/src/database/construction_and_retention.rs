@@ -1383,10 +1383,6 @@ pub(super) fn query_outcome_from_result(result: &Result<OwnedQueryResult>) -> Qu
     }
 }
 
-pub(super) fn maybe_prebuild_hnsw(vector_store: &VectorStore, accountant: &MemoryAccountant) {
-    let _ = (vector_store, accountant);
-}
-
 /// What a row VERSION costs the store that KEEPS it, as opposed to what one
 /// copy of it occupies. Three things, and a declared `MEMORY_LIMIT` is only
 /// effective if the figure covers all three:

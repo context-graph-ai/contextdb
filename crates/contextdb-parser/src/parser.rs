@@ -2413,7 +2413,6 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
                 return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
             Rule::alter_column_set_flat_below => return Err(removed_vector_clause("FLAT_BELOW")),
-            Rule::alter_column_set_hnsw => return Err(removed_vector_clause("HNSW")),
             Rule::alter_column_set_consolidation => {
                 let text = part.as_str();
                 let mut disabled = false;
@@ -3355,7 +3354,6 @@ fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVe
                 return Err(removed_vector_clause("AUTO_EXPANSION_CEILING"));
             }
             Rule::vector_flat_below_clause => return Err(removed_vector_clause("FLAT_BELOW")),
-            Rule::vector_hnsw_clause => return Err(removed_vector_clause("HNSW")),
             Rule::vector_consolidation_clause => {
                 let declaration = part.into_inner().next().ok_or_else(|| {
                     Error::ParseError("CONSOLIDATION missing policy group".to_string())

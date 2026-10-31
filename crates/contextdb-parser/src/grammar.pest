@@ -251,14 +251,13 @@ alter_column_action = {
     ^"ALTER"
     ~ ^"COLUMN"
     ~ identifier
-    ~ (alter_column_set_search | alter_column_set_ivf | alter_column_set_with | alter_column_reset_with | alter_column_set_max_partitions | alter_column_set_search_mode | alter_column_set_auto_index_at | alter_column_set_auto_expansion_ceiling | alter_column_set_flat_below | alter_column_set_hnsw | alter_column_set_consolidation)
+    ~ (alter_column_set_search | alter_column_set_ivf | alter_column_set_with | alter_column_reset_with | alter_column_set_max_partitions | alter_column_set_search_mode | alter_column_set_auto_index_at | alter_column_set_auto_expansion_ceiling | alter_column_set_flat_below | alter_column_set_consolidation)
 }
 alter_column_set_max_partitions = { ^"SET" ~ ^"MAX_PARTITIONS" ~ max_partitions_literal }
 alter_column_set_search_mode = { ^"SET" ~ ^"SEARCH_MODE" ~ vector_search_mode }
 alter_column_set_auto_index_at = { ^"SET" ~ ^"AUTO_INDEX_AT" ~ vector_policy_value }
 alter_column_set_auto_expansion_ceiling = { ^"SET" ~ ^"AUTO_EXPANSION_CEILING" ~ vector_policy_value }
 alter_column_set_flat_below = { ^"SET" ~ ^"FLAT_BELOW" ~ vector_policy_value }
-alter_column_set_hnsw = { ^"SET" ~ ^"HNSW" ~ (^"DEFAULT" | removed_clause_tail) }
 alter_column_set_consolidation = { ^"SET" ~ ^"CONSOLIDATION" ~ (^"DEFAULT" | consolidation_none | consolidation_options) }
 set_retain_action = { ^"SET" ~ ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
@@ -302,7 +301,6 @@ vector_type = {
     ~ vector_auto_index_at_clause?
     ~ vector_auto_expansion_ceiling_clause?
     ~ vector_flat_below_clause?
-    ~ vector_hnsw_clause?
     ~ vector_search_clause?
     ~ vector_ivf_clause?
     ~ vector_consolidation_clause?
@@ -333,8 +331,6 @@ max_partitions_literal = @{ "-"? ~ ASCII_DIGIT+ }
 vector_auto_index_at_clause = { ^"AUTO_INDEX_AT" ~ vector_policy_value }
 vector_auto_expansion_ceiling_clause = { ^"AUTO_EXPANSION_CEILING" ~ vector_policy_value }
 vector_flat_below_clause = { ^"FLAT_BELOW" ~ vector_policy_value }
-vector_hnsw_clause = { ^"HNSW" ~ removed_clause_tail }
-removed_clause_tail = @{ "(" ~ (removed_clause_tail | (!("(" | ")") ~ ANY))* ~ ")" }
 vector_consolidation_clause = { ^"CONSOLIDATION" ~ (consolidation_none | consolidation_options) }
 consolidation_none = { ^"NONE" }
 consolidation_options = { "(" ~ consolidation_option ~ ("," ~ consolidation_option)* ~ ")" }

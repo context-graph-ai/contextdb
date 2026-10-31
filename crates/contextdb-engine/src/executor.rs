@@ -15085,11 +15085,8 @@ fn vector_search_trace(operator: &'static str, candidate_trace: Option<QueryTrac
     };
 
     trace.physical_plan = match (trace.physical_plan, operator) {
-        ("IndexScan", "HNSWSearch") => "IndexScan -> HNSWSearch",
         ("IndexScan", _) => "IndexScan -> VectorSearch",
-        ("Scan", "HNSWSearch") => "Scan -> HNSWSearch",
         ("Scan", _) => "Scan -> VectorSearch",
-        (_, "HNSWSearch") => "HNSWSearch",
         _ => "VectorSearch",
     };
     trace.sort_elided = false;

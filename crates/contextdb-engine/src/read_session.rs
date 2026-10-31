@@ -6113,11 +6113,8 @@ fn known_plan_label(label: &str) -> Option<&'static str> {
         "AdjacencyProbe",
         "EdgesScan",
         "GraphBfs",
-        "HNSWSearch",
         "VectorSearch",
-        "IndexScan -> HNSWSearch",
         "IndexScan -> VectorSearch",
-        "Scan -> HNSWSearch",
         "Scan -> VectorSearch",
     ];
     LABELS.iter().copied().find(|known| *known == label)

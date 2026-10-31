@@ -3563,7 +3563,7 @@ impl Database {
 
             // Vectors: complete per-column copy with the column's declared
             // quantization, so relational vector values re-hydrate on open and
-            // HNSW rebuilds deterministically from the same stored data.
+            // the vector index rebuilds deterministically from the same stored data.
             let quantization = RedbPersistence::vector_quantization_map(&table_meta);
             let mut vector_count = 0u64;
             let mut vector_batch = Vec::new();
@@ -4812,22 +4812,6 @@ impl Database {
         self.finalization
             .accountant
             .current_identity_admission_failure_consumed_for_test()
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    #[doc(hidden)]
-    pub fn arm_vector_tail_admission_failure_for_test(&self) {
-        self.finalization
-            .accountant
-            .arm_tail_admission_failure_for_test();
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    #[doc(hidden)]
-    pub fn vector_tail_admission_failure_consumed_for_test(&self) -> bool {
-        self.finalization
-            .accountant
-            .tail_admission_failure_consumed_for_test()
     }
 
     #[cfg(any(test, feature = "test-seams"))]

@@ -5030,7 +5030,7 @@ impl SyncClient {
                     // page is older than or equal to the purge. Publish those
                     // items first, then let the purge's replacement image be
                     // the final state; applying ordinary vectors afterward
-                    // can re-extend the freshly purged HNSW route with stale
+                    // can re-extend the freshly purged vector route with stale
                     // page entries.
                     db.apply_incoming_authoritative_purge_batch_while_authoritative(
                         &authoritative_purges,
