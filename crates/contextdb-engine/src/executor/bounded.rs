@@ -16518,6 +16518,7 @@ fn build_vector_kernel<'plan>(
     // the captured row before any distance evaluation. It needs no full
     // relational candidate scan or population-sized identity bitmap.
     let native_residual = db.has_native_ivf_source()
+        && !complete_relational_route
         && !access_filter
         && context.transaction().is_none()
         && access_candidates
