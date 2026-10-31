@@ -977,50 +977,6 @@ impl ImageMemory {
         )
     }
 
-    /// Each call keeps its own image; the shared prepaid-output counter also
-    /// owns an independent exact original invoice through its final free.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn operation_writer_per_call(
-        accountant: crate::memory_accounting::AccountantHandle,
-        prepaid_output_bytes: usize,
-    ) -> Result<ImageMemoryHandle> {
-        use contextdb_core::read_memory::ReadShared;
-        let mut payload = Self::writer_payload(
-            accountant,
-            "writer_source",
-            "decode_stored_value",
-            "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
-        );
-        let original = payload._writer_custody.clone().unwrap_or_else(|| {
-            crate::memory_accounting::StoreAccountantHandle::from_original_nonwriter(
-                &payload.accountant,
-            )
-        });
-        let invoice = ImageControlInvoice::admit(
-            original,
-            ReadShared::<PrepaidOutput, ImageControlInvoice>::layout().size(),
-            true,
-            payload.subsystem,
-            payload.operation,
-            payload.hint,
-        )?;
-        payload.prepaid_output = Some(
-            ReadShared::try_from_invoice_native(
-                PrepaidOutput {
-                    remaining: AtomicUsize::new(prepaid_output_bytes),
-                    adopted: AtomicUsize::new(0),
-                },
-                invoice,
-            )
-            .map_err(Error::NativeEngineOther)?,
-        );
-        payload.per_call = Some(parking_lot::Mutex::new(None));
-        Self::funded_writer_payload(payload, true)
-    }
-
     /// Prepaid output bytes this owner's per-call decodes adopted.
     #[cfg_attr(
         not(feature = "test-seams"),
@@ -1049,18 +1005,6 @@ impl ImageMemory {
             }
             adopted
         })
-    }
-
-    /// `subsystem/operation` this owner's admissions and refusals carry.
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
-    pub(crate) fn labels(&self) -> (&'static str, &'static str) {
-        (self.subsystem, self.operation)
     }
 
     /// Bytes held by this owner, including its current per-call owner.
@@ -3610,33 +3554,6 @@ mod exact_sequence_tests {
         .unwrap();
         assert_eq!(decoded.0, values);
         assert_eq!(owner.held(), 48 + 16 * 1535, "unchanged allowance");
-    }
-
-    #[test]
-    fn a_kept_sequence_adopts_a_prepaid_credit_instead_of_charging_it() {
-        let values: Vec<f32> = (0..1536).map(|lane| lane as f32).collect();
-        let writer = accountant(1 << 20);
-        let owner = ImageMemory::operation_writer_per_call(writer.clone(), 1536 * 4).unwrap();
-        let _scope = owner.enter();
-        let before = writer.usage().used;
-        let (decoded, _) = decode::<Kept>(
-            &ImageMemory::enter_decode_call().unwrap(),
-            &encoded(&values),
-        )
-        .unwrap();
-        assert_eq!(decoded.0.capacity(), 1536);
-        assert_eq!(owner.adopted_output(), 1536 * 4);
-        // The call's own owner holds no payload: the kept vector was prepaid.
-        assert_eq!(owner.held_with_call(), 0);
-        assert_eq!(writer.usage().used, before);
-        // A second kept vector finds no prepaid credit left and is charged.
-        let (_second, _) = decode::<Kept>(
-            &ImageMemory::enter_decode_call().unwrap(),
-            &encoded(&values),
-        )
-        .unwrap();
-        assert_eq!(owner.adopted_output(), 1536 * 4);
-        assert_eq!(writer.usage().used, before + 1536 * 4);
     }
 
     #[test]

@@ -3738,21 +3738,9 @@ impl RedbPersistence {
 
 #[cfg(test)]
 impl DurableMembershipSource {
-    pub(crate) fn d1_initialized_observation_for_test(&self) -> (bool, usize) {
-        (
-            self.accountant.is_writer(),
-            self.partition.index.table.as_ptr() as usize,
-        )
-    }
 }
 #[cfg(test)]
 impl DurableReverseMembershipSource {
-    pub(crate) fn d1_initialized_observation_for_test(&self) -> (bool, usize) {
-        (
-            self.accountant.is_writer(),
-            self.index.table.as_ptr() as usize,
-        )
-    }
 }
 
 use crate::persistence::writer_source::WriterSnapshotHandle;

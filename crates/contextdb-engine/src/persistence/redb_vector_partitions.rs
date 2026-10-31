@@ -590,68 +590,6 @@ impl RedbPersistence {
         }
     }
 
-    #[cfg(test)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn visit_relational_table_impl(
-        &self,
-        name: &str,
-        accountant: &crate::memory_accounting::AccountantHandle,
-        mut visit: impl FnMut(VersionedRow) -> Result<()>,
-    ) -> Result<()> {
-        let page_memory =
-            crate::read_image_memory::ImageMemory::operation_writer(accountant.clone())?;
-        let _page_scope = page_memory.enter();
-        // The existing page callback's native Arc control precedes allocation.
-        page_memory.reserve(
-            std::mem::size_of::<crate::read_image_memory::ImageMemoryHandle>()
-                + 2 * std::mem::size_of::<usize>(),
-        )?;
-        let admission = {
-            let memory = page_memory.clone();
-            Arc::new(move |bytes: usize| {
-                memory
-                    .reserve(bytes)
-                    .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
-            })
-                as Arc<dyn Fn(usize) -> std::result::Result<(), redb::StorageError> + Send + Sync>
-        };
-        let read = || {
-            self.with_db(|db| {
-                let read_txn = db.begin_read().map_err(Self::storage_error)?;
-                let table_meta = Self::load_table_meta_in_read_txn(&read_txn, name)?;
-                let table_name = Self::rel_table_name(name);
-                let table_def: TableDefinition<&[u8], &[u8]> =
-                    TableDefinition::new(table_name.as_str());
-                match read_txn.open_table(table_def) {
-                    Ok(table) => {
-                        for entry in table.iter().map_err(Self::storage_error)? {
-                            let (_, value) = entry.map_err(Self::storage_error)?;
-                            let decoded = page_memory.staged_row_copy_owner()?;
-                            let row = decoded.scope(|| {
-                                Self::decode_versioned_row(value.value(), table_meta.as_ref())
-                            })?;
-                            #[cfg(feature = "in-process-test-seams")]
-                            crate::writer_query_test_seams::note_history(
-                                crate::writer_query_test_seams::HistoryFamily::Row,
-                            );
-                            visit(row)?;
-                        }
-                        Ok(())
-                    }
-                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(()),
-                    Err(redb::TableError::TableTypeMismatch { .. }) => {
-                        Err(Self::unrecognized_relational_layout(name))
-                    }
-                    Err(err) => Err(Self::storage_error(err)),
-                }
-            })
-        };
-        redb::with_read_memory_admission_storage(admission, read)
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -809,29 +747,6 @@ impl RedbPersistence {
                 prepare,
                 |state, membership| visit(state, membership, &mut load_body),
                 |reason| self.vector_partition_corruption(reason),
-            )
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg(test)]
-    pub(crate) fn load_vector_partition_memberships_for(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> Result<Vec<VectorPartitionMembershipRecord>> {
-        let prefix = Self::vector_partition_prefix(index, partition_key);
-        self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
-            self.load_vector_partition_table_in_read(
-                &read_txn,
-                VECTOR_PARTITION_MEMBERSHIP_TABLE,
-                VectorPartitionRecordKind::Membership,
-                Self::vector_partition_membership_key,
-                Some(&prefix),
             )
         })
     }
@@ -1381,49 +1296,8 @@ impl RedbPersistence {
         .map_err(Self::storage_error)
     }
 
-    /// Report whether this route has any durable journal work beyond the
-    /// generation catalog's covered frontier. Deletes deliberately count:
-    /// they add no mutable graph point, but a later generation must still
-    /// represent their authoritative absence before the journal can advance.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg(test)]
-    pub(crate) fn vector_partition_has_uncovered_journal_records(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        covered_lsn: Lsn,
-    ) -> Result<bool> {
-        self.vector_partition_has_uncovered_journal_records_with_admission(
-            index,
-            partition_key,
-            covered_lsn,
-            |_| Ok(()),
-        )
-    }
-
     // Preserve the existing framing-only fixture entry. An unbound frame can
     // never pass the transactional publication guard.
-
-    /// Upper-bound heap retained by one decoded vector persistence record.
-    /// Route inspection runs before owned decoding and proves the complete
-    /// stored component count exists, removing serde's hostile length-hint
-    /// reservation. Its initial Vec capacity is at most the actual count;
-    /// larger valid sequences can grow geometrically to less than twice that
-    /// count. Each component consumes at least two encoded bytes (tag+value),
-    /// so one slot per encoded byte covers that growth; the extra byte factor
-    /// also covers string payloads. Exact capacities replace this bound after
-    /// decoding. Journal inspection covers both independently stored routes.
-    pub(super) fn vector_partition_record_decode_bound(
-        encoded_bytes: usize,
-        inline_bytes: usize,
-    ) -> usize {
-        encoded_bytes
-            .saturating_mul(std::mem::size_of::<VectorPartitionComponent>().saturating_add(1))
-            .saturating_add(inline_bytes)
-    }
 
     /// Resolve every durable row-version pairing for the selected vector
     /// occurrences before authoritative purge begins its write transaction.

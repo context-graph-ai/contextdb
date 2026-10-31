@@ -738,26 +738,6 @@ impl StagedCopyCharge {
         }
     }
 
-    #[cfg(test)]
-    /// Admit the sole outer Box at the existing fallible prepaid handoff.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn prepare_prepaid_box(mut self) -> Result<Self> {
-        assert!(
-            self.own_control.is_none(),
-            "one staged copy owns one prepaid Box control"
-        );
-        let layout = std::alloc::Layout::for_value(&self);
-        self.own_control = Some(crate::memory_accounting::ControlCredit::admit(
-            &self.accountant,
-            layout.size(),
-            "staged_copy_prepaid_box_control",
-        )?);
-        Ok(self)
-    }
-
     /// The owner that releases these bytes now holds them.
     pub(super) fn transfer(mut self) {
         self.bytes = 0;

@@ -4227,44 +4227,6 @@ mod vector_inspection_aggregation_tests {
         assert_eq!(fanout_broad_route_state(&[]), "ready");
     }
 
-    #[test]
-    fn healthy_and_failed_layout_actions_use_only_published_recovery_words() {
-        let healthy = lifecycle("idle");
-        assert_eq!(broad_route_recovery_action(&[healthy], "none"), "none");
-
-        for (failure, available, maintenance_reason, action) in [
-            (
-                contextdb_vector::store::VectorMaintenanceFailure::MemoryLimit,
-                "resource_stalled",
-                "memory_limit",
-                "raise_memory_limit",
-            ),
-            (
-                contextdb_vector::store::VectorMaintenanceFailure::DiskLimit,
-                "resource_stalled",
-                "disk_limit",
-                "raise_disk_limit_or_free_space",
-            ),
-            (
-                contextdb_vector::store::VectorMaintenanceFailure::BuildFailure,
-                "build_failure",
-                "build_failure",
-                "inspect_build_failure",
-            ),
-        ] {
-            let stalled = vector_maintenance_failure_lifecycle(failure, Some(TxId(7)));
-            assert_eq!(stalled.availability_reason, "none");
-            assert_eq!(stalled.maintenance_reason, maintenance_reason);
-            assert_eq!(stalled.recovery_action, action);
-            assert_eq!(broad_route_recovery_action(&[stalled], "none"), "none");
-            assert_eq!(vector_unavailable_failure_reason(failure), available);
-        }
-
-        assert_eq!(
-            published_vector_maintenance_reason("policy_replacement"),
-            "new_changes"
-        );
-    }
 }
 
 /// What the clustered index says about one partition, from its live rows and
