@@ -262,7 +262,7 @@ impl Database {
             }
             add_work(&mut total,work.work);
             let bytes=std::mem::size_of::<VectorPartitionSearchTrace>();before_retain(bytes)?;trace_bytes+=bytes;
-            trace_routes.reserve_exact(1);trace_routes.push(VectorPartitionSearchTrace {route:if work.indexed {VectorPartitionSearchRoute::Indexed} else {VectorPartitionSearchRoute::Exact},reason:if work.indexed {"clustered_index"} else {"clustered_exact"}});
+            trace_routes.reserve_exact(1);trace_routes.push(VectorPartitionSearchTrace {route:if work.indexed {VectorPartitionSearchRoute::Indexed} else {VectorPartitionSearchRoute::Exact},reason:if work.indexed {"clustered_index"} else {"clustered_exact"},traversal_complete:work.work.lists_probed==work.work.centroid_evaluations});
             if !pooled.get() {
                 for hit in &hits[..count] {
                     merge_hit(&mut rows, capacity, hit);

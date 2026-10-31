@@ -519,6 +519,14 @@ fn assert_ready_layer_facts(explain: &str) {
 #[test]
 fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts() {
     let (db, source_id) = fixture();
+    // Declared before the first build: one append stays below the 100% change
+    // threshold, while the later deletion crosses the 10% tombstone threshold.
+    db.execute(
+        "ALTER TABLE vector_inspection_docs ALTER COLUMN embedding \
+         SET CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 10)",
+        &empty(),
+    )
+    .expect("declare the consolidation thresholds before the first build");
     let before_charge = db.accountant().usage().used;
     let before_serial = db.__debug_vector_index_generation_for_test(index());
     let before_activity = db.__vector_passive_activity_counters_for_test();

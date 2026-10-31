@@ -4241,6 +4241,31 @@ fn vector_partition_query_state(
     }
 }
 
+/// An idle published partition reports why maintenance is due, by the same
+/// declared-policy decision maintenance makes. Active progress, failure and a
+/// damage-driven requalification keep their own diagnosis.
+fn vector_pending_work_lifecycle(
+    mut lifecycle: VectorInspectionLifecycle,
+    native: Option<&crate::persistence::vector_ivf::inspection::Inspection>,
+    maintenance_policy: MaintenancePolicy,
+) -> VectorInspectionLifecycle {
+    if lifecycle.maintenance_state == "idle"
+        && lifecycle.maintenance_reason == "none"
+        && lifecycle.availability_reason == "none"
+    {
+        let reason = match native.and_then(|native| native.pending_trigger) {
+            Some("tombstone_percent") => Some("tombstones"),
+            Some("change_percent" | "policy_revision") => Some("new_changes"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            lifecycle.maintenance_reason = reason;
+            lifecycle.recovery_action = vector_maintenance_recovery_action(maintenance_policy);
+        }
+    }
+    lifecycle
+}
+
 /// A partition whose index was never published reports why and what to do,
 /// beside its truthful (idle) maintenance state; no build is invented.
 fn vector_missing_publication_lifecycle(
@@ -4408,10 +4433,15 @@ fn vector_index_inspection_row(
     let lifecycle = partitions
         .iter()
         .zip(&states)
-        .map(|(partition, state)| {
-            vector_missing_publication_lifecycle(
-                vector_partition_inspection_lifecycle(partition, maintenance_policy),
-                state,
+        .zip(native)
+        .map(|((partition, state), native)| {
+            vector_pending_work_lifecycle(
+                vector_missing_publication_lifecycle(
+                    vector_partition_inspection_lifecycle(partition, maintenance_policy),
+                    state,
+                    maintenance_policy,
+                ),
+                native.as_ref(),
                 maintenance_policy,
             )
         })
@@ -4618,9 +4648,13 @@ fn vector_partition_inspection_row(
 ) -> Result<Vec<Value>> {
     let query_state =
         vector_partition_query_state(partition.live_rows, native, declaration.search_mode);
-    let lifecycle = vector_missing_publication_lifecycle(
-        vector_partition_inspection_lifecycle(&partition, maintenance_policy),
-        query_state,
+    let lifecycle = vector_pending_work_lifecycle(
+        vector_missing_publication_lifecycle(
+            vector_partition_inspection_lifecycle(&partition, maintenance_policy),
+            query_state,
+            maintenance_policy,
+        ),
+        native,
         maintenance_policy,
     );
     let desired = partition.desired_policy;
@@ -24545,6 +24579,7 @@ fn execute_vector_inspection(
                             &partition.partition.partition_key,
                             read_memory.clone(),
                             checkpoint,
+                            partition.live_rows,
                         )?;
                         if let Some(native) = native {
                             if native.recovery_action() == "rebuild" {
@@ -24616,6 +24651,7 @@ fn execute_vector_inspection(
                         &partition.partition.partition_key,
                         read_memory.clone(),
                         checkpoint,
+                        partition.live_rows,
                     )?;
                     let mut row = vector_partition_inspection_row(
                         partition_key_columns,

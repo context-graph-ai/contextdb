@@ -544,6 +544,22 @@ impl<'a> PageSource<'a> {
         }
         entries.checked_mul(PAGE_BYTES as u64).ok_or_else(corrupt)
     }
+    /// The declared-policy replacement decision for the serving generation.
+    pub(super) fn replacement_trigger(
+        &self,
+        column: &contextdb_core::ColumnDef,
+        serving: Manifest,
+        live: u64,
+        damaged: bool,
+    ) -> Option<&'static str> {
+        super::maintenance::replacement_trigger(
+            column,
+            &self.record.borrow(),
+            Some(serving),
+            live,
+            damaged,
+        )
+    }
     /// The source snapshot the selected published generation was built from.
     pub(super) fn base_tx(&self, generation: u64) -> Result<u64> {
         let record = self.record.borrow();

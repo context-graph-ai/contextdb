@@ -13,7 +13,7 @@ impl Database {
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Option<Inspection>> {
-        self.native_ivf_inspect(index, tuple, memory, checkpoint, false)
+        self.native_ivf_inspect(index, tuple, memory, checkpoint, false, None)
     }
     /// SHOW's inspection: uncached, selects nothing and records no damage.
     pub(crate) fn native_ivf_pure_inspection(
@@ -22,8 +22,16 @@ impl Database {
         tuple: &VectorPartitionKey,
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         checkpoint: &dyn Fn() -> Result<()>,
+        live_rows: usize,
     ) -> Result<Option<Inspection>> {
-        self.native_ivf_inspect(index, tuple, memory, checkpoint, true)
+        self.native_ivf_inspect(
+            index,
+            tuple,
+            memory,
+            checkpoint,
+            true,
+            u64::try_from(live_rows).ok(),
+        )
     }
     fn native_ivf_inspect(
         &self,
@@ -32,6 +40,7 @@ impl Database {
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         checkpoint: &dyn Fn() -> Result<()>,
         pure: bool,
+        live: Option<u64>,
     ) -> Result<Option<Inspection>> {
         let Some(root) = self.native_ivf_root()? else {
             return Ok(None);
@@ -65,7 +74,7 @@ impl Database {
                 boundary: &boundary,
             });
         let Some(mut result) = inspection::inspect(
-            &root, memory, index, tuple, column, max_runs, selection, checkpoint,
+            &root, memory, index, tuple, column, max_runs, selection, live, checkpoint,
         )?
         else {
             return Ok(None);

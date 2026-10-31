@@ -247,6 +247,7 @@ impl Database {
                 } else {
                     "clustered_exact"
                 },
+                traversal_complete: !indexed,
             });
             Ok(())
         })?;

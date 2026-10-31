@@ -587,6 +587,9 @@ pub enum VectorPartitionSearchRoute {
 pub struct VectorPartitionSearchTrace {
     pub route: VectorPartitionSearchRoute,
     pub reason: &'static str,
+    /// The successful call visited every vector it could have returned: an
+    /// exact scan, or an index traversal that probed every list it counted.
+    pub traversal_complete: bool,
 }
 
 #[doc(hidden)]
@@ -3852,6 +3855,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     VectorPartitionSearchTrace {
                         route: VectorPartitionSearchRoute::Exact,
                         reason,
+                        traversal_complete: true,
                     };
                     partition_count
                 ];

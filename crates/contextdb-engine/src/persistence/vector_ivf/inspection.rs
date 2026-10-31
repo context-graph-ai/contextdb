@@ -32,6 +32,10 @@ pub(crate) struct Inspection {
     /// The source snapshot of the selected published generation; absent
     /// while nothing is published.
     pub base_tx: Option<u64>,
+    /// Why an idle published index is due for a replacement, by the same
+    /// declared-policy decision maintenance makes; absent without live rows
+    /// to judge or when nothing is due.
+    pub pending_trigger: Option<&'static str>,
 }
 impl Inspection {
     /// A published index that can serve this partition.
@@ -70,6 +74,7 @@ pub(crate) fn inspect(
     column: &contextdb_core::ColumnDef,
     max_delta_runs: u64,
     selection: Option<retained::Selection<'_>>,
+    live: Option<u64>,
     checkpoint: &dyn Fn() -> Result<()>,
 ) -> Result<Option<Inspection>> {
     let authority = read::NativeAuthority::open_uncached(root, memory)?;
@@ -92,12 +97,22 @@ pub(crate) fn inspect(
         .filter(|manifest| manifest.active_lists != 0)
         .map(|manifest| source.base_tx(manifest.generation))
         .transpose()?;
+    let pending_trigger = match (live, manifest.filter(|manifest| manifest.active_lists != 0)) {
+        (Some(live), Some(serving)) => source.replacement_trigger(
+            column,
+            serving,
+            live,
+            catalog.is_some_and(|catalog| catalog.unserviceable.is_some()),
+        ),
+        _ => None,
+    };
     Ok(Some(Inspection {
         manifest,
         catalog,
         objective,
         durable_index_bytes,
         base_tx,
+        pending_trigger,
     }))
 }
 /// The declared objective judged only by evidence for this generation and

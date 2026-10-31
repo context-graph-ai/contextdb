@@ -11068,16 +11068,16 @@ impl VectorState {
                             if let Err(error) =
                                 self.score_staged_vectors(db, context).and_then(|()| {
                                     // A row-checked scan never built the allowed set:
-                                    // when every partition ran the exact route it
-                                    // visited each vector once, so the passing
-                                    // tally is the allowed population; otherwise
-                                    // the population is unknown.
+                                    // when every partition's successful call visited
+                                    // everything it could return, the passing tally is
+                                    // the allowed population; otherwise it is unknown.
                                     let allowed = if !self.row_checked {
                                         Some(aggregate_allowed_count)
-                                    } else if trace.partition_routes().iter().all(|route| {
-                                        route.route
-                                            == contextdb_vector::VectorPartitionSearchRoute::Exact
-                                    }) {
+                                    } else if trace
+                                        .partition_routes()
+                                        .iter()
+                                        .all(|route| route.traversal_complete)
+                                    {
                                         Some(allowed_passed.get())
                                     } else {
                                         None
