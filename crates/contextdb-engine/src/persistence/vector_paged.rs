@@ -138,3 +138,44 @@ impl RedbPersistence {
         })
     }
 }
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn bind_pages_root(write: &redb::WriteTransaction) -> Result<()> {
+    content_identity::bind_vector_pages_root_in_write(write)
+}
+
+/// The schema half of the pages-root binding, checked once when a read opens.
+/// A store that never bound a pages root has no schema half to check.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn validate_schema_meta_root(read: &redb::ReadTransaction) -> Result<()> {
+    if content_identity::vector_schema_meta_root_bound_in_read(read)?
+        && !content_identity::vector_schema_meta_root_matches_in_read(read)?
+    {
+        return Err(corruption(
+            "schema metadata physical root differs from its published binding",
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn validate_pages_root(read: &redb::ReadTransaction) -> Result<()> {
+    let actual = content_identity::vector_schema_pages_root_in_read(read)?;
+    let expected = content_identity::vector_pages_root_in_read(read)
+        .map_err(|error| corruption(format!("pages root binding is invalid: {error}")))?;
+    if actual != expected && !content_identity::vector_schema_meta_root_matches_in_read(read)? {
+        return Err(corruption(
+            "pages or schema physical root differs from its published binding",
+        ));
+    }
+    Ok(())
+}

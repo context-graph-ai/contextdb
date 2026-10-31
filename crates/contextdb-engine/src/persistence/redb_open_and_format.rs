@@ -1,48 +1,6 @@
 use super::*;
 
 impl RedbPersistence {
-    /// Actual collection backing capacity retained by staged paged publications.
-    #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn paged_publication_owners_for_test(&self) -> usize {
-        let publications = self.paged_publications.lock();
-        let pages_capacity = |pages: &PreencodedVectorPartitionGraphPages| {
-            pages.root_key.capacity()
-                + pages.manifest_bytes.capacity()
-                + pages.graph_bytes.capacity()
-        };
-        publications.capacity()
-            * (std::mem::size_of::<(Vec<u8>, vector_paged::PagedPublication)>() + 1)
-            + publications
-                .iter()
-                .map(|(key, publication)| {
-                    let prepared = &publication.prepared;
-                    key.capacity()
-                        + prepared.base_key.capacity()
-                        + prepared.base_bytes.capacity()
-                        + pages_capacity(&prepared.base_pages)
-                        + prepared
-                            .change
-                            .as_ref()
-                            .map_or(0, |(key, bytes)| key.capacity() + bytes.capacity())
-                        + prepared.change_pages.as_ref().map_or(0, pages_capacity)
-                        + prepared.catalog_key.capacity()
-                        + prepared.catalog_bytes.capacity()
-                        + prepared.catalog_route.index.table.capacity()
-                        + prepared.catalog_route.index.column.capacity()
-                        // This accessor counts component Vec and TEXT capacities
-                        // plus the inline key, already included in the map slot.
-                        + (prepared.catalog_route.partition_key.estimated_bytes()
-                            - std::mem::size_of::<VectorPartitionKey>())
-                        + prepared.attributable_stale_catalog_keys.capacity()
-                            * std::mem::size_of::<Vec<u8>>()
-                        + prepared
-                            .attributable_stale_catalog_keys
-                            .iter()
-                            .map(Vec::capacity)
-                            .sum::<usize>()
-                })
-                .sum::<usize>()
-    }
 
     /// Publish a completed checkpoint as a fresh physical database
     /// incarnation. The checkpoint bytes are a snapshot of the source, but
@@ -955,8 +913,6 @@ impl RedbPersistence {
                 }
 
                 {
-                    std::ptr::addr_of_mut!((*construction.source).paged_publications)
-                        .write(Default::default());
                     std::ptr::addr_of_mut!((*construction.source).native_ivf_cache)
                         .write(Default::default());
                     construction.initialized[11] = true;
@@ -972,12 +928,6 @@ impl RedbPersistence {
                     std::ptr::addr_of_mut!((*construction.source).scoped_vector_root_capture)
                         .write(std::sync::OnceLock::new());
                     construction.initialized[13] = true;
-                }
-
-                {
-                    std::ptr::addr_of_mut!((*construction.source).vector_repair_audit)
-                        .write(parking_lot::Mutex::new(None));
-                    construction.initialized[14] = true;
                 }
                 {
                     std::ptr::addr_of_mut!((*construction.source).saved_export_recovery_cutoff)
@@ -1164,8 +1114,6 @@ impl RedbPersistence {
                             }
 
                             {
-                                std::ptr::addr_of_mut!((*construction.source).paged_publications)
-                                    .write(Default::default());
                                 std::ptr::addr_of_mut!((*construction.source).native_ivf_cache)
                                     .write(Default::default());
                                 construction.initialized[11] = true;
@@ -1183,12 +1131,6 @@ impl RedbPersistence {
                                 )
                                 .write(std::sync::OnceLock::new());
                                 construction.initialized[13] = true;
-                            }
-
-                            {
-                                std::ptr::addr_of_mut!((*construction.source).vector_repair_audit)
-                                    .write(parking_lot::Mutex::new(None));
-                                construction.initialized[14] = true;
                             }
                             {
                                 std::ptr::addr_of_mut!(
@@ -1711,8 +1653,6 @@ impl RedbPersistence {
                         }
 
                         {
-                            std::ptr::addr_of_mut!((*construction.source).paged_publications)
-                                .write(Default::default());
                             std::ptr::addr_of_mut!((*construction.source).native_ivf_cache)
                                 .write(Default::default());
                             construction.initialized[11] = true;
@@ -1730,12 +1670,6 @@ impl RedbPersistence {
                             )
                             .write(std::sync::OnceLock::new());
                             construction.initialized[13] = true;
-                        }
-
-                        {
-                            std::ptr::addr_of_mut!((*construction.source).vector_repair_audit)
-                                .write(parking_lot::Mutex::new(None));
-                            construction.initialized[14] = true;
                         }
                         {
                             std::ptr::addr_of_mut!(

@@ -69,9 +69,6 @@ impl PersistenceConstruction {
                         std::ptr::drop_in_place(std::ptr::addr_of_mut!(
                             (*self.source).native_ivf_cache
                         ));
-                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
-                            (*self.source).paged_publications
-                        ));
                     }
                     12 => {
                         std::ptr::drop_in_place(std::ptr::addr_of_mut!(
@@ -81,11 +78,6 @@ impl PersistenceConstruction {
                     13 => {
                         std::ptr::drop_in_place(std::ptr::addr_of_mut!(
                             (*self.source).scoped_vector_root_capture
-                        ));
-                    }
-                    14 => {
-                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
-                            (*self.source).vector_repair_audit
                         ));
                     }
                     15 => {

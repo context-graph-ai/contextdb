@@ -32,6 +32,7 @@ pub(crate) fn search<E: From<Error>>(
     distance: &dyn Fn(DistanceKind) -> Result<()>,
     eligible: &mut dyn FnMut(CandidateIdentity<'_>) -> std::result::Result<bool, E>,
     output: &mut [Hit],
+    pool: Option<&mut dyn FnMut(&[Hit]) -> std::result::Result<(), E>>,
 ) -> std::result::Result<Option<(usize, QueryWork)>, E> {
     let authority = match read::NativeAuthority::open(root, memory) {
         Ok(authority) => authority,
@@ -127,6 +128,7 @@ pub(crate) fn search<E: From<Error>>(
             .into(),
         }));
     }
+    let limit = output.len();
     let route = select_route(
         &source,
         column,
@@ -134,7 +136,7 @@ pub(crate) fn search<E: From<Error>>(
         query_breadth,
         catalog,
         manifest,
-        output.len(),
+        limit,
     )
     .map_err(E::from)?;
     let probes = route.probes;
@@ -181,11 +183,15 @@ pub(crate) fn search<E: From<Error>>(
     .ok_or_else(|| E::from(corrupt()))?;
     let mut work = Work::default();
     let selected = if indexed { Mode::Indexed } else { Mode::Exact };
-    let _route_invoice = if route_depth > output.len() {
+    // A ranked read asks for the whole refined candidate pool, which is
+    // `rerank` hits at the route selected for the original limit.
+    let pooled = pool.is_some() && indexed;
+    let route_capacity = if pooled { rerank } else { route_depth };
+    let _route_invoice = if route_capacity > output.len() {
         Some(
             super::memory::Invoice::reserve(
                 authority.vector_owner(),
-                std::alloc::Layout::array::<Hit>(route_depth)
+                std::alloc::Layout::array::<Hit>(route_capacity)
                     .map_err(|_| E::from(corrupt()))?
                     .size(),
                 "clustered_served_depth",
@@ -195,12 +201,12 @@ pub(crate) fn search<E: From<Error>>(
     } else {
         None
     };
-    let mut route_hits = if route_depth > output.len() {
-        vec![Hit::default(); route_depth]
+    let mut route_hits = if route_capacity > output.len() {
+        vec![Hit::default(); route_capacity]
     } else {
         Vec::new()
     };
-    let count = if route_depth > output.len() {
+    let count = if route_capacity > output.len() {
         let n = ivf::search_with_eligibility(
             &source,
             policy,
@@ -212,6 +218,11 @@ pub(crate) fn search<E: From<Error>>(
             &mut route_hits,
             &mut work,
         )?;
+        if let Some(pool) = pool
+            && pooled
+        {
+            pool(&route_hits[..n])?;
+        }
         let n = n.min(output.len());
         output[..n].copy_from_slice(&route_hits[..n]);
         n

@@ -1922,7 +1922,6 @@ impl ReadPersistenceImage {
             trigger_audit_stamps: self.trigger_audit_stamps,
             sink_queues: self.sink_queues,
             sink_queue_extents: self.sink_queue_extents,
-            vector_generation_catalog: self.vector_generation_catalog,
             retained_source,
             source_path: self
                 .source_path

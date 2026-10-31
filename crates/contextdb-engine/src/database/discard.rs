@@ -915,7 +915,6 @@ impl Database {
             source_provenance: prepared.disk_source_provenance,
             vectors: prepared.vector_entries,
             vector_partition_identities: prepared.vector_partition_identities,
-            vector_generation_candidates: prepared.vector_generation_candidates,
             graph_entries: prepared.canonical_graph_entries,
             row_graph_entries: prepared.row_graph_entries,
             row_graph_credit: prepared.row_graph_credit,
@@ -1656,7 +1655,6 @@ impl Database {
             source_provenance: prepared.disk_source_provenance,
             vectors: prepared.vector_entries,
             vector_partition_identities: prepared.vector_partition_identities,
-            vector_generation_candidates: prepared.vector_generation_candidates,
             graph_entries: Vec::new(),
             sink_entries: prepared
                 .durable_sink_entries

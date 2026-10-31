@@ -79,7 +79,7 @@ use crate::executor::{
 };
 use crate::memory_accounting::{MemoryAccountant, OwnedMemoryReservation, WriterBudget};
 use crate::persistence::{
-    AuthoritativePurgePersistenceProjection, LoadedVectorPartitionGenerationCatalog,
+    AuthoritativePurgePersistenceProjection,
     LocalSchemaPersistenceProjection, ReadOnlyVectorGenerationSource,
     ReceivedSchemaPersistenceProjection, RedbPersistence, VectorPartitionBaseGenerationRecord,
     VectorPartitionChangeGenerationRecord, VectorPartitionGenerationCandidate,
@@ -2471,7 +2471,6 @@ struct AuthoritativePurgePreparedSet {
     change_log_entries: Vec<ChangeLogEntry>,
     vector_entries: Vec<VectorEntry>,
     vector_partition_identities: Vec<VectorPartitionVersionIdentity>,
-    vector_generation_candidates: Vec<VectorPartitionGenerationCandidate>,
     canonical_graph_entries: Vec<AdjEntry>,
     row_graph_entries: Vec<contextdb_tx::OwnedAdjEntry>,
     row_graph_credit: contextdb_core::read_memory::ReadCredit,
@@ -10816,7 +10815,6 @@ struct OriginalPurgeNonEventPublication {
 struct OriginalPurgeNonEventPreparedSet {
     vector_entries: Vec<VectorEntry>,
     vector_partition_identities: Vec<VectorPartitionVersionIdentity>,
-    vector_generation_candidates: Vec<VectorPartitionGenerationCandidate>,
     disk_source_provenance: Vec<(String, RowId, Lsn, u8)>,
     lineage_config_owners: Vec<AuthoritativePurgeLineageConfigOwners>,
     durable_sink_entries: Vec<AuthoritativePurgeSinkEntryKey>,

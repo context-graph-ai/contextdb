@@ -7918,10 +7918,7 @@ pub(super) fn vector_schema_pages_root_in_write(
         hash.update(&scopes);
         *hash.finalize().as_bytes()
     } else {
-        write
-            .table_root_fingerprint(super::vector_paged::PAGES)
-            .map_err(RedbPersistence::storage_error)?
-            .unwrap_or([0; 32])
+        [0; 32]
     };
     Ok(vector_schema_pages_hash(pages, schema))
 }
@@ -7944,9 +7941,7 @@ pub(super) fn vector_schema_pages_root_in_read(read: &redb::ReadTransaction) -> 
         hash.update(&scopes);
         *hash.finalize().as_bytes()
     } else {
-        read.table_root_fingerprint(super::vector_paged::PAGES)
-            .map_err(RedbPersistence::storage_error)?
-            .unwrap_or([0; 32])
+        [0; 32]
     };
     Ok(vector_schema_pages_hash(pages, schema))
 }

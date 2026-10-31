@@ -1741,7 +1741,6 @@ impl Database {
             trigger_audit_stamps: _,
             sink_queues,
             sink_queue_extents,
-            vector_generation_catalog,
             retained_source,
             source_path: _,
             store_file_bytes,

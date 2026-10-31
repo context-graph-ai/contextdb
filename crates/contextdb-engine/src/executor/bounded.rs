@@ -4031,10 +4031,6 @@ struct VectorState {
     // before their independent live charge. Cursor settlement cannot refund it.
     row_filter: Option<VectorRowFilter>,
     prepaid_construction: usize,
-    /// The row checks this statement may spend (see `row_check_allowance`),
-    /// once known, and those spent so far: index entries a bounded probe
-    /// read, then each row checked.
-    row_check_allowance: Option<usize>,
     row_checks: Cell<usize>,
     /// The probe could not establish a small candidate set within half the
     /// allowance: the filter is checked on each row the search reaches.
@@ -7674,7 +7670,7 @@ impl ScanState {
         context: &ControlArc<RequestContext>,
         candidate_ids: &mut Vec<u64>,
         candidate_bytes: &mut usize,
-        probe: Option<(&Cell<usize>, usize)>,
+        row_checkable: bool,
     ) -> std::result::Result<CandidateDrain, BoundedExecutionError> {
         if !self.identities_only
             || !self.vector_candidate_source
@@ -7686,9 +7682,9 @@ impl ScanState {
         let ScanMode::Index { cursor, pick, .. } = &mut self.mode else {
             return Ok(CandidateDrain::Unsupported);
         };
-        // A bounded probe reads at most `cap` entries, each counted before it
-        // is read; the entry after the cap is never read to learn whether
-        // the range had ended.
+        // When the filter can be checked on each row the search reaches, a
+        // refusal of the candidate-id memory admission ends the drain; the
+        // caller then searches with the filter checked row by row.
         let capped = Cell::new(false);
         let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(
             contextdb_core::find_attribution::inline_phases::Phase::CandidateDrain,
@@ -7701,25 +7697,23 @@ impl ScanState {
                 self.snapshot,
                 cursor,
                 &mut || {
-                    if let Some((spent, cap)) = probe {
-                        if spent.get() >= cap {
-                            capped.set(true);
-                            return Err(BoundedExecutionError::Cancelled);
-                        }
-                        spent.set(spent.get() + 1);
-                    }
                     context.charge(
                         BoundedWorkSource::IndexRange,
                         BoundedSourceTouch::IndexEntry,
                     )
                 },
                 &mut |row_id| {
-                    let added = reserve_vector_slot(
+                    let Some(added) = reserve_vector_slot_inner(
                         context,
                         BoundedWorkSource::VectorCandidates,
                         candidate_ids,
                         "vector candidate ids",
-                    )?;
+                        row_checkable,
+                    )?
+                    else {
+                        capped.set(true);
+                        return Err(BoundedExecutionError::Cancelled);
+                    };
                     *candidate_bytes = candidate_bytes
                         .checked_add(added)
                         .ok_or_else(|| bounded_size_error("vector candidate ids"))?;
@@ -10104,8 +10098,25 @@ fn reserve_vector_slot<T>(
     values: &mut Vec<T>,
     operation: &str,
 ) -> std::result::Result<usize, BoundedExecutionError> {
+    Ok(reserve_vector_slot_inner(context, source, values, operation, false)?.unwrap_or(0))
+}
+
+/// Growth the read can do without: when `optional`, a refusal of this reader's
+/// own memory admission is `None` and the caller falls back to a smaller
+/// representation. Every other failure still ends the read.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn reserve_vector_slot_inner<T>(
+    context: &ControlArc<RequestContext>,
+    source: BoundedWorkSource,
+    values: &mut Vec<T>,
+    operation: &str,
+    optional: bool,
+) -> std::result::Result<Option<usize>, BoundedExecutionError> {
     if values.len() < values.capacity() {
-        return Ok(0);
+        return Ok(Some(0));
     }
     let previous_capacity = values.capacity();
     // Growing by one slot at a time reallocates and copies everything already
@@ -10118,7 +10129,12 @@ fn reserve_vector_slot<T>(
         .max(AMORTIZED_GROWTH_FLOOR);
     let additional = target.saturating_sub(previous_capacity).max(1);
     let bytes = checked_size_mul(additional, std::mem::size_of::<T>(), operation)?;
-    context.reserve(source, bytes)?;
+    if let Err(error) = context.reserve(source, bytes) {
+        if optional && reader_memory_refusal(&error) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
     if values.try_reserve_exact(additional).is_err() {
         context.release(bytes)?;
         return Err(Error::Other((format!("bounded {operation} allocation failed")).into()).into());
@@ -10155,7 +10171,7 @@ fn reserve_vector_slot<T>(
         }
     };
     reconcile_new_reservation(context, source, bytes, delta)?;
-    Ok(delta)
+    Ok(Some(delta))
 }
 
 /// Which column of a candidate set names the rows it picked.
@@ -10876,63 +10892,13 @@ impl VectorState {
         loop {
             match self.preparation {
                 VectorPreparation::Candidates(_) => {
-                    // A filter the search could check row by row is first
-                    // probed for a small exact candidate set: at most half the
-                    // statement's row checks, each counted before it is read.
-                    let probe_cap = if !matches!(
+                    // A filter the search can check row by row keeps its exact
+                    // candidate set only while the read can afford to hold it.
+                    let row_checkable = matches!(
                         self.preparation,
                         VectorPreparation::Candidates(Some(_))
-                    ) {
-                        None
-                    } else {
-                        match (&self.row_filter, self.row_check_allowance) {
-                            (Some(_), Some(allowance)) => Some(allowance / 2),
-                            (Some(_), None)
-                                if self.search_mode != contextdb_core::VectorSearchMode::Exact =>
-                            {
-                                let allowance = {
-                                    let groups = self.with_partition_scope(context, || {
-                        let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::Grouping);
-                                            context.with_vector_copies(|vector_copy_owner| {
-                                                db.bounded_vector_candidate_groups(
-                                                    &self.index,
-                                                    None,
-                                                    self.snapshot,
-                                                    &mut || context.native_source_touch(),
-                                                    &mut || {
-                                                        context.charge_operator(
-                                                            BoundedWorkSource::VectorCandidates,
-                                                        )
-                                                    },
-                                                    &mut |bytes| {
-                                                        context.reserve(
-                                                            BoundedWorkSource::VectorCandidates,
-                                                            bytes,
-                                                        )
-                                                    },
-                                                    &mut |bytes| context.release_parked(bytes),
-                                                    vector_copy_owner,
-                                                    context.reader_budget.clone(),
-                                                )
-                                            })
-                                        })?;
-                                    let groups =
-                                        RetainedVectorCandidateGroups::new(groups, context);
-                                    context.with_vector_copies(|vector_copy_owner| {
-                                        db.bounded_vector_row_check_allowance(
-                                            &self.index,
-                                            self.k,
-                                            groups.get(),
-                                            vector_copy_owner,
-                                        )
-                                    })?
-                                };
-                                self.row_check_allowance = allowance;
-                                allowance.map(|allowance| allowance / 2)
-                            }
-                            _ => None,
-                        }
-                    };
+                    ) && self.row_filter.is_some()
+                        && self.search_mode != contextdb_core::VectorSearchMode::Exact;
                     let candidate = match &mut self.preparation {
                         VectorPreparation::Candidates(candidate) => candidate,
                         _ => {
@@ -10953,7 +10919,7 @@ impl VectorState {
                             context,
                             &mut self.candidate_ids,
                             &mut self.candidate_bytes,
-                            probe_cap.map(|cap| (&self.row_checks, cap)),
+                            row_checkable,
                         )? {
                             CandidateDrain::Drained => {
                                 self.candidate_ids.sort_unstable();
@@ -10967,12 +10933,6 @@ impl VectorState {
                             }
                             CandidateDrain::Unsupported => {}
                         }
-                    }
-                    if let Some(cap) = probe_cap
-                        && self.row_checks.get() >= cap
-                    {
-                        self.enter_row_checked(context)?;
-                        continue;
                     }
                     // How this candidate set names the rows it picked. A plan
                     // that reads the table directly projects the table's own
@@ -10991,9 +10951,6 @@ impl VectorState {
                                 .to_string()).into())
                         })?;
                     let row = root.next(db, context)?;
-                    if probe_cap.is_some() && row.is_some() {
-                        self.row_checks.set(self.row_checks.get() + 1);
-                    }
                     match row {
                         Some(row) => {
                             let resolved =
@@ -11044,12 +11001,18 @@ impl VectorState {
                                 row.release(context)?;
                                 continue;
                             };
-                            let added = reserve_vector_slot(
+                            let Some(added) = reserve_vector_slot_inner(
                                 context,
                                 BoundedWorkSource::VectorCandidates,
                                 &mut self.candidate_ids,
                                 "vector candidate ids",
-                            )?;
+                                row_checkable,
+                            )?
+                            else {
+                                row.release(context)?;
+                                self.enter_row_checked(context)?;
+                                continue;
+                            };
                             self.candidate_bytes = self
                                 .candidate_bytes
                                 .checked_add(added)
@@ -17085,7 +17048,6 @@ fn build_vector_kernel<'plan>(
             candidate_bytes,
             row_filter,
             prepaid_construction: size_of::<VectorState>(),
-            row_check_allowance: None,
             row_checks: Cell::new(0),
             row_checked: stream_plain_filter,
             source: None,

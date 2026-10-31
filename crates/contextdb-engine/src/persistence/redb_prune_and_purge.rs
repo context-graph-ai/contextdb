@@ -993,7 +993,6 @@ impl RedbPersistence {
             &HashSet<NodeId>,
         )>,
         commit_index_lsns: &[Lsn],
-        generations: &VectorGenerationCleanup,
         selection_progress: &[(String, Vec<u8>)],
     ) -> Result<PruneScopedStats> {
         self.prune_retention_with_owned_scoped(
@@ -1010,7 +1009,6 @@ impl RedbPersistence {
                 )
             }),
             commit_index_lsns,
-            generations,
             selection_progress,
         )
     }
@@ -1032,7 +1030,6 @@ impl RedbPersistence {
             &HashSet<NodeId>,
         )>,
         commit_index_lsns: &[Lsn],
-        generations: &VectorGenerationCleanup,
         selection_progress: &[(String, Vec<u8>)],
     ) -> Result<PruneScopedStats> {
         self.prepare_proof_owner()?;
@@ -1041,7 +1038,6 @@ impl RedbPersistence {
             && orphaned_source_lsn_rows.is_empty()
             && auxiliary.is_none()
             && commit_index_lsns.is_empty()
-            && generations.is_empty()
             && selection_progress.is_empty()
         {
             return Ok(PruneScopedStats::default());
@@ -1152,9 +1148,6 @@ impl RedbPersistence {
                 &write_txn,
                 commit_index_lsns,
             )?);
-            for (catalog, retained) in generations {
-                self.reclaim_vector_generations_in_write(&write_txn, catalog, retained)?;
-            }
             {
                 let mut config = write_txn
                     .open_table(CONFIG_TABLE)
@@ -1589,7 +1582,6 @@ impl RedbPersistence {
         pruned_change_keys: &[(String, RowId, Lsn)],
         vector_versions: &[contextdb_vector::VectorVersionIdentity],
         commit_index_lsns: &[Lsn],
-        generations: &VectorGenerationCleanup,
         durable: &std::cell::Cell<bool>,
         cleanup_progress: &[(String, writer_cleanup_progress::CurrencyCleanupProgress)],
         cleanup_rotation: Option<[u8; 32]>,
@@ -1599,7 +1591,6 @@ impl RedbPersistence {
             && pruned_change_keys.is_empty()
             && vector_versions.is_empty()
             && commit_index_lsns.is_empty()
-            && generations.is_empty()
             && cleanup_progress.is_empty()
             && cleanup_rotation.is_none()
         {
@@ -1689,9 +1680,6 @@ impl RedbPersistence {
                     &write_txn,
                     commit_index_lsns,
                 )?);
-                for (catalog, retained) in generations {
-                    self.reclaim_vector_generations_in_write(&write_txn, catalog, retained)?;
-                }
                 Self::apply_content_identity_mutations_in_write(
                     &write_txn,
                     &posting_outputs.mutations,
@@ -1750,11 +1738,7 @@ impl RedbPersistence {
         projection: &AuthoritativePurgePersistenceProjection,
         marker: Option<purge_publication::DurableMarker>,
         frontier: Lsn,
-        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
-        operation: &str,
-    ) -> Result<Vec<(VectorPartitionRef, u64, u64)>> {
-        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
-
+    ) -> Result<()> {
         #[cfg(test)]
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
             "RedbPersistence::commit_authoritative_purge");
@@ -1762,43 +1746,6 @@ impl RedbPersistence {
         content_identity::proof_allocation_oracle_tests::note_purge_publication_frontier(
             frontier.0,
         );
-        // Presence, including a malformed fence, is sufficient to refuse.
-        // The write-transaction check below closes a concurrent retirement.
-        if self.has_vector_repair_fence()? || self.has_paged_cleanup()? {
-            return Err(vector_paged::corruption(
-                "vector ownership cleanup is incomplete before authoritative erasure",
-            ));
-        }
-        #[cfg(test)]
-        let _purge_prepare_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
-            "RedbPersistence::commit_authoritative_purge::prepare_vector_generations");
-        let prepared_vector_generations =
-            self.prepare_authoritative_purge_vector_generations(projection)?;
-        #[cfg(test)]
-        drop(_purge_prepare_producer);
-        // A saved (paged) replacement is renumbered to its storage identity
-        // when it is prepared; the caller's in-memory replacement adopts the
-        // published identity so a restart registers the same generation.
-        #[cfg(test)]
-        let _purge_identities_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
-            "RedbPersistence::commit_authoritative_purge::collect_published_identities");
-        let published_identities = prepared_vector_generations
-            .iter()
-            .map(|prepared| {
-                let catalog: VectorPartitionGenerationCatalogRecord = self
-                    .decode_vector_partition_record(
-                        VectorPartitionRecordKind::GenerationCatalog,
-                        &prepared.catalog_bytes,
-                    )?;
-                Ok((
-                    prepared.catalog_route.clone(),
-                    catalog.base.generation_id,
-                    catalog.base.durable_bytes,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        #[cfg(test)]
-        drop(_purge_identities_producer);
         #[cfg(test)]
         let _purge_with_db_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
             "RedbPersistence::commit_authoritative_purge::with_db");
@@ -1835,24 +1782,12 @@ impl RedbPersistence {
             #[cfg(test)]
             drop(_purge_graph_producer);
             #[cfg(test)]
-            let _purge_fence_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
-                "RedbPersistence::commit_authoritative_purge::refuse_unresolved_vector_erasure");
-            Self::refuse_unresolved_vector_erasure_in_write(
-                &write_txn,
-                &Self::preencoded_native_storage(&prepared_vector_generations),
-            )?;
-            #[cfg(test)]
-            drop(_purge_fence_producer);
-            #[cfg(test)]
             let _purge_erasure_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
                 "RedbPersistence::commit_authoritative_purge::apply_local_erasure");
             self.apply_local_erasure(
                 &write_txn,
                 projection,
-                &prepared_vector_generations,
                 marker,
-                accountant.clone(),
-                operation,
                 None,
             )?;
             if let Some(session)=&mut native_session {session.erase_rows(self,&native_original,&projection.vector_partition_identities)?;session.bind_final()?;}
@@ -1905,7 +1840,7 @@ impl RedbPersistence {
                     &identity.partition_key,
                 ));
         }
-        Ok(published_identities)
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -2256,42 +2191,6 @@ impl RedbPersistence {
         }
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn prepare_authoritative_purge_vector_generations(
-        &self,
-        projection: &AuthoritativePurgePersistenceProjection,
-    ) -> Result<Vec<PreencodedVectorPartitionGenerationCandidate>> {
-        let affected_partitions = projection
-            .vector_partition_identities
-            .iter()
-            .map(|identity| (identity.index.clone(), identity.partition_key.clone()))
-            .collect::<HashSet<_>>();
-        let mut candidate_partitions = HashSet::new();
-        projection
-            .vector_generation_candidates
-            .iter()
-            .map(|candidate| {
-                let partition = (
-                    candidate.catalog.index.clone(),
-                    candidate.catalog.partition_key.clone(),
-                );
-                if !affected_partitions.contains(&partition) {
-                    return Err(crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), format_args!(
-                            "authoritative purge replacement generation is outside its affected partition: {}.{}",
-                            partition.0.table, partition.0.column
-                        )));
-                }
-                if !candidate_partitions.insert(partition) {
-                    return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "authoritative purge prepared two replacement generations for one partition".into()));
-                }
-                self.prepare_vector_partition_generation_candidate_inner(candidate, true, |_| Ok(()))
-            })
-            .collect()
-    }
-
     // Both erasure verbs share the exact physical writer and fault boundary.
     #[expect(
         clippy::result_large_err,
@@ -2301,14 +2200,9 @@ impl RedbPersistence {
         &self,
         write_txn: &redb::WriteTransaction,
         projection: &AuthoritativePurgePersistenceProjection,
-        prepared_vector_generations: &[PreencodedVectorPartitionGenerationCandidate],
         marker: Option<purge_publication::DurableMarker>,
-        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
-        operation: &str,
         original_history: Option<&OriginalPersistenceFrame<'_>>,
     ) -> Result<()> {
-        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
-
         #[cfg(test)]
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
             "RedbPersistence::apply_local_erasure");
@@ -2585,9 +2479,6 @@ impl RedbPersistence {
         self.purge_vector_partition_generation_identities_in_write(
             write_txn,
             &projection.vector_partition_identities,
-            accountant,
-            operation,
-            &Self::preencoded_native_storage(prepared_vector_generations),
         )?;
 
         if !projection.vectors.is_empty() {
@@ -2787,34 +2678,6 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .insert(PURGE_PUBLICATION_MARKER_KEY, bytes.as_slice())
                 .map_err(Self::storage_error)?;
-        }
-
-        // Every candidate was encoded, decoded, and validated before the
-        // destructive transaction began. Immutable objects are inserted
-        // first and their authoritative catalog pointers last; any Redb
-        // error still aborts the entire erasure transaction.
-        for prepared in prepared_vector_generations {
-            self.insert_preencoded_vector_partition_generation_objects_in_write(
-                write_txn, prepared,
-            )?;
-        }
-        for prepared in prepared_vector_generations {
-            // Purge builds its replacement from the current survivors while
-            // holding the commit gate. Capture that frontier in this same
-            // erasure transaction before publishing the replacement catalog.
-            let catalog: VectorPartitionGenerationCatalogRecord = self
-                .decode_vector_partition_record(
-                    VectorPartitionRecordKind::GenerationCatalog,
-                    &prepared.catalog_bytes,
-                )?;
-            vector_membership_pages::begin_pending_frontier(
-                write_txn,
-                &prepared.catalog_route,
-                catalog.change.unwrap_or(catalog.base).covered_tx,
-            )?;
-            self.publish_preencoded_vector_partition_generation_catalog_in_write(
-                write_txn, prepared,
-            )?;
         }
 
         #[cfg(any(test, feature = "test-seams"))]

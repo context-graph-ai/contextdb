@@ -1218,30 +1218,7 @@ pub(super) fn vector_partition_record_payload(
         ));
     }
     let checksum_offset = encoded.len() - 32;
-    let expected_checksum = {
-        // A record that carries a whole saved graph is hashed over that graph,
-        // and that pass is one a graph load pays for, so it is metered as one.
-        // A paged generation's record carries only its small META; the graph's
-        // one full pass is the route page-set walk, so this digest of the
-        // record still runs but is not a graph pass.
-        const PAGED_META_RECORD_LIMIT: usize = 64 * 1024;
-        let carries_graph = matches!(
-            expected_kind,
-            VectorPartitionRecordKind::BaseGeneration | VectorPartitionRecordKind::ChangeGeneration
-        ) && !(checksum_offset <= PAGED_META_RECORD_LIMIT
-            && encoded[..checksum_offset]
-                .windows(vector_paged::META_MAGIC.len())
-                .any(|window| window == vector_paged::META_MAGIC));
-        let _hashing = carries_graph
-            .then(|| contextdb_core::find_attribution::stage("graph_load_record_digest"));
-        if carries_graph {
-            contextdb_core::find_attribution::note_hash_pass(
-                "graph_record_envelope_hashed_bytes",
-                checksum_offset,
-            );
-        }
-        blake3::hash(&encoded[..checksum_offset])
-    };
+    let expected_checksum = blake3::hash(&encoded[..checksum_offset]);
     #[cfg(any(test, feature = "test-seams"))]
     if expected_kind == VectorPartitionRecordKind::Membership {
         crate::database::resident_history_test_seams::note(|work| {
@@ -1935,59 +1912,6 @@ pub(super) fn validate_vector_partition_journal_record(
 /// Stale catalog attribution needs only an exact route and an authenticated,
 /// completely decodable fixed suffix. Descriptors and publication IDs contain
 /// no strings or sequences, so unrelated catalogs never allocate route owners.
-pub(super) fn vector_partition_catalog_has_expected_route(
-    encoded: &[u8],
-    index: &VectorIndexRef,
-    partition_key: &VectorPartitionKey,
-) -> bool {
-    let Ok(payload) = vector_partition_expected_metadata_payload(
-        VectorPartitionRecordKind::GenerationCatalog,
-        encoded,
-        index,
-        partition_key,
-    ) else {
-        return false;
-    };
-    let Ok(route_end) = vector_partition_expected_route_prefix(payload, index, partition_key)
-    else {
-        return false;
-    };
-    type CatalogSuffix = (
-        VectorPartitionGenerationDescriptor,
-        Option<VectorPartitionGenerationDescriptor>,
-        TxId,
-        Lsn,
-    );
-    bincode::serde::decode_from_slice::<CatalogSuffix, _>(
-        &payload[route_end..],
-        bincode::config::standard(),
-    )
-    .is_ok_and(|(_, consumed)| consumed == payload.len() - route_end)
-}
-
-pub(super) fn vector_generation_catalog_fault_reason(
-    encoded: &[u8],
-) -> VectorRouteQuarantineReason {
-    let header_len = VECTOR_PARTITION_RECORD_MAGIC.len() + 2 + 1 + 8;
-    if encoded.len() < header_len + 32 {
-        return VectorRouteQuarantineReason::CorruptBase;
-    }
-    let checksum_offset = encoded.len() - 32;
-    let checksum = blake3::hash(&encoded[..checksum_offset]);
-    if checksum.as_bytes()[..] != encoded[checksum_offset..]
-        || &encoded[..VECTOR_PARTITION_RECORD_MAGIC.len()] != VECTOR_PARTITION_RECORD_MAGIC
-    {
-        return VectorRouteQuarantineReason::CorruptBase;
-    }
-    let version_offset = VECTOR_PARTITION_RECORD_MAGIC.len();
-    let version = u16::from_be_bytes([encoded[version_offset], encoded[version_offset + 1]]);
-    if version != VECTOR_PARTITION_RECORD_VERSION {
-        VectorRouteQuarantineReason::IncompatibleFormat
-    } else {
-        VectorRouteQuarantineReason::CorruptBase
-    }
-}
-
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2064,29 +1988,21 @@ pub(super) fn vector_body_root_matches(
     Ok(expected.value() == actual)
 }
 
-/// Decode only vector membership identities and generation catalogs. Graph
-/// bodies and journal pages deliberately remain untouched during hydration.
+/// Validate the committed vector directory and report whether it is ready.
+/// Vector bodies and journal pages deliberately remain untouched during hydration.
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn decode_read_vector_generation_catalog(
+pub(super) fn decode_read_raw_vector_directory(
     read_txn: &redb::ReadTransaction,
     memory: &crate::read_image_memory::ImageMemoryHandle,
-) -> std::result::Result<
-    (
-        LoadedVectorPartitionGenerationCatalog,
-        ReadRawVectorDirectory,
-    ),
-    LoadReadImageError,
-> {
+) -> std::result::Result<ReadRawVectorDirectory, LoadReadImageError> {
     let _decode_scope =
         crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
     vector_membership_pages::validate_in_read(read_txn).map_err(read_image_error)?;
-    // Schema metadata is store-wide: damage there refuses the whole read here,
-    // before any route could take it for that route's own graph damage.
+    // Schema metadata is store-wide: damage there refuses the whole read here.
     vector_paged::validate_schema_meta_root(read_txn).map_err(read_image_error)?;
-    let mut known_by_key = HashMap::<Vec<u8>, VectorPartitionRef>::new();
     let mut raw_ready = true;
     let memberships = match read_txn.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
         Ok(table) => Some(table),
@@ -2148,61 +2064,6 @@ pub(super) fn decode_read_vector_generation_catalog(
         // An empty vector store needs no directory. A nonempty store without
         // memberships takes the full-image reconstruction route.
         raw_ready = indexed_count == 0 && body_count == 0;
-    }
-    // Routes come from the writer-maintained per-route summaries: one keyed,
-    // checksummed row per route, never a walk of the memberships. Each route's
-    // key, decoded identity and map slot are admitted before allocation; the
-    // map lives only for this decode, so the charge returns when it ends.
-    struct RouteMapCharge {
-        owner: crate::read_image_memory::ImageMemoryHandle,
-        bytes: usize,
-    }
-    impl Drop for RouteMapCharge {
-        fn drop(&mut self) {
-            if self.bytes != 0 {
-                self.owner.release(self.bytes);
-            }
-        }
-    }
-    let mut route_map_charge = RouteMapCharge {
-        owner: crate::read_image_memory::active_owner().map_err(read_image_error)?,
-        bytes: 0,
-    };
-    match read_txn.open_table(vector_membership_pages::SUMMARY) {
-        Ok(summaries) => {
-            for entry in summaries.iter().map_err(read_storage_error)? {
-                let (key, value) = entry.map_err(read_storage_error)?;
-                let prefix = key.value();
-                if prefix.is_empty() {
-                    continue;
-                }
-                let route_bytes = prefix
-                    .len()
-                    .saturating_mul(3)
-                    .saturating_add(value.value().len())
-                    .saturating_add(std::mem::size_of::<VectorPartitionRef>())
-                    .saturating_add(std::mem::size_of::<(Vec<u8>, VectorPartitionRef)>())
-                    .saturating_add(64);
-                route_map_charge
-                    .owner
-                    .reserve(route_bytes)
-                    .map_err(read_image_error)?;
-                route_map_charge.bytes += route_bytes;
-                vector_membership_pages::decode_summary(prefix, value.value())
-                    .map_err(read_image_error)?;
-                let route = vector_membership_pages::partition_from_prefix(prefix)
-                    .map_err(read_image_error)?;
-                known_by_key.insert(
-                    RedbPersistence::vector_partition_catalog_key_from_parts(
-                        &route.index,
-                        &route.partition_key,
-                    ),
-                    route,
-                );
-            }
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(error) => return Err(read_table_error(error)),
     }
     if memberships_present && let Some(root) = directory_root {
         // The membership and open-directory pages are bound to the committed
@@ -2329,82 +2190,7 @@ pub(super) fn decode_read_vector_generation_catalog(
     // source. Reading their B-tree at open faults payload pages proportional
     // to the declared vector dimension, even though no vector is hydrated.
 
-    let table = match read_txn.open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => {
-            return Ok((
-                LoadedVectorPartitionGenerationCatalog {
-                    catalogs: Vec::new(),
-                    quarantines: Vec::new(),
-                },
-                ReadRawVectorDirectory { ready: raw_ready },
-            ));
-        }
-        Err(error) => return Err(read_table_error(error)),
-    };
-    let mut catalogs = Vec::new();
-    let mut quarantines = HashMap::<VectorPartitionRef, VectorRouteQuarantineReason>::new();
-    for entry in table.iter().map_err(read_storage_error)? {
-        let (key, value) = entry.map_err(read_storage_error)?;
-        let physical_key = key.value();
-        let physical_route = known_by_key.get(physical_key).cloned();
-        match decode_vector_partition_record_payload::<VectorPartitionGenerationCatalogRecord>(
-            VectorPartitionRecordKind::GenerationCatalog,
-            value.value(),
-        ) {
-            Ok(catalog) => {
-                let payload_route =
-                    VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone());
-                if RedbPersistence::vector_partition_catalog_key(&catalog).as_slice()
-                    != physical_key
-                {
-                    quarantines
-                        .entry(physical_route.unwrap_or(payload_route))
-                        .or_insert(VectorRouteQuarantineReason::CorruptBase);
-                } else {
-                    catalogs.push(catalog);
-                }
-            }
-            Err(_) => {
-                if let Some(route) = physical_route {
-                    let reason = vector_generation_catalog_fault_reason(value.value());
-                    quarantines
-                        .entry(route)
-                        .and_modify(|current| {
-                            if reason == VectorRouteQuarantineReason::IncompatibleFormat {
-                                *current = reason;
-                            }
-                        })
-                        .or_insert(reason);
-                }
-            }
-        }
-    }
-    catalogs.retain(|catalog| {
-        !quarantines.contains_key(&VectorPartitionRef::new(
-            catalog.index.clone(),
-            catalog.partition_key.clone(),
-        ))
-    });
-    let mut quarantines = quarantines.into_iter().collect::<Vec<_>>();
-    quarantines.sort_by(|(left, _), (right, _)| {
-        left.index
-            .table
-            .cmp(&right.index.table)
-            .then(left.index.column.cmp(&right.index.column))
-            .then(
-                left.partition_key
-                    .canonical_bytes()
-                    .cmp(&right.partition_key.canonical_bytes()),
-            )
-    });
-    Ok((
-        LoadedVectorPartitionGenerationCatalog {
-            catalogs,
-            quarantines,
-        },
-        ReadRawVectorDirectory { ready: raw_ready },
-    ))
+    Ok(ReadRawVectorDirectory { ready: raw_ready })
 }
 
 #[expect(
@@ -3629,8 +3415,7 @@ pub(super) fn decode_complete_read_image(
         }
     }
     note_open("table_meta");
-    let (vector_generation_catalog, raw_vector_directory) =
-        decode_read_vector_generation_catalog(read_txn, &memory)?;
+    let raw_vector_directory = decode_read_raw_vector_directory(read_txn, &memory)?;
     note_open("vector_catalog_and_raw_vector_directory");
     // Durable relational postings and the raw-vector membership directory
     // must both cover their complete body tables before the direct reader can
@@ -3822,7 +3607,6 @@ pub(super) fn decode_complete_read_image(
         trigger_audit_stamps: Vec::new(),
         sink_queues: BTreeMap::new(),
         sink_queue_extents,
-        vector_generation_catalog,
         source_path: None,
         // Filled in by the source that has the file open; the decoder itself
         // is handed a read transaction and never sees a path.

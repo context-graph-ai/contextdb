@@ -59,6 +59,7 @@ impl Database {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
         query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
+        rank_pool: bool,
         before_source: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_exact: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), E>,
@@ -119,6 +120,11 @@ impl Database {
         )
         .map_err(E::from)?;
         let mut hits = vec![Hit::default(); k];
+        // A ranked indexed read keeps the whole refined candidate pool of the
+        // route selected for `k`; the pool's extra score and merge space is
+        // admitted when a partition reports it.
+        let mut capacity = k;
+        let mut pool_growth = ReadCredit::new(memory.clone());
         let score_bytes = k
             .checked_mul(std::mem::size_of::<(RowId, f32)>())
             .ok_or_else(|| E::from(Error::Other("native score workspace overflow".into())))?;
@@ -196,7 +202,51 @@ impl Database {
                 Ok(true)
             };
             let record_damage=|catalog|self.record_selected_native_ivf_damage(&root,index,tuple,column.vector_engine_policy.max_delta_runs.unwrap_or(2),catalog,&checkpoint).map(|_|());
-            let found=crate::persistence::vector_ivf::query::search(&root,memory.clone(),index,tuple,column,maintenance,Some(&record_damage),query,mode,query_breadth,&checkpoint,&charge,&mut eligible,&mut hits);
+            let pooled = std::cell::Cell::new(false);
+            let merge_hit = |rows: &mut Vec<(RowId, f64)>, capacity: usize, hit: &Hit| {
+                let score = (RowId(hit.row), hit.distance);
+                let at = rows
+                    .binary_search_by(|(r, d): &(RowId, f64)| {
+                        d.total_cmp(&score.1).then_with(|| r.cmp(&score.0))
+                    })
+                    .unwrap_or_else(|at| at);
+                if at >= capacity {
+                    return;
+                }
+                if rows.len() == capacity {
+                    rows.pop();
+                }
+                rows.insert(at, score);
+            };
+            let mut on_pool = |pool: &[Hit]| -> std::result::Result<(), E> {
+                if pool.len() > capacity {
+                    let extra = pool.len() - capacity;
+                    let score_extra = extra
+                        .checked_mul(std::mem::size_of::<(RowId, f32)>())
+                        .ok_or_else(|| E::from(Error::Other("native pool workspace overflow".into())))?;
+                    let merge_extra = extra
+                        .checked_mul(std::mem::size_of::<(RowId, f64)>())
+                        .ok_or_else(|| E::from(Error::Other("native pool workspace overflow".into())))?;
+                    before_retain(score_extra)?;
+                    retained += score_extra;
+                    pool_growth
+                        .try_grow_for(
+                            merge_extra,
+                            "vector_search",
+                            "native_canonical_merge",
+                            "Reduce LIMIT or raise reader memory.",
+                        )
+                        .map_err(E::from)?;
+                    rows.reserve_exact(extra);
+                    capacity = pool.len();
+                }
+                for hit in pool {
+                    merge_hit(&mut rows, capacity, hit);
+                }
+                pooled.set(true);
+                Ok(())
+            };
+            let found=crate::persistence::vector_ivf::query::search(&root,memory.clone(),index,tuple,column,maintenance,Some(&record_damage),query,mode,query_breadth,&checkpoint,&charge,&mut eligible,&mut hits,rank_pool.then_some(&mut on_pool as &mut dyn FnMut(&[Hit]) -> std::result::Result<(), E>));
             if let Some(error)=error.borrow_mut().take() {return Err(error);}
             let Some((count,work))=found? else {unavailable=true;return Ok(());};
             #[cfg(feature="test-seams")]
@@ -204,11 +254,10 @@ impl Database {
             add_work(&mut total,work.work);
             let bytes=std::mem::size_of::<VectorPartitionSearchTrace>();before_retain(bytes)?;trace_bytes+=bytes;
             trace_routes.reserve_exact(1);trace_routes.push(VectorPartitionSearchTrace {route:if work.indexed {VectorPartitionSearchRoute::Indexed} else {VectorPartitionSearchRoute::Exact},reason:if work.indexed {"clustered_index"} else {"clustered_exact"}});
-            for hit in &hits[..count] {
-                let score=(RowId(hit.row),hit.distance);
-                let at=rows.binary_search_by(|(r,d):&(RowId,f64)|d.total_cmp(&score.1).then_with(||r.cmp(&score.0))).unwrap_or_else(|at|at);
-                if at>=k {continue;}
-                if rows.len()==k {rows.pop();}rows.insert(at,score);
+            if !pooled.get() {
+                for hit in &hits[..count] {
+                    merge_hit(&mut rows, capacity, hit);
+                }
             }
             Ok(())
         });
@@ -258,7 +307,7 @@ impl Database {
         };
         // Keep canonical precision through every tuple merge and LIMIT cut.
         // The public score representation is converted only after ranking.
-        let mut scores = Vec::with_capacity(k);
+        let mut scores = Vec::with_capacity(capacity);
         for (row, distance) in &rows {
             scores.push((*row, (1.0 - distance) as f32));
         }

@@ -4078,12 +4078,6 @@ impl RedbPersistence {
         Self::vector_partition_prefix(index, partition_key)
     }
 
-    pub(super) fn vector_partition_catalog_key(
-        record: &VectorPartitionGenerationCatalogRecord,
-    ) -> Vec<u8> {
-        Self::vector_partition_catalog_key_from_parts(&record.index, &record.partition_key)
-    }
-
     pub(super) fn vector_partition_base_generation_key_from_parts(
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
@@ -4092,16 +4086,6 @@ impl RedbPersistence {
         let mut key = Self::vector_partition_prefix_with_suffix_capacity(index, partition_key, 8);
         key.extend_from_slice(&generation_id.to_be_bytes());
         key
-    }
-
-    pub(super) fn vector_partition_base_generation_key(
-        record: &VectorPartitionBaseGenerationRecord,
-    ) -> Vec<u8> {
-        Self::vector_partition_base_generation_key_from_parts(
-            &record.index,
-            &record.partition_key,
-            record.generation_id,
-        )
     }
 
     pub(super) fn vector_partition_change_generation_key_from_parts(
@@ -4113,50 +4097,6 @@ impl RedbPersistence {
         let mut key = Self::vector_partition_prefix_with_suffix_capacity(index, partition_key, 16);
         key.extend_from_slice(&base_generation_id.to_be_bytes());
         key.extend_from_slice(&change_generation_id.to_be_bytes());
-        key
-    }
-
-    pub(super) fn vector_partition_change_generation_key(
-        record: &VectorPartitionChangeGenerationRecord,
-    ) -> Vec<u8> {
-        Self::vector_partition_change_generation_key_from_parts(
-            &record.index,
-            &record.partition_key,
-            record.base_generation_id,
-            record.change_generation_id,
-        )
-    }
-
-    pub(super) fn vector_partition_graph_page_root_key(
-        generation_key: &[u8],
-        is_base: bool,
-    ) -> Vec<u8> {
-        let route_marker = if is_base { 0xb0 } else { 0xc0 };
-        let identity_bytes = generation_key
-            .len()
-            .saturating_add(1)
-            .saturating_add(VECTOR_PARTITION_GRAPH_PAGE_KEY_SUFFIX_BYTES)
-            .saturating_add(VECTOR_PARTITION_GRAPH_PAGE_HEADER_BYTES)
-            .saturating_add(VECTOR_PARTITION_GRAPH_PAGE_LEAF_FRAME_BYTES);
-        if identity_bytes < VECTOR_PARTITION_GRAPH_PAGE_RECORD_BYTES {
-            let mut key = Vec::with_capacity(generation_key.len().saturating_add(1));
-            key.extend_from_slice(generation_key);
-            key.push(route_marker);
-            return key;
-        }
-
-        // Partition values are not bounded by the graph page size. Keep the
-        // existing physical identity for every generation that previously
-        // fit, and compact only identities that could never have been
-        // published in the paged format.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"contextdb-vector-graph-page-root-v1");
-        hasher.update(&[route_marker]);
-        hasher.update(generation_key);
-        let digest = hasher.finalize();
-        let mut key = Vec::with_capacity(4 + digest.as_bytes().len());
-        key.extend_from_slice(&[0xff, b'V', b'G', route_marker]);
-        key.extend_from_slice(digest.as_bytes());
         key
     }
 
@@ -4184,147 +4124,6 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn remove_vector_partition_graph_page_root_in_write(
-        write_txn: &redb::WriteTransaction,
-        root_key: &[u8],
-    ) -> Result<(usize, u64)> {
-        let mut removed = 0usize;
-        let mut bytes = 0u64;
-        let mut cursor = None::<Vec<u8>>;
-        match write_txn.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE) {
-            Ok(mut pages) => loop {
-                let next = {
-                    let lower = cursor
-                        .as_ref()
-                        .map_or(std::ops::Bound::Included(root_key), |key| {
-                            std::ops::Bound::Excluded(key.as_slice())
-                        });
-                    let mut next = None;
-                    for entry in pages
-                        .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
-                        .map_err(Self::storage_error)?
-                    {
-                        let (key, value) = entry.map_err(Self::storage_error)?;
-                        let key = key.value();
-                        if !key.starts_with(root_key) {
-                            break;
-                        }
-                        // An ordinary base root can prefix another generation's
-                        // root. Only this manifest and its four-byte ordinal
-                        // children belong to this removal; leave other roots
-                        // intact for their caller's manifest authentication.
-                        if key.len() == root_key.len()
-                            || key.len().checked_sub(root_key.len())
-                                == Some(VECTOR_PARTITION_GRAPH_PAGE_KEY_SUFFIX_BYTES)
-                        {
-                            next = Some((key.to_vec(), value.value().len() as u64));
-                            break;
-                        }
-                    }
-                    next
-                };
-                let Some((key, value_bytes)) = next else {
-                    break;
-                };
-                bytes = bytes.saturating_add(value_bytes);
-                pages.remove(key.as_slice()).map_err(Self::storage_error)?;
-                removed = removed.saturating_add(1);
-                cursor = Some(key);
-            },
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(error) => return Err(Self::storage_error(error)),
-        }
-        Ok((removed, bytes))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn remove_vector_partition_graph_pages_for_partition_in_write(
-        &self,
-        write_txn: &redb::WriteTransaction,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> Result<()> {
-        let mut cursor = None::<(
-            Vec<u8>,
-            Option<crate::memory_accounting::OwnedMemoryReservation>,
-        )>;
-        loop {
-            let next = {
-                let table = match write_txn.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE) {
-                    Ok(table) => table,
-                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                    Err(error) => return Err(Self::storage_error(error)),
-                };
-                let lower = cursor
-                    .as_ref()
-                    .map_or(std::ops::Bound::Unbounded, |(key, _)| {
-                        std::ops::Bound::Excluded(key.as_slice())
-                    });
-                let mut next = None;
-                for entry in table
-                    .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
-                    .map_err(Self::storage_error)?
-                {
-                    let (key, value) = entry.map_err(Self::storage_error)?;
-                    if Self::is_vector_partition_graph_page_record_key(key.value()) {
-                        continue;
-                    }
-                    // Admit the one manifest, derived identity and cursor before
-                    // allocating. Physical graph bodies are never copied here.
-                    let memory = self
-                        .proof_accountant()
-                        .map(|accountant| {
-                            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                                accountant,
-                                key.value()
-                                    .len()
-                                    .saturating_add(value.value().len())
-                                    .saturating_mul(64)
-                                    .saturating_add(8192),
-                                "vector",
-                                "authoritative_purge_graph_pages",
-                                "Raise MEMORY_LIMIT to erase vector graph pages.",
-                            )
-                        })
-                        .transpose()?;
-                    let manifest: VectorPartitionGraphPageManifestRecord = self
-                        .decode_vector_partition_record(
-                            VectorPartitionRecordKind::GraphPageManifest,
-                            value.value(),
-                        )?;
-                    let root = self.authenticated_vector_partition_graph_manifest_root(
-                        key.value(),
-                        &manifest,
-                        "authoritative purge graph page manifest key disagrees with its payload",
-                    )?;
-                    let selected =
-                        manifest.index == *index && manifest.partition_key == *partition_key;
-                    next = Some((root, selected, memory));
-                    break;
-                }
-                next
-            };
-            let Some((root, selected, memory)) = next else {
-                break;
-            };
-            if selected {
-                Self::remove_vector_partition_graph_page_root_in_write(write_txn, &root)?;
-            }
-            // Hold the admitted cursor through the next seek. The enclosing
-            // purge transaction also owns membership and catalog removal: any
-            // manifest refusal aborts all durable effects together.
-            cursor = Some((root, memory));
-        }
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn insert_preencoded_immutable_vector_partition_record(
         table: &mut redb::Table<'_, &[u8], &[u8]>,
         key: &[u8],
@@ -4341,108 +4140,6 @@ impl RedbPersistence {
         }
         table.insert(key, encoded).map_err(Self::storage_error)?;
         Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn validate_vector_partition_base_generation(
-        &self,
-        base: &VectorPartitionBaseGenerationRecord,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        generation_id: u64,
-    ) -> Result<()> {
-        Self::validate_vector_partition_base_generation_at(
-            base,
-            index,
-            partition_key,
-            generation_id,
-            |reason| self.vector_partition_corruption(reason),
-        )
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn validate_vector_partition_base_generation_at(
-        base: &VectorPartitionBaseGenerationRecord,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        generation_id: u64,
-        corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
-    ) -> Result<()> {
-        if base.index != *index
-            || base.partition_key != *partition_key
-            || base.generation_id != generation_id
-            || base.dimension == 0
-            || base.highest_included_tx.0 < base.base_tx.0
-            || base.highest_included_lsn.0 < base.base_lsn.0
-        {
-            return Err(corruption(
-                "base generation identity, dimension, or inclusion boundary is invalid".into(),
-            ));
-        }
-        base.graph.verify(corruption)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn validate_vector_partition_change_generation(
-        &self,
-        change: &VectorPartitionChangeGenerationRecord,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        base: &VectorPartitionBaseGenerationRecord,
-        generation_id: u64,
-    ) -> Result<()> {
-        Self::validate_vector_partition_change_generation_at(
-            change,
-            index,
-            partition_key,
-            base,
-            generation_id,
-            |reason| self.vector_partition_corruption(reason),
-        )
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn validate_vector_partition_change_generation_at(
-        change: &VectorPartitionChangeGenerationRecord,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        base: &VectorPartitionBaseGenerationRecord,
-        generation_id: u64,
-        corruption: impl Fn(contextdb_core::error::DiagnosticText) -> Error,
-    ) -> Result<()> {
-        if change.index != *index
-            || change.partition_key != *partition_key
-            || change.base_generation_id != base.generation_id
-            || change.change_generation_id != generation_id
-            || change.dimension != base.dimension
-            || change.quantization != base.quantization
-            || change.algorithm_version != base.algorithm_version
-            || !vector_paged::change_format_compatible(
-                change.graph_format_version,
-                base.graph_format_version,
-            )
-            || change.covered_through_tx.0 < base.highest_included_tx.0
-            || change.covered_through_lsn.0 < base.highest_included_lsn.0
-            || change.fresh_tail_from_tx.0 < change.covered_through_tx.0
-            || change.fresh_tail_from_lsn.0 < change.covered_through_lsn.0
-        {
-            return Err(corruption(
-                "sealed change identity, format, or replay boundary is invalid".into(),
-            ));
-        }
-        change.graph.verify(corruption)
     }
 
     #[expect(
@@ -5362,16 +5059,6 @@ impl RedbPersistence {
         Ok(())
     }
 
-    /// Storage of the replacement generations an erasure prepared for itself.
-    pub(super) fn preencoded_native_storage(
-        prepared: &[PreencodedVectorPartitionGenerationCandidate],
-    ) -> Vec<u64> {
-        prepared
-            .iter()
-            .flat_map(|candidate| candidate.native_storage.iter().flatten().copied())
-            .collect()
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -5380,12 +5067,7 @@ impl RedbPersistence {
         &self,
         write_txn: &redb::WriteTransaction,
         identities: &[VectorPartitionVersionIdentity],
-        accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
-        operation: &str,
-        own_storage: &[u64],
     ) -> Result<()> {
-        let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
-
         if identities.is_empty() {
             return Ok(());
         }
@@ -5518,48 +5200,6 @@ impl RedbPersistence {
         }
 
         for (index, partition_key) in affected_partitions {
-            let prefix = Self::vector_partition_prefix(&index, &partition_key);
-            // Erasure covers native paged generations and unpublished paged
-            // builds too: their pages hold copies of the erased vectors.
-            self.erase_partition_paged_storage_in_write(
-                write_txn,
-                &prefix,
-                accountant.clone(),
-                operation,
-                own_storage,
-            )?;
-            self.remove_vector_partition_graph_pages_for_partition_in_write(
-                write_txn,
-                &index,
-                &partition_key,
-            )?;
-            self.remove_vector_partition_prefix_records_in_write::<
-                VectorPartitionBaseGenerationRecord,
-            >(
-                write_txn,
-                VECTOR_PARTITION_BASE_GENERATION_TABLE,
-                VectorPartitionRecordKind::BaseGeneration,
-                &prefix,
-                Self::vector_partition_base_generation_key,
-            )?;
-            self.remove_vector_partition_prefix_records_in_write::<
-                VectorPartitionChangeGenerationRecord,
-            >(
-                write_txn,
-                VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
-                VectorPartitionRecordKind::ChangeGeneration,
-                &prefix,
-                Self::vector_partition_change_generation_key,
-            )?;
-            self.remove_vector_partition_prefix_records_in_write::<
-                VectorPartitionGenerationCatalogRecord,
-            >(
-                write_txn,
-                VECTOR_PARTITION_GENERATION_CATALOG_TABLE,
-                VectorPartitionRecordKind::GenerationCatalog,
-                &prefix,
-                Self::vector_partition_catalog_key,
-            )?;
             vector_membership_pages::reset_pending_frontier(
                 write_txn,
                 &VectorPartitionRef::new(index, partition_key),

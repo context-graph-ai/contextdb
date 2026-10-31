@@ -3908,55 +3908,6 @@ impl Database {
             |table| selected_by_table.contains_key(table),
             vector_copy_owner,
         )?;
-        let mut replacement_generation_plans = Vec::<(VectorPartitionRef, u64)>::new();
-        for partition in &affected_vector_partitions {
-            let has_live_survivor = vector_registry_entries.iter().any(|entry| {
-                entry.entry.index == partition.index
-                    && entry.partition_key == partition.partition_key
-                    && entry.entry.deleted_tx.is_none()
-            });
-            if !has_live_survivor {
-                continue;
-            }
-            let current = persistence.load_vector_partition_generation_catalog_for(
-                &partition.index,
-                &partition.partition_key,
-            )?;
-            if current.is_none()
-                && !self
-                    .vector_store
-                    .erasure_partition_has_materialized_hnsw(partition)
-            {
-                // A partition that had no maintained route before purge stays
-                // unavailable; maintenance remains responsible for its first
-                // generation. Purge must replace every route that did exist.
-                continue;
-            }
-            let previous_generation = current
-                .as_ref()
-                .map(|catalog| {
-                    catalog
-                        .change
-                        .map(|change| change.generation_id)
-                        .unwrap_or(catalog.base.generation_id)
-                        .max(catalog.base.generation_id)
-                })
-                .unwrap_or(0);
-            let generation_id = previous_generation.checked_add(1).ok_or_else(|| {
-                Error::Other(
-                    (format!(
-                        "vector generation identity exhausted for {}.{}",
-                        partition.index.table, partition.index.column
-                    ))
-                    .into(),
-                )
-            })?;
-            replacement_generation_plans.push((partition.clone(), generation_id));
-        }
-        let replacement_generation_partitions = replacement_generation_plans
-            .iter()
-            .map(|(partition, _)| partition.clone())
-            .collect::<Vec<_>>();
         admit_erasure_vector_input_copies(
             &vector_schemas,
             &vector_registry_entries,
@@ -3969,118 +3920,10 @@ impl Database {
                 vector_schemas.clone(),
                 vector_registry_entries.clone(),
                 affected_vector_partitions.clone(),
-                replacement_generation_partitions,
                 crate::memory_accounting::persistence_original_projection(frame.original)?
                     .vector_budget()?,
                 vector_copy_owner,
             )?;
-        let covered_tx = self.tx_mgr.current_tx_max();
-        let mut vector_generation_candidates =
-            Vec::with_capacity(replacement_generation_plans.len());
-        for (partition, generation_id) in replacement_generation_plans {
-            let layout = vector_schemas
-                .iter()
-                .find(|(index, _)| *index == partition.index)
-                .map(|(_, layout)| layout)
-                .ok_or_else(|| Error::UnknownVectorIndex {
-                    index: partition.index.clone(),
-                })?;
-            let live_count = vector_registry_entries
-                .iter()
-                .filter(|entry| {
-                    entry.entry.index == partition.index
-                        && entry.partition_key == partition.partition_key
-                        && entry.entry.deleted_tx.is_none()
-                })
-                .count();
-            let policy = layout.resolve_policy(live_count, 1);
-            let identity = VectorGraphGeneration {
-                generation_id,
-                covered_tx,
-                covered_lsn: frontier,
-                durable_bytes: 0,
-                policy_revision: policy.policy_revision,
-                hnsw_m: u32::try_from(policy.hnsw_m).map_err(|_| {
-                    Error::Other(("resolved HNSW M exceeds the durable range".to_string()).into())
-                })?,
-                hnsw_ef_construction: u32::try_from(policy.hnsw_ef_construction).map_err(|_| {
-                    Error::Other(
-                        ("resolved HNSW EF_CONSTRUCTION exceeds the durable range".to_string())
-                            .into(),
-                    )
-                })?,
-            };
-            let (encoded_graph, resident_bytes) =
-                vector.prepare_partition_base_generation(&partition, identity)?;
-            let durable_bytes = u64::try_from(encoded_graph.len()).map_err(|_| {
-                Error::Other(
-                    ("vector generation bytes exceed the durable range".to_string()).into(),
-                )
-            })?;
-            let resident_bytes = u64::try_from(resident_bytes).map_err(|_| {
-                Error::Other(
-                    ("vector generation residency exceeds the durable range".to_string()).into(),
-                )
-            })?;
-            let mut live_entries = vector_registry_entries
-                .iter()
-                .filter(|entry| {
-                    entry.entry.index == partition.index
-                        && entry.partition_key == partition.partition_key
-                        && entry.entry.deleted_tx.is_none()
-                })
-                .map(|entry| &entry.entry)
-                .collect::<Vec<_>>();
-            live_entries.sort_by_key(|entry| (entry.row_id, entry.created_tx, entry.lsn));
-            let state_bytes = frame.encode(&live_entries).map_err(|error| {
-                Error::Other(
-                    (format!("could not encode vector generation state digest: {error}")).into(),
-                )
-            })?;
-            let descriptor = VectorPartitionGenerationDescriptor {
-                generation_id,
-                covered_tx,
-                covered_lsn: frontier,
-                resident_bytes,
-                durable_bytes,
-                policy_revision: policy.policy_revision,
-                hnsw_m: identity.hnsw_m,
-                hnsw_ef_construction: identity.hnsw_ef_construction,
-            };
-            let base = VectorPartitionBaseGenerationRecord {
-                index: partition.index.clone(),
-                partition_key: partition.partition_key.clone(),
-                generation_id,
-                base_tx: covered_tx,
-                base_lsn: frontier,
-                highest_included_tx: covered_tx,
-                highest_included_lsn: frontier,
-                dimension: u32::try_from(layout.dimension).map_err(|_| {
-                    Error::Other(
-                        ("vector dimension exceeds the durable generation range".to_string())
-                            .into(),
-                    )
-                })?,
-                quantization: layout.quantization,
-                algorithm_version: VECTOR_GRAPH_ALGORITHM_VERSION,
-                graph_format_version: VECTOR_GRAPH_FORMAT_VERSION,
-                graph: VectorPartitionGraphBytes::verified(encoded_graph),
-                state_digest: *blake3::hash(&state_bytes).as_bytes(),
-            };
-            let catalog = VectorPartitionGenerationCatalogRecord {
-                index: partition.index,
-                partition_key: partition.partition_key,
-                base: descriptor,
-                change: None,
-                published_tx: covered_tx,
-                published_lsn: frontier,
-            };
-            vector_generation_candidates.push(VectorPartitionGenerationCandidate {
-                base,
-                change: None,
-                catalog,
-            });
-        }
         let old_edges = if self.graph_store.is_source_backed() {
             Vec::new()
         } else {
@@ -4138,7 +3981,6 @@ impl Database {
         Ok(OriginalPurgeNonEventPreparedSet {
             vector_entries,
             vector_partition_identities,
-            vector_generation_candidates,
             disk_source_provenance,
             lineage_config_owners,
             durable_sink_entries,

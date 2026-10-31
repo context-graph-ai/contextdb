@@ -146,10 +146,7 @@ mod custody_pending;
 mod custody_records;
 pub(crate) mod custody_source;
 use contextdb_vector::VectorWorkspaceReservation;
-use contextdb_vector::hnsw::{ReadOnlyVectorGraphPageReader, ReadOnlyVectorGraphPageSource};
-use contextdb_vector::store::{
-    RawVectorDirectoryEntry, VectorPartitionRef, VectorRouteQuarantineReason,
-};
+use contextdb_vector::store::{RawVectorDirectoryEntry, VectorPartitionRef};
 use redb::{
     Key as RedbKey, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
     TableHandle, Value as RedbValue,
@@ -684,7 +681,6 @@ pub(crate) struct ReadPersistenceImage {
     /// Lightweight, checksummed pointers to maintained vector generations.
     /// Graph bodies and journal pages remain in the store until a query
     /// actually chooses the dormant indexed route.
-    vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
     /// The released source a dormant generation loader may reopen read-only.
     /// Hydration never carries a Redb handle into the committed image.
     source_path: Option<PathBuf>,
@@ -757,7 +753,6 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) trigger_audit_stamps: Vec<(String, u64)>,
     pub(crate) sink_queues: BTreeMap<String, Vec<(u64, Vec<u8>)>>,
     pub(crate) sink_queue_extents: BTreeMap<String, SinkQueueExtent>,
-    pub(crate) vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
     pub(crate) retained_source: RetainedReadSource,
     #[allow(
         dead_code,
@@ -6688,18 +6683,6 @@ const VECTOR_PARTITION_JOURNAL_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_journal");
 const VECTOR_PARTITION_TOMBSTONE_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_tombstones");
-/// Immutable graph generations are deliberately separate from the mutable
-/// membership/journal registry.  The catalog is the only authoritative route
-/// to one of these records; old records remain addressable until a
-/// snapshot-aware owner reclaims them.
-const VECTOR_PARTITION_BASE_GENERATION_TABLE: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("vector_partition_base_generations");
-const VECTOR_PARTITION_CHANGE_GENERATION_TABLE: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("vector_partition_change_generations");
-const VECTOR_PARTITION_GRAPH_PAGE_TABLE: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("vector_partition_graph_pages");
-const VECTOR_PARTITION_GENERATION_CATALOG_TABLE: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("vector_partition_generation_catalog");
 const SYNC_ROW_SOURCE_LSN_TABLE: TableDefinition<&[u8], u64> =
     TableDefinition::new("sync_row_source_lsn");
 const SYNC_ROW_SOURCE_KIND_TABLE: TableDefinition<&[u8], u8> =
@@ -6719,13 +6702,8 @@ pub(crate) const TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY: &str = "__trigger_audit_ne
 pub(crate) const TRIGGER_AUDIT_RING_CONFIG_KEY: &str = "__trigger_audit_ring";
 const VECTOR_PARTITION_RECORD_MAGIC: &[u8] = b"contextdb-vector-partition";
 const VECTOR_PARTITION_RECORD_VERSION: u16 = 1;
-const VECTOR_PARTITION_GRAPH_PAGE_HEADER_BYTES: usize = 4 + 32;
-const VECTOR_PARTITION_GRAPH_PAGE_RECORD_BYTES: usize = 64 * 1024;
-const VECTOR_PARTITION_GRAPH_PAGE_KEY_SUFFIX_BYTES: usize = 4;
-const VECTOR_PARTITION_GRAPH_PAGE_LEAF_FRAME_BYTES: usize = 4 + 4 + 4;
 // Roots published before the record-size correction used a 64 KiB body plus
 // the authenticated header. Keep reading those immutable generations.
-const LEGACY_VECTOR_PARTITION_GRAPH_PAGE_BYTES: usize = 64 * 1024;
 
 /// A pre2-sized persistence-owned reservation. Its accountant/use custody
 /// is enclosed by PersistenceProofOwner until all persistence fields are freed.
@@ -6793,14 +6771,10 @@ pub struct RedbPersistence {
     /// no opener reads past it. Never set back to `false` — one unsupported table
     /// is enough to mark the whole root.
     used_legacy_table_meta_layout: AtomicBool,
-    /// Catalog/base records staged for the publishing batch of a paged
-    /// vector build, keyed by its partition route. Taken by that batch.
-    paged_publications: parking_lot::Mutex<HashMap<Vec<u8>, vector_paged::PagedPublication>>,
     pub(crate) native_ivf_cache: vector_ivf::NativeIvfCache,
     /// Captures the writer's published root for paged generation readers.
     paged_root_capture: std::sync::OnceLock<vector_paged::PagedRootCapture>,
     scoped_vector_root_capture: std::sync::OnceLock<vector_paged::ScopedWriterRootCapture>,
-    vector_repair_audit: parking_lot::Mutex<Option<vector_paged::RepairAudit>>,
     saved_export_recovery_cutoff: std::sync::OnceLock<u64>,
     saved_export_abandonment_error: Arc<parking_lot::Mutex<Option<String>>>,
     /// The database's own memory accountant, attached once the owning
@@ -6900,282 +6874,11 @@ pub(crate) struct VectorPartitionJournalRecord {
     pub(crate) change: VectorPartitionJournalChange,
 }
 
-/// Bytes of a sealed graph are carried in the durable envelope and also have
-/// their own checksum.  The second checksum lets a manager distinguish a bad
-/// graph body from a bad catalog/payload envelope in its repair receipt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VectorPartitionGraphBytes {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) checksum: [u8; 32],
-}
-
-#[derive(Deserialize)]
-struct BorrowedVectorPartitionGraphBytes<'a> {
-    #[serde(borrow)]
-    bytes: &'a [u8],
-    checksum: [u8; 32],
-}
-
-#[derive(Deserialize)]
-struct BorrowedVectorPartitionBaseGenerationRecord<'a> {
-    index: VectorIndexRef,
-    partition_key: VectorPartitionKey,
-    generation_id: u64,
-    base_tx: TxId,
-    base_lsn: Lsn,
-    highest_included_tx: TxId,
-    highest_included_lsn: Lsn,
-    dimension: u32,
-    quantization: VectorQuantization,
-    algorithm_version: u16,
-    graph_format_version: u16,
-    #[serde(borrow)]
-    graph: BorrowedVectorPartitionGraphBytes<'a>,
-    state_digest: [u8; 32],
-}
-
-#[derive(Deserialize)]
-struct BorrowedVectorPartitionChangeGenerationRecord<'a> {
-    index: VectorIndexRef,
-    partition_key: VectorPartitionKey,
-    base_generation_id: u64,
-    change_generation_id: u64,
-    covered_through_tx: TxId,
-    covered_through_lsn: Lsn,
-    fresh_tail_from_tx: TxId,
-    fresh_tail_from_lsn: Lsn,
-    dimension: u32,
-    quantization: VectorQuantization,
-    algorithm_version: u16,
-    graph_format_version: u16,
-    #[serde(borrow)]
-    graph: BorrowedVectorPartitionGraphBytes<'a>,
-}
-
-/// Root for independently keyed immutable graph pages. The generation record
-/// remains the complete fallback for roots written before page materialization;
-/// once this marker exists, every named page is mandatory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VectorPartitionGraphPageManifestRecord {
-    index: VectorIndexRef,
-    partition_key: VectorPartitionKey,
-    base_generation_id: u64,
-    generation_id: u64,
-    is_base: bool,
-    page_bytes: u32,
-    graph_bytes: u64,
-    graph_checksum: [u8; 32],
-    page_count: u32,
-    schema_binding: VectorSchemaBinding,
-}
-
-struct PreencodedVectorPartitionGraphPages {
-    root_key: Vec<u8>,
-    manifest_bytes: Vec<u8>,
-    // Keep one body owner; frame each page/key only while inserting it.
-    graph_bytes: Vec<u8>,
-    page_bytes: usize,
-}
-
-/// A complete immutable base.  `base_*` names the snapshot the builder read;
-/// `highest_included_*` names the last accepted partition change represented
-/// by the graph, which is normally equal but is kept explicit for repairs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VectorPartitionBaseGenerationRecord {
-    pub(crate) index: VectorIndexRef,
-    pub(crate) partition_key: VectorPartitionKey,
-    pub(crate) generation_id: u64,
-    pub(crate) base_tx: TxId,
-    pub(crate) base_lsn: Lsn,
-    pub(crate) highest_included_tx: TxId,
-    pub(crate) highest_included_lsn: Lsn,
-    pub(crate) dimension: u32,
-    pub(crate) quantization: VectorQuantization,
-    pub(crate) algorithm_version: u16,
-    pub(crate) graph_format_version: u16,
-    pub(crate) graph: VectorPartitionGraphBytes,
-    pub(crate) state_digest: [u8; 32],
-}
-
-/// At most one sealed change graph is selected by a catalog.  It is immutable
-/// too; later writes are replayed from `fresh_tail_*` through the journal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VectorPartitionChangeGenerationRecord {
-    pub(crate) index: VectorIndexRef,
-    pub(crate) partition_key: VectorPartitionKey,
-    pub(crate) base_generation_id: u64,
-    pub(crate) change_generation_id: u64,
-    pub(crate) covered_through_tx: TxId,
-    pub(crate) covered_through_lsn: Lsn,
-    pub(crate) fresh_tail_from_tx: TxId,
-    pub(crate) fresh_tail_from_lsn: Lsn,
-    pub(crate) dimension: u32,
-    pub(crate) quantization: VectorQuantization,
-    pub(crate) algorithm_version: u16,
-    pub(crate) graph_format_version: u16,
-    pub(crate) graph: VectorPartitionGraphBytes,
-}
-
-/// The only mutable authority for a partition's maintained route.  Its key is
-/// exactly `(VectorIndexRef, canonical typed VectorPartitionKey)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VectorPartitionGenerationDescriptor {
-    pub(crate) generation_id: u64,
-    pub(crate) covered_tx: TxId,
-    pub(crate) covered_lsn: Lsn,
-    /// Memory that must be reserved before the graph envelope is decoded.
-    pub(crate) resident_bytes: u64,
-    /// Encoded graph-body bytes temporarily held while loading/decoding.
-    pub(crate) durable_bytes: u64,
-    #[serde(default)]
-    pub(crate) policy_revision: u64,
-    #[serde(default)]
-    pub(crate) hnsw_m: u32,
-    #[serde(default)]
-    pub(crate) hnsw_ef_construction: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VectorPartitionGenerationCatalogRecord {
-    pub(crate) index: VectorIndexRef,
-    pub(crate) partition_key: VectorPartitionKey,
-    pub(crate) base: VectorPartitionGenerationDescriptor,
-    pub(crate) change: Option<VectorPartitionGenerationDescriptor>,
-    pub(crate) published_tx: TxId,
-    pub(crate) published_lsn: Lsn,
-}
-
-/// Passive startup/maintenance inventory. Invalid catalog bytes never become
-/// generation descriptors: they are either attributed to one known raw route
-/// with a typed quarantine reason or left as an unreadable orphan.
-pub(crate) struct LoadedVectorPartitionGenerationCatalog {
-    pub(crate) catalogs: Vec<VectorPartitionGenerationCatalogRecord>,
-    pub(crate) quarantines: Vec<(VectorPartitionRef, VectorRouteQuarantineReason)>,
-}
-
-/// Reopenable, read-only source for graph bodies named by a committed image's
-/// already-validated catalog. The image owns no Redb handle; each lazy load
-/// holds one read transaction only for the duration of that load step.
-#[derive(Clone)]
-pub(crate) struct ReadOnlyVectorGenerationSource {
-    read: Arc<redb::ReadTransaction>,
-    source: RetainedReadSource,
-    snapshot_lsn: Lsn,
-}
-
-/// What a change generation must agree with in the base it extends, as the
-/// catalog that selected both of them names it. Taken from the catalog, not
-/// from the base's own record: reading that record would hash the whole base
-/// graph again only to learn these few fields.
-pub(crate) struct ChangeGenerationBase {
-    pub(crate) covered_tx: TxId,
-    pub(crate) covered_lsn: Lsn,
-    pub(crate) dimension: u32,
-    pub(crate) quantization: VectorQuantization,
-    pub(crate) algorithm_version: u16,
-    pub(crate) graph_format_version: u16,
-}
-
-pub(crate) struct ReadOnlyVectorGenerationGraph<'a> {
-    pub(crate) bytes: &'a [u8],
-    pub(crate) covered_tx: TxId,
-    pub(crate) covered_lsn: Lsn,
-    pub(crate) dimension: u32,
-    pub(crate) quantization: VectorQuantization,
-    pub(crate) algorithm_version: u16,
-    pub(crate) graph_format_version: u16,
-    pub(crate) source: Arc<dyn ReadOnlyVectorGraphPageSource>,
-}
-
-#[derive(Clone)]
-struct RetainedVectorGraphPageSource {
-    source: RetainedReadSource,
-    key: Arc<Vec<u8>>,
-    is_base: bool,
-    graph_offset: usize,
-    graph_len: usize,
-    paged: Option<Arc<RetainedVectorGraphPages>>,
-}
-
-#[derive(Clone)]
-struct RetainedVectorGraphPages {
-    root_key: Vec<u8>,
-    page_bytes: usize,
-    page_count: usize,
-}
-
-struct RetainedVectorGraphPageReader {
-    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    transaction: redb::ReadTransaction,
-    key: Arc<Vec<u8>>,
-    is_base: bool,
-    graph_offset: usize,
-    graph_len: usize,
-    paged: Option<Arc<RetainedVectorGraphPages>>,
-    database_path: PathBuf,
-}
-
 pub(crate) struct IndexValidationFailure<'a> {
     declaration: &'a IndexDecl,
     column: Option<(&'a str, &'static str)>,
     parts: Option<usize>,
     suffix: &'static str,
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "test-seams"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PagedRouteFaultForTest {
-    /// Flip a byte of the route's first point page; its keyed check fails.
-    FlipFirstPointPage,
-    /// Flip a byte of the route's last page, which a find need not visit.
-    FlipLastPage,
-    /// A different, correctly sealed point payload under the same key.
-    ResealFirstPointPage,
-    /// Another route's point payload, sealed under this route's key.
-    CrossRouteFirstPointPage,
-    /// One correctly sealed page past the committed page set.
-    ExtraPage,
-    /// A correctly sealed point page far wider than any page the route wrote.
-    OversizedPage,
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "test-seams"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VectorGenerationCatalogRecordFaultForTest {
-    MalformedEnvelope,
-    RelocateToMalformedPhysicalKey,
-    WellFormedNewerEnvelopeVersion { version: u16 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VectorPartitionGenerationCandidate {
-    pub(crate) base: VectorPartitionBaseGenerationRecord,
-    pub(crate) change: Option<VectorPartitionChangeGenerationRecord>,
-    pub(crate) catalog: VectorPartitionGenerationCatalogRecord,
-}
-
-pub(crate) type VectorGenerationCleanup = Vec<(
-    VectorPartitionGenerationCatalogRecord,
-    Vec<(u64, Option<u64>)>,
-)>;
-
-/// Fully encoded and round-trip-verified generation bytes. Authoritative
-/// purge prepares these before opening its destructive write transaction, so
-/// serialization or validation failure cannot occur after erasure begins.
-pub(crate) struct PreencodedVectorPartitionGenerationCandidate {
-    base_key: Vec<u8>,
-    base_bytes: Vec<u8>,
-    base_pages: PreencodedVectorPartitionGraphPages,
-    change: Option<(Vec<u8>, Vec<u8>)>,
-    change_pages: Option<PreencodedVectorPartitionGraphPages>,
-    catalog_key: Vec<u8>,
-    catalog_bytes: Vec<u8>,
-    catalog_route: VectorPartitionRef,
-    attributable_stale_catalog_keys: Vec<Vec<u8>>,
-    native_storage: [Option<u64>; 2],
-    _saved_export_ownership: Option<vector_saved::SavedExportOwnership>,
 }
 
 /// A row/vector-version identity used by authoritative retention/purge.  A
@@ -7209,9 +6912,6 @@ pub(crate) struct VectorPartitionVersionSelector {
 
 trait VectorPartitionRecordIndex {
     fn vector_partition_record_index(&self) -> &VectorIndexRef;
-    fn native_paged_graph(&self) -> Option<&[u8]> {
-        None
-    }
 }
 
 #[derive(Default)]
@@ -7359,7 +7059,6 @@ pub(crate) struct AuthoritativePurgePersistenceProjection {
     pub(crate) source_provenance: Vec<(String, RowId, Lsn, u8)>,
     pub(crate) vectors: Vec<VectorEntry>,
     pub(crate) vector_partition_identities: Vec<VectorPartitionVersionIdentity>,
-    pub(crate) vector_generation_candidates: Vec<VectorPartitionGenerationCandidate>,
     pub(crate) graph_entries: Vec<AdjEntry>,
     pub(crate) row_graph_entries: Vec<contextdb_tx::OwnedAdjEntry>,
     #[allow(
@@ -7580,9 +7279,6 @@ thread_local! {
 
 #[cfg(all(test, feature = "test-seams"))]
 mod empty_declared_index_readiness_tests;
-
-#[cfg(all(test, feature = "test-seams"))]
-mod generation_admission_tests;
 
 #[cfg(test)]
 mod bounded_catalog_tests;

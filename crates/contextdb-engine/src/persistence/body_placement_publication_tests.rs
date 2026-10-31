@@ -60,7 +60,7 @@ fn decode_catalog(persistence: &RedbPersistence) -> std::result::Result<bool, Lo
     persistence
         .with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
-            let (_, raw) = decode_read_vector_generation_catalog(
+            let raw = decode_read_raw_vector_directory(
                 &read,
                 &crate::read_image_memory::ImageMemory::new(Some(1024 * 1024))?,
             )
