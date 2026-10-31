@@ -1,4 +1,4 @@
-use contextdb_core::Result;
+use contextdb_core::{Error, Result};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1396,3 +1396,31 @@ mod copy_reservation_observation;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub use copy_reservation_observation::observe_copy_reservations_for_test;
+
+/// Shared physical bucket/control sizing for scratch sets and row-verdict maps.
+/// Refuse unrepresentable allocation geometry before asking an allocator.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn checked_hash_allocation_bytes<T>(capacity: usize) -> Result<usize> {
+    const GROUP_BYTES: usize = 16;
+    let overflow = || Error::Other(("bounded hash allocation size overflow".to_string()).into());
+    if capacity == 0 {
+        return Ok(0);
+    }
+    let buckets = if capacity < 8 {
+        if capacity < 4 { 4 } else { 8 }
+    } else {
+        (capacity.checked_mul(8).ok_or_else(overflow)? / 7)
+            .checked_next_power_of_two()
+            .ok_or_else(overflow)?
+    };
+    let alignment = GROUP_BYTES.max(std::mem::align_of::<T>());
+    buckets
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| bytes.checked_next_multiple_of(alignment))
+        .and_then(|bytes| bytes.checked_add(buckets))
+        .and_then(|bytes| bytes.checked_add(GROUP_BYTES))
+        .ok_or_else(overflow)
+}

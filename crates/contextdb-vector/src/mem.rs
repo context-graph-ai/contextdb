@@ -626,7 +626,7 @@ impl<'check, 'storage, E: From<Error>> RowCheckLedger<'check, 'storage, E> {
             )));
         }
         let bytes =
-            crate::hnsw::checked_hash_allocation_bytes::<(RowId, bool)>(next).map_err(E::from)?;
+            crate::memory_budget::checked_hash_allocation_bytes::<(RowId, bool)>(next).map_err(E::from)?;
         // The entire replacement coexists with, and is funded beside, the old
         // map. The scoped replacement refunds on every error or unwind.
         let mut replacement =
@@ -647,7 +647,7 @@ impl<'check, 'storage, E: From<Error>> RowCheckLedger<'check, 'storage, E> {
         }
         #[cfg(feature = "test-seams")]
         drop(cache_observation);
-        let actual = crate::hnsw::checked_hash_allocation_bytes::<(RowId, bool)>(
+        let actual = crate::memory_budget::checked_hash_allocation_bytes::<(RowId, bool)>(
             replacement.value.capacity(),
         )
         .map_err(E::from)?;
