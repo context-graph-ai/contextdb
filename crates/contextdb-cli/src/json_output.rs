@@ -337,8 +337,7 @@ pub(crate) fn compaction_policy_text(policy: &StorageCompactionPolicy) -> String
 }
 
 /// `.maintenance compact` under `--json`: the explicit, on-demand
-/// full-file redb compaction this call just ran (or, on an in-memory
-/// database, the honest no-op).
+/// full-file redb compaction this call just ran.
 /// `.verify history <table>`: one entry per historical index, each verified.
 pub(crate) fn verify_history_document(
     table: &str,
