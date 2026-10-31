@@ -4323,9 +4323,7 @@ impl Database {
         )
     )]
     pub(crate) fn vector_memory_ownership_receipt(&self) -> Result<VectorMemoryOwnershipReceipt> {
-        let sampled = self
-            .vector_store
-            .memory_ownership_snapshot_for_funder(self.finalization.vector_accountant.as_ref());
+        let sampled = self.vector_store.memory_ownership_snapshot_for_test();
         let (source_metadata, reader_source_metadata) = {
             let mut count = 0usize;
             self.visit_source_copy_credits(&mut |_, _, _| count += 1);
@@ -5195,18 +5193,7 @@ impl Database {
                     .ok_or_else(|| Error::UnknownVectorIndex {
                         index: index.clone(),
                     })?;
-                let mut partitions = self.vector_store.partition_infos(&index, vector_copy_owner)?;
-                if self.persistence.as_ref().is_some_and(|p| p.repair_orphan_audit_blocked()) {
-                    let details = contextdb_vector::store::VectorMaintenanceFailureDetails::from_error(
-                        &Error::Other("vector page ownership reclamation is stalled; inspect unauthenticated retained references".into()),
-                    );
-                    for info in &mut partitions {
-                        if info.maintenance_failure_details.is_none() {
-                            info.maintenance_failure = Some(details.failure);
-                            info.maintenance_failure_details = Some(details);
-                        }
-                    }
-                }
+                let partitions = self.vector_store.partition_infos(&index, vector_copy_owner)?;
                 Ok((
                     declaration,
                     self.vector_store
@@ -7077,17 +7064,6 @@ impl Database {
             Ok(())
         };
         result?;
-        if consolidation_only && let Some(published) = published_policy {
-            // Match ordinary local/received policy publication: a refused
-            // inspection-only recheck keeps its failure mark until the
-            // next maintenance pass. Durable metadata remains authoritative.
-            if let Ok(read_memory) = self.declared_reader_memory() {
-                let mut owner = crate::vector_read_memory::admission(read_memory);
-                let _ = self
-                    .vector_store
-                    .recheck_policy_maintenance_failures(&published, &mut owner);
-            }
-        }
         Ok(())
     }
 

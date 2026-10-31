@@ -4718,25 +4718,8 @@ enum DatabaseAssemblyBudget {
 // stack + 4096 B guard. This includes the full arena mapping, not only RSS or
 // live malloc objects. Add the whole requested live stack separately. Native
 // qualification must reconcile the complete process with the writer ceiling.
-const RESIDENT_INSERTION_RUNTIME_RETAINED_PER_WORKER: usize = 71_307_264;
 
 const VECTOR_GENERATION_PERSISTENCE_COPIES: usize = 6;
-
-#[derive(Debug, Clone, Copy)]
-struct VectorGenerationWorkspacePlan {
-    graph_build_bytes: usize,
-    insertion_workers: usize,
-    insertion_worker_bytes: usize,
-    raw_entry_bytes: usize,
-    raw_decode_scratch_bytes: usize,
-    selected_entry_bytes: usize,
-    encoded_graph_bound: usize,
-    encoding_scratch_bytes: usize,
-    prior_base_bytes: usize,
-    durable_metadata_bytes: usize,
-    digest_reference_bytes: usize,
-    carrier_metadata_bytes: usize,
-}
 
 #[derive(Default)]
 pub(crate) struct RetentionDeferredEdges {

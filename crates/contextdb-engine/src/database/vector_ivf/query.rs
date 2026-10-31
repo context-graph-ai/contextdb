@@ -42,11 +42,13 @@ impl Database {
             return Ok(Some((persistence.paged_root_capture()?)()?));
         }
         if let Some(source) = &self.retained_graph_source {
-            let generation = crate::persistence::ReadOnlyVectorGenerationSource::new(
-                source.clone(),
-                self.published_read_lsn(),
-            )?;
-            return Ok(Some((generation.paged_root_capture())()?));
+            let read = Arc::new(source.begin_read()?);
+            return Ok(Some(
+                crate::persistence::vector_paged::CapturedPagedRoot::from_image(
+                    read,
+                    source.clone(),
+                )?,
+            ));
         }
         Ok(None)
     }

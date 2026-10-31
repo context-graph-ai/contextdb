@@ -158,10 +158,9 @@ impl ReceivedSchemaStageRegistration {
         while self.next_arriving_index_cleanup < self.arriving_vector_indexes.len() {
             let position = self.next_arriving_index_cleanup;
             self.next_arriving_index_cleanup += 1;
-            let receipt = self.vector_store.teardown_index_without_copy(
-                &self.arriving_vector_indexes[position],
-                self.accountant.as_ref(),
-            );
+            let receipt = self
+                .vector_store
+                .teardown_index_without_copy(&self.arriving_vector_indexes[position]);
             self.accountant.release(receipt.legacy_live_raw_bytes);
         }
     }

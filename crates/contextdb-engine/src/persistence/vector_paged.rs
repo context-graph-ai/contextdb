@@ -44,7 +44,7 @@ impl CapturedPagedRoot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn from_image(
+    pub(crate) fn from_image(
         read: Arc<redb::ReadTransaction>,
         source: RetainedReadSource,
     ) -> Result<Self> {

@@ -4012,7 +4012,6 @@ impl Database {
             read_memory.clone(),
             executing_owner.clone(),
         )
-        .map(|(results, _)| results)
     }
 
     #[expect(

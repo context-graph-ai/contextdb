@@ -7938,10 +7938,6 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                         .extend(content_identity::config_mutations(key, Some(&encoded)));
                 }
             }
-            // Schema, lineage and paged bindings publish as one durable rename.
-            for (from, to) in &vector_renames {
-                self.rename_vector_partition_generation_index_in_write(&write_txn, from, to)?;
-            }
             {
                 let mut ddl_table = write_txn
                     .open_table(DDL_LOG_TABLE)

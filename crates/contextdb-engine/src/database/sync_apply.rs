@@ -7317,14 +7317,6 @@ impl Database {
                     vector_copy_owner,
                 )?;
                 self.finalization.accountant.release(accounted_bytes);
-                let replaced_indexes = received_image_superseded_vectors
-                    .iter()
-                    .map(|version| version.index.clone())
-                    .collect::<HashSet<_>>();
-                for index in replaced_indexes {
-                    self.vector_store
-                        .clear_hnsw_for(&index, self.finalization.accountant.as_ref());
-                }
                 self.received_vector_image_pending
                     .store(false, Ordering::SeqCst);
             }

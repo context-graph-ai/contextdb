@@ -1677,135 +1677,6 @@ impl RedbPersistence {
         })
     }
 
-    /// Walk one route's journal suffix in an operation's captured root,
-    /// streaming one authenticated record at a time. `admit_identities` is
-    /// asked before each distinct upsert identity is retained, and
-    /// `admit_bodies` once before the immutable vector bodies are read, so
-    /// the caller funds growth past its saved minimum before it exists.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn load_vector_partition_tail_entries_in_read(
-        read: &redb::ReadTransaction,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        covered_lsn: Lsn,
-        through_lsn: Option<Lsn>,
-        mut checkpoint: impl FnMut() -> Result<()>,
-        admit_bodies: impl FnOnce(usize) -> Result<()>,
-    ) -> Result<(Vec<VectorEntry>, Lsn)> {
-        let catalog =
-            Self::vector_partition_generation_descriptors_in_read(read, index, partition_key)?;
-        let floor = catalog.map_or(Lsn(0), |(base, change)| change.unwrap_or(base).covered_lsn);
-        if covered_lsn < floor {
-            return Err(Self::captured_generation_corruption(
-                "captured suffix replay starts below the journal truncation floor",
-            ));
-        }
-        let Some((lower, upper)) = Self::vector_partition_journal_suffix_bounds(
-            index,
-            partition_key,
-            covered_lsn,
-            through_lsn,
-        )?
-        else {
-            return Ok((Vec::new(), covered_lsn));
-        };
-        let journal = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), covered_lsn)),
-            Err(error) => return Err(Self::storage_error(error)),
-        };
-        let mut identities = BTreeSet::new();
-        let mut replayed_through_lsn = covered_lsn;
-        for entry in journal
-            .range(lower.as_slice()..upper.as_slice())
-            .map_err(Self::storage_error)?
-        {
-            checkpoint()?;
-            let (key, value) = entry.map_err(Self::storage_error)?;
-            #[cfg(test)]
-            bounded_journal_suffix_tests::note_examined();
-            let record: VectorPartitionJournalRecord = decode_vector_partition_record_payload(
-                VectorPartitionRecordKind::Journal,
-                value.value(),
-            )
-            .map_err(Self::captured_generation_corruption)?;
-            if record.index != *index
-                || record.partition_key != *partition_key
-                || Self::vector_partition_journal_key(&record).as_slice() != key.value()
-            {
-                return Err(Self::captured_generation_corruption(
-                    "journal selection encountered a mismatched route or physical key",
-                ));
-            }
-            if record.lsn <= covered_lsn || through_lsn.is_some_and(|through| record.lsn > through)
-            {
-                continue;
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            crate::vector_observations::emit(
-                index,
-                partition_key,
-                covered_lsn,
-                crate::vector_observations::VectorJournalReplayWork::Record { lsn: record.lsn },
-            );
-            replayed_through_lsn = replayed_through_lsn.max(record.lsn);
-            if let VectorPartitionJournalChange::Upsert(membership) = record.change {
-                identities.insert((
-                    membership.row_id,
-                    membership.vector_created_tx,
-                    membership.vector_lsn,
-                ));
-            }
-        }
-        drop(journal);
-        admit_bodies(identities.len())?;
-        if identities.is_empty() {
-            return Ok((Vec::new(), replayed_through_lsn));
-        }
-        let vectors = read
-            .open_byte_table_bounded(VECTORS_TABLE)
-            .map_err(Self::storage_error)?;
-        let mut tail = Vec::with_capacity(identities.len());
-        for (row_id, created_tx, lsn) in identities {
-            checkpoint()?;
-            let key = Self::vector_identity_key(index, row_id, created_tx, lsn);
-            let value = vectors
-                .get_bounded(key.as_slice())
-                .map_err(Self::storage_error)?
-                .ok_or_else(|| {
-                    Self::captured_generation_corruption(
-                        "journal tail points to a missing immutable vector",
-                    )
-                })?;
-            let entry = Self::decode_vector_entry(value.value())?;
-            if entry.index != *index
-                || entry.row_id != row_id
-                || entry.created_tx != created_tx
-                || entry.lsn != lsn
-            {
-                return Err(Self::captured_generation_corruption(
-                    "journal tail vector key disagrees with its payload",
-                ));
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            crate::vector_observations::emit(
-                index,
-                partition_key,
-                covered_lsn,
-                crate::vector_observations::VectorJournalReplayWork::Vector {
-                    row_id,
-                    created_tx,
-                    lsn,
-                },
-            );
-            tail.push(entry);
-        }
-        Ok((tail, replayed_through_lsn))
-    }
-
     /// The column declaration in force at an operation's captured root.
     #[expect(
         clippy::result_large_err,
@@ -1842,17 +1713,6 @@ impl RedbPersistence {
         ))
     }
 
-    /// Constant-size witness for an optional writer tail: the exact committed
-    /// catalog and final journal record, authenticated at one root. The last
-    /// journal key is a B-tree seek, never a prefix walk.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn writer_vector_tail_frontier(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Result<Option<[u8; 32]>> {
         let prefix = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -2025,53 +1885,6 @@ impl RedbPersistence {
                 }
             }
             Ok(count)
-        })
-    }
-
-    /// Inspect physical journal identities without decoding or cloning their
-    /// payloads. A cleaned catalog need not re-enter its cleanup transaction.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn vector_partition_has_covered_journal_records(
-        &self,
-        catalog: &VectorPartitionGenerationCatalogRecord,
-    ) -> Result<bool> {
-        let prefix = Self::vector_partition_prefix(&catalog.index, &catalog.partition_key);
-        let covered_lsn = catalog
-            .change
-            .map(|change| change.covered_lsn)
-            .unwrap_or(catalog.base.covered_lsn);
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            let table = match read.open_byte_table_bounded(VECTOR_PARTITION_JOURNAL_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let Some(entry) = table
-                .prefix_bounded(prefix.as_slice())
-                .map_err(Self::storage_error)?
-                .next()
-            else {
-                return Ok(false);
-            };
-            let (key, _) = entry.map_err(Self::storage_error)?;
-            if !key.value().starts_with(&prefix) {
-                return Ok(false);
-            }
-            let lsn = key
-                .value()
-                .get(prefix.len()..prefix.len().saturating_add(8))
-                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                .map(u64::from_be_bytes)
-                .ok_or_else(|| {
-                    self.vector_partition_corruption("journal identity has a truncated LSN")
-                })?;
-            // Big-endian LSNs sort first within this route. If its first
-            // record is uncovered, every later record is uncovered too.
-            Ok(lsn <= covered_lsn.0)
         })
     }
 

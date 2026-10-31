@@ -1701,16 +1701,9 @@ impl CompositeStore {
             }
         }
         if fresh_publication {
-            fresh_publication = mutations.iter().all(|mutation| match mutation {
-                PreparedVectorPartitionMutation::Insert { index, after, .. } => self
-                    .vector
-                    .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
-                        index.clone(),
-                        after.partition_key.clone(),
-                    ))
-                    .is_none(),
-                _ => false,
-            });
+            fresh_publication = mutations
+                .iter()
+                .all(|mutation| matches!(mutation, PreparedVectorPartitionMutation::Insert { .. }));
         }
         if defer_publication && !fresh_publication {
             for mutation in &mutations {
