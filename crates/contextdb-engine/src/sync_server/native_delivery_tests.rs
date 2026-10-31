@@ -4151,10 +4151,22 @@ async fn a_result_refusal_leaves_its_page_without_durable_delivery_status() {
         loop {
             steps += 1;
             assert!(steps < 400, "page {target_page}: the walk did not finish");
-            let tight = DeclaredReadMemory::from_reader_limit(limit)
-                .expect("admit the declared fixture root");
-            // Taking the caller's reader is itself charged; a limit below it
-            // steps past it like any other site.
+            // Taking the caller's root and reader is itself charged; a limit
+            // below them steps past them like any other site.
+            let tight = match DeclaredReadMemory::from_reader_limit(limit) {
+                Ok(tight) => tight,
+                Err(contextdb_core::Error::NativeEngineOther(
+                    contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                        requested_bytes,
+                        available_bytes,
+                        ..
+                    },
+                )) => {
+                    limit += requested_bytes.saturating_sub(available_bytes) as u64 + SLACK;
+                    continue;
+                }
+                Err(other) => panic!("caller root: {other:?}"),
+            };
             let child = match tight.child() {
                 Ok(child) => child,
                 Err(contextdb_core::Error::MemoryBudgetExceeded {
@@ -4181,8 +4193,8 @@ async fn a_result_refusal_leaves_its_page_without_durable_delivery_status() {
             );
             assert_eq!(
                 tight.retained_bytes_for_test(),
-                0,
-                "limit {limit}: a refused fetch retains nothing"
+                native_root_bytes_for_test(),
+                "limit {limit}: a refused fetch retains nothing beyond its root"
             );
             match result {
                 Err(contextdb_core::Error::MemoryBudgetExceeded {
@@ -4228,7 +4240,10 @@ async fn a_result_refusal_leaves_its_page_without_durable_delivery_status() {
                 "page one's result refusal leaves no durable delivery status"
             );
         }
-        assert_eq!(settled(&requests, 0), 0);
+        assert_eq!(
+            settled(&requests, native_root_bytes_for_test()),
+            native_root_bytes_for_test()
+        );
         hub.stop().await;
     }
     println!("S4_RESULT_REFUSAL {}", lines.join(" | "));
