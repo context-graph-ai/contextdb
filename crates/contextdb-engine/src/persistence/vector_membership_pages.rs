@@ -113,7 +113,7 @@ impl MembershipSummary {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn update_pending_summary(
+pub(super) fn update_pending_summary(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
     update: impl FnOnce(&mut MembershipSummary) -> Result<()>,

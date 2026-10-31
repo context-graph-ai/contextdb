@@ -10107,7 +10107,7 @@ impl VectorState {
         db: &dyn ReadExecutionTarget,
         context: &ControlArc<RequestContext>,
         published_trace: &mut QueryTrace,
-        aggregate_allowed_vectors: usize,
+        aggregate_allowed_vectors: Option<usize>,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         trace: &contextdb_vector::mem::BoundedVectorSearchTrace,
     ) -> std::result::Result<(), BoundedExecutionError> {
@@ -10940,6 +10940,9 @@ impl VectorState {
                         self.k
                     }
                     .saturating_add(staged_entries);
+                    // Vectors that passed the row predicate in this attempt;
+                    // a retried attempt starts again from zero.
+                    let allowed_passed = Cell::new(0usize);
                     let searched = {
                         // The search's own checks: one per candidate it may
                         // evaluate, each paying its ordinary request work.
@@ -10950,7 +10953,7 @@ impl VectorState {
                         {
                             Some((filter, meta)) => {
                                 self.row_checks.set(self.row_checks.get() + 1);
-                                vector_row_passes(
+                                let passed = vector_row_passes(
                                     db,
                                     context,
                                     &self.table,
@@ -10959,7 +10962,11 @@ impl VectorState {
                                     &self.params,
                                     self.snapshot,
                                     row_id,
-                                )
+                                )?;
+                                if passed {
+                                    allowed_passed.set(allowed_passed.get() + 1);
+                                }
+                                Ok(passed)
                             }
                             None => Ok(true),
                         };
@@ -11060,11 +11067,26 @@ impl VectorState {
                             // transaction's bounded staged delta directly.
                             if let Err(error) =
                                 self.score_staged_vectors(db, context).and_then(|()| {
+                                    // A row-checked scan never built the allowed set:
+                                    // when every partition ran the exact route it
+                                    // visited each vector once, so the passing
+                                    // tally is the allowed population; otherwise
+                                    // the population is unknown.
+                                    let allowed = if !self.row_checked {
+                                        Some(aggregate_allowed_count)
+                                    } else if trace.partition_routes().iter().all(|route| {
+                                        route.route
+                                            == contextdb_vector::VectorPartitionSearchRoute::Exact
+                                    }) {
+                                        Some(allowed_passed.get())
+                                    } else {
+                                        None
+                                    };
                                     self.record_disclosure(
                                         db,
                                         context,
                                         published_trace,
-                                        aggregate_allowed_count,
+                                        allowed,
                                         groups.get(),
                                         &trace,
                                     )
@@ -11307,7 +11329,7 @@ impl VectorState {
                                     db,
                                     context,
                                     published_trace,
-                                    deferred.aggregate,
+                                    Some(deferred.aggregate),
                                     groups.get(),
                                     deferred.trace.as_ref().unwrap(),
                                 )?;

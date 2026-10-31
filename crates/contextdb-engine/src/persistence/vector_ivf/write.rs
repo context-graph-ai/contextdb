@@ -209,7 +209,6 @@ impl<'a> WriteSession<'a> {
 pub struct WriteScope<'a, 'tx> {
     session: &'a mut WriteSession<'tx>,
     index: &'a VectorIndexRef,
-    #[cfg(feature = "test-seams")]
     tuple: &'a VectorPartitionKey,
     route: Vec<u8>,
     pub(super) key: [u8; 64],
@@ -394,7 +393,6 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
         Ok(Self {
             session,
             index,
-            #[cfg(feature = "test-seams")]
             tuple,
             route,
             key,
@@ -680,6 +678,26 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
             basis_entries: summary.entries,
             basis_live_entries: summary.live_entries,
         });
+        if generation != 0 {
+            // A new build counts changes since the snapshot it reads, in this
+            // same transaction, so publication can promote exact counts.
+            let partition =
+                contextdb_vector::VectorPartitionRef::new(self.index.clone(), self.tuple.clone());
+            let covered_tx = contextdb_core::TxId(self.session.snapshot.0);
+            super::super::vector_membership_pages::update_pending_summary(
+                self.session.write,
+                &partition,
+                |summary| {
+                    summary.candidate_pending =
+                        Some(super::super::vector_membership_pages::PendingCounts {
+                            covered_tx,
+                            pending_inserts: 0,
+                            tombstones: 0,
+                        });
+                    Ok(())
+                },
+            )?;
+        }
         // Register the actual storage family before its first native page
         // allocation. This provisional control is private to the outer write;
         // successful kernel commit replaces it with final sealed kind roots.
@@ -1415,7 +1433,7 @@ impl WritePages for WriteOperation<'_, '_, '_> {
         self.check_cancel()?;
         self.scope
             .ensure_family(manifest.generation, &mut self.workspace.borrow_mut())?;
-        let before = {
+        let (before, source_snapshot) = {
             let mut record = self.scope.record.borrow_mut();
             let slot = record
                 .families
@@ -1429,9 +1447,30 @@ impl WritePages for WriteOperation<'_, '_, '_> {
             let before = family.manifest.map(|m| m.manifest()).transpose()?;
             family.manifest = Some(manifest.into());
             family.committed_through_lsn = self.scope.session.row_commit_lsn.0;
+            let source_snapshot = family.source_snapshot;
             record.serving = Some(manifest.into());
-            before
+            (before, source_snapshot)
         };
+        if manifest.generation != 0 && before.is_none() {
+            // The build generation starts serving: its counts become the
+            // partition's pending counts. Tail and remap manifests keep them.
+            let partition = contextdb_vector::VectorPartitionRef::new(
+                self.scope.index.clone(),
+                self.scope.tuple.clone(),
+            );
+            super::super::vector_membership_pages::update_pending_summary(
+                self.scope.session.write,
+                &partition,
+                |summary| {
+                    let candidate = summary.candidate_pending.take().ok_or_else(corrupt)?;
+                    if candidate.covered_tx != contextdb_core::TxId(source_snapshot) {
+                        return Err(corrupt());
+                    }
+                    summary.pending = candidate;
+                    Ok(())
+                },
+            )?;
+        }
         // Prepared remap slots are created exactly once, before their run root
         // becomes visible. Count their real persisted marker in this same seal.
         if let Some(old) = before.filter(|old| old.generation == manifest.generation) {

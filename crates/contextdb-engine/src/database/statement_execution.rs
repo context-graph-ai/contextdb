@@ -2746,7 +2746,7 @@ impl Database {
         query_expr: &Expr,
         snapshot: SnapshotId,
         params: &HashMap<String, Value>,
-        aggregate_allowed_vectors: usize,
+        aggregate_allowed_vectors: Option<usize>,
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         partition_routes: &[VectorPartitionSearchTrace],
         fallback_reason: Option<&'static str>,
@@ -2795,7 +2795,8 @@ impl Database {
         } else {
             match requested_mode {
                 contextdb_core::VectorSearchMode::Auto
-                    if filtered_exact || aggregate_allowed_vectors < policy.auto_index_at =>
+                    if filtered_exact
+                        || aggregate_allowed_vectors.is_some_and(|count| count < policy.auto_index_at) =>
                 {
                     contextdb_core::VectorSearchMode::Exact
                 }
@@ -2857,7 +2858,7 @@ impl Database {
             route_evidence: VectorSearchRouteEvidence::Executed,
             requested_mode,
             resolved_mode,
-            aggregate_allowed_vectors: Some(aggregate_allowed_vectors),
+            aggregate_allowed_vectors,
             effective_auto_index_at: policy.auto_index_at,
             auto_index_at_source: policy.auto_index_at_source.to_owned(),
             partition_key_columns: layout.partition_key_columns,
