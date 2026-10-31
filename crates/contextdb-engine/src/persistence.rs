@@ -1371,7 +1371,6 @@ struct InspectedVectorPartitionComponents {
 /// Validate sequence elements without reserving from a durable size hint.
 /// The count is actual consumed elements, never the advertised length.
 struct InspectedSequence<T> {
-    count: usize,
     marker: std::marker::PhantomData<T>,
 }
 
@@ -6807,9 +6806,6 @@ enum VectorPartitionRecordKind {
     Journal = 2,
     Tombstone = 3,
     BaseGeneration = 4,
-    ChangeGeneration = 5,
-    GenerationCatalog = 6,
-    GraphPageManifest = 7,
 }
 
 /// One durable row-version/vector-version placement in the local two-level
@@ -6918,8 +6914,6 @@ pub(crate) struct FlushDataSnapshots<'a> {
 
 pub(crate) struct LocalErasurePersistence<'a> {
     pub(crate) projection: &'a AuthoritativePurgePersistenceProjection,
-    pub(crate) accountant: contextdb_vector::MemoryBudgetOwner,
-    pub(crate) operation: &'static str,
 }
 
 pub(crate) struct FlushDataOptions<'a> {

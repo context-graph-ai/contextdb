@@ -977,20 +977,6 @@ impl ImageMemory {
         )
     }
 
-    /// Prepaid output bytes this owner's per-call decodes adopted.
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from an_import_tail_charges_each_decoded_vector_once.rs"
-        )
-    )]
-    pub(crate) fn adopted_output(&self) -> usize {
-        self.prepaid_output
-            .as_ref()
-            .map_or(0, |prepaid| prepaid.adopted.load(Ordering::SeqCst))
-    }
-
     /// Adopt `bytes` of a caller's prepaid output credit, if it has that much.
     fn adopt_prepaid_output(&self, bytes: usize) -> bool {
         self.prepaid_output.as_ref().is_some_and(|prepaid| {
@@ -1585,13 +1571,9 @@ impl Drop for ImageVectorCharge {
 
 pub(crate) struct ImageVectorCopy {
     pub(crate) owner: contextdb_vector::VectorCopyAdmission,
-    accountant: contextdb_vector::MemoryBudgetOwner,
     image: crate::read_image_memory::ImageMemoryHandle,
 }
 impl ImageVectorCopy {
-    pub(crate) fn accountant(&self) -> &contextdb_vector::MemoryBudgetOwner {
-        &self.accountant
-    }
     /// The returned answer's existing image owner adopts the complete charge
     /// once. The bridge is consumed, and no budget admission occurs here.
     pub(crate) fn into_image(self) {
@@ -3329,7 +3311,6 @@ impl ImageMemoryHandle {
             contextdb_vector::VectorCopyAdmission::from_prepaid(accountant.clone(), charge)?;
         Ok(ImageVectorCopy {
             owner,
-            accountant,
             image: self.clone(),
         })
     }
@@ -3510,11 +3491,6 @@ mod exact_sequence_tests {
     struct Exact(#[serde(deserialize_with = "exact")] Vec<f32>);
     fn exact<'de, D: de::Deserializer<'de>>(d: D) -> std::result::Result<Vec<f32>, D::Error> {
         deserialize_exact_vec(d, false)
-    }
-    #[derive(Deserialize)]
-    struct Kept(#[serde(deserialize_with = "kept")] Vec<f32>);
-    fn kept<'de, D: de::Deserializer<'de>>(d: D) -> std::result::Result<Vec<f32>, D::Error> {
-        deserialize_exact_vec(d, true)
     }
     #[derive(Deserialize)]
     struct Generic(Vec<f32>);

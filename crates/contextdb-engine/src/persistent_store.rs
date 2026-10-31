@@ -247,8 +247,6 @@ impl PersistentCompositeStore {
             FlushDataOptions {
                 local_erasure: erasure.map(|stage| LocalErasurePersistence {
                     projection: &stage.durable,
-                    accountant: (stage._vector_workspace.accountant().clone()),
-                    operation: "discard",
                 }),
                 sink_events: sink_events.as_deref().map(Vec::as_slice).unwrap_or(&[]),
                 trigger_audits: &trigger_audits,
@@ -1187,8 +1185,6 @@ impl OwnedPersistentCompositeStore {
                         FlushDataOptions {
                             local_erasure: erasure.map(|stage| LocalErasurePersistence {
                                 projection: &stage.durable,
-                                accountant: (stage._vector_workspace.accountant().clone()),
-                                operation: "discard",
                             }),
                             sink_events: stage.as_ref().map_or(&[], |stage| stage.events),
                             trigger_audits: &trigger_audits,

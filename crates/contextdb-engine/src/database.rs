@@ -197,7 +197,7 @@ use contextdb_vector::store::{
     VectorPartitionRef,
 };
 use contextdb_vector::{
-    MemVectorExecutor, MemoryBudget, PartitionedVectorEntry, PreparedVectorPublication,
+    MemVectorExecutor, PartitionedVectorEntry, PreparedVectorPublication,
     VectorIndexLayout, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
     VectorMaintenanceReport, VectorPartitionSearchRoute, VectorPartitionSearchTrace,
     VectorSearchDebugTrace, VectorStore, VectorVersionIdentity, cosine_similarity,
@@ -10687,11 +10687,7 @@ thread_local! {
 
 mod native_commit_paths;
 #[cfg(test)]
-pub(crate) use native_commit_paths::*;
-
-#[cfg(test)]
-#[path = "database/d1_initialized_control_proofs.rs"]
-pub(crate) mod d1_initialized_control_proofs;
+use native_commit_paths::*;
 
 #[cfg(test)]
 mod cdb126_reader_history_tests;

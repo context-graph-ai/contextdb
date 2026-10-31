@@ -3627,16 +3627,12 @@ impl DurableColumnSourceFactory {
         let loader = self.loader.clone();
         let layout = layout.clone();
         let copy_owner = Arc::new(owner);
-        #[cfg(test)]
-        crate::database::d1_initialized_control_proofs::observe_partition_credit_for_test();
         let reverse = Arc::new(DurableReverseMembershipSource {
             owner: MembershipOwner::Writable(self.persistence.clone()),
             index: index.clone(),
             _copy_owner: Some(Arc::new(reverse_owner)),
             accountant: self.accountant.clone(),
         });
-        #[cfg(test)]
-        crate::database::d1_initialized_control_proofs::observe_reverse_for_test(&reverse);
         let admitted_loader = AdmittedLayoutLoader {
             loader,
             layout,

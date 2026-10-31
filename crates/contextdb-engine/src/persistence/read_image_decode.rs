@@ -1325,14 +1325,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for InspectedSequence<T> {
                 self,
                 mut sequence: A,
             ) -> std::result::Result<Self::Value, A::Error> {
-                let mut count = 0usize;
-                while sequence.next_element::<T>()?.is_some() {
-                    count = count.checked_add(1).ok_or_else(|| {
-                        serde::de::Error::custom("persisted sequence element count overflow")
-                    })?;
-                }
+                while sequence.next_element::<T>()?.is_some() {}
                 Ok(InspectedSequence {
-                    count,
                     marker: std::marker::PhantomData,
                 })
             }
@@ -1398,17 +1392,14 @@ pub(super) fn prevalidate_vector_partition_metadata_routes(
         VectorPartitionRecordKind::Membership
             | VectorPartitionRecordKind::Journal
             | VectorPartitionRecordKind::Tombstone
-            | VectorPartitionRecordKind::GenerationCatalog
-            | VectorPartitionRecordKind::GraphPageManifest
             | VectorPartitionRecordKind::BaseGeneration
-            | VectorPartitionRecordKind::ChangeGeneration
     ) {
         return Ok(());
     }
     let route_end = inspect_vector_partition_metadata_route(payload)?;
     if matches!(
         kind,
-        VectorPartitionRecordKind::BaseGeneration | VectorPartitionRecordKind::ChangeGeneration
+        VectorPartitionRecordKind::BaseGeneration
     ) {
         type Graph<'a> = (&'a [u8], [u8; 32]);
         type BaseTail<'a> = (

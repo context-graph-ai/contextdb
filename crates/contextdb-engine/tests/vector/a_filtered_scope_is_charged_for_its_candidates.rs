@@ -1,6 +1,5 @@
 use super::retained_query_rows::RetainedRows;
 
-use super::maintained_search;
 use contextdb_core::read_contract::{
     DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureLimit, ReadLimits,
 };
@@ -24,10 +23,8 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use uuid::Uuid;
 
 const SELECTED_ROWS: usize = 1_000;
-const CURRENT_ROWS_PER_CONTEXT: usize = 125;
 
 struct DistanceCounter(AtomicU64);
 
@@ -105,143 +102,6 @@ fn limits() -> ReadLimits {
         work: 50_000,
         memory: 256 * 1024 * 1024,
         ..ReadLimits::default()
-    }
-}
-
-fn context_id(partition: usize) -> Uuid {
-    Uuid::from_u128(0xC045_1000_0000_0000_0000_0000_0000_0000 + partition as u128)
-}
-
-fn generation_id(partition: usize) -> Uuid {
-    Uuid::from_u128(0xC045_2000_0000_0000_0000_0000_0000_0000 + partition as u128)
-}
-
-fn insert(db: &Database, ordinal: usize, partition: usize, current: bool) {
-    db.execute(
-        "INSERT INTO scoped_vectors VALUES ($id, $context, $generation, $current, $embedding)",
-        &HashMap::from([
-            (
-                "id".into(),
-                Value::Int64(maintained_search::corpus_id(ordinal)),
-            ),
-            ("context".into(), Value::Uuid(context_id(partition))),
-            ("generation".into(), Value::Uuid(generation_id(partition))),
-            ("current".into(), Value::Bool(current)),
-            (
-                "embedding".into(),
-                Value::Vector(maintained_search::corpus_vector(ordinal)),
-            ),
-        ]),
-    )
-    .unwrap();
-}
-
-fn seed(include_unrelated_contexts: bool) -> Database {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE scoped_vectors (id INT PRIMARY KEY, context_id UUID NOT NULL, \
-         generation_id UUID NOT NULL, is_current BOOL NOT NULL, \
-         embedding VECTOR(768) PARTITION_KEY (context_id, generation_id) \
-         MAX_PARTITIONS 8 SEARCH_MODE AUTO)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "CREATE INDEX scoped_vectors_current_idx ON scoped_vectors \
-         (context_id, generation_id, is_current)",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    // Both fixtures contain byte-for-byte the same selected Context: the
-    // accepted 1,000 frozen vectors with exactly 125 current rows.
-    for ordinal in 0..SELECTED_ROWS {
-        insert(&db, ordinal, 0, ordinal < CURRENT_ROWS_PER_CONTEXT);
-    }
-    if include_unrelated_contexts {
-        // Grow only the other seven Contexts to the frozen 10,000-row total.
-        // Each has exactly 125 current rows; corpus ids and vector bytes stay
-        // in their frozen order.
-        for ordinal in SELECTED_ROWS..maintained_search::CORPUS_ROWS {
-            let offset = ordinal - SELECTED_ROWS;
-            let context = 1 + offset % 7;
-            let local_ordinal = offset / 7;
-            insert(
-                &db,
-                ordinal,
-                context,
-                local_ordinal < CURRENT_ROWS_PER_CONTEXT,
-            );
-        }
-    }
-    db
-}
-
-fn selected_context_snapshot(db: &Database) -> RetainedRows {
-    db.execute(
-        "SELECT id, context_id, generation_id, is_current, embedding FROM scoped_vectors \
-         WHERE context_id = $context AND generation_id = $generation ORDER BY id ASC",
-        &HashMap::from([
-            ("context".into(), Value::Uuid(context_id(0))),
-            ("generation".into(), Value::Uuid(generation_id(0))),
-        ]),
-    )
-    .expect("read every selected-Context field that can affect search")
-    .into()
-}
-
-fn query(db: &Database, partitions: usize) -> ChargedQuery {
-    let graph = Arc::new(DistanceCounter(AtomicU64::new(0)));
-    let native = Arc::new(DistanceCounter(AtomicU64::new(0)));
-    let grouping = Arc::new(GroupingCounter::default());
-    let mut params = HashMap::from([
-        (
-            "query".into(),
-            Value::Vector(maintained_search::held_out_vector(0)),
-        ),
-        ("is_current".into(), Value::Bool(true)),
-    ]);
-    let mut contexts = Vec::with_capacity(partitions);
-    let mut generations = Vec::with_capacity(partitions);
-    for partition in 0..partitions {
-        let context = format!("context_{partition}");
-        let generation = format!("generation_{partition}");
-        params.insert(context.clone(), Value::Uuid(context_id(partition)));
-        params.insert(generation.clone(), Value::Uuid(generation_id(partition)));
-        contexts.push(format!("${context}"));
-        generations.push(format!("${generation}"));
-    }
-    let result = with_bounded_candidate_grouping_observer_for_test(grouping.clone(), || {
-        
-            with_native_ivf_seal_observer_for_test(graph.clone(), || {
-                with_native_vector_score_observer_for_test(native.clone(), || {
-                    bounded::execute(
-                        db,
-                        &bounded::BoundedReadRequest::new(
-                            format!(
-                                "SELECT id FROM scoped_vectors WHERE context_id IN ({}) AND \
-                         generation_id IN ({}) AND is_current = $is_current \
-                         ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 10",
-                                contexts.join(", "),
-                                generations.join(", "),
-                            ),
-                            params,
-                            limits(),
-                            Arc::new(FrozenClock),
-                        ),
-                    )
-                })
-            })
-        
-    })
-    .expect("the bounded filtered query succeeds");
-    ChargedQuery {
-        used_indexed_route: db.__debug_last_query_vector_used_indexed_route_for_test(),
-        result,
-        distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
-        row_directory_lookups: grouping.row_directory_lookups.load(Ordering::SeqCst),
-        snapshot_visibility_probes: grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
-        placements: grouping.placements.load(Ordering::SeqCst),
     }
 }
 

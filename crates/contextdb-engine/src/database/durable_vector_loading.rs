@@ -1974,8 +1974,6 @@ pub(super) fn register_dormant_raw_vector_partitions(
             .saturating_add(16 * std::mem::size_of::<usize>()),
     )?;
     let factory_owner = Arc::new(factory_owner);
-    #[cfg(test)]
-    d1_initialized_control_proofs::observe_factory_credit_for_test(&factory_owner, accountant);
     let loader_for: crate::persistence::vector_membership_source::DurableLoaderBuilder = {
         let captures = LoaderCallbackCaptures {
             persistence: std::mem::ManuallyDrop::new(persistence.clone()),
@@ -1994,8 +1992,6 @@ pub(super) fn register_dormant_raw_vector_partitions(
             },
         )
     };
-    #[cfg(test)]
-    d1_initialized_control_proofs::observe_callback_for_test(&loader_for, accountant);
     let published_root: crate::persistence::vector_membership_source::PublishedMembershipRoot = {
         let manager = manager.downgrade();
         Arc::new(move || {
@@ -2015,8 +2011,6 @@ pub(super) fn register_dormant_raw_vector_partitions(
         _copy_owner: factory_owner,
         accountant: crate::memory_accounting::StoreAccountantHandle::new(accountant.clone()),
     });
-    #[cfg(test)]
-    d1_initialized_control_proofs::observe_columns_for_test(&columns);
     let layouts = vector.index_layout_infos(copy_owner)?;
     for info in &layouts {
         let (reverse, partitions) = columns.column_sources(

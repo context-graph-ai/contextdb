@@ -53,9 +53,6 @@ pub struct WriterHistoryWork {
 }
 
 pub(crate) enum HistoryFamily {
-    /// Only the test-only relational visit driver reads row history pages.
-    #[cfg(test)]
-    Row,
     Graph,
     ChangeLog,
     CommitIndex,
@@ -68,8 +65,6 @@ pub(crate) fn note_history(family: HistoryFamily) {
     WORK.with(|work| {
         if let Some(mut counters) = work.get() {
             let count = match family {
-                #[cfg(test)]
-                HistoryFamily::Row => &mut counters.history.row_versions,
                 HistoryFamily::Graph => &mut counters.history.graph_versions,
                 HistoryFamily::ChangeLog => &mut counters.history.change_log_entries,
                 HistoryFamily::CommitIndex => &mut counters.history.commit_index_entries,

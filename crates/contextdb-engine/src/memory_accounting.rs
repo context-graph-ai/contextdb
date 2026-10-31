@@ -2284,17 +2284,14 @@ impl WriterAdmission {
 // remains unlimited; finite arithmetic cannot manufacture capacity on overflow.
 struct WriterHeadroom {
     available: Option<usize>,
-    within_limit: bool,
 }
 fn writer_headroom(limit: usize, used: usize, releasing: usize, private: usize) -> WriterHeadroom {
     let occupied = used
         .checked_sub(releasing)
         .expect("replacement credit must be owned by this accountant");
-    let combined_used = Some(occupied);
     let effective = limit.saturating_add(private);
     WriterHeadroom {
         available: (limit != 0).then(|| effective.saturating_sub(occupied)),
-        within_limit: limit == 0 || combined_used.is_some_and(|bytes| bytes <= effective),
     }
 }
 
