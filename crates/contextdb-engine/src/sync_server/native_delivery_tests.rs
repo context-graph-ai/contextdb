@@ -3519,10 +3519,11 @@ async fn every_hub_admission_site_refuses_before_its_allocation() {
             watch_native_admissions_for_test();
             let refused = within(hub.client.fetch_delivery_outcomes(None)).await;
             let witnessed = witnesses_of(&tight, take_native_admissions_for_test());
-            let retained = settled(&tight, 0);
+            let retained = settled(&tight, native_root_bytes_for_test());
             assert_eq!(
-                retained, 0,
-                "{operation}: a refused request retains nothing"
+                retained,
+                native_root_bytes_for_test(),
+                "{operation}: a refused request retains nothing beyond its root"
             );
             assert_eq!(accepted(), accepted_before, "no success body was published");
             let Some(at) = witnessed.iter().position(|w| !w.admitted) else {
