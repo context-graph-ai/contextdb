@@ -5,8 +5,6 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const HNSW_HEADER_BYTES: usize = 12;
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredVectorEntry {
     pub membership: VectorMembershipProvenance,
@@ -645,120 +643,6 @@ impl StoredVector {
         }
     }
 
-    pub fn as_f32_slice(&self) -> Option<&[f32]> {
-        match self {
-            StoredVector::F32(vector) => Some(vector),
-            _ => None,
-        }
-    }
-
-    pub fn to_hnsw_u8(&self) -> Vec<u8> {
-        let (len, min, max, payload) = match self {
-            StoredVector::F32(_) => return Vec::new(),
-            StoredVector::SQ8 {
-                min,
-                max,
-                len,
-                payload,
-            }
-            | StoredVector::SQ4 {
-                min,
-                max,
-                len,
-                payload,
-            } => (*len, *min, *max, &payload[..]),
-        };
-        encode_hnsw_quantized_payload(len, min, max, payload)
-    }
-}
-
-pub(crate) fn encode_hnsw_quantized_payload(
-    len: usize,
-    min: f32,
-    max: f32,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(HNSW_HEADER_BYTES + payload.len());
-    bytes.extend_from_slice(&(len as u32).to_le_bytes());
-    bytes.extend_from_slice(&min.to_le_bytes());
-    bytes.extend_from_slice(&max.to_le_bytes());
-    bytes.extend_from_slice(payload);
-    bytes
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HnswQuantizedHeader<'a> {
-    pub len: usize,
-    pub min: f32,
-    pub max: f32,
-    pub payload: &'a [u8],
-}
-
-pub(crate) fn decode_hnsw_quantized(bytes: &[u8]) -> Option<HnswQuantizedHeader<'_>> {
-    if bytes.len() < HNSW_HEADER_BYTES {
-        return None;
-    }
-    let len = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-    let min = f32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    let max = f32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    Some(HnswQuantizedHeader {
-        len,
-        min,
-        max,
-        payload: &bytes[HNSW_HEADER_BYTES..],
-    })
-}
-
-pub(crate) fn quantized_hnsw_query_score(
-    bytes: &[u8],
-    query: &[f32],
-    quantization: VectorQuantization,
-) -> Option<f32> {
-    let stored = decode_hnsw_quantized(bytes)?;
-    if stored.len != query.len() {
-        return None;
-    }
-    match quantization {
-        VectorQuantization::SQ8 => Some(cosine_query_sq8(
-            query,
-            stored.payload,
-            stored.min,
-            stored.max,
-        )),
-        VectorQuantization::SQ4 => Some(cosine_query_sq4(
-            query,
-            stored.payload,
-            stored.len,
-            stored.min,
-            stored.max,
-        )),
-        VectorQuantization::F32 => None,
-    }
-}
-
-pub(crate) fn quantized_hnsw_distance(
-    left: &[u8],
-    right: &[u8],
-    quantization: VectorQuantization,
-) -> f32 {
-    let Some(left) = decode_hnsw_quantized(left) else {
-        return 1.0;
-    };
-    let Some(right) = decode_hnsw_quantized(right) else {
-        return 1.0;
-    };
-    let len = left.len.min(right.len);
-    if len == 0 {
-        return 0.0;
-    }
-
-    let similarity = match quantization {
-        VectorQuantization::SQ8 => cosine_sq8(left, right, len),
-        VectorQuantization::SQ4 => cosine_sq4(left, right, len),
-        VectorQuantization::F32 => return 1.0,
-    };
-
-    (1.0 - similarity as f64).max(0.0) as f32
 }
 
 fn cosine_query_sq8(query: &[f32], payload: &[u8], min: f32, max: f32) -> f32 {
@@ -805,70 +689,6 @@ fn cosine_query_sq4(query: &[f32], payload: &[u8], len: usize, min: f32, max: f3
         vector_norm += b * b;
     }
     finish_cosine(dot, query_norm, vector_norm)
-}
-
-fn cosine_sq8(left: HnswQuantizedHeader<'_>, right: HnswQuantizedHeader<'_>, len: usize) -> f32 {
-    let left_range = left.max - left.min;
-    let right_range = right.max - right.min;
-    let left_scale = if left_range <= f32::EPSILON {
-        0.0
-    } else {
-        left_range / 255.0
-    };
-    let right_scale = if right_range <= f32::EPSILON {
-        0.0
-    } else {
-        right_range / 255.0
-    };
-    let (mut dot, mut left_norm, mut right_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for i in 0..len {
-        let a = if left_scale == 0.0 {
-            left.min
-        } else {
-            left.min + left.payload.get(i).copied().unwrap_or(0) as f32 * left_scale
-        };
-        let b = if right_scale == 0.0 {
-            right.min
-        } else {
-            right.min + right.payload.get(i).copied().unwrap_or(0) as f32 * right_scale
-        };
-        dot += a * b;
-        left_norm += a * a;
-        right_norm += b * b;
-    }
-    finish_cosine(dot, left_norm, right_norm)
-}
-
-fn cosine_sq4(left: HnswQuantizedHeader<'_>, right: HnswQuantizedHeader<'_>, len: usize) -> f32 {
-    let left_range = left.max - left.min;
-    let right_range = right.max - right.min;
-    let left_scale = if left_range <= f32::EPSILON {
-        0.0
-    } else {
-        left_range / 15.0
-    };
-    let right_scale = if right_range <= f32::EPSILON {
-        0.0
-    } else {
-        right_range / 15.0
-    };
-    let (mut dot, mut left_norm, mut right_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for i in 0..len {
-        let a = if left_scale == 0.0 {
-            left.min
-        } else {
-            left.min + unpack_sq4(left.payload, i) as f32 * left_scale
-        };
-        let b = if right_scale == 0.0 {
-            right.min
-        } else {
-            right.min + unpack_sq4(right.payload, i) as f32 * right_scale
-        };
-        dot += a * b;
-        left_norm += a * a;
-        right_norm += b * b;
-    }
-    finish_cosine(dot, left_norm, right_norm)
 }
 
 fn cosine_from_iter<A, B>(left: A, right: B, expected_len: usize) -> f32

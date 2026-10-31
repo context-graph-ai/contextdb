@@ -16,11 +16,11 @@ use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorEntry, VectorIndexRef, VectorPartitionKey,
     VectorQuantization, VectorSearchMode,
 };
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 // unpartitioned_vector_membership_pages_reload_at_constant_residency observes private directory owners.
 #[cfg(feature = "test-seams")]
@@ -62,12 +62,6 @@ impl SnapshotPartitionMismatch {
         )
     }
 }
-
-const MAINTENANCE_SAMPLE_NO_PRIOR_TAIL: u64 = 1;
-const MAINTENANCE_SAMPLE_MOVED_BASE: u64 = 2;
-const MAINTENANCE_SAMPLE_MOVED_CHANGE: u64 = 3;
-const MAINTENANCE_SAMPLE_REPLACED_EMPTY_TAIL: u64 = 4;
-const MAINTENANCE_SAMPLE_ADDED_TO_BASE: u64 = 5;
 
 /// Receipt of vector lifecycle work. These counters record completed events,
 /// never a derived view of the store's current resident state.
@@ -555,15 +549,6 @@ impl Drop for BulkWriteStackGuard {
             debug_assert_eq!(popped, Some(self.store_id));
         });
     }
-}
-
-/// What the bounded HNSW gate needs to know about one partition's stored
-/// entries. `live_count` is evaluated at the reading snapshot; later entries
-/// do not invalidate an older compatible graph generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoundedIndexEligibility {
-    pub entry_count: usize,
-    pub live_count: usize,
 }
 
 #[derive(Default)]
@@ -2328,11 +2313,6 @@ impl RawVectorBodyReads {
         drop(self.control_owner.take());
     }
 
-    /// Switch between one-pass and reused reads; returns the previous mode.
-    pub(crate) fn set_one_pass(&mut self, one_pass: bool) -> bool {
-        std::mem::replace(&mut self.one_pass, one_pass)
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2408,15 +2388,6 @@ pub struct DormantRawVectorPartition {
     pub directory: Vec<RawVectorDirectoryEntry>,
     pub loader: Arc<dyn DormantRawVectorLoader>,
 }
-
-#[derive(Clone, Copy)]
-enum SealedChainLocation {
-    Current,
-    Retired { base_generation_id: u64 },
-}
-
-/// `IndexState::tail_frontier_tx` when no build frontier is known.
-const TAIL_FRONTIER_UNKNOWN: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorMaintenanceProgress {
@@ -2526,9 +2497,6 @@ pub struct IndexState {
     dimension: usize,
     quantization: VectorQuantization,
     maintenance: Mutex<()>,
-    /// Serializes builders for this partition without making foreground
-    /// publication wait for graph construction.
-    maintenance_build: Mutex<()>,
     vectors: RwLock<PartitionVectors>,
     raw_directory: RwLock<Vec<RawVectorDirectoryEntry>>,
     #[cfg(test)]
@@ -2563,10 +2531,6 @@ pub struct IndexState {
     #[cfg(any(test, feature = "test-seams"))]
     maintenance_step_pause: Mutex<Option<Arc<MaintenanceProgressPauseSlot>>>,
     maintenance_policy_revision: AtomicU64,
-    /// Makes tail extension/replacement and a generation pointer switch one
-    /// observation. Durable decode stays outside this short boundary; its
-    /// candidate is admitted only if `fresh_tail_revision` is unchanged.
-    generation_publication: Mutex<()>,
     #[cfg(any(test, feature = "test-seams"))]
     passive_activity: OnceLock<Arc<VectorPassiveActivity>>,
 }
@@ -2927,7 +2891,6 @@ impl IndexState {
             dimension,
             quantization,
             maintenance: Mutex::new(()),
-            maintenance_build: Mutex::new(()),
             vectors: RwLock::new(PartitionVectors::default()),
             raw_directory: RwLock::new(Vec::new()),
             #[cfg(test)]
@@ -2951,7 +2914,6 @@ impl IndexState {
             #[cfg(any(test, feature = "test-seams"))]
             maintenance_step_pause: Mutex::new(None),
             maintenance_policy_revision: AtomicU64::new(0),
-            generation_publication: Mutex::new(()),
             #[cfg(any(test, feature = "test-seams"))]
             passive_activity: OnceLock::new(),
         }
@@ -3145,13 +3107,6 @@ impl IndexState {
 
     fn clear_maintenance_failure(&self) {
         self.maintenance_inspection.write().failure = None;
-    }
-
-    fn clear_maintenance_failure_if(&self, expected: VectorMaintenanceFailureDetails) {
-        let mut inspection = self.maintenance_inspection.write();
-        if inspection.failure == Some(expected) {
-            inspection.failure = None;
-        }
     }
 
     fn begin_maintenance_progress_at(
@@ -3862,24 +3817,6 @@ impl IndexState {
         );
     }
 
-    /// Rows visible at a maintenance sample frontier.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn sampled_visible_count(
-        &self,
-        snapshot: SnapshotId,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<usize> {
-        let mut local_copy_admission = owner.local_scratch();
-        let owner = local_copy_admission.as_mut().unwrap_or(owner);
-        match self.durable_membership_source() {
-            Some(source) => source.visible_count(snapshot, &mut || true, owner),
-            None => Ok(self.visibility_counts.read().count(snapshot)),
-        }
-    }
-
     /// One-pass reads for an exhaustive comparison over this partition.
     pub(crate) fn one_pass_reads(
         &self,
@@ -4001,31 +3938,6 @@ impl IndexState {
         Ok(self
             .try_visible_directory_entry_by_row(row, snapshot, owner)?
             .is_some())
-    }
-
-    /// The LSN of the version of `row` that `snapshot` sees, if any: which
-    /// stored version a graph member must be to answer for its row.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn try_directory_visible_lsn_with_copy_admission(
-        &self,
-        row: RowId,
-        snapshot: SnapshotId,
-        owner: &mut VectorCopyAdmission,
-        admit: VectorCopyAdmissionCallback<'_>,
-    ) -> Result<Option<Lsn>> {
-        let mut local_copy_admission = owner.local_scratch();
-        let owner = local_copy_admission.as_mut().unwrap_or(owner);
-        if let Some(source) = self.durable_membership_source() {
-            return Ok(source
-                .visible_by_row_with_copy_admission(row, snapshot, &mut || true, owner, admit)?
-                .map(|entry| entry.lsn));
-        }
-        Ok(self
-            .visible_directory_entry_by_row(row, snapshot)
-            .map(|entry| entry.lsn))
     }
 
     #[expect(
@@ -4405,20 +4317,6 @@ impl IndexState {
         }
         self.ensure_raw_vectors_loaded(owner)?;
         Ok(self.visible_entry_by_row(index, row_id, snapshot))
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn load_visible_entry_for_tail(
-        &self,
-        index: &VectorIndexRef,
-        row_id: RowId,
-        snapshot: SnapshotId,
-        cache: bool,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<Option<VectorEntry>> {
-        self.load_visible_entry_by_row_caching(index, row_id, snapshot, cache, owner)
     }
 
     /// Legacy full-load readers retain an operation-owned authenticated copy.
@@ -5296,16 +5194,6 @@ impl IndexState {
         None
     }
 
-    /// The directory holds exactly one version of this row. A second version --
-    /// superseded, re-created, or left behind by cleanup -- means an immutable
-    /// graph may name a point that is not the version this snapshot reads.
-    fn row_has_one_stored_version(&self, row_id: RowId) -> bool {
-        self.raw_directory_by_row
-            .read()
-            .get(&row_id)
-            .is_some_and(|positions| positions.len() == 1)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn score_visible_candidate_inner<E>(
         &self,
@@ -5595,40 +5483,6 @@ impl IndexState {
             release_retained,
             owner,
             None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn bounded_score_visible_candidate_with_copy_admission<E>(
-        &self,
-        index: &VectorIndexRef,
-        row_id: RowId,
-        snapshot: SnapshotId,
-        query: &[f32],
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-        owner: &mut VectorCopyAdmission,
-        admit: VectorCopyAdmissionCallback<'_>,
-    ) -> std::result::Result<Option<f32>, E>
-    where
-        E: From<Error>,
-    {
-        self.score_visible_candidate_inner(
-            index,
-            row_id,
-            None,
-            snapshot,
-            query,
-            true,
-            None,
-            before_checkpoint,
-            before_distance,
-            before_retain,
-            release_retained,
-            owner,
-            Some(admit),
         )
     }
 
@@ -6082,13 +5936,6 @@ pub struct PreparedVectorPolicyLayout {
     column: Arc<VectorColumnState>,
     layout: VectorIndexLayout,
     growth: Option<PaidRetainedMemoryCharge>,
-}
-
-/// A policy-only layout change [`VectorStore::publish_policy_layout_update`]
-/// has published, kept for the follow-up maintenance-failure recheck.
-pub struct PublishedVectorPolicyLayout {
-    index: VectorIndexRef,
-    column: Arc<VectorColumnState>,
 }
 
 /// Complete in-memory declaration for one vector column. Partition columns
@@ -7382,87 +7229,6 @@ impl VectorColumnState {
         failed.keys.insert(key.clone());
     }
 
-    /// Whether a recheck can find anything: some partition was noted as
-    /// failed, or the set is incomplete.
-    fn may_have_failed_partitions(&self) -> bool {
-        let failed = self.failed_partitions.lock();
-        failed.incomplete || !failed.keys.is_empty()
-    }
-
-    /// Drop `key` from the failed-partition set and return its charge.
-    fn forget_failed_partition(&self, key: &VectorPartitionKey) {
-        let mut failed = self.failed_partitions.lock();
-        if !failed.keys.remove(key) {
-            return;
-        }
-        let bytes = Self::failed_partition_entry_bytes(key);
-        let mut retained = self.directory_accounting.lock();
-        retained.accountant.release(bytes);
-        retained.bytes -= bytes;
-    }
-
-    /// The partitions a policy recheck must look at, under the caller's
-    /// admission: only the noted failed ones, or, when that set is
-    /// incomplete, every partition. In that case the second value names the
-    /// set's incompleteness count when the recheck started:
-    /// the noted keys stay (the recheck notes or forgets each partition it
-    /// visits, and recorders keep noting new failures), and only a recheck
-    /// that finishes calls [`Self::complete_failed_partitions`], so a refused
-    /// one leaves the set incomplete. Noted keys whose partition is gone are
-    /// dropped here.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn failure_recheck_snapshots(
-        &self,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<(Vec<PartitionSnapshot>, Option<u64>)> {
-        let keys = {
-            let failed = self.failed_partitions.lock();
-            if failed.incomplete {
-                let since = failed.incomplete_since;
-                drop(failed);
-                return Ok((self.admitted_partition_snapshots(owner)?, Some(since)));
-            }
-            if failed.keys.is_empty() {
-                return Ok((Vec::new(), None));
-            }
-            let bytes = failed.keys.iter().fold(0usize, |bytes, key| {
-                bytes
-                    .saturating_add(std::mem::size_of::<(VectorPartitionKey, Arc<IndexState>)>())
-                    .saturating_add(key.estimated_bytes())
-            });
-            owner.reserve(bytes)?;
-            failed.keys.iter().cloned().collect::<Vec<_>>()
-        };
-        let partitions = self.partitions.read();
-        let mut snapshots = Vec::with_capacity(keys.len());
-        let mut gone = Vec::new();
-        for key in keys {
-            match partitions.get(&key) {
-                Some(state) => snapshots.push((key, state.clone())),
-                None => gone.push(key),
-            }
-        }
-        drop(partitions);
-        for key in &gone {
-            self.forget_failed_partition(key);
-        }
-        Ok((snapshots, None))
-    }
-
-    /// A full recheck that started when the set had become incomplete
-    /// `since` times finished: every partition was visited and each failure
-    /// it found is noted, so the set is trusted again unless a charge was
-    /// refused while it ran.
-    fn complete_failed_partitions(&self, since: u64) {
-        let mut failed = self.failed_partitions.lock();
-        if failed.incomplete_since == since {
-            failed.incomplete = false;
-        }
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -8099,17 +7865,9 @@ impl VectorColumnState {
     }
 
     fn retained_bytes(&self, index: &VectorIndexRef) -> usize {
-        let state_bytes = self
-            .partitions
-            .read()
-            .values()
-            .fold(0usize, |bytes, state| {
-                bytes
-            });
         self.directory_ownership(index)
             .total()
             .saturating_add(self.raw_allocation_bytes_matching(|_| true))
-            .saturating_add(state_bytes)
     }
 
     /// Exact disjoint owners in the lightweight registry image. These are
@@ -8685,10 +8443,6 @@ impl VectorRegistryLock {
         self.assert_not_renaming();
         self.inner.write()
     }
-    fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, VectorRegistry>> {
-        self.assert_not_renaming();
-        self.inner.try_read()
-    }
     fn rename_guard(&self) -> RegistryRenameThreadGuard<'_> {
         *self.rename_thread.lock() = Some(std::thread::current().id());
         RegistryRenameThreadGuard { registry: self }
@@ -8746,7 +8500,6 @@ pub struct PreparedVectorIndexRename<'a> {
     reverse: Option<NativeSourceArc<dyn RawVectorReverseMembershipSource>>,
     registry_directories: Vec<PreparedRegistryDirectoryCharge>,
     displaced: Option<Arc<VectorColumnState>>,
-    removal_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     // Drop preparation allocations before returning their statement credit.
     owner: VectorCopyAdmission,
     _rename_guard: RegistryRenameThreadGuard<'a>,
@@ -8759,12 +8512,7 @@ impl PreparedVectorIndexRename<'_> {
     pub fn publish(mut self) -> VectorTeardownReceipt {
         let mut receipt = VectorTeardownReceipt::default();
         if let Some(column) = self.displaced.take() {
-            receipt.release_column(
-                &column,
-                self.removal_accountant
-                    .as_deref()
-                    .expect("replacement removal has an accountant"),
-            );
+            receipt.release_column(&column);
         }
         for prepared in self.sources.drain(..) {
             *prepared.state.durable_memberships.write() = prepared.source;
@@ -8851,7 +8599,7 @@ pub struct VectorTeardownReceipt {
 }
 
 impl VectorTeardownReceipt {
-    fn release_column(&mut self, column: &VectorColumnState, accountant: &dyn MemoryBudget) {
+    fn release_column(&mut self, column: &VectorColumnState) {
         for state in column.partitions.read().values() {
             if !state.release_accounted_raw_residency_for_removal() {
                 for entry in &state.vectors.read().entries {
@@ -8890,10 +8638,6 @@ impl PreparedLoadedVectorReplacement<'_> {
                 column.go_live();
             }
             let old = std::mem::replace(&mut *self.destination.registry.write(), self.registry);
-            for column in old.values() {
-                // Accounted incoming and outgoing images have independent
-                // allocation-owned payload and directory reservations.
-            }
             drop(old);
         });
     }
@@ -8978,16 +8722,7 @@ impl PreparedVectorPublication {
                         .preserved_states
                         .contains(&(Arc::as_ptr(state) as usize))
             };
-            column
-                .partition_snapshots()
-                .into_iter()
-                .filter(|(_, state)| preserved(state))
-                .fold(
-                    total.saturating_add(column.raw_allocation_bytes_matching(preserved)),
-                    |bytes, (_, state)| {
-                        bytes
-                    },
-                )
+            total.saturating_add(column.raw_allocation_bytes_matching(preserved))
         })
     }
 
@@ -10365,7 +10100,6 @@ impl VectorStore {
     pub fn retire_snapshot_free_partition_states(
         &self,
         registered_snapshots: &[SnapshotId],
-        accountant: &dyn MemoryBudget,
         owner: &mut VectorCopyAdmission,
     ) -> Result<usize> {
         let mut local_copy_admission = owner.local_scratch();
@@ -10423,10 +10157,7 @@ impl VectorStore {
     pub fn publish_prepared_received_schema(
         &self,
         publication: PreparedVectorPublication,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
         self.registry.assert_not_renaming();
         let _bulk = self.bulk_gate.write();
         let (
@@ -10749,16 +10480,13 @@ impl VectorStore {
     pub fn publish_prepared_received_schema_tables(
         &self,
         mut prepared: PreparedVectorTablePublication,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
         // Keep the complete preparation owner armed across every policy body
         // and the outgoing registry's physical destruction, including unwind.
         for policy in std::mem::take(&mut prepared.policy_updates) {
             let _ = self.publish_policy_layout_update(policy);
         }
-        self.publish_prepared_received_schema(prepared.publication, accountant);
+        self.publish_prepared_received_schema(prepared.publication);
     }
 
     #[cfg(feature = "test-seams")]
@@ -11003,13 +10731,13 @@ impl VectorStore {
     }
 
     /// Apply a prepared policy-only layout change. The column keeps its
-    /// partitions and graphs; only its declared policy changes. If the index
+    /// partitions; only its declared policy changes. If the index
     /// was replaced since preparation, the prepared change is dropped and
     /// its admitted growth returned.
     pub fn publish_policy_layout_update(
         &self,
         prepared: PreparedVectorPolicyLayout,
-    ) -> Option<PublishedVectorPolicyLayout> {
+    ) {
         self.with_bulk_maintenance(|| {
             let PreparedVectorPolicyLayout {
                 index,
@@ -11023,7 +10751,7 @@ impl VectorStore {
                 .get(&index)
                 .is_some_and(|live| Arc::ptr_eq(live, &column));
             if !still_current {
-                return None;
+                return;
             }
             let old_bytes = column.layout.read().estimated_bytes();
             let new_bytes = layout.estimated_bytes();
@@ -11038,7 +10766,6 @@ impl VectorStore {
                 retained.bytes -= old_bytes - new_bytes;
             }
             drop(retained);
-            Some(PublishedVectorPolicyLayout { index, column })
         })
     }
 
@@ -12765,12 +12492,11 @@ impl VectorStore {
     pub fn teardown_index_without_copy(
         &self,
         index: &VectorIndexRef,
-        accountant: &dyn MemoryBudget,
     ) -> VectorTeardownReceipt {
         self.with_bulk_maintenance(|| {
             let mut receipt = VectorTeardownReceipt::default();
             if let Some(column) = self.registry.write().remove(index) {
-                receipt.release_column(&column, accountant);
+                receipt.release_column(&column);
             }
             receipt
         })
@@ -12779,13 +12505,12 @@ impl VectorStore {
     pub fn teardown_table_without_copy(
         &self,
         table: &str,
-        accountant: &dyn MemoryBudget,
     ) -> VectorTeardownReceipt {
         self.with_bulk_maintenance(|| {
             let mut receipt = VectorTeardownReceipt::default();
             let mut registry = self.registry.write();
             for (_, column) in registry.extract_if(|index, _| index.table == table) {
-                receipt.release_column(&column, accountant);
+                receipt.release_column(&column);
             }
             registry.release_empty_buckets();
             receipt
@@ -12794,13 +12519,12 @@ impl VectorStore {
 
     pub fn teardown_all_without_copy(
         &self,
-        accountant: &dyn MemoryBudget,
     ) -> VectorTeardownReceipt {
         self.with_bulk_maintenance(|| {
             let mut receipt = VectorTeardownReceipt::default();
             let mut registry = self.registry.write();
             for (_, column) in registry.drain() {
-                receipt.release_column(&column, accountant);
+                receipt.release_column(&column);
             }
             registry.release_empty_buckets();
             receipt
@@ -12818,7 +12542,6 @@ impl VectorStore {
     pub fn deregister_index(
         &self,
         index: &VectorIndexRef,
-        accountant: &dyn MemoryBudget,
         owner: &mut VectorCopyAdmission,
     ) -> Result<Vec<VectorEntry>> {
         self.with_bulk_maintenance(|| {
@@ -12852,7 +12575,6 @@ impl VectorStore {
     pub fn deregister_table(
         &self,
         table: &str,
-        accountant: &dyn MemoryBudget,
         owner: &mut VectorCopyAdmission,
     ) -> Result<Vec<VectorEntry>> {
         let mut route_copy = owner.local_scratch();
@@ -12953,7 +12675,7 @@ impl VectorStore {
         new: &VectorIndexRef,
         owner: VectorCopyAdmission,
     ) -> Result<PreparedVectorIndexRename<'a>> {
-        self.prepare_index_rename_inner(old, new, None, None, owner)
+        self.prepare_index_rename_inner(old, new, None, owner)
     }
 
     /// Prepare the explicitly named destination removal and source rename as
@@ -12967,17 +12689,14 @@ impl VectorStore {
         old: &VectorIndexRef,
         new: &VectorIndexRef,
         replaced: &VectorIndexRef,
-        removal_accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: VectorCopyAdmission,
     ) -> Result<PreparedVectorIndexRename<'a>> {
-        let removal_accountant: crate::memory_budget::MemoryBudgetOwner = removal_accountant.into();
-
         if replaced != new || old == new {
             return Err(Error::Other(
                 "replacement must name the distinct rename destination".into(),
             ));
         }
-        self.prepare_index_rename_inner(old, new, Some(replaced), Some(removal_accountant), owner)
+        self.prepare_index_rename_inner(old, new, Some(replaced), owner)
     }
 
     #[expect(
@@ -12989,7 +12708,6 @@ impl VectorStore {
         old: &VectorIndexRef,
         new: &VectorIndexRef,
         replaced: Option<&VectorIndexRef>,
-        removal_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
         mut owner: VectorCopyAdmission,
     ) -> Result<PreparedVectorIndexRename<'a>> {
         self.registry.assert_not_renaming();
@@ -13148,7 +12866,6 @@ impl VectorStore {
             registry_directories,
             owner,
             displaced,
-            removal_accountant,
         })
     }
 
@@ -14210,14 +13927,6 @@ impl VectorStore {
         Ok(Some(selected))
     }
 
-    /// What the memory budget this store charges has free, if it has a limit.
-    pub(crate) fn memory_available_bytes(&self) -> Option<usize> {
-        self.memory_accountant
-            .read()
-            .as_ref()
-            .and_then(|accountant| accountant.available_bytes())
-    }
-
     #[doc(hidden)]
     #[expect(
         clippy::result_large_err,
@@ -14831,23 +14540,15 @@ impl VectorStore {
                     reservation.bytes -= header_bytes;
                     stored.vector.promote_to_shared();
                 }
-                let row_id = stored.row_id;
-                let entry_lsn = stored.lsn;
-                let live = stored.deleted_tx.is_none();
                 state.push_resident_body(stored);
                 drop(residency);
-                if live {
-                }
                 continue;
             }
             drop(residency);
             if state.is_durable() {
-                // The body and membership are durable with the row. Only the
-                // fresh graph tail takes the vector; the caller's per-insert
-                // body admission is returned because nothing retains it.
-                let row_id = insert.entry.row_id;
-                let entry_lsn = insert.entry.lsn;
-                let live = insert.entry.deleted_tx.is_none();
+                // The body and membership are durable with the row; the
+                // caller's per-insert body admission is returned because
+                // nothing retains it.
                 let bytes = crate::quantized::stored_vector_resident_bytes(
                     insert.entry.vector.len(),
                     state.quantization,
@@ -14855,8 +14556,6 @@ impl VectorStore {
                 drop(insert);
                 if let Some(accountant) = accountant {
                     accountant.release(bytes);
-                }
-                if live {
                 }
                 continue;
             }
@@ -14995,7 +14694,7 @@ impl VectorStore {
                 reservation.bytes -= bytes;
                 moved.vector.promote_to_shared();
             }
-            target.push_entry_with(moved, |stored| {
+            target.push_entry_with(moved, |_| {
                 column.note_move(
                     &row_move.source_partition_key,
                     &row_move.target_partition_key,
@@ -16366,7 +16065,6 @@ impl VectorStore {
         &self,
         row_ids: &HashSet<RowId>,
         indexes: &[VectorIndexRef],
-        accountant: &dyn MemoryBudget,
         owner: &mut VectorCopyAdmission,
     ) -> Result<usize> {
         let mut local_copy_admission = owner.local_scratch();
@@ -16481,7 +16179,6 @@ impl VectorStore {
     pub fn prune_row_ids(
         &self,
         row_ids: &HashSet<RowId>,
-        accountant: &dyn MemoryBudget,
         owner: &mut VectorCopyAdmission,
     ) -> Result<usize> {
         let mut local_copy_admission = owner.local_scratch();
@@ -18102,20 +17799,11 @@ impl VectorStore {
     /// reconciliation path.
     #[doc(hidden)]
     pub fn memory_ownership_snapshot_for_test(&self) -> VectorMemoryOwnershipSnapshot {
-        self.memory_ownership_snapshot(None)
-    }
-
-    #[doc(hidden)]
-    pub fn memory_ownership_snapshot_for_funder(
-        &self,
-        accountant: &dyn crate::memory_budget::MemoryBudget,
-    ) -> VectorMemoryOwnershipSnapshot {
-        self.memory_ownership_snapshot(Some(accountant))
+        self.memory_ownership_snapshot()
     }
 
     fn memory_ownership_snapshot(
         &self,
-        accountant: Option<&dyn crate::memory_budget::MemoryBudget>,
     ) -> VectorMemoryOwnershipSnapshot {
         let registry = self.registry.read();
         let components = Self::partition_vector_components(&registry);

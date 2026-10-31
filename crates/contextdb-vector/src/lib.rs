@@ -29,7 +29,7 @@ pub use store::{
     OwnedPartitionedVectorEntries, PartitionedVectorDelete, PartitionedVectorEntry,
     PartitionedVectorMove, PreparedLoadedVectorReplacement, PreparedPartitionedVectorBatch,
     PreparedVectorPolicyLayout, PreparedVectorPublication, PreparedVectorTablePublication,
-    PublishedVectorPolicyLayout, VectorIndexInfo, VectorIndexLayout, VectorIndexLayoutInfo,
+    VectorIndexInfo, VectorIndexLayout, VectorIndexLayoutInfo,
     VectorMaintenanceFailure, VectorMaintenanceFailureDetails, VectorMaintenanceReport, VectorMembershipProvenance, VectorPartitionInfo, VectorPartitionRef,
     VectorStore, VectorTeardownReceipt, VectorVersionIdentity,
 };
