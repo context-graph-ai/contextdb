@@ -4,8 +4,9 @@ use contextdb_engine::database::VectorSearchTraceObservation;
 use contextdb_engine::{
     Database, MaintenancePolicy, QueryResult, VectorSearchResidual, VectorSearchRoute,
 };
-use contextdb_vector::hnsw::{
-    HnswCandidateDistanceEvent, HnswCandidateObserver, with_hnsw_candidate_observer,
+use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
 };
 use contextdb_vector::mem::{
     NativeVectorScoreObserver, with_native_vector_score_observer_for_test,
@@ -58,9 +59,21 @@ const LIVE_ROWS_PER_PARTITION: usize = ROWS_PER_PARTITION / 2;
 
 struct Counter(AtomicU64);
 
-impl HnswCandidateObserver for Counter {
-    fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
-        self.0.fetch_add(1, Ordering::SeqCst);
+impl NativeIvfSealObserver for Counter {
+    fn observe(&self, event: NativeIvfSealEvent<'_>) {
+        if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
+            self.0.fetch_add(
+                work.centroid_evaluations
+                    + work.quantized_evaluations
+                    + work.full_precision_evaluations
+                    + work.buffer_evaluations,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn before_boundary(&self, _boundary: NativeIvfFaultBoundary<'_>) -> contextdb_core::Result<()> {
+        Ok(())
     }
 }
 
@@ -70,9 +83,15 @@ impl NativeVectorScoreObserver for Counter {
     }
 }
 
+fn used_indexed_route(debug: &VectorSearchTraceObservation) -> bool {
+    debug.partition_routes.iter().any(|route| {
+        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
+    })
+}
+
 struct ScoredQuery {
     result: QueryResult,
-    graph_scores: u64,
+    index_scores: u64,
     native_scores: u64,
     debug: VectorSearchTraceObservation,
 }
@@ -90,7 +109,7 @@ impl ScoredQuery {
         )
     )]
     fn total_scores(&self) -> u64 {
-        self.graph_scores.saturating_add(self.native_scores)
+        self.index_scores.saturating_add(self.native_scores)
     }
 }
 
@@ -99,10 +118,10 @@ fn execute_and_count_scoring(
     sql: &str,
     query: &HashMap<String, Value>,
 ) -> ScoredQuery {
-    let graph_scores = Arc::new(Counter(AtomicU64::new(0)));
+    let index_scores = Arc::new(Counter(AtomicU64::new(0)));
     let native_scores = Arc::new(Counter(AtomicU64::new(0)));
     db.__reset_last_query_vector_trace_for_test();
-    let result = with_hnsw_candidate_observer(graph_scores.clone(), || {
+    let result = with_native_ivf_seal_observer_for_test(index_scores.clone(), || {
         with_native_vector_score_observer_for_test(native_scores.clone(), || {
             db.execute(sql, query).unwrap()
         })
@@ -115,19 +134,19 @@ fn execute_and_count_scoring(
             .expect("read the admitted trace observation")
     }
     .expect("every vector query publishes its real route receipt");
-    let graph_scores = graph_scores.0.load(Ordering::SeqCst);
+    let index_scores = index_scores.0.load(Ordering::SeqCst);
     let native_scores = native_scores.0.load(Ordering::SeqCst);
     assert!(
-        !debug.used_hnsw || graph_scores > 0,
+        !used_indexed_route(&debug) || index_scores > 0,
         "a graph route must expose its actual graph distance work"
     );
     assert!(
-        debug.used_hnsw || native_scores > 0,
+        used_indexed_route(&debug) || native_scores > 0,
         "an exact route must expose its actual native-vector score work"
     );
     ScoredQuery {
         result,
-        graph_scores,
+        index_scores,
         native_scores,
         debug,
     }
@@ -161,9 +180,9 @@ fn native_score_observer_counts_each_exact_comparison_once() {
         "SELECT id FROM observer_control ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 3",
         &HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0]))]),
     );
-    assert!(!observed.debug.used_hnsw);
+    assert!(!used_indexed_route(&observed.debug));
     assert_eq!(observed.result.rows().len(), 3);
-    assert_eq!(observed.graph_scores, 0);
+    assert_eq!(observed.index_scores, 0);
     assert_eq!(
         observed.native_scores, 3,
         "the native observer records one score for each exact comparison without double-counting"
@@ -387,9 +406,8 @@ fn fixture() -> Database {
         .unwrap();
     }
     for _ in 0..64 {
-        db.run_maintenance_cycle().unwrap();
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == PARTITIONS && status.remaining_partitions == 0 {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        if report.ready_partitions == PARTITIONS && report.remaining_partitions == 0 {
             return db;
         }
     }
@@ -444,9 +462,8 @@ fn single_context_fixture() -> Database {
         .unwrap();
     }
     for _ in 0..64 {
-        db.run_maintenance_cycle().unwrap();
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == 1 && status.remaining_partitions == 0 {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        if report.ready_partitions == 1 && report.remaining_partitions == 0 {
             return db;
         }
     }
@@ -496,7 +513,11 @@ fn assert_scoped_trace(result: &QueryResult, partitions: usize) -> bool {
     disclosure
         .partitions
         .iter()
-        .any(|partition| ROWS_PER_PARTITION > partition.hnsw_ef_search)
+        .any(|partition| {
+            partition
+                .probes
+                .is_none_or(|probes| ROWS_PER_PARTITION > probes as usize)
+        })
 }
 
 #[cfg_attr(
@@ -778,7 +799,7 @@ fn run_cell(db: &Database, partitions: usize, mode: &'static str) -> CellRun {
             u64::try_from(partitions * LIVE_ROWS_PER_PARTITION).unwrap(),
             "EXACT scores every current vector in this search cell exactly once"
         );
-        assert_eq!(exact.graph_scores, 0);
+        assert_eq!(exact.index_scores, 0);
         if assert_scoped_trace(&searched.result, partitions) {
             strict_required_queries += 1;
         }
@@ -797,11 +818,11 @@ fn run_cell(db: &Database, partitions: usize, mode: &'static str) -> CellRun {
                 "a scope below AUTO_INDEX_AT is compared exactly"
             );
             assert_eq!(
-                searched.graph_scores, 0,
+                searched.index_scores, 0,
                 "a scope below AUTO_INDEX_AT does no graph work"
             );
         }
-        if searched.debug.used_hnsw {
+        if used_indexed_route(&searched.debug) {
             run.graph_queries += 1;
             assert!(
                 matches!(
@@ -932,85 +953,6 @@ fn forced_indexed_multi_context_cells_meet_the_graph_bar() {
 
 #[cfg(feature = "nightly-tests")]
 #[test]
-fn declared_flat_multi_context_cells_are_never_slower_than_exact() {
-    // INDEXED's maintained flat route (BEHAVIOR CHANGE "INDEXED maintained
-    // flat route"; the user promise: the index is never slower than checking
-    // every passage). The frozen scopes and held-out queries, with FLAT_BELOW
-    // declared on the column after the frozen build, so the fixture data are
-    // untouched. Each partition's route is expected from that declaration and
-    // the frozen live count, not from what the search reports: 1,250 live
-    // rows per partition < 1,251, so every partition is flat. An all-flat
-    // INDEXED scope does EXACT's work, keeps every query at 10/10, and its
-    // p95 latency is at most EXACT's, paired and interleaved, planning
-    // included -- the AUTO all-exact noise allowance does not apply to it.
-    const FLAT_BELOW: usize = ROWS_PER_PARTITION + 1;
-    let db = fixture();
-    db.execute(
-        &format!("ALTER TABLE indexed_vectors ALTER COLUMN embedding SET FLAT_BELOW {FLAT_BELOW}"),
-        &HashMap::new(),
-    )
-    .expect("declare FLAT_BELOW on the frozen column");
-    let mut misses = Vec::new();
-    for partitions in [3_usize, 8] {
-        let expected_flat = ROWS_PER_PARTITION < FLAT_BELOW;
-        assert!(
-            expected_flat,
-            "the declared threshold covers every frozen partition"
-        );
-        let (sql, mut params) = scoped_statement(partitions, "INDEXED");
-        set_probe(&mut params, 0);
-        let routes: Vec<_> = db
-            .execute(&sql, &params)
-            .expect("the declared flat INDEXED search executes")
-            .trace()
-            .vector_search
-            .as_ref()
-            .expect("the executed search reports its route")
-            .partitions
-            .iter()
-            .map(|partition| (partition.route.clone(), partition.reason.clone()))
-            .collect();
-        assert_eq!(
-            routes,
-            vec![
-                (
-                    Some(VectorSearchRoute::Exact),
-                    Some(contextdb_vector::mem::PARTITION_BELOW_FLAT_THRESHOLD_REASON.to_owned())
-                );
-                partitions
-            ],
-            "every frozen partition is served by its maintained flat route"
-        );
-        let run = run_cell(&db, partitions, "INDEXED");
-        if run.graph_queries != 0 {
-            misses.push(format!("{partitions}-pair flat INDEXED walked a graph"));
-        }
-        if run.mode_work != run.exact_work {
-            misses.push(format!(
-                "{partitions}-pair flat INDEXED work differs from EXACT's ({} vs {})",
-                run.mode_total(),
-                run.exact_total()
-            ));
-        }
-        if !run.low_recall.is_empty() {
-            misses.push(format!(
-                "{partitions}-pair flat INDEXED recall below 10/10: {:?}",
-                run.low_recall
-            ));
-        }
-        if run.mode_p95() > run.exact_p95() {
-            misses.push(format!(
-                "{partitions}-pair flat INDEXED p95 latency above EXACT ({}us > {}us)",
-                run.mode_p95(),
-                run.exact_p95()
-            ));
-        }
-    }
-    assert!(misses.is_empty(), "{misses:#?}");
-}
-
-#[cfg(feature = "nightly-tests")]
-#[test]
 fn single_context_saved_graph_auto_and_indexed_are_faster_than_exact() {
     // The mandatory 10,000-row single-Context bar, per graph mode: strictly
     // less MEAN distance work than EXACT, a strictly lower p95 latency than
@@ -1040,21 +982,21 @@ fn single_context_saved_graph_auto_and_indexed_are_faster_than_exact() {
     let mut auto_matched = 0_u64;
     let mut indexed_matched = 0_u64;
     let mut low_recall = Vec::new();
-    let mut observed_graph_scores = 0_u64;
+    let mut observed_index_scores = 0_u64;
     for probe in 0..maintained_search::HELD_OUT_ROWS {
         set_probe(&mut params, probe);
         let auto = execute_and_count_scoring(&single, &auto_sql, &params);
         let indexed = execute_and_count_scoring(&single, &indexed_sql, &params);
         let exact = execute_and_count_scoring(&single, &exact_sql, &params);
         assert_eq!(exact.native_scores, maintained_search::CORPUS_ROWS as u64);
-        assert_eq!(exact.graph_scores, 0);
+        assert_eq!(exact.index_scores, 0);
         for (label, observed) in [("AUTO", &auto), ("INDEXED", &indexed)] {
             assert!(
-                observed.debug.used_hnsw,
+                used_indexed_route(&observed.debug),
                 "{label} must use the 10,000-row graph"
             );
             assert!(
-                observed.graph_scores > 0,
+                observed.index_scores > 0,
                 "{label}'s graph observer is a positive control"
             );
             let query_matched = overlap_at_ten(&observed.result, &exact.result);
@@ -1067,9 +1009,9 @@ fn single_context_saved_graph_auto_and_indexed_are_faster_than_exact() {
         auto_work.push(auto.total_scores());
         indexed_work.push(indexed.total_scores());
         exact_work.push(exact.total_scores());
-        observed_graph_scores = observed_graph_scores
-            .saturating_add(auto.graph_scores)
-            .saturating_add(indexed.graph_scores);
+        observed_index_scores = observed_index_scores
+            .saturating_add(auto.index_scores)
+            .saturating_add(indexed.index_scores);
     }
     const AUTO: usize = 0;
     const INDEXED: usize = 1;
@@ -1123,7 +1065,7 @@ fn single_context_saved_graph_auto_and_indexed_are_faster_than_exact() {
         }
     }
     println!(
-        "wall_search_indexed single_rows={} probes={} auto_matched={auto_matched} indexed_matched={indexed_matched} graph_scores={observed_graph_scores} low_recall={low_recall:?}",
+        "wall_search_indexed single_rows={} probes={} auto_matched={auto_matched} indexed_matched={indexed_matched} index_scores={observed_index_scores} low_recall={low_recall:?}",
         maintained_search::CORPUS_ROWS,
         maintained_search::HELD_OUT_ROWS,
     );
@@ -1133,6 +1075,6 @@ fn single_context_saved_graph_auto_and_indexed_are_faster_than_exact() {
         low_recall.is_empty(),
         "every query keeps recall@10 of at least .95 in the mandatory 10,000-row cell; (mode, probe, matched/10): {low_recall:?}"
     );
-    assert!(observed_graph_scores > 0);
+    assert!(observed_index_scores > 0);
     assert!(misses.is_empty(), "{misses:#?}");
 }

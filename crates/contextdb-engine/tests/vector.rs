@@ -60,16 +60,12 @@ mod maintained_search;
 mod multi_partition_union_recovers_nearest_rows;
 #[path = "vector/named_vector_planner_tests.rs"]
 mod named_vector_planner_tests;
-#[path = "vector/one_search_covers_every_layer_on_both_routes.rs"]
-mod one_search_covers_every_layer_on_both_routes;
 #[path = "vector/passive_explain_predicts_the_executed_auto_route.rs"]
 mod passive_explain_predicts_the_executed_auto_route;
 #[path = "vector/public_row_apis_honor_quantized_columns.rs"]
 mod public_row_apis_honor_quantized_columns;
 #[path = "vector/quantized_vector_read_agreement.rs"]
 mod quantized_vector_read_agreement;
-#[path = "vector/restamped_group_rescoring_stays_inside_the_breadth_allowance.rs"]
-mod restamped_group_rescoring_stays_inside_the_breadth_allowance;
 #[path = "vector/retained_indexed_rows.rs"]
 mod retained_indexed_rows;
 #[path = "fixtures/retained_query_rows.rs"]
@@ -154,12 +150,6 @@ mod vector_snapshot_frontier_completeness_contract;
 mod vector_tail_transaction_contract;
 #[path = "vector/vector_transaction_filter_snapshot_truth_contract.rs"]
 mod vector_transaction_filter_snapshot_truth_contract;
-#[path = "vector/what_a_declared_search_breadth_buys.rs"]
-mod what_a_declared_search_breadth_buys;
-#[path = "vector/what_the_approved_budget_does_to_one_large_context.rs"]
-mod what_the_approved_budget_does_to_one_large_context;
-#[path = "vector/where_one_partition_spends_its_find.rs"]
-mod where_one_partition_spends_its_find;
 #[path = "vector/writer_residency_attribution.rs"]
 mod writer_residency_attribution;
 

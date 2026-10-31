@@ -943,9 +943,10 @@ fn embedded_graph_scratch_obeys_memory_admission_and_returns_its_charge() {
 
 #[test]
 fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_passes() {
-    use contextdb_vector::hnsw::{
-        HnswCandidateDistanceEvent, HnswCandidateObserver, with_hnsw_candidate_observer,
-    };
+    use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
+};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -1062,7 +1063,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                 .passive_activity_counters_for_test();
             let distances = Arc::new(Distances::default());
             db.__reset_last_query_vector_trace_for_test();
-            let ordinary = with_hnsw_candidate_observer(distances.clone(), || {
+            let ordinary = with_native_ivf_seal_observer_for_test(distances.clone(), || {
                 db.execute(&sql, &parameters(&query)).unwrap()
             });
             assert_eq!(

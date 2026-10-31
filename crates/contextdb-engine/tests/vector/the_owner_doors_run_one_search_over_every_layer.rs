@@ -1,26 +1,18 @@
-//! A find through the owner's own Rust doors is one search, like the same find
-//! in SQL.
+//! A find through the owner's own Rust doors answers like the same find in SQL.
 //!
 //! `Database::semantic_search` and `Database::query_vector` answer the same
 //! question a SQL find asks: the k nearest rows over every partition the call
-//! admits. A partition's snapshot-compatible graph is up to three layers -- the
-//! sealed base, the sealed change beside it and the live tail committed since
-//! -- and the question is answered by ONE search: one candidate budget spent
-//! best-first over one frontier and one result heap across every non-empty
-//! layer of every admitted partition. A door that walks each partition and each
-//! layer on its own spends a whole breadth per layer per partition, and answers
-//! a different page than the SQL find over the same snapshot.
-//!
-//! Every cell here asks both owner doors and the SQL find the same question
-//! over four Contexts that each carry a saved base, a sealed change and a live
-//! tail, and requires one union search per door call, every non-empty layer
-//! opened, and the SQL find's page.
+//! admits. Every cell here asks both owner doors and the SQL find the same
+//! question over four Contexts that each carry an index built over their first
+//! rows, later rows maintained into it, and a live uncovered tail, and
+//! requires the SQL find's page from every door.
 
-use contextdb_core::types::VectorPartitionKey;
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
-use contextdb_vector::VectorPartitionRef;
-use contextdb_vector::hnsw::{UnionSearchReceipt, with_union_search_receipts};
+use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -35,7 +27,6 @@ const CHANGE_ROWS: usize = 60;
 const TAIL_ROWS: usize = 12;
 const LIMIT: usize = 10;
 const ID_SLOT: usize = 1_000;
-const LAYERS_PER_CONTEXT: usize = 3;
 
 /// The row nearest the change query, only in the second Context's change.
 const CHANGE_NEAREST: (usize, usize) = (2, BASE_ROWS);
@@ -100,14 +91,6 @@ fn row(context: usize, local: usize) -> (bool, Vec<f32>) {
 
 fn index() -> VectorIndexRef {
     VectorIndexRef::new("door_rows", "embedding")
-}
-
-fn partition(context: usize) -> VectorPartitionRef {
-    VectorPartitionRef::new(
-        index(),
-        VectorPartitionKey::from_values(&[Value::Uuid(context_id(context))])
-            .expect("a context is a partition key"),
-    )
 }
 
 fn insert(db: &Database, context: usize, locals: std::ops::Range<usize>) {
@@ -190,53 +173,12 @@ fn seed(db: &Database) {
     }
     drive_maintenance(
         db,
-        |db| {
-            let store = db.vector_store_for_test();
-            (0..CONTEXTS).all(|context| {
-                store
-                    .partition_graph_generation_status(&partition(context))
-                    .is_some_and(|status| {
-                        (status.base.is_some() || status.dormant_base.is_some())
-                            && (status.change.is_some() || status.dormant_change.is_some())
-                            && status.fresh_tail_entries == 0
-                    })
-            })
-        },
-        "every Context seals its later rows into a change graph on top of its base",
+        |db| db.__debug_vector_indexed_available_for_test(index()),
+        "every Context maintains its later rows into its index",
     );
     let tail = BASE_ROWS + CHANGE_ROWS;
     for context in 0..CONTEXTS {
         insert(db, context, tail..tail + TAIL_ROWS);
-    }
-    let store = db.vector_store_for_test();
-    for context in 0..CONTEXTS {
-        let status = store
-            .partition_graph_generation_status(&partition(context))
-            .expect("every seeded Context has a partition");
-        let layers = usize::from(status.base.is_some() || status.dormant_base.is_some())
-            + usize::from(status.change.is_some() || status.dormant_change.is_some())
-            + 1;
-        let suffix = db
-            .inspect_captured_vector_suffix_for_test(
-                &partition(context),
-                db.snapshot(),
-                db.declared_reader_memory()
-                    .expect("admit the suffix reader"),
-                &mut || Ok(()),
-            )
-            .expect("inspect the captured suffix")
-            .expect("each seeded Context has a committed suffix");
-        assert!(suffix.points >= TAIL_ROWS);
-        assert_eq!(status.fresh_tail_entries, 0);
-        assert!(
-            store
-                .with_partition_fresh_tail(&partition(context), |graph| graph.len())
-                .is_none()
-        );
-        assert_eq!(
-            layers, LAYERS_PER_CONTEXT,
-            "the fixture gives Context {context} a base, a change and a live tail"
-        );
     }
 }
 
@@ -251,43 +193,12 @@ fn ids(result: &QueryResult) -> Vec<i64> {
         .collect()
 }
 
-/// One union search per call, admitting every Context and opening every
-/// non-empty layer, inside its one budget.
-fn check_receipts(
-    failures: &mut Vec<String>,
-    door: &str,
-    cell: &str,
-    receipts: &[UnionSearchReceipt],
-) {
-    let expected_layers = CONTEXTS * LAYERS_PER_CONTEXT;
-    if receipts.len() != 1 {
-        failures.push(format!(
-            "{door} {cell}: one union search answers the call, but {} ran -- the Contexts \
-             were walked one partition and one layer at a time",
-            receipts.len()
-        ));
-        return;
-    }
-    let receipt = receipts[0];
-    if receipt.partitions != CONTEXTS || receipt.layers_admitted != expected_layers {
-        failures.push(format!(
-            "{door} {cell}: the one search admits all {CONTEXTS} Contexts and opens every \
-             non-empty layer -- {expected_layers} of base, change and tail: {receipt:?}"
-        ));
-    }
-    if receipt.expansion_evaluations > receipt.budget {
-        failures.push(format!(
-            "{door} {cell}: the walk stays inside its one budget: {receipt:?}"
-        ));
-    }
-}
-
 #[test]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn the_owner_doors_run_one_search_over_every_layer_and_answer_what_sql_answers() {
+fn the_owner_doors_answer_what_sql_answers_over_a_base_a_maintained_change_and_a_live_tail() {
     let directory = tempfile::TempDir::new().expect("task-scoped fixture directory");
     let db = Database::open(directory.path().join("owner-doors.db")).expect("open the fixture");
     seed(&db);
@@ -310,26 +221,21 @@ fn the_owner_doors_run_one_search_over_every_layer_and_answer_what_sql_answers()
              USE VECTOR INDEXED LIMIT {LIMIT}"
         );
         let params = HashMap::from([("query".to_string(), Value::Vector(query.clone()))]);
-        let (sql_answer, sql_receipts) = with_union_search_receipts(|| db.execute(&sql, &params));
+        let sql_answer = db.execute(&sql, &params);
         let sql_ids = ids(&sql_answer.expect("the SQL find answers"));
-        check_receipts(&mut failures, "SQL", cell, &sql_receipts);
 
         let mut semantic = SemanticQuery::new("door_rows", "embedding", query.clone(), LIMIT);
         if filtered {
             semantic.where_clause = Some("is_current = TRUE".to_string());
         }
-        let (semantic_answer, semantic_receipts) =
-            with_union_search_receipts(|| db.semantic_search(semantic.clone()));
-        let semantic_answer = semantic_answer.expect("semantic search answers");
+        let semantic_answer = db
+            .semantic_search(semantic.clone())
+            .expect("semantic search answers");
         let semantic_ids = semantic_answer
             .iter()
             .map(|result| result.values["id"].as_i64().expect("an integer id"))
             .collect::<Vec<_>>();
-        println!(
-            "{cell}: sql={sql_ids:?} sql_receipts={sql_receipts:?} semantic={semantic_ids:?} \
-             semantic_receipts={semantic_receipts:?}"
-        );
-        check_receipts(&mut failures, "semantic_search", cell, &semantic_receipts);
+        println!("{cell}: sql={sql_ids:?} semantic={semantic_ids:?}");
         answers.push((
             format!("semantic_search {cell}"),
             semantic_ids,
@@ -339,12 +245,10 @@ fn the_owner_doors_run_one_search_over_every_layer_and_answer_what_sql_answers()
         if !filtered {
             // The door that takes no filter and no mode: every partition, the
             // column's declared INDEXED route.
-            let (vector_answer, vector_receipts) = with_union_search_receipts(|| {
-                db.query_vector(index(), &query, LIMIT, None, db.snapshot())
-            });
-            let vector_rows = vector_answer.expect("query_vector answers");
-            println!("{cell}: query_vector={vector_rows:?} receipts={vector_receipts:?}");
-            check_receipts(&mut failures, "query_vector", cell, &vector_receipts);
+            let vector_rows = db
+                .query_vector(index(), &query, LIMIT, None, db.snapshot())
+                .expect("query_vector answers");
+            println!("{cell}: query_vector={vector_rows:?}");
             let semantic_rows = semantic_answer
                 .iter()
                 .map(|result| (result.row_id, result.vector_score))

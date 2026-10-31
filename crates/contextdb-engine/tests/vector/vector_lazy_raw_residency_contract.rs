@@ -321,9 +321,10 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
-    use contextdb_vector::hnsw::{
-        PagedVectorObserver, PagedVectorStorageWork, with_paged_vector_observer,
-    };
+    use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
+};
     use contextdb_vector::mem::{
         NativeVectorScoreEvent, NativeVectorScoreObserver,
         with_native_vector_score_observer_for_test,
