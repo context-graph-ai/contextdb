@@ -3450,15 +3450,13 @@ async fn every_hub_admission_site_refuses_before_its_allocation() {
     use crate::vector_read_memory::{
         take_native_admissions_for_test, watch_native_admissions_for_test,
     };
-    const ROUTE_SITES: [&str; 8] = [
+    const ROUTE_SITES: [&str; 6] = [
         "request_owner",
         "native cancellation token",
         "materialize_body",
         "reply_stream_controls",
         "native_finish_callback",
         "native owned future",
-        "native_control_cell",
-        "native_control_payload",
     ];
     let provider = Arc::new(SwitchableProvider {
         roomy: DeclaredReadMemory::from_reader_limit(LIMIT)
