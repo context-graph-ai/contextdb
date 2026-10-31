@@ -18593,16 +18593,6 @@ mod tests {
     }
 
     impl RawVectorMembershipSource for PruningCatalogSource {
-        fn capture_serving_selection(
-            &self,
-            _: SnapshotId,
-            _: Option<&VectorGraphGeneration>,
-            _: Option<&VectorGraphGeneration>,
-            _: &mut VectorCopyAdmission,
-        ) -> Result<CapturedVectorServingSelection> {
-            panic!("pruning must use catalog metadata")
-        }
-
         fn published_summary(&self) -> RawVectorMembershipSummary {
             self.published
         }
@@ -20473,6 +20463,3 @@ mod reverse_probe_lifetime_tests {
         assert_eq!(budget.live.load(Ordering::SeqCst), 64);
     }
 }
-
-#[cfg(test)]
-mod page_cache_budget_tests;

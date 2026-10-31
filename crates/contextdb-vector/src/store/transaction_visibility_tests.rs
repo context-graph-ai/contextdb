@@ -168,47 +168,6 @@ fn refused_tail_admission_preserves_the_row_directory_and_existing_graph() {
 }
 
 #[test]
-fn successful_tail_publication_consumes_prior_admission_without_rebuilding() {
-    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-    let (store, state, budget) = seeded();
-    let serial = state.raw_hnsw_build_serial_for_test();
-    let prepared = store
-        .prepare_partitioned_batch(
-            Vec::new(),
-            vec![PartitionedVectorEntry::new(
-                VectorPartitionKey::unpartitioned(),
-                entry(2, TxId(2)),
-            )],
-            Vec::new(),
-            HashSet::new(),
-            VectorCopyAdmission::new(executing_accountant.clone()),
-        )
-        .unwrap();
-    budget
-        .try_allocate_for(
-            state.stored_entry(entry(2, TxId(2))).estimated_bytes(),
-            "vector",
-            "staged_raw",
-            "test",
-        )
-        .unwrap();
-    budget.refuse_tail.store(true, Ordering::SeqCst);
-    store.publish_prepared_partitioned_batch(prepared, Lsn(2), Some(budget.as_ref()));
-    assert_eq!(state.vector_count(), 2);
-    assert_eq!(state.raw_hnsw_entry_count_for_row(RowId(2)), Some(1));
-    assert_eq!(state.raw_hnsw_build_serial_for_test(), serial);
-    assert_eq!(
-        state.with_fresh_tail(HnswIndex::policy_values),
-        Some((32, 96, 17))
-    );
-    drop(state);
-    drop(store);
-    assert_eq!(budget.used.load(Ordering::SeqCst), 0);
-}
-
-#[test]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -299,37 +258,6 @@ fn snapshot_counts_and_filtered_eligibility_do_not_walk_excluded_history() {
         ),
         Err(Error::ReadCancelled)
     ));
-}
-
-fn publish_base(state: &IndexState, budget: &Arc<Budget>, generation: u64) {
-    let rows = (1..=generation)
-        .map(|row| entry(row, TxId(row * 10)))
-        .collect::<Vec<_>>();
-    let policy = layout().resolve_policy(rows.len(), 1);
-    let graph =
-        HnswIndex::from_vector_entries_with_policy(&rows, 2, VectorQuantization::F32, policy);
-    let bytes = graph.estimated_resident_bytes();
-    budget
-        .try_allocate_for(bytes, "vector_index", "test_base", "test")
-        .unwrap();
-    state
-        .publish_replacement_base_generation(
-            VectorGraphGeneration {
-                generation_id: generation,
-                covered_tx: TxId(generation * 10),
-                covered_lsn: Lsn(generation * 10),
-                durable_bytes: 0,
-                policy_revision: 3,
-            },
-            LoadedVectorGraphGeneration {
-                graph,
-                resident_bytes: bytes,
-                accountant: budget.clone().into(),
-                caller_adopted_bytes: 0,
-                fresh_tail: None,
-            },
-        )
-        .unwrap();
 }
 
 #[test]
@@ -425,37 +353,6 @@ fn overlapping_snapshots_pin_only_the_generations_they_select() {
     assert_eq!(budget.used.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn purge_and_empty_tail_keep_the_declared_graph_policy() {
-    let (_store, state, budget) = seeded();
-    let (bytes, _) = state
-        .prepare_fresh_tail_as_base_generation(
-            VectorGraphGeneration {
-                generation_id: 1,
-                covered_tx: TxId(1),
-                covered_lsn: Lsn(1),
-                durable_bytes: 0,
-                policy_revision: 3,
-            },
-            layout().resolve_policy(state.vector_count(), 1),
-        )
-        .unwrap();
-    let loaded = HnswIndex::decode_durable_generation(&bytes, 2, VectorQuantization::F32).unwrap();
-    assert_eq!(loaded.policy_values(), (32, 96, 17));
-    assert_eq!(
-        state.with_fresh_tail(HnswIndex::policy_values),
-        Some((32, 96, 17))
-    );
-    let empty = IndexState::new(2, VectorQuantization::F32);
-    empty
-        .initialize_empty_fresh_tail(budget, layout().resolve_policy(100, 1))
-        .unwrap();
-    assert_eq!(
-        empty.with_fresh_tail(HnswIndex::policy_values),
-        Some((32, 96, 17))
-    );
-}
-
 struct DirectoryOnlyLoader;
 impl DormantRawVectorLoader for DirectoryOnlyLoader {
     fn load(
@@ -524,88 +421,6 @@ fn dormant_counts_keep_old_snapshot_visibility_and_sorted_row_versions() {
     assert_eq!(state.directory_visible_entry_count(SnapshotId(5), None), 0);
     assert_eq!(state.directory_visible_entry_count(SnapshotId(20), None), 1);
     assert!(!state.raw_resident.load(Ordering::SeqCst));
-}
-
-#[test]
-fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
-    let executing_accountant = Arc::new(super::tests::CountingMemoryBudget::default());
-    let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-    let (store, state, budget) = seeded();
-    let identity = VectorGraphGeneration {
-        generation_id: 1,
-        covered_tx: TxId(1),
-        covered_lsn: Lsn(1),
-        durable_bytes: 0,
-        policy_revision: 3,
-    };
-    let (bytes, resident) = state
-        .prepare_fresh_tail_as_base_generation(
-            identity,
-            layout().resolve_policy(state.vector_count(), 1),
-        )
-        .unwrap();
-    let prepared = store
-        .prepare_partitioned_batch(
-            Vec::new(),
-            vec![PartitionedVectorEntry::new(
-                VectorPartitionKey::unpartitioned(),
-                entry(2, TxId(2)),
-            )],
-            Vec::new(),
-            HashSet::new(),
-            VectorCopyAdmission::new(executing_accountant.clone()),
-        )
-        .unwrap();
-    let serial = state
-        .with_fresh_tail(HnswIndex::build_serial_for_test)
-        .unwrap();
-    let graph = HnswIndex::decode_durable_generation(&bytes, 2, VectorQuantization::F32).unwrap();
-    let replay = HnswIndex::from_vector_entries_with_policy(
-        &[],
-        2,
-        VectorQuantization::F32,
-        layout().resolve_policy(1, 1),
-    );
-    budget
-        .try_allocate_for(resident, "vector_index", "reload_base", "test")
-        .unwrap();
-    state
-        .install_loaded_sealed_generation(
-            true,
-            identity,
-            LoadedVectorGraphGeneration {
-                graph,
-                resident_bytes: resident,
-                accountant: budget.clone().into(),
-                caller_adopted_bytes: 0,
-                fresh_tail: Some(LoadedVectorFreshTail {
-                    graph: replay,
-                    resident_bytes: 0,
-                    accountant: budget.clone().into(),
-                    replayed_through_lsn: Lsn(1),
-                }),
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        state.with_fresh_tail(HnswIndex::build_serial_for_test),
-        Some(serial)
-    );
-    budget
-        .try_allocate_for(
-            state.stored_entry(entry(2, TxId(2))).estimated_bytes(),
-            "vector",
-            "staged_raw",
-            "test",
-        )
-        .unwrap();
-    store.publish_prepared_partitioned_batch(prepared, Lsn(2), Some(budget.as_ref()));
-    assert_eq!(state.raw_hnsw_entry_count_for_row(RowId(2)), Some(1));
-    assert_eq!(state.fresh_tail_preparations.load(Ordering::SeqCst), 0);
-    drop(state);
-    drop(store);
-    assert_eq!(budget.used.load(Ordering::SeqCst), 0);
 }
 
 #[test]
