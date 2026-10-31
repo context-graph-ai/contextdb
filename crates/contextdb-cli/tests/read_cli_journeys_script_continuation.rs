@@ -14,16 +14,15 @@ use read_cli_support::*;
 
 fn vector_insert_refusal_limit(extra_table: bool) -> usize {
     use contextdb_engine::memory_accounting::{
-        MemoryAccountant, take_budget_ledger_for_test, watch_budget_ledger_for_test,
+        take_budget_ledger_for_test, watch_budget_ledger_for_test,
     };
     let root = tempfile::tempdir().expect("task-scoped owner profile");
-    let accountant = std::sync::Arc::new(MemoryAccountant::no_limit());
-    let db = contextdb_engine::Database::open_with_config(
-        root.path().join("profile.db"),
-        std::sync::Arc::new(contextdb_engine::plugin::CorePlugin),
-        accountant,
-    )
-    .unwrap();
+    // The production writer door: the same native writer budget the CLI opens
+    // with, not a host accountant handed to the legacy constructor. The tables
+    // exist before the ledger watches, exactly as the script below declares the
+    // budget only after its CREATE statements: the schema's own transient
+    // encoding is far larger than the vector owner and is not what is measured.
+    let db = contextdb_engine::Database::open(root.path().join("profile.db")).unwrap();
     db.execute(
         "CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048))",
         &std::collections::HashMap::new(),
@@ -91,8 +90,8 @@ fn a_memory_refusal_is_followed_by_independent_work_and_recovery() {
     let limit = vector_insert_refusal_limit(false);
     let limit_kib = limit / 1024;
     let script = format!(
-        "SET MEMORY_LIMIT '{limit_kib}K';\n\
-         CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
+        "CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
+         SET MEMORY_LIMIT '{limit_kib}K';\n\
          INSERT INTO audio_clips (id, vector_audio) VALUES \
          ('11111111-1111-1111-1111-111111111111', [{vec_body}]);\n\
          SELECT 1 + 1;\n\
@@ -309,9 +308,9 @@ fn a_refusal_is_distinguishable_from_a_successful_empty_result() {
     let limit = vector_insert_refusal_limit(true);
     let limit_kib = limit / 1024;
     let script = format!(
-        "SET MEMORY_LIMIT '{limit_kib}K';\n\
-         CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
+        "CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
          CREATE TABLE empty_t (id UUID PRIMARY KEY);\n\
+         SET MEMORY_LIMIT '{limit_kib}K';\n\
          SELECT * FROM empty_t;\n\
          INSERT INTO audio_clips (id, vector_audio) VALUES \
          ('11111111-1111-1111-1111-111111111111', [{vec_body}]);\n"
