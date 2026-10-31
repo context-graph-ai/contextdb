@@ -5,7 +5,7 @@ pub use membership::{
     LazyRawVectorMembershipSource, RawVectorInspectionSnapshot, RawVectorMembershipCursor,
     RawVectorMembershipFactory, RawVectorMembershipSelection, RawVectorMembershipSource,
     RawVectorMembershipSummary, RawVectorReverseMembershipCursor, RawVectorReverseMembershipSource,
-    RawVectorSuffixChange,
+    RawVectorSuffixChange, canonical_source_key,
 };
 
 use crate::hnsw::ServingPages;

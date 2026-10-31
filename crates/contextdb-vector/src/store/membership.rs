@@ -7,6 +7,21 @@ use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorIndexRef, VectorPartitionKey,
 };
 
+/// Canonical fixed-width ordering of a durable source index. Engines build
+/// the ordered source index of a partition using this exact key.
+pub fn canonical_source_key(row: RowId, lsn: Lsn, created: TxId) -> Vec<u8> {
+    let mut x = row.0 ^ lsn.0 ^ created.0;
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    let mut key = Vec::with_capacity(32);
+    for component in [lsn.0, created.0, x, row.0] {
+        key.extend_from_slice(&component.to_be_bytes());
+    }
+    key
+}
+
 /// Catalog counts maintained atomically with membership publication. These
 /// describe the current published frontier, not a reconstructed history map.
 #[doc(hidden)]

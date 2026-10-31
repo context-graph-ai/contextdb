@@ -1,7 +1,7 @@
 //! Transaction-coupled membership summaries and ordered source/reverse indexes.
 //! These indexes retain only durable metadata; readers borrow one record window.
 use super::*;
-use contextdb_vector::hnsw::paged_builder::canonical_source_key;
+use contextdb_vector::store::canonical_source_key;
 
 pub(super) const SOURCE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_membership_source_pages");
