@@ -801,7 +801,10 @@ fn open_counting_page_read_attempts(
             .expect("open the ordinary read session")
         },
     );
-    (attempts.0.load(std::sync::atomic::Ordering::SeqCst), session)
+    (
+        attempts.0.load(std::sync::atomic::Ordering::SeqCst),
+        session,
+    )
 }
 
 #[test]
@@ -939,7 +942,8 @@ fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_rou
     }
     // The page-read observer wraps only the ordinary session open: the CLI
     // subprocess above is a different process and cannot be observed from here.
-    let (control_open_page_reads, control_session) = open_counting_page_read_attempts(&control_store.path);
+    let (control_open_page_reads, control_session) =
+        open_counting_page_read_attempts(&control_store.path);
     let (image_open_page_reads, image_session) =
         open_counting_page_read_attempts(std::path::Path::new(store.path_str()));
     assert_eq!(
