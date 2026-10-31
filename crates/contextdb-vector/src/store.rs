@@ -8,15 +8,10 @@ pub use membership::{
     RawVectorSuffixChange, canonical_source_key,
 };
 
-use crate::hnsw::ServingPages;
-use crate::hnsw::paged_builder::{
-    PagedBuilderProgress, PagedGenerationBuilder, PagedGenerationPersistence, PagedVectorBatchPlan,
-    PagedVectorPhase, PagedVectorProgress, PagedVectorTail,
-};
 use crate::memory_budget::{
     MemoryBudget, ScopedVectorCopy, VectorCopyAdmission, VectorWorkspaceReservation,
 };
-use crate::{HnswIndex, quantized::StoredVectorEntry};
+use crate::quantized::StoredVectorEntry;
 use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorEntry, VectorIndexRef, VectorPartitionKey,
     VectorQuantization, VectorSearchMode,
@@ -26,11 +21,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-
-enum ServingPageGiveBackEvent {
-    Short,
-    Freed(usize),
-}
 
 // unpartitioned_vector_membership_pages_reload_at_constant_residency observes private directory owners.
 #[cfg(feature = "test-seams")]
@@ -50,14 +40,6 @@ type PartitionKeySet =
 
 type VectorCopyAdmissionCallback<'a> =
     &'a mut (dyn FnMut(&mut VectorCopyAdmission, usize, &str, &str, &str) -> Result<()> + 'a);
-
-type SnapshotCompatibleHnswLayersResult<R, E> = std::result::Result<
-    (
-        VectorGraphLayerAvailability,
-        Vec<(Option<VectorGraphGeneration>, R)>,
-    ),
-    E,
->;
 
 /// Internal route inconsistency; not an embedder-facing refusal type.
 enum SnapshotPartitionMismatch {
@@ -496,9 +478,6 @@ thread_local! {
 thread_local! {
     static HELD_MAINTENANCE_LOCKS: RefCell<Vec<(StoreId, VectorIndexRef, VectorPartitionKey)>> = const { RefCell::new(Vec::new()) };
     static HELD_BULK_READ_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
-    /// The partitions the statement on this thread is searching, by address,
-    /// while it loads their graphs.
-    static STATEMENT_PARTITIONS: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
     static HELD_BULK_WRITE_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -648,47 +627,6 @@ impl PartitionVectors {
     }
 }
 
-/// Identity and durable coverage of a sealed graph generation.  The bytes of
-/// the graph deliberately stay outside this value: the codec owns their
-/// representation and hands this layer an already-verified `HnswIndex`.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VectorGraphGeneration {
-    pub generation_id: u64,
-    pub covered_tx: TxId,
-    pub covered_lsn: Lsn,
-    pub durable_bytes: u64,
-    pub policy_revision: u64,
-    pub hnsw_m: u32,
-    pub hnsw_ef_construction: u32,
-}
-
-/// The exact generation element used by the existing directory-layout witness.
-#[cfg(any(test, feature = "test-seams"))]
-#[doc(hidden)]
-pub type VectorIndexGeneration = VectorGraphGeneration;
-
-/// What a store consumer may inspect without borrowing a graph.  In
-/// particular, inspection never forces a lazy graph to load or decode.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VectorGraphGenerationStatus {
-    pub base: Option<VectorGraphGeneration>,
-    pub change: Option<VectorGraphGeneration>,
-    pub dormant_base: Option<VectorGraphGeneration>,
-    pub dormant_change: Option<VectorGraphGeneration>,
-    pub base_resident: bool,
-    pub change_resident: bool,
-    pub fresh_tail_entries: usize,
-    pub retained_generations: usize,
-    pub pending_generation_count: usize,
-    /// How many searches answered through paged/durable reads because this
-    /// partition's saved graph could not be retained, and the last such
-    /// refusal. The search still answers; this keeps the reason visible.
-    pub paged_route_refusals: u64,
-    pub last_paged_route_refusal: Option<VectorPagedRouteRefusal>,
-}
-
 /// The memory refusal that sent one search to the paged/durable route
 /// instead of a retained saved graph.
 #[doc(hidden)]
@@ -705,31 +643,6 @@ pub enum VectorGraphLayerAvailability {
     Ready,
     Dormant,
     Unavailable,
-}
-
-/// A passive, route-local reason that forbids indexed use until maintenance
-/// has published a replacement from authoritative raw vectors.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VectorRouteQuarantineReason {
-    CorruptBase,
-    CorruptChanges,
-    IncompatibleFormat,
-    /// A search reached every row the maintained graph connects and found
-    /// live rows it does not: the graph is set aside until maintenance
-    /// rebuilds it.
-    DisconnectedGraph,
-}
-
-impl VectorRouteQuarantineReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CorruptBase => "corrupt_base",
-            Self::CorruptChanges => "corrupt_changes",
-            Self::IncompatibleFormat => "incompatible_format",
-            Self::DisconnectedGraph => "disconnected_graph",
-        }
-    }
 }
 
 /// Stable reason retained after a maintenance attempt cannot be admitted or
@@ -769,7 +682,6 @@ pub struct VectorMaintenanceFailureDetails {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorPartitionSourceMaintenanceMetadata {
     pub historical_only: bool,
-    pub quarantine: Option<VectorRouteQuarantineReason>,
     pub failure: Option<VectorMaintenanceFailureDetails>,
 }
 
@@ -1063,251 +975,6 @@ impl VectorMaintenanceFailureDetails {
     }
 }
 
-#[derive(Clone)]
-struct SealedHnswGeneration {
-    identity: VectorGraphGeneration,
-    // Taken by Drop so the last Arc allocation is retired before its moved
-    // graph and final invoice. No Weak or raw Arc leaves this private owner.
-    contents: Option<Arc<SealedHnswGenerationContents>>,
-}
-
-struct SealedHnswGenerationContents {
-    graph: HnswIndex,
-    charge: SealedHnswCharge,
-}
-
-struct SealedHnswCharge {
-    /// Falls while the generation is resident when its serving cache gives
-    /// slots back; what remains is released when the generation goes.
-    bytes: AtomicUsize,
-    accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
-    _control_invoice:
-        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
-}
-
-/// One snapshot-compatible graph layer, held by the statement that is
-/// searching it for as long as its search runs.
-///
-/// A sealed generation is held by an owned clone: it is immutable and carries
-/// its memory charge in a shared owner, so holding it keeps the graph and its
-/// charge alive even if a publication replaces the generation underneath. The
-/// mutable tail is held under its read lock instead. It is charged to its
-/// partition, not to a shared owner, and a publication moves or replaces it
-/// under that lock's write side, so holding the read side is what keeps it --
-/// and the rows the snapshot selected in it -- in place until the search lets
-/// go. Commits keep appending to it meanwhile; the search skips any point it
-/// did not see when it opened the layer, and per-row visibility drops rows
-/// newer than its snapshot.
-pub(crate) struct SnapshotCompatibleLayer<'s> {
-    pub(crate) identity: Option<VectorGraphGeneration>,
-    held: HeldLayer<'s>,
-    len: usize,
-}
-
-#[allow(clippy::large_enum_variant)] // Captured root wrapper stays inside the charged layer vector.
-enum HeldLayer<'s> {
-    Sealed(SealedHnswGeneration),
-    Tail(parking_lot::MappedRwLockReadGuard<'s, HnswIndex>),
-    /// A paged tail holds a captured immutable root and needs no graph lock
-    /// while a reader admits pages or executes statement callbacks.
-    PagedTail(HnswIndex),
-    /// A tail whose search has finished. Its lock is given back before the
-    /// statement resolves its candidates, because resolving reads the
-    /// partition under its publication lock, and a publication waiting for
-    /// the tail's write side holds that lock.
-    CapturedSuffix(Arc<CapturedSuffixContents>),
-    Released,
-}
-
-impl HeldLayer<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Sealed(generation) => generation.graph().len(),
-            Self::Tail(graph) => graph.len(),
-            Self::PagedTail(graph) => graph.len(),
-            Self::CapturedSuffix(suffix) => suffix.graph.len(),
-            Self::Released => 0,
-        }
-    }
-}
-impl SnapshotCompatibleLayer<'_> {
-    /// The layer's graph, while the search holds it.
-    pub(crate) fn graph(&self) -> Option<&HnswIndex> {
-        match &self.held {
-            HeldLayer::Sealed(sealed) => Some(sealed.graph()),
-            HeldLayer::Tail(tail) => Some(tail),
-            HeldLayer::PagedTail(tail) => Some(tail),
-            HeldLayer::CapturedSuffix(suffix) => Some(&suffix.graph),
-            HeldLayer::Released => None,
-        }
-    }
-
-    /// The indexed vector identities the layer held when it was selected,
-    /// including rows sharing a point and retained identities.
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Give back a held tail's read lock once its search has finished. A
-    /// sealed generation stays held: it blocks no writer.
-    pub(crate) fn release_tail(&mut self) {
-        if matches!(self.held, HeldLayer::Tail(_)) {
-            self.held = HeldLayer::Released;
-        }
-    }
-}
-
-impl SealedHnswGeneration {
-    fn new(
-        identity: VectorGraphGeneration,
-        graph: HnswIndex,
-        bytes: usize,
-        accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
-    ) -> Self {
-        Self {
-            identity,
-            contents: Some(Arc::new(SealedHnswGenerationContents {
-                graph,
-                charge: SealedHnswCharge {
-                    bytes: AtomicUsize::new(bytes),
-                    _control_invoice: accountant
-                        .as_ref()
-                        .and_then(|owner| owner.control_invoice()),
-                    accountant,
-                },
-            })),
-        }
-    }
-
-    fn graph(&self) -> &HnswIndex {
-        &self
-            .contents
-            .as_ref()
-            .expect("live sealed generation")
-            .graph
-    }
-
-    fn bytes(&self) -> usize {
-        self.contents
-            .as_ref()
-            .expect("live sealed generation")
-            .charge
-            .bytes
-            .load(Ordering::SeqCst)
-    }
-
-    /// How many serving slots this generation's cache holds, and what each is
-    /// charged; `None` for a generation that holds its vectors itself.
-    fn serving_slots(&self) -> Option<(usize, usize)> {
-        let graph = self.graph();
-        Some((graph.serving_cache_slots()?, graph.serving_slot_bytes()?))
-    }
-
-    /// Give serving slots back until at most `keep` remain and return what
-    /// that freed to the budget. The topology stays resident. A slot whose
-    /// page a walk is still reading is not given back, and keeps its charge.
-    fn give_back_serving_slots(&self, keep: usize) -> usize {
-        let freed = self.graph().give_back_serving_slots(keep);
-        self.contents
-            .as_ref()
-            .expect("live sealed generation")
-            .charge
-            .release(freed)
-    }
-
-    fn into_parts(mut self) -> std::result::Result<ReleasedSealedGeneration, SealedHnswGeneration> {
-        let identity = self.identity;
-        let contents = self.contents.take().expect("live sealed generation");
-        match Arc::try_unwrap(contents) {
-            Ok(contents) => {
-                let SealedHnswGenerationContents { graph, charge } = contents;
-                let (bytes, accountant) = charge.disarm();
-                Ok((graph, bytes, accountant))
-            }
-            Err(contents) => Err(Self {
-                identity,
-                contents: Some(contents),
-            }),
-        }
-    }
-}
-
-impl Drop for SealedHnswGeneration {
-    fn drop(&mut self) {
-        if let Some(contents) = self.contents.take()
-            && let Some(contents) = Arc::into_inner(contents)
-        {
-            // Every strong owner uses into_inner. Its final success frees
-            // the Arc block before returning the moved contents; graph fields
-            // then free before the final charge. Unlike a charge inside an
-            // ordinarily dropped Arc, the control allocation is still paid
-            // at its own physical deallocation.
-            drop(contents);
-        }
-    }
-}
-
-/// While held, the partitions a statement named stay out of reach of the room
-/// its loads make; dropping it restores what an enclosing statement named.
-pub(crate) struct StatementPartitions {
-    previous: Option<Vec<usize>>,
-}
-
-impl Drop for StatementPartitions {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        STATEMENT_PARTITIONS.with(|declared| declared.replace(previous));
-    }
-}
-
-/// A sealed generation taken apart: its graph, the bytes it was charged for,
-/// and the accountant that charge belongs to when one is still attached.
-type ReleasedSealedGeneration = (
-    HnswIndex,
-    usize,
-    Option<crate::memory_budget::MemoryBudgetOwner>,
-);
-
-impl SealedHnswCharge {
-    /// Return `bytes` of this charge to the budget while the generation stays
-    /// resident, never more than it still holds. Returns what was released.
-    fn release(&self, bytes: usize) -> usize {
-        if bytes == 0 {
-            return 0;
-        }
-        let released = match self
-            .bytes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                Some(held.saturating_sub(bytes))
-            }) {
-            Ok(held) | Err(held) => held.min(bytes),
-        };
-        if released != 0
-            && let Some(accountant) = self.accountant.as_ref()
-        {
-            accountant.release(released);
-        }
-        released
-    }
-
-    fn disarm(mut self) -> (usize, Option<crate::memory_budget::MemoryBudgetOwner>) {
-        let bytes = self.bytes.swap(0, Ordering::SeqCst);
-        let accountant = self.accountant.take();
-        (bytes, accountant)
-    }
-}
-
-impl Drop for SealedHnswCharge {
-    fn drop(&mut self) {
-        let bytes = self.bytes.load(Ordering::SeqCst);
-        if bytes != 0
-            && let Some(accountant) = self.accountant.take()
-        {
-            accountant.release(bytes);
-        }
-    }
-}
-
 /// One retained-memory reservation whose release belongs to the object that
 /// holds the corresponding allocation. Keeping the reservation beside the
 /// retained state prevents DDL cleanup from having to reconstruct who paid
@@ -1577,84 +1244,6 @@ fn history_entry_terms(keys: &[Arc<VectorPartitionKey>], capacity: usize) -> (us
     (vectors, typed)
 }
 
-/// A durable catalog entry that is known to be valid but whose graph pages are
-/// not resident in this process.  The vector crate intentionally knows no
-/// file format or persistence implementation; the owner of the descriptor
-/// supplies the loader.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DormantVectorGraphGeneration {
-    pub identity: VectorGraphGeneration,
-    /// Bytes that become resident if this generation is loaded.  This is an
-    /// admission fact, not a claim about durable file size.
-    pub resident_bytes: usize,
-    /// Resident graph plus the persisted graph buffer that coexists with it
-    /// during decode. A bounded caller reserves this known minimum before the
-    /// loader performs any persistence I/O, then retains only owned residency.
-    pub load_bytes: usize,
-    /// Space the cache should make before invoking a loader whose exact
-    /// request is learned from saved metadata. Ordinary owned decodes use the
-    /// same value as `load_bytes`.
-    pub reclaim_bytes: usize,
-}
-
-/// An owned, verified graph returned by a persistence-owned loader. The
-/// loader either reserves `resident_bytes` itself or adopts the caller's
-/// already-admitted reservation before returning, then transfers that one
-/// owner to the store through the supplied accountant.
-#[doc(hidden)]
-pub struct LoadedVectorGraphGeneration {
-    pub graph: HnswIndex,
-    pub resident_bytes: usize,
-    pub accountant: crate::memory_budget::MemoryBudgetOwner,
-    /// Resident bytes transferred from the active caller's temporary
-    /// reservation. A retained file reader reserves cache residency directly
-    /// against its session accountant, so this is zero for that path.
-    pub caller_adopted_bytes: usize,
-    /// Restart may replay the bounded journal suffix while it loads the base.
-    /// This graph was created fresh in this process and is therefore the one
-    /// mutable layer later commits may extend.
-    pub fresh_tail: Option<LoadedVectorFreshTail>,
-}
-
-impl LoadedVectorGraphGeneration {
-    /// Complete std Arc allocation used by the sealed native graph owner.
-    /// Native page/root sources retain separate original receipts; the graph's
-    /// legacy maps are empty and allocate no population-sized buffers.
-    #[doc(hidden)]
-    pub fn paged_resident_control_bytes() -> usize {
-        std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
-            .extend(std::alloc::Layout::new::<SealedHnswGenerationContents>())
-            .expect("sealed graph control layout")
-            .0
-            .pad_to_align()
-            .size()
-    }
-}
-
-#[doc(hidden)]
-pub struct LoadedVectorFreshTail {
-    pub graph: HnswIndex,
-    pub resident_bytes: usize,
-    pub accountant: crate::memory_budget::MemoryBudgetOwner,
-    /// Highest durable journal LSN represented by this replay image. Hot
-    /// commits at or below it were persisted before their in-memory apply and
-    /// must not be inserted a second time after this image is published.
-    pub replayed_through_lsn: Lsn,
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapturedVectorSuffixInspectionForTest {
-    pub base: Option<VectorGraphGeneration>,
-    pub change: Option<VectorGraphGeneration>,
-    pub points: usize,
-    pub policy: (usize, usize, usize),
-    pub topology_digest: u64,
-    pub replayed_through_lsn: Lsn,
-}
-
 /// A persistence-owned loader asks its caller either to check cancellation or
 /// to admit an additional load allocation learned after lightweight metadata
 /// I/O and before that allocation is materialized.
@@ -1664,104 +1253,6 @@ pub enum DormantVectorLoadRequest {
     Checkpoint,
     Reserve(usize),
     Progress { done: usize, total: usize },
-}
-
-/// The persistence boundary for lazy graph residency.  It deliberately has
-/// no byte-format methods: codecs remain outside the vector crate.  A loader
-/// either returns one complete, verified owned graph or an error; it never
-/// exposes partial graph state to search.
-#[doc(hidden)]
-pub trait DormantVectorGraphLoader: Send + Sync {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn load(
-        &self,
-        generation: DormantVectorGraphGeneration,
-        caller_reserved_load_bytes: usize,
-        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
-    ) -> Result<LoadedVectorGraphGeneration>;
-
-    /// A writable loader may omit suffix reconstruction when the registry
-    /// already owns its authenticated fresh tail. Captured readers still use load.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn load_reusing_fresh_tail(
-        &self,
-        generation: DormantVectorGraphGeneration,
-        caller_reserved_load_bytes: usize,
-        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
-        _fresh_tail_present: bool,
-    ) -> Result<LoadedVectorGraphGeneration> {
-        self.load(generation, caller_reserved_load_bytes, request)
-    }
-}
-
-/// An immutable layer supplier retained by one serving operation. The loader
-/// retains the storage root that authenticated its complete admission facts.
-#[doc(hidden)]
-pub struct CapturedVectorGraphLayer {
-    pub descriptor: DormantVectorGraphGeneration,
-    pub loader: Arc<dyn DormantVectorGraphLoader>,
-}
-
-#[doc(hidden)]
-pub struct LoadedCapturedVectorSuffix {
-    pub tail: Option<LoadedVectorFreshTail>,
-    pub caller_adopted_bytes: usize,
-}
-
-#[doc(hidden)]
-pub trait CapturedVectorSuffixLoader: Send + Sync {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn load(
-        &self,
-        caller_reserved_load_bytes: usize,
-        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
-    ) -> Result<LoadedCapturedVectorSuffix>;
-
-    fn as_streamed(&self) -> Option<&dyn StreamedVectorSuffixHandle> {
-        None
-    }
-}
-
-/// Root-retaining metadata supplier. Binding happens exactly once after the
-/// registry serving identities are frozen and before request pricing.
-#[doc(hidden)]
-pub trait CapturedVectorSuffixSource: Send + Sync {
-    /// Bind a frozen dormant identity to this operation's captured root without
-    /// reading graph payloads or loading its suffix. The returned loader must
-    /// retain that root and never publish a fresh tail into the registry.
-    /// Called only after `bind_serving_frontier`, once per dormant layer; the
-    /// descriptor's identity names its role among the frozen frontier's.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn bind_serving_layer(
-        &self,
-        descriptor: &DormantVectorGraphGeneration,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<CapturedVectorGraphLayer>;
-
-    /// Receives the frozen serving base and change identities exactly once,
-    /// before any dormant layer binds and before request pricing.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn bind_serving_frontier(
-        &self,
-        base: Option<VectorGraphGeneration>,
-        change: Option<VectorGraphGeneration>,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<CapturedVectorSuffix>;
 }
 
 #[doc(hidden)]
@@ -1813,15 +1304,6 @@ pub trait StreamedVectorSuffixHandle: Send + Sync {
     fn observe_vector_decode(&self, row_id: RowId, created_tx: TxId, lsn: Lsn) {
         let _ = (row_id, created_tx, lsn);
     }
-}
-
-/// Saved suffix admission, authenticated before the operation prices its loads.
-#[doc(hidden)]
-pub struct CapturedVectorSuffix {
-    pub resident_bytes: usize,
-    pub load_bytes: usize,
-    pub reclaim_bytes: usize,
-    pub loader: Arc<dyn CapturedVectorSuffixLoader>,
 }
 
 /// Private serving delta consumed through the existing bounded raw scorer.
@@ -1880,216 +1362,6 @@ impl std::ops::Deref for CapturedVectorStreamedTailHandle {
     type Target = dyn CapturedVectorStreamedTail;
     fn deref(&self) -> &Self::Target {
         &*self.source
-    }
-}
-
-/// A root-coherent serving selection. This value deliberately has no Clone
-/// implementation: only an Arc shared within its operation may retain it.
-/// Neither this supplier nor its loaded suffix may enter the serving registry.
-#[doc(hidden)]
-pub struct CapturedVectorServingSelection {
-    pub inspection: RawVectorInspectionSnapshot,
-    pub base: Option<CapturedVectorGraphLayer>,
-    pub change: Option<CapturedVectorGraphLayer>,
-    pub suffix_source: Arc<dyn CapturedVectorSuffixSource>,
-    suffix: Option<CapturedVectorSuffix>,
-    pub(crate) streamed_tail: Option<CapturedVectorStreamedTailHandle>,
-    resident: parking_lot::Mutex<CapturedServingResidency>,
-    /// The store's refusal to retain this selection's base (0) or change (1)
-    /// layer during this find. It is replayed once to the page-scoring
-    /// preload, so the same retained load is not attempted, read and hashed
-    /// twice in one find.
-    retention_refusal: parking_lot::Mutex<[Option<Error>; 2]>,
-    _copy_owner: Option<VectorCopyAdmission>,
-}
-
-#[derive(Default)]
-struct CapturedServingResidency {
-    base: Option<SealedHnswGeneration>,
-    change: Option<SealedHnswGeneration>,
-    suffix: Option<Arc<CapturedSuffixContents>>,
-    suffix_loaded: bool,
-}
-struct CapturedSuffixContents {
-    graph: HnswIndex,
-    _charge: PaidRetainedMemoryCharge,
-}
-
-impl CapturedVectorServingSelection {
-    pub fn new(
-        inspection: RawVectorInspectionSnapshot,
-        base: Option<CapturedVectorGraphLayer>,
-        change: Option<CapturedVectorGraphLayer>,
-        suffix_source: Arc<dyn CapturedVectorSuffixSource>,
-    ) -> Self {
-        Self {
-            inspection,
-            base,
-            change,
-            suffix_source,
-            suffix: None,
-            streamed_tail: None,
-            resident: parking_lot::Mutex::new(CapturedServingResidency::default()),
-            retention_refusal: parking_lot::Mutex::new([None, None]),
-            _copy_owner: None,
-        }
-    }
-
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn with_streamed_tail(mut self, tail: CapturedVectorStreamedTailHandle) -> Result<Self> {
-        tail.validate()?;
-        self.streamed_tail = Some(tail);
-        // There is no graph suffix to load or install. The bounded scorer
-        // consumes this capture after the saved layers have been searched.
-        self.resident.get_mut().suffix_loaded = true;
-        Ok(self)
-    }
-
-    pub(crate) fn layer_presence(&self) -> (bool, bool, bool) {
-        let has_suffix = if self.streamed_tail.is_some() {
-            true
-        } else if let Some(streamed) = self.streamed_suffix() {
-            streamed.saved_inserts() != 0
-        } else {
-            self.suffix
-                .as_ref()
-                .is_some_and(|suffix| suffix.resident_bytes != 0 || suffix.load_bytes != 0)
-        };
-        (
-            self.inspection.base.is_some(),
-            self.inspection.change.is_some(),
-            has_suffix,
-        )
-    }
-
-    pub(crate) fn streamed_suffix(&self) -> Option<&dyn StreamedVectorSuffixHandle> {
-        if self.streamed_tail.is_some() {
-            return None;
-        }
-        self.suffix
-            .as_ref()
-            .and_then(|suffix| suffix.loader.as_streamed())
-    }
-
-    pub(crate) fn suffix_saved_inserts(&self) -> usize {
-        self.streamed_suffix().map_or(0, |s| s.saved_inserts())
-    }
-
-    pub(crate) fn serving_policy(&self) -> Option<VectorServingPolicy> {
-        let generation = self.inspection.base?;
-        Some(VectorServingPolicy {
-            hnsw_m: generation.hnsw_m as usize,
-            hnsw_ef_construction: generation.hnsw_ef_construction as usize,
-            policy_revision: generation.policy_revision,
-        })
-    }
-
-    fn missing_layer_bytes(&self, bytes: impl Fn(&CapturedVectorGraphLayer) -> usize) -> usize {
-        let resident = self.resident.lock();
-        self.base
-            .iter()
-            .filter(|_| resident.base.is_none())
-            .chain(self.change.iter().filter(|_| resident.change.is_none()))
-            .map(bytes)
-            .fold(0usize, usize::saturating_add)
-    }
-
-    pub(crate) fn dormant_layer_count(&self) -> usize {
-        self.missing_layer_bytes(|_| 1)
-    }
-    pub(crate) fn dormant_load_bytes(&self) -> usize {
-        self.missing_layer_bytes(|layer| layer.descriptor.reclaim_bytes)
-            .saturating_add(if self.resident.lock().suffix_loaded {
-                0
-            } else {
-                self.suffix
-                    .as_ref()
-                    .expect("serving suffix bound before pricing")
-                    .reclaim_bytes
-            })
-    }
-    pub(crate) fn dormant_page_bytes(&self) -> usize {
-        self.missing_layer_bytes(|layer| {
-            usize::try_from(layer.descriptor.identity.durable_bytes).unwrap_or(usize::MAX)
-        })
-    }
-
-    pub(crate) fn owned_layers(
-        &self,
-    ) -> (
-        VectorGraphLayerAvailability,
-        Vec<SnapshotCompatibleLayer<'static>>,
-    ) {
-        let resident = self.resident.lock();
-        // A named maintained layer must have a holder, even when an exact
-        // streamed suffix can answer k rows on its own.
-        if self.inspection.base.is_some() && self.base.is_none() && resident.base.is_none()
-            || self.inspection.change.is_some()
-                && self.change.is_none()
-                && resident.change.is_none()
-        {
-            return (VectorGraphLayerAvailability::Unavailable, Vec::new());
-        }
-        if self.base.is_some() && resident.base.is_none()
-            || self.change.is_some() && resident.change.is_none()
-            || !resident.suffix_loaded
-        {
-            return (VectorGraphLayerAvailability::Dormant, Vec::new());
-        }
-        // A route no maintenance ever published has no serving generation; a
-        // suffix of journal rows alone is not a maintained route, exactly as
-        // the store serves a bare tail only once a serving policy exists.
-        if self.serving_policy().is_none() {
-            return (VectorGraphLayerAvailability::Unavailable, Vec::new());
-        }
-        // Each holder has an inline native graph variant. Two unused slots
-        // per single-layer partition are real retained memory, not graph work.
-        // Allocate exactly the nonempty layers this locked capture will copy.
-        let count = resident
-            .base
-            .iter()
-            .chain(resident.change.iter())
-            .filter(|generation| !generation.graph().is_empty())
-            .count()
-            + usize::from(
-                resident
-                    .suffix
-                    .as_ref()
-                    .is_some_and(|suffix| !suffix.graph.is_empty()),
-            );
-        let mut layers = Vec::with_capacity(count);
-        for generation in resident.base.iter().chain(resident.change.iter()) {
-            if !generation.graph().is_empty() {
-                layers.push(SnapshotCompatibleLayer {
-                    identity: Some(generation.identity),
-                    len: generation.graph().len(),
-                    held: HeldLayer::Sealed(generation.clone()),
-                });
-            }
-        }
-        if let Some(suffix) = &resident.suffix
-            && !suffix.graph.is_empty()
-        {
-            layers.push(SnapshotCompatibleLayer {
-                identity: None,
-                len: suffix.graph.len(),
-                held: HeldLayer::CapturedSuffix(Arc::clone(suffix)),
-            });
-        }
-        let has_streamed_tail = self.streamed_tail.is_some()
-            || self
-                .streamed_suffix()
-                .is_some_and(|suffix| suffix.saved_inserts() != 0);
-        let availability = if layers.is_empty() && !has_streamed_tail {
-            VectorGraphLayerAvailability::Unavailable
-        } else {
-            VectorGraphLayerAvailability::Ready
-        };
-        (availability, layers)
     }
 }
 
@@ -3137,59 +2409,14 @@ pub struct DormantRawVectorPartition {
     pub loader: Arc<dyn DormantRawVectorLoader>,
 }
 
-#[derive(Clone)]
-struct DormantSealedGeneration {
-    descriptor: DormantVectorGraphGeneration,
-    loader: Arc<dyn DormantVectorGraphLoader>,
-}
-
-#[derive(Default)]
-struct RetiredSealedHnswChain {
-    base: Option<SealedHnswGeneration>,
-    change: Option<SealedHnswGeneration>,
-    dormant_base: Option<DormantSealedGeneration>,
-    dormant_change: Option<DormantSealedGeneration>,
-}
-
 #[derive(Clone, Copy)]
 enum SealedChainLocation {
     Current,
     Retired { base_generation_id: u64 },
 }
 
-/// The graph a search walked, as a disconnection report names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct GraphStamp {
-    base: Option<VectorGraphGeneration>,
-    change: Option<VectorGraphGeneration>,
-    tail_epoch: u64,
-}
-
 /// `IndexState::tail_frontier_tx` when no build frontier is known.
 const TAIL_FRONTIER_UNKNOWN: u64 = u64::MAX;
-
-/// Sealed graphs are never mutated after installation. `retired` preserves
-/// each old base and its optional bounded change as one serving chain until
-/// the engine confirms that no registered snapshot can still ask for it. We
-/// retain a chain only while a registered snapshot selects that chain.
-#[derive(Default)]
-struct SealedHnswGenerations {
-    base: Option<SealedHnswGeneration>,
-    change: Option<SealedHnswGeneration>,
-    dormant_base: Option<DormantSealedGeneration>,
-    dormant_change: Option<DormantSealedGeneration>,
-    pending_base: Option<DormantSealedGeneration>,
-    retired: Vec<RetiredSealedHnswChain>,
-    pending_generation_count: usize,
-    quarantine: Option<VectorRouteQuarantineReason>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VectorServingPolicy {
-    pub hnsw_m: usize,
-    pub hnsw_ef_construction: usize,
-    pub policy_revision: u64,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorMaintenanceProgress {
@@ -3295,218 +2522,6 @@ impl VectorVisibilityCounts {
     }
 }
 
-/// Page-granular candidate scoring for one statement. It holds the sealed
-/// layers this snapshot serves and one page reader for each, so a page is
-/// authenticated once and then answers every candidate it holds instead of
-/// one. The layers are taken once, before the first candidate, and never
-/// looked up again per row: nothing here waits on the publication gate while
-/// a scan runs.
-pub(crate) struct SealedPageScoring {
-    // The selected chain is exactly a base plus an optional change. Keep
-    // their controls inline in the caller's admitted scoring slot instead
-    // of allocating two unowned temporary/retained layer vectors.
-    layers: [Option<SealedPageLayer>; 2],
-    query_norm: f32,
-}
-
-struct SealedPageLayer {
-    covered_tx: TxId,
-    generation: SealedHnswGeneration,
-    pages: Option<ServingPages>,
-}
-
-impl std::fmt::Debug for SealedPageScoring {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SealedPageScoring")
-            .field("layers", &self.layers.iter().flatten().count())
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Default)]
-struct PagedBuildSlot {
-    pending: Option<(PagedGenerationBuilder, PagedVectorBatchPlan)>,
-    in_flight: bool,
-    invalidating: bool,
-    progress: Option<Arc<PagedBuilderProgress>>,
-}
-impl PagedBuildSlot {
-    fn active(&self) -> bool {
-        self.pending.is_some() || self.in_flight || self.invalidating
-    }
-}
-/// Move the finite operation out before admission or persistence callbacks.
-/// On failure/panic Drop restores its last committed descriptor. Neither the
-/// partition publication lock nor the slot mutex crosses a callback boundary.
-struct PagedBuildOperation {
-    state: Arc<IndexState>,
-    work: Option<(PagedGenerationBuilder, PagedVectorBatchPlan)>,
-    cleanup: bool,
-    finished: bool,
-    invalidating: bool,
-}
-impl PagedBuildOperation {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn take(state: Arc<IndexState>, cleanup: bool) -> Result<Option<Self>> {
-        let mut slot = if cleanup {
-            state.paged_reclaimer.lock()
-        } else {
-            state.paged_builder.lock()
-        };
-        if slot.in_flight || slot.invalidating {
-            return Err(Error::Other(
-                "paged generation operation is already active".into(),
-            ));
-        }
-        let Some(work) = slot.pending.take() else {
-            return Ok(None);
-        };
-        slot.progress = Some(work.0.progress_snapshot());
-        slot.in_flight = true;
-        drop(slot);
-        Ok(Some(Self {
-            state,
-            work: Some(work),
-            cleanup,
-            finished: false,
-            invalidating: false,
-        }))
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn take_for_abandon(state: Arc<IndexState>) -> Result<Self> {
-        let mut slot = state.paged_builder.lock();
-        if slot.invalidating {
-            return Err(Error::Other(
-                "paged build invalidation is already active".into(),
-            ));
-        }
-        slot.invalidating = true;
-        // Quarantine the slot before waiting. The running operation returns
-        // its last committed state, but no maintenance or registration can
-        // use it before the durable abandon fence completes. No engine gate
-        // may be held by this caller; the persistence callback owns that gate.
-        while slot.in_flight {
-            state.paged_build_finished.wait(&mut slot);
-        }
-        let Some(work) = slot.pending.take() else {
-            slot.invalidating = false;
-            return Err(Error::Other(
-                "paged vector builder is not registered".into(),
-            ));
-        };
-        slot.progress = Some(work.0.progress_snapshot());
-        slot.in_flight = true;
-        drop(slot);
-        Ok(Self {
-            state,
-            work: Some(work),
-            cleanup: false,
-            finished: false,
-            invalidating: true,
-        })
-    }
-    fn work(&mut self) -> &mut (PagedGenerationBuilder, PagedVectorBatchPlan) {
-        self.work.as_mut().expect("owned paged operation")
-    }
-}
-impl Drop for PagedBuildOperation {
-    fn drop(&mut self) {
-        let mut slot = if self.cleanup {
-            self.state.paged_reclaimer.lock()
-        } else {
-            self.state.paged_builder.lock()
-        };
-        slot.in_flight = false;
-        if self.finished {
-            slot.progress = None;
-        } else if let Some(work) = self.work.take() {
-            slot.progress = Some(work.0.progress_snapshot());
-            slot.pending = Some(work);
-        }
-        if self.invalidating {
-            slot.invalidating = false;
-        }
-        drop(slot);
-        self.state.paged_build_finished.notify_all();
-    }
-}
-
-/// A detached owned tail. Its charge survives a physical close, but no storage
-/// source, root, file handle, sealed graph or membership directory travels with it.
-#[doc(hidden)]
-pub struct WriterVectorTail {
-    graph: Option<HnswIndex>,
-    bytes: usize,
-    accountant: crate::memory_budget::MemoryBudgetOwner,
-    metadata_bytes: usize,
-    sealed_identity: Option<VectorGraphGeneration>,
-    replayed_through_lsn: u64,
-    mutated_through_lsn: u64,
-    replay_frontier_active: bool,
-    dimension: usize,
-    quantization: VectorQuantization,
-}
-
-impl WriterVectorTail {
-    pub fn take_metadata_charge(&mut self) -> (crate::memory_budget::MemoryBudgetOwner, usize) {
-        (
-            self.accountant.clone(),
-            std::mem::take(&mut self.metadata_bytes),
-        )
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn admit_metadata(&mut self, bytes: usize) -> Result<()> {
-        self.accountant.try_allocate_for_static(
-            bytes,
-            "vector_index",
-            "detach_writer_tail",
-            "Discard an optional tail when its route cannot fit.",
-        )?;
-        self.metadata_bytes += bytes;
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn reattach_budget(
-        &mut self,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        if !crate::memory_budget::same_funder(self.accountant.as_ref(), accountant.as_ref()) {
-            accountant.try_allocate_for_static(
-                self.bytes + self.metadata_bytes,
-                "vector_index",
-                "reattach_writer_tail",
-                "Discard the optional import tail when it cannot fit.",
-            )?;
-            self.accountant.release(self.bytes + self.metadata_bytes);
-        }
-        self.accountant = accountant;
-        Ok(())
-    }
-}
-
-impl Drop for WriterVectorTail {
-    fn drop(&mut self) {
-        drop(self.graph.take());
-        self.accountant.release(self.bytes + self.metadata_bytes);
-    }
-}
-
 pub struct IndexState {
     dimension: usize,
     quantization: VectorQuantization,
@@ -3514,10 +2529,6 @@ pub struct IndexState {
     /// Serializes builders for this partition without making foreground
     /// publication wait for graph construction.
     maintenance_build: Mutex<()>,
-    paged_builder: Mutex<PagedBuildSlot>,
-    paged_build_finished: Condvar,
-    paged_reclaimer: Mutex<PagedBuildSlot>,
-    paged_storage: AtomicBool,
     vectors: RwLock<PartitionVectors>,
     raw_directory: RwLock<Vec<RawVectorDirectoryEntry>>,
     #[cfg(test)]
@@ -3548,17 +2559,6 @@ pub struct IndexState {
     /// the cap edge answers "any pending work after this frontier" without a
     /// walk of the route's history.
     pending_marks: Mutex<ResidentPendingMarks>,
-    hnsw: OnceLock<RwLock<Option<HnswIndex>>>,
-    hnsw_bytes: AtomicUsize,
-    hnsw_accountant: RwLock<Option<crate::memory_budget::MemoryBudgetOwner>>,
-    serving_policy: RwLock<Option<VectorServingPolicy>>,
-    inspection_generation_id: AtomicU64,
-    inspection_base_tx: AtomicU64,
-    /// Monotonic store-local sequence of the most recent search that used
-    /// this partition's sealed graph chain.
-    sealed_graph_last_used: AtomicU64,
-    #[cfg(feature = "test-seams")]
-    base_backlog: Mutex<crate::observations::BaseBacklog>,
     maintenance_inspection: RwLock<VectorMaintenanceInspection>,
     #[cfg(any(test, feature = "test-seams"))]
     maintenance_step_pause: Mutex<Option<Arc<MaintenanceProgressPauseSlot>>>,
@@ -3567,41 +2567,6 @@ pub struct IndexState {
     /// observation. Durable decode stays outside this short boundary; its
     /// candidate is admitted only if `fresh_tail_revision` is unchanged.
     generation_publication: Mutex<()>,
-    fresh_tail_revision: AtomicU64,
-    /// The transaction a mutable tail that is the whole graph was built at:
-    /// it holds every row visible then and every row committed into it since
-    /// (a delete removes no point), so it answers every reader at or after
-    /// this frontier — one already active when later commits land included.
-    /// `TAIL_FRONTIER_UNKNOWN` when a tail was installed some other way: only
-    /// readers at the newest commit use it then.
-    tail_frontier_tx: AtomicU64,
-    /// Advances whenever the mutable tail is replaced, so a report about the
-    /// tail a search walked can tell whether that tail still serves.
-    tail_epoch: AtomicU64,
-    carried_tail_identity: RwLock<Option<VectorGraphGeneration>>,
-    fresh_tail_preparations: AtomicUsize,
-    fresh_tail_replay_frontier_active: AtomicBool,
-    fresh_tail_replayed_through_lsn: AtomicU64,
-    fresh_tail_mutated_through_lsn: AtomicU64,
-    /// In-memory maintenance builds from this fixed frontier while commits
-    /// continue into the fresh tail. A failed build retains the same frontier
-    /// for the next bounded attempt instead of folding later writes back into
-    /// the candidate.
-    maintenance_sample_active: AtomicBool,
-    maintenance_sample_tx: AtomicU64,
-    maintenance_sample_lsn: AtomicU64,
-    maintenance_sample_origin: AtomicU64,
-    maintenance_sample_prior_replay_frontier_active: AtomicBool,
-    maintenance_sample_prior_replayed_through_lsn: AtomicU64,
-    maintenance_sample_prior_mutated_through_lsn: AtomicU64,
-    #[cfg(any(test, feature = "test-seams"))]
-    graph_callback_pause: Mutex<Option<Arc<MaintenanceProgressPauseSlot>>>,
-    /// The old `hnsw` field above is deliberately the fresh, process-created
-    /// mutable tail.  Keeping it separate makes it impossible for an insert
-    /// to reach a sealed graph loaded from durable storage.
-    sealed_hnsw: RwLock<SealedHnswGenerations>,
-    paged_route_refusals: AtomicU64,
-    last_paged_route_refusal: Mutex<Option<VectorPagedRouteRefusal>>,
     #[cfg(any(test, feature = "test-seams"))]
     passive_activity: OnceLock<Arc<VectorPassiveActivity>>,
 }
@@ -3609,19 +2574,6 @@ pub struct IndexState {
 #[doc(hidden)]
 pub struct VectorMaintenanceProgressGuard {
     state: Arc<IndexState>,
-}
-
-struct SampledMaintenanceRollback {
-    state: Arc<IndexState>,
-    armed: bool,
-}
-
-impl Drop for SampledMaintenanceRollback {
-    fn drop(&mut self) {
-        if self.armed {
-            self.state.abort_sampled_hnsw_maintenance_if_uncontended();
-        }
-    }
 }
 
 impl VectorMaintenanceProgressGuard {
@@ -3976,10 +2928,6 @@ impl IndexState {
             quantization,
             maintenance: Mutex::new(()),
             maintenance_build: Mutex::new(()),
-            paged_builder: Mutex::new(PagedBuildSlot::default()),
-            paged_build_finished: Condvar::new(),
-            paged_reclaimer: Mutex::new(PagedBuildSlot::default()),
-            paged_storage: AtomicBool::new(false),
             vectors: RwLock::new(PartitionVectors::default()),
             raw_directory: RwLock::new(Vec::new()),
             #[cfg(test)]
@@ -3999,40 +2947,11 @@ impl IndexState {
             historical_only: AtomicBool::new(false),
             limit_link: Mutex::new(PartitionLimitLink::default()),
             pending_marks: Mutex::new(ResidentPendingMarks::default()),
-            hnsw: OnceLock::new(),
-            hnsw_bytes: AtomicUsize::new(0),
-            hnsw_accountant: RwLock::new(None),
-            serving_policy: RwLock::new(None),
-            inspection_generation_id: AtomicU64::new(0),
-            inspection_base_tx: AtomicU64::new(0),
-            sealed_graph_last_used: AtomicU64::new(0),
-            #[cfg(feature = "test-seams")]
-            base_backlog: Mutex::new(crate::observations::BaseBacklog::default()),
             maintenance_inspection: RwLock::new(VectorMaintenanceInspection::default()),
             #[cfg(any(test, feature = "test-seams"))]
             maintenance_step_pause: Mutex::new(None),
             maintenance_policy_revision: AtomicU64::new(0),
             generation_publication: Mutex::new(()),
-            fresh_tail_revision: AtomicU64::new(0),
-            tail_frontier_tx: AtomicU64::new(TAIL_FRONTIER_UNKNOWN),
-            tail_epoch: AtomicU64::new(0),
-            carried_tail_identity: RwLock::new(None),
-            fresh_tail_preparations: AtomicUsize::new(0),
-            fresh_tail_replay_frontier_active: AtomicBool::new(false),
-            fresh_tail_replayed_through_lsn: AtomicU64::new(0),
-            fresh_tail_mutated_through_lsn: AtomicU64::new(0),
-            maintenance_sample_active: AtomicBool::new(false),
-            maintenance_sample_tx: AtomicU64::new(0),
-            maintenance_sample_lsn: AtomicU64::new(0),
-            maintenance_sample_origin: AtomicU64::new(0),
-            maintenance_sample_prior_replay_frontier_active: AtomicBool::new(false),
-            maintenance_sample_prior_replayed_through_lsn: AtomicU64::new(0),
-            maintenance_sample_prior_mutated_through_lsn: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-seams"))]
-            graph_callback_pause: Mutex::new(None),
-            sealed_hnsw: RwLock::new(SealedHnswGenerations::default()),
-            paged_route_refusals: AtomicU64::new(0),
-            last_paged_route_refusal: Mutex::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             passive_activity: OnceLock::new(),
         }
@@ -4058,10 +2977,6 @@ impl IndexState {
         self.quantization
     }
 
-    fn serving_policy(&self) -> Option<VectorServingPolicy> {
-        *self.serving_policy.read()
-    }
-
     fn is_historical_only(&self) -> bool {
         self.historical_only.load(Ordering::SeqCst)
     }
@@ -4072,7 +2987,6 @@ impl IndexState {
     pub fn source_maintenance_metadata(&self) -> VectorPartitionSourceMaintenanceMetadata {
         VectorPartitionSourceMaintenanceMetadata {
             historical_only: self.is_historical_only(),
-            quarantine: self.route_quarantine(),
             failure: self.maintenance_failure_details(),
         }
     }
@@ -4215,31 +3129,6 @@ impl IndexState {
                 add_signed(&mut figures.typed_partition_keys, keys, 0);
             });
         }
-    }
-
-    fn set_serving_policy(&self, policy: ResolvedVectorPolicy) {
-        *self.serving_policy.write() = Some(VectorServingPolicy {
-            hnsw_m: policy.hnsw_m,
-            hnsw_ef_construction: policy.hnsw_ef_construction,
-            policy_revision: policy.policy_revision,
-        });
-        self.inspection_generation_id.fetch_add(1, Ordering::SeqCst);
-        self.inspection_base_tx
-            .store(self.max_tx().0, Ordering::SeqCst);
-        self.clear_maintenance_failure();
-    }
-
-    fn set_serving_policy_from_generation(&self, generation: VectorGraphGeneration) {
-        *self.serving_policy.write() = Some(VectorServingPolicy {
-            hnsw_m: generation.hnsw_m as usize,
-            hnsw_ef_construction: generation.hnsw_ef_construction as usize,
-            policy_revision: generation.policy_revision,
-        });
-        self.inspection_generation_id
-            .store(generation.generation_id, Ordering::SeqCst);
-        self.inspection_base_tx
-            .store(generation.covered_tx.0, Ordering::SeqCst);
-        self.clear_maintenance_failure();
     }
 
     fn maintenance_inspection(&self) -> VectorMaintenanceInspection {
@@ -4617,12 +3506,11 @@ impl IndexState {
         &self,
         owner: &mut VectorCopyAdmission,
     ) -> Result<bool> {
-        let covered = VectorStore::inspection_covered_tx(self);
         if self.is_durable() {
-            let (inserts, tombstones) = self.durable_pending_counts(covered, None, owner)?;
+            let (inserts, tombstones) = self.durable_pending_counts(None, None, owner)?;
             Ok(inserts != 0 || tombstones != 0)
         } else {
-            Ok(self.resident_pending_after(covered))
+            Ok(self.resident_pending_after(None))
         }
     }
 
@@ -6196,41 +5084,6 @@ impl IndexState {
         self.visibility_counts.read().max_tx()
     }
 
-    /// Eligibility shares the snapshot boundary index used by ordinary counts.
-    /// Durable historical probes checkpoint and charge every physical record;
-    /// resident counts use their snapshot boundary index.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg(test)]
-    pub(crate) fn bounded_hnsw_eligibility<E>(
-        &self,
-        snapshot_tx: TxId,
-        mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
-        owner: &mut VectorCopyAdmission,
-    ) -> std::result::Result<BoundedIndexEligibility, E>
-    where
-        E: From<Error>,
-    {
-        let mut local_copy_admission = owner.local_scratch();
-        let owner = local_copy_admission.as_mut().unwrap_or(owner);
-        before_source_entry()?;
-        if let Some(source) = self.durable_membership_source() {
-            return Ok(BoundedIndexEligibility {
-                entry_count: self.entry_count(),
-                live_count: with_membership_read(&mut before_source_entry, |before_read| {
-                    source.visible_count(SnapshotId(snapshot_tx.0), before_read, owner)
-                })?,
-            });
-        }
-        let counts = self.visibility_counts.read();
-        Ok(BoundedIndexEligibility {
-            entry_count: counts.created.len(),
-            live_count: counts.count(SnapshotId(snapshot_tx.0)),
-        })
-    }
-
     pub fn byte_count(&self) -> usize {
         let vectors = self.vectors.read();
         let raw_bytes = self.raw_payload_bytes();
@@ -6249,8 +5102,6 @@ impl IndexState {
             )
             .saturating_add(vectors.retained_map_bytes())
             .saturating_add(self.directory_byte_count())
-            .saturating_add(self.hnsw_bytes.load(Ordering::SeqCst))
-            .saturating_add(self.sealed_hnsw_bytes())
     }
 
     fn live_payload_bytes(&self) -> usize {
@@ -6259,34 +5110,6 @@ impl IndexState {
                 self.dimension,
                 self.quantization,
             ))
-    }
-
-    fn sealed_hnsw_bytes(&self) -> usize {
-        let sealed = self.sealed_hnsw.read();
-        sealed
-            .base
-            .iter()
-            .chain(sealed.change.iter())
-            .fold(0usize, |bytes, generation| {
-                bytes.saturating_add(generation.bytes())
-            })
-            .saturating_add(sealed.retired.iter().fold(0usize, |bytes, chain| {
-                bytes
-                    .saturating_add(
-                        chain
-                            .base
-                            .as_ref()
-                            .map(SealedHnswGeneration::bytes)
-                            .unwrap_or(0),
-                    )
-                    .saturating_add(
-                        chain
-                            .change
-                            .as_ref()
-                            .map(SealedHnswGeneration::bytes)
-                            .unwrap_or(0),
-                    )
-            }))
     }
 
     #[expect(
@@ -6473,133 +5296,6 @@ impl IndexState {
         None
     }
 
-    /// The serving pages a statement can score its candidates from: the sealed
-    /// layers this snapshot selects, each ready to open its own page reader.
-    /// `None` when nothing here serves from pages, and every candidate is
-    /// read the way it is read today, through its own stored body.
-    ///
-    /// Only the graph route asks for this. Its layers are dormant until
-    /// something loads them, so this brings them in once, before the first
-    /// candidate, under the caller's own cancellable charge.
-    ///
-    /// Two refusals arrive the same way and mean opposite things. A caller who
-    /// cancelled or ran out of time has ended the search, and that travels out
-    /// — established by asking the caller again after any refusal, not by
-    /// assuming which callback reports which class. A caller who will not admit the generation's memory has not: the
-    /// per-row route still answers every candidate from its own stored body,
-    /// so that returns "no pages here" and the statement carries on, which is
-    /// what a declared memory limit is for -- sweeping a store larger than the
-    /// reader's memory. A layer that simply will not load says the same.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn sealed_page_scoring<E>(
-        &self,
-        snapshot: SnapshotId,
-        captured: Option<&CapturedVectorServingSelection>,
-        query: &[f32],
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<Option<SealedPageScoring>, E>
-    where
-        E: From<Error>,
-    {
-        if query.len() != self.dimension {
-            return Ok(None);
-        }
-        // A cancellation is captured on the way past and re-raised once the
-        // preloader is out of the way; a memory refusal deliberately is not,
-        // so it falls through to "no pages here" below. The preloader returns
-        // whatever a failed load charged before it hands the error back.
-        let cancelled: RefCell<Option<E>> = RefCell::new(None);
-        let preloaded = {
-            let mut checkpoint = || -> std::result::Result<(), Error> {
-                before_checkpoint().map_err(|error| {
-                    *cancelled.borrow_mut() = Some(error);
-                    Error::Other(("the caller stopped this search".to_string()).into())
-                })
-            };
-            let mut retain = |bytes: usize| -> std::result::Result<(), Error> {
-                before_retain(bytes).map_err(|_| {
-                    Error::Other(
-                        ("the caller does not admit this generation's serving memory".to_string())
-                            .into(),
-                    )
-                })
-            };
-            self.preload_snapshot_compatible_hnsw_layers_for_request::<Error>(
-                snapshot,
-                captured,
-                &mut checkpoint,
-                &mut retain,
-                release_retained,
-            )
-        };
-        if let Some(error) = cancelled.into_inner() {
-            return Err(error);
-        }
-        if let Err(Error::MemoryBudgetExceeded {
-            requested_bytes,
-            available_bytes,
-            budget_limit_bytes,
-            ..
-        }) = &preloaded
-        {
-            // The search answers through paged/durable reads instead; record
-            // the refusal so the reason that route ran is not silent.
-            self.paged_route_refusals.fetch_add(1, Ordering::SeqCst);
-            *self.last_paged_route_refusal.lock() = Some(VectorPagedRouteRefusal {
-                requested_bytes: *requested_bytes,
-                available_bytes: *available_bytes,
-                budget_limit_bytes: *budget_limit_bytes,
-            });
-        }
-        if preloaded.is_err() {
-            // A reservation boundary can refuse for reasons that are NOT a
-            // memory refusal -- a cancellation, an elapsed deadline, a parked
-            // release fault the caller TAKES rather than copies. Those must not
-            // be dropped here. Asking the caller once more is what makes the
-            // distinction by error class rather than by which callback happened
-            // to report it.
-            before_checkpoint()?;
-            return Ok(None);
-        }
-        let snapshot_tx = TxId::from_snapshot(snapshot);
-        let generations = {
-            let _publication = self.generation_publication.lock();
-            let sealed = self.sealed_hnsw.read();
-            if sealed.quarantine.is_some() {
-                return Ok(None);
-            }
-            let Some(location) = Self::selected_chain_location(&sealed, snapshot_tx) else {
-                return Ok(None);
-            };
-            let Ok((base, change, _)) = Self::selected_chain_layers(&sealed, location, snapshot_tx)
-            else {
-                return Ok(None);
-            };
-            [Some(base), change]
-        };
-        let layers = generations.map(|generation| {
-            generation
-                .filter(|generation| generation.graph().serves_from_pages())
-                .map(|generation| SealedPageLayer {
-                    covered_tx: generation.identity.covered_tx,
-                    generation,
-                    pages: None,
-                })
-        });
-        Ok(layers
-            .iter()
-            .any(Option::is_some)
-            .then(|| SealedPageScoring {
-                layers,
-                query_norm: HnswIndex::stored_query_norm(query),
-            }))
-    }
-
     /// The directory holds exactly one version of this row. A second version --
     /// superseded, re-created, or left behind by cleanup -- means an immutable
     /// graph may name a point that is not the version this snapshot reads.
@@ -6608,67 +5304,6 @@ impl IndexState {
             .read()
             .get(&row_id)
             .is_some_and(|positions| positions.len() == 1)
-    }
-
-    /// Score one candidate out of the statement's serving pages, and only when
-    /// the page body is certainly this row's visible body: the directory holds
-    /// one version of the row, and that version was already committed when the
-    /// layer was sealed. Anything else falls through to the row's own stored
-    /// body, so the published score is the same number either way.
-    #[allow(clippy::too_many_arguments)]
-    fn score_candidate_from_serving_pages<E>(
-        &self,
-        paged: &mut SealedPageScoring,
-        identity: &RawVectorDirectoryEntry,
-        query: &[f32],
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<Option<f32>, E>
-    where
-        E: From<Error>,
-    {
-        if !self.row_has_one_stored_version(identity.row_id) {
-            return Ok(None);
-        }
-        let query_norm = paged.query_norm;
-        let charge = RefCell::new((before_retain, release_retained));
-        let mut acquire = |event| {
-            let mut charged = charge.borrow_mut();
-            crate::mem::apply_hnsw_scratch_acquire(event, &mut *charged.0)
-        };
-        let mut release = |event| {
-            let mut charged = charge.borrow_mut();
-            crate::mem::apply_hnsw_scratch_release(event, &mut *charged.1);
-        };
-        for layer in paged.layers.iter_mut().flatten() {
-            if identity.created_tx > layer.covered_tx {
-                continue;
-            }
-            if layer.pages.is_none() {
-                let Some(opened) = layer.generation.graph().serving_page_reader() else {
-                    continue;
-                };
-                layer.pages = Some(opened.map_err(E::from)?);
-            }
-            let Some(pages) = layer.pages.as_mut() else {
-                continue;
-            };
-            if let Some(score) = layer.generation.graph().serving_page_similarity(
-                identity.row_id,
-                query,
-                query_norm,
-                before_checkpoint,
-                before_distance,
-                &mut acquire,
-                &mut release,
-                pages,
-            )? {
-                return Ok(Some(score));
-            }
-        }
-        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6680,7 +5315,6 @@ impl IndexState {
         snapshot: SnapshotId,
         query: &[f32],
         caller_charged: bool,
-        paged: Option<&mut SealedPageScoring>,
         bodies: Option<&mut RawVectorBodyReads>,
         before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
         before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
@@ -6738,32 +5372,6 @@ impl IndexState {
                 identity
             }
         };
-        // A page this statement has already authenticated answers every vector
-        // it holds. Reading this candidate's own body instead would hash a
-        // fresh Merkle path for one vector out of the twenty a page carries.
-        if !owner.historical_durable_reads()
-            && let Some(paged) = paged
-            && let Some(score) = self.score_candidate_from_serving_pages(
-                paged,
-                &identity,
-                query,
-                before_checkpoint,
-                before_distance,
-                before_retain,
-                release_retained,
-            )?
-        {
-            #[cfg(feature = "test-seams")]
-            crate::mem::observe_native_score_identity_for_test(
-                identity.row_id,
-                identity.created_tx,
-                identity.lsn,
-                snapshot,
-                score,
-                None,
-            );
-            return Ok(Some(score));
-        }
         let loader = self.raw_loader.read().clone().ok_or_else(|| {
             E::from(Error::Other(
                 ("dormant raw vector candidate has no loader".to_string()).into(),
@@ -6937,7 +5545,6 @@ impl IndexState {
         row_id: RowId,
         snapshot: SnapshotId,
         query: &[f32],
-        paged: Option<&mut SealedPageScoring>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<Option<f32>> {
         let mut scratch = owner.scratch();
@@ -6948,7 +5555,6 @@ impl IndexState {
             snapshot,
             query,
             true,
-            paged,
             None,
             &mut || Ok::<(), Error>(()),
             &mut || Ok::<(), Error>(()),
@@ -6966,7 +5572,6 @@ impl IndexState {
         row_id: RowId,
         snapshot: SnapshotId,
         query: &[f32],
-        paged: Option<&mut SealedPageScoring>,
         before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
         before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -6983,7 +5588,6 @@ impl IndexState {
             snapshot,
             query,
             true,
-            paged,
             None,
             before_checkpoint,
             before_distance,
@@ -7001,7 +5605,6 @@ impl IndexState {
         row_id: RowId,
         snapshot: SnapshotId,
         query: &[f32],
-        paged: Option<&mut SealedPageScoring>,
         before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
         before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -7019,7 +5622,6 @@ impl IndexState {
             snapshot,
             query,
             true,
-            paged,
             None,
             before_checkpoint,
             before_distance,
@@ -7058,7 +5660,6 @@ impl IndexState {
             snapshot,
             query,
             true,
-            None,
             Some(bodies),
             before_checkpoint,
             before_distance,
@@ -7094,7 +5695,6 @@ impl IndexState {
             snapshot,
             query,
             true,
-            None,
             Some(bodies),
             before_checkpoint,
             before_distance,
@@ -7254,90 +5854,6 @@ impl IndexState {
         let row_id = entry.row_id;
         self.push_entry(entry);
         let _ = self.with_stored_by_row_id(row_id, after);
-    }
-
-    /// Extend a graph that was built fresh in this process. Loaded durable
-    /// generations use a separate sealed type and never reach this method.
-    ///
-    /// Memory is reserved before the vendor insertion. If that reservation or
-    /// insertion cannot complete, the old graph is retired so no query can
-    /// mistake a stale route for a complete one; the authoritative vectors
-    /// remain available to exact search and maintenance can build a new graph.
-    #[allow(
-        dead_code,
-        reason = "HNSW: the materialized-index insertion path goes with the HNSW index when it is replaced"
-    )]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn insert_into_materialized_hnsw(
-        &self,
-        index: &VectorIndexRef,
-        entry: &StoredVectorEntry,
-        fallback_accountant: Option<&dyn MemoryBudget>,
-    ) {
-        let Some(lock) = self.hnsw.get() else {
-            return;
-        };
-        let _publication = self.generation_publication.lock();
-        if self
-            .fresh_tail_replay_frontier_active
-            .load(Ordering::SeqCst)
-            && entry.lsn.0 <= self.fresh_tail_replayed_through_lsn.load(Ordering::SeqCst)
-        {
-            return;
-        }
-        let guard = lock.read();
-        let Some(hnsw) = guard.as_ref() else {
-            return;
-        };
-        let old_bytes = self.hnsw_bytes.load(Ordering::SeqCst);
-        let new_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            hnsw.len().saturating_add(1),
-            self.dimension,
-            self.quantization,
-            hnsw.policy_values().0,
-        );
-        let additional_bytes = new_bytes.saturating_sub(old_bytes);
-        let recorded_accountant = self.hnsw_accountant.read().clone();
-        let allocation = recorded_accountant
-            .as_deref()
-            .or(fallback_accountant)
-            .map(|accountant| {
-                if let Some(original) = recorded_accountant.as_ref() {
-                    let operation = crate::memory_budget::prepare_operation_label(original,
-                        format_args!("extend_hnsw@{}.{}", index.table, index.column))?;
-                    return accountant.try_allocate_for_label(additional_bytes, "vector_index", operation,
-                        "Reduce vector volume or raise MEMORY_LIMIT so committed vectors remain on the maintained indexed route.");
-                }
-                accountant.try_allocate_for(
-                    additional_bytes,
-                    "vector_index",
-                    &format!("extend_hnsw@{}.{}", index.table, index.column),
-                    "Reduce vector volume or raise MEMORY_LIMIT so committed vectors remain on the maintained indexed route.",
-                )
-            })
-            .transpose();
-        if allocation.is_err() {
-            drop(guard);
-            self.clear_hnsw_under_generation_publication(fallback_accountant);
-            return;
-        }
-        if let Err(_error) = hnsw.insert(entry) {
-            if additional_bytes != 0
-                && let Some(accountant) = recorded_accountant.as_deref().or(fallback_accountant)
-            {
-                accountant.release(additional_bytes);
-            }
-            drop(guard);
-            self.clear_hnsw_under_generation_publication(fallback_accountant);
-            return;
-        }
-        self.hnsw_bytes.store(new_bytes, Ordering::SeqCst);
-        self.fresh_tail_mutated_through_lsn
-            .fetch_max(entry.lsn.0, Ordering::SeqCst);
-        self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
     }
 
     fn tombstone_row(&self, row_id: RowId, deleted_tx: TxId) -> usize {
@@ -7513,140 +6029,6 @@ impl IndexState {
         released
     }
 
-    pub fn clear_hnsw(&self, accountant: &dyn MemoryBudget) {
-        self.clear_hnsw_with_optional_accountant(Some(accountant));
-    }
-
-    fn drop_hnsw_without_accounting(&self) {
-        self.clear_hnsw_with_optional_accountant(None);
-    }
-
-    fn clear_hnsw_with_optional_accountant(&self, accountant: Option<&dyn MemoryBudget>) {
-        let _publication = self.generation_publication.lock();
-        self.clear_hnsw_under_generation_publication(accountant);
-    }
-
-    fn clear_hnsw_under_generation_publication(&self, accountant: Option<&dyn MemoryBudget>) {
-        let bytes = self.remove_hnsw_graph();
-        let recorded_accountant = self.hnsw_accountant.write().take();
-        if bytes != 0 {
-            if let Some(accountant) = recorded_accountant {
-                accountant.release(bytes);
-            } else if let Some(accountant) = accountant {
-                accountant.release(bytes);
-            }
-        }
-        self.clear_sealed_hnsw();
-        *self.serving_policy.write() = None;
-        self.inspection_generation_id.store(0, Ordering::SeqCst);
-        self.inspection_base_tx.store(0, Ordering::SeqCst);
-        self.maintenance_sample_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_tx.store(0, Ordering::SeqCst);
-        self.maintenance_sample_lsn.store(0, Ordering::SeqCst);
-        self.maintenance_sample_origin.store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_replay_frontier_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_prior_replayed_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-    }
-
-    fn release_sealed_generation(generation: SealedHnswGeneration) {
-        drop(generation);
-    }
-
-    /// A loader transfers both reservations to this store only on successful
-    /// installation.  Every rejection path must hand them back here: dropping
-    /// the Rust values alone cannot return a budget reservation.
-    fn release_uninstalled_loaded_generation(loaded: LoadedVectorGraphGeneration) {
-        let LoadedVectorGraphGeneration {
-            graph,
-            resident_bytes,
-            accountant,
-            fresh_tail,
-            ..
-        } = loaded;
-        drop(graph);
-        if resident_bytes != 0 {
-            accountant.release(resident_bytes);
-        }
-        if let Some(LoadedVectorFreshTail {
-            graph,
-            resident_bytes,
-            accountant,
-            ..
-        }) = fresh_tail
-        {
-            drop(graph);
-            if resident_bytes != 0 {
-                accountant.release(resident_bytes);
-            }
-        }
-    }
-
-    fn layer_identity(
-        resident: Option<&SealedHnswGeneration>,
-        dormant: Option<&DormantSealedGeneration>,
-    ) -> Option<VectorGraphGeneration> {
-        dormant
-            .map(|generation| generation.descriptor.identity)
-            .or_else(|| resident.map(|generation| generation.identity))
-    }
-
-    fn retired_chain_base_identity(
-        chain: &RetiredSealedHnswChain,
-    ) -> Option<VectorGraphGeneration> {
-        Self::layer_identity(chain.base.as_ref(), chain.dormant_base.as_ref())
-    }
-
-    fn retired_chain_change_identity(
-        chain: &RetiredSealedHnswChain,
-    ) -> Option<VectorGraphGeneration> {
-        Self::layer_identity(chain.change.as_ref(), chain.dormant_change.as_ref())
-    }
-
-    fn retire_current_chain(sealed: &mut SealedHnswGenerations) {
-        if sealed.base.is_none()
-            && sealed.change.is_none()
-            && sealed.dormant_base.is_none()
-            && sealed.dormant_change.is_none()
-        {
-            return;
-        }
-        sealed.retired.push(RetiredSealedHnswChain {
-            base: sealed.base.take(),
-            change: sealed.change.take(),
-            dormant_base: sealed.dormant_base.take(),
-            dormant_change: sealed.dormant_change.take(),
-        });
-    }
-
-    fn selected_chain_location(
-        sealed: &SealedHnswGenerations,
-        snapshot_tx: TxId,
-    ) -> Option<SealedChainLocation> {
-        let current = Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
-            .filter(|identity| identity.covered_tx <= snapshot_tx)
-            .map(|identity| (identity, SealedChainLocation::Current));
-        sealed
-            .retired
-            .iter()
-            .filter_map(|chain| {
-                let identity = Self::retired_chain_base_identity(chain)?;
-                (identity.covered_tx <= snapshot_tx).then_some((
-                    identity,
-                    SealedChainLocation::Retired {
-                        base_generation_id: identity.generation_id,
-                    },
-                ))
-            })
-            .chain(current)
-            .max_by_key(|(identity, _)| (identity.covered_tx, identity.generation_id))
-            .map(|(_, location)| location)
-    }
-
     /// Capture durable serving metadata once, then freeze the actual registry
     /// serving chain when this is the writer's current physical publication.
     #[expect(
@@ -7662,3185 +6044,11 @@ impl IndexState {
         self.capture_serving_selection_with_work(snapshot, owner, &mut || true)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn capture_serving_selection_with_work(
-        &self,
-        snapshot: SnapshotId,
-        owner: &mut VectorCopyAdmission,
-        before_read: &mut dyn FnMut() -> bool,
-    ) -> Result<Option<Arc<CapturedVectorServingSelection>>> {
-        let Some(source) = self.durable_membership_source() else {
-            return Ok(None);
-        };
-        let mut retained = owner.scratch();
-        retained.reserve(
-            std::mem::size_of::<CapturedVectorServingSelection>()
-                .saturating_add(2 * std::mem::size_of::<usize>()),
-        )?;
-        let frozen_registry = {
-            let _publication = self.generation_publication.lock();
-            let sealed = self.sealed_hnsw.read();
-            let selected = Self::selected_chain_location(&sealed, TxId::from_snapshot(snapshot));
-            let (base, change, dormant_base, dormant_change) = match selected {
-                Some(SealedChainLocation::Current) => (
-                    sealed.base.as_ref(),
-                    sealed.change.as_ref(),
-                    sealed.dormant_base.as_ref(),
-                    sealed.dormant_change.as_ref(),
-                ),
-                Some(SealedChainLocation::Retired { base_generation_id }) => {
-                    let chain = sealed
-                        .retired
-                        .iter()
-                        .find(|chain| {
-                            Self::retired_chain_base_identity(chain).is_some_and(|identity| {
-                                identity.generation_id == base_generation_id
-                            })
-                        })
-                        .expect("selected serving chain is present while locked");
-                    (
-                        chain.base.as_ref(),
-                        chain.change.as_ref(),
-                        chain.dormant_base.as_ref(),
-                        chain.dormant_change.as_ref(),
-                    )
-                }
-                None => (None, None, None, None),
-            };
-            let frozen =
-                |dormant: Option<&DormantSealedGeneration>| dormant.map(|layer| layer.descriptor);
-            (
-                frozen(dormant_base),
-                frozen(dormant_change),
-                base.cloned(),
-                change.cloned(),
-                Self::layer_identity(base, dormant_base),
-                Self::layer_identity(change, dormant_change),
-            )
-        };
-        let mut selection = match source.capture_serving_selection_with_work(
-            snapshot,
-            frozen_registry.4.as_ref(),
-            frozen_registry.5.as_ref(),
-            owner,
-            before_read,
-        ) {
-            // A valid newer catalog cannot serve this old snapshot. Its raw
-            // memberships still can, after compatible graphs are reclaimed.
-            Err(Error::VectorIndexedRouteUnavailable { .. }) => return Ok(None),
-            result => result?,
-        };
-        selection._copy_owner = Some(retained);
-        let dormant = if selection.inspection.captured_catalog
-            || selection.base.is_some()
-            || selection.change.is_some()
-        {
-            None
-        } else {
-            let (base, change, resident_base, resident_change, base_identity, change_identity) =
-                frozen_registry;
-            let resident = selection.resident.get_mut();
-            resident.base = resident_base;
-            resident.change = resident_change;
-            selection.inspection.base = base_identity;
-            selection.inspection.change = change_identity;
-            Some((base, change))
-        };
-        // The frozen serving identities reach the root supplier exactly once,
-        // before any dormant layer binds, so the supplier classifies each
-        // dormant descriptor as base or change by identity -- including a
-        // dormant change over a resident base -- not by call order.
-        if let Some(tail) = &selection.streamed_tail {
-            tail.validate()?;
-        } else {
-            selection.suffix = Some(selection.suffix_source.bind_serving_frontier(
-                selection.inspection.base,
-                selection.inspection.change,
-                owner,
-            )?);
-        }
-        if let Some((base, change)) = dormant {
-            selection.base = base
-                .as_ref()
-                .map(|descriptor| {
-                    selection
-                        .suffix_source
-                        .bind_serving_layer(descriptor, owner)
-                })
-                .transpose()?;
-            selection.change = change
-                .as_ref()
-                .map(|descriptor| {
-                    selection
-                        .suffix_source
-                        .bind_serving_layer(descriptor, owner)
-                })
-                .transpose()?;
-        }
-        Ok(Some(Arc::new(selection)))
-    }
-
-    /// Load only operation-owned suppliers. A completed graph never changes
-    /// the global registry, publication revision, or mutable tail.
-    /// A share of this partition's current-chain layer with `identity`,
-    /// loading it through the store's retained loader when it is dormant.
-    /// Ownership: the store owns the charge from its load on (one owner);
-    /// the selection holds an `Arc` share and no charge, so a later retirement
-    /// leaves the selection serving its captured snapshot. A store refusal is
-    /// recorded on the selection and answered `None`.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn share_current_store_layer<E>(
-        &self,
-        selection: &CapturedVectorServingSelection,
-        is_base: bool,
-        identity: VectorGraphGeneration,
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<Option<SealedHnswGeneration>, E>
-    where
-        E: From<Error>,
-    {
-        let resident_now = |this: &Self| {
-            let sealed = this.sealed_hnsw.read();
-            let slot = if is_base {
-                sealed.base.as_ref()
-            } else {
-                sealed.change.as_ref()
-            };
-            slot.filter(|generation| generation.identity == identity)
-                .cloned()
-        };
-        if let Some(shared) = resident_now(self) {
-            return Ok(Some(shared));
-        }
-        let dormant_matches = {
-            let sealed = self.sealed_hnsw.read();
-            let dormant = if is_base {
-                sealed.dormant_base.as_ref()
-            } else {
-                sealed.dormant_change.as_ref()
-            };
-            dormant.is_some_and(|dormant| dormant.descriptor.identity == identity)
-        };
-        if !dormant_matches {
-            return Ok(None);
-        }
-        // The caller's own refusals (cancellation, its statement ceiling) are
-        // captured and re-raised as themselves; only the store's refusal to
-        // retain the graph is recorded and answered by the selection's loader.
-        let control: RefCell<Option<E>> = RefCell::new(None);
-        let loaded = {
-            let mut checkpoint = || -> Result<()> {
-                before_checkpoint().map_err(|error| {
-                    *control.borrow_mut() = Some(error);
-                    Error::Other(("the caller stopped this load".to_string()).into())
-                })
-            };
-            let mut retain = |bytes: usize| -> Result<()> {
-                before_retain(bytes).map_err(|error| {
-                    *control.borrow_mut() = Some(error);
-                    Error::Other(("the caller does not admit this load".to_string()).into())
-                })
-            };
-            self.preload_dormant_sealed_generation_with::<Error>(
-                is_base,
-                true,
-                &mut checkpoint,
-                &mut retain,
-                release_retained,
-            )
-        };
-        if let Some(error) = control.into_inner() {
-            return Err(error);
-        }
-        match loaded {
-            Ok(_) => Ok(resident_now(self)),
-            Err(error @ Error::MemoryBudgetExceeded { .. }) => {
-                selection.retention_refusal.lock()[usize::from(!is_base)] = Some(error);
-                Ok(None)
-            }
-            Err(error) => Err(E::from(error)),
-        }
-    }
-
-    pub(crate) fn preload_captured_serving_selection<E>(
-        &self,
-        selection: &CapturedVectorServingSelection,
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<(), E>
-    where
-        E: From<Error>,
-    {
-        // A preload is atomic within this operation's captured selection.
-        // Roll back only newly installed slots; frozen resident layers remain.
-        struct PreloadRollback<'a> {
-            selection: &'a CapturedVectorServingSelection,
-            base_present: bool,
-            change_present: bool,
-            suffix_loaded: bool,
-            committed: bool,
-        }
-        impl Drop for PreloadRollback<'_> {
-            fn drop(&mut self) {
-                if self.committed {
-                    return;
-                }
-                let removed = {
-                    let mut resident = self.selection.resident.lock();
-                    let base = if self.base_present {
-                        None
-                    } else {
-                        resident.base.take()
-                    };
-                    let change = if self.change_present {
-                        None
-                    } else {
-                        resident.change.take()
-                    };
-                    let suffix = if self.suffix_loaded {
-                        None
-                    } else {
-                        resident.suffix.take()
-                    };
-                    resident.suffix_loaded = self.suffix_loaded;
-                    (base, change, suffix)
-                };
-                // Free graphs and their final-holder credits outside the lock.
-                drop(removed);
-            }
-        }
-        let mut rollback = {
-            let resident = selection.resident.lock();
-            PreloadRollback {
-                selection,
-                base_present: resident.base.is_some(),
-                change_present: resident.change.is_some(),
-                suffix_loaded: resident.suffix_loaded,
-                committed: false,
-            }
-        };
-        for (is_base, layer) in [
-            (true, selection.base.as_ref()),
-            (false, selection.change.as_ref()),
-        ] {
-            let Some(layer) = layer else {
-                continue;
-            };
-            let already_loaded = {
-                let resident = selection.resident.lock();
-                if is_base {
-                    resident.base.is_some()
-                } else {
-                    resident.change.is_some()
-                }
-            };
-            if already_loaded {
-                continue;
-            }
-            // One load per generation per find: a layer of the store's current
-            // chain is loaded once by the store's retained loader, and the
-            // selection holds a share of it. The selection's own loader runs
-            // only when the store refuses to retain it, or for a retired chain.
-            if let Some(shared) = self.share_current_store_layer(
-                selection,
-                is_base,
-                layer.descriptor.identity,
-                before_checkpoint,
-                before_retain,
-                release_retained,
-            )? {
-                let mut resident = selection.resident.lock();
-                let slot = if is_base {
-                    &mut resident.base
-                } else {
-                    &mut resident.change
-                };
-                if slot.is_none() {
-                    *slot = Some(shared);
-                }
-                continue;
-            }
-            let dormant = DormantSealedGeneration {
-                descriptor: layer.descriptor,
-                loader: Arc::clone(&layer.loader),
-            };
-            let reason = if is_base {
-                VectorRouteQuarantineReason::CorruptBase
-            } else {
-                VectorRouteQuarantineReason::CorruptChanges
-            };
-            let loaded = self.load_dormant_generation(
-                &dormant,
-                reason,
-                true,
-                before_checkpoint,
-                before_retain,
-                release_retained,
-            )?;
-            let LoadedVectorGraphGeneration {
-                graph,
-                resident_bytes,
-                accountant,
-                caller_adopted_bytes: _,
-                fresh_tail,
-            } = loaded;
-            // The suffix has its own saved admission and root-local loader.
-            // Legacy generation loaders may return an additional replay graph;
-            // it is released here and never becomes the global mutable layer.
-            if let Some(LoadedVectorFreshTail {
-                graph,
-                resident_bytes,
-                accountant,
-                ..
-            }) = fresh_tail
-            {
-                drop(graph);
-                accountant.release(resident_bytes);
-            }
-            let generation = SealedHnswGeneration::new(
-                layer.descriptor.identity,
-                graph,
-                resident_bytes,
-                Some(accountant),
-            );
-            let mut resident = selection.resident.lock();
-            let slot = if is_base {
-                &mut resident.base
-            } else {
-                &mut resident.change
-            };
-            if slot.is_none() {
-                *slot = Some(generation);
-            }
-        }
-        if selection.resident.lock().suffix_loaded {
-            rollback.committed = true;
-            return Ok(());
-        }
-        before_checkpoint()?;
-        let suffix = selection
-            .suffix
-            .as_ref()
-            .expect("serving suffix bound before preload");
-        let initial = suffix.load_bytes;
-        before_retain(initial)?;
-        let mut reserved = initial;
-        let mut interrupted = None;
-        let loaded = suffix.loader.load(initial, &mut |request| {
-            if interrupted.is_some() {
-                return false;
-            }
-            let result = match request {
-                DormantVectorLoadRequest::Checkpoint
-                | DormantVectorLoadRequest::Progress { .. } => before_checkpoint(),
-                DormantVectorLoadRequest::Reserve(bytes) => match before_checkpoint() {
-                    Err(error) => Err(error),
-                    Ok(()) => match reserved.checked_add(bytes) {
-                        Some(total) => before_retain(bytes).map(|()| reserved = total),
-                        None => Err(E::from(Error::StoreCorrupted {
-                            path: "vector suffix".into(),
-                            reason: "suffix load reservation overflow".into(),
-                        })),
-                    },
-                },
-            };
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    interrupted = Some(error);
-                    false
-                }
-            }
-        });
-        let loaded = match loaded {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                release_retained(reserved);
-                if interrupted.is_none() && matches!(error, Error::StoreCorrupted { .. }) {
-                    // The saved suffix failed its integrity check. Quarantine
-                    // the route as the dormant loader does, so indexed reads
-                    // report it, exact reads still answer and maintenance
-                    // repairs it.
-                    self.set_route_quarantine(VectorRouteQuarantineReason::CorruptChanges);
-                }
-                return Err(interrupted.unwrap_or_else(|| E::from(error)));
-            }
-        };
-        let resident_bytes = loaded.tail.as_ref().map_or(0, |tail| tail.resident_bytes);
-        if loaded.caller_adopted_bytes > resident_bytes || loaded.caller_adopted_bytes > reserved {
-            if let Some(tail) = loaded.tail {
-                tail.accountant.release(tail.resident_bytes);
-            }
-            release_retained(reserved.saturating_sub(loaded.caller_adopted_bytes));
-            return Err(E::from(Error::StoreCorrupted {
-                path: "vector suffix".into(),
-                reason: "suffix caller ownership exceeds its admitted residency".into(),
-            }));
-        }
-        release_retained(reserved - loaded.caller_adopted_bytes);
-        let suffix = loaded.tail.map(|tail| {
-            Arc::new(CapturedSuffixContents {
-                graph: tail.graph,
-                _charge: PaidRetainedMemoryCharge::new(tail.resident_bytes, tail.accountant),
-            })
-        });
-        if let Some(error) = interrupted {
-            drop(suffix);
-            return Err(error);
-        }
-        before_checkpoint()?;
-        let mut resident = selection.resident.lock();
-        if !resident.suffix_loaded {
-            resident.suffix = suffix;
-            resident.suffix_loaded = true;
-        }
-        rollback.committed = true;
-        Ok(())
-    }
-
-    /// Topology of the published chain selected for this snapshot, without
-    /// loading any graph. Pending replacements never describe serving work.
-    pub fn snapshot_serving_policy(&self, snapshot: SnapshotId) -> Option<VectorServingPolicy> {
-        let snapshot_tx = TxId::from_snapshot(snapshot);
-        let sealed = self.sealed_hnsw.read();
-        let generation = match Self::selected_chain_location(&sealed, snapshot_tx) {
-            Some(SealedChainLocation::Current) => {
-                Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
-            }
-            Some(SealedChainLocation::Retired { base_generation_id }) => sealed
-                .retired
-                .iter()
-                .filter_map(Self::retired_chain_base_identity)
-                .find(|identity| identity.generation_id == base_generation_id),
-            None => {
-                return self
-                    .tail_serves_snapshot(snapshot_tx)
-                    .then(|| self.serving_policy())
-                    .flatten();
-            }
-        }?;
-        Some(VectorServingPolicy {
-            hnsw_m: generation.hnsw_m as usize,
-            hnsw_ef_construction: generation.hnsw_ef_construction as usize,
-            policy_revision: generation.policy_revision,
-        })
-    }
-
-    /// What AUTO's statement cost reads from this partition at `snapshot`, for
-    /// a caller that predicts the route without executing it. `unbuilt_hnsw_m`
-    /// is the resolved policy's degree, used when no graph serves the snapshot.
-    pub fn auto_partition_cost(
-        &self,
-        snapshot: SnapshotId,
-        allowed: usize,
-        live: usize,
-        unbuilt_hnsw_m: usize,
-        flat: bool,
-    ) -> crate::mem::AutoPartitionCost {
-        crate::mem::AutoPartitionCost {
-            allowed,
-            live,
-            hnsw_m: self
-                .snapshot_serving_policy(snapshot)
-                .map_or(unbuilt_hnsw_m, |serving| serving.hnsw_m),
-            dormant_layers: self.dormant_layer_count_for_snapshot(snapshot),
-            streams_raw_bodies: self.streams_raw_bodies(),
-            flat,
-        }
-    }
-
-    /// How many saved layers this snapshot still has to load: its base and
-    /// its change are a load each.
-    pub(crate) fn dormant_layer_count_for_snapshot(&self, snapshot: SnapshotId) -> usize {
-        self.dormant_bytes_for_snapshot(snapshot, |_| 1)
-    }
-
-    pub(crate) fn dormant_load_bytes_for_snapshot(&self, snapshot: SnapshotId) -> usize {
-        self.dormant_bytes_for_snapshot(snapshot, |dormant| dormant.descriptor.reclaim_bytes)
-    }
-
-    /// What the saved graphs this snapshot still has to load occupy: the
-    /// most serving pages their loads could use.
-    pub(crate) fn dormant_page_bytes_for_snapshot(&self, snapshot: SnapshotId) -> usize {
-        self.dormant_bytes_for_snapshot(snapshot, |dormant| {
-            usize::try_from(dormant.descriptor.identity.durable_bytes).unwrap_or(usize::MAX)
-        })
-    }
-
-    fn dormant_bytes_for_snapshot(
-        &self,
-        snapshot: SnapshotId,
-        bytes: fn(&DormantSealedGeneration) -> usize,
-    ) -> usize {
-        let missing_bytes =
-            |resident: Option<&SealedHnswGeneration>, dormant: Option<&DormantSealedGeneration>| {
-                dormant
-                    .filter(|dormant| {
-                        !resident.is_some_and(|resident| {
-                            resident.identity == dormant.descriptor.identity
-                        })
-                    })
-                    .map_or(0, bytes)
-            };
-
-        let sealed = self.sealed_hnsw.read();
-        match Self::selected_chain_location(&sealed, TxId::from_snapshot(snapshot)) {
-            Some(SealedChainLocation::Current) => {
-                missing_bytes(sealed.base.as_ref(), sealed.dormant_base.as_ref()).saturating_add(
-                    missing_bytes(sealed.change.as_ref(), sealed.dormant_change.as_ref()),
-                )
-            }
-            Some(SealedChainLocation::Retired { base_generation_id }) => sealed
-                .retired
-                .iter()
-                .find(|chain| {
-                    Self::retired_chain_base_identity(chain)
-                        .is_some_and(|base| base.generation_id == base_generation_id)
-                })
-                .map_or(0, |chain| {
-                    missing_bytes(chain.base.as_ref(), chain.dormant_base.as_ref()).saturating_add(
-                        missing_bytes(chain.change.as_ref(), chain.dormant_change.as_ref()),
-                    )
-                }),
-            None => 0,
-        }
-    }
-
-    fn reset_after_broken_catalog_retirement(&self, accountant: &dyn MemoryBudget) {
-        let _publication = self.generation_publication.lock();
-        let bytes = self.remove_hnsw_graph();
-        let recorded_owner = self.hnsw_accountant.write().take();
-        if bytes != 0 {
-            if let Some(owner) = recorded_owner {
-                owner.release(bytes);
-            } else {
-                accountant.release(bytes);
-            }
-        }
-        // Move existing generation owners, never clone payloads or discard
-        // retired chains that an older operation can still select.
-        let mut sealed = self.sealed_hnsw.write();
-        Self::retire_current_chain(&mut sealed);
-        sealed.pending_base = None;
-        sealed.quarantine = None;
-        drop(sealed);
-        *self.serving_policy.write() = None;
-        self.inspection_generation_id.store(0, Ordering::SeqCst);
-        self.inspection_base_tx.store(0, Ordering::SeqCst);
-        self.maintenance_sample_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_tx.store(0, Ordering::SeqCst);
-        self.maintenance_sample_lsn.store(0, Ordering::SeqCst);
-        self.maintenance_sample_origin.store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_replay_frontier_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_prior_replayed_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.clear_maintenance_failure();
-    }
-
-    fn clear_sealed_hnsw(&self) {
-        let mut sealed = self.sealed_hnsw.write();
-        let base = sealed.base.take();
-        let change = sealed.change.take();
-        let retired = std::mem::take(&mut sealed.retired);
-        sealed.dormant_base = None;
-        sealed.dormant_change = None;
-        sealed.pending_base = None;
-        sealed.pending_generation_count = 0;
-        sealed.quarantine = None;
-        for generation in base.into_iter().chain(change) {
-            Self::release_sealed_generation(generation);
-        }
-        for chain in retired {
-            for generation in chain.base.into_iter().chain(chain.change) {
-                Self::release_sealed_generation(generation);
-            }
-        }
-    }
-
-    fn remove_hnsw_graph(&self) -> usize {
-        if let Some(lock) = self.hnsw.get() {
-            *lock.write() = None;
-        }
-        self.fresh_tail_replayed_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.fresh_tail_replay_frontier_active
-            .store(false, Ordering::SeqCst);
-        self.fresh_tail_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-        self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-        self.tail_frontier_tx
-            .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-        self.hnsw_bytes.swap(0, Ordering::SeqCst)
-    }
-
-    pub fn hnsw_len(&self) -> Option<usize> {
-        self.hnsw_len_after_tail(|| {})
-    }
-
-    fn hnsw_len_after_tail(&self, after_tail: impl FnOnce()) -> Option<usize> {
-        // Base publication also retires the old tail. Sample both owners
-        // under that same boundary so one node cannot be counted twice.
-        let _publication = self.generation_publication.lock();
-        let tail = self
-            .hnsw
-            .get()
-            .and_then(|lock| lock.read().as_ref().map(|hnsw| hnsw.len()));
-        after_tail();
-        let sealed = self.sealed_hnsw.read();
-        let sealed_len = sealed
-            .base
-            .as_ref()
-            .map(|generation| generation.graph().len())
-            .unwrap_or(0)
-            .saturating_add(
-                sealed
-                    .change
-                    .as_ref()
-                    .map(|generation| generation.graph().len())
-                    .unwrap_or(0),
-            );
-        let total = sealed_len.saturating_add(tail.unwrap_or(0));
-        (total != 0).then_some(total)
-    }
-
-    pub(crate) fn has_complete_hnsw_route(&self) -> bool {
-        let tail_ready = self
-            .hnsw
-            .get()
-            .and_then(|tail| tail.read().as_ref().map(|graph| !graph.is_empty()))
-            .unwrap_or(false)
-            && self.serving_policy().is_some()
-            && !self.maintenance_sample_active.load(Ordering::SeqCst);
-        let sealed = self.sealed_hnsw.read();
-        if sealed.quarantine.is_some() {
-            return false;
-        }
-        let base_known = sealed.base.is_some() || sealed.dormant_base.is_some();
-        let change_known = sealed.change.is_some() || sealed.dormant_change.is_some();
-        base_known || (!change_known && tail_ready)
-    }
-
-    /// Observe the saved layers through this operation's captured source.
-    /// Only topology diagnostics walk nodes; stats/length/serial use the
-    /// authenticated graph progress. No diagnostic installs a resident graph.
-    #[cfg(any(test, feature = "test-seams"))]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn captured_hnsw_observation_for_test(
-        &self,
-        snapshot: SnapshotId,
-        owner: &mut VectorCopyAdmission,
-        topology: bool,
-    ) -> Result<Option<(crate::HnswGraphStats, usize, u64, u64)>> {
-        let Some(selection) = self.capture_serving_selection(snapshot, owner)? else {
-            return Ok(None);
-        };
-        let mut stats = crate::HnswGraphStats {
-            point_count: 0,
-            layer0_points: 0,
-            layer0_neighbor_edges: 0,
-            max_level_observed: 0,
-            dimension: 0,
-        };
-        let mut len = 0usize;
-        let mut digest = 0xcbf2_9ce4_8422_2325u64;
-        let mut serial = 0u64;
-        let mut page_owner = owner.scratch();
-        let mut observe = |graph: &HnswIndex, generation: u64| -> Result<()> {
-            let next = graph.graph_stats();
-            stats.point_count += next.point_count;
-            stats.layer0_points += next.layer0_points;
-            stats.layer0_neighbor_edges += next.layer0_neighbor_edges;
-            stats.max_level_observed = stats.max_level_observed.max(next.max_level_observed);
-            stats.dimension = next.dimension;
-            len += graph.len();
-            serial = if serial == 0 {
-                generation
-            } else {
-                serial.wrapping_mul(0x100_0000_01b3) ^ generation
-            };
-            if topology {
-                digest = digest.wrapping_mul(0x100_0000_01b3)
-                    ^ graph.graph_topology_digest_with_owner_for_test(&mut page_owner)?;
-            }
-            Ok(())
-        };
-        for (base, layer) in [
-            (true, selection.base.as_ref()),
-            (false, selection.change.as_ref()),
-        ] {
-            if let Some(layer) = layer {
-                // A loader returns a finite paged handle. Keep its reservation
-                // until that handle and all decoded values have been freed.
-                let mut reservation = owner.scratch();
-                reservation.reserve(layer.descriptor.load_bytes)?;
-                let loaded = with_copy_admission(&mut reservation, |request| {
-                    layer
-                        .loader
-                        .load(layer.descriptor, layer.descriptor.load_bytes, request)
-                })?;
-                observe(&loaded.graph, layer.descriptor.identity.generation_id)?;
-                drop(loaded);
-            } else {
-                let resident = selection.resident.lock();
-                let generation = if base {
-                    resident.base.as_ref()
-                } else {
-                    resident.change.as_ref()
-                };
-                if let Some(generation) = generation {
-                    observe(generation.graph(), generation.identity.generation_id)?;
-                }
-            }
-        }
-        Ok((serial != 0).then_some((stats, len, digest, serial)))
-    }
-
-    pub fn hnsw_stats(&self) -> Option<crate::HnswGraphStats> {
-        self.hnsw
-            .get()
-            .and_then(|lock| lock.read().as_ref().map(|hnsw| hnsw.graph_stats()))
-    }
-
-    /// Record a verified catalog entry without reading its graph pages.  The
-    /// replacement is only metadata, so it never affects a currently serving
-    /// resident graph.  The engine chooses when the catalog pointer itself is
-    /// durable; this store only makes the descriptor visible atomically.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn register_dormant_sealed_generation(
-        &self,
-        is_base: bool,
-        descriptor: DormantVectorGraphGeneration,
-        loader: Arc<dyn DormantVectorGraphLoader>,
-    ) -> Result<()> {
-        if descriptor.load_bytes < descriptor.resident_bytes
-            || descriptor.reclaim_bytes < descriptor.resident_bytes
-        {
-            return Err(Error::Other(
-                ("dormant vector load admission is smaller than resident ownership".to_string())
-                    .into(),
-            ));
-        }
-        let mut sealed = self.sealed_hnsw.write();
-        let current_identity = if is_base {
-            Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
-        } else {
-            Self::layer_identity(sealed.change.as_ref(), sealed.dormant_change.as_ref())
-        };
-        if current_identity
-            .is_some_and(|current| current.generation_id > descriptor.identity.generation_id)
-        {
-            return Err(Error::Other(
-                ("refusing to replace a newer dormant vector generation with an older one"
-                    .to_string())
-                .into(),
-            ));
-        }
-        if !is_base
-            && current_identity
-                .is_some_and(|current| current.generation_id != descriptor.identity.generation_id)
-        {
-            return Err(Error::Other(
-                ("a vector change generation can only be superseded by a replacement base"
-                    .to_string())
-                .into(),
-            ));
-        }
-        let has_current_chain = sealed.base.is_some()
-            || sealed.change.is_some()
-            || sealed.dormant_base.is_some()
-            || sealed.dormant_change.is_some();
-        if is_base
-            && has_current_chain
-            && current_identity
-                .is_none_or(|current| current.generation_id != descriptor.identity.generation_id)
-        {
-            if sealed.pending_base.as_ref().is_some_and(|pending| {
-                pending.descriptor.identity.generation_id > descriptor.identity.generation_id
-            }) {
-                return Err(Error::Other(
-                    ("refusing to replace a newer pending vector base with an older one"
-                        .to_string())
-                    .into(),
-                ));
-            }
-            let was_absent = sealed.pending_base.is_none();
-            sealed.pending_base = Some(DormantSealedGeneration { descriptor, loader });
-            if was_absent {
-                sealed.pending_generation_count = sealed.pending_generation_count.saturating_add(1);
-            }
-            return Ok(());
-        }
-        let resident_matches = if is_base {
-            sealed
-                .base
-                .as_ref()
-                .is_some_and(|generation| generation.identity == descriptor.identity)
-        } else {
-            sealed
-                .change
-                .as_ref()
-                .is_some_and(|generation| generation.identity == descriptor.identity)
-        };
-        let target = if is_base {
-            &mut sealed.dormant_base
-        } else {
-            &mut sealed.dormant_change
-        };
-        let was_absent = target.is_none();
-        *target = Some(DormantSealedGeneration { descriptor, loader });
-        if was_absent && !resident_matches {
-            sealed.pending_generation_count = sealed.pending_generation_count.saturating_add(1);
-        }
-        drop(sealed);
-        self.set_serving_policy_from_generation(descriptor.identity);
-        Ok(())
-    }
-
-    /// Install an owned sealed graph after a codec has fully verified it and
-    /// reserved its resident bytes.  A loaded graph is never inserted into:
-    /// future commits extend only `hnsw`, the fresh process-created tail.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn install_loaded_sealed_generation(
-        &self,
-        is_base: bool,
-        identity: VectorGraphGeneration,
-        loaded: LoadedVectorGraphGeneration,
-    ) -> Result<()> {
-        let _publication = self.generation_publication.lock();
-        self.install_loaded_sealed_generation_inner(is_base, identity, loaded, false)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn install_loaded_sealed_generation_inner(
-        &self,
-        is_base: bool,
-        identity: VectorGraphGeneration,
-        loaded: LoadedVectorGraphGeneration,
-        preserve_dormant_descriptor: bool,
-    ) -> Result<()> {
-        if loaded.resident_bytes == 0 && !loaded.graph.is_empty() {
-            Self::release_uninstalled_loaded_generation(loaded);
-            return Err(Error::Other(
-                ("loaded vector generation has graph entries but no reserved resident bytes"
-                    .to_string())
-                .into(),
-            ));
-        }
-        if loaded
-            .fresh_tail
-            .as_ref()
-            .is_some_and(|tail| tail.resident_bytes == 0 && !tail.graph.is_empty())
-        {
-            Self::release_uninstalled_loaded_generation(loaded);
-            return Err(Error::Other(
-                ("loaded vector tail has graph entries but no reserved resident bytes".to_string())
-                    .into(),
-            ));
-        }
-        let LoadedVectorGraphGeneration {
-            graph,
-            resident_bytes,
-            accountant,
-            caller_adopted_bytes: _,
-            mut fresh_tail,
-        } = loaded;
-        // A row commit already admitted and validated insertion against this
-        // fresh graph. A concurrent sealed-page eviction/reload may refresh the
-        // base, but must not replace that insertion target before publication.
-        if self.fresh_tail_preparations.load(Ordering::SeqCst) != 0
-            && let Some(tail) = fresh_tail.take()
-        {
-            tail.accountant.release(tail.resident_bytes);
-        }
-        let mut sealed = self.sealed_hnsw.write();
-        let current_generation_id = if is_base {
-            Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
-                .map(|identity| identity.generation_id)
-        } else {
-            Self::layer_identity(sealed.change.as_ref(), sealed.dormant_change.as_ref())
-                .map(|identity| identity.generation_id)
-        };
-        if current_generation_id.is_some_and(|current| current > identity.generation_id) {
-            Self::release_uninstalled_loaded_generation(LoadedVectorGraphGeneration {
-                graph,
-                resident_bytes,
-                accountant,
-                caller_adopted_bytes: 0,
-                fresh_tail,
-            });
-            return Err(Error::Other(
-                ("refusing to install an older sealed vector generation".to_string()).into(),
-            ));
-        }
-        if !is_base
-            && current_generation_id.is_some_and(|current| current != identity.generation_id)
-        {
-            Self::release_uninstalled_loaded_generation(LoadedVectorGraphGeneration {
-                graph,
-                resident_bytes,
-                accountant,
-                caller_adopted_bytes: 0,
-                fresh_tail,
-            });
-            return Err(Error::Other(
-                ("a sealed vector change can only be superseded by a replacement base".to_string())
-                    .into(),
-            ));
-        }
-        let incoming = SealedHnswGeneration::new(identity, graph, resident_bytes, Some(accountant));
-        self.install_incoming_sealed_generation_locked(
-            &mut sealed,
-            is_base,
-            identity,
-            current_generation_id,
-            incoming,
-            preserve_dormant_descriptor,
-        );
-        drop(sealed);
-        self.finish_sealed_installation(identity, fresh_tail, true);
-        Ok(())
-    }
-
-    /// The installation half shared by a load and an adoption, under the
-    /// publication lock and the registry's write side.
-    fn install_incoming_sealed_generation_locked(
-        &self,
-        sealed: &mut parking_lot::RwLockWriteGuard<'_, SealedHnswGenerations>,
-        is_base: bool,
-        identity: VectorGraphGeneration,
-        current_generation_id: Option<u64>,
-        incoming: SealedHnswGeneration,
-        preserve_dormant_descriptor: bool,
-    ) {
-        let installing_pending_base = is_base
-            && sealed
-                .pending_base
-                .as_ref()
-                .is_some_and(|pending| pending.descriptor.identity == identity);
-        if is_base
-            && (installing_pending_base
-                || current_generation_id.is_some_and(|current| current != identity.generation_id))
-        {
-            Self::retire_current_chain(sealed);
-        }
-        if installing_pending_base {
-            sealed.dormant_base = sealed.pending_base.take();
-        }
-        let old = if is_base {
-            sealed.base.replace(incoming)
-        } else {
-            sealed.change.replace(incoming)
-        };
-        if let Some(old) = old {
-            Self::release_sealed_generation(old);
-        }
-        if !preserve_dormant_descriptor {
-            if is_base {
-                sealed.dormant_base = None;
-            } else {
-                sealed.dormant_change = None;
-            }
-        }
-        sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
-    }
-
-    /// What follows an installation once the registry's write side is
-    /// released: the serving policy, and a load's replayed fresh tail.
-    fn finish_sealed_installation(
-        &self,
-        identity: VectorGraphGeneration,
-        fresh_tail: Option<LoadedVectorFreshTail>,
-        loaded: bool,
-    ) {
-        #[cfg(not(any(test, feature = "test-seams")))]
-        let _ = loaded;
-        self.set_serving_policy_from_generation(identity);
-        if let Some(tail) = fresh_tail {
-            let LoadedVectorFreshTail {
-                graph,
-                resident_bytes,
-                accountant,
-                replayed_through_lsn,
-            } = tail;
-            let prior_bytes = self.remove_hnsw_graph();
-            if prior_bytes != 0
-                && let Some(prior_accountant) = self.hnsw_accountant.write().take()
-            {
-                prior_accountant.release(prior_bytes);
-            }
-            self.set_hnsw(Some(graph), resident_bytes);
-            self.set_hnsw_bytes_with_accountant(resident_bytes, accountant);
-            self.fresh_tail_replayed_through_lsn
-                .store(replayed_through_lsn.0, Ordering::SeqCst);
-            self.fresh_tail_replay_frontier_active
-                .store(true, Ordering::SeqCst);
-            self.fresh_tail_mutated_through_lsn
-                .store(replayed_through_lsn.0, Ordering::SeqCst);
-        }
-        #[cfg(any(test, feature = "test-seams"))]
-        if loaded {
-            self.note_passive_activity(|activity| {
-                activity
-                    .sealed_generation_loads
-                    .fetch_add(1, Ordering::SeqCst);
-            });
-        }
-    }
-
-    /// Build preparation completes before this call.  Publication swaps the
-    /// complete replacement base under one lock, then starts with no mutable
-    /// tail; callers may create and populate that tail only after the commit
-    /// that made its change journal durable.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn publish_replacement_base_generation(
-        &self,
-        identity: VectorGraphGeneration,
-        loaded: LoadedVectorGraphGeneration,
-    ) -> Result<()> {
-        let _publication = self.generation_publication.lock();
-        self.install_loaded_sealed_generation_inner(true, identity, loaded, false)?;
-        let old_tail_bytes = self.remove_hnsw_graph();
-        if old_tail_bytes != 0
-            && let Some(accountant) = self.hnsw_accountant.write().take()
-        {
-            accountant.release(old_tail_bytes);
-        }
-        Ok(())
-    }
-
-    /// The engine calls this only while holding its snapshot-removal guard.
-    /// Retain exactly the retired chains selected by registered snapshots.
-    /// Newer readers do not pin older chains that they cannot select.
-    #[doc(hidden)]
-    pub fn reclaim_snapshot_free_graph_generations(
-        &self,
-        registered_snapshots: &[SnapshotId],
-    ) -> usize {
-        let mut sealed = self.sealed_hnsw.write();
-        let needed = registered_snapshots
-            .iter()
-            .filter_map(|snapshot| {
-                match Self::selected_chain_location(&sealed, TxId::from_snapshot(*snapshot)) {
-                    Some(SealedChainLocation::Retired { base_generation_id }) => {
-                        Some(base_generation_id)
-                    }
-                    _ => None,
-                }
-            })
-            .collect::<HashSet<_>>();
-        let retired = std::mem::take(&mut sealed.retired);
-        let mut count = 0usize;
-        for chain in retired {
-            if Self::retired_chain_base_identity(&chain)
-                .is_some_and(|base| needed.contains(&base.generation_id))
-            {
-                sealed.retired.push(chain);
-                continue;
-            }
-            if chain.base.is_none() && chain.dormant_base.is_some() {
-                sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
-            }
-            if chain.change.is_none() && chain.dormant_change.is_some() {
-                sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
-            }
-            count = count
-                .saturating_add(usize::from(
-                    chain.base.is_some() || chain.dormant_base.is_some(),
-                ))
-                .saturating_add(usize::from(
-                    chain.change.is_some() || chain.dormant_change.is_some(),
-                ));
-            for generation in chain.base.into_iter().chain(chain.change) {
-                Self::release_sealed_generation(generation);
-            }
-        }
-        count
-    }
-
-    fn snapshot_retained_chain_ids(&self, snapshots: &[SnapshotId]) -> Vec<(u64, Option<u64>)> {
-        let sealed = self.sealed_hnsw.read();
-        snapshots
-            .iter()
-            .filter_map(|snapshot| {
-                match Self::selected_chain_location(&sealed, TxId::from_snapshot(*snapshot))? {
-                    SealedChainLocation::Current => {
-                        let base = Self::layer_identity(
-                            sealed.base.as_ref(),
-                            sealed.dormant_base.as_ref(),
-                        )?;
-                        let change = Self::layer_identity(
-                            sealed.change.as_ref(),
-                            sealed.dormant_change.as_ref(),
-                        );
-                        Some((
-                            base.generation_id,
-                            change.map(|change| change.generation_id),
-                        ))
-                    }
-                    SealedChainLocation::Retired { base_generation_id } => {
-                        let chain = sealed.retired.iter().find(|chain| {
-                            Self::retired_chain_base_identity(chain)
-                                .is_some_and(|base| base.generation_id == base_generation_id)
-                        })?;
-                        Some((
-                            base_generation_id,
-                            Self::retired_chain_change_identity(chain)
-                                .map(|change| change.generation_id),
-                        ))
-                    }
-                }
-            })
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    fn retained_chain_ids(&self) -> Vec<(u64, Option<u64>)> {
-        self.sealed_hnsw
-            .read()
-            .retired
-            .iter()
-            .filter_map(|chain| {
-                let base = Self::retired_chain_base_identity(chain)?;
-                Some((
-                    base.generation_id,
-                    Self::retired_chain_change_identity(chain).map(|change| change.generation_id),
-                ))
-            })
-            .collect()
-    }
-
-    /// Cheap read-only peek at whether
-    /// [`Self::reclaim_snapshot_free_graph_generations`] would have anything
-    /// to release right now: a non-empty `retired` queue. Never drains or
-    /// mutates the queue, and does not consult registered snapshots -- a
-    /// caller uses this only to decide whether beginning a guarded removal
-    /// pass is worth attempting this cycle.
-    #[doc(hidden)]
-    pub fn has_retired_sealed_generations(&self) -> bool {
-        !self.sealed_hnsw.read().retired.is_empty()
-    }
-
-    #[doc(hidden)]
-    pub fn graph_generation_status(&self) -> VectorGraphGenerationStatus {
-        let sealed = self.sealed_hnsw.read();
-        VectorGraphGenerationStatus {
-            base: sealed.base.as_ref().map(|generation| generation.identity),
-            change: sealed.change.as_ref().map(|generation| generation.identity),
-            dormant_base: sealed
-                .dormant_base
-                .as_ref()
-                .map(|generation| generation.descriptor.identity),
-            dormant_change: sealed
-                .dormant_change
-                .as_ref()
-                .map(|generation| generation.descriptor.identity),
-            base_resident: sealed.base.is_some(),
-            change_resident: sealed.change.is_some(),
-            fresh_tail_entries: self
-                .hnsw
-                .get()
-                .and_then(|tail| tail.read().as_ref().map(HnswIndex::len))
-                .unwrap_or(0),
-            retained_generations: sealed.retired.iter().fold(0usize, |count, chain| {
-                count
-                    .saturating_add(usize::from(
-                        chain.base.is_some() || chain.dormant_base.is_some(),
-                    ))
-                    .saturating_add(usize::from(
-                        chain.change.is_some() || chain.dormant_change.is_some(),
-                    ))
-            }),
-            pending_generation_count: sealed.pending_generation_count,
-            paged_route_refusals: self.paged_route_refusals.load(Ordering::SeqCst),
-            last_paged_route_refusal: *self.last_paged_route_refusal.lock(),
-        }
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    fn superseded_generation_retention_for_test(&self) -> (usize, usize) {
-        let sealed = self.sealed_hnsw.read();
-        let superseded_base = if sealed.change.is_some() || sealed.dormant_change.is_some() {
-            sealed.base.as_ref()
-        } else {
-            None
-        };
-        let mut roots = HashSet::new();
-        let mut retained_bytes = |generation: &SealedHnswGeneration| {
-            generation
-                .bytes()
-                .saturating_add(generation.graph().paged_tail_snapshot().map_or(0, |tail| {
-                    tail.retained_control_receipts()
-                        .into_iter()
-                        .filter(|(owner, _)| roots.insert(*owner))
-                        .map(|(_, bytes)| bytes)
-                        .fold(0usize, usize::saturating_add)
-                }))
-        };
-        (
-            sealed
-                .retired
-                .iter()
-                .fold(0usize, |count, chain| {
-                    count
-                        .saturating_add(usize::from(chain.base.is_some()))
-                        .saturating_add(usize::from(chain.change.is_some()))
-                })
-                .saturating_add(usize::from(superseded_base.is_some())),
-            sealed
-                .retired
-                .iter()
-                .fold(0usize, |bytes, chain| {
-                    bytes
-                        .saturating_add(chain.base.as_ref().map(&mut retained_bytes).unwrap_or(0))
-                        .saturating_add(chain.change.as_ref().map(&mut retained_bytes).unwrap_or(0))
-                })
-                .saturating_add(superseded_base.map(&mut retained_bytes).unwrap_or(0)),
-        )
-    }
-
-    pub(crate) fn set_route_quarantine(&self, reason: VectorRouteQuarantineReason) {
-        self.sealed_hnsw.write().quarantine = Some(reason);
-    }
-
-    /// The graph a search is about to walk: the sealed generations it
-    /// selected, by identity, and the mutable tail's epoch when it was taken.
-    pub(crate) fn graph_stamp_of(
-        &self,
-        layers: &[SnapshotCompatibleLayer<'_>],
-        tail_epoch: u64,
-    ) -> GraphStamp {
-        let mut sealed = layers.iter().filter_map(|layer| layer.identity);
-        GraphStamp {
-            base: sealed.next(),
-            change: sealed.next(),
-            tail_epoch,
-        }
-    }
-
-    /// The tail epoch: it advances whenever the mutable tail is replaced.
-    pub(crate) fn tail_epoch(&self) -> u64 {
-        self.tail_epoch.load(Ordering::SeqCst)
-    }
-
-    /// Set the graph aside after a search found live rows it does not
-    /// connect, until maintenance rebuilds it under the same declarations.
-    /// The report names the graph the search walked; a report about a graph
-    /// already replaced (a publication or a rebuild since) says nothing about
-    /// the one serving now and is ignored. Returns whether it was applied.
-    pub(crate) fn set_disconnected_graph(&self, observed: GraphStamp) -> bool {
-        let _publication = self.generation_publication.lock();
-        let mut sealed = self.sealed_hnsw.write();
-        let current = GraphStamp {
-            base: Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref()),
-            change: Self::layer_identity(sealed.change.as_ref(), sealed.dormant_change.as_ref()),
-            tail_epoch: self.tail_epoch.load(Ordering::SeqCst),
-        };
-        if current != observed {
-            return false;
-        }
-        sealed.quarantine = Some(VectorRouteQuarantineReason::DisconnectedGraph);
-        true
-    }
-
-    fn clear_route_quarantine(&self) {
-        self.sealed_hnsw.write().quarantine = None;
-    }
-
-    pub(crate) fn route_quarantine(&self) -> Option<VectorRouteQuarantineReason> {
-        self.sealed_hnsw.read().quarantine
-    }
-
-    /// Borrow a resident sealed graph for a codec-owned export.  No clone or
-    /// byte encoding occurs here; the caller's closure is the only place a
-    /// codec may serialize it, so accounting cannot be bypassed by a hidden
-    /// graph copy.
-    #[doc(hidden)]
-    pub fn with_resident_sealed_generation<R>(
-        &self,
-        is_base: bool,
-        f: impl FnOnce(VectorGraphGeneration, &HnswIndex) -> R,
-    ) -> Option<R> {
-        let sealed = self.sealed_hnsw.read();
-        let generation = if is_base {
-            sealed.base.as_ref()
-        } else {
-            sealed.change.as_ref()
-        }?;
-        Some(f(generation.identity, generation.graph()))
-    }
-
-    /// Load one cataloged graph without holding a store lock across I/O or
-    /// decode.  The loader transfers a single pre-reserved resident allocation
-    /// with the owned graph.  A racing successful load releases its own
-    /// reservation and keeps the first complete publication.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn preload_dormant_sealed_generation(&self, is_base: bool) -> Result<bool> {
-        let mut checkpoint = || Ok::<(), Error>(());
-        let mut reserve = |_bytes| Ok::<(), Error>(());
-        let mut release = |_bytes| {};
-        self.preload_dormant_sealed_generation_with(
-            is_base,
-            false,
-            &mut checkpoint,
-            &mut reserve,
-            &mut release,
-        )
-    }
-
-    fn load_dormant_generation<E>(
-        &self,
-        dormant: &DormantSealedGeneration,
-        corruption_reason: VectorRouteQuarantineReason,
-        caller_charged: bool,
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<LoadedVectorGraphGeneration, E>
-    where
-        E: From<Error>,
-    {
-        let initial_caller_reservation = if caller_charged {
-            dormant.descriptor.load_bytes
-        } else {
-            0
-        };
-        if caller_charged {
-            before_checkpoint()?;
-            before_retain(initial_caller_reservation)?;
-        }
-        struct ReplayProgress<'a> {
-            state: &'a IndexState,
-            owned: bool,
-        }
-        impl Drop for ReplayProgress<'_> {
-            fn drop(&mut self) {
-                if self.owned {
-                    self.state.maintenance_inspection.write().progress = None;
-                }
-            }
-        }
-        let mut progress_owner = ReplayProgress {
-            state: self,
-            owned: false,
-        };
-        let mut interrupted = None;
-        let mut caller_reserved = initial_caller_reservation;
-        let loaded = {
-            let mut request = |request| {
-                if interrupted.is_some() {
-                    return false;
-                }
-                let result = match request {
-                    DormantVectorLoadRequest::Checkpoint => before_checkpoint(),
-                    DormantVectorLoadRequest::Progress { done, total } => {
-                        {
-                            let mut inspection = self.maintenance_inspection.write();
-                            if inspection.progress.is_none() {
-                                inspection.progress = Some(VectorMaintenanceProgress {
-                                    state: "replaying",
-                                    reason: "new_changes",
-                                    vectors_done: 0,
-                                    vectors_total: total,
-                                    checkpoint_tx: dormant.descriptor.identity.covered_tx,
-                                });
-                                progress_owner.owned = true;
-                            }
-                        }
-                        if progress_owner.owned {
-                            self.set_maintenance_vectors_done(done);
-                        }
-                        before_checkpoint()
-                    }
-                    DormantVectorLoadRequest::Reserve(bytes) => {
-                        if let Err(error) = before_checkpoint() {
-                            Err(error)
-                        } else if let Some(total) = caller_reserved.checked_add(bytes) {
-                            match before_retain(bytes) {
-                                Ok(()) => {
-                                    caller_reserved = total;
-                                    Ok(())
-                                }
-                                Err(error) => Err(error),
-                            }
-                        } else {
-                            Err(E::from(Error::Other(
-                                ("bounded vector load reservation overflow".to_string()).into(),
-                            )))
-                        }
-                    }
-                };
-                match result {
-                    Ok(()) => true,
-                    Err(error) => {
-                        interrupted = Some(error);
-                        false
-                    }
-                }
-            };
-            dormant.loader.load_reusing_fresh_tail(
-                dormant.descriptor,
-                initial_caller_reservation,
-                &mut request,
-                *self.carried_tail_identity.read() == Some(dormant.descriptor.identity)
-                    && self.hnsw.get().is_some_and(|tail| tail.read().is_some()),
-            )
-        };
-        match loaded {
-            Err(error) => {
-                if caller_charged {
-                    release_retained(caller_reserved);
-                }
-                match interrupted {
-                    Some(error) => Err(error),
-                    None => {
-                        if matches!(error, Error::StoreCorrupted { .. }) {
-                            self.set_route_quarantine(corruption_reason);
-                        }
-                        Err(E::from(error))
-                    }
-                }
-            }
-            Ok(loaded) => {
-                if caller_charged {
-                    let tail_resident = loaded
-                        .fresh_tail
-                        .as_ref()
-                        .map(|tail| tail.resident_bytes)
-                        .unwrap_or(0);
-                    let Some(adopted) = loaded.resident_bytes.checked_add(tail_resident) else {
-                        Self::release_uninstalled_loaded_generation(loaded);
-                        return Err(E::from(Error::Other(
-                            ("loaded vector residency overflow".to_string()).into(),
-                        )));
-                    };
-                    if loaded.caller_adopted_bytes > adopted {
-                        Self::release_uninstalled_loaded_generation(loaded);
-                        return Err(E::from(Error::Other(
-                            ("loaded vector caller ownership exceeds its residency".to_string())
-                                .into(),
-                        )));
-                    }
-                    let Some(transient) = caller_reserved.checked_sub(loaded.caller_adopted_bytes)
-                    else {
-                        Self::release_uninstalled_loaded_generation(loaded);
-                        return Err(E::from(Error::Other(
-                            ("loaded vector residency exceeds its caller reservation".to_string())
-                                .into(),
-                        )));
-                    };
-                    release_retained(transient);
-                }
-                if let Some(error) = interrupted {
-                    Self::release_uninstalled_loaded_generation(loaded);
-                    return Err(error);
-                }
-                if let Err(error) = before_checkpoint() {
-                    Self::release_uninstalled_loaded_generation(loaded);
-                    return Err(error);
-                }
-                Ok(loaded)
-            }
-        }
-    }
-
-    fn preload_dormant_sealed_generation_with<E>(
-        &self,
-        is_base: bool,
-        caller_charged: bool,
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<bool, E>
-    where
-        E: From<Error>,
-    {
-        // One share for this layer, however many times a moving fresh tail
-        // makes it load again.
-        let layer_load = contextdb_core::serving_cache_share::begin_layer_load();
-        for _ in 0..4 {
-            let dormant = {
-                let sealed = self.sealed_hnsw.read();
-                let dormant = if is_base {
-                    sealed
-                        .pending_base
-                        .clone()
-                        .or_else(|| sealed.dormant_base.clone())
-                } else {
-                    sealed.dormant_change.clone()
-                };
-                if dormant.as_ref().is_some_and(|dormant| {
-                    let resident = if is_base {
-                        sealed.base.as_ref()
-                    } else {
-                        sealed.change.as_ref()
-                    };
-                    resident
-                        .is_some_and(|resident| resident.identity == dormant.descriptor.identity)
-                }) {
-                    return Ok(false);
-                }
-                dormant
-            };
-            let Some(dormant) = dormant else {
-                return Ok(false);
-            };
-            let expected_tail_revision = {
-                let _publication = self.generation_publication.lock();
-                self.fresh_tail_revision.load(Ordering::SeqCst)
-            };
-            let loaded = self.load_dormant_generation(
-                &dormant,
-                if is_base {
-                    VectorRouteQuarantineReason::CorruptBase
-                } else {
-                    VectorRouteQuarantineReason::CorruptChanges
-                },
-                caller_charged,
-                before_checkpoint,
-                before_retain,
-                release_retained,
-            )?;
-            #[cfg(feature = "test-seams")]
-            if crate::test_seam::take_vector_post_load_reconciliation_failure_for_test() {
-                Self::release_uninstalled_loaded_generation(loaded);
-                return Err(E::from(Error::Other(
-                    ("injected vector post-load reconciliation failure".to_string()).into(),
-                )));
-            }
-            #[cfg(feature = "test-seams")]
-            let moved_under_the_load = crate::test_seam::take_vector_stale_dormant_load_for_test();
-            #[cfg(not(feature = "test-seams"))]
-            let moved_under_the_load = false;
-            let identity = dormant.descriptor.identity;
-            let _publication = self.generation_publication.lock();
-            if moved_under_the_load
-                || loaded.fresh_tail.as_ref().is_some_and(|tail| {
-                    self.fresh_tail_revision.load(Ordering::SeqCst) != expected_tail_revision
-                        || tail.replayed_through_lsn.0
-                            < self.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst)
-                })
-            {
-                Self::release_uninstalled_loaded_generation(loaded);
-                continue;
-            }
-            let still_selected = {
-                let sealed = self.sealed_hnsw.read();
-                let selected = if is_base {
-                    sealed
-                        .pending_base
-                        .as_ref()
-                        .or(sealed.dormant_base.as_ref())
-                } else {
-                    sealed.dormant_change.as_ref()
-                };
-                selected.is_some_and(|selected| selected.descriptor.identity == identity)
-            };
-            if !still_selected {
-                Self::release_uninstalled_loaded_generation(loaded);
-                // A publication moved this layer's chain; the statement loads
-                // it again from there, on the share given back here.
-                layer_load.give_back();
-                return Ok(false);
-            }
-            let already_resident = {
-                let sealed = self.sealed_hnsw.read();
-                if is_base {
-                    sealed
-                        .base
-                        .as_ref()
-                        .is_some_and(|generation| generation.identity == identity)
-                } else {
-                    sealed
-                        .change
-                        .as_ref()
-                        .is_some_and(|generation| generation.identity == identity)
-                }
-            };
-            if already_resident {
-                Self::release_uninstalled_loaded_generation(loaded);
-                return Ok(false);
-            }
-            self.install_loaded_sealed_generation_inner(is_base, identity, loaded, true)
-                .map_err(E::from)?;
-            return Ok(true);
-        }
-        Err(E::from(Error::Other(
-            ("vector fresh tail changed repeatedly while a dormant generation was loading"
-                .to_string())
-            .into(),
-        )))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn preload_retired_sealed_generation(
-        &self,
-        base_generation_id: u64,
-        is_base: bool,
-    ) -> Result<bool> {
-        let mut checkpoint = || Ok::<(), Error>(());
-        let mut reserve = |_bytes| Ok::<(), Error>(());
-        let mut release = |_bytes| {};
-        self.preload_retired_sealed_generation_with(
-            base_generation_id,
-            is_base,
-            false,
-            &mut checkpoint,
-            &mut reserve,
-            &mut release,
-        )
-    }
-
-    fn preload_retired_sealed_generation_with<E>(
-        &self,
-        base_generation_id: u64,
-        is_base: bool,
-        caller_charged: bool,
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<bool, E>
-    where
-        E: From<Error>,
-    {
-        let dormant = {
-            let sealed = self.sealed_hnsw.read();
-            let Some(chain) = sealed.retired.iter().find(|chain| {
-                Self::retired_chain_base_identity(chain)
-                    .is_some_and(|identity| identity.generation_id == base_generation_id)
-            }) else {
-                return Ok(false);
-            };
-            let dormant = if is_base {
-                chain.dormant_base.clone()
-            } else {
-                chain.dormant_change.clone()
-            };
-            let resident = if is_base {
-                chain.base.as_ref()
-            } else {
-                chain.change.as_ref()
-            };
-            if dormant.as_ref().is_some_and(|dormant| {
-                resident.is_some_and(|resident| resident.identity == dormant.descriptor.identity)
-            }) {
-                return Ok(false);
-            }
-            dormant
-        };
-        let Some(dormant) = dormant else {
-            return Ok(false);
-        };
-        let layer_load = contextdb_core::serving_cache_share::begin_layer_load();
-        let loaded = self.load_dormant_generation(
-            &dormant,
-            if is_base {
-                VectorRouteQuarantineReason::CorruptBase
-            } else {
-                VectorRouteQuarantineReason::CorruptChanges
-            },
-            caller_charged,
-            before_checkpoint,
-            before_retain,
-            release_retained,
-        )?;
-        if loaded.resident_bytes == 0 && !loaded.graph.is_empty() {
-            Self::release_uninstalled_loaded_generation(loaded);
-            return Err(E::from(Error::Other((
-                "loaded retired vector generation has graph entries but no reserved resident bytes"
-                    .to_string()).into())));
-        }
-        let identity = dormant.descriptor.identity;
-        let _publication = self.generation_publication.lock();
-        let mut sealed = self.sealed_hnsw.write();
-        let Some(chain) = sealed.retired.iter_mut().find(|chain| {
-            Self::retired_chain_base_identity(chain)
-                .is_some_and(|base| base.generation_id == base_generation_id)
-        }) else {
-            drop(sealed);
-            Self::release_uninstalled_loaded_generation(loaded);
-            layer_load.give_back();
-            return Ok(false);
-        };
-        let selected = if is_base {
-            chain.dormant_base.as_ref()
-        } else {
-            chain.dormant_change.as_ref()
-        };
-        if !selected.is_some_and(|selected| selected.descriptor.identity == identity) {
-            drop(sealed);
-            Self::release_uninstalled_loaded_generation(loaded);
-            layer_load.give_back();
-            return Ok(false);
-        }
-        let resident = if is_base {
-            &mut chain.base
-        } else {
-            &mut chain.change
-        };
-        if resident
-            .as_ref()
-            .is_some_and(|generation| generation.identity == identity)
-        {
-            drop(sealed);
-            Self::release_uninstalled_loaded_generation(loaded);
-            return Ok(false);
-        }
-        let LoadedVectorGraphGeneration {
-            graph,
-            resident_bytes,
-            accountant,
-            caller_adopted_bytes: _,
-            fresh_tail,
-        } = loaded;
-        if let Some(tail) = fresh_tail
-            && tail.resident_bytes != 0
-        {
-            tail.accountant.release(tail.resident_bytes);
-        }
-        let old = resident.replace(SealedHnswGeneration::new(
-            identity,
-            graph,
-            resident_bytes,
-            Some(accountant),
-        ));
-        sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
-        drop(sealed);
-        if let Some(old) = old {
-            Self::release_sealed_generation(old);
-        }
-        #[cfg(any(test, feature = "test-seams"))]
-        self.note_passive_activity(|activity| {
-            activity
-                .sealed_generation_loads
-                .fetch_add(1, Ordering::SeqCst);
-        });
-        Ok(true)
-    }
-
-    /// Eviction drops only a resident graph that still has a durable catalog
-    /// descriptor. Raw vectors, metadata, and the descriptor remain, so any
-    /// later selected read can load the same verified generation. A bounded
-    /// read does so through its charged, cancellable request preloader.
-    #[doc(hidden)]
-    pub fn evict_resident_sealed_generation(&self, is_base: bool) -> bool {
-        let Some(_publication) = self.generation_publication.try_lock() else {
-            return false;
-        };
-        let Some(mut sealed) = self.sealed_hnsw.try_write() else {
-            return false;
-        };
-        let descriptor_present = if is_base {
-            sealed.dormant_base.is_some()
-        } else {
-            sealed.dormant_change.is_some()
-        };
-        if !descriptor_present {
-            return false;
-        }
-        let removed = if is_base {
-            sealed.base.take()
-        } else {
-            sealed.change.take()
-        };
-        if removed.is_some() {
-            sealed.pending_generation_count = sealed.pending_generation_count.saturating_add(1);
-        }
-        drop(sealed);
-        if let Some(generation) = removed {
-            Self::release_sealed_generation(generation);
-            // An empty replay tail owns memory too. It can be recreated from
-            // the durable frontier, unless a prepared commit owns its target.
-            if self.fresh_tail_preparations.load(Ordering::SeqCst) == 0
-                && let Some(lock) = self.hnsw.get()
-                && let Some(mut tail) = lock.try_write()
-                && tail.as_ref().is_some_and(HnswIndex::is_empty)
-            {
-                *tail = None;
-                let bytes = self.hnsw_bytes.swap(0, Ordering::SeqCst);
-                if let Some(accountant) = self.hnsw_accountant.write().take() {
-                    accountant.release(bytes);
-                }
-                self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-                self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-                self.tail_frontier_tx
-                    .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-            }
-            #[cfg(any(test, feature = "test-seams"))]
-            self.note_passive_activity(|activity| {
-                activity
-                    .sealed_generation_evictions
-                    .fetch_add(1, Ordering::SeqCst);
-            });
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    fn make_retired_sealed_generations_dormant_for_test(&self) -> usize {
-        let _publication = self.generation_publication.lock();
-        let mut sealed = self.sealed_hnsw.write();
-        let mut removed = Vec::new();
-        let mut pending = 0usize;
-        for chain in &mut sealed.retired {
-            let evict_base = chain.dormant_base.is_some() && chain.base.is_some();
-            if evict_base && let Some(generation) = chain.base.take() {
-                removed.push(generation);
-                pending = pending.saturating_add(1);
-            }
-            let evict_change = chain.dormant_change.is_some() && chain.change.is_some();
-            if evict_change && let Some(generation) = chain.change.take() {
-                removed.push(generation);
-                pending = pending.saturating_add(1);
-            }
-        }
-        sealed.pending_generation_count = sealed.pending_generation_count.saturating_add(pending);
-        let dormant = sealed.retired.iter().fold(0usize, |count, chain| {
-            count
-                .saturating_add(usize::from(chain.dormant_base.is_some()))
-                .saturating_add(usize::from(chain.dormant_change.is_some()))
-        });
-        drop(sealed);
-        for generation in removed {
-            Self::release_sealed_generation(generation);
-        }
-        dormant
-    }
-
-    /// Remove a graph/catalog entry that the codec has proved corrupt or
-    /// incompatible.  This is deliberately a quarantine operation, not a
-    /// rebuild: callers receive the normal unavailable route until their
-    /// maintenance path prepares a replacement from authoritative vectors.
-    #[doc(hidden)]
-    pub fn quarantine_sealed_generation(&self, is_base: bool, generation_id: u64) -> bool {
-        let mut sealed = self.sealed_hnsw.write();
-        let removed_pending = is_base
-            && sealed.pending_base.as_ref().is_some_and(|generation| {
-                generation.descriptor.identity.generation_id == generation_id
-            });
-        if removed_pending {
-            sealed.pending_base = None;
-            sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
-        }
-        let resident = if is_base {
-            if sealed
-                .base
-                .as_ref()
-                .is_some_and(|generation| generation.identity.generation_id == generation_id)
-            {
-                sealed.base.take()
-            } else {
-                None
-            }
-        } else if sealed
-            .change
-            .as_ref()
-            .is_some_and(|generation| generation.identity.generation_id == generation_id)
-        {
-            sealed.change.take()
-        } else {
-            None
-        };
-        let dormant = if is_base {
-            &mut sealed.dormant_base
-        } else {
-            &mut sealed.dormant_change
-        };
-        let removed_descriptor = dormant.as_ref().is_some_and(|generation| {
-            generation.descriptor.identity.generation_id == generation_id
-        });
-        if removed_descriptor {
-            *dormant = None;
-            sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
-        }
-        drop(sealed);
-        if let Some(generation) = resident {
-            Self::release_sealed_generation(generation);
-            true
-        } else {
-            removed_descriptor || removed_pending
-        }
-    }
-
-    /// Preload every durable layer selected for this snapshot under the
-    /// request's own cancellable memory charge. Each successful load moves
-    /// that charge to the resident graph owner; every other exit returns it.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn preload_snapshot_compatible_hnsw_layers_for_request<E>(
-        &self,
-        snapshot: SnapshotId,
-        captured: Option<&CapturedVectorServingSelection>,
-        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize),
-    ) -> std::result::Result<(), E>
-    where
-        E: From<Error>,
-    {
-        let snapshot_tx = TxId::from_snapshot(snapshot);
-        for _ in 0..4 {
-            before_checkpoint()?;
-            let load = {
-                let sealed = self.sealed_hnsw.read();
-                if sealed.quarantine.is_some() {
-                    return Ok(());
-                }
-                Self::selected_chain_location(&sealed, snapshot_tx).and_then(|location| {
-                    match location {
-                        SealedChainLocation::Current => {
-                            let base_identity = Self::layer_identity(
-                                sealed.base.as_ref(),
-                                sealed.dormant_base.as_ref(),
-                            )?;
-                            if !sealed
-                                .base
-                                .as_ref()
-                                .is_some_and(|base| base.identity == base_identity)
-                                && sealed.dormant_base.is_some()
-                            {
-                                return Some((location, true));
-                            }
-                            let change_identity = Self::layer_identity(
-                                sealed.change.as_ref(),
-                                sealed.dormant_change.as_ref(),
-                            );
-                            if change_identity.is_some_and(|identity| {
-                                !sealed
-                                    .change
-                                    .as_ref()
-                                    .is_some_and(|change| change.identity == identity)
-                            }) && sealed.dormant_change.is_some()
-                            {
-                                return Some((location, false));
-                            }
-                            None
-                        }
-                        SealedChainLocation::Retired { base_generation_id } => {
-                            let chain = sealed.retired.iter().find(|chain| {
-                                Self::retired_chain_base_identity(chain).is_some_and(|identity| {
-                                    identity.generation_id == base_generation_id
-                                })
-                            })?;
-                            let base_identity = Self::retired_chain_base_identity(chain)?;
-                            if !chain
-                                .base
-                                .as_ref()
-                                .is_some_and(|base| base.identity == base_identity)
-                                && chain.dormant_base.is_some()
-                            {
-                                return Some((location, true));
-                            }
-                            let change_identity = Self::retired_chain_change_identity(chain);
-                            if change_identity.is_some_and(|identity| {
-                                !chain
-                                    .change
-                                    .as_ref()
-                                    .is_some_and(|change| change.identity == identity)
-                            }) && chain.dormant_change.is_some()
-                            {
-                                return Some((location, false));
-                            }
-                            None
-                        }
-                    }
-                })
-            };
-            let Some((location, is_base)) = load else {
-                return Ok(());
-            };
-            // The captured selection already asked the store to retain this
-            // layer in this find and was refused: replay that refusal rather
-            // than reading and hashing the same saved generation again.
-            if matches!(location, SealedChainLocation::Current)
-                && let Some(selection) = captured
-                && let Some(refusal) =
-                    selection.retention_refusal.lock()[usize::from(!is_base)].take()
-            {
-                return Err(E::from(refusal));
-            }
-            contextdb_core::find_attribution::count("dormant_layers_loaded", 1);
-            let _loading = contextdb_core::find_attribution::stage("graph_load");
-            match location {
-                SealedChainLocation::Current => {
-                    self.preload_dormant_sealed_generation_with(
-                        is_base,
-                        true,
-                        before_checkpoint,
-                        before_retain,
-                        release_retained,
-                    )?;
-                }
-                SealedChainLocation::Retired { base_generation_id } => {
-                    self.preload_retired_sealed_generation_with(
-                        base_generation_id,
-                        is_base,
-                        true,
-                        before_checkpoint,
-                        before_retain,
-                        release_retained,
-                    )?;
-                }
-            }
-        }
-        Err(E::from(Error::Other(
-            ("snapshot-compatible vector layers changed repeatedly while loading".to_string())
-                .into(),
-        )))
-    }
-
-    /// The resident layers of the chain a snapshot selects, cloned while the
-    /// registry still holds them. `Err` names what is missing, so a caller can
-    /// report a chain that is merely dormant apart from one that is gone. The
-    /// flag says the fresh tail is still in front of the sealed frontier and
-    /// belongs in the same search.
-    fn selected_chain_layers(
-        sealed: &SealedHnswGenerations,
-        location: SealedChainLocation,
-        snapshot_tx: TxId,
-    ) -> std::result::Result<
-        (SealedHnswGeneration, Option<SealedHnswGeneration>, bool),
-        VectorGraphLayerAvailability,
-    > {
-        match location {
-            SealedChainLocation::Current => {
-                let base_identity =
-                    Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
-                        .expect("a selected current vector chain has a base identity");
-                let Some(base) = sealed
-                    .base
-                    .as_ref()
-                    .filter(|base| base.identity == base_identity)
-                    .cloned()
-                else {
-                    let availability = if sealed.dormant_base.is_some() {
-                        VectorGraphLayerAvailability::Dormant
-                    } else {
-                        VectorGraphLayerAvailability::Unavailable
-                    };
-                    return Err(availability);
-                };
-                let change_identity =
-                    Self::layer_identity(sealed.change.as_ref(), sealed.dormant_change.as_ref());
-                let change = if let Some(identity) = change_identity {
-                    let Some(change) = sealed
-                        .change
-                        .as_ref()
-                        .filter(|change| change.identity == identity)
-                        .cloned()
-                    else {
-                        let availability = if sealed.dormant_change.is_some() {
-                            VectorGraphLayerAvailability::Dormant
-                        } else {
-                            VectorGraphLayerAvailability::Unavailable
-                        };
-                        return Err(availability);
-                    };
-                    Some(change)
-                } else {
-                    None
-                };
-                // A later commit cannot suppress an older reader's eligible
-                // tail. Search it exactly when the sealed frontier predates
-                // the snapshot; per-row visibility drops any newer points.
-                let active_frontier = change_identity.unwrap_or(base_identity);
-                Ok((base, change, active_frontier.covered_tx < snapshot_tx))
-            }
-            SealedChainLocation::Retired { base_generation_id } => {
-                let chain = sealed
-                    .retired
-                    .iter()
-                    .find(|chain| {
-                        Self::retired_chain_base_identity(chain)
-                            .is_some_and(|identity| identity.generation_id == base_generation_id)
-                    })
-                    .expect("a selected retired vector chain remains registered");
-                let base_identity = Self::retired_chain_base_identity(chain)
-                    .expect("a selected retired vector chain has a base identity");
-                let Some(base) = chain
-                    .base
-                    .as_ref()
-                    .filter(|base| base.identity == base_identity)
-                    .cloned()
-                else {
-                    let availability = if chain.dormant_base.is_some() {
-                        VectorGraphLayerAvailability::Dormant
-                    } else {
-                        VectorGraphLayerAvailability::Unavailable
-                    };
-                    return Err(availability);
-                };
-                let change_identity = Self::retired_chain_change_identity(chain);
-                let change = if let Some(identity) = change_identity {
-                    let Some(change) = chain
-                        .change
-                        .as_ref()
-                        .filter(|change| change.identity == identity)
-                        .cloned()
-                    else {
-                        let availability = if chain.dormant_change.is_some() {
-                            VectorGraphLayerAvailability::Dormant
-                        } else {
-                            VectorGraphLayerAvailability::Unavailable
-                        };
-                        return Err(availability);
-                    };
-                    Some(change)
-                } else {
-                    None
-                };
-                Ok((base, change, false))
-            }
-        }
-    }
-
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn pause_graph_callback_for_test(&self) {
         if let Some(slot) = self.graph_callback_pause.lock().clone() {
             slot.pause_after(0);
         }
-    }
-
-    /// Every non-empty snapshot-compatible layer of this partition's chain --
-    /// the sealed base, the sealed change beside it and the mutable tail --
-    /// selected under one `generation_publication` acquisition and held for
-    /// the search that asked for them.
-    ///
-    /// `with_snapshot_compatible_hnsw_layers` lends each layer to a callback
-    /// and takes it back, which is all a search over ONE partition needs. A
-    /// search over several partitions has to hold every partition's layers at
-    /// once -- it spends one candidate budget across all of them -- so it
-    /// holds them here instead: sealed generations as owned clones, the tail
-    /// under its read lock, both taken while the publication lock pins the
-    /// chain, so the layers a snapshot selects are exactly the layers the
-    /// search walks, whatever is published after.
-    pub(crate) fn snapshot_compatible_owned_layers(
-        &self,
-        snapshot: SnapshotId,
-    ) -> (
-        VectorGraphLayerAvailability,
-        Vec<SnapshotCompatibleLayer<'_>>,
-    ) {
-        let snapshot_tx = TxId::from_snapshot(snapshot);
-        let publication = self.generation_publication.lock();
-        let sealed = self.sealed_hnsw.read();
-        if sealed.quarantine.is_some() {
-            return (VectorGraphLayerAvailability::Unavailable, Vec::new());
-        }
-        let held_tail = || {
-            self.hnsw.get().and_then(|tail| {
-                parking_lot::RwLockReadGuard::try_map(tail.read(), |tail| {
-                    tail.as_ref().filter(|tail| !tail.is_empty())
-                })
-                .ok()
-                .map(|graph| {
-                    if let Some(root) = graph.paged_tail_snapshot() {
-                        drop(graph);
-                        HeldLayer::PagedTail(HnswIndex::from_paged_root(root))
-                    } else {
-                        HeldLayer::Tail(graph)
-                    }
-                })
-            })
-        };
-        let Some(location) = Self::selected_chain_location(&sealed, snapshot_tx) else {
-            // No sealed chain answers this snapshot. A bare mutable tail does
-            // exactly when the lending door would serve it alone.
-            let tail_only = sealed.base.is_none()
-                && sealed.dormant_base.is_none()
-                && sealed.change.is_none()
-                && sealed.dormant_change.is_none()
-                && self.serving_policy().is_some()
-                && !self.maintenance_sample_active.load(Ordering::SeqCst)
-                && self.tail_serves_snapshot(snapshot_tx);
-            let tail = tail_only.then(held_tail).flatten();
-            drop(sealed);
-            drop(publication);
-            let Some(tail) = tail else {
-                return (VectorGraphLayerAvailability::Unavailable, Vec::new());
-            };
-            #[cfg(any(test, feature = "test-seams"))]
-            if let Some(slot) = self.graph_callback_pause.lock().clone() {
-                slot.pause_after(0);
-            }
-            let len = tail.len();
-            return (
-                VectorGraphLayerAvailability::Ready,
-                vec![SnapshotCompatibleLayer {
-                    identity: None,
-                    held: tail,
-                    len,
-                }],
-            );
-        };
-        let (base, change, include_tail) =
-            match Self::selected_chain_layers(&sealed, location, snapshot_tx) {
-                Ok(layers) => layers,
-                Err(availability) => return (availability, Vec::new()),
-            };
-        drop(sealed);
-        let tail = include_tail.then(held_tail).flatten();
-        drop(publication);
-        #[cfg(any(test, feature = "test-seams"))]
-        if let Some(slot) = self.graph_callback_pause.lock().clone() {
-            slot.pause_after(0);
-        }
-        let mut layers =
-            Vec::with_capacity(1 + usize::from(change.is_some()) + usize::from(tail.is_some()));
-        for generation in std::iter::once(base).chain(change) {
-            let len = generation.graph().len();
-            if len == 0 {
-                continue;
-            }
-            layers.push(SnapshotCompatibleLayer {
-                identity: Some(generation.identity),
-                held: HeldLayer::Sealed(generation),
-                len,
-            });
-        }
-        if let Some(tail) = tail {
-            let len = tail.len();
-            layers.push(SnapshotCompatibleLayer {
-                identity: None,
-                held: tail,
-                len,
-            });
-        }
-        (VectorGraphLayerAvailability::Ready, layers)
-    }
-
-    /// Visit the complete graph layers compatible with `snapshot`. Ordinary
-    /// execution may load a dormant layer here. A bounded caller first uses
-    /// the request-owned preloader above, then visits without further I/O.
-    /// The callback sees only immutable sealed graphs plus the fresh tail.
-    #[doc(hidden)]
-    pub(crate) fn with_snapshot_compatible_hnsw_layers<E, R>(
-        &self,
-        snapshot: SnapshotId,
-        allow_lazy_load: bool,
-        mut visit: impl FnMut(&HnswIndex) -> std::result::Result<R, E>,
-    ) -> SnapshotCompatibleHnswLayersResult<R, E>
-    where
-        E: From<Error>,
-    {
-        let snapshot_tx = TxId::from_snapshot(snapshot);
-        if allow_lazy_load {
-            // A chain has at most two durable layers. A few bounded retries
-            // cover a publication racing either load without permitting an
-            // unbounded read-side repair loop.
-            for _ in 0..4 {
-                let load = {
-                    let sealed = self.sealed_hnsw.read();
-                    if sealed.quarantine.is_some() {
-                        return Ok((VectorGraphLayerAvailability::Unavailable, Vec::new()));
-                    }
-                    Self::selected_chain_location(&sealed, snapshot_tx).and_then(|location| {
-                        match location {
-                            SealedChainLocation::Current => {
-                                let base_identity = Self::layer_identity(
-                                    sealed.base.as_ref(),
-                                    sealed.dormant_base.as_ref(),
-                                )?;
-                                if !sealed
-                                    .base
-                                    .as_ref()
-                                    .is_some_and(|base| base.identity == base_identity)
-                                    && sealed.dormant_base.is_some()
-                                {
-                                    return Some((location, true));
-                                }
-                                let change_identity = Self::layer_identity(
-                                    sealed.change.as_ref(),
-                                    sealed.dormant_change.as_ref(),
-                                );
-                                if change_identity.is_some_and(|identity| {
-                                    !sealed
-                                        .change
-                                        .as_ref()
-                                        .is_some_and(|change| change.identity == identity)
-                                }) && sealed.dormant_change.is_some()
-                                {
-                                    return Some((location, false));
-                                }
-                                None
-                            }
-                            SealedChainLocation::Retired { base_generation_id } => {
-                                let chain = sealed.retired.iter().find(|chain| {
-                                    Self::retired_chain_base_identity(chain).is_some_and(
-                                        |identity| identity.generation_id == base_generation_id,
-                                    )
-                                })?;
-                                let base_identity = Self::retired_chain_base_identity(chain)?;
-                                if !chain
-                                    .base
-                                    .as_ref()
-                                    .is_some_and(|base| base.identity == base_identity)
-                                    && chain.dormant_base.is_some()
-                                {
-                                    return Some((location, true));
-                                }
-                                let change_identity = Self::retired_chain_change_identity(chain);
-                                if change_identity.is_some_and(|identity| {
-                                    !chain
-                                        .change
-                                        .as_ref()
-                                        .is_some_and(|change| change.identity == identity)
-                                }) && chain.dormant_change.is_some()
-                                {
-                                    return Some((location, false));
-                                }
-                                None
-                            }
-                        }
-                    })
-                };
-                let Some((location, is_base)) = load else {
-                    break;
-                };
-                match location {
-                    SealedChainLocation::Current => {
-                        self.preload_dormant_sealed_generation(is_base)
-                            .map_err(E::from)?;
-                    }
-                    SealedChainLocation::Retired { base_generation_id } => {
-                        self.preload_retired_sealed_generation(base_generation_id, is_base)
-                            .map_err(E::from)?;
-                    }
-                }
-            }
-        }
-        let (availability, layers) = self.snapshot_compatible_owned_layers(snapshot);
-        let mut results = Vec::with_capacity(layers.len());
-        for layer in &layers {
-            if let Some(graph) = layer.graph() {
-                results.push((layer.identity, visit(graph)?));
-            }
-        }
-        Ok((availability, results))
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn raw_hnsw_search(
-        &self,
-        index: &VectorIndexRef,
-        query: &[f32],
-        k: usize,
-    ) -> Option<Result<Vec<(RowId, f32)>>> {
-        let searched =
-            self.with_snapshot_compatible_hnsw_layers(SnapshotId(u64::MAX), false, |hnsw| {
-                hnsw.search(index, query, k)
-            });
-        match searched {
-            Err(error) => Some(Err(error)),
-            Ok((VectorGraphLayerAvailability::Ready, layers)) => {
-                let mut best = HashMap::<RowId, f32>::new();
-                for (_, rows) in layers {
-                    for (row_id, distance) in rows {
-                        best.entry(row_id)
-                            .and_modify(|current| *current = current.max(distance))
-                            .or_insert(distance);
-                    }
-                }
-                let mut rows = best.into_iter().collect::<Vec<_>>();
-                rows.sort_by(|(left_row, left_distance), (right_row, right_distance)| {
-                    right_distance
-                        .total_cmp(left_distance)
-                        .then_with(|| left_row.0.cmp(&right_row.0))
-                });
-                rows.truncate(k);
-                Some(Ok(rows))
-            }
-            Ok((_, _)) => None,
-        }
-    }
-
-    pub fn raw_hnsw_entry_count_for_row(&self, row_id: RowId) -> Option<usize> {
-        self.hnsw.get().and_then(|lock| {
-            lock.read()
-                .as_ref()
-                .map(|hnsw| hnsw.raw_entry_count_for_row(row_id))
-        })
-    }
-
-    pub fn raw_hnsw_topology_digest_for_test(&self) -> Option<u64> {
-        self.hnsw.get().and_then(|lock| {
-            lock.read()
-                .as_ref()
-                .map(|hnsw| hnsw.graph_topology_digest_for_test())
-        })
-    }
-
-    pub fn raw_hnsw_build_serial_for_test(&self) -> Option<u64> {
-        let sealed = self.sealed_hnsw.read();
-        let durable_generation = sealed
-            .base
-            .as_ref()
-            .map(|generation| generation.identity.generation_id)
-            .or_else(|| {
-                sealed
-                    .dormant_base
-                    .as_ref()
-                    .map(|generation| generation.descriptor.identity.generation_id)
-            });
-        drop(sealed);
-        durable_generation.or_else(|| {
-            let generation_id = self.inspection_generation_id.load(Ordering::SeqCst);
-            self.hnsw.get().and_then(|lock| {
-                lock.read().as_ref().map(|hnsw| {
-                    if generation_id == 0 {
-                        hnsw.build_serial_for_test()
-                    } else {
-                        generation_id
-                    }
-                })
-            })
-        })
-    }
-
-    pub fn set_hnsw(&self, hnsw: Option<HnswIndex>, bytes: usize) {
-        self.fresh_tail_replayed_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.fresh_tail_replay_frontier_active
-            .store(false, Ordering::SeqCst);
-        self.fresh_tail_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-        if hnsw.is_some() {
-            self.hnsw_bytes.store(bytes, Ordering::SeqCst);
-        } else {
-            self.hnsw_bytes.store(0, Ordering::SeqCst);
-            self.hnsw_accountant.write().take();
-        }
-        // An installed graph covers the rows visible now.
-        self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-        self.tail_frontier_tx.store(
-            if hnsw.is_some() {
-                self.max_tx().0
-            } else {
-                TAIL_FRONTIER_UNKNOWN
-            },
-            Ordering::SeqCst,
-        );
-        let lock = self.hnsw.get_or_init(|| RwLock::new(None));
-        *lock.write() = hnsw;
-    }
-
-    /// Whether a mutable tail that is the whole graph answers a reader at
-    /// `snapshot_tx`: every row that reader sees is one of its points.
-    fn tail_serves_snapshot(&self, snapshot_tx: TxId) -> bool {
-        match self.tail_frontier_tx.load(Ordering::SeqCst) {
-            TAIL_FRONTIER_UNKNOWN => self.max_tx() <= snapshot_tx,
-            frontier => frontier <= snapshot_tx.0,
-        }
-    }
-
-    fn sampled_maintenance_frontier(&self) -> Option<(TxId, Lsn)> {
-        self.maintenance_sample_active
-            .load(Ordering::SeqCst)
-            .then(|| {
-                (
-                    TxId(self.maintenance_sample_tx.load(Ordering::SeqCst)),
-                    Lsn(self.maintenance_sample_lsn.load(Ordering::SeqCst)),
-                )
-            })
-    }
-
-    /// Freeze one in-memory build frontier and move subsequent commits onto a
-    /// new fresh tail. The existing serving graph becomes the current sealed
-    /// base/change chain, so reads keep using it while construction runs.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn begin_sampled_hnsw_maintenance(
-        &self,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        policy: ResolvedVectorPolicy,
-    ) -> Result<Option<(TxId, Lsn)>> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        if let Some(frontier) = self.sampled_maintenance_frontier() {
-            return Ok(Some(frontier));
-        }
-        if self.fresh_tail_preparations.load(Ordering::SeqCst) != 0 {
-            return Ok(None);
-        }
-
-        let sample_tx = self.max_tx();
-        let sample_lsn = match self.durable_membership_source() {
-            Some(source) => {
-                let mut scratch = VectorCopyAdmission::new(accountant.clone());
-                let mut cursor =
-                    with_membership_copy_admission(&mut scratch, |request| source.open(request))?;
-                let mut sample_lsn = Lsn(0);
-                while let Some(entry) =
-                    with_membership_copy_admission(&mut scratch, |request| cursor.next(request))?
-                {
-                    if entry.created_tx <= sample_tx {
-                        sample_lsn = sample_lsn.max(entry.lsn);
-                    }
-                }
-                sample_lsn
-            }
-            None => self
-                .raw_directory
-                .read()
-                .iter()
-                .filter(|entry| entry.created_tx <= sample_tx)
-                .map(|entry| entry.lsn)
-                .max()
-                .unwrap_or_default(),
-        };
-        let empty_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            0,
-            self.dimension,
-            self.quantization,
-            policy.hnsw_m,
-        );
-        accountant.try_allocate_for_static(
-            empty_bytes,
-            "vector_index",
-            "begin_sampled_hnsw_maintenance",
-            "Raise MEMORY_LIMIT to retain the fresh vector tail during maintenance.",
-        )?;
-        let mut empty_charge = PaidRetainedMemoryCharge::new(empty_bytes, accountant.clone());
-        let empty_tail = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            HnswIndex::from_vector_entries_with_policy(
-                &[],
-                self.dimension,
-                self.quantization,
-                policy,
-            )
-        }))
-        .map_err(|_| {
-            Error::Other(("preparing an empty maintenance tail panicked".to_string()).into())
-        })?;
-
-        let _publication = self.generation_publication.lock();
-        if let Some(frontier) = self.sampled_maintenance_frontier() {
-            return Ok(Some(frontier));
-        }
-        if self.fresh_tail_preparations.load(Ordering::SeqCst) != 0 {
-            return Ok(None);
-        }
-
-        let mut sealed = self.sealed_hnsw.write();
-        let tail_lock = self.hnsw.get_or_init(|| RwLock::new(None));
-        let mut tail = tail_lock.write();
-        let serving = self.serving_policy();
-        let tail_has_entries = tail.as_ref().is_some_and(|graph| !graph.is_empty());
-        let base_known = sealed.base.is_some() || sealed.dormant_base.is_some();
-        if tail_has_entries
-            && serving.is_some()
-            && base_known
-            && (sealed.change.is_some() || sealed.dormant_change.is_some())
-        {
-            return Err(Error::Other(
-                ("sampled maintenance found an occupied sealed change layer".to_string()).into(),
-            ));
-        }
-
-        let old_graph = tail.take();
-        let old_bytes = self.hnsw_bytes.swap(0, Ordering::SeqCst);
-        let old_accountant = self.hnsw_accountant.write().take();
-        let moves_serving_graph =
-            old_graph.as_ref().is_some_and(|graph| !graph.is_empty()) && serving.is_some();
-        let sample_origin = match (base_known, moves_serving_graph, old_graph.is_some()) {
-            (false, true, _) => MAINTENANCE_SAMPLE_MOVED_BASE,
-            (true, true, _) => MAINTENANCE_SAMPLE_MOVED_CHANGE,
-            (true, false, true) => MAINTENANCE_SAMPLE_REPLACED_EMPTY_TAIL,
-            (true, false, false) => MAINTENANCE_SAMPLE_ADDED_TO_BASE,
-            (false, false, _) => MAINTENANCE_SAMPLE_NO_PRIOR_TAIL,
-        };
-        self.maintenance_sample_prior_replay_frontier_active.store(
-            self.fresh_tail_replay_frontier_active
-                .load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
-        self.maintenance_sample_prior_replayed_through_lsn.store(
-            self.fresh_tail_replayed_through_lsn.load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
-        self.maintenance_sample_prior_mutated_through_lsn.store(
-            self.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
-        let mut discarded_charge = None;
-        if let Some(graph) = old_graph {
-            if !graph.is_empty()
-                && let Some(serving) = serving
-            {
-                let (hnsw_m, hnsw_ef_construction, _) = graph.policy_values();
-                let identity = if let Some(base) =
-                    Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
-                {
-                    VectorGraphGeneration {
-                        generation_id: base.generation_id,
-                        covered_tx: sample_tx,
-                        covered_lsn: sample_lsn,
-                        durable_bytes: 0,
-                        policy_revision: serving.policy_revision,
-                        hnsw_m: hnsw_m as u32,
-                        hnsw_ef_construction: hnsw_ef_construction as u32,
-                    }
-                } else {
-                    VectorGraphGeneration {
-                        generation_id: self.inspection_generation_id.load(Ordering::SeqCst).max(1),
-                        covered_tx: TxId(
-                            self.inspection_base_tx
-                                .load(Ordering::SeqCst)
-                                .min(sample_tx.0),
-                        ),
-                        covered_lsn: sample_lsn,
-                        durable_bytes: 0,
-                        policy_revision: serving.policy_revision,
-                        hnsw_m: hnsw_m as u32,
-                        hnsw_ef_construction: hnsw_ef_construction as u32,
-                    }
-                };
-                let generation =
-                    SealedHnswGeneration::new(identity, graph, old_bytes, old_accountant);
-                if base_known {
-                    sealed.change = Some(generation);
-                } else {
-                    sealed.base = Some(generation);
-                }
-            } else {
-                discarded_charge = old_accountant
-                    .map(|accountant| PaidRetainedMemoryCharge::new(old_bytes, accountant));
-            }
-        }
-
-        *tail = Some(empty_tail);
-        self.hnsw_bytes.store(empty_bytes, Ordering::SeqCst);
-        *self.hnsw_accountant.write() = Some(accountant);
-        empty_charge.bytes = 0;
-        self.fresh_tail_replayed_through_lsn
-            .store(sample_lsn.0, Ordering::SeqCst);
-        self.fresh_tail_replay_frontier_active
-            .store(true, Ordering::SeqCst);
-        self.fresh_tail_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-        self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-        self.tail_frontier_tx
-            .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-        self.maintenance_sample_tx
-            .store(sample_tx.0, Ordering::SeqCst);
-        self.maintenance_sample_lsn
-            .store(sample_lsn.0, Ordering::SeqCst);
-        self.maintenance_sample_origin
-            .store(sample_origin, Ordering::SeqCst);
-        self.maintenance_sample_active.store(true, Ordering::SeqCst);
-        drop(sealed);
-        drop(tail);
-        drop(discarded_charge);
-        Ok(Some((sample_tx, sample_lsn)))
-    }
-
-    /// Roll back a failed sample split only while no commit has reached its
-    /// fresh tail. Once a write crosses, the fixed frontier stays installed
-    /// for a later retry so aborting maintenance cannot discard that write.
-    fn abort_sampled_hnsw_maintenance_if_uncontended(&self) -> bool {
-        if !self.maintenance_sample_active.load(Ordering::SeqCst) {
-            return false;
-        }
-        let _publication = self.generation_publication.lock();
-        if !self.maintenance_sample_active.load(Ordering::SeqCst)
-            || self.fresh_tail_preparations.load(Ordering::SeqCst) != 0
-        {
-            return false;
-        }
-        let mut sealed = self.sealed_hnsw.write();
-        let tail_lock = self.hnsw.get_or_init(|| RwLock::new(None));
-        let mut tail = tail_lock.write();
-        if tail.as_ref().is_some_and(|graph| !graph.is_empty()) {
-            return false;
-        }
-
-        let origin = self.maintenance_sample_origin.load(Ordering::SeqCst);
-        if origin == MAINTENANCE_SAMPLE_REPLACED_EMPTY_TAIL {
-            self.fresh_tail_replayed_through_lsn.store(
-                self.maintenance_sample_prior_replayed_through_lsn
-                    .load(Ordering::SeqCst),
-                Ordering::SeqCst,
-            );
-            self.fresh_tail_replay_frontier_active.store(
-                self.maintenance_sample_prior_replay_frontier_active
-                    .load(Ordering::SeqCst),
-                Ordering::SeqCst,
-            );
-            self.fresh_tail_mutated_through_lsn.store(
-                self.maintenance_sample_prior_mutated_through_lsn
-                    .load(Ordering::SeqCst),
-                Ordering::SeqCst,
-            );
-            self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-            self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-            self.tail_frontier_tx
-                .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-            self.maintenance_sample_active
-                .store(false, Ordering::SeqCst);
-            self.maintenance_sample_tx.store(0, Ordering::SeqCst);
-            self.maintenance_sample_lsn.store(0, Ordering::SeqCst);
-            self.maintenance_sample_origin.store(0, Ordering::SeqCst);
-            self.maintenance_sample_prior_replay_frontier_active
-                .store(false, Ordering::SeqCst);
-            self.maintenance_sample_prior_replayed_through_lsn
-                .store(0, Ordering::SeqCst);
-            self.maintenance_sample_prior_mutated_through_lsn
-                .store(0, Ordering::SeqCst);
-            return true;
-        }
-
-        let restored = match origin {
-            MAINTENANCE_SAMPLE_MOVED_BASE => sealed.base.take(),
-            MAINTENANCE_SAMPLE_MOVED_CHANGE => sealed.change.take(),
-            MAINTENANCE_SAMPLE_NO_PRIOR_TAIL | MAINTENANCE_SAMPLE_ADDED_TO_BASE => None,
-            _ => return false,
-        };
-        if matches!(
-            origin,
-            MAINTENANCE_SAMPLE_MOVED_BASE | MAINTENANCE_SAMPLE_MOVED_CHANGE
-        ) && restored.is_none()
-        {
-            return false;
-        }
-
-        let restored = match restored {
-            Some(restored) => match restored.into_parts() {
-                Ok(restored) => Some(restored),
-                Err(restored) => {
-                    match origin {
-                        MAINTENANCE_SAMPLE_MOVED_BASE => sealed.base = Some(restored),
-                        MAINTENANCE_SAMPLE_MOVED_CHANGE => sealed.change = Some(restored),
-                        _ => unreachable!("only a moved generation can be restored"),
-                    }
-                    return false;
-                }
-            },
-            None => None,
-        };
-        let discarded_tail = tail.take();
-        let discarded_bytes = self.hnsw_bytes.swap(0, Ordering::SeqCst);
-        let discarded_accountant = self.hnsw_accountant.write().take();
-        let restored_old_tail = restored.is_some();
-        if let Some((graph, bytes, accountant)) = restored {
-            *tail = Some(graph);
-            self.hnsw_bytes.store(bytes, Ordering::SeqCst);
-            *self.hnsw_accountant.write() = accountant;
-        }
-        self.fresh_tail_replayed_through_lsn.store(
-            if restored_old_tail {
-                self.maintenance_sample_prior_replayed_through_lsn
-                    .load(Ordering::SeqCst)
-            } else {
-                0
-            },
-            Ordering::SeqCst,
-        );
-        self.fresh_tail_replay_frontier_active.store(
-            restored_old_tail
-                && self
-                    .maintenance_sample_prior_replay_frontier_active
-                    .load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
-        self.fresh_tail_mutated_through_lsn.store(
-            if restored_old_tail {
-                self.maintenance_sample_prior_mutated_through_lsn
-                    .load(Ordering::SeqCst)
-            } else {
-                0
-            },
-            Ordering::SeqCst,
-        );
-        self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-        self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-        self.tail_frontier_tx
-            .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-        self.maintenance_sample_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_tx.store(0, Ordering::SeqCst);
-        self.maintenance_sample_lsn.store(0, Ordering::SeqCst);
-        self.maintenance_sample_origin.store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_replay_frontier_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_prior_replayed_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-        drop(sealed);
-        drop(tail);
-        drop(discarded_tail);
-        if discarded_bytes != 0
-            && let Some(accountant) = discarded_accountant
-        {
-            accountant.release(discarded_bytes);
-        }
-        true
-    }
-
-    /// Publish a graph built from the fixed in-memory maintenance frontier.
-    /// The current base/change pair moves to the retired snapshot chain while
-    /// commits that crossed during construction remain in the fresh tail.
-    fn publish_sampled_hnsw(
-        &self,
-        hnsw: HnswIndex,
-        bytes: usize,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        policy: ResolvedVectorPolicy,
-        sample_tx: TxId,
-        sample_lsn: Lsn,
-    ) {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        let _publication = self.generation_publication.lock();
-        let mut sealed = self.sealed_hnsw.write();
-        let mut greatest_generation = self.inspection_generation_id.load(Ordering::SeqCst);
-        for identity in [
-            Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref()),
-            Self::layer_identity(sealed.change.as_ref(), sealed.dormant_change.as_ref()),
-            sealed
-                .pending_base
-                .as_ref()
-                .map(|generation| generation.descriptor.identity),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            greatest_generation = greatest_generation.max(identity.generation_id);
-        }
-        for chain in &sealed.retired {
-            for identity in [
-                Self::retired_chain_base_identity(chain),
-                Self::retired_chain_change_identity(chain),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                greatest_generation = greatest_generation.max(identity.generation_id);
-            }
-        }
-        let identity = VectorGraphGeneration {
-            generation_id: greatest_generation.saturating_add(1).max(1),
-            covered_tx: sample_tx,
-            covered_lsn: sample_lsn,
-            durable_bytes: 0,
-            policy_revision: policy.policy_revision,
-            hnsw_m: policy.hnsw_m as u32,
-            hnsw_ef_construction: policy.hnsw_ef_construction as u32,
-        };
-        let tail_lock = self.hnsw.get_or_init(|| RwLock::new(None));
-        let mut tail = tail_lock.write();
-        let first_build_without_overlap = sealed.base.is_none()
-            && sealed.change.is_none()
-            && sealed.dormant_base.is_none()
-            && sealed.dormant_change.is_none()
-            && self.fresh_tail_preparations.load(Ordering::SeqCst) == 0
-            && tail.as_ref().is_some_and(HnswIndex::is_empty);
-        if first_build_without_overlap {
-            // Built from every row visible at the sample frontier; commits
-            // since then crossed into the empty tail it replaces.
-            self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-            self.tail_frontier_tx.store(sample_tx.0, Ordering::SeqCst);
-            let old_tail = tail.replace(hnsw);
-            let old_bytes = self.hnsw_bytes.swap(bytes, Ordering::SeqCst);
-            let old_accountant = self.hnsw_accountant.write().replace(accountant);
-            self.fresh_tail_replayed_through_lsn
-                .store(0, Ordering::SeqCst);
-            self.fresh_tail_replay_frontier_active
-                .store(false, Ordering::SeqCst);
-            self.fresh_tail_mutated_through_lsn
-                .store(0, Ordering::SeqCst);
-            self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-            self.maintenance_sample_active
-                .store(false, Ordering::SeqCst);
-            self.maintenance_sample_tx.store(0, Ordering::SeqCst);
-            self.maintenance_sample_lsn.store(0, Ordering::SeqCst);
-            self.maintenance_sample_origin.store(0, Ordering::SeqCst);
-            self.maintenance_sample_prior_replay_frontier_active
-                .store(false, Ordering::SeqCst);
-            self.maintenance_sample_prior_replayed_through_lsn
-                .store(0, Ordering::SeqCst);
-            self.maintenance_sample_prior_mutated_through_lsn
-                .store(0, Ordering::SeqCst);
-            drop(sealed);
-            drop(tail);
-            self.set_serving_policy_from_generation(identity);
-            self.clear_route_quarantine();
-            drop(old_tail);
-            if old_bytes != 0
-                && let Some(old_accountant) = old_accountant
-            {
-                old_accountant.release(old_bytes);
-            }
-            return;
-        }
-        Self::retire_current_chain(&mut sealed);
-        sealed.base = Some(SealedHnswGeneration::new(
-            identity,
-            hnsw,
-            bytes,
-            Some(accountant),
-        ));
-        sealed.change = None;
-        sealed.dormant_base = None;
-        sealed.dormant_change = None;
-        drop(sealed);
-        drop(tail);
-        self.fresh_tail_replayed_through_lsn
-            .store(sample_lsn.0, Ordering::SeqCst);
-        self.fresh_tail_replay_frontier_active
-            .store(true, Ordering::SeqCst);
-        self.maintenance_sample_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_tx.store(0, Ordering::SeqCst);
-        self.maintenance_sample_lsn.store(0, Ordering::SeqCst);
-        self.maintenance_sample_origin.store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_replay_frontier_active
-            .store(false, Ordering::SeqCst);
-        self.maintenance_sample_prior_replayed_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.maintenance_sample_prior_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.set_serving_policy_from_generation(identity);
-        self.clear_route_quarantine();
-    }
-
-    pub fn set_hnsw_bytes(&self, bytes: usize) {
-        self.hnsw_bytes.store(bytes, Ordering::SeqCst);
-        if bytes == 0 {
-            self.hnsw_accountant.write().take();
-        }
-    }
-
-    pub(crate) fn set_hnsw_bytes_with_accountant(
-        &self,
-        bytes: usize,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-    ) {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        self.hnsw_bytes.store(bytes, Ordering::SeqCst);
-        *self.hnsw_accountant.write() = Some(accountant);
-    }
-
-    pub fn hnsw(&self) -> &OnceLock<RwLock<Option<HnswIndex>>> {
-        &self.hnsw
-    }
-
-    #[doc(hidden)]
-    pub(crate) fn with_fresh_tail<R>(&self, f: impl FnOnce(&HnswIndex) -> R) -> Option<R> {
-        self.hnsw.get().and_then(|tail| tail.read().as_ref().map(f))
-    }
-
-    /// Turn a graph built in an unpublished purge image into that image's
-    /// sealed base generation. Every fallible step completes before the graph
-    /// moves: encoding, charge reconciliation, and construction of the empty
-    /// mutable tail that later commits will extend.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn prepare_fresh_tail_as_base_generation(
-        &self,
-        identity: VectorGraphGeneration,
-        policy: ResolvedVectorPolicy,
-    ) -> Result<(Vec<u8>, usize)> {
-        if identity.generation_id == 0 {
-            return Err(Error::Other(
-                ("a prepared vector base generation requires a nonzero identity".to_string())
-                    .into(),
-            ));
-        }
-        let _publication = self.generation_publication.lock();
-        let tail = self.hnsw.get().ok_or_else(|| {
-            Error::Other(("prepared vector generation has no built graph".to_string()).into())
-        })?;
-        let (encoded, resident_bytes) = {
-            let tail = tail.read();
-            let graph = tail.as_ref().ok_or_else(|| {
-                Error::Other(("prepared vector generation has no built graph".to_string()).into())
-            })?;
-            (
-                graph.encode_durable_generation()?,
-                graph.estimated_resident_bytes(),
-            )
-        };
-        let identity = VectorGraphGeneration {
-            durable_bytes: encoded.len() as u64,
-            ..identity
-        };
-        let charged_bytes = self.hnsw_bytes.load(Ordering::SeqCst);
-        if charged_bytes != resident_bytes {
-            return Err(Error::Other((format!(
-                "prepared vector generation charge mismatch: graph requires {resident_bytes} bytes but owns {charged_bytes}"
-            )).into()));
-        }
-        let accountant = self.hnsw_accountant.read().clone().ok_or_else(|| {
-            Error::Other(("prepared vector generation has no memory owner".to_string()).into())
-        })?;
-        {
-            let sealed = self.sealed_hnsw.read();
-            if sealed.base.is_some()
-                || sealed.change.is_some()
-                || sealed.dormant_base.is_some()
-                || sealed.dormant_change.is_some()
-                || sealed.pending_base.is_some()
-                || !sealed.retired.is_empty()
-            {
-                return Err(Error::Other(
-                    ("prepared purge state already owns a sealed vector generation".to_string())
-                        .into(),
-                ));
-            }
-        }
-        let empty_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            0,
-            self.dimension,
-            self.quantization,
-            policy.hnsw_m,
-        );
-        accountant.try_allocate_for_static(
-            empty_bytes,
-            "vector_index",
-            "prepare_vector_generation",
-            "Raise MEMORY_LIMIT to retain the fresh vector tail.",
-        )?;
-        let mut empty_charge = PaidRetainedMemoryCharge::new(empty_bytes, accountant.clone());
-        let empty_tail = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            HnswIndex::from_vector_entries_with_policy(
-                &[],
-                self.dimension,
-                self.quantization,
-                policy,
-            )
-        }))
-        .map_err(|_| {
-            Error::Other(("preparing an empty post-purge vector tail panicked".to_string()).into())
-        })?;
-
-        let graph = {
-            let mut tail = tail.write();
-            let graph = tail
-                .take()
-                .expect("prepared vector graph was validated under the publication lock");
-            *tail = Some(empty_tail);
-            graph
-        };
-        self.fresh_tail_replayed_through_lsn
-            .store(identity.covered_lsn.0, Ordering::SeqCst);
-        self.fresh_tail_replay_frontier_active
-            .store(true, Ordering::SeqCst);
-        self.fresh_tail_mutated_through_lsn
-            .store(0, Ordering::SeqCst);
-        self.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-        self.tail_epoch.fetch_add(1, Ordering::SeqCst);
-        self.tail_frontier_tx
-            .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-        self.hnsw_bytes.store(empty_bytes, Ordering::SeqCst);
-        empty_charge.bytes = 0;
-        *self.hnsw_accountant.write() = Some(accountant.clone());
-        self.sealed_hnsw.write().base = Some(SealedHnswGeneration::new(
-            identity,
-            graph,
-            resident_bytes,
-            Some(accountant),
-        ));
-        Ok((encoded, resident_bytes))
-    }
-
-    fn adopt_published_base_generation(&self, generation_id: u64, durable_bytes: u64) {
-        let _publication = self.generation_publication.lock();
-        if let Some(base) = self.sealed_hnsw.write().base.as_mut() {
-            base.identity.generation_id = generation_id;
-            base.identity.durable_bytes = durable_bytes;
-        }
-    }
-
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn initialize_empty_fresh_tail(
-        &self,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        policy: ResolvedVectorPolicy,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        let _publication = self.generation_publication.lock();
-        if self.hnsw.get().is_some_and(|tail| tail.read().is_some()) {
-            return Ok(());
-        }
-        let bytes = HnswIndex::estimated_resident_bytes_with_m(
-            0,
-            self.dimension,
-            self.quantization,
-            policy.hnsw_m,
-        );
-        accountant.try_allocate_for_static(
-            bytes,
-            "vector_index",
-            "initialize_vector_tail",
-            "Raise MEMORY_LIMIT to retain the fresh vector tail.",
-        )?;
-        let mut charge = PaidRetainedMemoryCharge::new(bytes, accountant.clone());
-        let graph = HnswIndex::from_vector_entries_with_policy(
-            &[],
-            self.dimension,
-            self.quantization,
-            policy,
-        );
-        self.set_hnsw(Some(graph), bytes);
-        self.set_hnsw_bytes_with_accountant(bytes, accountant);
-        charge.bytes = 0;
-        Ok(())
     }
 
     #[expect(
@@ -10863,12 +6071,6 @@ impl IndexState {
                 .map(StoredVectorEntry::estimated_bytes),
         );
         Ok(sizes)
-    }
-}
-
-impl Drop for IndexState {
-    fn drop(&mut self) {
-        self.drop_hnsw_without_accounting();
     }
 }
 
@@ -10928,36 +6130,6 @@ pub struct ResolvedVectorPolicy {
     pub policy_revision: u64,
     pub auto_index_at_source: &'static str,
     pub ef_search_source: &'static str,
-}
-
-/// One shared answer for maintenance wake selection and passive lifecycle
-/// inspection. Persistent journal-only work is added by the engine, but the
-/// represented partition state is classified here exactly once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VectorMaintenanceNeed {
-    InitialBuild,
-    Quarantine(VectorRouteQuarantineReason),
-    PolicyReplacement,
-    NewChanges,
-    Tombstones,
-}
-
-impl VectorMaintenanceNeed {
-    pub fn reason(self) -> &'static str {
-        match self {
-            Self::InitialBuild => "initial_build",
-            Self::Quarantine(reason) => reason.as_str(),
-            Self::PolicyReplacement | Self::NewChanges => "new_changes",
-            Self::Tombstones => "tombstones",
-        }
-    }
-
-    fn build_reason(self) -> &'static str {
-        match self {
-            Self::PolicyReplacement => "policy_replacement",
-            _ => self.reason(),
-        }
-    }
 }
 
 impl VectorIndexLayout {
@@ -11088,44 +6260,6 @@ impl VectorIndexLayout {
             || tombstones.saturating_mul(100)
                 >= population
                     .saturating_mul(self.effective_consolidation_tombstone_percent() as u128)
-    }
-
-    pub fn maintenance_need(
-        &self,
-        partition: &VectorPartitionInfo,
-    ) -> Option<VectorMaintenanceNeed> {
-        if let Some(reason) = partition.quarantine_reason {
-            return Some(VectorMaintenanceNeed::Quarantine(reason));
-        }
-        if partition.live_rows == 0
-            && partition.retained_rows == 0
-            && partition.pending_inserts == 0
-            && partition.tombstones == 0
-        {
-            return None;
-        }
-        if !partition.graph_available {
-            return Some(VectorMaintenanceNeed::InitialBuild);
-        }
-        if partition.serving_policy.is_none_or(|serving| {
-            serving.hnsw_m != partition.desired_policy.hnsw_m
-                || serving.hnsw_ef_construction != partition.desired_policy.hnsw_ef_construction
-        }) {
-            return Some(VectorMaintenanceNeed::PolicyReplacement);
-        }
-        if !self.consolidation_due(
-            partition.live_rows,
-            partition.retained_rows,
-            partition.pending_inserts,
-            partition.tombstones,
-        ) {
-            return None;
-        }
-        Some(if partition.tombstones != 0 {
-            VectorMaintenanceNeed::Tombstones
-        } else {
-            VectorMaintenanceNeed::NewChanges
-        })
     }
 
     pub fn effective_auto_index_at(&self) -> usize {
@@ -11532,7 +6666,6 @@ pub struct PreparedPartitionedVectorBatch {
     requested: HashMap<VectorIndexRef, PartitionKeySet>,
     projected_live_or_retained_partitions: HashMap<VectorIndexRef, usize>,
     directory_reservation: PreparedDirectoryReservation,
-    tail_insertions: PreparedTailInsertions,
     /// Post-batch counts of each touched durable-membership partition. Their
     /// memberships are published durably with the rows; publication installs
     /// only these counts.
@@ -11554,7 +6687,6 @@ impl PartialEq for PreparedPartitionedVectorBatch {
             && self.projected_live_or_retained_partitions
                 == other.projected_live_or_retained_partitions
             && self.directory_reservation == other.directory_reservation
-            && self.tail_insertions == other.tail_insertions
             && self.durable_counts == other.durable_counts
     }
 }
@@ -11617,100 +6749,6 @@ impl std::fmt::Debug for PreparedPartitionStates {
     }
 }
 
-struct PreparedTailInsertion {
-    state: Arc<IndexState>,
-    row_id: RowId,
-    insertion: Option<crate::hnsw::PreparedHnswInsertion>,
-    charge: PaidRetainedMemoryCharge,
-    resident_bytes: usize,
-    // Last: prepared graph allocations are destroyed before scratch credit.
-    _scratch: VectorCopyAdmission,
-}
-
-impl PreparedTailInsertion {
-    fn publish(mut self, lsn: Lsn) {
-        let _publication = self.state.generation_publication.lock();
-        let tail = self
-            .state
-            .hnsw
-            .get()
-            .expect("prepared fresh tail exists")
-            .read();
-        let graph = tail
-            .as_ref()
-            .expect("prepared fresh tail stays resident through commit");
-        graph.publish_insert(
-            self.insertion
-                .take()
-                .expect("prepared insertion publishes once"),
-        );
-        self.state
-            .hnsw_bytes
-            .fetch_add(self.resident_bytes, Ordering::SeqCst);
-        // Growth was admitted against the graph's existing funder.
-        self.charge.bytes -= self.resident_bytes;
-        self.state
-            .fresh_tail_mutated_through_lsn
-            .fetch_max(lsn.0, Ordering::SeqCst);
-        self.state
-            .fresh_tail_revision
-            .fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-impl Drop for PreparedTailInsertion {
-    fn drop(&mut self) {
-        let previous = self
-            .state
-            .fresh_tail_preparations
-            .fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(
-            previous != 0,
-            "a prepared tail owns its insertion target pin"
-        );
-    }
-}
-
-struct PreparedTailInsertionBatch {
-    pending: VecDeque<PreparedTailInsertion>,
-    // Publication is serialized by the batch lock, so one admitted workspace
-    // covers the largest insertion and outlives every prepared payload.
-    _publication_scratch: VectorCopyAdmission,
-}
-
-#[derive(Clone)]
-struct PreparedTailInsertions(Arc<Mutex<PreparedTailInsertionBatch>>);
-
-impl std::fmt::Debug for PreparedTailInsertions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PreparedTailInsertions")
-            .field(&self.0.lock().pending.len())
-            .finish()
-    }
-}
-
-impl PartialEq for PreparedTailInsertions {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl PreparedTailInsertions {
-    fn publish(&self, state: &Arc<IndexState>, row_id: RowId, lsn: Lsn) {
-        let mut batch = self.0.lock();
-        if let Some(at) = batch
-            .pending
-            .iter()
-            .position(|item| Arc::ptr_eq(&item.state, state) && item.row_id == row_id)
-        {
-            batch
-                .pending
-                .remove(at)
-                .expect("prepared insertion position exists")
-                .publish(lsn);
-        }
-    }
-}
 #[derive(Clone)]
 struct PreparedDirectoryReservation {
     charge: Arc<Mutex<Option<PaidRetainedMemoryCharge>>>,
@@ -11950,24 +6988,15 @@ pub struct VectorPartitionInfo {
     pub live_rows: usize,
     pub retained_rows: usize,
     pub bytes: usize,
-    pub graph_available: bool,
-    /// The same actual complete-route predicate, under the generic test name.
-    #[cfg(any(test, feature = "test-seams"))]
-    pub indexed_available: bool,
-    pub base_generation: Option<u64>,
-    pub base_tx: Option<TxId>,
     pub pending_inserts: usize,
     pub tombstones: usize,
     pub durable_vector_bytes: usize,
     pub charged_vector_bytes: usize,
-    pub durable_index_bytes: usize,
     pub charged_index_bytes: usize,
-    pub quarantine_reason: Option<VectorRouteQuarantineReason>,
     pub maintenance_progress: Option<VectorMaintenanceProgress>,
     pub maintenance_failure: Option<VectorMaintenanceFailure>,
     pub maintenance_failure_details: Option<VectorMaintenanceFailureDetails>,
     pub desired_policy: ResolvedVectorPolicy,
-    pub serving_policy: Option<VectorServingPolicy>,
     pub maintenance_policy_revision: Option<u64>,
 }
 
@@ -11980,7 +7009,6 @@ pub struct VectorIndexLayoutInfo {
     pub live_or_retained_partitions: usize,
     pub partition_states: usize,
     pub bytes: usize,
-    pub graph_available: bool,
 }
 
 /// Marks one bounded replacement attempt for passive inspection. Dropping
@@ -12556,24 +7584,6 @@ impl VectorColumnState {
             .sum()
     }
 
-    fn has_hnsw(&self) -> bool {
-        self.partitions
-            .read()
-            .values()
-            .any(|state| state.hnsw_len().is_some())
-    }
-
-    fn has_complete_hnsw_route(&self) -> bool {
-        let partitions = self.partitions.read();
-        let mut nonempty = partitions
-            .values()
-            .filter(|state| state.vector_count() != 0);
-        let Some(first) = nonempty.next() else {
-            return false;
-        };
-        first.has_complete_hnsw_route() && nonempty.all(|state| state.has_complete_hnsw_route())
-    }
-
     fn with_partition_candidates_for_row<E, T>(
         &self,
         row_id: RowId,
@@ -13060,28 +8070,6 @@ impl VectorColumnState {
         !removed.is_empty()
     }
 
-    fn clear_hnsw(&self, accountant: &dyn MemoryBudget) {
-        for state in self.partitions.read().values() {
-            state.clear_hnsw(accountant);
-        }
-    }
-
-    fn drop_hnsw_without_accounting_except(&self, preserved_states: &HashSet<usize>) {
-        for state in self.partitions.read().values() {
-            if !preserved_states.contains(&(Arc::as_ptr(state) as usize)) {
-                state.drop_hnsw_without_accounting();
-            }
-        }
-    }
-
-    fn clear_hnsw_except(&self, accountant: &dyn MemoryBudget, preserved_states: &HashSet<usize>) {
-        for state in self.partitions.read().values() {
-            if !preserved_states.contains(&(Arc::as_ptr(state) as usize)) {
-                state.clear_hnsw(accountant);
-            }
-        }
-    }
-
     fn raw_allocation_bytes_matching(&self, keep: impl Fn(&Arc<IndexState>) -> bool) -> usize {
         let partitions = self.partitions.read();
         let mut total = 0usize;
@@ -13117,8 +8105,6 @@ impl VectorColumnState {
             .values()
             .fold(0usize, |bytes, state| {
                 bytes
-                    .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst))
-                    .saturating_add(state.sealed_hnsw_bytes())
             });
         self.directory_ownership(index)
             .total()
@@ -13817,20 +8803,14 @@ type PartitionSnapshot = (VectorPartitionKey, Arc<IndexState>);
 
 pub struct VectorStore {
     last_maintenance_partition: Mutex<Option<(VectorPartitionRef, VectorCopyAdmission)>>,
-    graph_use_sequence: AtomicU64,
     id: StoreId,
     registry: VectorRegistryLock,
     build_mutex: Mutex<()>,
-    /// Lets destructive all-index graph operations wait for builders without
-    /// putting foreground structural publication behind the bulk gate.
-    hnsw_build_gate: RwLock<()>,
     bulk_gate: RwLock<()>,
     #[cfg(any(test, feature = "test-seams"))]
     full_index_entries_touched: AtomicU64,
     #[cfg(feature = "test-seams")]
     pause_registry: crate::test_seam::PauseRegistry,
-    #[cfg(feature = "test-seams")]
-    graph_candidate_caps: crate::test_seam::GraphCandidateCapRegistry,
     #[cfg(any(test, feature = "test-seams"))]
     passive_activity: Arc<VectorPassiveActivity>,
     #[cfg(any(test, feature = "test-seams"))]
@@ -13888,7 +8868,6 @@ impl VectorTeardownReceipt {
                 }
                 state.clear_entries();
             }
-            state.clear_hnsw(accountant);
         }
     }
 }
@@ -13914,7 +8893,6 @@ impl PreparedLoadedVectorReplacement<'_> {
             for column in old.values() {
                 // Accounted incoming and outgoing images have independent
                 // allocation-owned payload and directory reservations.
-                column.clear_hnsw(self.accountant.as_ref());
             }
             drop(old);
         });
@@ -14008,82 +8986,14 @@ impl PreparedVectorPublication {
                     total.saturating_add(column.raw_allocation_bytes_matching(preserved)),
                     |bytes, (_, state)| {
                         bytes
-                            .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst))
-                            .saturating_add(state.sealed_hnsw_bytes())
                     },
                 )
         })
     }
 
-    /// Encode and seal one affected survivor partition before the owning
-    /// purge transaction starts. The returned bytes are immutable input to
-    /// persistence; the same prepared graph becomes visible in memory only
-    /// if that transaction commits and consumes this publication.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn prepare_partition_base_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        identity: VectorGraphGeneration,
-    ) -> Result<(Vec<u8>, usize)> {
-        let column =
-            self.registry
-                .get(&partition.index)
-                .ok_or_else(|| Error::UnknownVectorIndex {
-                    index: partition.index.clone(),
-                })?;
-        let state = column
-            .partition_state(&partition.partition_key)
-            .ok_or_else(|| {
-                Error::Other(
-                    (format!(
-                        "prepared vector partition is missing for {}.{}",
-                        partition.index.table, partition.index.column
-                    ))
-                    .into(),
-                )
-            })?;
-        let policy = column.layout().resolve_policy(state.vector_count(), 1);
-        state.prepare_fresh_tail_as_base_generation(identity, policy)
-    }
 }
 
 impl PreparedVectorPublication {
-    /// Adopt the identity a replacement base generation was durably published
-    /// under. Only identity fields change; nothing is allocated.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn adopt_published_base_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        generation_id: u64,
-        durable_bytes: u64,
-    ) -> Result<()> {
-        let column =
-            self.registry
-                .get(&partition.index)
-                .ok_or_else(|| Error::UnknownVectorIndex {
-                    index: partition.index.clone(),
-                })?;
-        let state = column
-            .partition_state(&partition.partition_key)
-            .ok_or_else(|| {
-                Error::Other(
-                    (format!(
-                        "prepared vector partition is missing for {}.{}",
-                        partition.index.table, partition.index.column
-                    ))
-                    .into(),
-                )
-            })?;
-        state.adopt_published_base_generation(generation_id, durable_bytes);
-        Ok(())
-    }
 }
 
 /// A prepared purge publication can own HNSW graphs before the durable commit.
@@ -14098,14 +9008,13 @@ impl Drop for PreparedVectorPublication {
             {
                 continue;
             }
-            column.drop_hnsw_without_accounting_except(&self.preserved_states);
         }
     }
 }
 
 impl Default for VectorStore {
     fn default() -> Self {
-        Self::new(Arc::new(OnceLock::new()))
+        Self::new()
     }
 }
 
@@ -14132,19 +9041,16 @@ impl VectorStore {
         )
     }
 
-    pub fn new(_legacy_hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>) -> Self {
+    pub fn new() -> Self {
         Self {
             id: StoreId::next(),
             registry: VectorRegistryLock::new(VectorRegistry::new()),
             build_mutex: Mutex::new(()),
-            hnsw_build_gate: RwLock::new(()),
             bulk_gate: RwLock::new(()),
             #[cfg(any(test, feature = "test-seams"))]
             full_index_entries_touched: AtomicU64::new(0),
             #[cfg(feature = "test-seams")]
             pause_registry: crate::test_seam::PauseRegistry::default(),
-            #[cfg(feature = "test-seams")]
-            graph_candidate_caps: crate::test_seam::GraphCandidateCapRegistry::default(),
             #[cfg(any(test, feature = "test-seams"))]
             passive_activity: Arc::new(VectorPassiveActivity::default()),
             #[cfg(any(test, feature = "test-seams"))]
@@ -14156,7 +9062,6 @@ impl VectorStore {
             #[cfg(any(test, feature = "test-seams"))]
             journal_truncation_faults: Mutex::new(HashMap::new()),
             last_maintenance_partition: Mutex::new(None),
-            graph_use_sequence: AtomicU64::new(0),
             workspace_bytes: Arc::new(AtomicUsize::new(0)),
             raw_payload_bytes: Arc::new(AtomicUsize::new(0)),
             raw_payload_header_bytes: Arc::new(AtomicUsize::new(0)),
@@ -14775,10 +9680,7 @@ impl VectorStore {
         Ok(PreparedVectorPublication::new(registry))
     }
 
-    /// Build the exact replacement registry for authoritative purge.  Unlike
-    /// normal lazy search construction, this preserves a graph only for an
-    /// index that already had one, and builds it before durability even when
-    /// the survivor count has crossed below the ordinary lazy threshold.
+    /// Build the exact replacement registry for authoritative purge.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -14786,34 +9688,11 @@ impl VectorStore {
     pub fn prepare_authoritative_purge_publication(
         schemas: Vec<(VectorIndexRef, usize, VectorQuantization)>,
         entries: Vec<VectorEntry>,
-        materialized_indexes: Vec<VectorIndexRef>,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         declared_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<PreparedVectorPublication> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
         let declared_owner: crate::memory_budget::MemoryBudgetOwner = declared_owner.into();
 
-        let publication =
-            Self::prepare_received_schema_publication(schemas, entries, declared_owner)?;
-        for index in materialized_indexes {
-            let Some(column) = publication.registry.get(&index) else {
-                continue;
-            };
-            let Some(state) = column.partition_state(&VectorPartitionKey::unpartitioned()) else {
-                continue;
-            };
-            let policy = column.layout().resolve_policy(state.vector_count(), 1);
-            Self::build_prepared_hnsw(
-                &index,
-                &state,
-                policy,
-                accountant.clone(),
-                VectorCopyAdmission::new(accountant.clone()),
-                || {},
-                &mut || Ok(()),
-            )?;
-        }
-        Ok(publication)
+        Self::prepare_received_schema_publication(schemas, entries, declared_owner)
     }
 
     /// Internal erasure bridge. Copy only declarations in the selected tables;
@@ -14856,17 +9735,6 @@ impl VectorStore {
         })
     }
 
-    #[doc(hidden)]
-    pub fn erasure_partition_has_materialized_hnsw(&self, partition: &VectorPartitionRef) -> bool {
-        self.with_bulk_read(|| {
-            self.registry
-                .read()
-                .get(&partition.index)
-                .and_then(|column| column.partition_state(&partition.partition_key))
-                .is_some_and(|state| state.hnsw_len().is_some())
-        })
-    }
-
     /// Prepare a complete selected-table delta before durability. No registry
     /// entry may be added by erasure; publication uses existing-cell swaps.
     #[doc(hidden)]
@@ -14879,7 +9747,6 @@ impl VectorStore {
         schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
         entries: Vec<PartitionedVectorEntry>,
         affected_partitions: Vec<VectorPartitionRef>,
-        materialized_partitions: Vec<VectorPartitionRef>,
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<PreparedVectorPublication> {
@@ -14953,7 +9820,6 @@ impl VectorStore {
             schemas,
             entries,
             affected_partitions,
-            materialized_partitions,
             accountant,
             &mut workspace,
         )?;
@@ -15057,7 +9923,6 @@ impl VectorStore {
         schemas: Vec<(VectorIndexRef, VectorIndexLayout)>,
         entries: Vec<PartitionedVectorEntry>,
         affected_partitions: Vec<VectorPartitionRef>,
-        materialized_partitions: Vec<VectorPartitionRef>,
         _accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         owner: &mut VectorCopyAdmission,
     ) -> Result<PreparedVectorPublication> {
@@ -15251,29 +10116,6 @@ impl VectorStore {
             purge_links: Vec::new(),
             purge_workspace: None,
         };
-        for partition in materialized_partitions {
-            if !affected_partitions.contains(&partition) {
-                continue;
-            }
-            let Some(column) = publication.registry.get(&partition.index) else {
-                continue;
-            };
-            let Some(state) = column.partition_state(&partition.partition_key) else {
-                continue;
-            };
-            let policy = column.layout().resolve_policy(state.vector_count(), 1);
-            Self::build_prepared_hnsw(
-                &partition.index,
-                &state,
-                policy,
-                self.try_partition_state(&partition.index, &partition.partition_key)
-                    .and_then(|state| state.hnsw_accountant.read().clone())
-                    .unwrap_or_else(|| column.directory_accounting.lock().accountant.clone()),
-                owner.scratch(),
-                || {},
-                &mut || Ok(()),
-            )?;
-        }
         // Rebuilt partitions of a durable column hold their survivors only
         // to build their graph; afterwards they read the durable directory
         // the purge commit leaves, like every other partition there.
@@ -15318,609 +10160,6 @@ impl VectorStore {
         Ok(publication)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn build_prepared_hnsw(
-        index: &VectorIndexRef,
-        state: &Arc<IndexState>,
-        policy: ResolvedVectorPolicy,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        mut workspace: VectorCopyAdmission,
-        after_reservation: impl FnOnce(),
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        let entry_count = state.vector_count();
-        let final_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            entry_count,
-            state.dimension(),
-            state.quantization(),
-            policy.hnsw_m,
-        );
-        let reservation_bytes = crate::mem::estimate_hnsw_build_reservation(
-            entry_count,
-            state.dimension(),
-            state.quantization(),
-            policy,
-        );
-        workspace.reserve_for_static(
-            reservation_bytes.saturating_sub(final_bytes),
-            "vector_index",
-            "prepare_authoritative_purge_hnsw_workspace",
-            "Reduce vector volume or raise MEMORY_LIMIT before rebuilding its HNSW index.",
-        )?;
-        accountant.try_allocate_for_label(
-            final_bytes,
-            "vector_index",
-            crate::memory_budget::prepare_operation_label(&accountant,
-                format_args!("prepare_authoritative_purge_hnsw@{}.{}", index.table, index.column))?,
-            "Reduce vector volume or raise MEMORY_LIMIT before authoritative purge can rebuild its materialized HNSW index.",
-        )?;
-        let mut retained = PaidRetainedMemoryCharge::new(final_bytes, accountant.clone());
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            after_reservation();
-            state.with_entries(|entries| {
-                HnswIndex::new_with_policy_and_progress(
-                    entries,
-                    state.dimension(),
-                    state.quantization(),
-                    policy,
-                    |done| {
-                        checkpoint()?;
-                        state.set_maintenance_vectors_done(done);
-                        checkpoint()
-                    },
-                )
-            })
-        }));
-        let hnsw = match built {
-            Ok(Ok(hnsw)) => hnsw,
-            Ok(Err(error)) => {
-                return Err(error);
-            }
-            Err(_) => {
-                return Err(Error::Other(
-                    (format!(
-                        "authoritative purge HNSW build panicked for {}.{}",
-                        index.table, index.column
-                    ))
-                    .into(),
-                ));
-            }
-        };
-        state.set_hnsw(Some(hnsw), final_bytes);
-        state.set_hnsw_bytes_with_accountant(final_bytes, accountant);
-        retained.bytes = 0;
-        state.set_serving_policy(policy);
-        state.clear_route_quarantine();
-        #[cfg(any(test, feature = "test-seams"))]
-        state.note_passive_activity(|activity| {
-            activity.hnsw_builds.fetch_add(1, Ordering::SeqCst);
-        });
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn in_memory_maintenance_request(
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        state: &Arc<IndexState>,
-        layout: &VectorIndexLayout,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<Option<(ResolvedVectorPolicy, &'static str)>> {
-        if state.paged_storage.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        let info = ScopedVectorCopy::new(owner, |scratch| {
-            Self::partition_info_snapshot(index, partition_key, state, layout, scratch)
-        })?;
-        let need = layout.maintenance_need(&info);
-        if let Some((sample_tx, _)) = state.sampled_maintenance_frontier() {
-            let Some(need) = need else {
-                return Ok(None);
-            };
-            let sampled_count = state.sampled_visible_count(SnapshotId(sample_tx.0), owner)?;
-            let policy = layout.resolve_policy(sampled_count, 1);
-            return Ok(Some((policy, need.build_reason())));
-        }
-        if state.vector_count() == 0 {
-            return Ok(None);
-        }
-        Ok(need.map(|need| (info.desired_policy, need.build_reason())))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn run_sampled_hnsw_maintenance(
-        &self,
-        partition: &VectorPartitionRef,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-        mut after_reservation: impl FnMut(),
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<bool> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        // Short partition gates freeze and later revalidate one sampled
-        // frontier. Construction itself holds only the detached candidate and
-        // graph-lifecycle locks, so unrelated structural commits can publish
-        // while foreground writes extend this partition's fresh tail.
-        let _build_lifecycle = self.hnsw_build_gate.read();
-        {
-            let Some(column) = self.try_column(&partition.index) else {
-                return Ok(false);
-            };
-            let Some(state) = column.partition_state(&partition.partition_key) else {
-                return Ok(false);
-            };
-            let _builder = state.maintenance_build.lock();
-
-            let prepared = self.with_partition_maintenance(
-                &partition.index,
-                &partition.partition_key,
-                || -> Result<_> {
-                    let Some(current_column) = self.try_column(&partition.index) else {
-                        return Ok(None);
-                    };
-                    let Some(current_state) =
-                        current_column.partition_state(&partition.partition_key)
-                    else {
-                        return Ok(None);
-                    };
-                    if !Arc::ptr_eq(&current_state, &state) {
-                        return Ok(None);
-                    }
-                    let layout = current_column.scoped_layout(owner)?;
-                    let Some((policy, reason)) = Self::in_memory_maintenance_request(
-                        &partition.index,
-                        &partition.partition_key,
-                        &state,
-                        &layout,
-                     owner)? else {
-                        return Ok(None);
-                    };
-                    checkpoint()?;
-                    let Some((sample_tx, sample_lsn)) = state
-                        .begin_sampled_hnsw_maintenance(accountant.clone(), policy)?
-                    else {
-                        return Ok(None);
-                    };
-                    let rollback = SampledMaintenanceRollback {
-                        state: state.clone(),
-                        armed: true,
-                    };
-                    let vector_count = state.sampled_visible_count(SnapshotId(sample_tx.0), owner)?;
-                    let final_bytes = HnswIndex::estimated_resident_bytes_with_m(
-                        vector_count,
-                        state.dimension(),
-                        state.quantization(),
-                        policy.hnsw_m,
-                    );
-                    let reservation_bytes = crate::mem::estimate_hnsw_build_reservation(
-                        vector_count,
-                        state.dimension(),
-                        state.quantization(),
-                        policy,
-                    );
-                    let workspace_bytes = reservation_bytes.checked_sub(final_bytes).ok_or_else(|| {
-                        Error::Other((format!(
-                            "maintenance build reservation is smaller than its retained graph for {}.{}",
-                            partition.index.table, partition.index.column
-                        )).into())
-                    })?;
-                    // The fresh tail and detached candidate coexist during
-                    // construction, so each owner keeps its complete charge.
-                    accountant.try_allocate_for_label(
-                        reservation_bytes,
-                        "vector_index",
-                        crate::memory_budget::prepare_operation_label(&accountant, format_args!(
-                            "build_hnsw@{}.{}",
-                            partition.index.table, partition.index.column
-                        ))?,
-                        "Reduce vector volume or raise MEMORY_LIMIT before maintenance rebuilds this materialized HNSW index.",
-                    )?;
-                    let reservation = PaidRetainedMemoryCharge::new(reservation_bytes, accountant.clone());
-                    let mut entries = Vec::new();
-                    entries.try_reserve_exact(vector_count).map_err(|_| {
-                        Error::Other((format!(
-                            "maintenance vector snapshot allocation failed for {}.{}",
-                            partition.index.table, partition.index.column
-                        )).into())
-                    })?;
-                    if state.is_durable() {
-                        let sample = SnapshotId(sample_tx.0);
-                        entries.extend(
-                            state
-                                .durable_entries_selected(&partition.index, sample, &|bytes| crate::memory_budget::require_copy_capacity(reservation.bytes, bytes), &mut VectorCopyAdmission::new(reservation.accountant.clone()), |entry| {
-                                    entry.created_tx <= sample_tx
-                                        && entry
-                                            .deleted_tx
-                                            .is_none_or(|deleted| deleted > sample_tx)
-                                })?
-                                .into_iter()
-                                .map(|entry| state.stored_entry(entry)),
-                        );
-                    } else {
-                        state.with_entries(|source| {
-                            entries.extend(
-                                source
-                                    .iter()
-                                    .filter(|entry| {
-                                        entry.created_tx <= sample_tx
-                                            && entry
-                                                .deleted_tx
-                                                .is_none_or(|deleted| deleted > sample_tx)
-                                    })
-                                    .cloned(),
-                            );
-                        });
-                    }
-                    if entries.len() != vector_count {
-                        return Err(Error::Other((format!(
-                            "maintenance vector snapshot disagrees with live count for {}.{}",
-                            partition.index.table, partition.index.column
-                        )).into()));
-                    }
-                    checkpoint()?;
-                    let progress = state.begin_maintenance_progress_at(
-                        match reason {
-                            "initial_build" | "policy_replacement" => "building",
-                            "new_changes" => "replaying",
-                            _ => "compacting",
-                        },
-                        if reason == "policy_replacement" {
-                            "new_changes"
-                        } else {
-                            reason
-                        },
-                        vector_count,
-                        sample_tx,
-                    );
-                    Ok(Some((
-                        policy,
-                        entries,
-                        sample_tx,
-                        sample_lsn,
-                        final_bytes,
-                        workspace_bytes,
-                        reservation,
-                        progress,
-                        rollback,
-                    )))
-                },
-            )?;
-            let Some((
-                policy,
-                entries,
-                sample_tx,
-                sample_lsn,
-                final_bytes,
-                workspace_bytes,
-                mut reservation,
-                progress,
-                mut rollback,
-            )) = prepared
-            else {
-                return Ok(false);
-            };
-
-            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                after_reservation();
-                HnswIndex::new_with_policy_and_progress(
-                    &entries,
-                    state.dimension(),
-                    state.quantization(),
-                    policy,
-                    |done| {
-                        checkpoint()?;
-                        progress.advance(done);
-                        checkpoint()
-                    },
-                )
-            }));
-            let hnsw = match built {
-                Ok(Ok(hnsw)) => hnsw,
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err(Error::Other(
-                        (format!(
-                            "maintenance HNSW build panicked for {}.{}",
-                            partition.index.table, partition.index.column
-                        ))
-                        .into(),
-                    ));
-                }
-            };
-
-            let published =
-                self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-                    let Some(current_column) = self.try_column(&partition.index) else {
-                        return false;
-                    };
-                    let Some(current_state) =
-                        current_column.partition_state(&partition.partition_key)
-                    else {
-                        return false;
-                    };
-                    if !Arc::ptr_eq(&current_state, &state) {
-                        return false;
-                    }
-                    let current_policy = current_column
-                        .layout
-                        .read()
-                        .resolve_policy(entries.len(), 1);
-                    if current_policy != policy {
-                        return false;
-                    }
-                    if state.sampled_maintenance_frontier() != Some((sample_tx, sample_lsn)) {
-                        return false;
-                    }
-                    state.publish_sampled_hnsw(
-                        hnsw,
-                        final_bytes,
-                        accountant.clone(),
-                        policy,
-                        sample_tx,
-                        sample_lsn,
-                    );
-                    rollback.armed = false;
-                    reservation.bytes = workspace_bytes;
-                    #[cfg(any(test, feature = "test-seams"))]
-                    state.note_passive_activity(|activity| {
-                        activity.hnsw_builds.fetch_add(1, Ordering::SeqCst);
-                    });
-                    true
-                });
-            Ok(published)
-        }
-    }
-
-    /// Install the engine's persisted frontier build record and transaction
-    /// callback. Subsequent ordinary maintenance cycles dispatch this finite
-    /// builder and never enter the resident whole-partition build for it.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn register_partition_paged_builder(
-        &self,
-        partition: &VectorPartitionRef,
-        progress: PagedVectorProgress,
-        persistence: Arc<dyn PagedGenerationPersistence>,
-        plan: PagedVectorBatchPlan,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        self.register_paged_operation(
-            partition,
-            progress,
-            persistence,
-            plan,
-            accountant,
-            false,
-            owner,
-        )
-    }
-    /// Reopen a retired durable cleanup record independently of the pending
-    /// replacement builder. The engine inventory owns retired identities; this
-    /// partition retains at most one finite cleanup operation at a time.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn register_partition_paged_reclaimer(
-        &self,
-        partition: &VectorPartitionRef,
-        progress: PagedVectorProgress,
-        persistence: Arc<dyn PagedGenerationPersistence>,
-        plan: PagedVectorBatchPlan,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        if !matches!(
-            progress.phase,
-            PagedVectorPhase::Published
-                | PagedVectorPhase::Abandoned
-                | PagedVectorPhase::Reclaiming
-        ) {
-            return Err(Error::Other(
-                "cleanup requires a retired published generation".into(),
-            ));
-        }
-        self.register_paged_operation(
-            partition,
-            progress,
-            persistence,
-            plan,
-            accountant,
-            true,
-            owner,
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn register_paged_operation(
-        &self,
-        partition: &VectorPartitionRef,
-        progress: PagedVectorProgress,
-        persistence: Arc<dyn PagedGenerationPersistence>,
-        plan: PagedVectorBatchPlan,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        cleanup: bool,
-        _owner: &mut VectorCopyAdmission,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        let policy = self.with_index_layout(&partition.index, |layout| {
-            layout.resolve_policy(progress.total_points, 1)
-        })?;
-        let builder = PagedGenerationBuilder::resume_for_partition(
-            partition,
-            progress,
-            policy,
-            state.dimension,
-            state.quantization,
-            persistence,
-            accountant,
-            Arc::clone(&self.workspace_bytes),
-        )?;
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let current = self.partition_state(&partition.index, &partition.partition_key)?;
-            if !Arc::ptr_eq(&state, &current) {
-                return Err(Error::Other(
-                    "paged generation partition changed during registration".into(),
-                ));
-            }
-            let mut slot = if cleanup {
-                state.paged_reclaimer.lock()
-            } else {
-                state.paged_builder.lock()
-            };
-            if slot.active() {
-                return Err(Error::Other(
-                    "paged generation operation is already registered".into(),
-                ));
-            }
-            slot.progress = Some(builder.progress_snapshot());
-            slot.pending = Some((builder, plan));
-            state.paged_storage.store(true, Ordering::SeqCst);
-            Ok(())
-        })
-    }
-    /// Maintenance bridge for exporting an already admitted resident graph.
-    /// The engine retains its graph, source rows and finite transaction owner.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn export_resident_paged_batch(
-        &self,
-        graph: &HnswIndex,
-        rows: &[&VectorEntry],
-        previous: &PagedVectorProgress,
-        plan: PagedVectorBatchPlan,
-        transaction: &mut dyn crate::hnsw::paged_builder::PagedGenerationTransaction,
-    ) -> Result<PagedVectorProgress> {
-        graph.export_resident_paged_batch(rows, previous, plan, transaction)
-    }
-
-    #[doc(hidden)]
-    pub fn partition_paged_build_progress(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Option<PagedVectorProgress> {
-        self.try_partition_state(&partition.index, &partition.partition_key)
-            .and_then(|state| {
-                let slot = state.paged_builder.lock();
-                slot.pending
-                    .as_ref()
-                    .map(|(builder, _)| builder.progress().clone())
-                    .or_else(|| slot.progress.as_ref().map(|progress| (***progress).clone()))
-            })
-    }
-    /// Advance only the engine-selected partition by one persisted finite batch.
-    /// The operation guard restores its last committed progress on every exit;
-    /// the callback runs after the slot lock is released. A busy or absent
-    /// operation returns false without driving another partition.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn step_partition_paged_build(
-        &self,
-        partition: &VectorPartitionRef,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<bool> {
-        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
-        else {
-            return Ok(false);
-        };
-        if state.paged_builder.lock().in_flight {
-            return Ok(false);
-        }
-        let Some(mut operation) = PagedBuildOperation::take(state, false)? else {
-            return Ok(false);
-        };
-        let (builder, plan) = operation.work();
-        builder.step(*plan, checkpoint)?;
-        Ok(true)
-    }
-
-    /// Advance one engine-selected partition by one batch under a plan the
-    /// engine derives from its current writer budget. The registered plan is
-    /// replaced first, so a later limit change never runs a stale workspace.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn step_partition_paged_build_with_plan(
-        &self,
-        partition: &VectorPartitionRef,
-        plan: PagedVectorBatchPlan,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<bool> {
-        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
-        else {
-            return Ok(false);
-        };
-        if state.paged_builder.lock().in_flight {
-            return Ok(false);
-        }
-        let Some(mut operation) = PagedBuildOperation::take(state, false)? else {
-            return Ok(false);
-        };
-        let (builder, registered) = operation.work();
-        *registered = plan;
-        builder.step(plan, checkpoint)?;
-        Ok(true)
-    }
-
-    /// `publish_partition_paged_build` under a plan derived at publication.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn publish_partition_paged_build_with_plan(
-        &self,
-        partition: &VectorPartitionRef,
-        through_lsn: Lsn,
-        plan: PagedVectorBatchPlan,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<PagedVectorProgress> {
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        let mut operation = PagedBuildOperation::take(state, false)?
-            .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
-        let (builder, registered) = operation.work();
-        *registered = plan;
-        builder.publish(through_lsn, plan, checkpoint)?;
-        let progress = builder.progress().clone();
-        operation.finished = true;
-        Ok(progress)
-    }
-
     /// Report the durable checkpoint after a paged batch completes or aborts.
     #[doc(hidden)]
     pub fn report_partition_paged_build_progress(
@@ -15945,22 +10184,6 @@ impl VectorStore {
         });
     }
 
-    /// Drop a registered paged build whose durable record was erased. Waits
-    /// for an in-flight batch; the engine never calls this under its gate.
-    #[doc(hidden)]
-    pub fn forget_partition_paged_build(&self, partition: &VectorPartitionRef) {
-        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
-        else {
-            return;
-        };
-        let mut slot = state.paged_builder.lock();
-        while slot.in_flight {
-            state.paged_build_finished.wait(&mut slot);
-        }
-        slot.pending = None;
-        slot.progress = None;
-    }
-
     /// Clear the reported progress of a published or abandoned paged build.
     #[doc(hidden)]
     pub fn clear_partition_paged_build_progress(&self, partition: &VectorPartitionRef) {
@@ -15969,147 +10192,6 @@ impl VectorStore {
         }
     }
 
-    /// Complete storage publication under the engine's commit gate, then
-    /// release the pending-build slot. Serving roots are installed through
-    /// install_loaded_sealed_generation / publish_replacement_base_generation;
-    /// retired cleanup records remain in the engine's durable inventory.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn publish_partition_paged_build(
-        &self,
-        partition: &VectorPartitionRef,
-        through_lsn: Lsn,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<PagedVectorProgress> {
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        let mut operation = PagedBuildOperation::take(state, false)?
-            .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
-        let (builder, plan) = operation.work();
-        builder.publish(through_lsn, *plan, checkpoint)?;
-        let progress = builder.progress().clone();
-        operation.finished = true;
-        Ok(progress)
-    }
-    /// Invalidate an obsolete pinned frontier through the engine's explicit
-    /// durable abandon fence, freeing the build slot for a new frontier.
-    /// Cleanup can resume independently from the returned inventory record.
-    /// Call outside the engine commit gate: an in-flight finite batch finishes
-    /// before the persistence callback acquires that gate for the abandon CAS.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn abandon_partition_paged_build(
-        &self,
-        partition: &VectorPartitionRef,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<PagedVectorProgress> {
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        let mut operation = PagedBuildOperation::take_for_abandon(state)?;
-        let (builder, plan) = operation.work();
-        builder.abandon(*plan, checkpoint)?;
-        let progress = builder.progress().clone();
-        operation.finished = true;
-        Ok(progress)
-    }
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn reclaim_partition_paged_build(
-        &self,
-        partition: &VectorPartitionRef,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<usize> {
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        let mut operation = PagedBuildOperation::take(state, true)?
-            .ok_or_else(|| Error::Other("paged vector reclaimer is not registered".into()))?;
-        let (builder, plan) = operation.work();
-        let removed = builder.reclaim(*plan, checkpoint)?;
-        operation.finished = builder.progress().phase == PagedVectorPhase::Reclaimed;
-        Ok(removed)
-    }
-    /// Whether this partition owns native paged construction or serving storage.
-    #[doc(hidden)]
-    pub fn partition_has_paged_storage(&self, partition: &VectorPartitionRef) -> bool {
-        self.try_partition_state(&partition.index, &partition.partition_key)
-            .is_some_and(|state| state.paged_storage.load(Ordering::SeqCst))
-    }
-
-    /// Install a captured-root fresh tail before enabling ordinary writer
-    /// maintenance. Admission precedes the short state publication boundary.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn install_partition_paged_tail(
-        &self,
-        partition: &VectorPartitionRef,
-        tail: PagedVectorTail,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        let (dimension, quantization, policy) = tail.definition();
-        if tail.partition() != partition
-            || dimension != state.dimension
-            || quantization != state.quantization
-        {
-            return Err(Error::Other(
-                "paged tail declaration does not match its partition".into(),
-            ));
-        }
-        let through_lsn = tail.progress().frontier_lsn;
-        let graph = HnswIndex::from_paged_tail(tail);
-        let bytes = graph.estimated_resident_bytes();
-        accountant.try_allocate_for_static(
-            bytes,
-            "vector_index",
-            "install_paged_vector_tail",
-            "release idle serving pages",
-        )?;
-        let mut charge = PaidRetainedMemoryCharge::new(bytes, accountant.clone());
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let current = self.partition_state(&partition.index, &partition.partition_key)?;
-            if !Arc::ptr_eq(&state, &current) {
-                return Err(Error::Other(
-                    "paged tail partition changed during installation".into(),
-                ));
-            }
-            let _publication = state.generation_publication.lock();
-            let old_bytes = state.remove_hnsw_graph();
-            let old_accountant = state.hnsw_accountant.write().take();
-            *state.hnsw.get_or_init(|| RwLock::new(None)).write() = Some(graph);
-            state.hnsw_bytes.store(bytes, Ordering::SeqCst);
-            *state.hnsw_accountant.write() = Some(accountant);
-            state.paged_storage.store(true, Ordering::SeqCst);
-            state.set_serving_policy(policy);
-            state
-                .fresh_tail_replayed_through_lsn
-                .store(through_lsn.0, Ordering::SeqCst);
-            state
-                .fresh_tail_replay_frontier_active
-                .store(true, Ordering::SeqCst);
-            state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-            state.tail_epoch.fetch_add(1, Ordering::SeqCst);
-            state
-                .tail_frontier_tx
-                .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-            charge.bytes = 0;
-            drop(_publication);
-            if let Some(accountant) = old_accountant {
-                accountant.release(old_bytes)
-            }
-            Ok(())
-        })
-    }
     /// Inspect only the suffix owned by this operation's captured source.
     /// This test seam never installs a graph or changes resident inspection.
     #[cfg(any(test, feature = "test-seams"))]
@@ -16240,302 +10322,6 @@ impl VectorStore {
         Ok(Some(inspected))
     }
 
-    /// The callback must commit row bodies/MVCC, journal, graph pages and the
-    /// successor root together. No vector registry/publication lock is held
-    /// during admission or that callback. The engine serializes this operation
-    /// with DDL/purge and ordinary commits using its existing commit gate.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn append_partition_paged_tail(
-        &self,
-        partition: &VectorPartitionRef,
-        entries: &[VectorEntry],
-        plan: PagedVectorBatchPlan,
-    ) -> Result<()> {
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        let tail = state
-            .hnsw
-            .get()
-            .and_then(|lock| {
-                lock.read()
-                    .as_ref()
-                    .and_then(HnswIndex::paged_tail_snapshot)
-            })
-            .ok_or_else(|| Error::Other("paged vector tail is not installed".into()))?;
-        let mut next = (*tail).clone();
-        next.append(entries, plan)?;
-        let _publication = state.generation_publication.lock();
-        let current = self
-            .try_partition_state(&partition.index, &partition.partition_key)
-            .ok_or_else(|| Error::Other("paged tail partition retired during commit".into()))?;
-        if !Arc::ptr_eq(&state, &current) {
-            return Err(Error::Other(
-                "paged tail partition changed outside the engine commit gate".into(),
-            ));
-        }
-        let lock = state.hnsw.get().expect("installed tail");
-        let mut graph = lock.write();
-        let graph = graph.as_mut().ok_or_else(|| {
-            Error::Other("paged tail removed outside the engine commit gate".into())
-        })?;
-        graph.publish_paged_tail_root(&tail, next)?;
-        let through_lsn = entries
-            .iter()
-            .map(|entry| entry.lsn.0)
-            .max()
-            .unwrap_or(tail.progress().frontier_lsn.0);
-        state
-            .fresh_tail_replayed_through_lsn
-            .store(through_lsn, Ordering::SeqCst);
-        state
-            .fresh_tail_mutated_through_lsn
-            .store(through_lsn, Ordering::SeqCst);
-        state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Advance every needy partition in one finite sampled cycle. Queries do
-    /// not call this method; caller-driven and engine-owned maintenance share
-    /// the same cycle.
-    ///
-    /// The engine calls `retire_snapshot_free_partition_states` first while
-    /// holding its commit and snapshot-removal guards. Keeping that separate
-    /// makes the proof boundary explicit: this graph-build loop has no
-    /// authority to decide that an old snapshot has released a state.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn run_hnsw_maintenance_cycle(
-        &self,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<VectorMaintenanceReport> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        self.run_hnsw_maintenance_cycle_with(accountant, &mut || Ok(()), owner)
-    }
-
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn run_hnsw_maintenance_cycle_with(
-        &self,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<VectorMaintenanceReport> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        let mut local_copy_admission = owner.local_scratch();
-        let owner = local_copy_admission.as_mut().unwrap_or(owner);
-        let indexes = self.scoped_sorted_refs(|_| true, owner)?;
-        let mut pending = Vec::new();
-        let mut first_failure_details = None;
-        for index in &indexes {
-            if let Some(column) = self.try_column(index) {
-                for (key, state) in column.admitted_partition_snapshots(owner)? {
-                    let layout = column.scoped_layout(owner)?;
-                    let needed = if state.paged_builder.lock().active() {
-                        true
-                    } else {
-                        match Self::in_memory_maintenance_request(
-                            index, &key, &state, &layout, owner,
-                        ) {
-                            Ok(request) => request.is_some(),
-                            Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
-                                return Err(error);
-                            }
-                            Err(error) => {
-                                let details = VectorMaintenanceFailureDetails::from_error(&error);
-                                state.record_maintenance_failure(details);
-                                column.note_failed_partition(&key);
-                                first_failure_details.get_or_insert(details);
-                                continue;
-                            }
-                        }
-                    };
-                    if needed {
-                        owner.reserve(
-                            std::mem::size_of::<VectorPartitionRef>()
-                                .saturating_add(index.table.len())
-                                .saturating_add(index.column.len()),
-                        )?;
-                        pending.reserve_exact(1);
-                        pending.push(VectorPartitionRef::new(index.clone(), key));
-                    }
-                }
-            }
-        }
-        // A wake advances the whole finite sampled backlog. A partition with
-        // no complete route goes first so a large replacement backlog cannot
-        // leave a cold partition unavailable for another full sweep.
-        owner.reserve(
-            pending
-                .len()
-                .saturating_mul(std::mem::size_of::<VectorPartitionRef>()),
-        )?;
-        pending.sort_by_key(|partition| {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .is_some_and(|state| {
-                    state.serving_policy().is_some() || state.route_quarantine().is_some()
-                })
-        });
-
-        let mut built_partitions = 0usize;
-        let mut built_indexes = HashSet::new();
-        for partition in pending {
-            let paged_step = if let Some(state) =
-                self.try_partition_state(&partition.index, &partition.partition_key)
-            {
-                if state.paged_builder.lock().in_flight {
-                    Some(Ok(false))
-                } else {
-                    match PagedBuildOperation::take(state, false) {
-                        Ok(Some(mut operation)) => {
-                            let (builder, plan) = operation.work();
-                            Some(builder.step(*plan, checkpoint).map(|()| false))
-                        }
-                        Ok(None) => None,
-                        Err(error) => Some(Err(error)),
-                    }
-                }
-            } else {
-                None
-            };
-            let did_build = if let Some(result) = paged_step {
-                result
-            } else {
-                self.run_sampled_hnsw_maintenance(
-                    &partition,
-                    accountant.clone(),
-                    checkpoint,
-                    || {
-                        #[cfg(feature = "test-seams")]
-                        self.pause_registry
-                            .maybe_pause(&partition.index, crate::test_seam::PauseWindow::Build);
-                    },
-                    owner,
-                )
-            };
-            let did_build = match did_build {
-                Ok(did_build) => did_build,
-                Err(error @ Error::ReadCancelled) => return Err(error),
-                Err(error) => {
-                    let details = VectorMaintenanceFailureDetails::from_error(&error);
-                    if let Some(state) =
-                        self.try_partition_state(&partition.index, &partition.partition_key)
-                    {
-                        state.record_maintenance_failure(details);
-                        self.note_failed_partition(&partition.index, &partition.partition_key);
-                    }
-                    first_failure_details.get_or_insert(details);
-                    continue;
-                }
-            };
-            if did_build {
-                built_partitions = built_partitions.saturating_add(1);
-                built_indexes.insert(partition.index.clone());
-            }
-        }
-
-        let mut report = self.hnsw_maintenance_status();
-        report.built_partitions = built_partitions;
-        report.built_indexes = built_indexes.len();
-        report.first_failure = first_failure_details.map(|details| details.failure);
-        report.first_failure_details = first_failure_details;
-        Ok(report)
-    }
-
-    /// Drive the production maintenance body for one index without making a
-    /// query the owner of construction. This is test-only because production
-    /// scheduling remains the finite store-wide maintenance cycle above.
-    #[doc(hidden)]
-    #[cfg(feature = "test-seams")]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn run_hnsw_maintenance_for_index_for_test(
-        &self,
-        index: &VectorIndexRef,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<bool> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        self.try_column(index)
-            .ok_or_else(|| Error::UnknownVectorIndex {
-                index: index.clone(),
-            })?;
-        let mut built = false;
-        let partitions = self
-            .try_column(index)
-            .expect("index existence was checked")
-            .admitted_partition_snapshots(owner)?;
-        for (partition_key, _) in partitions {
-            let partition = VectorPartitionRef::new(index.clone(), partition_key);
-            let did_build = self.run_sampled_hnsw_maintenance(
-                &partition,
-                accountant.clone(),
-                &mut || Ok(()),
-                || {
-                    self.pause_registry
-                        .maybe_pause(index, crate::test_seam::PauseWindow::Build);
-                },
-                owner,
-            )?;
-            built |= did_build;
-        }
-        Ok(built)
-    }
-
-    /// Observe maintained-route readiness without constructing, loading, or
-    /// mutating a graph. File-backed maintenance uses this after its durable
-    /// catalog publication so the report and every reader share one
-    /// publication point.
-    pub fn hnsw_maintenance_status(&self) -> VectorMaintenanceReport {
-        self.with_bulk_read(|| {
-            let mut report = VectorMaintenanceReport::default();
-            for column in self.registry.read().values() {
-                let mut index_nonempty = false;
-                let mut index_remaining = false;
-                for state in column
-                    .partitions
-                    .read()
-                    .values()
-                    .filter(|state| !state.is_historical_only())
-                {
-                    if state.vector_count() == 0 {
-                        continue;
-                    }
-                    index_nonempty = true;
-                    report.nonempty_partitions = report.nonempty_partitions.saturating_add(1);
-                    if state.has_complete_hnsw_route() {
-                        report.ready_partitions = report.ready_partitions.saturating_add(1);
-                    } else {
-                        index_remaining = true;
-                        report.remaining_partitions = report.remaining_partitions.saturating_add(1);
-                    }
-                }
-                if index_nonempty {
-                    report.nonempty_indexes = report.nonempty_indexes.saturating_add(1);
-                    if index_remaining {
-                        report.remaining_indexes = report.remaining_indexes.saturating_add(1);
-                    } else {
-                        report.ready_indexes = report.ready_indexes.saturating_add(1);
-                    }
-                }
-            }
-            report
-        })
-    }
-
     /// Cheap read-only pre-check for
     /// [`Self::retire_snapshot_free_partition_states`] and
     /// [`IndexState::reclaim_snapshot_free_graph_generations`]: whether any
@@ -16559,20 +10345,7 @@ impl VectorStore {
             column.partitions.read().values().any(|state| {
                 state.entry_count() == 0
                     || (!state.historical_only.load(Ordering::SeqCst) && state.vector_count() == 0)
-                    || state.has_retired_sealed_generations()
             })
-        })
-    }
-
-    /// Retired graphs can be reclaimed independently of route retirement.
-    #[doc(hidden)]
-    pub fn has_retired_graph_generations(&self) -> bool {
-        self.registry.read().values().any(|column| {
-            column
-                .partitions
-                .read()
-                .values()
-                .any(|state| state.has_retired_sealed_generations())
         })
     }
 
@@ -16615,7 +10388,6 @@ impl VectorStore {
                         // historical read. Do not leave its empty active
                         // identity consuming an inspection slot after the
                         // source history has already been pruned.
-                        state.clear_hnsw(accountant);
                         has_empty_state = true;
                         continue;
                     }
@@ -16632,7 +10404,6 @@ impl VectorStore {
                     if needed {
                         continue;
                     }
-                    state.clear_hnsw(accountant);
                     column.mark_historical_only(&partition_key);
                     retired = retired.saturating_add(1);
                 }
@@ -16732,7 +10503,6 @@ impl VectorStore {
             if preserved_columns.contains(&(Arc::as_ptr(column) as usize)) {
                 continue;
             }
-            column.clear_hnsw_except(&*accountant, &preserved_states);
         }
         // Continuing columns already own one retained identity. Once outgoing
         // copied keys are destroyed, their same directory credit covers the
@@ -17072,7 +10842,7 @@ impl VectorStore {
                 .saturating_add(32 * std::mem::size_of::<usize>()),
         )?;
         let paged_counts = self.paged_partition_counts(&index)?;
-        let changed_column = self.with_bulk_maintenance(|| {
+        self.with_bulk_maintenance(|| {
             let existing = { self.registry.read().get(&index).cloned() };
             let Some(existing) = existing else {
                 let column = Arc::new(VectorColumnState::new(layout.clone(), declared_owner.clone()));
@@ -17136,10 +10906,7 @@ impl VectorStore {
         // Only the few partitions carrying an old failure need a
         // directory-derived recheck, and a concurrent retry cannot have its
         // newer mark cleared by this one.
-        let Some(changed_column) = changed_column else {
-            return Ok(());
-        };
-        self.recheck_maintenance_failures_for_layout(&index, &changed_column, &layout, owner)
+        Ok(())
     }
 
     /// After a policy-only layout change is visible, clear each recorded
@@ -17152,66 +10919,6 @@ impl VectorStore {
         if let Some(column) = column {
             column.note_failed_partition(key);
         }
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn recheck_maintenance_failures_for_layout(
-        &self,
-        index: &VectorIndexRef,
-        changed_column: &Arc<VectorColumnState>,
-        layout: &VectorIndexLayout,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<()> {
-        self.with_bulk_read(|| {
-            let still_current = self.registry.read().get(index).is_some_and(|column| {
-                Arc::ptr_eq(column, changed_column) && *column.layout.read() == *layout
-            });
-            if !still_current {
-                return Ok(());
-            }
-            let (snapshots, full_since) = changed_column.failure_recheck_snapshots(owner)?;
-            for (partition_key, state) in snapshots {
-                #[cfg(test)]
-                FAILURE_RECHECK_VISITS.with(|visits| visits.set(visits.get() + 1));
-                if state.is_historical_only() {
-                    if state.maintenance_failure_details().is_some() {
-                        changed_column.note_failed_partition(&partition_key);
-                    }
-                    continue;
-                }
-                self.with_partition_maintenance(index, &partition_key, || -> Result<()> {
-                    if let Some(failure) = state.maintenance_failure_details() {
-                        debug_assert!(
-                            !HELD_BULK_WRITE_LOCKS
-                                .with(|held| held.borrow().contains(&self.id)),
-                            "declaration failure recheck cannot inspect raw vector directories under the store-wide write gate"
-                        );
-                        let info = Self::partition_info_snapshot(index, &partition_key, &state, layout, owner)?;
-                        if layout.maintenance_need(&info).is_none() {
-                            state.clear_maintenance_failure_if(failure);
-                        }
-                    }
-                    Ok(())
-                })?;
-                // A failure recorded after the check above is noted again by
-                // its recorder, or here, so the set never loses one.
-                if state.maintenance_failure_details().is_some() {
-                    changed_column.note_failed_partition(&partition_key);
-                } else {
-                    changed_column.forget_failed_partition(&partition_key);
-                    if state.maintenance_failure_details().is_some() {
-                        changed_column.note_failed_partition(&partition_key);
-                    }
-                }
-            }
-            if let Some(since) = full_since {
-                changed_column.complete_failed_partitions(since);
-            }
-            Ok(())
-        })
     }
 
     /// Admit a policy-only layout change for a registered index: the same
@@ -17333,36 +11040,6 @@ impl VectorStore {
             drop(retained);
             Some(PublishedVectorPolicyLayout { index, column })
         })
-    }
-
-    /// The local ALTER's follow-up for a published policy-only change: clear
-    /// each recorded partition maintenance failure the new layout no longer
-    /// needs. The failure mark is inspection-only, so a caller that cannot
-    /// fail after durability may ignore a refusal here; the mark then stays
-    /// until the next maintenance pass touches the partition.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn recheck_policy_maintenance_failures(
-        &self,
-        published: &PublishedVectorPolicyLayout,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<()> {
-        if !published.column.may_have_failed_partitions() {
-            return Ok(());
-        }
-        let layout = {
-            let current = published.column.layout.read();
-            owner.reserve(current.estimated_bytes())?;
-            current.clone()
-        };
-        self.recheck_maintenance_failures_for_layout(
-            &published.index,
-            &published.column,
-            &layout,
-            owner,
-        )
     }
 
     #[expect(
@@ -17564,9 +11241,7 @@ impl VectorStore {
             return Ok(false);
         }
         if !changed_by_batch && !state.is_durable() {
-            if state.route_quarantine().is_some()
-                || state.resident_pending_after(Self::inspection_covered_tx(&state))
-            {
+            if state.resident_pending_after(None) {
                 // The cap-time sweep has no authority to discard an
                 // untouched route's pending durability or repair work.
                 return Ok(false);
@@ -17580,7 +11255,7 @@ impl VectorStore {
                 &layout,
                 owner,
             )?;
-            if info.pending_inserts != 0 || info.tombstones != 0 || info.quarantine_reason.is_some()
+            if info.pending_inserts != 0 || info.tombstones != 0
             {
                 // The cap-time sweep has no authority to discard an
                 // untouched route's pending durability or repair work.
@@ -18058,8 +11733,6 @@ impl VectorStore {
             reservation
         };
 
-        let tail_insertions = self.prepare_tail_insertions(inserts, &valid_moves, owner)?;
-
         let mut durable_counts = Vec::new();
         for partition in Self::sorted_partition_refs(touched.iter().cloned()) {
             let Some(column) = self.try_column(&partition.index) else {
@@ -18123,7 +11796,6 @@ impl VectorStore {
             requested,
             projected_live_or_retained_partitions: projected_counts,
             directory_reservation,
-            tail_insertions,
             durable_counts,
             canonical_closures: Vec::new(),
             partition_states: PreparedPartitionStates {
@@ -18168,183 +11840,6 @@ impl VectorStore {
             }
         }
         rows
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn prepare_tail_insertion(
-        &self,
-        pending: &mut Vec<PreparedTailInsertion>,
-        state: Arc<IndexState>,
-        lsn: Lsn,
-        prepare_entry: impl FnOnce(&mut VectorCopyAdmission) -> Result<StoredVectorEntry>,
-        owner: &mut VectorCopyAdmission,
-        publication_scratch: &mut VectorCopyAdmission,
-        publication_workspace_bytes: &mut usize,
-    ) -> Result<()> {
-        let _publication = state.generation_publication.lock();
-        if state
-            .fresh_tail_replay_frontier_active
-            .load(Ordering::SeqCst)
-            && lsn.0 != 0
-            && lsn.0 <= state.fresh_tail_replayed_through_lsn.load(Ordering::SeqCst)
-        {
-            return Ok(());
-        }
-        let Some(lock) = state.hnsw.get() else {
-            return Ok(());
-        };
-        let tail = lock.read();
-        let Some(graph) = tail.as_ref() else {
-            return Ok(());
-        };
-        let additions = state
-            .fresh_tail_preparations
-            .load(Ordering::SeqCst)
-            .checked_add(1)
-            .ok_or_else(|| {
-                Error::Other(("HNSW prepared insertion count overflow".to_string()).into())
-            })?;
-        let prior_count = graph
-            .len()
-            .checked_add(additions - 1)
-            .ok_or_else(|| Error::Other(("HNSW data-id space exhausted".to_string()).into()))?;
-        let next_count = prior_count
-            .checked_add(1)
-            .ok_or_else(|| Error::Other(("HNSW data-id space exhausted".to_string()).into()))?;
-        let resident_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            next_count,
-            state.dimension,
-            state.quantization,
-            graph.policy_values().0,
-        )
-        .saturating_sub(HnswIndex::estimated_resident_bytes_with_m(
-            prior_count,
-            state.dimension,
-            state.quantization,
-            graph.policy_values().0,
-        ));
-        let (_, ef_construction, _) = graph.policy_values();
-        let scratch_bytes =
-            crate::quantized::stored_vector_resident_bytes(state.dimension, state.quantization)
-                .saturating_mul(3)
-                .saturating_add(2 * std::mem::size_of::<PreparedTailInsertion>());
-        let workspace_bytes = ef_construction.saturating_mul(8 * std::mem::size_of::<usize>());
-        if workspace_bytes > *publication_workspace_bytes {
-            if *publication_workspace_bytes == 0 {
-                publication_scratch.reserve(std::mem::size_of::<VectorCopyAdmission>() + 32)?;
-            }
-            publication_scratch.reserve(workspace_bytes - *publication_workspace_bytes)?;
-            *publication_workspace_bytes = workspace_bytes;
-        }
-        let accountant =
-            state.hnsw_accountant.read().clone().ok_or_else(|| {
-                Error::Other("resident HNSW tail has no retained graph owner".into())
-            })?;
-        let mut scratch = owner.scratch();
-        scratch.reserve(scratch_bytes)?;
-        self.reclaim_idle_graphs_for(resident_bytes, &[state.as_ref()]);
-        accountant.try_allocate_for_static(resident_bytes, "vector_index", "prepare_hnsw_tail",
-            "Reduce vector volume or raise MEMORY_LIMIT before committing another searchable vector.")?;
-        let charge = PaidRetainedMemoryCharge::new(resident_bytes, accountant);
-        // Conversion, encoding and id-space validation precede durability and
-        // happen only after admission. No vendor insert is attempted here.
-        let entry = prepare_entry(owner)?;
-        let insertion = graph.prepare_insert(&entry, additions)?;
-        if pending.capacity() == 0 {
-            pending.reserve_exact(1);
-        }
-        state.fresh_tail_preparations.fetch_add(1, Ordering::SeqCst);
-        pending.push(PreparedTailInsertion {
-            state: state.clone(),
-            row_id: entry.row_id,
-            insertion: Some(insertion),
-            charge,
-            resident_bytes,
-            _scratch: scratch,
-        });
-        Ok(())
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn prepare_tail_insertions(
-        &self,
-        inserts: &[PartitionedVectorEntry],
-        moves: &[PartitionedVectorMove],
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<PreparedTailInsertions> {
-        let mut pending = Vec::<PreparedTailInsertion>::new();
-        let mut publication_scratch = owner.scratch();
-        let mut publication_workspace_bytes = 0;
-        for insert in inserts {
-            if insert.entry.deleted_tx.is_none()
-                && let Some(state) =
-                    self.try_partition_state(&insert.entry.index, &insert.partition_key)
-            {
-                self.prepare_tail_insertion(
-                    &mut pending,
-                    state.clone(),
-                    insert.entry.lsn,
-                    |_owner| Ok(state.stored_entry_ref(&insert.entry)),
-                    owner,
-                    &mut publication_scratch,
-                    &mut publication_workspace_bytes,
-                )?;
-            }
-        }
-        for row_move in moves {
-            if let Some(source) =
-                self.try_partition_state(&row_move.index, &row_move.source_partition_key)
-                && let Some(target) =
-                    self.try_partition_state(&row_move.index, &row_move.target_partition_key)
-            {
-                self.prepare_tail_insertion(
-                    &mut pending,
-                    target,
-                    Lsn(0),
-                    |owner| {
-                        let mut entry = if source.is_durable() {
-                            source
-                                .load_visible_entry_for_tail(
-                                    &row_move.index,
-                                    row_move.old_row_id,
-                                    SnapshotId(u64::MAX),
-                                    false,
-                                    owner,
-                                )?
-                                .map(|entry| source.stored_entry(entry))
-                        } else {
-                            source.stored_by_row_id(row_move.old_row_id)
-                        }
-                        .ok_or_else(|| {
-                            Error::Other(
-                                ("prepared vector move lost its source".to_string()).into(),
-                            )
-                        })?;
-                        entry.row_id = row_move.new_row_id;
-                        entry.created_tx = row_move.tx;
-                        entry.deleted_tx = None;
-                        entry.lsn = Lsn(0);
-                        Ok(entry)
-                    },
-                    owner,
-                    &mut publication_scratch,
-                    &mut publication_workspace_bytes,
-                )?;
-            }
-        }
-        Ok(PreparedTailInsertions(Arc::new(Mutex::new(
-            PreparedTailInsertionBatch {
-                pending: pending.into(),
-                _publication_scratch: publication_scratch,
-            },
-        ))))
     }
 
     /// Validate one keyed batch without mutating the store. The engine calls
@@ -18758,10 +12253,6 @@ impl VectorStore {
                 if !state.is_durable() {
                     state.ensure_raw_vectors_loaded(owner)?;
                 }
-                if state.hnsw.get().is_none_or(|tail| tail.read().is_none()) {
-                    state.preload_dormant_sealed_generation(true)?;
-                    state.preload_dormant_sealed_generation(false)?;
-                }
             }
         }
         Ok(())
@@ -18817,7 +12308,6 @@ impl VectorStore {
                     requested: _,
                     projected_live_or_retained_partitions: _,
                     directory_reservation: _,
-                    tail_insertions,
                     durable_counts,
                     mut canonical_closures,
                     partition_states: _,
@@ -18831,7 +12321,7 @@ impl VectorStore {
                     moves,
                     lsn,
                     accountant,
-                    (&tail_insertions, &mut directory_reservations),
+                    &mut directory_reservations,
                     &mut canonical_closures,
                 );
                 for closure in &canonical_closures {
@@ -18864,7 +12354,6 @@ impl VectorStore {
                 requested,
                 projected_live_or_retained_partitions: _,
                 directory_reservation: _,
-                tail_insertions,
                 durable_counts,
                 mut canonical_closures,
                 partition_states,
@@ -18879,7 +12368,7 @@ impl VectorStore {
                     moves,
                     lsn,
                     accountant,
-                    (&tail_insertions, &mut directory_reservations),
+                    &mut directory_reservations,
                     &mut canonical_closures,
                 );
                 for closure in &canonical_closures {
@@ -18897,7 +12386,6 @@ impl VectorStore {
                     };
                     if let Some(state) = column.partition_state(&partition.partition_key) {
                         debug_assert_eq!(state.vector_count(), 0);
-                        state.clear_hnsw_with_optional_accountant(accountant);
                         state.mark_historical_only();
                     }
                     column.remove_empty_partition(&partition.partition_key);
@@ -19346,7 +12834,6 @@ impl VectorStore {
                 for state in column.partitions.read().values() {
                     state.release_accounted_raw_residency_for_removal();
                 }
-                column.clear_hnsw(accountant);
                 Ok(entries)
             } else {
                 Ok(Vec::new())
@@ -19447,7 +12934,6 @@ impl VectorStore {
                     for state in column.partitions.read().values() {
                         state.release_accounted_raw_residency_for_removal();
                     }
-                    column.clear_hnsw(accountant);
                 }
                 Ok(entries)
             })
@@ -20065,7 +13551,6 @@ impl VectorStore {
         index: &VectorIndexRef,
         expected_state: &Arc<IndexState>,
         failure: Option<VectorMaintenanceFailureDetails>,
-        quarantine: Option<VectorRouteQuarantineReason>,
     ) -> bool {
         self.with_bulk_read(|| {
             let Some(column) = self.try_column(index) else {
@@ -20093,9 +13578,6 @@ impl VectorStore {
             drop(partitions);
             if failure.is_some() {
                 column.note_failed_partition(&expected_key);
-            }
-            if let Some(quarantine) = quarantine {
-                expected_state.set_route_quarantine(quarantine);
             }
             true
         })
@@ -20455,20 +13937,6 @@ impl VectorStore {
         })
     }
 
-    /// The frontier a partition's pending work is counted after, exactly as
-    /// `partition_info_snapshot` derives it for a resident partition.
-    fn inspection_covered_tx(state: &IndexState) -> Option<TxId> {
-        let generations = state.graph_generation_status();
-        let base = generations.base.or(generations.dormant_base);
-        let change = generations.change.or(generations.dormant_change);
-        let local_generation_id = state.inspection_generation_id.load(Ordering::SeqCst);
-        let local_base_tx = state.inspection_base_tx.load(Ordering::SeqCst);
-        change
-            .or(base)
-            .map(|generation| generation.covered_tx)
-            .or((local_generation_id != 0).then_some(TxId(local_base_tx)))
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -20486,41 +13954,9 @@ impl VectorStore {
                 .saturating_add(index.column.len())
                 .saturating_add(partition_key.estimated_bytes()),
         )?;
-        let generations = state.graph_generation_status();
-        let serving_base = generations.base.or(generations.dormant_base);
-        let serving_change = generations.change.or(generations.dormant_change);
-        let serving_covered = serving_change
-            .or(serving_base)
-            .map(|generation| generation.covered_tx);
         if let Some(source) = state.durable_membership_source()
-            && let Some(mut snapshot) = source.inspection_snapshot(serving_covered, owner)?
+            && let Some(snapshot) = source.inspection_snapshot(owner)?
         {
-            #[cfg(feature = "test-seams")]
-            if !snapshot.captured_catalog
-                && serving_base.is_none_or(|base| {
-                    snapshot
-                        .base
-                        .is_some_and(|saved| base.covered_tx == saved.covered_tx)
-                })
-                && let Some((inserts, tombstones)) = snapshot.base_pending
-            {
-                // Initialize observation from metadata the real inspection
-                // already authenticated. Registration performs no extra read.
-                let mut backlog = state.base_backlog.lock();
-                if backlog.generation == 0 {
-                    backlog.generation = snapshot.base.map_or(0, |base| base.generation_id);
-                    backlog.covered_tx = snapshot.base.map_or(0, |base| base.covered_tx.0);
-                    backlog.pending = crate::observations::VectorBacklog {
-                        inserts,
-                        tombstones,
-                    };
-                    backlog.record_high_water();
-                }
-            }
-            if !snapshot.captured_catalog && serving_base.is_some() {
-                snapshot.base = serving_base;
-                snapshot.change = serving_change;
-            }
             let live_rows = snapshot.summary.live_entries;
             let retained_rows = snapshot.summary.entries.saturating_sub(live_rows);
             let bytes = state
@@ -20530,18 +13966,12 @@ impl VectorStore {
             let durable_vector_bytes = snapshot.summary.entries.saturating_mul(
                 crate::quantized::stored_vector_resident_bytes(state.dimension, state.quantization),
             );
-            let mut info = Self::partition_info_from_counts(
+            return Ok(Self::partition_info_from_counts(
                 index,
                 partition_key,
                 state,
                 layout,
                 (live_rows, retained_rows, bytes),
-                (
-                    snapshot.base,
-                    snapshot.change,
-                    snapshot.base.map(|generation| generation.generation_id),
-                    snapshot.base.map(|generation| generation.covered_tx),
-                ),
                 (
                     snapshot.pending_inserts,
                     snapshot.tombstones,
@@ -20549,14 +13979,7 @@ impl VectorStore {
                     charged_vector_bytes,
                     bytes.saturating_sub(charged_vector_bytes),
                 ),
-            );
-            info.graph_available = snapshot.base.is_some() && info.quarantine_reason.is_none();
-            info.serving_policy = snapshot.base.map(|generation| VectorServingPolicy {
-                hnsw_m: generation.hnsw_m as usize,
-                hnsw_ef_construction: generation.hnsw_ef_construction as usize,
-                policy_revision: generation.policy_revision,
-            });
-            return Ok(info);
+            ));
         }
         let live_rows = state.vector_count();
         let retained_rows = state.entry_count().saturating_sub(live_rows);
@@ -20565,25 +13988,8 @@ impl VectorStore {
             .saturating_add(partition_key.estimated_bytes());
         let charged_vector_bytes = state.raw_payload_bytes();
         let charged_index_bytes = bytes.saturating_sub(charged_vector_bytes);
-        let generations = state.graph_generation_status();
-        let base = generations.base.or(generations.dormant_base);
-        let change = generations.change.or(generations.dormant_change);
-        let local_generation_id = state.inspection_generation_id.load(Ordering::SeqCst);
-        let local_base_tx = state.inspection_base_tx.load(Ordering::SeqCst);
-        let base_generation = base
-            .map(|generation| generation.generation_id)
-            .or((local_generation_id != 0).then_some(local_generation_id));
-        let base_tx = base
-            .map(|generation| generation.covered_tx)
-            .or((local_generation_id != 0).then_some(TxId(local_base_tx)));
-        let covered_tx = change
-            .or(base)
-            .map(|generation| generation.covered_tx)
-            .or((local_generation_id != 0).then_some(TxId(local_base_tx)));
         if state.is_durable() {
-            let covered_lsn = change.or(base).map(|generation| generation.covered_lsn);
-            let (pending_inserts, tombstones) =
-                state.durable_pending_counts(covered_tx, covered_lsn, owner)?;
+            let (pending_inserts, tombstones) = state.durable_pending_counts(None, None, owner)?;
             let durable_vector_bytes =
                 state
                     .entry_count()
@@ -20597,7 +14003,6 @@ impl VectorStore {
                 state,
                 layout,
                 (live_rows, retained_rows, bytes),
-                (base, change, base_generation, base_tx),
                 (
                     pending_inserts,
                     tombstones,
@@ -20615,18 +14020,11 @@ impl VectorStore {
         );
         let pending_inserts = directory
             .iter()
-            .filter(|entry| {
-                entry.deleted_tx.is_none()
-                    && covered_tx.is_none_or(|covered| entry.created_tx > covered)
-            })
+            .filter(|entry| entry.deleted_tx.is_none())
             .count();
         let tombstones = directory
             .iter()
-            .filter(|entry| {
-                entry
-                    .deleted_tx
-                    .is_some_and(|deleted| covered_tx.is_none_or(|covered| deleted > covered))
-            })
+            .filter(|entry| entry.deleted_tx.is_some())
             .count();
         let durable_vector_bytes = if state.raw_loader.read().is_some() {
             directory
@@ -20645,7 +14043,6 @@ impl VectorStore {
             state,
             layout,
             (live_rows, retained_rows, bytes),
-            (base, change, base_generation, base_tx),
             (
                 pending_inserts,
                 tombstones,
@@ -20656,19 +14053,12 @@ impl VectorStore {
         ))
     }
 
-    #[allow(clippy::type_complexity)]
     fn partition_info_from_counts(
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
         state: &IndexState,
         layout: &VectorIndexLayout,
         (live_rows, retained_rows, bytes): (usize, usize, usize),
-        (base, change, base_generation, base_tx): (
-            Option<VectorGraphGeneration>,
-            Option<VectorGraphGeneration>,
-            Option<u64>,
-            Option<TxId>,
-        ),
         (
             pending_inserts,
             tombstones,
@@ -20677,14 +14067,6 @@ impl VectorStore {
             charged_index_bytes,
         ): (usize, usize, usize, usize, usize),
     ) -> VectorPartitionInfo {
-        let durable_index_bytes =
-            base.into_iter()
-                .chain(change)
-                .fold(0usize, |total, generation| {
-                    total.saturating_add(
-                        usize::try_from(generation.durable_bytes).unwrap_or(usize::MAX),
-                    )
-                });
         let maintenance_inspection = state.maintenance_inspection();
         let maintenance_failure_details = maintenance_inspection.failure;
         VectorPartitionInfo {
@@ -20692,23 +14074,15 @@ impl VectorStore {
             live_rows,
             retained_rows,
             bytes,
-            graph_available: state.has_complete_hnsw_route(),
-            #[cfg(any(test, feature = "test-seams"))]
-            indexed_available: state.has_complete_hnsw_route(),
-            base_generation,
-            base_tx,
             pending_inserts,
             tombstones,
             durable_vector_bytes,
             charged_vector_bytes,
-            durable_index_bytes,
             charged_index_bytes,
-            quarantine_reason: state.route_quarantine(),
             maintenance_progress: maintenance_inspection.progress,
             maintenance_failure: maintenance_failure_details.map(|details| details.failure),
             maintenance_failure_details,
             desired_policy: layout.resolve_policy(live_rows, 1),
-            serving_policy: state.serving_policy(),
             maintenance_policy_revision: state.maintenance_policy_revision(),
         }
     }
@@ -20836,481 +14210,12 @@ impl VectorStore {
         Ok(Some(selected))
     }
 
-    /// Reclaim only reloadable, unborrowed graphs. Query layer read guards
-    /// prevent eviction while a snapshot is actively using those pages.
-    #[doc(hidden)]
-    pub fn evict_idle_graphs(&self) -> usize {
-        self.evict_idle_graphs_except(None)
-    }
-
-    /// Free at least `needed` bytes of serving pages from the paged
-    /// generations resident in this store, so that a graph load that did not
-    /// fit can: serving pages give way to a topology.
-    ///
-    /// Only serving slots are given back, never a topology, so no partition a
-    /// search is walking or about to walk stops being searchable from its
-    /// graph; a page given back is read and authenticated again when a walk
-    /// next needs it, and no answer changes. The largest caches give first,
-    /// down to one level they all share, so no partition is left with a
-    /// smaller cache than another gave up to, and none is taken below one
-    /// slot. If even that frees less than `needed`, nothing is given back:
-    /// the load is refused either way and the caches stay warm.
-    pub fn give_back_serving_pages(&self, needed: usize) -> usize {
-        self.give_back_serving_pages_where(needed, false, |_| true)
-    }
-
-    /// Before the statement on this thread loads its partitions, take back
-    /// up to `wanted` bytes of serving pages from idle partitions it is not
-    /// searching, so its own loads can have the caches they would have on a
-    /// fresh reader. Their topologies stay resident, so they are not read
-    /// again; only pages they can re-read are given up. Gives what it can.
-    pub(crate) fn give_back_serving_pages_outside_statement(&self, wanted: usize) -> usize {
-        STATEMENT_PARTITIONS.with(|declared| {
-            let declared = declared.borrow();
-            let Some(searched) = declared.as_ref() else {
-                return 0;
-            };
-            self.give_back_serving_pages_where(wanted, true, |state| {
-                !searched.contains(&(state as *const IndexState as usize))
-            })
-        })
-    }
-
-    fn give_back_serving_pages_where(
-        &self,
-        needed: usize,
-        partial: bool,
-        from: impl Fn(&IndexState) -> bool,
-    ) -> usize {
-        self.give_back_serving_pages_metered(needed, partial, from, |event| match event {
-            ServingPageGiveBackEvent::Short => {
-                contextdb_core::find_attribution::count("serving_page_give_back_short", 1);
-            }
-            ServingPageGiveBackEvent::Freed(freed) => {
-                contextdb_core::find_attribution::count(
-                    "serving_page_bytes_given_back",
-                    freed as u64,
-                );
-            }
-        })
-    }
-
-    /// Same serving-page policy with fixed scalar meters under native pressure.
-    #[doc(hidden)]
-    pub fn give_back_serving_pages_native(&self, needed: usize) -> usize {
-        self.give_back_serving_pages_metered(needed, false, |_| true, |event| match event {
-            ServingPageGiveBackEvent::Short => {
-                contextdb_core::find_attribution::note_native_serving_page_give_back_short();
-            }
-            ServingPageGiveBackEvent::Freed(freed) => {
-                contextdb_core::find_attribution::note_native_serving_page_give_back_reached_final_pass();
-                contextdb_core::find_attribution::note_native_serving_page_bytes_given_back(freed);
-            }
-        })
-    }
-
-    fn give_back_serving_pages_metered(
-        &self,
-        needed: usize,
-        partial: bool,
-        from: impl Fn(&IndexState) -> bool,
-        meter: impl Fn(ServingPageGiveBackEvent),
-    ) -> usize {
-        if needed == 0 {
-            return 0;
-        }
-        // Every lock here is only tried: this runs inside whatever allocation
-        // was refused, which may already hold any of them, and a cache that
-        // cannot be reached right now simply keeps its pages. Nothing here
-        // allocates either -- the memory it would need is what is short -- so
-        // the generations are visited where they are, once per question.
-        let freed_at = |level: usize| {
-            let mut freed = 0_usize;
-            self.for_each_serving_generation(&from, |generation| {
-                if let Some((slots, slot_bytes)) = generation.serving_slots() {
-                    freed = freed
-                        .saturating_add(slots.saturating_sub(level).saturating_mul(slot_bytes));
-                }
-            });
-            freed
-        };
-        let needed = if partial {
-            needed.min(freed_at(1))
-        } else {
-            needed
-        };
-        if needed == 0 {
-            return 0;
-        }
-        if freed_at(1) < needed {
-            meter(ServingPageGiveBackEvent::Short);
-            return 0;
-        }
-        // The highest level every cache can keep while the ones above it
-        // still free what is needed.
-        let mut high = 1_usize;
-        self.for_each_serving_generation(&from, |generation| {
-            if let Some((slots, _)) = generation.serving_slots() {
-                high = high.max(slots);
-            }
-        });
-        let mut low = 1_usize;
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            if freed_at(middle) >= needed {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        let mut freed = 0_usize;
-        self.for_each_serving_generation(&from, |generation| {
-            if generation
-                .serving_slots()
-                .is_some_and(|(slots, _)| slots > low)
-            {
-                freed = freed.saturating_add(generation.give_back_serving_slots(low));
-            }
-        });
-        meter(ServingPageGiveBackEvent::Freed(freed));
-        contextdb_core::find_attribution::note_serving_pages_given_back(freed);
-        freed
-    }
-
-    /// Visit every resident sealed generation of the partitions `from`
-    /// accepts, in place and without allocating, under locks that are only
-    /// tried: a registry, column or partition that is busy right now is
-    /// skipped.
-    fn for_each_serving_generation(
-        &self,
-        from: &impl Fn(&IndexState) -> bool,
-        mut visit: impl FnMut(&SealedHnswGeneration),
-    ) {
-        let Some(registry) = self.registry.try_read() else {
-            return;
-        };
-        for column in registry.values() {
-            let Some(partitions) = column.partitions.try_read() else {
-                continue;
-            };
-            for state in partitions.values() {
-                if !from(state.as_ref()) {
-                    continue;
-                }
-                let Some(sealed) = state.sealed_hnsw.try_read() else {
-                    continue;
-                };
-                for generation in sealed.base.iter().chain(sealed.change.iter()).chain(
-                    sealed
-                        .retired
-                        .iter()
-                        .flat_map(|chain| chain.base.iter().chain(chain.change.iter())),
-                ) {
-                    visit(generation);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn evict_idle_graphs_except(&self, selected: Option<&IndexState>) -> usize {
-        self.registry
-            .read()
-            .values()
-            .map(|column| {
-                column
-                    .partitions
-                    .read()
-                    .values()
-                    .filter(|state| {
-                        selected.is_none_or(|selected| !std::ptr::eq(state.as_ref(), selected))
-                    })
-                    .map(|state| {
-                        usize::from(state.evict_resident_sealed_generation(true))
-                            + usize::from(state.evict_resident_sealed_generation(false))
-                    })
-                    .sum::<usize>()
-            })
-            .sum()
-    }
-
-    pub(crate) fn mark_sealed_graph_used(&self, state: &IndexState) {
-        let sequence = self
-            .graph_use_sequence
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        state
-            .sealed_graph_last_used
-            .store(sequence, Ordering::Relaxed);
-    }
-
     /// What the memory budget this store charges has free, if it has a limit.
     pub(crate) fn memory_available_bytes(&self) -> Option<usize> {
         self.memory_accountant
             .read()
             .as_ref()
             .and_then(|accountant| accountant.available_bytes())
-    }
-
-    /// Name the partitions the statement on this thread is about to search,
-    /// so a load it makes never evicts one of them to make room.
-    pub(crate) fn declare_statement_partitions(states: &[&IndexState]) -> StatementPartitions {
-        let searched = states
-            .iter()
-            .map(|state| *state as *const IndexState as usize)
-            .collect::<Vec<_>>();
-        StatementPartitions {
-            previous: STATEMENT_PARTITIONS.with(|declared| declared.replace(Some(searched))),
-        }
-    }
-
-    /// Release reloadable graphs only when a finite shared budget cannot
-    /// admit the next allocation. With room available, alternating
-    /// partitions remain warm.
-    /// Make room for the graphs a read is about to load, never by taking one
-    /// the same read is going to search.
-    ///
-    /// `selected` names every partition this statement has admitted, not just
-    /// the one whose load is being sized. A find over several Contexts loads
-    /// them one after another, so excluding only the partition in hand lets
-    /// each load evict the sibling the previous one just loaded, and the find
-    /// re-reads every graph it has already read.
-    pub(crate) fn reclaim_idle_graphs_for(
-        &self,
-        required_bytes: usize,
-        selected: &[&IndexState],
-    ) -> usize {
-        self.reclaim_idle_graphs_except(required_bytes, |state| {
-            selected
-                .iter()
-                .any(|selected| std::ptr::eq(state, *selected))
-        })
-    }
-
-    /// Make `short` more bytes free for a graph the statement on this thread
-    /// is loading, by evicting idle graphs of partitions that statement is
-    /// not searching. A statement that declared nothing evicts nothing here:
-    /// without its partitions named, any sibling it already loaded could be
-    /// taken.
-    pub fn make_room_for_graph_load(&self, short: usize) -> usize {
-        if short == 0 {
-            return 0;
-        }
-        STATEMENT_PARTITIONS.with(|declared| {
-            let declared = declared.borrow();
-            let Some(searched) = declared.as_ref() else {
-                return 0;
-            };
-            let Some(available) = self
-                .memory_accountant
-                .read()
-                .as_ref()
-                .and_then(|accountant| accountant.available_bytes())
-            else {
-                return 0;
-            };
-            self.reclaim_idle_graphs_except(available.saturating_add(short), |state| {
-                searched.contains(&(state as *const IndexState as usize))
-            })
-        })
-    }
-
-    fn reclaim_idle_graphs_except(
-        &self,
-        required_bytes: usize,
-        selected: impl Fn(&IndexState) -> bool,
-    ) -> usize {
-        let Some(accountant) = self.memory_accountant.read().clone() else {
-            return 0;
-        };
-        if accountant
-            .available_bytes()
-            .is_none_or(|available| required_bytes <= available)
-        {
-            return 0;
-        }
-        let Some(mut available) = accountant.available_bytes() else {
-            return 0;
-        };
-        // Pressure reclamation cannot allocate the inventory whose memory
-        // it is trying to recover. Walk timestamp groups and routes in the
-        // same oldest-first, table/column/key order using borrowed keys.
-        let registry = self.registry.read();
-
-        contextdb_core::find_attribution::count("graph_reclaims_over_budget", 1);
-        contextdb_core::find_attribution::count(
-            "graph_reclaim_required_bytes",
-            required_bytes as u64,
-        );
-        contextdb_core::find_attribution::count("graph_reclaim_available_bytes", available as u64);
-        let mut evicted = 0usize;
-        let mut previous_time = None;
-        while required_bytes > available {
-            let next_time = registry
-                .values()
-                .filter_map(|column| {
-                    column
-                        .partitions
-                        .read()
-                        .values()
-                        .filter(|state| !selected(state.as_ref()))
-                        .map(|state| state.sealed_graph_last_used.load(Ordering::Relaxed))
-                        .filter(|time| previous_time.is_none_or(|previous| *time > previous))
-                        .min()
-                })
-                .min();
-            let Some(time) = next_time else {
-                break;
-            };
-            let mut previous_index: Option<&VectorIndexRef> = None;
-            while required_bytes > available {
-                let next_index = registry
-                    .keys()
-                    .filter(|index| {
-                        previous_index.is_none_or(|previous| {
-                            (&index.table, &index.column) > (&previous.table, &previous.column)
-                        })
-                    })
-                    .min_by(|left, right| {
-                        left.table
-                            .cmp(&right.table)
-                            .then(left.column.cmp(&right.column))
-                    });
-                let Some(index) = next_index else {
-                    break;
-                };
-                let column = registry
-                    .get(index)
-                    .expect("borrowed registry key remains held");
-                for state in column.partitions.read().values() {
-                    if required_bytes <= available {
-                        break;
-                    }
-                    if selected(state.as_ref())
-                        || state.sealed_graph_last_used.load(Ordering::Relaxed) != time
-                    {
-                        continue;
-                    }
-                    evicted += usize::from(state.evict_resident_sealed_generation(true));
-                    evicted += usize::from(state.evict_resident_sealed_generation(false));
-                    available = accountant.available_bytes().unwrap_or(usize::MAX);
-                }
-                previous_index = Some(index);
-            }
-            previous_time = Some(time);
-        }
-
-        contextdb_core::find_attribution::count("sealed_generations_evicted", evicted as u64);
-        evicted
-    }
-
-    /// Native-pressure sibling of `make_room_for_graph_load`. It preserves
-    /// the legacy oldest-first walk and locks, but records into fixed scalar
-    /// meters so a refused native admission never enters the allocating sink.
-    #[doc(hidden)]
-    pub fn make_room_for_graph_load_native(&self, short: usize) -> usize {
-        if short == 0 {
-            return 0;
-        }
-        STATEMENT_PARTITIONS.with(|declared| {
-            let declared = declared.borrow();
-            let Some(searched) = declared.as_ref() else {
-                return 0;
-            };
-            let Some(available) = self
-                .memory_accountant
-                .read()
-                .as_ref()
-                .and_then(|accountant| accountant.available_bytes())
-            else {
-                return 0;
-            };
-            self.reclaim_idle_graphs_except_native(available.saturating_add(short), |state| {
-                searched.contains(&(state as *const IndexState as usize))
-            })
-        })
-    }
-
-    fn reclaim_idle_graphs_except_native(
-        &self,
-        required_bytes: usize,
-        selected: impl Fn(&IndexState) -> bool,
-    ) -> usize {
-        let Some(accountant) = self.memory_accountant.read().clone() else {
-            return 0;
-        };
-        if accountant
-            .available_bytes()
-            .is_none_or(|available| required_bytes <= available)
-        {
-            return 0;
-        }
-        let Some(mut available) = accountant.available_bytes() else {
-            return 0;
-        };
-        let registry = self.registry.read();
-
-        contextdb_core::find_attribution::note_native_graph_reclaims_over_budget();
-        contextdb_core::find_attribution::note_native_graph_reclaim_required_bytes(required_bytes);
-        contextdb_core::find_attribution::note_native_graph_reclaim_available_bytes(available);
-        let mut evicted = 0usize;
-        let mut previous_time = None;
-        while required_bytes > available {
-            let next_time = registry
-                .values()
-                .filter_map(|column| {
-                    column
-                        .partitions
-                        .read()
-                        .values()
-                        .filter(|state| !selected(state.as_ref()))
-                        .map(|state| state.sealed_graph_last_used.load(Ordering::Relaxed))
-                        .filter(|time| previous_time.is_none_or(|previous| *time > previous))
-                        .min()
-                })
-                .min();
-            let Some(time) = next_time else {
-                break;
-            };
-            let mut previous_index: Option<&VectorIndexRef> = None;
-            while required_bytes > available {
-                let next_index = registry
-                    .keys()
-                    .filter(|index| {
-                        previous_index.is_none_or(|previous| {
-                            (&index.table, &index.column) > (&previous.table, &previous.column)
-                        })
-                    })
-                    .min_by(|left, right| {
-                        left.table
-                            .cmp(&right.table)
-                            .then(left.column.cmp(&right.column))
-                    });
-                let Some(index) = next_index else {
-                    break;
-                };
-                let column = registry
-                    .get(index)
-                    .expect("borrowed registry key remains held");
-                for state in column.partitions.read().values() {
-                    if required_bytes <= available {
-                        break;
-                    }
-                    if selected(state.as_ref())
-                        || state.sealed_graph_last_used.load(Ordering::Relaxed) != time
-                    {
-                        continue;
-                    }
-                    evicted += usize::from(state.evict_resident_sealed_generation(true));
-                    evicted += usize::from(state.evict_resident_sealed_generation(false));
-                    available = accountant.available_bytes().unwrap_or(usize::MAX);
-                }
-                previous_index = Some(index);
-            }
-            previous_time = Some(time);
-        }
-
-        contextdb_core::find_attribution::note_native_sealed_generations_evicted(evicted);
-        evicted
     }
 
     #[doc(hidden)]
@@ -21386,7 +14291,6 @@ impl VectorStore {
                     |counts| if partitioned { counts[3] } else { 1 },
                 ),
                 bytes: column.retained_bytes(index),
-                graph_available: column.has_complete_hnsw_route(),
             })
         })
     }
@@ -21855,10 +14759,9 @@ impl VectorStore {
         moves: Vec<PartitionedVectorMove>,
         lsn: Lsn,
         accountant: Option<&dyn MemoryBudget>,
-        publication_owners: (&PreparedTailInsertions, &mut PreparedDirectoryCharges),
+        directory_reservations: &mut PreparedDirectoryCharges,
         canonical_closures: &mut [PreparedCanonicalClosure],
     ) {
-        let (tail_insertions, directory_reservations) = publication_owners;
         let deleted_rows = deletes
             .iter()
             .map(|delete| (delete.partition.index.clone(), delete.row_id))
@@ -21934,7 +14837,6 @@ impl VectorStore {
                 state.push_resident_body(stored);
                 drop(residency);
                 if live {
-                    tail_insertions.publish(&state, row_id, entry_lsn);
                 }
                 continue;
             }
@@ -21955,7 +14857,6 @@ impl VectorStore {
                     accountant.release(bytes);
                 }
                 if live {
-                    tail_insertions.publish(&state, row_id, entry_lsn);
                 }
                 continue;
             }
@@ -21999,7 +14900,6 @@ impl VectorStore {
             }
             state.push_entry_with(stored, |stored| {
                 column.note_live_insert(&insert.partition_key, stored);
-                tail_insertions.publish(&state, stored.row_id, stored.lsn);
             });
         }
         for row_move in moves {
@@ -22072,7 +14972,6 @@ impl VectorStore {
                         }
                     }
                 }
-                tail_insertions.publish(&target, row_move.new_row_id, lsn);
                 continue;
             }
             let Some(old) = source.stored_by_row_id(row_move.old_row_id) else {
@@ -22103,7 +15002,6 @@ impl VectorStore {
                     row_move.old_row_id,
                     row_move.new_row_id,
                 );
-                tail_insertions.publish(&target, stored.row_id, lsn);
             });
         }
     }
@@ -22661,7 +15559,6 @@ impl VectorStore {
                 let layout = column.layout();
                 for (_, state) in column.partition_snapshots() {
                     state.clear_entries();
-                    state.drop_hnsw_without_accounting();
                 }
                 if layout.is_partitioned() {
                     column.clear_partition_map();
@@ -22772,7 +15669,6 @@ impl VectorStore {
                 let layout = column.layout();
                 for (_, state) in column.partition_snapshots() {
                     state.clear_entries();
-                    state.drop_hnsw_without_accounting();
                 }
                 if layout.is_partitioned() {
                     column.clear_partition_map();
@@ -23081,7 +15977,6 @@ impl VectorStore {
         let mut local_copy_admission = owner.local_scratch();
         let owner = local_copy_admission.as_mut().unwrap_or(owner);
         let mut workspace = 0usize;
-        let mut disk = 0usize;
         for (index, column) in self.registry.read().iter() {
             // Selection must precede every layout/directory copy, including
             // the admission quote used by both erasure consumers.
@@ -23117,19 +16012,9 @@ impl VectorStore {
                         .saturating_add(128),
                 );
                 workspace = workspace.saturating_add(values.saturating_mul(4));
-                if state.has_complete_hnsw_route() {
-                    let graph = HnswIndex::estimated_build_reservation(
-                        count,
-                        layout.dimension,
-                        layout.quantization,
-                        layout.resolve_policy(count, 1),
-                    );
-                    workspace = workspace.saturating_add(graph.saturating_mul(6));
-                    disk = disk.saturating_add(graph.saturating_mul(2).saturating_add(64 * 1024));
-                }
             }
         }
-        Ok((workspace, disk))
+        Ok((workspace, 0))
     }
 
     /// Load exactly the raw partitions that contain any version of one of
@@ -23509,7 +16394,6 @@ impl VectorStore {
                                     !row_ids.contains(&entry.row_id)
                                 }));
                         }
-                        state.clear_hnsw(accountant);
                     }
                 }
                 if column.layout.read().is_partitioned() {
@@ -23643,7 +16527,6 @@ impl VectorStore {
                                 !row_ids.contains(&entry.row_id)
                             }));
                     }
-                    state.clear_hnsw(accountant);
                 }
                 column.remove_empty_partitioned_states();
                 column.rebuild_current_rows_from(snapshots);
@@ -24320,110 +17203,6 @@ impl VectorStore {
         })
     }
 
-    pub fn has_hnsw_index(&self) -> bool {
-        self.with_bulk_read(|| {
-            self.registry
-                .read()
-                .values()
-                .any(|column| column.has_hnsw())
-        })
-    }
-
-    pub fn has_hnsw_index_for(&self, index: &VectorIndexRef) -> bool {
-        self.with_bulk_read(|| {
-            self.try_state(index)
-                .and_then(|state| state.hnsw_len())
-                .is_some()
-        })
-    }
-
-    pub fn has_hnsw_index_for_partition(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> bool {
-        self.with_bulk_read(|| {
-            self.try_partition_state(index, partition_key)
-                .and_then(|state| state.hnsw_len())
-                .is_some()
-        })
-    }
-
-    /// The purge planner uses this to preserve the materialization contract
-    /// without causing previously lazy indexes to allocate a graph.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn materialized_hnsw_indexes(
-        &self,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<Vec<VectorIndexRef>> {
-        self.with_bulk_read(|| {
-            let registry = self.registry.read();
-            let count = registry.values().filter(|column| column.has_hnsw()).count();
-            owner.reserve(count.saturating_mul(std::mem::size_of::<VectorIndexRef>()))?;
-            let mut indexes = Vec::with_capacity(count);
-            for (index, column) in registry.iter() {
-                if column.has_hnsw() {
-                    owner.reserve(index.table.len().saturating_add(index.column.len()))?;
-                    indexes.push(index.clone());
-                }
-            }
-            indexes.sort_unstable_by(|a, b| a.table.cmp(&b.table).then(a.column.cmp(&b.column)));
-            Ok(indexes)
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn materialized_hnsw_partitions(
-        &self,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<Vec<VectorPartitionRef>> {
-        self.with_bulk_read(|| {
-            let registry = self.registry.read();
-            let count = registry
-                .values()
-                .map(|column| {
-                    column
-                        .partitions
-                        .read()
-                        .values()
-                        .filter(|state| state.hnsw_len().is_some())
-                        .count()
-                })
-                .sum::<usize>();
-            owner.reserve(count.saturating_mul(std::mem::size_of::<VectorPartitionRef>()))?;
-            let mut materialized = Vec::with_capacity(count);
-            for (index, column) in registry.iter() {
-                for (key, state) in column.partitions.read().iter() {
-                    if state.hnsw_len().is_none() {
-                        continue;
-                    }
-                    owner.reserve(
-                        index
-                            .table
-                            .len()
-                            .saturating_add(index.column.len())
-                            .saturating_add(key.estimated_bytes()),
-                    )?;
-                    materialized.push(VectorPartitionRef::new(index.clone(), key.clone()));
-                }
-            }
-            materialized.sort_unstable_by(|a, b| {
-                a.index
-                    .table
-                    .cmp(&b.index.table)
-                    .then(a.index.column.cmp(&b.index.column))
-                    .then(a.partition_key.cmp(&b.partition_key))
-            });
-            Ok(materialized)
-        })
-    }
-
     /// Passive price of the actual partition's generation output workspace.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
@@ -24500,243 +17279,6 @@ impl VectorStore {
         self.with_bulk_read(|| {
             self.try_partition_state(index, partition_key)
                 .is_some_and(|state| state.evict_raw_vectors())
-        })
-    }
-
-    pub fn clear_hnsw(&self, accountant: &dyn MemoryBudget) {
-        let _build_lifecycle = self.hnsw_build_gate.write();
-        self.with_bulk_maintenance(|| {
-            #[cfg(feature = "test-seams")]
-            self.pause_registry.maybe_pause(
-                &contextdb_core::VectorIndexRef::default(),
-                crate::test_seam::PauseWindow::Bulk,
-            );
-            for column in self.registry.read().values() {
-                column.clear_hnsw(accountant);
-            }
-        });
-    }
-
-    pub fn clear_hnsw_for(&self, index: &VectorIndexRef, accountant: &dyn MemoryBudget) {
-        self.with_bulk_maintenance(|| {
-            if let Some(column) = self.try_column(index) {
-                column.clear_hnsw(accountant);
-            }
-        });
-    }
-
-    pub fn clear_hnsw_for_partition(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        accountant: &dyn MemoryBudget,
-    ) {
-        self.with_partition_maintenance(index, partition_key, || {
-            if let Some(state) = self.try_partition_state(index, partition_key) {
-                state.clear_hnsw(accountant);
-            }
-        });
-    }
-
-    /// Register durable graph metadata for one partition without loading it.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn register_dormant_partition_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        is_base: bool,
-        descriptor: DormantVectorGraphGeneration,
-        loader: Arc<dyn DormantVectorGraphLoader>,
-    ) -> Result<()> {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            #[cfg(feature = "test-seams")]
-            if is_base && !state.is_durable() {
-                // A reopened process starts observation at its real durable
-                // base. Historical high-water before this process is unknown.
-                let directory = state.raw_directory.read();
-                let mut backlog = state.base_backlog.lock();
-                if backlog.generation == 0 {
-                    backlog.generation = descriptor.identity.generation_id;
-                    backlog.covered_tx = descriptor.identity.covered_tx.0;
-                    backlog.pending = crate::observations::VectorBacklog {
-                        inserts: directory
-                            .iter()
-                            .filter(|entry| {
-                                entry.deleted_tx.is_none()
-                                    && entry.created_tx.0 > backlog.covered_tx
-                            })
-                            .count(),
-                        tombstones: directory
-                            .iter()
-                            .filter(|entry| {
-                                entry.deleted_tx.is_some_and(|tx| tx.0 > backlog.covered_tx)
-                            })
-                            .count(),
-                    };
-                    backlog.record_high_water();
-                }
-            }
-            state.register_dormant_sealed_generation(is_base, descriptor, loader)
-        })
-    }
-
-    /// Install one already decoded, checksummed graph.  The codec/persistence
-    /// owner reserves its resident bytes before this call; this method only
-    /// transfers ownership at one atomic partition publication point.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn install_loaded_partition_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        is_base: bool,
-        identity: VectorGraphGeneration,
-        loaded: LoadedVectorGraphGeneration,
-    ) -> Result<()> {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            state.install_loaded_sealed_generation(is_base, identity, loaded)
-        })
-    }
-
-    /// Atomically publish a prepared full base and retire the old mutable
-    /// tail. Superseded sealed graphs remain pinned until the engine calls the
-    /// reclaim method with no registered old snapshots.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn publish_partition_base_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        identity: VectorGraphGeneration,
-        loaded: LoadedVectorGraphGeneration,
-    ) -> Result<()> {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            state.publish_replacement_base_generation(identity, loaded)
-        })
-    }
-
-    /// Move only an owned mutable graph out of a writer, under its publication
-    /// boundary. The engine authenticates the durable frontier before reuse.
-    #[doc(hidden)]
-    pub fn detach_writer_tail(&self, partition: &VectorPartitionRef) -> Option<WriterVectorTail> {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.try_partition_state(&partition.index, &partition.partition_key)?;
-            let _publication = state.generation_publication.lock();
-            if state.fresh_tail_preparations.load(Ordering::SeqCst) != 0
-                || state.maintenance_sample_active.load(Ordering::SeqCst)
-                || state.route_quarantine().is_some()
-            {
-                return None;
-            }
-            let mut slot = state.hnsw.get()?.try_write()?;
-            if !slot.as_ref()?.is_owned_mutable() {
-                return None;
-            }
-            let accountant = state.hnsw_accountant.write().take()?;
-            let tail = WriterVectorTail {
-                graph: slot.take(),
-                metadata_bytes: 0,
-                sealed_identity: {
-                    let sealed = state.sealed_hnsw.read();
-                    IndexState::layer_identity(
-                        sealed.change.as_ref(),
-                        sealed.dormant_change.as_ref(),
-                    )
-                    .or_else(|| {
-                        IndexState::layer_identity(
-                            sealed.base.as_ref(),
-                            sealed.dormant_base.as_ref(),
-                        )
-                    })
-                },
-                bytes: state.hnsw_bytes.swap(0, Ordering::SeqCst),
-                accountant,
-                replayed_through_lsn: state.fresh_tail_replayed_through_lsn.load(Ordering::SeqCst),
-                mutated_through_lsn: state.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst),
-                replay_frontier_active: state
-                    .fresh_tail_replay_frontier_active
-                    .load(Ordering::SeqCst),
-                dimension: state.dimension,
-                quantization: state.quantization,
-            };
-            state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-            state.tail_epoch.fetch_add(1, Ordering::SeqCst);
-            state
-                .tail_frontier_tx
-                .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-            Some(tail)
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn reattach_writer_tail(
-        &self,
-        partition: &VectorPartitionRef,
-        mut tail: WriterVectorTail,
-    ) -> bool {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
-            else {
-                return false;
-            };
-            let _publication = state.generation_publication.lock();
-            if state.dimension != tail.dimension
-                || state.quantization != tail.quantization
-                || state.route_quarantine().is_some()
-                || state.fresh_tail_preparations.load(Ordering::SeqCst) != 0
-                || state.maintenance_sample_active.load(Ordering::SeqCst)
-            {
-                return false;
-            }
-            let mut slot = state.hnsw.get_or_init(|| RwLock::new(None)).write();
-            if slot.is_some() {
-                return false;
-            }
-            *slot = tail.graph.take();
-            state.hnsw_bytes.store(tail.bytes, Ordering::SeqCst);
-            *state.carried_tail_identity.write() = tail.sealed_identity;
-            *state.hnsw_accountant.write() = Some(tail.accountant.clone());
-            tail.bytes = 0;
-            state
-                .fresh_tail_replayed_through_lsn
-                .store(tail.replayed_through_lsn, Ordering::SeqCst);
-            state
-                .fresh_tail_mutated_through_lsn
-                .store(tail.mutated_through_lsn, Ordering::SeqCst);
-            state
-                .fresh_tail_replay_frontier_active
-                .store(tail.replay_frontier_active, Ordering::SeqCst);
-            state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
-            state.tail_epoch.fetch_add(1, Ordering::SeqCst);
-            state
-                .tail_frontier_tx
-                .store(TAIL_FRONTIER_UNKNOWN, Ordering::SeqCst);
-            true
-        })
-    }
-
-    /// Borrow the process-created tail graph for durable checkpoint encoding.
-    /// The callback runs under this partition's maintenance lock, so a commit
-    /// cannot extend the graph midway through serialization.
-    #[doc(hidden)]
-    pub fn with_partition_fresh_tail<R>(
-        &self,
-        partition: &VectorPartitionRef,
-        f: impl FnOnce(&HnswIndex) -> R,
-    ) -> Option<R> {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .and_then(|state| state.with_fresh_tail(f))
         })
     }
 
@@ -24840,94 +17382,6 @@ impl VectorStore {
         crate::observations::emit(&event);
     }
 
-    /// Start the one mutable post-generation tail. An empty graph owns no
-    /// entry bytes but gives later commits the fresh in-process insertion
-    /// target that sealed graphs deliberately refuse.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn initialize_partition_fresh_tail(
-        &self,
-        partition: &VectorPartitionRef,
-        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
-        _owner: &mut VectorCopyAdmission,
-    ) -> Result<()> {
-        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
-
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            let live_count = state.vector_count();
-            let policy = self.with_index_layout(&partition.index, |layout| {
-                layout.resolve_policy(live_count, 1)
-            })?;
-            state.initialize_empty_fresh_tail(accountant, policy)
-        })
-    }
-
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn preload_dormant_partition_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        is_base: bool,
-    ) -> Result<bool> {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            state.preload_dormant_sealed_generation(is_base)
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn evict_resident_partition_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        is_base: bool,
-    ) -> bool {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .is_some_and(|state| state.evict_resident_sealed_generation(is_base))
-        })
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn make_retired_partition_generations_dormant_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> usize {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .map_or(0, |state| {
-                    state.make_retired_sealed_generations_dormant_for_test()
-                })
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn partition_graph_generation_status(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Option<VectorGraphGenerationStatus> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .map(|state| state.graph_generation_status())
-        })
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    #[doc(hidden)]
-    pub fn partition_generation_status(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Option<VectorGraphGenerationStatus> {
-        self.partition_graph_generation_status(partition)
-    }
-
     /// Retain an actionable maintenance failure for passive inspection. The
     /// engine calls this when durable generation work fails outside the vector
     /// crate (for example disk admission); only a later successful generation
@@ -25014,33 +17468,6 @@ impl VectorStore {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
-    pub fn dormant_partition_generation_load_bytes_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-        is_base: bool,
-    ) -> Option<usize> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .and_then(|state| {
-                    let sealed = state.sealed_hnsw.read();
-                    if is_base {
-                        sealed
-                            .pending_base
-                            .as_ref()
-                            .or(sealed.dormant_base.as_ref())
-                            .map(|generation| generation.descriptor.load_bytes)
-                    } else {
-                        sealed
-                            .dormant_change
-                            .as_ref()
-                            .map(|generation| generation.descriptor.load_bytes)
-                    }
-                })
-        })
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
     pub fn partition_superseded_generation_retention_for_test(
         &self,
         partition: &VectorPartitionRef,
@@ -25049,261 +17476,6 @@ impl VectorStore {
             self.try_partition_state(&partition.index, &partition.partition_key)
                 .map(|state| state.superseded_generation_retention_for_test())
                 .unwrap_or((0, 0))
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn with_resident_partition_generation<R>(
-        &self,
-        partition: &VectorPartitionRef,
-        is_base: bool,
-        f: impl FnOnce(VectorGraphGeneration, &HnswIndex) -> R,
-    ) -> Option<R> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .and_then(|state| state.with_resident_sealed_generation(is_base, f))
-        })
-    }
-
-    /// Durable current or retired chains selected by the guarded snapshot sample.
-    #[doc(hidden)]
-    pub fn snapshot_retained_partition_chain_ids(
-        &self,
-        partition: &VectorPartitionRef,
-        snapshots: &[SnapshotId],
-    ) -> Vec<(u64, Option<u64>)> {
-        self.try_partition_state(&partition.index, &partition.partition_key)
-            .map_or_else(Vec::new, |state| {
-                state.snapshot_retained_chain_ids(snapshots)
-            })
-    }
-
-    #[doc(hidden)]
-    pub fn retained_partition_chain_ids(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Vec<(u64, Option<u64>)> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .map_or_else(Vec::new, |state| state.retained_chain_ids())
-        })
-    }
-
-    /// The caller holds its snapshot-removal guard. Return the number of released graphs.
-    #[doc(hidden)]
-    pub fn reclaim_snapshot_free_partition_graph_generations(
-        &self,
-        partition: &VectorPartitionRef,
-        registered_snapshots: &[SnapshotId],
-    ) -> usize {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .map(|state| state.reclaim_snapshot_free_graph_generations(registered_snapshots))
-                .unwrap_or(0)
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn quarantine_partition_generation(
-        &self,
-        partition: &VectorPartitionRef,
-        is_base: bool,
-        generation_id: u64,
-    ) -> bool {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .is_some_and(|state| state.quarantine_sealed_generation(is_base, generation_id))
-        })
-    }
-
-    /// Mark one live raw-vector route unavailable without inventing a graph
-    /// descriptor or touching any authoritative vector body.
-    #[doc(hidden)]
-    pub fn quarantine_partition_route(
-        &self,
-        partition: &VectorPartitionRef,
-        reason: VectorRouteQuarantineReason,
-    ) -> bool {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .is_some_and(|state| {
-                    state.set_route_quarantine(reason);
-                    true
-                })
-        })
-    }
-
-    /// Internal repair transition, after atomic durable catalog retirement.
-    /// The caller holds maintenance publication and snapshot-removal authority.
-    #[doc(hidden)]
-    pub fn reset_partition_after_broken_catalog_retirement(
-        &self,
-        partition: &VectorPartitionRef,
-        accountant: &dyn MemoryBudget,
-    ) -> bool {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .is_some_and(|state| {
-                    state.reset_after_broken_catalog_retirement(accountant);
-                    true
-                })
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn clear_partition_route_quarantine(&self, partition: &VectorPartitionRef) -> bool {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .is_some_and(|state| {
-                    state.clear_route_quarantine();
-                    true
-                })
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn partition_route_quarantine(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Option<VectorRouteQuarantineReason> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(&partition.index, &partition.partition_key)
-                .and_then(|state| state.route_quarantine())
-        })
-    }
-
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn partition_route_quarantines(
-        &self,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<Vec<(VectorPartitionRef, VectorRouteQuarantineReason)>> {
-        self.with_bulk_read(|| {
-            let mut quarantines = Vec::new();
-            for index in self.scoped_sorted_refs(|_| true, owner)?.into_iter() {
-                let Some(column) = self.try_column(&index) else {
-                    continue;
-                };
-                for (key, state) in column
-                    .partitions
-                    .read()
-                    .iter()
-                    .filter(|(_, state)| !state.is_historical_only())
-                {
-                    if let Some(reason) = state.route_quarantine() {
-                        owner.reserve(
-                            std::mem::size_of::<(VectorPartitionRef, VectorRouteQuarantineReason)>(
-                            )
-                            .saturating_add(index.table.len())
-                            .saturating_add(index.column.len())
-                            .saturating_add(key.estimated_bytes()),
-                        )?;
-                        quarantines.reserve_exact(1);
-                        quarantines
-                            .push((VectorPartitionRef::new(index.clone(), key.clone()), reason));
-                    }
-                }
-            }
-            Ok(quarantines)
-        })
-    }
-
-    pub fn raw_hnsw_search(
-        &self,
-        index: &VectorIndexRef,
-        query: &[f32],
-        k: usize,
-    ) -> Option<Result<Vec<(RowId, f32)>>> {
-        self.with_bulk_read(|| {
-            self.try_state(index)
-                .and_then(|state| state.raw_hnsw_search(index, query, k))
-        })
-    }
-
-    pub fn raw_hnsw_search_partition(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        query: &[f32],
-        k: usize,
-    ) -> Option<Result<Vec<(RowId, f32)>>> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(index, partition_key)
-                .and_then(|state| state.raw_hnsw_search(index, query, k))
-        })
-    }
-
-    pub fn raw_hnsw_entry_count_for_row(
-        &self,
-        index: &VectorIndexRef,
-        row_id: RowId,
-    ) -> Option<usize> {
-        self.with_bulk_read(|| {
-            self.try_state(index)
-                .and_then(|state| state.raw_hnsw_entry_count_for_row(row_id))
-        })
-    }
-
-    pub fn raw_hnsw_entry_count_for_row_in_partition(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-        row_id: RowId,
-    ) -> Option<usize> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(index, partition_key)
-                .and_then(|state| state.raw_hnsw_entry_count_for_row(row_id))
-        })
-    }
-
-    pub fn raw_hnsw_topology_digest_for_test(&self, index: &VectorIndexRef) -> Option<u64> {
-        self.with_bulk_read(|| {
-            self.try_column(index).and_then(|column| {
-                column
-                    .partitions
-                    .read()
-                    .values()
-                    .filter(|state| !state.is_historical_only())
-                    .find_map(|state| state.raw_hnsw_topology_digest_for_test())
-            })
-        })
-    }
-
-    pub fn raw_hnsw_topology_digest_for_partition_for_test(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> Option<u64> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(index, partition_key)
-                .and_then(|state| state.raw_hnsw_topology_digest_for_test())
-        })
-    }
-
-    pub fn raw_hnsw_build_serial_for_test(&self, index: &VectorIndexRef) -> Option<u64> {
-        self.with_bulk_read(|| {
-            self.try_column(index).and_then(|column| {
-                column
-                    .partitions
-                    .read()
-                    .values()
-                    .filter(|state| !state.is_historical_only())
-                    .find_map(|state| state.raw_hnsw_build_serial_for_test())
-            })
-        })
-    }
-
-    pub fn raw_hnsw_build_serial_for_partition_for_test(
-        &self,
-        index: &VectorIndexRef,
-        partition_key: &VectorPartitionKey,
-    ) -> Option<u64> {
-        self.with_bulk_read(|| {
-            self.try_partition_state(index, partition_key)
-                .and_then(|state| state.raw_hnsw_build_serial_for_test())
         })
     }
 
@@ -25380,7 +17552,7 @@ impl VectorStore {
                          release: &mut _,
                          owner: &mut VectorCopyAdmission| {
                 state.bounded_score_visible_candidate(
-                    index, row_id, snapshot, query, None, checkpoint, distance, retain, release,
+                    index, row_id, snapshot, query, checkpoint, distance, retain, release,
                     owner,
                 )
             };
@@ -25961,21 +18133,6 @@ impl VectorStore {
                 .fold(0usize, usize::saturating_add),
             ..VectorMemoryOwnershipSnapshot::default()
         };
-        // A paged generation's root and partition charges are held by its
-        // durable tail, not by the generation's own charge; clones and
-        // successor roots share them, so each is counted once.
-        let mut paged_roots = HashSet::<usize>::new();
-        let mut paged_root_bytes = |generation: Option<&SealedHnswGeneration>| -> usize {
-            generation
-                .and_then(|generation| generation.graph().paged_tail_snapshot())
-                .map_or(0, |tail| {
-                    tail.retained_control_receipts()
-                        .into_iter()
-                        .filter(|(owner, _)| paged_roots.insert(*owner))
-                        .map(|(_, bytes)| bytes)
-                        .fold(0usize, usize::saturating_add)
-                })
-        };
         for (index, column) in registry.iter() {
             let directory = column.directory_ownership(index);
             receipt.raw_reverse_directory = receipt
@@ -25995,70 +18152,6 @@ impl VectorStore {
                     .map(VectorColumnState::failed_partition_entry_bytes)
                     .fold(0usize, usize::saturating_add),
             );
-            let partitions = column.partitions.read();
-            for state in partitions.values() {
-                // Pending builders/reclaimers own their partition-name copy and
-                // progress Arc independently of published graph generations.
-                // The slots progress is an alias of the pending builders
-                // progress, so count the physical invoice only once.
-                for slot in [&state.paged_builder, &state.paged_reclaimer] {
-                    let slot = slot.lock();
-                    if let Some((builder, _)) = slot.pending.as_ref() {
-                        receipt.vector_partition_controls = receipt
-                            .vector_partition_controls
-                            .saturating_add(accountant.map_or_else(
-                                || builder.retained_control_bytes(),
-                                |accountant| builder.retained_control_bytes_for(accountant),
-                            ));
-                    }
-                }
-                receipt.mutable_tail = receipt
-                    .mutable_tail
-                    .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst));
-                let sealed = state.sealed_hnsw.read();
-                let current_base = sealed
-                    .base
-                    .as_ref()
-                    .map(SealedHnswGeneration::bytes)
-                    .unwrap_or(0)
-                    .saturating_add(paged_root_bytes(sealed.base.as_ref()));
-                let current_change = sealed
-                    .change
-                    .as_ref()
-                    .map(SealedHnswGeneration::bytes)
-                    .unwrap_or(0)
-                    .saturating_add(paged_root_bytes(sealed.change.as_ref()));
-                if state.vector_count() == 0 {
-                    receipt.retired_pinned_graph_bytes = receipt
-                        .retired_pinned_graph_bytes
-                        .saturating_add(current_base)
-                        .saturating_add(current_change);
-                } else {
-                    receipt.base_graph = receipt.base_graph.saturating_add(current_base);
-                    receipt.change_graph = receipt.change_graph.saturating_add(current_change);
-                }
-                receipt.retired_pinned_graph_bytes = receipt
-                    .retired_pinned_graph_bytes
-                    .saturating_add(sealed.retired.iter().fold(0usize, |bytes, chain| {
-                        bytes
-                            .saturating_add(
-                                chain
-                                    .base
-                                    .as_ref()
-                                    .map(SealedHnswGeneration::bytes)
-                                    .unwrap_or(0),
-                            )
-                            .saturating_add(paged_root_bytes(chain.base.as_ref()))
-                            .saturating_add(
-                                chain
-                                    .change
-                                    .as_ref()
-                                    .map(SealedHnswGeneration::bytes)
-                                    .unwrap_or(0),
-                            )
-                            .saturating_add(paged_root_bytes(chain.change.as_ref()))
-                    }));
-            }
         }
         receipt
     }
@@ -26406,7 +18499,6 @@ impl VectorStore {
                     live_or_retained_partitions: column.live_or_retained_partition_count(),
                     partition_states: column.maintained_partition_state_count(),
                     bytes: column.retained_bytes(index),
-                    graph_available: column.has_complete_hnsw_route(),
                 });
             }
             drop(registry);
@@ -26474,88 +18566,6 @@ mod tests {
             0
         }
         fn write(&mut self, _: &[u8]) {}
-    }
-
-    #[test]
-    fn compatibility_profile_edges_and_partial_policy_validation_agree() {
-        for (quantization, expected) in [
-            (
-                VectorQuantization::F32,
-                [
-                    (16, 200, 10),
-                    (16, 200, 10),
-                    (16, 200, 20),
-                    (24, 400, 400),
-                    (24, 400, 400),
-                    (16, 200, 200),
-                ],
-            ),
-            (
-                VectorQuantization::SQ8,
-                [
-                    (8, 32, 96),
-                    (8, 32, 96),
-                    (8, 32, 96),
-                    (12, 64, 128),
-                    (12, 64, 128),
-                    (12, 64, 128),
-                ],
-            ),
-            (
-                VectorQuantization::SQ4,
-                [
-                    (8, 32, 96),
-                    (8, 32, 96),
-                    (8, 32, 96),
-                    (12, 64, 128),
-                    (12, 64, 128),
-                    (12, 64, 128),
-                ],
-            ),
-        ] {
-            let silent = VectorIndexLayout::unpartitioned(3, quantization);
-            for (count, expected) in [625, 2_500, 5_000, 5_001, 50_000, 50_001]
-                .into_iter()
-                .zip(expected)
-            {
-                let resolved = silent.resolve_policy(count, 1);
-                assert_eq!(
-                    (
-                        resolved.hnsw_m,
-                        resolved.hnsw_ef_construction,
-                        resolved.hnsw_ef_search
-                    ),
-                    expected,
-                    "{quantization:?} at {count}"
-                );
-            }
-            let (too_small, valid) = if quantization == VectorQuantization::F32 {
-                (20, 24)
-            } else {
-                (10, 12)
-            };
-            let partial = silent
-                .clone()
-                .with_policy(None, None, Some(too_small), None, 1);
-            let at_zero = partial.resolve_policy(0, 1);
-            assert!(at_zero.hnsw_ef_construction >= at_zero.hnsw_m);
-            assert!(
-                !partial.hnsw_policy_is_valid(),
-                "validation includes the next profile even on an empty column"
-            );
-            assert!(
-                silent
-                    .clone()
-                    .with_policy(None, None, Some(valid), None, 1)
-                    .hnsw_policy_is_valid()
-            );
-            assert!(
-                silent
-                    .with_policy(None, Some(u32::MAX), Some(u32::MAX), Some(u32::MAX), 1)
-                    .hnsw_policy_is_valid(),
-                "validation adds no private numeric maximum"
-            );
-        }
     }
 
     #[test]
@@ -28774,1038 +20784,6 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_and_hot_writes_keep_partition_graphs_independent() {
-        let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-        let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
-        let store = VectorStore::default();
-        let index = index();
-        let first = text_key("a");
-        let second = text_key("b");
-        store
-            .register_index_with_layout(
-                index.clone(),
-                partitioned_layout(4),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        store
-            .apply_partitioned_inserts(
-                vec![
-                    partitioned_entry(&index, &first, 1, TxId(1), [1.0, 0.0]),
-                    partitioned_entry(&index, &second, 2, TxId(2), [0.0, 1.0]),
-                ],
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-        let accountant = crate::memory_budget::unlimited_memory_budget();
-
-        let first_cycle = store
-            .run_hnsw_maintenance_cycle(accountant.clone(), &mut executing_admission)
-            .unwrap();
-        assert_eq!(first_cycle.built_partitions, 2);
-        let first_serial = store
-            .raw_hnsw_build_serial_for_partition_for_test(&index, &first)
-            .unwrap();
-        let second_serial = store
-            .raw_hnsw_build_serial_for_partition_for_test(&index, &second)
-            .unwrap();
-        let second_cycle = store
-            .run_hnsw_maintenance_cycle(accountant.clone(), &mut executing_admission)
-            .unwrap();
-        assert_eq!(second_cycle.built_partitions, 0);
-
-        store
-            .apply_partitioned_inserts_with_accountant(
-                vec![partitioned_entry(&index, &first, 3, TxId(3), [0.9, 0.1])],
-                Some(accountant.as_ref()),
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-        store
-            .apply_partitioned_deletes(
-                vec![PartitionedVectorDelete::new(
-                    index.clone(),
-                    first.clone(),
-                    RowId(1),
-                    TxId(4),
-                    TxId(1),
-                    Lsn(1),
-                )],
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-
-        assert_eq!(
-            store.raw_hnsw_build_serial_for_partition_for_test(&index, &first),
-            Some(first_serial)
-        );
-        assert_eq!(
-            store.raw_hnsw_build_serial_for_partition_for_test(&index, &second),
-            Some(second_serial)
-        );
-        assert!(
-            !store
-                .raw_hnsw_search_partition(&index, &second, &[0.0, 1.0], 1)
-                .unwrap()
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn sampled_build_accounts_for_the_fresh_tail_and_candidate_separately() {
-        let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-        let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
-        let layout = partitioned_layout(1)
-            .with_policy(Some(1), Some(2), Some(2), Some(2), 1)
-            .with_consolidation_policy(Some(1), Some(1));
-        assert!(
-            layout.hnsw_policy_is_valid(),
-            "M=2 and EF_CONSTRUCTION=2 are a legal small topology"
-        );
-        let policy = layout.resolve_policy(2, 1);
-        let fresh_tail_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            0,
-            layout.dimension,
-            layout.quantization,
-            policy.hnsw_m,
-        );
-        let candidate_bytes = crate::mem::estimate_hnsw_build_reservation(
-            2,
-            layout.dimension,
-            layout.quantization,
-            policy,
-        );
-        let final_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            2,
-            layout.dimension,
-            layout.quantization,
-            policy.hnsw_m,
-        );
-        let one_entry_tail_bytes = HnswIndex::estimated_resident_bytes_with_m(
-            1,
-            layout.dimension,
-            layout.quantization,
-            policy.hnsw_m,
-        );
-        assert!(candidate_bytes >= final_bytes);
-
-        let mut make_store = || {
-            let store = VectorStore::default();
-            let index = index();
-            let key = text_key("accounted");
-            store
-                .register_index_with_layout(
-                    index.clone(),
-                    layout.clone(),
-                    declared_column_owner.clone(),
-                    &mut registration_workspace,
-                )
-                .unwrap();
-            store
-                .apply_partitioned_inserts(
-                    vec![
-                        partitioned_entry(&index, &key, 1, TxId(1), [1.0, 0.0]),
-                        partitioned_entry(&index, &key, 2, TxId(2), [0.0, 1.0]),
-                    ],
-                    VectorCopyAdmission::new(executing_accountant.clone()),
-                )
-                .unwrap();
-            let partition = VectorPartitionRef::new(index.clone(), key.clone());
-            (store, index, key, partition)
-        };
-        let graph_bytes = |ownership: VectorMemoryOwnershipSnapshot| {
-            ownership
-                .base_graph
-                .saturating_add(ownership.change_graph)
-                .saturating_add(ownership.mutable_tail)
-                .saturating_add(ownership.retired_pinned_graph_bytes)
-        };
-
-        let (store, _index, _key, partition) = make_store();
-        let exact_budget = Arc::new(CountingMemoryBudget::with_limit(
-            fresh_tail_bytes.saturating_add(candidate_bytes),
-        ));
-        let mut reached_boundary = false;
-        assert!(
-            store
-                .run_sampled_hnsw_maintenance(
-                    &partition,
-                    exact_budget.clone(),
-                    &mut || Ok(()),
-                    || {
-                        reached_boundary = true;
-                        let ownership = store.memory_ownership_snapshot_for_test();
-                        assert_eq!(ownership.mutable_tail, fresh_tail_bytes);
-                        assert_eq!(graph_bytes(ownership), fresh_tail_bytes);
-                        assert_eq!(
-                            exact_budget.live_bytes(),
-                            fresh_tail_bytes.saturating_add(candidate_bytes),
-                            "the fresh tail and complete detached candidate coexist at the build boundary"
-                        );
-                    },
-                 &mut executing_admission)
-                .unwrap()
-        );
-        assert!(reached_boundary);
-        assert_eq!(exact_budget.build_reservation_bytes(), candidate_bytes);
-        let published = store.memory_ownership_snapshot_for_test();
-        assert_eq!(published.mutable_tail, final_bytes);
-        assert_eq!(graph_bytes(published), exact_budget.live_bytes());
-        assert_eq!(exact_budget.live_bytes(), final_bytes);
-        store.clear_hnsw(exact_budget.as_ref());
-        assert_eq!(exact_budget.live_bytes(), 0);
-
-        let (store, index, key, partition) = make_store();
-        let overlapping_budget = Arc::new(CountingMemoryBudget::default());
-        assert!(
-            store
-                .run_sampled_hnsw_maintenance(
-                    &partition,
-                    overlapping_budget.clone(),
-                    &mut || Ok(()),
-                    || {
-                        assert_eq!(
-                            overlapping_budget.live_bytes(),
-                            fresh_tail_bytes.saturating_add(candidate_bytes)
-                        );
-                        store
-                            .apply_partitioned_inserts_with_accountant(
-                                vec![partitioned_entry(&index, &key, 3, TxId(3), [0.7, 0.7])],
-                                Some(overlapping_budget.as_ref()),
-                                VectorCopyAdmission::new(executing_accountant.clone()),
-                            )
-                            .expect("the exact budget includes the overlapping fresh-tail growth");
-                    },
-                    &mut executing_admission
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            overlapping_budget.build_reservation_bytes(),
-            candidate_bytes
-        );
-        let published = store.memory_ownership_snapshot_for_test();
-        assert_eq!(published.base_graph, final_bytes);
-        assert_eq!(published.mutable_tail, one_entry_tail_bytes);
-        assert_eq!(graph_bytes(published), overlapping_budget.live_bytes());
-        assert_eq!(
-            overlapping_budget.live_bytes(),
-            final_bytes.saturating_add(one_entry_tail_bytes)
-        );
-        store.clear_hnsw(overlapping_budget.as_ref());
-        assert_eq!(overlapping_budget.live_bytes(), 0);
-
-        let (store, _index, _key, partition) = make_store();
-        let short_budget = Arc::new(CountingMemoryBudget::with_limit(
-            fresh_tail_bytes
-                .saturating_add(candidate_bytes)
-                .saturating_sub(1),
-        ));
-        let refused = store
-            .run_sampled_hnsw_maintenance(
-                &partition,
-                short_budget.clone(),
-                &mut || Ok(()),
-                || panic!("a refused candidate never reaches graph construction"),
-                &mut executing_admission,
-            )
-            .expect_err("one byte below complete ownership must refuse the candidate");
-        assert!(matches!(refused, Error::MemoryBudgetExceeded { .. }));
-        assert_eq!(short_budget.build_reservation_bytes(), candidate_bytes);
-        assert_eq!(short_budget.live_bytes(), 0);
-        assert_eq!(graph_bytes(store.memory_ownership_snapshot_for_test()), 0);
-    }
-
-    #[test]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn sampled_maintenance_publishes_while_every_build_attempt_overlaps_a_write() {
-        let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-        let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
-        let store = VectorStore::default();
-        let index = index();
-        let key = text_key("hot");
-        store
-            .register_index_with_layout(
-                index.clone(),
-                partitioned_layout(4),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        store
-            .apply_partitioned_inserts(
-                (0..16)
-                    .map(|row| {
-                        partitioned_entry(
-                            &index,
-                            &key,
-                            row + 1,
-                            TxId(row + 1),
-                            [1.0, row as f32 / 16.0],
-                        )
-                    })
-                    .collect(),
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-        let partition = VectorPartitionRef::new(index.clone(), key.clone());
-        let accountant = crate::memory_budget::unlimited_memory_budget();
-        let mut attempts = 0_u64;
-
-        let published = store
-            .run_sampled_hnsw_maintenance(
-                &partition,
-                accountant.clone(),
-                &mut || Ok(()),
-                || {
-                    attempts += 1;
-                    let row = 100 + attempts;
-                    store
-                        .apply_partitioned_inserts_with_accountant(
-                            vec![partitioned_entry(&index, &key, row, TxId(row), [0.0, 1.0])],
-                            Some(accountant.as_ref()),
-                            VectorCopyAdmission::new(executing_accountant.clone()),
-                        )
-                        .expect("a foreground write overlaps every maintenance build attempt");
-                },
-                &mut executing_admission,
-            )
-            .expect("sampled maintenance returns normally");
-
-        assert!(
-            attempts > 0,
-            "the test must overlap at least one real build"
-        );
-        assert!(
-            published,
-            "ordinary writes overlapping every build attempt cannot prevent maintenance progress"
-        );
-        let info = store
-            .partition_info(&index, &key, &mut executing_admission)
-            .unwrap()
-            .unwrap();
-        assert_eq!(info.live_rows, 16 + attempts as usize);
-        assert!(
-            info.graph_available,
-            "the resulting indexed route is complete"
-        );
-    }
-
-    #[test]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn disabled_consolidation_skips_an_interrupted_threshold_retry_but_keeps_required_builds() {
-        let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-        let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
-        let store = VectorStore::default();
-        let index = index();
-        let hot = text_key("hot");
-        let layout = partitioned_layout(2)
-            .with_policy(None, Some(8), Some(32), Some(16), 1)
-            .with_consolidation_policy(Some(1), Some(100));
-        store
-            .register_index_with_layout(
-                index.clone(),
-                layout.clone(),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        store
-            .apply_partitioned_inserts(
-                (0..32)
-                    .map(|row| {
-                        partitioned_entry(
-                            &index,
-                            &hot,
-                            row + 1,
-                            TxId(row + 1),
-                            [1.0, row as f32 / 32.0],
-                        )
-                    })
-                    .collect(),
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-        let accountant = crate::memory_budget::unlimited_memory_budget();
-        assert_eq!(
-            store
-                .run_hnsw_maintenance_cycle(accountant.clone(), &mut executing_admission)
-                .unwrap()
-                .built_partitions,
-            1,
-            "CONSOLIDATION does not suppress initial construction"
-        );
-        let initial_serial = store
-            .raw_hnsw_build_serial_for_partition_for_test(&index, &hot)
-            .unwrap();
-        store
-            .apply_partitioned_inserts_with_accountant(
-                vec![partitioned_entry(&index, &hot, 33, TxId(33), [0.0, -1.0])],
-                Some(accountant.as_ref()),
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-
-        let hot_state = store.try_partition_state(&index, &hot).unwrap();
-        let mut sampled_checkpoints = 0usize;
-        let mut crossed_write = false;
-        let interrupted = store.run_hnsw_maintenance_cycle_with(
-            accountant.clone(),
-            &mut || {
-                if hot_state.sampled_maintenance_frontier().is_some() {
-                    sampled_checkpoints += 1;
-                    if sampled_checkpoints == 2 {
-                        store.apply_partitioned_inserts_with_accountant(
-                            vec![partitioned_entry(&index, &hot, 34, TxId(34), [-1.0, 0.0])],
-                            Some(accountant.as_ref()),
-                            VectorCopyAdmission::new(executing_accountant.clone()),
-                        )?;
-                        crossed_write = true;
-                        return Err(Error::ReadCancelled);
-                    }
-                }
-                Ok(())
-            },
-            &mut executing_admission,
-        );
-        assert!(matches!(interrupted, Err(Error::ReadCancelled)));
-        assert!(
-            crossed_write,
-            "the interruption follows a real graph-construction checkpoint and fresh-tail write"
-        );
-        assert!(
-            hot_state.sampled_maintenance_frontier().is_some(),
-            "the nonempty fresh tail retains the interrupted sample frontier"
-        );
-        assert!(
-            hot_state
-                .visible_entry_by_row(&index, RowId(32), SnapshotId(32))
-                .is_some()
-        );
-        assert!(
-            hot_state
-                .visible_entry_by_row(&index, RowId(33), SnapshotId(32))
-                .is_none()
-        );
-        assert!(
-            hot_state
-                .visible_entry_by_row(&index, RowId(34), SnapshotId(32))
-                .is_none()
-        );
-        for (row, query) in [(33, [0.0, -1.0]), (34, [-1.0, 0.0])] {
-            assert!(
-                store
-                    .raw_hnsw_search_partition(&index, &hot, &query, 4)
-                    .unwrap()
-                    .unwrap()
-                    .iter()
-                    .any(|(candidate, _)| *candidate == RowId(row)),
-                "the sealed sample and fresh tail both remain searchable"
-            );
-        }
-
-        let disabled = layout.clone().with_consolidation_disabled(true);
-        store
-            .register_index_with_layout(
-                index.clone(),
-                disabled.clone(),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        let hot_info = store
-            .partition_info(&index, &hot, &mut executing_admission)
-            .unwrap()
-            .unwrap();
-        assert!(hot_info.graph_available);
-        assert_eq!(disabled.maintenance_need(&hot_info), None);
-        let disabled_cycle = store
-            .run_hnsw_maintenance_cycle(accountant.clone(), &mut executing_admission)
-            .unwrap();
-        assert_eq!(disabled_cycle.built_partitions, 0);
-        assert_eq!(disabled_cycle.built_indexes, 0);
-        assert_eq!(
-            store.raw_hnsw_build_serial_for_partition_for_test(&index, &hot),
-            Some(initial_serial),
-            "disabling threshold consolidation does not publish the retained sample"
-        );
-
-        let cold = text_key("cold");
-        store
-            .apply_partitioned_inserts_with_accountant(
-                vec![partitioned_entry(&index, &cold, 35, TxId(35), [0.0, 1.0])],
-                Some(accountant.as_ref()),
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-        let initial = store
-            .run_hnsw_maintenance_cycle(accountant.clone(), &mut executing_admission)
-            .unwrap();
-        assert_eq!(initial.built_partitions, 1);
-        assert_eq!(initial.built_indexes, 1);
-        assert!(
-            store
-                .partition_info(&index, &cold, &mut executing_admission)
-                .unwrap()
-                .unwrap()
-                .graph_available
-        );
-
-        assert!(store.quarantine_partition_route(
-            &VectorPartitionRef::new(index.clone(), cold.clone()),
-            VectorRouteQuarantineReason::CorruptChanges,
-        ));
-        let repaired = store
-            .run_hnsw_maintenance_cycle(accountant.clone(), &mut executing_admission)
-            .unwrap();
-        assert_eq!(repaired.built_partitions, 1);
-        assert_eq!(repaired.built_indexes, 1);
-        assert_eq!(
-            store
-                .partition_route_quarantine(&VectorPartitionRef::new(index.clone(), cold.clone(),)),
-            None
-        );
-
-        let replacement = disabled.with_policy(None, Some(12), Some(64), Some(16), 2);
-        store
-            .register_index_with_layout(
-                index.clone(),
-                replacement,
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        let replaced = store
-            .run_hnsw_maintenance_cycle(accountant, &mut executing_admission)
-            .unwrap();
-        assert_eq!(replaced.built_partitions, 2);
-        assert_eq!(replaced.built_indexes, 1);
-        for key in [&hot, &cold] {
-            let serving = store
-                .partition_info(&index, key, &mut executing_admission)
-                .unwrap()
-                .unwrap()
-                .serving_policy
-                .unwrap();
-            assert_eq!((serving.hnsw_m, serving.hnsw_ef_construction), (12, 64));
-        }
-    }
-
-    #[test]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn refused_sampled_build_restores_the_old_tail_replay_frontier() {
-        // A failed captured suffix load rolls back this invocation's new graph
-        // slots while preserving the exact contents and credit already present.
-        struct SavedGraphProducer {
-            encoded: Arc<Vec<u8>>,
-            reader: Arc<CountingMemoryBudget>,
-        }
-        impl DormantVectorGraphLoader for SavedGraphProducer {
-            fn load(
-                &self,
-                _generation: DormantVectorGraphGeneration,
-                caller_reserved_load_bytes: usize,
-                request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
-            ) -> Result<LoadedVectorGraphGeneration> {
-                if !request(DormantVectorLoadRequest::Checkpoint) {
-                    return Err(Error::ReadCancelled);
-                }
-                let graph = HnswIndex::decode_durable_generation(
-                    &self.encoded,
-                    2,
-                    VectorQuantization::F32,
-                )?;
-                let resident_bytes = graph.estimated_resident_bytes();
-                if resident_bytes > caller_reserved_load_bytes {
-                    return Err(Error::Other("decoded graph exceeds saved admission".into()));
-                }
-                Ok(LoadedVectorGraphGeneration {
-                    graph,
-                    resident_bytes,
-                    accountant: self.reader.clone().into(),
-                    caller_adopted_bytes: resident_bytes,
-                    fresh_tail: None,
-                })
-            }
-        }
-        struct NeverBindOrLoadSuffix;
-        impl CapturedVectorSuffixSource for NeverBindOrLoadSuffix {
-            fn bind_serving_layer(
-                &self,
-                _descriptor: &DormantVectorGraphGeneration,
-                _owner: &mut VectorCopyAdmission,
-            ) -> Result<CapturedVectorGraphLayer> {
-                panic!("this row tests an already-bound immutable selection")
-            }
-            fn bind_serving_frontier(
-                &self,
-                _base: Option<VectorGraphGeneration>,
-                _change: Option<VectorGraphGeneration>,
-                _owner: &mut VectorCopyAdmission,
-            ) -> Result<CapturedVectorSuffix> {
-                panic!("the suffix admission is already bound before this preload")
-            }
-        }
-        impl CapturedVectorSuffixLoader for NeverBindOrLoadSuffix {
-            fn load(
-                &self,
-                _caller_reserved_load_bytes: usize,
-                _request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
-            ) -> Result<LoadedCapturedVectorSuffix> {
-                panic!("the actual reader budget refuses before suffix payload loading")
-            }
-        }
-        let captured_index = index();
-        let mut policy =
-            VectorIndexLayout::unpartitioned(2, VectorQuantization::F32).resolve_policy(1, 1);
-        policy.hnsw_m = 8;
-        let mut saved = Vec::new();
-        for (ordinal, vector) in [[1.0, 0.0], [0.0, 1.0]].into_iter().enumerate() {
-            let graph = HnswIndex::from_vector_entries_with_policy(
-                &[entry(&captured_index, ordinal as u64 + 1, TxId(1), vector)],
-                2,
-                VectorQuantization::F32,
-                policy,
-            );
-            let resident = graph.estimated_resident_bytes();
-            let encoded = Arc::new(graph.encode_durable_generation().unwrap());
-            let quote =
-                HnswIndex::durable_resident_bound(&encoded, 2, VectorQuantization::F32, 8).unwrap();
-            let load = quote.max(resident).checked_add(encoded.len()).unwrap();
-            let identity = VectorGraphGeneration {
-                generation_id: ordinal as u64 + 1,
-                covered_tx: TxId(1),
-                covered_lsn: Lsn(1),
-                durable_bytes: encoded.len() as u64,
-                policy_revision: 1,
-                hnsw_m: 8,
-                hnsw_ef_construction: policy.hnsw_ef_construction as u32,
-            };
-            saved.push((
-                encoded,
-                resident,
-                DormantVectorGraphGeneration {
-                    identity,
-                    resident_bytes: quote.max(resident),
-                    load_bytes: load,
-                    reclaim_bytes: 0,
-                },
-            ));
-        }
-        let reader_limit = saved[0]
-            .2
-            .load_bytes
-            .max(saved[0].1.checked_add(saved[1].2.load_bytes).unwrap())
-            .checked_add(1)
-            .unwrap();
-        for preexisting in [false, true] {
-            let reader = Arc::new(CountingMemoryBudget::with_limit(reader_limit));
-            let registered = Arc::new(CountingMemoryBudget::default());
-            let captured_store = VectorStore::default();
-            captured_store
-                .register_index(
-                    captured_index.clone(),
-                    2,
-                    VectorQuantization::F32,
-                    registered,
-                )
-                .unwrap();
-            let captured_state = captured_store.state(&captured_index).unwrap();
-            let mut selection = CapturedVectorServingSelection::new(
-                RawVectorInspectionSnapshot {
-                    captured_catalog: true,
-                    summary: RawVectorMembershipSummary {
-                        entries: 2,
-                        live_entries: 2,
-                        max_tx: TxId(1),
-                    },
-                    base: Some(saved[0].2.identity),
-                    change: Some(saved[1].2.identity),
-                    pending_inserts: 0,
-                    tombstones: 0,
-                    #[cfg(feature = "test-seams")]
-                    base_pending: None,
-                },
-                Some(CapturedVectorGraphLayer {
-                    descriptor: saved[0].2,
-                    loader: Arc::new(SavedGraphProducer {
-                        encoded: saved[0].0.clone(),
-                        reader: reader.clone(),
-                    }),
-                }),
-                Some(CapturedVectorGraphLayer {
-                    descriptor: saved[1].2,
-                    loader: Arc::new(SavedGraphProducer {
-                        encoded: saved[1].0.clone(),
-                        reader: reader.clone(),
-                    }),
-                }),
-                Arc::new(NeverBindOrLoadSuffix),
-            );
-            selection.suffix = Some(CapturedVectorSuffix {
-                resident_bytes: reader_limit,
-                load_bytes: reader_limit,
-                reclaim_bytes: 0,
-                loader: Arc::new(NeverBindOrLoadSuffix),
-            });
-            if preexisting {
-                for (is_base, (encoded, resident, descriptor)) in
-                    [true, false].into_iter().zip(&saved)
-                {
-                    let graph =
-                        HnswIndex::decode_durable_generation(encoded, 2, VectorQuantization::F32)
-                            .unwrap();
-                    reader
-                        .try_allocate_for(*resident, "reader", "existing_graph", "fixture")
-                        .unwrap();
-                    let generation = SealedHnswGeneration::new(
-                        descriptor.identity,
-                        graph,
-                        *resident,
-                        Some(reader.clone().into()),
-                    );
-                    let slots = selection.resident.get_mut();
-                    if is_base {
-                        slots.base = Some(generation);
-                    } else {
-                        slots.change = Some(generation);
-                    }
-                }
-            }
-            let identities_before =
-                {
-                    let slots = selection.resident.lock();
-                    (
-                        slots.base.as_ref().map(|g| {
-                            Arc::as_ptr(g.contents.as_ref().expect("live sealed generation"))
-                        }),
-                        slots.change.as_ref().map(|g| {
-                            Arc::as_ptr(g.contents.as_ref().expect("live sealed generation"))
-                        }),
-                    )
-                };
-            let baseline = reader.live_bytes();
-            let slots_at_refusal = std::cell::Cell::new(false);
-            let refused = captured_state.preload_captured_serving_selection::<Error>(
-                &selection,
-                &mut || Ok(()),
-                &mut |bytes| {
-                    if bytes == reader_limit {
-                        let slots = selection.resident.lock();
-                        slots_at_refusal.set(slots.base.is_some() && slots.change.is_some());
-                    }
-                    reader.try_allocate_for(bytes, "reader", "captured_preload", "fixture")
-                },
-                &mut |bytes| reader.release(bytes),
-            );
-            assert!(matches!(refused, Err(Error::MemoryBudgetExceeded { .. })));
-            assert!(
-                slots_at_refusal.get(),
-                "both real graphs installed before suffix refusal"
-            );
-            let slots = selection.resident.lock();
-            assert_eq!(
-                (
-                    slots
-                        .base
-                        .as_ref()
-                        .map(|g| Arc::as_ptr(g.contents.as_ref().expect("live sealed generation"))),
-                    slots
-                        .change
-                        .as_ref()
-                        .map(|g| Arc::as_ptr(g.contents.as_ref().expect("live sealed generation"))),
-                ),
-                identities_before,
-                "new invocation slots are gone; preexisting native graph identities survive"
-            );
-            assert!(slots.suffix.is_none());
-            assert!(!slots.suffix_loaded);
-            drop(slots);
-            assert_eq!(reader.live_bytes(), baseline);
-            drop(selection);
-            assert_eq!(reader.live_bytes(), 0);
-        }
-
-        let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-        let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
-        let store = VectorStore::default();
-        let index = index();
-        let key = text_key("replayed-tail");
-        let layout = partitioned_layout(1)
-            .with_policy(Some(1), Some(8), Some(32), Some(16), 1)
-            .with_consolidation_policy(Some(1), Some(1));
-        store
-            .register_index_with_layout(
-                index.clone(),
-                layout,
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        store
-            .apply_partitioned_inserts(
-                vec![
-                    partitioned_entry(&index, &key, 1, TxId(1), [1.0, 0.0]),
-                    partitioned_entry(&index, &key, 2, TxId(2), [0.0, 1.0]),
-                ],
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-        let partition = VectorPartitionRef::new(index.clone(), key.clone());
-        let unlimited = crate::memory_budget::unlimited_memory_budget();
-        assert!(
-            store
-                .run_sampled_hnsw_maintenance(
-                    &partition,
-                    unlimited.clone(),
-                    &mut || Ok(()),
-                    || {
-                        store
-                            .apply_partitioned_inserts_with_accountant(
-                                vec![partitioned_entry(&index, &key, 3, TxId(3), [0.7, 0.7])],
-                                Some(unlimited.as_ref()),
-                                VectorCopyAdmission::new(executing_accountant.clone()),
-                            )
-                            .unwrap();
-                    },
-                    &mut executing_admission
-                )
-                .unwrap(),
-            "the first sampled base publishes with a nonempty fresh tail"
-        );
-        let state = store.try_partition_state(&index, &key).unwrap();
-        assert_eq!(state.hnsw_len(), Some(3));
-        // Model the durable replay path after it has established that the
-        // existing fresh tail already represents journal LSN 3.
-        state
-            .fresh_tail_replayed_through_lsn
-            .store(3, Ordering::SeqCst);
-        state
-            .fresh_tail_replay_frontier_active
-            .store(true, Ordering::SeqCst);
-        state
-            .fresh_tail_mutated_through_lsn
-            .store(3, Ordering::SeqCst);
-        let replayed = state.stored_by_row_id(RowId(3)).unwrap();
-
-        let refused = Arc::new(RefuseSampledBuildMemoryBudget::default());
-        let error = store
-            .run_sampled_hnsw_maintenance(
-                &partition,
-                refused.clone(),
-                &mut || Ok(()),
-                || {},
-                &mut executing_admission,
-            )
-            .expect_err("the second sampled build is refused after splitting the old tail");
-        assert!(matches!(error, Error::MemoryBudgetExceeded { .. }));
-        assert_eq!(
-            refused.live_bytes.load(Ordering::SeqCst),
-            0,
-            "the abandoned candidate releases its empty-tail allocation"
-        );
-
-        // The overlapping durable commit publication repeats a record the
-        // restored tail already owns. Its restored replay frontier must make
-        // this idempotent rather than adding a second graph node.
-        state.insert_into_materialized_hnsw(&index, &replayed, Some(unlimited.as_ref()));
-        let (_, layer_counts) = state
-            .with_snapshot_compatible_hnsw_layers(SnapshotId(3), true, |graph| {
-                Ok::<_, Error>(graph.raw_entry_count_for_row(RowId(3)))
-            })
-            .unwrap();
-        assert_eq!(
-            layer_counts.iter().map(|(_, count)| *count).sum::<usize>(),
-            1,
-            "the base/tail chain represents the replayed row exactly once"
-        );
-        let (_, layer_results) = state
-            .with_snapshot_compatible_hnsw_layers(SnapshotId(3), true, |graph| {
-                graph.search(&index, &[0.7, 0.7], 8)
-            })
-            .unwrap();
-        assert_eq!(
-            layer_results
-                .into_iter()
-                .flat_map(|(_, rows)| rows)
-                .filter(|(row_id, _)| *row_id == RowId(3))
-                .count(),
-            1,
-            "search observes one result for the replayed tail row"
-        );
-    }
-
-    #[test]
-    fn raw_publication_helpers_keep_the_serving_graph_policy_until_replacement() {
-        let executing_accountant = Arc::new(CountingMemoryBudget::default());
-        let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
-
-        let declared_column_owner = Arc::new(CountingMemoryBudget::default());
-        let mut registration_workspace = VectorCopyAdmission::new(declared_column_owner.clone());
-        let store = VectorStore::default();
-        let index = index();
-        let layout = VectorIndexLayout::unpartitioned(2, VectorQuantization::F32).with_policy(
-            Some(3),
-            Some(24),
-            Some(128),
-            Some(7),
-            9,
-        );
-        store
-            .register_index_with_layout(
-                index.clone(),
-                layout.clone(),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-        store
-            .apply_inserts(
-                vec![entry(&index, 1, TxId(1), [1.0, 0.0])],
-                VectorCopyAdmission::new(executing_accountant.clone()),
-            )
-            .unwrap();
-        let accountant = crate::memory_budget::unlimited_memory_budget();
-        store
-            .run_hnsw_maintenance_cycle(accountant.clone(), &mut executing_admission)
-            .unwrap();
-        let state = store.state(&index).unwrap();
-        let serial = state.raw_hnsw_build_serial_for_test().unwrap();
-        store
-            .register_index_with_layout(
-                index.clone(),
-                layout.with_policy(Some(3), Some(32), Some(160), Some(9), 10),
-                declared_column_owner.clone(),
-                &mut registration_workspace,
-            )
-            .unwrap();
-
-        for publication in 0..4 {
-            match publication {
-                0 => store
-                    .apply_inserts_with_accountant(
-                        vec![entry(&index, 2, TxId(2), [0.0, 1.0])],
-                        Some(accountant.as_ref()),
-                        VectorCopyAdmission::new(executing_accountant.clone()),
-                    )
-                    .unwrap(),
-                1 => store
-                    .apply_moves_with_accountant(
-                        vec![(index.clone(), RowId(2), RowId(3), TxId(3), TxId(2), Lsn(2))],
-                        Lsn(3),
-                        Some(accountant.as_ref()),
-                        VectorCopyAdmission::new(executing_accountant.clone()),
-                    )
-                    .unwrap(),
-                2 => store
-                    .apply_changes_with_accountant_ref(
-                        &[],
-                        &[entry(&index, 4, TxId(4), [-1.0, 0.0])],
-                        &[],
-                        Lsn(4),
-                        Some(accountant.as_ref()),
-                        VectorCopyAdmission::new(executing_accountant.clone()),
-                    )
-                    .unwrap(),
-                _ => store
-                    .apply_changes_with_accountant_ref(
-                        &[],
-                        &[],
-                        &[(index.clone(), RowId(4), RowId(5), TxId(5), TxId(4), Lsn(4))],
-                        Lsn(5),
-                        Some(accountant.as_ref()),
-                        VectorCopyAdmission::new(executing_accountant.clone()),
-                    )
-                    .unwrap(),
-            }
-            assert_eq!(
-                state.raw_hnsw_build_serial_for_test(),
-                Some(serial),
-                "publication extends the existing graph without clearing it"
-            );
-            assert_eq!(
-                state
-                    .hnsw
-                    .get()
-                    .unwrap()
-                    .read()
-                    .as_ref()
-                    .unwrap()
-                    .policy_values(),
-                (24, 128, 7),
-                "the serving graph retains its built shape while the newer declaration awaits maintenance"
-            );
-        }
-        for (old, current, vector) in [(2, 3, [0.0, 1.0]), (4, 5, [-1.0, 0.0])] {
-            assert!(
-                state
-                    .visible_entry_by_row(&index, RowId(old), SnapshotId(5))
-                    .is_none()
-            );
-            assert_eq!(
-                state
-                    .visible_entry_by_row(&index, RowId(current), SnapshotId(5))
-                    .unwrap()
-                    .vector,
-                vector.to_vec()
-            );
-            assert!(
-                store
-                    .raw_hnsw_search(&index, &vector, 10)
-                    .unwrap()
-                    .unwrap()
-                    .iter()
-                    .any(|(row, _)| *row == RowId(current))
-            );
-        }
-        store
-            .run_hnsw_maintenance_cycle(accountant, &mut executing_admission)
-            .unwrap();
-        assert_ne!(state.raw_hnsw_build_serial_for_test(), Some(serial));
-        assert_eq!(
-            state
-                .hnsw
-                .get()
-                .unwrap()
-                .read()
-                .as_ref()
-                .unwrap()
-                .policy_values(),
-            (32, 160, 9)
-        );
-    }
-
-    #[test]
     fn retained_bytes_include_large_text_partition_keys() {
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
         let _executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
@@ -30367,60 +21345,6 @@ mod reverse_probe_lifetime_tests {
 
 #[cfg(test)]
 mod page_cache_budget_tests;
-
-#[cfg(test)]
-mod disconnection_report_tests {
-    use super::*;
-    use crate::quantized::StoredVector;
-
-    /// A disconnection report names the graph the search walked. A report
-    /// about a graph that a rebuild has replaced since says nothing about the
-    /// one serving now and sets nothing aside; the same report about the
-    /// serving graph does.
-    #[test]
-    fn a_report_about_a_replaced_graph_sets_nothing_aside() {
-        let entries = (1..=4_u64)
-            .map(|row| StoredVectorEntry {
-                membership: VectorMembershipProvenance::new(TxId(1), Lsn(row), TxId(1), None),
-                canonical_deleted_tx: None,
-                row_id: RowId(row),
-                vector: StoredVector::from_f32(&[row as f32, 1.0], VectorQuantization::F32),
-                created_tx: TxId(1),
-                deleted_tx: None,
-                lsn: Lsn(row),
-            })
-            .collect::<Vec<_>>();
-        let state = IndexState::new(2, VectorQuantization::F32);
-        state.set_hnsw(
-            Some(HnswIndex::new(&entries, 2, VectorQuantization::F32)),
-            0,
-        );
-        let walked = state.graph_stamp_of(&[], state.tail_epoch());
-        // A rebuild replaces the graph before the walk's report arrives.
-        state.set_hnsw(
-            Some(HnswIndex::new(&entries, 2, VectorQuantization::F32)),
-            0,
-        );
-        assert!(
-            !state.set_disconnected_graph(walked),
-            "the stale report is ignored"
-        );
-        assert_eq!(
-            state.route_quarantine(),
-            None,
-            "the replacement is not set aside"
-        );
-        let serving = state.graph_stamp_of(&[], state.tail_epoch());
-        assert!(
-            state.set_disconnected_graph(serving),
-            "a report about the serving graph applies"
-        );
-        assert_eq!(
-            state.route_quarantine(),
-            Some(VectorRouteQuarantineReason::DisconnectedGraph)
-        );
-    }
-}
 
 #[cfg(any(test, feature = "test-seams"))]
 mod physical;

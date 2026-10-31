@@ -1,7 +1,7 @@
 //! Durable raw membership access. Implementations own the pinned storage read,
 //! authenticate each record when used, and reuse one admitted decode window.
 //! No decoded directory is retained by the vector store.
-use super::{DormantVectorLoadRequest, RawVectorDirectoryEntry, VectorGraphGeneration};
+use super::{DormantVectorLoadRequest, RawVectorDirectoryEntry};
 use crate::MemoryBudget;
 use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorIndexRef, VectorPartitionKey,
@@ -37,40 +37,22 @@ pub struct RawVectorMembershipSummary {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawVectorInspectionSnapshot {
-    /// The captured physical root differs from the current writer publication.
-    /// Its catalog descriptors and counts must remain paired.
-    pub captured_catalog: bool,
     pub summary: RawVectorMembershipSummary,
-    pub base: Option<VectorGraphGeneration>,
-    pub change: Option<VectorGraphGeneration>,
     pub pending_inserts: usize,
     pub tombstones: usize,
-    #[cfg(feature = "test-seams")]
-    pub base_pending: Option<(usize, usize)>,
 }
 
 impl RawVectorInspectionSnapshot {
     #[doc(hidden)]
     pub fn new(
-        captured_catalog: bool,
         summary: RawVectorMembershipSummary,
-        base: Option<VectorGraphGeneration>,
-        change: Option<VectorGraphGeneration>,
         pending_inserts: usize,
         tombstones: usize,
-        base_pending: Option<(usize, usize)>,
     ) -> Self {
-        #[cfg(not(feature = "test-seams"))]
-        let _ = base_pending;
         Self {
-            captured_catalog,
             summary,
-            base,
-            change,
             pending_inserts,
             tombstones,
-            #[cfg(feature = "test-seams")]
-            base_pending,
         }
     }
 }
@@ -133,38 +115,6 @@ pub trait RawVectorMembershipSource: Send + Sync {
         _caller: &dyn MemoryBudget,
         _visit: &mut dyn FnMut(usize, usize, bool),
     ) {
-    }
-
-    /// Authenticate one serving selection on this operation's physical root.
-    /// No default is permitted: every supplier must bind its root explicitly.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn capture_serving_selection(
-        &self,
-        snapshot: SnapshotId,
-        frozen_base: Option<&VectorGraphGeneration>,
-        frozen_change: Option<&VectorGraphGeneration>,
-        owner: &mut super::VectorCopyAdmission,
-    ) -> Result<super::CapturedVectorServingSelection>;
-
-    /// Private streaming capture can account every metadata window. Ordinary
-    /// suppliers preserve their existing constant-size capture unchanged.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn capture_serving_selection_with_work(
-        &self,
-        snapshot: SnapshotId,
-        frozen_base: Option<&VectorGraphGeneration>,
-        frozen_change: Option<&VectorGraphGeneration>,
-        owner: &mut super::VectorCopyAdmission,
-        _before_read: &mut dyn FnMut() -> bool,
-    ) -> Result<super::CapturedVectorServingSelection> {
-        self.capture_serving_selection(snapshot, frozen_base, frozen_change, owner)
     }
 
     /// Rebind a live writer source after its durable index keys are renamed.
@@ -352,19 +302,17 @@ pub trait RawVectorMembershipSource: Send + Sync {
         Ok(None)
     }
 
-    /// Return counts and catalog metadata from one authorized operation root.
-    /// When installation was refused, count against the actual serving frontier.
-    /// Sources without a durable catalog keep the resident path.
+    /// Return counts from one authorized operation root. Sources without a
+    /// durable catalog keep the resident path.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn inspection_snapshot(
         &self,
-        serving_covered: Option<TxId>,
         owner: &mut super::VectorCopyAdmission,
     ) -> Result<Option<RawVectorInspectionSnapshot>> {
-        let _ = (serving_covered, owner);
+        let _ = owner;
         Ok(None)
     }
 
@@ -725,21 +673,6 @@ impl RawVectorMembershipSource for LazyRawVectorMembershipSource {
         if let Some(source) = slot.source.as_ref() {
             source.visit_retained_copy_credits(caller, visit);
         }
-    }
-
-    fn capture_serving_selection(
-        &self,
-        snapshot: SnapshotId,
-        frozen_base: Option<&VectorGraphGeneration>,
-        frozen_change: Option<&VectorGraphGeneration>,
-        owner: &mut super::VectorCopyAdmission,
-    ) -> Result<super::CapturedVectorServingSelection> {
-        self.resolve(&mut || true)?.capture_serving_selection(
-            snapshot,
-            frozen_base,
-            frozen_change,
-            owner,
-        )
     }
 
     fn supports_root_selection(&self) -> bool {

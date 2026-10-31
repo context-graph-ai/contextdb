@@ -1446,9 +1446,6 @@ pub struct VectorSearchDebugTrace {
     pub fallback_reason: Option<&'static str>,
     /// Actual per-partition choices in selected-partition order.
     pub partition_routes: Vec<VectorPartitionSearchTrace>,
-    /// Durable generation identities actually searched for this result. The
-    /// mutable tail has no durable identity and is deliberately absent.
-    pub selected_generations: Vec<crate::store::VectorGraphGeneration>,
     /// The one union walk's budget and terminal state, when a walk ran.
     pub budget_receipt: Option<VectorSearchBudgetReceipt>,
 }
@@ -1473,9 +1470,9 @@ pub struct VectorSearchBudgetReceipt {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct TraceInvoiceForTest {
-    // table, column, routes, final rows, selected generations
-    pub allocations: [(usize, usize, usize); 5],
-    pub capacities: [usize; 5],
+    // table, column, routes, final rows
+    pub allocations: [(usize, usize, usize); 4],
+    pub capacities: [usize; 4],
     pub original_payer: usize,
     pub forwarding_payer: usize,
     pub owner_control_invoice_present: bool,
@@ -1503,17 +1500,16 @@ impl TraceInvoiceForTest {
     }
 }
 #[cfg(feature = "test-seams")]
-fn trace_capacities_for_test(trace: &VectorSearchDebugTrace) -> [usize; 5] {
+fn trace_capacities_for_test(trace: &VectorSearchDebugTrace) -> [usize; 4] {
     [
         trace.index.table.capacity(),
         trace.index.column.capacity(),
         trace.partition_routes.capacity(),
         trace.final_row_ids.capacity(),
-        trace.selected_generations.capacity(),
     ]
 }
 #[cfg(feature = "test-seams")]
-fn trace_allocations_for_test(trace: &VectorSearchDebugTrace) -> [(usize, usize, usize); 5] {
+fn trace_allocations_for_test(trace: &VectorSearchDebugTrace) -> [(usize, usize, usize); 4] {
     fn buffer<T>(pointer: *const T, capacity: usize) -> (usize, usize, usize) {
         let layout = std::alloc::Layout::array::<T>(capacity).unwrap();
         (pointer as usize, layout.size(), layout.align())
@@ -1526,10 +1522,6 @@ fn trace_allocations_for_test(trace: &VectorSearchDebugTrace) -> [(usize, usize,
             trace.partition_routes.capacity(),
         ),
         buffer(trace.final_row_ids.as_ptr(), trace.final_row_ids.capacity()),
-        buffer(
-            trace.selected_generations.as_ptr(),
-            trace.selected_generations.capacity(),
-        ),
     ]
 }
 
@@ -1585,9 +1577,6 @@ impl OwnedVectorSearchTrace {
 
     pub fn supplemented_row_count(&self) -> usize {
         self.trace.supplemented_row_count
-    }
-    pub fn selected_generations(&self) -> &[crate::store::VectorGraphGeneration] {
-        &self.trace.selected_generations
     }
 
     #[doc(hidden)]
@@ -1658,7 +1647,6 @@ impl OwnedVectorSearchTrace {
             supplemented_row_count: 0,
             fallback_reason: Some(reason),
             partition_routes: routes,
-            selected_generations: Vec::new(),
             budget_receipt: None,
         };
         Ok(Self {
@@ -1810,57 +1798,11 @@ pub struct BoundedBruteForceCursor {
 struct BoundedSnapshotVectorSource {
     partition_key: VectorPartitionKey,
     state: crate::store::VectorQueryState,
-    serving_selection: Option<Arc<crate::store::CapturedVectorServingSelection>>,
     candidate_ids: Option<Vec<u64>>,
     point_load: bool,
     candidate_ids_cover_all_live: bool,
     allowed_count: usize,
     live_count: usize,
-}
-
-impl BoundedSnapshotVectorSource {
-    fn serving_policy(&self, snapshot: SnapshotId) -> Option<crate::store::VectorServingPolicy> {
-        match &self.serving_selection {
-            Some(selection) => selection.serving_policy(),
-            None => self.state.snapshot_serving_policy(snapshot),
-        }
-    }
-    fn dormant_layer_count(&self, snapshot: SnapshotId) -> usize {
-        self.serving_selection.as_ref().map_or_else(
-            || self.state.dormant_layer_count_for_snapshot(snapshot),
-            |selection| selection.dormant_layer_count(),
-        )
-    }
-    fn dormant_load_bytes(&self, snapshot: SnapshotId) -> usize {
-        self.serving_selection.as_ref().map_or_else(
-            || self.state.dormant_load_bytes_for_snapshot(snapshot),
-            |selection| selection.dormant_load_bytes(),
-        )
-    }
-    fn streamed_suffix(&self) -> Option<&dyn crate::store::StreamedVectorSuffixHandle> {
-        self.serving_selection
-            .as_ref()
-            .and_then(|selection| selection.streamed_suffix())
-    }
-    fn journal_suffix_frontier(&self) -> Option<TxId> {
-        let selection = self.serving_selection.as_ref()?;
-        if selection.streamed_suffix()?.saved_inserts() == 0 {
-            return None;
-        }
-        Some(
-            selection
-                .inspection
-                .change
-                .or(selection.inspection.base)
-                .map_or(TxId(0), |generation| generation.covered_tx),
-        )
-    }
-    fn dormant_page_bytes(&self, snapshot: SnapshotId) -> usize {
-        self.serving_selection.as_ref().map_or_else(
-            || self.state.dormant_page_bytes_for_snapshot(snapshot),
-            |selection| selection.dormant_page_bytes(),
-        )
-    }
 }
 
 impl std::fmt::Debug for BoundedSnapshotVectorSource {
@@ -1944,22 +1886,14 @@ impl BoundedVectorCandidateGroups {
     #[doc(hidden)]
     pub fn visit_nonempty_partitions<E>(
         &self,
-        mut visit: impl FnMut(
-            usize,
-            usize,
-            Option<crate::store::VectorServingPolicy>,
-        ) -> std::result::Result<(), E>,
+        mut visit: impl FnMut(usize, usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         for source in self
             .sources
             .iter()
             .filter(|source| source.allowed_count != 0)
         {
-            visit(
-                source.allowed_count,
-                source.live_count,
-                source.serving_policy(self.snapshot),
-            )?;
+            visit(source.allowed_count, source.live_count)?;
         }
         Ok(())
     }
@@ -1993,39 +1927,6 @@ impl BoundedVectorCandidateGroups {
         Ok(())
     }
 
-    /// The row checks one statement may spend on a filter it checks row by
-    /// row: its walk budget for `k` at the declared breadth,
-    /// `max(EF_SEARCH, k) x (2M + 4)` for the statement's resolved policy and
-    /// the widest serving graph's degree -- the same function that sizes the
-    /// walk, for the whole statement across its partitions and layers.
-    pub fn row_check_allowance(&self, layout: &crate::store::VectorIndexLayout, k: usize) -> usize {
-        let statement_live_count = self
-            .sources
-            .iter()
-            .map(|source| source.live_count)
-            .fold(0usize, usize::saturating_add);
-        let statement_policy = layout.resolve_policy(statement_live_count, search_policy_limit(k));
-        let widest_m = self
-            .sources
-            .iter()
-            .map(|source| {
-                source.serving_policy(self.snapshot).map_or_else(
-                    || {
-                        layout
-                            .resolve_policy(source.live_count, search_policy_limit(k))
-                            .hnsw_m
-                    },
-                    |serving| serving.hnsw_m,
-                )
-            })
-            .max()
-            .unwrap_or(statement_policy.hnsw_m);
-        statement_policy
-            .hnsw_ef_search
-            .max(k)
-            .saturating_mul(widest_m.saturating_mul(2).saturating_add(4))
-    }
-
     /// Inspect only the already captured nonempty sources, one fixed
     /// metadata window at a time. This never builds a partition-info array.
     #[expect(
@@ -2041,12 +1942,7 @@ impl BoundedVectorCandidateGroups {
             .iter()
             .filter(|source| source.allowed_count != 0)
         {
-            let pending = if let Some(selection) = &source.serving_selection {
-                selection.inspection.pending_inserts != 0 || selection.inspection.tombstones != 0
-            } else {
-                source.state.has_pending_work_for_read(owner)?
-            };
-            if pending {
+            if source.state.has_pending_work_for_read(owner)? {
                 return Ok(true);
             }
         }
@@ -2057,13 +1953,7 @@ impl BoundedVectorCandidateGroups {
         self.retained_bytes
     }
 
-    fn into_cursor_parts(mut self) -> (SnapshotId, bool, Vec<BoundedSnapshotVectorSource>, usize) {
-        // Exhaustive stepping uses the captured raw source and snapshot only.
-        // Release graph-only loaders/controls before retaining body and score
-        // workspaces, while their own admissions still cover physical free.
-        for source in &mut self.sources {
-            drop(source.serving_selection.take());
-        }
+    fn into_cursor_parts(self) -> (SnapshotId, bool, Vec<BoundedSnapshotVectorSource>, usize) {
         (
             self.snapshot,
             self.filtered,
@@ -2713,7 +2603,6 @@ where
             supplemented_row_count: 0,
             fallback_reason: Some(fallback_reason),
             partition_routes,
-            selected_generations: Vec::new(),
             budget_receipt,
         },
         retained_bytes,
@@ -2781,7 +2670,6 @@ where
         BoundedSnapshotVectorSource {
             partition_key: key.clone(),
             state: state.into(),
-            serving_selection: None,
             candidate_ids: None,
             point_load: false,
             candidate_ids_cover_all_live: false,
@@ -2857,22 +2745,6 @@ pub struct MemVectorExecutor<S: WriteSetApplicator> {
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
-    /// The row checks a statement over `index` may spend checking its filter
-    /// row by row: see `BoundedVectorCandidateGroups::row_check_allowance`.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn bounded_row_check_allowance(
-        &self,
-        index: &VectorIndexRef,
-        k: usize,
-        groups: &BoundedVectorCandidateGroups,
-        owner: &mut crate::VectorCopyAdmission,
-    ) -> Result<usize> {
-        let layout = self.store.scoped_index_layout(index, owner)?;
-        Ok(groups.row_check_allowance(&layout, k))
-    }
 
     #[doc(hidden)]
     pub fn new_engine(
@@ -3448,42 +3320,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             drop(sources);
             release_retained(retained_bytes);
             return Err(error);
-        }
-        for source in &mut sources {
-            if owner.uses_only_raw_sources() {
-                continue;
-            }
-            // A quarantined route serves no graph; its exact reads use the
-            // raw memberships, which do not depend on the damaged catalog.
-            if source.state.route_quarantine().is_some() {
-                continue;
-            }
-            let mut capture_interrupted = None;
-            let captured =
-                source
-                    .state
-                    .capture_serving_selection_with_work(snapshot, owner, &mut || {
-                        match before_checkpoint() {
-                            Ok(()) => true,
-                            Err(error) => {
-                                capture_interrupted = Some(error);
-                                false
-                            }
-                        }
-                    });
-            if let Some(error) = capture_interrupted {
-                drop(sources);
-                release_retained(retained_bytes);
-                return Err(error);
-            }
-            match captured {
-                Ok(selection) => source.serving_selection = selection,
-                Err(error) => {
-                    drop(sources);
-                    release_retained(retained_bytes);
-                    return Err(E::from(error));
-                }
-            }
         }
         let aggregate_allowed_count = sources.iter().fold(0usize, |count, source| {
             count.saturating_add(source.allowed_count)
@@ -4321,7 +4157,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     routes.push(BoundedSnapshotVectorSource {
                         partition_key: key,
                         state,
-                        serving_selection: None,
                         candidate_ids: None,
                         point_load: false,
                         candidate_ids_cover_all_live: false,
@@ -4371,7 +4206,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         result.push(BoundedSnapshotVectorSource {
                             partition_key: key.clone(),
                             state,
-                            serving_selection: None,
                             candidate_ids: None,
                             point_load: false,
                             candidate_ids_cover_all_live: false,
@@ -4836,84 +4670,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 Ok(count)
             })
         })
-    }
-
-    /// Compatibility entrypoint that admits and releases its own candidate
-    /// grouping. Engine execution keeps one grouping across all vector stages.
-    #[allow(clippy::too_many_arguments)]
-    pub fn bounded_rank_candidate_k<E>(
-        &self,
-        index: &VectorIndexRef,
-        limit: usize,
-        candidates: Option<&[u64]>,
-        snapshot: SnapshotId,
-        mut before_source: impl FnMut() -> std::result::Result<(), E>,
-        mut acquire: impl FnMut(usize) -> std::result::Result<(), E>,
-        mut release: impl FnMut(usize),
-        owner: &mut crate::VectorCopyAdmission,
-    ) -> std::result::Result<usize, E>
-    where
-        E: From<Error>,
-    {
-        let groups = self.bounded_candidate_groups(
-            index,
-            candidates,
-            snapshot,
-            &mut before_source,
-            || Ok(()),
-            &mut acquire,
-            &mut release,
-            owner,
-        )?;
-        let result =
-            self.bounded_rank_candidate_k_grouped(index, limit, &groups, before_source, owner);
-        release(groups.into_retained_bytes());
-        result
-    }
-
-    /// Resolve the global rank pool from the same selected partition policies
-    /// as the graph walk, charging source selection to the active reader.
-    #[allow(clippy::too_many_arguments)]
-    pub fn bounded_rank_candidate_k_grouped<E>(
-        &self,
-        index: &VectorIndexRef,
-        limit: usize,
-        groups: &BoundedVectorCandidateGroups,
-        mut before_source: impl FnMut() -> std::result::Result<(), E>,
-        owner: &mut crate::VectorCopyAdmission,
-    ) -> std::result::Result<usize, E>
-    where
-        E: From<Error>,
-    {
-        before_source()?;
-        let layout = self
-            .store
-            .scoped_index_layout(index, owner)
-            .map_err(E::from)?;
-        let mut breadth = limit;
-        let mut allowed = 0usize;
-        for source in &groups.sources {
-            before_source()?;
-            let count = source.allowed_count;
-            if count == 0 {
-                continue;
-            }
-            allowed = allowed.saturating_add(count);
-            breadth = breadth.max(
-                layout
-                    .resolve_policy(
-                        source.state.bounded_directory_visible_entry_count(
-                            groups.snapshot,
-                            None,
-                            &mut before_source,
-                            owner,
-                        )?,
-                        limit,
-                    )
-                    .hnsw_ef_search,
-            );
-        }
-        Ok(breadth.min(allowed).max(limit))
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.

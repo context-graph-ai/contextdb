@@ -30,9 +30,8 @@ pub use store::{
     PartitionedVectorMove, PreparedLoadedVectorReplacement, PreparedPartitionedVectorBatch,
     PreparedVectorPolicyLayout, PreparedVectorPublication, PreparedVectorTablePublication,
     PublishedVectorPolicyLayout, VectorIndexInfo, VectorIndexLayout, VectorIndexLayoutInfo,
-    VectorMaintenanceFailure, VectorMaintenanceFailureDetails, VectorMaintenanceNeed,
-    VectorMaintenanceReport, VectorMembershipProvenance, VectorPartitionInfo, VectorPartitionRef,
-    VectorRouteQuarantineReason, VectorStore, VectorTeardownReceipt, VectorVersionIdentity,
+    VectorMaintenanceFailure, VectorMaintenanceFailureDetails, VectorMaintenanceReport, VectorMembershipProvenance, VectorPartitionInfo, VectorPartitionRef,
+    VectorStore, VectorTeardownReceipt, VectorVersionIdentity,
 };
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
@@ -48,7 +47,7 @@ pub use store::{
 #[doc(hidden)]
 pub use store::{VectorMaintenanceProgressPauseHandle, VectorPassiveActivityCounters};
 #[doc(hidden)]
-pub use store::{VectorMemoryOwnershipSnapshot, WriterVectorTail};
+pub use store::VectorMemoryOwnershipSnapshot;
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
