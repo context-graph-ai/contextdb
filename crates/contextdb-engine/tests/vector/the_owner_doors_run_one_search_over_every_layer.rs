@@ -9,10 +9,6 @@
 
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
-use contextdb_engine::vector_ivf_observations::{
-    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
-    with_native_ivf_seal_observer_for_test,
-};
 use std::collections::HashMap;
 use uuid::Uuid;
 

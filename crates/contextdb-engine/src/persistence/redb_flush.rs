@@ -10,7 +10,7 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         image: &CompleteVectorPartitionImage,
         affected_tables: &HashSet<String>,
-        accountant: crate::memory_accounting::AccountantHandle,
+        _accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<()> {
         self.prepare_vector_partition_image_replacement_in_write(write_txn, affected_tables)?;
         if !image.memberships.is_empty() {

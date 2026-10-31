@@ -270,7 +270,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         matches!(cancelled, Err(contextdb_core::Error::ReadCancelled)),
         "cancellation has its typed result: {cancelled:?}"
     );
-    let mut partition_observation_owner_4 = contextdb_engine::vector_read_memory::admission(
+    let _partition_observation_owner_4 = contextdb_engine::vector_read_memory::admission(
         db.declared_reader_memory()
             .expect("admit the partition observation reader"),
     );
@@ -330,7 +330,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
                     "resumed initial construction must exclude committed source identities; repeated {identity:?}"
                 );
             }
-            let mut partition_observation_owner_6 = contextdb_engine::vector_read_memory::admission(
+            let _partition_observation_owner_6 = contextdb_engine::vector_read_memory::admission(
                 db.declared_reader_memory()
                     .expect("admit the partition observation reader"),
             );
@@ -398,7 +398,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
             .expect("admit the partition observation reader"),
     );
 
-    let info = db
+    let _info = db
         .vector_store_for_test()
         .partition_info(
             &route.index,
@@ -453,7 +453,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
             .expect("admit the partition observation reader"),
     );
 
-    let replacement = db
+    let _replacement = db
         .vector_store_for_test()
         .partition_info(
             &route.index,
@@ -776,7 +776,7 @@ fn current_only_maintenance_crash_cuts() {
                 "all committed and resumed source identities are consumed exactly once"
             );
         }
-        let mut partition_observation_owner_11 = contextdb_engine::vector_read_memory::admission(
+        let _partition_observation_owner_11 = contextdb_engine::vector_read_memory::admission(
             db.declared_reader_memory()
                 .expect("admit the partition observation reader"),
         );

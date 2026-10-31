@@ -6,23 +6,18 @@
 //! Database, SQL, sync, PURGE, and maintenance; aggregate usage alone would hide
 //! a leak in one category behind a release in another.
 
-use contextdb_core::read_contract::{
-    DeadlineClock, DeadlineWait, OwnerReadCancellation, ReadFailureDetail, ReadFailureLimit,
-    ReadLimits,
-};
 use contextdb_core::{Error, TenantId, Value, VectorIndexRef, VectorPartitionKey};
-use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::plugin::CorePlugin;
 use contextdb_engine::{
-    Database, MaintenancePolicy, MaintenanceReport, VectorJournalTruncationPhaseForTest,
+    Database, MaintenancePolicy,
     VectorMemoryOwnershipReceiptForTest, VectorMemoryWorkspacePhaseForTest,
 };
 use contextdb_server::subjects::pull_subject;
 use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use serial_test::serial;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -2042,7 +2037,7 @@ fn retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_
         graph_publications >= 2,
         "the declared low thresholds must publish maintained graphs across successive scalar updates"
     );
-    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+    let _partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
         db.declared_reader_memory()
             .expect("admit the partition observation reader"),
     );

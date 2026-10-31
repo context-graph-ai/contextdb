@@ -866,7 +866,7 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
         Ok(MembershipSummary::default())
     };
     let mut global = read_summary(GLOBAL)?;
-    let existing_partition = summaries
+    let _existing_partition = summaries
         .get_bounded(partition_key.as_slice())
         .map_err(metadata_error)?
         .is_some();

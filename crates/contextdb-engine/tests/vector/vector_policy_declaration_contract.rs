@@ -3,7 +3,7 @@
 
 use contextdb_core::{Error, Value};
 use contextdb_engine::cli_render::render_table_meta;
-use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
+use contextdb_engine::{Database, QueryResult};
 use std::collections::HashMap;
 
 fn empty() -> HashMap<String, Value> {

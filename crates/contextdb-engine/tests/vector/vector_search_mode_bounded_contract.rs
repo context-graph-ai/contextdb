@@ -6,9 +6,9 @@
 //! decision: two selected 500-row partitions must not become two exact scans.
 
 use contextdb_core::read_contract::{
-    DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureLimit, ReadLimits,
+    DeadlineClock, DeadlineWait, ReadLimits,
 };
-use contextdb_core::{Error, RowId, Value, VectorIndexRef, VectorPartitionKey, VectorSearchMode};
+use contextdb_core::{Error, RowId, Value, VectorSearchMode};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::{
     Database, MaintenancePolicy, QueryResult, SemanticQuery, VectorSearchRoute,
@@ -18,10 +18,9 @@ use contextdb_engine::vector_ivf_observations::{
     NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
     with_native_ivf_seal_observer_for_test,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tempfile::TempDir;
 use uuid::Uuid;
 
 #[derive(Clone, Copy)]

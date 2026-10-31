@@ -717,7 +717,7 @@ impl Database {
         selections: &[AuthoritativePurgeSelection],
         queue_mutation_token: event_bus::AuthoritativePurgeQueueMutationToken,
         report_shape: crate::custody::erasure::PurgeReportShape,
-        frontier: Lsn,
+        _frontier: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AuthoritativePurgePreparedSet> {
@@ -2046,7 +2046,7 @@ impl Database {
                     )?;
                     let mut vector_workspace = self
                         .reserve_authoritative_erasure_workspace(selections, read_memory.clone())?;
-                    let erasure_accountant = crate::memory_accounting::AccountantHandle::clone(
+                    let _erasure_accountant = crate::memory_accounting::AccountantHandle::clone(
                         &self.finalization.accountant,
                     );
                     let queue_mutation_token = queue_drain

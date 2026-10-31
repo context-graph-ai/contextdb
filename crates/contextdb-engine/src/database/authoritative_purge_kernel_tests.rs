@@ -667,7 +667,7 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
         db.run_maintenance_cycle()
             .expect("deterministically materialize fixture index");
     }
-    let indexed_query = db
+    let _indexed_query = db
         .execute(
             "SELECT id FROM notes ORDER BY embedding <=> [1,0,0] LIMIT 10",
             &HashMap::new(),

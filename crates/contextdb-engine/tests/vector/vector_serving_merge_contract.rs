@@ -411,7 +411,7 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                 semantic.search_mode = Some(VectorSearchMode::Indexed);
                 db.__reset_last_query_vector_trace_for_test();
                 let embedded = db.semantic_search(semantic.clone()).unwrap();
-                let plain_trace = {
+                let _plain_trace = {
                     let seam_read_memory = db
                         .declared_reader_memory()
                         .expect("admit the fixture operation reader");

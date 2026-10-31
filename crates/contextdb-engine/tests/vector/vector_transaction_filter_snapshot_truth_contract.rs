@@ -26,7 +26,6 @@ use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey, VectorSea
 use contextdb_engine::database::VectorSearchTraceObservation;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
-use contextdb_vector::store::VectorPartitionRef;
 use contextdb_engine::vector_ivf_observations::{
     NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
     with_native_ivf_seal_observer_for_test,

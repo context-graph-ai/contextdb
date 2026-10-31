@@ -3,7 +3,7 @@
 //! the writer for the session lifetime. New readers see complete committed state."
 
 use contextdb_core::read_contract::ReadLimits;
-use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey, Wallclock};
+use contextdb_core::{Value, Wallclock};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::local_transport::ManualDeadlineClock;
 use contextdb_engine::writer_commit_test_seams::{CommitBoundary, observe as observe_commit};

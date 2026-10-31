@@ -6011,7 +6011,7 @@ impl MemoryAccountant {
                 .into(),
             });
         }
-        let mut allocation = self.try_allocate_with_provenance(bytes, provenance);
+        let allocation = self.try_allocate_with_provenance(bytes, provenance);
         #[cfg(any(test, feature = "test-seams"))]
         if allocation.is_ok() {
             note_budget_admission(
@@ -12452,7 +12452,7 @@ impl MemoryAccountant {
                     },
                 );
             }
-            let mut allocation = self.try_allocate_with_provenance_native(bytes, provenance);
+            let allocation = self.try_allocate_with_provenance_native(bytes, provenance);
             {
                 #[cfg(any(test, feature = "test-seams"))]
                 let (subsystem, operation) = (_observed_subsystem, _observed_operation);

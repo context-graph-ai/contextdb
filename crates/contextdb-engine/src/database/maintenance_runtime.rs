@@ -12,7 +12,7 @@ pub(super) fn vector_partition_routes(
     for index in vector.index_layout_infos(vector_copy_owner)? {
         let keys = vector.partition_keys(&index.index, vector_copy_owner)?;
         #[cfg(all(test, feature = "test-seams"))]
-        let output = (routes.len(), routes.as_ptr() as usize, routes.capacity());
+        let _output = (routes.len(), routes.as_ptr() as usize, routes.capacity());
         let append = || -> Result<()> {
             let output_capacity = routes
                 .len()
@@ -1515,7 +1515,7 @@ impl MaintenanceContext {
         // one -- is a boundary: it observes the process ceiling once, before
         // its first admission.
         crate::memory_accounting::observe_inherited_process_ceiling();
-        let mut maintenance_vector_copy_owner =
+        let _maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
         let pruning = self.run_pruning_within_cycle(read_memory.clone())?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;

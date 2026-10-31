@@ -143,7 +143,6 @@ use contextdb_tx::WriteSet;
 mod custody_pending;
 mod custody_records;
 pub(crate) mod custody_source;
-use contextdb_vector::VectorWorkspaceReservation;
 use contextdb_vector::store::{RawVectorDirectoryEntry, VectorPartitionRef};
 use redb::{
     Key as RedbKey, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,

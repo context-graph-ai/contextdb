@@ -1,7 +1,6 @@
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::{
-    Database, MaintenancePolicy, VectorJournalTruncationPhaseForTest,
-    VectorPartitionJournalFileForTest,
+    Database, MaintenancePolicy,
 };
 use contextdb_vector::{VectorPartitionRef, store::VectorMaintenancePreparationPhaseForTest};
 use std::{
@@ -11,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-fn seed(db: &Database, scopes: usize, m: usize) {
+fn seed(db: &Database, scopes: usize, _m: usize) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let max_partitions = scopes.max(3);
     db.execute(&format!("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS {max_partitions} SEARCH_MODE INDEXED )"), &HashMap::new()).unwrap();

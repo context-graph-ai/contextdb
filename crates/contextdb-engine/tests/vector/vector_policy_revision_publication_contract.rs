@@ -4,14 +4,10 @@
 
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::{
-    Database, MaintenancePolicy, QueryResult, VectorMaintenancePreparationPhaseForTest,
+    Database, MaintenancePolicy,
 };
 use contextdb_vector::VectorPartitionRef;
 use std::collections::HashMap;
-use std::sync::{Arc, mpsc};
-use std::thread;
-use std::time::Duration;
-use tempfile::TempDir;
 use uuid::Uuid;
 
 fn empty() -> HashMap<String, Value> {

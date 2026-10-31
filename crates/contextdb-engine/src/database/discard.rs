@@ -1003,7 +1003,7 @@ impl Database {
         let sync_graph_arrivals = self.sync_graph_arrivals.clone();
         let lineage_state_lock = self.lineage_state_lock.clone();
         let custody_cache = self.custody_cache.clone();
-        let accountant = self.accountant.vector_budget()?;
+        let _accountant = self.accountant.vector_budget()?;
         self.local_erasure_stages.lock().insert(
             lsn,
             Stage {
@@ -1747,7 +1747,7 @@ impl Database {
         let arrivals = self.sync_graph_arrivals.clone();
         let lineage = self.lineage_state_lock.clone();
         let custody = self.custody_cache.clone();
-        let vector_accountant =
+        let _vector_accountant =
             crate::memory_accounting::persistence_original_projection(original)?.vector_budget()?;
         preparation_slot = Some(frame.into_reservation());
         let memory = PreparedMemorySwap::from_original_preparation(

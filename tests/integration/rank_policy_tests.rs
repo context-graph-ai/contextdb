@@ -1,7 +1,6 @@
-use contextdb_core::{Error, Lsn, Value, VectorIndexRef, VectorQuantization, VectorSearchMode};
+use contextdb_core::{Error, Lsn, Value, VectorIndexRef, VectorSearchMode};
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use contextdb_engine::{Database, MaintenancePolicy, SearchResult, SemanticQuery};
-use contextdb_vector::VectorIndexLayout;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};

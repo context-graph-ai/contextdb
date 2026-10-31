@@ -3,7 +3,6 @@ use crate::database::{
     Database, InsertRowResult, MaintenancePolicy, OwnedQueryResult, QueryResultData, QueryTrace,
     UpdateReplacementContext, UpsertIntentDetails, VectorSearchDisclosure, rank_index_name,
 };
-pub(crate) use crate::memory_accounting::VectorLoadReservationTransfer;
 use crate::owned_cursor_page::OwnedCursorPage as CursorPage;
 use crate::rank_formula::RankFormula;
 use crate::sync_types::{DdlChange, natural_key_from_row_values};
@@ -4806,6 +4805,7 @@ fn vector_partition_inspection_row(
         Value::Text(
             native
                 .map(|native| native.recovery_action())
+                .filter(|action| *action != "none")
                 .unwrap_or(lifecycle.recovery_action)
                 .to_owned(),
         ),

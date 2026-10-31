@@ -1,5 +1,4 @@
 use super::*;
-use serial_test::serial;
 
 fn selection_partition() -> VectorPartitionRef {
     VectorPartitionRef::new(

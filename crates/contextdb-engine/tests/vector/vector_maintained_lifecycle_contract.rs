@@ -1,6 +1,5 @@
-use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
+use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::{Database, MaintenancePolicy};
-use contextdb_vector::VectorPartitionRef;
 use std::collections::HashMap;
 use tempfile::TempDir;
 use uuid::Uuid;

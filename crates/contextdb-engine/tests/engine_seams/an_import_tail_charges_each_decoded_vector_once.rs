@@ -7,13 +7,13 @@
 //! paid for, never accumulated across stored values that are already freed -- and
 //! an import whose new vectors exceed the writer budget must still complete,
 //! in committed cohorts, without the budget being raised.
-use contextdb_core::{Lsn, TxId, Value, Wallclock, read_contract::ReadLimits};
+use contextdb_core::{Value, Wallclock, read_contract::ReadLimits};
 use contextdb_engine::memory_accounting::{
     BudgetLedgerEntry, take_budget_ledger_for_test, watch_budget_ledger_for_test,
 };
 use contextdb_engine::vector_observations::{
-    ImportTailLoadBoundaryForTest, ImportTailLoadForTest, VectorJournalReplayWork,
-    observe_import_tail_loads_for_test, observe_journal_replay,
+    ImportTailLoadBoundaryForTest, ImportTailLoadForTest,
+    observe_import_tail_loads_for_test,
 };
 use contextdb_engine::vector_read_memory::{
     reader_parents_created_for_test, unowned_decodes_for_test,
@@ -21,10 +21,7 @@ use contextdb_engine::vector_read_memory::{
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
 };
 
 const DIMENSION: usize = 1536;

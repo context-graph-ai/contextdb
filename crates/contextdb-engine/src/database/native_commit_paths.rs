@@ -3501,7 +3501,7 @@ impl Database {
         encoded_source: &crate::persistence::OwnedEncodedEventSource<'_>,
         sink_names: &BTreeSet<String>,
         report_shape: crate::custody::erasure::PurgeReportShape,
-        frontier: Lsn,
+        _frontier: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OriginalPurgeNonEventPreparedSet> {

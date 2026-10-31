@@ -7,7 +7,6 @@
 
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
-use contextdb_vector::VectorPartitionRef;
 use std::collections::HashMap;
 use tempfile::TempDir;
 use uuid::Uuid;

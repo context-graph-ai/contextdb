@@ -2,8 +2,7 @@
 //! must still prove every partition's frontier before publishing an answer.
 
 use super::*;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
-use std::sync::atomic::AtomicUsize;
+use redb::TableDefinition;
 
 const CATALOGS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("vector_partition_generation_catalog");
