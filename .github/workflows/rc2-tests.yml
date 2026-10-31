@@ -58,7 +58,6 @@ jobs:
           - { shard: contextdb-cli, crate: contextdb-cli, features: "" }
           - { shard: contextdb-vector, crate: contextdb-vector, features: "" }
           - { shard: contextdb-vector-test-seams, crate: contextdb-vector, features: "test-seams" }
-          - { shard: contextdb-hnsw, crate: contextdb-hnsw, features: "" }
           - { shard: contextdb-graph, crate: contextdb-graph, features: "" }
           - { shard: contextdb-parser, crate: contextdb-parser, features: "" }
           - { shard: contextdb-planner, crate: contextdb-planner, features: "" }

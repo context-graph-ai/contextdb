@@ -5,7 +5,7 @@
     clippy::result_large_err,
     reason = "The public typed error retains inline refusal diagnostics."
 )]
-#[path = "hnsw_public_ports/pages.rs"]
+#[path = "clustered_public_ports/pages.rs"]
 mod ivf_pages;
 use contextdb_core::{Error, Result, VectorIndexRef};
 use contextdb_vector::ivf::storage::*;
@@ -1293,7 +1293,7 @@ fn a_selective_filter_does_not_cost_the_graph_its_answer() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-#[path = "hnsw_public_ports/custody.rs"]
+#[path = "clustered_public_ports/custody.rs"]
 mod physical_custody;
 
 #[test]

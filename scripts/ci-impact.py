@@ -27,7 +27,7 @@ PERFORMANCE_METADATA = frozenset({
 })
 MAINTAINER_METADATA = frozenset({
     ".gitignore", ".dockerignore",
-    "crates/contextdb-hnsw/MAINTENANCE.md", "crates/contextdb-redb/MAINTENANCE.md",
+    "crates/contextdb-redb/MAINTENANCE.md",
 })
 RUNTIME_OR_INTEGRATION = ("crates/", "tests/", "scripts/", ".github/workflows/")
 BUILD_INPUTS = frozenset({"Cargo.toml", "Cargo.lock", "rust-toolchain.toml",

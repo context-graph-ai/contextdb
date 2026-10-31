@@ -212,7 +212,7 @@ Rules apply in this order; the first match wins.
   `scripts/ci-performance.py` → performance only. These match before the
   `scripts/` and `.github/workflows/` rule below.
 - A short allowlist of maintainer files (`.gitignore`, `.dockerignore`, the
-  `MAINTENANCE.md` notes of the vendored hnsw and redb crates) → maintainer
+  `MAINTENANCE.md` note of the vendored redb crate) → maintainer
   metadata, which needs neither integration nor performance measurement.
 - Markdown under `docs/` or `skills/`, top-level Markdown, `LICENSE`, `NOTICE`
   → documentation only.

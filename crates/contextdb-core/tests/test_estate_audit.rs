@@ -511,13 +511,10 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
 // No tests or clock/sleep allowances are removed or changed.
 const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // Inventory includes three native custody source-selection proofs.
-    ("contextdb-core", 89, RSN_TEST_COUNT),
+    ("contextdb-core", 88, RSN_TEST_COUNT),
     ("contextdb-tx", 19, RSN_TEST_COUNT),
     ("contextdb-relational", 10, RSN_TEST_COUNT),
     ("contextdb-graph", 10, RSN_TEST_COUNT),
-    // Inventory: the fork proof that appended links keep their order, survive encoding and
-    // need a declared slack.
-    ("contextdb-hnsw", 22, RSN_TEST_COUNT),
     // Inventory additions (+5): the declared index cap funds each selected
     // partition and keeps opening and expansion inside the original cap
     // one proof each; the policy layout update admits, refunds and publishes

@@ -266,7 +266,7 @@ def schema_replay_fixture_contract(root):
 # Scheduling only: each tuple retains its own command and receipt identity.
 BUNDLES = {
     'bundle-transactions-relational': ['contextdb-tx', 'contextdb-tx-test-seams', 'contextdb-relational'],
-    'bundle-vector-index-graph': ['contextdb-vector', 'contextdb-vector-test-seams', 'contextdb-hnsw', 'contextdb-graph'],
+    'bundle-vector-index-graph': ['contextdb-vector', 'contextdb-vector-test-seams', 'contextdb-graph'],
     'bundle-parser-planner-redb': ['contextdb-parser', 'contextdb-planner', 'contextdb-redb'],
 }
 def pr_jobs(root):
