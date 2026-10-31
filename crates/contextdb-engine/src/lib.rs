@@ -171,7 +171,8 @@ pub use contextdb_vector::VectorPartitionRef;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use contextdb_vector::{
-    VectorJournalTruncationPhaseForTest, VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
+    VectorJournalTruncationPhaseForTest, VectorMaintenancePreparationPhaseForTest,
+    VectorMemoryWorkspacePhaseForTest,
 };
 pub use custody_types::{
     ApplicationTablePolicy, ApplicationTablePolicyExpectation, AuthenticatedTenantPolicyBinding,

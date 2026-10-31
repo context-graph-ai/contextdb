@@ -10,8 +10,8 @@ use contextdb_core::{Error, TenantId, Value, VectorIndexRef, VectorPartitionKey}
 use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::plugin::CorePlugin;
 use contextdb_engine::{
-    Database, MaintenancePolicy,
-    VectorMemoryOwnershipReceiptForTest, VectorMemoryWorkspacePhaseForTest,
+    Database, MaintenancePolicy, VectorMemoryOwnershipReceiptForTest,
+    VectorMemoryWorkspacePhaseForTest,
 };
 use contextdb_server::subjects::pull_subject;
 use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};

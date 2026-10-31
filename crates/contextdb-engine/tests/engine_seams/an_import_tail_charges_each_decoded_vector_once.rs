@@ -12,17 +12,13 @@ use contextdb_engine::memory_accounting::{
     BudgetLedgerEntry, take_budget_ledger_for_test, watch_budget_ledger_for_test,
 };
 use contextdb_engine::vector_observations::{
-    ImportTailLoadBoundaryForTest, ImportTailLoadForTest,
-    observe_import_tail_loads_for_test,
+    ImportTailLoadBoundaryForTest, ImportTailLoadForTest, observe_import_tail_loads_for_test,
 };
 use contextdb_engine::vector_read_memory::{
     reader_parents_created_for_test, unowned_decodes_for_test,
 };
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 const DIMENSION: usize = 1536;
 const BASE_ROWS: i64 = 16;

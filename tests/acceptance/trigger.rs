@@ -5646,7 +5646,11 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             since,
             &[("host_writes", 0), ("host_audits", audit_indexed_count)],
             Some((uuid(20), "ROLLBACK_EDGE")),
-            Some((audit_indexed_index, rollback_probe_rows, audit_indexed_baseline)),
+            Some((
+                audit_indexed_index,
+                rollback_probe_rows,
+                audit_indexed_baseline,
+            )),
         ) {
             failures.push(failure);
         }
@@ -5767,7 +5771,11 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             since,
             &[("host_writes", 0), ("host_audits", audit_indexed_count)],
             Some((uuid(25), "ERR_ROLLBACK_EDGE")),
-            Some((audit_indexed_index, rollback_probe_rows, audit_indexed_baseline)),
+            Some((
+                audit_indexed_index,
+                rollback_probe_rows,
+                audit_indexed_baseline,
+            )),
         ) {
             failures.push(failure);
         }

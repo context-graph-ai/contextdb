@@ -92,7 +92,10 @@ fn maintain_to_completion(db: &Database) -> usize {
 /// remains. Returns the maintenance cycles it ran.
 fn maintain_passage_vectors(db: &Database) -> usize {
     let mut cycles = 0;
-    if db.persist_import_vector_tails().expect("first coverage ask") {
+    if db
+        .persist_import_vector_tails()
+        .expect("first coverage ask")
+    {
         return cycles;
     }
     loop {
@@ -134,7 +137,8 @@ fn maintenance_to_completion_covers_every_committed_vector() {
 }
 
 #[test]
-fn new_committed_work_is_covered_again_after_one_more_maintenance_run_and_the_call_builds_nothing() {
+fn new_committed_work_is_covered_again_after_one_more_maintenance_run_and_the_call_builds_nothing()
+{
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open(&root.path().join("regrowth.db"));
     commit(&db, 0..IMPORTED);

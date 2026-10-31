@@ -197,15 +197,16 @@ use contextdb_vector::store::{
     VectorPartitionRef,
 };
 use contextdb_vector::{
-    MemVectorExecutor, PartitionedVectorEntry, PreparedVectorPublication,
-    VectorIndexLayout, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
-    VectorMaintenanceReport, VectorPartitionSearchRoute, VectorPartitionSearchTrace,
-    VectorSearchDebugTrace, VectorStore, VectorVersionIdentity, cosine_similarity,
+    MemVectorExecutor, PartitionedVectorEntry, PreparedVectorPublication, VectorIndexLayout,
+    VectorMaintenanceFailure, VectorMaintenanceFailureDetails, VectorMaintenanceReport,
+    VectorPartitionSearchRoute, VectorPartitionSearchTrace, VectorSearchDebugTrace, VectorStore,
+    VectorVersionIdentity, cosine_similarity,
 };
 #[cfg(any(test, feature = "test-seams"))]
 use contextdb_vector::{
-    VectorJournalTruncationFaultHandle, VectorJournalTruncationPhaseForTest, VectorLifecyclePauseHandle,
-    VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
+    VectorJournalTruncationFaultHandle, VectorJournalTruncationPhaseForTest,
+    VectorLifecyclePauseHandle, VectorMaintenancePreparationPhaseForTest,
+    VectorMemoryWorkspacePhaseForTest,
 };
 #[cfg(any(test, feature = "test-seams"))]
 use contextdb_vector::{VectorMaintenanceProgressPauseHandle, VectorPassiveActivityCounters};

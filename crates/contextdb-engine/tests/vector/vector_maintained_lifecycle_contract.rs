@@ -158,12 +158,11 @@ fn graph_serial(db: &Database, vector_index: &VectorIndexRef) -> Option<u64> {
     db.__debug_vector_index_generation_for_test(vector_index.clone())
 }
 
-fn used_indexed_route(
-    trace: &contextdb_engine::database::VectorSearchTraceObservation,
-) -> bool {
-    trace.partition_routes.iter().any(|route| {
-        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
-    })
+fn used_indexed_route(trace: &contextdb_engine::database::VectorSearchTraceObservation) -> bool {
+    trace
+        .partition_routes
+        .iter()
+        .any(|route| route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed)
 }
 
 fn inspected_query_state(db: &Database, vector_index: &VectorIndexRef) -> String {

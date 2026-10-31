@@ -1,12 +1,12 @@
 use super::maintained_search;
 use contextdb_core::Value;
 use contextdb_engine::database::VectorSearchTraceObservation;
-use contextdb_engine::{
-    Database, MaintenancePolicy, QueryResult, VectorSearchResidual, VectorSearchRoute,
-};
 use contextdb_engine::vector_ivf_observations::{
     NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
     with_native_ivf_seal_observer_for_test,
+};
+use contextdb_engine::{
+    Database, MaintenancePolicy, QueryResult, VectorSearchResidual, VectorSearchRoute,
 };
 use contextdb_vector::mem::{
     NativeVectorScoreObserver, with_native_vector_score_observer_for_test,
@@ -84,9 +84,10 @@ impl NativeVectorScoreObserver for Counter {
 }
 
 fn used_indexed_route(debug: &VectorSearchTraceObservation) -> bool {
-    debug.partition_routes.iter().any(|route| {
-        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
-    })
+    debug
+        .partition_routes
+        .iter()
+        .any(|route| route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed)
 }
 
 struct ScoredQuery {
@@ -510,14 +511,11 @@ fn assert_scoped_trace(result: &QueryResult, partitions: usize) -> bool {
         partitions,
         "the two IN lists name only the real Context/generation pairs; invalid cross-pairs are empty"
     );
-    disclosure
-        .partitions
-        .iter()
-        .any(|partition| {
-            partition
-                .probes
-                .is_none_or(|probes| ROWS_PER_PARTITION > probes as usize)
-        })
+    disclosure.partitions.iter().any(|partition| {
+        partition
+            .probes
+            .is_none_or(|probes| ROWS_PER_PARTITION > probes as usize)
+    })
 }
 
 #[cfg_attr(

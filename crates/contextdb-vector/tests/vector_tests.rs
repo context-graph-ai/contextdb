@@ -442,7 +442,10 @@ fn public_search_ties_order_by_row_id_over_a_large_population() {
         )
         .unwrap();
     assert_eq!(
-        indexed.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        indexed
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<Vec<_>>(),
         vec![
             RowId(10),
             RowId(20),

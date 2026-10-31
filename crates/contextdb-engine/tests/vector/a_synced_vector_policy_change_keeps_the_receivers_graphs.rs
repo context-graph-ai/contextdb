@@ -369,9 +369,7 @@ async fn a_synced_ivf_layout_change_serves_the_old_index_until_maintenance_repla
         "every partition serves its declared layout before the change: {before:?}"
     );
     synced
-        .alter(
-            "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF (LISTS = 24)",
-        )
+        .alter("ALTER TABLE policy_items ALTER COLUMN embedding SET IVF (LISTS = 24)")
         .await;
     let pending = policy_revisions(&synced.edge);
     assert_eq!(declared_lists(&synced.edge), Value::Int64(24));
@@ -387,9 +385,7 @@ async fn a_synced_ivf_layout_change_serves_the_old_index_until_maintenance_repla
     let replaced = policy_revisions(&synced.edge);
     assert_eq!(declared_lists(&synced.edge), Value::Int64(24));
     assert!(
-        replaced
-            .iter()
-            .all(|(desired, serving)| serving == desired),
+        replaced.iter().all(|(desired, serving)| serving == desired),
         "bounded maintenance serves the new layout: {replaced:?}"
     );
     assert_indexed_answers(&synced.edge, "the new index serves INDEXED");

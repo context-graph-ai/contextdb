@@ -18,6 +18,8 @@ mod bounded_tables_tests;
 mod change_log_table_index_consistency_tests;
 #[path = "integration/cli_spawn.rs"]
 mod cli_spawn;
+#[path = "integration/clustered_index_tests.rs"]
+mod clustered_index_tests;
 #[path = "integration/column_level_immutable_tests.rs"]
 mod column_level_immutable_tests;
 #[path = "integration/commit_failed_observer_tests.rs"]
@@ -52,8 +54,6 @@ mod golden_output;
 mod helpers;
 #[path = "integration/history_policy_declaration_tests.rs"]
 mod history_policy_declaration_tests;
-#[path = "integration/clustered_index_tests.rs"]
-mod clustered_index_tests;
 #[path = "integration/hybrid_query_on_true_join_tests.rs"]
 mod hybrid_query_on_true_join_tests;
 #[path = "integration/indexed_scan_filter_composite_routing_tests.rs"]

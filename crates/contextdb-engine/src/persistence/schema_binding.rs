@@ -551,7 +551,6 @@ impl RedbPersistence {
             column_incarnation,
         })
     }
-
 }
 
 impl WriterSnapshotHandle {

@@ -245,21 +245,19 @@ fn grouped_query_with_fault(
     };
     let execute = || {
         with_bounded_candidate_grouping_observer_for_test(grouping.clone(), || {
-            
-                with_native_ivf_seal_observer_for_test(graph.clone(), || {
-                    with_native_vector_score_observer_for_test(native.clone(), || {
-                        bounded::execute(
-                            db,
-                            &bounded::BoundedReadRequest::new(
-                                sql,
-                                params,
-                                work_limit,
-                                Arc::new(FrozenClock),
-                            ),
-                        )
-                    })
+            with_native_ivf_seal_observer_for_test(graph.clone(), || {
+                with_native_vector_score_observer_for_test(native.clone(), || {
+                    bounded::execute(
+                        db,
+                        &bounded::BoundedReadRequest::new(
+                            sql,
+                            params,
+                            work_limit,
+                            Arc::new(FrozenClock),
+                        ),
+                    )
                 })
-            
+            })
         })
     };
     let result = match fault {

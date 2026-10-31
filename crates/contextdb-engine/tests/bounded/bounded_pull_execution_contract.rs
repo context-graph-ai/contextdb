@@ -1097,7 +1097,8 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
     create_vector_table(&indexed, "indexed_vectors", false);
     let indexed_ids = seed_vectors(&indexed, "indexed_vectors", 1_003, None, 102);
     let indexed_sql = "SELECT id FROM indexed_vectors ORDER BY embedding <=> $query LIMIT 5";
-    indexed.run_maintenance_cycle()
+    indexed
+        .run_maintenance_cycle()
         .expect("build the maintained graph before measuring query work");
     let indexed_outcome = bounded_success(
         &indexed,
@@ -1979,8 +1980,11 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     // state, never erase this index-owned cache to make accounting balance.
     let indexed_sql = "SELECT id FROM matrix_indexed_vectors ORDER BY embedding <=> $query \
                     USE VECTOR INDEXED LIMIT 5";
-    db.execute(indexed_sql, &params([("query", Value::Vector(vector_for(0)))]))
-        .expect("prebuild persistent clustered-index state outside the bounded request");
+    db.execute(
+        indexed_sql,
+        &params([("query", Value::Vector(vector_for(0)))]),
+    )
+    .expect("prebuild persistent clustered-index state outside the bounded request");
     assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     let indexed_trace = db
         .__debug_last_query_vector_trace_for_test(

@@ -39,8 +39,9 @@ pub use store::{VectorCapWorkCountersForTest, VectorPartitionLimitAuditForTest};
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use store::{
-    VectorJournalTruncationFaultHandle, VectorJournalTruncationPhaseForTest, VectorLifecyclePauseHandle,
-    VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
+    VectorJournalTruncationFaultHandle, VectorJournalTruncationPhaseForTest,
+    VectorLifecyclePauseHandle, VectorMaintenancePreparationPhaseForTest,
+    VectorMemoryWorkspacePhaseForTest,
 };
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]

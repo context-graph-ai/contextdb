@@ -1397,10 +1397,7 @@ pub(super) fn prevalidate_vector_partition_metadata_routes(
         return Ok(());
     }
     let route_end = inspect_vector_partition_metadata_route(payload)?;
-    if matches!(
-        kind,
-        VectorPartitionRecordKind::BaseGeneration
-    ) {
+    if matches!(kind, VectorPartitionRecordKind::BaseGeneration) {
         type Graph<'a> = (&'a [u8], [u8; 32]);
         type BaseTail<'a> = (
             u64,

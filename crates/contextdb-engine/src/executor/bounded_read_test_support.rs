@@ -125,7 +125,6 @@ impl BoundedExecutionProbe for ProbeAdapter {
     fn cancellation_observed(&self, completed_work: u64) {
         self.0.cancellation_observed(completed_work);
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

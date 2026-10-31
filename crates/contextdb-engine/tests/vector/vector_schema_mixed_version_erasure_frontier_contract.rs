@@ -681,7 +681,11 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     let hub_row = index_row_for(&hub_indexes, "docs", "embedding");
     let edge_indexes = show_vector_indexes(&edge);
     let edge_row = index_row_for(&edge_indexes, "docs", "embedding");
-    for field in ["declared_lists", "declared_probes", "declared_auto_index_at"] {
+    for field in [
+        "declared_lists",
+        "declared_probes",
+        "declared_auto_index_at",
+    ] {
         assert_eq!(
             int_or_null_at(&edge_indexes, edge_row, field),
             int_or_null_at(&hub_indexes, hub_row, field),
@@ -792,7 +796,11 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         .expect("the edge pulls the DEFAULT clauses");
     let cleared_indexes = show_vector_indexes(&edge);
     let cleared_row = index_row_for(&cleared_indexes, "docs", "embedding");
-    for field in ["declared_lists", "declared_probes", "declared_auto_index_at"] {
+    for field in [
+        "declared_lists",
+        "declared_probes",
+        "declared_auto_index_at",
+    ] {
         assert_eq!(
             int_or_null_at(&cleared_indexes, cleared_row, field),
             None,

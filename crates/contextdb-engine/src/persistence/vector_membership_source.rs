@@ -3733,11 +3733,9 @@ impl RedbPersistence {
 }
 
 #[cfg(test)]
-impl DurableMembershipSource {
-}
+impl DurableMembershipSource {}
 #[cfg(test)]
-impl DurableReverseMembershipSource {
-}
+impl DurableReverseMembershipSource {}
 
 use crate::persistence::writer_source::WriterSnapshotHandle;
 

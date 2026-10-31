@@ -2619,7 +2619,10 @@ fn nv_deferred_index_build_per_index() {
     assert_eq!(r1.rows()[0][id_idx], Value::Uuid(text_id));
     assert_eq!(db.accountant().usage().used, used_before_text_build);
     assert!(
-        !db.__debug_vector_indexed_available_for_test(VectorIndexRef::new("evidence", "vector_text")),
+        !db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+            "evidence",
+            "vector_text"
+        )),
         "a query must not build vector_text"
     );
     assert!(
@@ -2638,7 +2641,10 @@ fn nv_deferred_index_build_per_index() {
         "caller-driven maintenance must materialize an accountant-tracked index build; used before={used_before_text_build}, after={used_after_text_build}"
     );
     assert!(
-        db.__debug_vector_indexed_available_for_test(VectorIndexRef::new("evidence", "vector_text")),
+        db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+            "evidence",
+            "vector_text"
+        )),
         "vector_text must have a published clustered index, not synthetic bytes or a global index"
     );
     assert!(
@@ -2665,8 +2671,7 @@ fn nv_deferred_index_build_per_index() {
         .explain("SELECT id FROM evidence ORDER BY vector_vision <=> $q LIMIT 1")
         .expect("vision explain");
     assert!(
-        vision_trace.contains("VectorSearch")
-            && vision_trace.contains("vector_vision"),
+        vision_trace.contains("VectorSearch") && vision_trace.contains("vector_vision"),
         "small vector_vision index must not inherit vector_text's index build state; got: {vision_trace}"
     );
 

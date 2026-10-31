@@ -52,15 +52,19 @@ async fn within_copy_class_replication<F: std::future::Future>(future: F) -> F::
 }
 
 fn used_indexed_route(result: &contextdb_engine::QueryResult) -> bool {
-    result.trace().vector_search.as_ref().is_some_and(|disclosure| {
-        matches!(
-            disclosure.route,
-            Some(
-                contextdb_engine::VectorSearchRoute::Indexed
-                    | contextdb_engine::VectorSearchRoute::FilteredIndexed
+    result
+        .trace()
+        .vector_search
+        .as_ref()
+        .is_some_and(|disclosure| {
+            matches!(
+                disclosure.route,
+                Some(
+                    contextdb_engine::VectorSearchRoute::Indexed
+                        | contextdb_engine::VectorSearchRoute::FilteredIndexed
+                )
             )
-        )
-    })
+        })
 }
 
 fn spec(path: &Path) -> String {
@@ -1143,10 +1147,8 @@ fn assert_restored_purge(
         "{place} vector proof must exercise the clustered index"
     );
     assert!(
-        restored.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
-            "notes",
-            "embedding"
-        )),
+        restored
+            .__debug_vector_indexed_available_for_test(VectorIndexRef::new("notes", "embedding")),
         "{place} must materialize the clustered index"
     );
     let index_len: usize = 1000;
@@ -1784,10 +1786,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             .unwrap_or_else(|error| panic!("materialize {place} ANN graph: {error}"));
         let index_len: usize = 1001;
         assert!(
-            db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
-                "notes",
-                "embedding"
-            )),
+            db.__debug_vector_indexed_available_for_test(VectorIndexRef::new("notes", "embedding")),
             "{place} must materialize the clustered index"
         );
         assert!(
@@ -2104,10 +2103,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             "{place} must rematerialize the production indexed path after purge"
         );
         assert!(
-            db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
-                "notes",
-                "embedding"
-            )),
+            db.__debug_vector_indexed_available_for_test(VectorIndexRef::new("notes", "embedding")),
             "{place} index serves the survivors after the purge"
         );
         let _ = index_len_before;

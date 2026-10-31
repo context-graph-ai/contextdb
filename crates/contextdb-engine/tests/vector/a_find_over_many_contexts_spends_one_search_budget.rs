@@ -27,13 +27,13 @@ use contextdb_engine::read_session::{
     ReadKernelCancellationEvent, ReadKernelResidualRejectionEvent, ReadKernelSourceEvent,
     ReadKernelTestObserver, ReadSessionOperation,
 };
-use contextdb_engine::{
-    Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
-    ReadSessionOptions,
-};
 use contextdb_engine::vector_ivf_observations::{
     NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
     with_native_ivf_seal_observer_for_test,
+};
+use contextdb_engine::{
+    Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
+    ReadSessionOptions,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -408,8 +408,6 @@ fn a_warm_find_over_many_contexts_reads_no_index_page_twice() {
         observed.backend_bytes,
     );
 }
-
-
 
 /// A search that runs out of its budget refuses; it never answers short.
 ///

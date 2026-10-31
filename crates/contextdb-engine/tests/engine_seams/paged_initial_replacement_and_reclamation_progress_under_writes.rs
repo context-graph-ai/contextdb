@@ -276,7 +276,10 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     );
 
     assert!(
-        !db.__debug_vector_partition_indexed_for_test(route.index.clone(), route.partition_key.clone()),
+        !db.__debug_vector_partition_indexed_for_test(
+            route.index.clone(),
+            route.partition_key.clone()
+        ),
         "cancellation publishes no partial graph"
     );
     assert_eq!(
@@ -335,7 +338,10 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
                     .expect("admit the partition observation reader"),
             );
 
-            initial_published = db.__debug_vector_partition_indexed_for_test(route.index.clone(), route.partition_key.clone());
+            initial_published = db.__debug_vector_partition_indexed_for_test(
+                route.index.clone(),
+                route.partition_key.clone(),
+            );
         }
         let mut partition_observation_owner_7 = contextdb_engine::vector_read_memory::admission(
             db.declared_reader_memory()
@@ -412,7 +418,10 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         reports.join("\n")
     );
     assert!(
-        db.__debug_vector_partition_indexed_for_test(route.index.clone(), route.partition_key.clone()),
+        db.__debug_vector_partition_indexed_for_test(
+            route.index.clone(),
+            route.partition_key.clone()
+        ),
         "finite cycles must finish a partition exceeding the frozen workspace; repeated whole-build refusal is not durable progress"
     );
     assert!(
@@ -431,7 +440,12 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         "peak resident builder bytes are one finite batch"
     );
     all_searches(&db, 0..ROWS + 8, "INDEXED");
-    let generation = db.__debug_vector_partition_generation_for_test(route.index.clone(), route.partition_key.clone()).unwrap_or(0);
+    let generation = db
+        .__debug_vector_partition_generation_for_test(
+            route.index.clone(),
+            route.partition_key.clone(),
+        )
+        .unwrap_or(0);
     // Retained memberships count toward the consolidation population under HISTORY ALL.
     // Declare a threshold that makes the following 128 tombstones due for replacement.
     exec(
@@ -463,7 +477,12 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         .unwrap()
         .unwrap();
     assert!(
-        db.__debug_vector_partition_generation_for_test(route.index.clone(), route.partition_key.clone()).unwrap_or(0) > generation,
+        db.__debug_vector_partition_generation_for_test(
+            route.index.clone(),
+            route.partition_key.clone()
+        )
+        .unwrap_or(0)
+            > generation,
         "replacement publishes a new complete generation"
     );
     assert_eq!(
@@ -687,7 +706,10 @@ fn current_only_maintenance_crash_cuts() {
             .unwrap()
             .unwrap();
         assert_eq!(
-            db.__debug_vector_partition_indexed_for_test(route.index.clone(), route.partition_key.clone()),
+            db.__debug_vector_partition_indexed_for_test(
+                route.index.clone(),
+                route.partition_key.clone()
+            ),
             cut == "GenerationAfterRedb",
             "complete graph/catalog publication is atomic across process death: {cut}; {restored:?}"
         );
@@ -730,7 +752,10 @@ fn current_only_maintenance_crash_cuts() {
             // separate CommittedScratch arm proves that restart boundary.
         }
         let mut previous = preceding.map_or(0, |progress| progress.vectors_done);
-        let mut published = db.__debug_vector_partition_indexed_for_test(route.index.clone(), route.partition_key.clone());
+        let mut published = db.__debug_vector_partition_indexed_for_test(
+            route.index.clone(),
+            route.partition_key.clone(),
+        );
         for _ in 0..64 {
             let (report, work) = observe(|| db.run_maintenance_cycle());
             report.unwrap();
@@ -766,7 +791,10 @@ fn current_only_maintenance_crash_cuts() {
                     );
                     previous = progress.vectors_done;
                 }
-                published = db.__debug_vector_partition_indexed_for_test(route.index.clone(), route.partition_key.clone());
+                published = db.__debug_vector_partition_indexed_for_test(
+                    route.index.clone(),
+                    route.partition_key.clone(),
+                );
             }
         }
         if cut == "CommittedScratch" {
@@ -781,9 +809,10 @@ fn current_only_maintenance_crash_cuts() {
                 .expect("admit the partition observation reader"),
         );
 
-        assert!(
-            db.__debug_vector_partition_indexed_for_test(route.index.clone(), route.partition_key.clone())
-        );
+        assert!(db.__debug_vector_partition_indexed_for_test(
+            route.index.clone(),
+            route.partition_key.clone()
+        ));
         let changed = cut == "Insertion";
         for scope in 0..=1 {
             let expected = (0..rows)

@@ -8636,15 +8636,19 @@ fn prv_seed_docs(db: &Database) -> PrvFixture {
 }
 
 fn prv_used_indexed_route(result: &contextdb_engine::QueryResult) -> bool {
-    result.trace().vector_search.as_ref().is_some_and(|disclosure| {
-        matches!(
-            disclosure.route,
-            Some(
-                contextdb_engine::VectorSearchRoute::Indexed
-                    | contextdb_engine::VectorSearchRoute::FilteredIndexed
+    result
+        .trace()
+        .vector_search
+        .as_ref()
+        .is_some_and(|disclosure| {
+            matches!(
+                disclosure.route,
+                Some(
+                    contextdb_engine::VectorSearchRoute::Indexed
+                        | contextdb_engine::VectorSearchRoute::FilteredIndexed
+                )
             )
-        )
-    })
+        })
 }
 
 fn prv_seed_indexed_docs(db: &Database, rows: usize) -> PrvFixture {
@@ -9614,7 +9618,8 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
         .expect("caller-driven maintenance builds the index before the read-only probe");
     let before_index_generation = db.__debug_vector_index_generation_for_test(index.clone());
     assert!(
-        before_index_generation.is_some() && db.__debug_vector_indexed_available_for_test(index.clone()),
+        before_index_generation.is_some()
+            && db.__debug_vector_indexed_available_for_test(index.clone()),
         "read-only probe must exercise an already-built clustered index"
     );
     let sink_deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9743,7 +9748,13 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_indexed_route_when_active(
     // cheaper than an index walk, so the large queries ask for the maintained route with
     // `USE VECTOR INDEXED`, placed after the vector ordering and before `USE RANK`.
     for _ in 0..2_100 {
-        if db.run_maintenance_cycle().unwrap().vector.remaining_partitions == 0 {
+        if db
+            .run_maintenance_cycle()
+            .unwrap()
+            .vector
+            .remaining_partitions
+            == 0
+        {
             break;
         }
     }
@@ -10358,8 +10369,10 @@ fn prv_27_row_vector_explain_does_not_materialize_the_index() {
         explain.contains("VectorSearch"),
         "EXPLAIN must still describe the vector operator without building the index: {explain}"
     );
-    assert!(!db.__debug_vector_indexed_available_for_test(index),
-        "EXPLAIN must be read-only and must not lazily materialize the clustered index");
+    assert!(
+        !db.__debug_vector_indexed_available_for_test(index),
+        "EXPLAIN must be read-only and must not lazily materialize the clustered index"
+    );
 }
 
 #[test]
@@ -10384,8 +10397,10 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
             && covering_explain.contains("fallback=filtered_route_exact"),
         "filtered EXPLAIN must describe the read-only exact fallback without inventing an index: {covering_explain}"
     );
-    assert!(!covering_db.__debug_vector_indexed_available_for_test(index.clone()),
-        "covering EXPLAIN must derive strategy without building the index");
+    assert!(
+        !covering_db.__debug_vector_indexed_available_for_test(index.clone()),
+        "covering EXPLAIN must derive strategy without building the index"
+    );
 
     let covering_result = covering_db
         .execute(
@@ -10427,8 +10442,10 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
             && fallback_explain.contains("strategy=BruteForce"),
         "filtered EXPLAIN must match runtime fallback when the effective search width cannot cover the index: {fallback_explain}"
     );
-    assert!(!fallback_db.__debug_vector_indexed_available_for_test(fallback_index.clone()),
-        "fallback EXPLAIN must not build the index");
+    assert!(
+        !fallback_db.__debug_vector_indexed_available_for_test(fallback_index.clone()),
+        "fallback EXPLAIN must not build the index"
+    );
 
     let fallback_result = fallback_db
         .execute(

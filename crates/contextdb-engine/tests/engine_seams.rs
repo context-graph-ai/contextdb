@@ -229,7 +229,6 @@ mod consumer_declared_count_and_pending_seek_contract;
 #[path = "grouped_session_top_n_contract.rs"]
 mod grouped_session_top_n_contract;
 
-
 #[path = "engine_seams/a_vector_search_decodes_under_its_request_owner.rs"]
 mod a_vector_search_decodes_under_its_request_owner;
 #[path = "engine_seams/import_tail_survives_restart_without_history_reconstruction.rs"]
@@ -252,7 +251,6 @@ mod reads_are_answered_while_a_maintenance_commit_holds_the_commit_gate;
 
 #[path = "engine_seams/a_reads_erasure_check_does_fixed_work_however_much_history_there_is.rs"]
 mod a_reads_erasure_check_does_fixed_work_however_much_history_there_is;
-
 
 #[path = "engine_seams/allocator_foreign_events.rs"]
 mod allocator_foreign_events;

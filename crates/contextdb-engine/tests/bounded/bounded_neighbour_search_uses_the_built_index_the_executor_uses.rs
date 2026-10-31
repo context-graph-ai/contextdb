@@ -147,8 +147,7 @@ fn ranked_documents() -> Database {
 fn publish_document_index(database: &Database) {
     let index = VectorIndexRef::new("docs", "embedding");
     for _ in 0..MAX_BUILD_MAINTENANCE_CYCLES {
-        if database.__debug_vector_indexed_available_for_test(index.clone())
-        {
+        if database.__debug_vector_indexed_available_for_test(index.clone()) {
             break;
         }
         database

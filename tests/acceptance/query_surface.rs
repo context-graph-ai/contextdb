@@ -1222,9 +1222,12 @@ fn f114_explain_shows_vector_search_operator_for_vector_ann_query() {
         db.run_maintenance_cycle()
             .expect("one finite caller-driven maintenance cycle succeeds");
     }
-    assert!(db.__debug_vector_indexed_available_for_test(
-        contextdb_core::VectorIndexRef::new("embeddings", "embedding",)
-    ));
+    assert!(
+        db.__debug_vector_indexed_available_for_test(contextdb_core::VectorIndexRef::new(
+            "embeddings",
+            "embedding",
+        ))
+    );
     let explain = db
         .explain("SELECT * FROM embeddings ORDER BY embedding <=> $query LIMIT 10")
         .expect("vector explain");

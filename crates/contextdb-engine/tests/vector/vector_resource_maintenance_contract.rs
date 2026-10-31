@@ -1,7 +1,5 @@
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
-use contextdb_engine::{
-    Database, MaintenancePolicy,
-};
+use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_vector::{VectorPartitionRef, store::VectorMaintenancePreparationPhaseForTest};
 use std::{
     collections::HashMap,

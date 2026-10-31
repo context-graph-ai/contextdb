@@ -225,8 +225,7 @@ fn vector_store(rows: u128) -> Database {
         let index = VectorIndexRef::new("docs", "embedding");
         let _expected_points = usize::try_from(rows).expect("fixture count fits usize");
         for _ in 0..256 {
-            if database.__debug_vector_indexed_available_for_test(index.clone())
-            {
+            if database.__debug_vector_indexed_available_for_test(index.clone()) {
                 break;
             }
             database

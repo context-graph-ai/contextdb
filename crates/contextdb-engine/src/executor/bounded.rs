@@ -11015,15 +11015,16 @@ impl VectorState {
                     // such an answer is dropped and the read repeats over the
                     // whole pool below, as the transaction route does.
                     match searched {
-                        super::BoundedVectorSearchOutcome::Complete((rows, retained_bytes), trace)
-                            if self.sort_key.is_some()
-                                && self.search_mode == contextdb_core::VectorSearchMode::Auto
-                                && !self.force_exact_for_relational_fallback
-                                && rows.len() >= self.candidate_k
-                                && !trace.partition_routes().iter().any(|route| {
-                                    route.route
-                                        == contextdb_vector::VectorPartitionSearchRoute::Indexed
-                                }) =>
+                        super::BoundedVectorSearchOutcome::Complete(
+                            (rows, retained_bytes),
+                            trace,
+                        ) if self.sort_key.is_some()
+                            && self.search_mode == contextdb_core::VectorSearchMode::Auto
+                            && !self.force_exact_for_relational_fallback
+                            && rows.len() >= self.candidate_k
+                            && !trace.partition_routes().iter().any(|route| {
+                                route.route == contextdb_vector::VectorPartitionSearchRoute::Indexed
+                            }) =>
                         {
                             let trace_bytes = trace.retained_bytes();
                             drop(trace);
@@ -11078,7 +11079,8 @@ impl VectorState {
                             // indexed route; exact routes are counted at their own touches.
                             #[cfg(any(test, feature = "test-seams"))]
                             if let Some(scored) = trace.budget_receipt() {
-                                self.receipt.add_native_scored(scored.rescore_evaluations as u64);
+                                self.receipt
+                                    .add_native_scored(scored.rescore_evaluations as u64);
                             }
                             let trace = context.own_vector_trace(trace)?;
                             db.publish_vector_search_trace(trace);

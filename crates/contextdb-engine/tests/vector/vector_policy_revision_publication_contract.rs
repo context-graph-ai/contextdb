@@ -3,9 +3,7 @@
 //! queries and newer declarations proceed; its timeout only guards deadlock.
 
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
-use contextdb_engine::{
-    Database, MaintenancePolicy,
-};
+use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_vector::VectorPartitionRef;
 use std::collections::HashMap;
 use uuid::Uuid;

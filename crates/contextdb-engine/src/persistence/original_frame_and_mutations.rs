@@ -4963,8 +4963,7 @@ impl RedbPersistence {
     }
 }
 
-impl RetainedReadSource {
-}
+impl RetainedReadSource {}
 
 #[cfg(all(test, feature = "test-seams"))]
 impl RedbPersistence {
@@ -4997,5 +4996,4 @@ impl RedbPersistence {
 }
 
 #[cfg(test)]
-impl RedbPersistence {
-}
+impl RedbPersistence {}

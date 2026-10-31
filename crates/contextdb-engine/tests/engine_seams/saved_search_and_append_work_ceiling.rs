@@ -162,7 +162,8 @@ fn first_saved_search_stays_inside_its_primitive_ceiling() {
         "v".into(),
         Value::Vector(crate::resident_history_support::vector(0, DIM)),
     )]);
-    let ((result, _query), work) = observe_work(&db, || observe_writer(|| db.execute(sql, &params)));
+    let ((result, _query), work) =
+        observe_work(&db, || observe_writer(|| db.execute(sql, &params)));
     let mut ids = result
         .unwrap()
         .rows()

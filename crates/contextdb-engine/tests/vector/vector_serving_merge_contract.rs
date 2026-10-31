@@ -72,12 +72,11 @@ fn ids(result: &QueryResult) -> Vec<i64> {
         .collect()
 }
 
-fn used_indexed_route(
-    trace: &contextdb_engine::database::VectorSearchTraceObservation,
-) -> bool {
-    trace.partition_routes.iter().any(|route| {
-        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
-    })
+fn used_indexed_route(trace: &contextdb_engine::database::VectorSearchTraceObservation) -> bool {
+    trace
+        .partition_routes
+        .iter()
+        .any(|route| route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed)
 }
 
 #[test]
@@ -835,9 +834,9 @@ fn embedded_graph_scratch_obeys_memory_admission_and_returns_its_charge() {
 #[test]
 fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_passes() {
     use contextdb_engine::vector_ivf_observations::{
-    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
-    with_native_ivf_seal_observer_for_test,
-};
+        NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+        with_native_ivf_seal_observer_for_test,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]

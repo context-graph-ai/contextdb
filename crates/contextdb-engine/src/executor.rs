@@ -4226,7 +4226,6 @@ mod vector_inspection_aggregation_tests {
         assert_eq!(vector_index_query_state(&[]), "empty");
         assert_eq!(fanout_broad_route_state(&[]), "ready");
     }
-
 }
 
 /// What the clustered index says about one partition, from its live rows and

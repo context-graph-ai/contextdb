@@ -180,10 +180,11 @@ fn check_shared_walk(fixture: Fixture) {
                 .expect("exhaustive search of the stored vectors");
             let truth = ids(&exact);
             assert_eq!(truth.len(), LIMIT);
-            let found = ids(
-                &db.execute(&statement("INDEXED"), &params)
-                    .unwrap_or_else(|error| panic!("unexpected indexed error at probe {probe}: {error}")),
-            );
+            let found = ids(&db
+                .execute(&statement("INDEXED"), &params)
+                .unwrap_or_else(|error| {
+                    panic!("unexpected indexed error at probe {probe}: {error}")
+                }));
             assert_eq!(found.len(), LIMIT);
             let matched = found.intersection(&truth).count();
             let threshold = 0.95;

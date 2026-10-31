@@ -542,9 +542,7 @@ impl<'a> PageSource<'a> {
                 .checked_add(self.native().table_entries(name.as_str()?)?)
                 .ok_or_else(corrupt)?;
         }
-        entries
-            .checked_mul(PAGE_BYTES as u64)
-            .ok_or_else(corrupt)
+        entries.checked_mul(PAGE_BYTES as u64).ok_or_else(corrupt)
     }
     fn family_slot(&self, generation: u64) -> Option<usize> {
         self.record

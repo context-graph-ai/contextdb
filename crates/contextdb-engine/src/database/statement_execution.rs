@@ -2319,9 +2319,7 @@ impl Database {
             vector_copy_owner,
             read_memory.clone(),
         )?;
-        vector_copy_owner.reserve(
-            facts.policy.auto_index_at_source.len(),
-        )?;
+        vector_copy_owner.reserve(facts.policy.auto_index_at_source.len())?;
         Ok((
             VectorSearchDisclosure {
                 route_evidence: if actual_trace.is_some() {
@@ -2854,9 +2852,7 @@ impl Database {
         } else {
             None
         };
-        vector_copy_owner.reserve(
-            policy.auto_index_at_source.len(),
-        )?;
+        vector_copy_owner.reserve(policy.auto_index_at_source.len())?;
         Ok(VectorSearchDisclosure {
             route_evidence: VectorSearchRouteEvidence::Executed,
             requested_mode,

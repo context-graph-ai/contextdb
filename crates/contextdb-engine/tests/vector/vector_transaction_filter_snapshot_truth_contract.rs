@@ -25,11 +25,11 @@ use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey, VectorSearchMode};
 use contextdb_engine::database::VectorSearchTraceObservation;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
-use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
 use contextdb_engine::vector_ivf_observations::{
     NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
     with_native_ivf_seal_observer_for_test,
 };
+use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -343,9 +343,10 @@ fn drive_until_indexed(db: &Database, scope: Uuid) {
 /// Start one trace receipt for exactly the call that follows. The test-only
 /// reset is required because a process-global last trace could otherwise let a
 fn used_indexed_route(trace: &VectorSearchTraceObservation) -> bool {
-    trace.partition_routes.iter().any(|route| {
-        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
-    })
+    trace
+        .partition_routes
+        .iter()
+        .any(|route| route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed)
 }
 
 /// Rust or snapshot call inherit an earlier SQL route.
@@ -879,8 +880,8 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     narrow_request.probe = Some(Arc::clone(&narrow_counter) as Arc<dyn bounded::ExecutionProbe>);
     db.__reset_vector_full_index_entries_touched_for_test();
     reset_index_trace(&db);
-    let bounded_narrow =
-        execute_observed(&db, &narrow_request, &narrow_counter).expect("bounded narrow AUTO search");
+    let bounded_narrow = execute_observed(&db, &narrow_request, &narrow_counter)
+        .expect("bounded narrow AUTO search");
     assert_eq!(ids(&bounded_narrow.result), vec![wanted]);
     assert_exact_trace(&db, "bounded narrow AUTO route");
     assert_eq!(
@@ -1209,8 +1210,9 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     refused_auto_request.probe =
         Some(Arc::clone(&refused_auto_counter) as Arc<dyn bounded::ExecutionProbe>);
     reset_refusal_source_touches(&unindexed);
-    let bounded_auto_error = execute_observed(&unindexed, &refused_auto_request, &refused_auto_counter)
-        .expect_err("bounded AUTO refuses before over-budget broad exact work starts");
+    let bounded_auto_error =
+        execute_observed(&unindexed, &refused_auto_request, &refused_auto_counter)
+            .expect_err("bounded AUTO refuses before over-budget broad exact work starts");
     assert_no_refusal_source_touches(&unindexed, "bounded AUTO broad budget refusal");
     assert!(
         matches!(

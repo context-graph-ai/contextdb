@@ -5,18 +5,16 @@
 //! case. That case is the smallest F32 fixture that can prove a whole-query
 //! decision: two selected 500-row partitions must not become two exact scans.
 
-use contextdb_core::read_contract::{
-    DeadlineClock, DeadlineWait, ReadLimits,
-};
+use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{Error, RowId, Value, VectorSearchMode};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
-use contextdb_engine::{
-    Database, MaintenancePolicy, QueryResult, SemanticQuery, VectorSearchRoute,
-    VectorSearchRouteEvidence,
-};
 use contextdb_engine::vector_ivf_observations::{
     NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
     with_native_ivf_seal_observer_for_test,
+};
+use contextdb_engine::{
+    Database, MaintenancePolicy, QueryResult, SemanticQuery, VectorSearchRoute,
+    VectorSearchRouteEvidence,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,12 +144,16 @@ fn take_trace(db: &Database) -> contextdb_engine::database::VectorSearchTraceObs
 }
 
 fn result_used_indexed_route(result: &QueryResult) -> bool {
-    result.trace().vector_search.as_ref().is_some_and(|disclosure| {
-        matches!(
-            disclosure.route,
-            Some(VectorSearchRoute::Indexed | VectorSearchRoute::FilteredIndexed)
-        )
-    })
+    result
+        .trace()
+        .vector_search
+        .as_ref()
+        .is_some_and(|disclosure| {
+            matches!(
+                disclosure.route,
+                Some(VectorSearchRoute::Indexed | VectorSearchRoute::FilteredIndexed)
+            )
+        })
 }
 
 fn disclosed_partition_routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<&str>)> {
@@ -688,10 +690,9 @@ fn filtered_many_partition_search_reuses_partition_local_candidates() {
         .expect("ordinary filtered INDEXED search succeeds");
     let probe = Arc::new(IndexedWorkCounter::default());
     let request = bounded_request(sql, bound);
-    let bounded = with_native_ivf_seal_observer_for_test(probe.clone(), || {
-        bounded::execute(&db, &request)
-    })
-    .expect("bounded filtered INDEXED search succeeds");
+    let bounded =
+        with_native_ivf_seal_observer_for_test(probe.clone(), || bounded::execute(&db, &request))
+            .expect("bounded filtered INDEXED search succeeds");
     assert_eq!(bounded.result.rows(), ordinary.rows());
     let candidate_touches = probe.0.load(Ordering::SeqCst);
     println!(

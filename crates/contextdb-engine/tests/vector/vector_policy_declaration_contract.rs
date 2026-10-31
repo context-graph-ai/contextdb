@@ -321,8 +321,14 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
         .expect("seed the row that every refusal must preserve");
     let before = schema_identity(&db, "add_policy");
     let invalid: Vec<(&str, &str)> = vec![
-        ("AUTO_INDEX_AT 0", "AUTO_INDEX_AT must be a positive integer"),
-        ("AUTO_INDEX_AT -1", "AUTO_INDEX_AT must be a positive integer"),
+        (
+            "AUTO_INDEX_AT 0",
+            "AUTO_INDEX_AT must be a positive integer",
+        ),
+        (
+            "AUTO_INDEX_AT -1",
+            "AUTO_INDEX_AT must be a positive integer",
+        ),
         (
             "AUTO_INDEX_AT 4294967296",
             "AUTO_INDEX_AT is outside the persisted numeric range",

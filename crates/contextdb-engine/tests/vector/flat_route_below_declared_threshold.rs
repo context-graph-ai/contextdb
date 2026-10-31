@@ -142,7 +142,10 @@ fn indexed_over_small_and_large_partitions_answers_what_exact_answers() {
         fixture(&db, &rows);
         let indexed = search(&db, "INDEXED");
         let exact = search(&db, "EXACT");
-        assert!(indexed.index_scores > 0, "INDEXED searches the index ({rows:?})");
+        assert!(
+            indexed.index_scores > 0,
+            "INDEXED searches the index ({rows:?})"
+        );
         assert_eq!(
             indexed.result.rows(),
             exact.result.rows(),

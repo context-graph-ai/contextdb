@@ -162,11 +162,7 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path) {
 
 /// Flip actual bytes of the partition's serving codebook, then close.
 #[cfg(unix)]
-fn damage_codebook(
-    path: &std::path::Path,
-    index: &VectorIndexRef,
-    tuple: &VectorPartitionKey,
-) {
+fn damage_codebook(path: &std::path::Path, index: &VectorIndexRef, tuple: &VectorPartitionKey) {
     use contextdb_vector::ivf::storage::PageKind;
     let db = Database::open(path).expect("open the store to damage one index");
     let manifest = db

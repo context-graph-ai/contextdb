@@ -2851,8 +2851,7 @@ const RECEIVED_VECTOR_OCCUPIED: TableDefinition<&[u8], u64> =
 const RECEIVED_VECTOR_COUNTS: TableDefinition<&[u8], u64> =
     TableDefinition::new("__received_vector_partition_counts");
 
-impl RedbPersistence {
-}
+impl RedbPersistence {}
 
 impl RedbPersistence {
     #[expect(

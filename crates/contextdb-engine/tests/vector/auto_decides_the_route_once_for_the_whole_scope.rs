@@ -254,9 +254,7 @@ fn auto_takes_the_aggregate_route_however_the_rows_are_split() {
         for partitions in SPLITS {
             let cell = format!("{corpus} rows over {partitions} Contexts");
             let observed = observe(corpus, partitions);
-            println!(
-                "auto_split_decision {cell} expected={expected:?} observed={observed:?}"
-            );
+            println!("auto_split_decision {cell} expected={expected:?} observed={observed:?}");
             decisions.push((partitions, observed.routes.clone()));
             if observed.rows != LIMIT {
                 failures.push(format!("{cell}: {} rows, not a full page", observed.rows));
