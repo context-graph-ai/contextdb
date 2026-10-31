@@ -43,8 +43,7 @@ cargo build --release -p contextdb-cli
 contextdb ./my.db --write
 ```
 
-`--write` creates the store if it is missing and authorizes mutation. `:memory:` is always
-writable with no flag; a file-backed store is different — see
+`--write` creates the store if it is missing and authorizes mutation — see
 [`docs/cli.md`](cli.md#cli-client-contextdb). Example tables such as `decisions` are yours to
 define; see the [README](https://github.com/context-graph-ai/contextdb/blob/dev/README.md).
 
@@ -176,11 +175,6 @@ and let the two copies drift, three sentences and where each one is spelled out 
   a JSON document on stderr, and the process exit code is one of the four in
   [Exit Codes](cli.md#exit-codes).
   <!-- enforced by: read_cli_journeys_session_shape::a_piped_session_is_a_full_session_including_the_cursor -->
-
-### 3. Scratch space
-
-`contextdb :memory:` is a disposable, always-writable playground — no file, no `--write`
-needed, gone on exit. <!-- enforced by: read_cli_journeys_invocation::memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op -->
 
 ## Indexes and Scale
 

@@ -15,8 +15,7 @@ On machine A, run a sync hub — a `contextdb-server` process the edges dial int
 contextdb-server --db-path hub.db --tenant-id demo
 ```
 
-A hub requires a durable store: `--db-path` names the file it keeps its state in, and an in-memory
-store is not a supported hub (it serves only as a test fixture).
+A hub requires a durable store: `--db-path` names the file it keeps its state in.
 
 On startup it prints an enrollment ticket and the exact command an edge runs to connect (substitute your own database path for `<client-db-path>`):
 

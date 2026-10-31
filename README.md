@@ -44,7 +44,6 @@ use contextdb_engine::Database;
 use std::collections::HashMap;
 
 let db = Database::open(std::path::Path::new("./my.db"))?;
-// or: Database::open_memory() for ephemeral
 
 let params = HashMap::new();
 
@@ -116,7 +115,7 @@ use contextdb_core::Value;
 use contextdb_engine::Database;
 use std::collections::HashMap;
 
-let db = Database::open_memory();
+let db = Database::open(std::path::Path::new("./my.db"))?;
 db.execute("CREATE TABLE observation (id UUID PRIMARY KEY)", &HashMap::new())?;
 db.execute(
     "CREATE TABLE derived (id UUID PRIMARY KEY, observation_id UUID)",
@@ -221,7 +220,7 @@ create the store again.
 
 ```bash
 cargo build --release -p contextdb-cli
-./target/release/contextdb :memory:
+./target/release/contextdb ./my.db --write
 ```
 
 ```

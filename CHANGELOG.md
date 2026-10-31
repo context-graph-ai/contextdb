@@ -4,6 +4,9 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Behavior change.** contextdb is durable and has no in-memory database. The CLI
+  refuses `:memory:`, the server requires `--db-path`, and `Database::open_memory`,
+  its variants and `Database::is_memory_backed` are no longer public.
 - **Behavior change.** An atomic received sync unit can retain several ordered
   replay positions and commits at one final acceptance position. Apply results
   and acknowledgements identify that final position; one apply can advance the

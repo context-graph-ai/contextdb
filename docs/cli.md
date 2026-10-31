@@ -13,7 +13,7 @@ Two binaries: `contextdb` (interactive client) and `contextdb-server` (sync coor
 contextdb <PATH> [OPTIONS]
 ```
 
-`<PATH>` is the database file. Use `:memory:` for an in-memory (ephemeral) database.
+`<PATH>` is the database file.
 
 **Reading is the default.** `contextdb <PATH>` opens an existing store for bounded, read-only
 inspection: it never creates the store, never mutates it, and leaves every byte in the store
@@ -45,7 +45,7 @@ The same command works whether the store is idle or already owned by a live proc
 | `--tenant-id <ID>` | *(none)* | Writer-only: sync namespace. Omit for local-only mode. |
 | `--sync-debounce-ms <MS>` | 500 | Writer-only: auto-sync batching window. |
 | `--memory-limit <SIZE>` | *(unlimited)* | Whole-session memory ceiling, read or write mode. Suffixes: `K`, `M`, `G`. |
-| `--disk-limit <SIZE>` | *(unlimited)* | File-backed session disk ceiling. Never authorizes writes; invalid for `:memory:`. |
+| `--disk-limit <SIZE>` | *(unlimited)* | Session disk ceiling. Never authorizes writes. |
 | `--maintenance <MODE>` | `engine-owned` | Maintenance schedule for this process: `engine-owned` starts the database worker when work is declared; `caller-driven` starts no worker and leaves scheduling to `.maintenance run` or the embedding host. Writer-only for file-backed stores. |
 | `--maintenance-poll-ms <MS>` | persisted value, else `60000` | Positive engine-owned poll interval in milliseconds. A supplied value is persisted for a file-backed database; omitting the flag uses that persisted value on later opens rather than overwriting it. Writer-only for file-backed stores. |
 
@@ -313,14 +313,7 @@ The simplest way to start — no server, no network:
 ```bash
 contextdb ./my.db          # read-only inspection of an existing store
 contextdb ./my.db --write  # create/mutate, persisted to file
-contextdb :memory:         # ephemeral writable scratch database, lost on exit
 ```
-
-`:memory:` is always writable: mutation, transaction control, and sync configuration work
-without `--write`, and an explicit `--write` is an accepted no-op. It creates no file, no
-companion, no owner channel, emits no route notice, and reports owner state `not_applicable`.
-Every `--read-*` and `--owner-read-*` flag, and `--no-owner-reads`, is invalid with `:memory:`
-(exit `2`). <!-- enforced by: read_cli_journeys_invocation::memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op, read_cli_journeys_invocation::read_and_owner_read_flags_are_invalid_with_a_memory_store, read_cli_journeys_invocation::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable -->
 
 ### Sync Mode
 
@@ -329,9 +322,8 @@ edge enrollment, exactly as before. A read session's `.sync status` prints exact
 this session — this reports the CLI session only, not the store; a live owner's sync state
 belongs to that owner process.` <!-- enforced by: read_cli_journeys_session_shape::read_mode_sync_status_reports_the_session_and_disclaims_the_store -->
 
-For a file-backed edge, a bare pasted ticket uses the durable adjacent identity at
-`<canonical-db-path>.fabric-identity.key`; an explicit `identity=<key-file>` always wins. A
-memory-backed edge must name an explicit persisted identity in its endpoint. If the endpoint is
+For an edge, a bare pasted ticket uses the durable adjacent identity at
+`<canonical-db-path>.fabric-identity.key`; an explicit `identity=<key-file>` always wins. If the endpoint is
 down, sync prints one clear warning line rather than failing hard.
 
 ### Logging
@@ -530,7 +522,7 @@ pages and does not repack them, so that slack is not given back; it is `unknown`
 when the walk failed, and always JSON `null` in `.maintenance run`'s `compaction` document. When nothing was measured, the field is unknown:
 JSON `null`, text `fragmentation_before=unknown` (`auto_compact_fragmentation_before=unknown` in
 the `.maintenance run` line). That covers a cycle with no check due, a store whose allocator
-totals are not trusted, a failed measurement, and an in-memory store. A check that found the
+totals are not trusted, and a failed measurement. A check that found the
 file below the start ratio reports what it measured. Every later batch of a sweep reports the
 measurement that sweep started on, so a sweep that started unmeasured stays unknown until it
 completes, across reopen. It is never reported as 0.
@@ -675,8 +667,7 @@ A populated caller-driven result is immediately actionable; for example, a summa
 `partition_key={"context_id":"camera-17"}`, `base_generation=4`, `base_tx=891`, the same pending
 counts for that route, `maintenance_reason=tombstones`, and
 `recovery_action=run_maintenance_cycle`. The compatibility `bytes` value is exactly
-`15360 + 28704`; durable byte columns are separate file-storage facts and are zero for an
-in-memory database.
+`15360 + 28704`; durable byte columns are separate file-storage facts.
 
 Rows are in stable `(table, column, canonical_partition_key)` order. Each reports its key, live and
 retained rows, serving base generation/transaction, tail and tombstone counts, durable and charged
@@ -801,7 +792,6 @@ row-reading route and stays usable when every reader slot is occupied:
 | Owner serving | `serving` | 0 |
 | Deliberately disabled (`--no-owner-reads`) | `serving_disabled` + reason | 0 |
 | Expected to serve but cannot | `not_serving` + reason | 1 |
-| `:memory:` | `not_applicable` | 0 |
 | Windows | `not_applicable` + reason `platform_unsupported` | 0 |
 
 Windows has no local owner channel: a store held by a live writer cannot be inspected there —
@@ -864,7 +854,7 @@ contextdb-server --tenant-id <TENANT_ID> [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db-path <PATH>` | `:memory:` | Database file path (env bootstrap alias: `CONTEXTDB_DB_PATH`, flag wins). A `:memory:` server serves sync but never a local owner-read channel. <!-- enforced by: read_cli_journeys_invocation::memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op, read_cli_journeys_invocation::read_and_owner_read_flags_are_invalid_with_a_memory_store, read_cli_journeys_invocation::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable --> |
+| `--db-path <PATH>` | *(required)* | Database file path (env bootstrap alias: `CONTEXTDB_DB_PATH`, flag wins). The server refuses to start without one. |
 | `--sync-endpoint <SPEC>` | *(auto)* | `iroh:?identity=<key-file>[&port=<u16>][&relay=…][&relay-ca=…][&publish=…][&lookup=…]` — transport identity and routing only. |
 | `--response-staging-bytes <N>` | unlimited | Durable unfinished-response storage bound. |
 | `--pre-admission-connections <N>` | 128 | Incoming connection/handshake task bound. |
@@ -912,7 +902,7 @@ a non-interactive agent. <!-- enforced by: read_cli_journeys_session_shape::a_pi
   process exits `1` if any statement suffered a runtime refusal
 
 ```bash
-echo "SELECT 1 + 1;" | contextdb :memory:
+echo "SELECT 1 + 1;" | contextdb ./my.db --write
 contextdb ./my.db --write < schema.sql
 echo "SELECT * FROM t;" | contextdb ./my.db && echo "OK" || echo "FAILED"
 ```

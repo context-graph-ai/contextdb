@@ -189,9 +189,6 @@ the real observed count and identifiable reader names. A direct read that finds
 committed state a writable open would have to mend refuses with
 `direct_read_requires_writer` instead of serving something the file cannot back.
 
-An in-memory database has no backing file, companion, or owner channel.
-<!-- enforced by: crates/contextdb-cli/tests/read_cli_journeys_invocation.rs::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable -->
-
 The supplied runtime directory names the owner channel; a channel startup failure leaves the
 database open with a `not_serving` status. Reader coordination uses the platform per-user
 directory when available, otherwise the supplied directory. Inventories inspect every known
@@ -373,7 +370,7 @@ keep their memory-budget fields and leave the prior declaration intact.
 Successful file data statements publish residency from a bounded distinct-page window,
 including ordinary, byte-window and native cache hits. Non-data inspections and failed statements
 preserve the previous observation. Empty, zero-share and superseded windows report Null;
-Null means no pages were measured. Owner and in-memory routes also have no session-owned file
+Null means no pages were measured. Owner routes also have no session-owned file
 cache to measure.
 
 Identifiers and their intrusive list links live in the existing prepaid native index arena;
@@ -544,8 +541,7 @@ Two implementations:
 
 | Implementation | Used by | Behavior |
 |---------------|---------|----------|
-| `CompositeStore` (in-memory) | `Database::open_memory()` | Applies to in-memory stores directly |
-| `PersistentCompositeStore` | `Database::open(path)` | Applies to in-memory stores + flushes to redb |
+| `PersistentCompositeStore` | `Database::open(path)` | Applies to the engine's working stores + flushes to redb |
 
 This trait is the extension point for additional backends if required. The
 applicator borrows the commit `WriteSet`; stores clone only the row, edge, or
@@ -717,7 +713,6 @@ Inject a custom plugin:
 ```rust
 let plugin = Arc::new(MyPlugin::new());
 let db = Database::open_with_plugin(path, plugin)?;
-// or: Database::open_memory_with_plugin(plugin)?
 ```
 
 ---
@@ -1155,9 +1150,7 @@ loads or creates `<canonical-db-path>.fabric-identity.key`. Reopening that
 database and recreating the database file while retaining this adjacent key
 both keep the same node identity; a recreated database still has its new store
 incarnation. An endpoint that explicitly supplies `identity=<key-file>` always
-takes precedence over the adjacent key. An in-memory edge must supply that
-explicit persisted identity itself: a bare ticket is refused before it dials or
-signs a sync request. The lower-level raw transport may still use an ephemeral
+takes precedence over the adjacent key. The lower-level raw transport may still use an ephemeral
 identity only for protocol-level anonymous-refusal coverage where no database
 participates.
 
@@ -1482,8 +1475,7 @@ The database tracks all row, graph, and vector allocations against one memory
 budget. Embedding callers use the durable
 `Database::set_memory_limit(Some(bytes))`; its setting survives reopen and
 remains runtime-configurable. A process that needs a non-raisable startup
-ceiling uses `contextdb_engine::database::open_with_startup_limits` (or
-`open_memory_with_startup_limit`). The CLI's `--memory-limit` uses that same
+ceiling uses `contextdb_engine::database::open_with_startup_limits`. The CLI's `--memory-limit` uses that same
 startup path. Budget exceeded →
 operations return `MemoryBudgetExceeded`. The raw mutable accountant is an
 engine implementation detail and is not attachable or reachable through the

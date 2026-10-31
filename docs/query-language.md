@@ -459,7 +459,7 @@ Null means no pages were measured: this includes no prior data statement, a stat
 file pages, a disabled file cache, or a window superseded while another statement ran. Inspecting
 other settings and statements that fail before execution keep the last data statement's observation.
 
-`SHOW DISK_LIMIT` returns the same columns for file-backed storage. On `:memory:` databases, disk limit commands are accepted but ignored.
+`SHOW DISK_LIMIT` returns the same columns for file-backed storage.
 
 `SHOW CONTENT_SIZE` is a read-only inspection of a file-backed store's captured committed snapshot.
 It returns one row with `live_row_bytes`, `live_vector_bytes`, `live_content_bytes`,
@@ -1671,8 +1671,7 @@ schema replay and sync. `EXPLAIN` and every executed route receipt name the effe
 source, and each flat partition's route as `exact` with the reason `partition_below_flat_threshold`.
 `AUTO` prices a flat partition at its exact comparisons when it chooses a route.
 A read already active keeps the graph it can walk: a reader whose snapshot predates later commits,
-deletes or a maintenance rebuild still walks the graph state compatible with its snapshot, on an
-in-memory store as on a file-backed one, and a graph retired by a rebuild is released once no active
+deletes or a maintenance rebuild still walks the graph state compatible with its snapshot, and a graph retired by a rebuild is released once no active
 reader needs it.
 <!-- enforced by: flat_route_below_declared_threshold::reaching_the_flat_threshold_moves_new_readers_to_the_graph_only, flat_route_below_declared_threshold::a_reader_pinned_before_a_rebuild_keeps_its_graph_until_it_finishes -->
 <!-- enforced by: flat_route_below_declared_threshold::flat_below_is_declared_validated_altered_and_reset, flat_route_below_declared_threshold::an_explicit_zero_flat_threshold_is_declared_and_never_flat, flat_route_below_declared_threshold::a_partition_at_the_flat_threshold_walks_its_graph, flat_route_below_declared_threshold::explain_predicts_the_flat_route_execution_takes, flat_route_below_declared_threshold::flat_below_travels_with_create_alter_and_reset_through_replay, flat_route_below_declared_threshold::auto_over_declared_flat_partitions_does_no_more_work_than_exact -->
@@ -1688,7 +1687,7 @@ post-base journal is published into a replacement generation. Writes can take th
 percentage between wakes, and the percentage is not a byte ceiling. `ALTER ... SET CONSOLIDATION
 (...)` changes the named members while retaining omitted members; `ALTER ... SET CONSOLIDATION
 DEFAULT` clears both declarations. The policy persists in schema, travels with it, and is honored by
-in-memory and file-backed maintenance.
+maintenance.
 `CONSOLIDATION NONE` (including `ALTER ... SET CONSOLIDATION NONE`) disables automatic threshold
 consolidation without disabling the maintained index, initial construction, topology replacement,
 or repair. Because healthy-tail threshold rebuilds no longer advance the covered frontier, the
