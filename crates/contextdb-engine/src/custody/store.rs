@@ -1433,8 +1433,51 @@ impl Store {
 /// entry) repeats it. Nothing here grows with the journal.
 mod verified {
     const SLOTS: usize = 1024;
-    type Table = parking_lot::Mutex<[[u8; 32]; SLOTS]>;
-    static SIGNATURES: Table = parking_lot::const_mutex([[0; 32]; SLOTS]);
+    const SIGNATURE_SLOTS: usize = 4096;
+    const SIGNATURE_CAPACITY: usize = SIGNATURE_SLOTS / 4 * 3;
+    static SIGNATURES: parking_lot::Mutex<SignatureTable> =
+        parking_lot::const_mutex(SignatureTable::new());
+
+    /// Every successful signature proof since the table last filled. Whether a
+    /// record hits depends only on which records were proved since then, never
+    /// on its digest: digests that share a slot probe onward instead of
+    /// replacing each other, and a full table empties whole.
+    struct SignatureTable {
+        slots: [[u8; 32]; SIGNATURE_SLOTS],
+        used: usize,
+    }
+    impl SignatureTable {
+        const fn new() -> Self {
+            Self {
+                slots: [[0; 32]; SIGNATURE_SLOTS],
+                used: 0,
+            }
+        }
+        /// The digest's slot, or the empty slot that ends its probe. The load
+        /// stays below the slot count, so an empty slot always ends the walk.
+        fn probe(&self, digest: &[u8; 32]) -> usize {
+            let mut at = usize::from(u16::from_le_bytes([digest[0], digest[1]])) % SIGNATURE_SLOTS;
+            while self.slots[at] != *digest && self.slots[at] != [0; 32] {
+                at = (at + 1) % SIGNATURE_SLOTS;
+            }
+            at
+        }
+        fn known(&self, digest: &[u8; 32]) -> bool {
+            self.slots[self.probe(digest)] == *digest
+        }
+        fn remember(&mut self, digest: [u8; 32]) {
+            if self.known(&digest) {
+                return;
+            }
+            if self.used == SIGNATURE_CAPACITY {
+                self.slots.fill([0; 32]);
+                self.used = 0;
+            }
+            let at = self.probe(&digest);
+            self.slots[at] = digest;
+            self.used += 1;
+        }
+    }
 
     /// One store's companion checks, keyed by captured root and record key.
     /// Allocated once per durable store at a fixed size.
@@ -1468,19 +1511,80 @@ mod verified {
     fn slot(digest: &[u8; 32]) -> usize {
         usize::from(u16::from_le_bytes([digest[0], digest[1]])) % SLOTS
     }
-    fn known(table: &Table, digest: &[u8; 32]) -> bool {
-        table.lock()[slot(digest)] == *digest
-    }
-    fn remember(table: &Table, digest: [u8; 32]) {
-        table.lock()[slot(&digest)] = digest;
-    }
     pub(super) fn signature_known(digest: &[u8; 32]) -> bool {
-        known(&SIGNATURES, digest)
+        SIGNATURES.lock().known(digest)
     }
     pub(super) fn remember_signature(digest: [u8; 32]) {
-        remember(&SIGNATURES, digest)
+        SIGNATURES.lock().remember(digest)
+    }
+    /// Starts a test's proof count from nothing proved.
+    #[cfg(test)]
+    pub(crate) fn forget_signatures_for_test() {
+        *SIGNATURES.lock() = SignatureTable::new();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sharing_a_slot(tail: u16) -> [u8; 32] {
+            let mut digest = [7; 32];
+            digest[30..].copy_from_slice(&tail.to_le_bytes());
+            digest
+        }
+        fn in_its_own_slot(tail: u16) -> [u8; 32] {
+            let mut digest = sharing_a_slot(tail);
+            digest[..2].copy_from_slice(&tail.to_le_bytes());
+            digest
+        }
+
+        #[test]
+        fn a_proof_survives_every_digest_that_shares_its_slot() {
+            let mut table = Box::new(SignatureTable::new());
+            for tail in 1..=64 {
+                table.remember(sharing_a_slot(tail));
+            }
+            for tail in 1..=64 {
+                assert!(table.known(&sharing_a_slot(tail)));
+            }
+            assert!(!table.known(&sharing_a_slot(65)));
+        }
+
+        #[test]
+        fn remembering_a_proof_twice_takes_one_slot() {
+            let mut table = Box::new(SignatureTable::new());
+            table.remember(sharing_a_slot(1));
+            table.remember(sharing_a_slot(1));
+            assert_eq!(table.used, 1);
+        }
+
+        // Two runs over different digest values prove the same records in the
+        // same order past the capacity: the hits are identical, whichever slots
+        // those digests fall in.
+        #[test]
+        fn hits_depend_on_what_was_proved_never_on_digest_values() {
+            let tails = 1..=(SIGNATURE_CAPACITY as u16 + 100);
+            let hits = |digest: fn(u16) -> [u8; 32]| {
+                let mut table = Box::new(SignatureTable::new());
+                let mut hits = Vec::new();
+                for tail in tails.clone() {
+                    table.remember(digest(tail));
+                }
+                for tail in tails.clone() {
+                    hits.push(table.known(&digest(tail)));
+                }
+                hits
+            };
+            let first = hits(in_its_own_slot);
+            assert_eq!(first, hits(sharing_a_slot));
+            assert!(!first[0], "the full table emptied before the later proofs");
+            assert!(*first.last().expect("proofs"), "later proofs stay known");
+        }
     }
 }
+
+#[cfg(test)]
+pub(crate) use verified::forget_signatures_for_test;
 
 /// The operation's memory as the funder of native signature inputs: each
 /// native buffer is admitted to it before the buffer exists, and a refusal
