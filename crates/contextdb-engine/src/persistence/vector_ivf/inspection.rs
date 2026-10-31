@@ -31,7 +31,9 @@ impl Inspection {
     /// A published index that can serve this partition.
     pub fn available(self) -> bool {
         self.recovery_action() != "rebuild"
-            && self.manifest.is_some_and(|manifest| manifest.active_lists != 0)
+            && self
+                .manifest
+                .is_some_and(|manifest| manifest.active_lists != 0)
     }
     /// The published codebook's identity, when an index is published.
     pub fn codebook(self) -> Option<[u8; 32]> {

@@ -120,7 +120,7 @@ fn enrolled_vector_index() -> Database {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
- "CREATE TABLE neighbourhoods (id UUID PRIMARY KEY, embedding VECTOR(3) IVF (PROBES = 32))",
+        "CREATE TABLE neighbourhoods (id UUID PRIMARY KEY, embedding VECTOR(3) IVF (PROBES = 32))",
         &HashMap::new(),
     )
     .expect("create the vector table");

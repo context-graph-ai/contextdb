@@ -2913,9 +2913,7 @@ impl StoreFinalization {
             // Internal helper handles can outlive the last caller-facing
             // holder. They do not keep the store open and therefore must not
             // keep vector bodies or relational/F32 projection charges alive.
-            let receipt = self
-                .vector
-                .teardown_all_without_copy();
+            let receipt = self.vector.teardown_all_without_copy();
             self.accountant.release(receipt.legacy_live_raw_bytes);
             // A receipt observer is Internal and can keep this Arc alive. It
             // must not extend history residency after the last actual reader.

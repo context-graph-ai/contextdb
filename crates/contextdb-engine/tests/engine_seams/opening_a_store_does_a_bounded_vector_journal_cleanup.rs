@@ -94,7 +94,7 @@ fn insert_batch(db: &Database, first: i64, rows: i64) {
 fn built_with(path: &std::path::Path, absorbing: bool) -> Database {
     let db = open(path);
     let consolidation = if absorbing { "" } else { " CONSOLIDATION NONE" };
- db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 256){consolidation})"), &HashMap::new()).unwrap();
+    db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 256){consolidation})"), &HashMap::new()).unwrap();
     insert_batch(&db, 0, 16);
     while db
         .run_maintenance_cycle()

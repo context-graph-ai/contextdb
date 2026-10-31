@@ -1791,7 +1791,7 @@ fn hnsw_threshold_1001_hnsw_boundary() {
     assert_eq!(result_ids(&results), result_ids(&exact));
     // A declared breadth bounds the rank pool without rebuilding its ready graph.
     db.execute(
- "ALTER TABLE decisions ALTER COLUMN embedding SET IVF (PROBES = 128)",
+        "ALTER TABLE decisions ALTER COLUMN embedding SET IVF (PROBES = 128)",
         &empty_params(),
     )
     .unwrap();

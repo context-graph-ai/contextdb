@@ -1200,7 +1200,6 @@ impl BoundedVectorSearchTrace {
     pub fn debug_trace_for_test(&self) -> &VectorSearchDebugTrace {
         &self.trace
     }
-
 }
 
 impl BoundedBruteForceCursor {
@@ -1760,7 +1759,6 @@ pub struct MemVectorExecutor<S: WriteSetApplicator> {
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
-
     #[doc(hidden)]
     pub fn new_engine(
         store: Arc<VectorStore>,
@@ -3967,7 +3965,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
         self.search_with_strategy(index, query, k, candidates, snapshot, executing_owner)
     }
-
 }
 
 impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {

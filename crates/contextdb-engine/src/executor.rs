@@ -2759,7 +2759,6 @@ impl ReadExecutionTarget for Database {
         )
     }
 
-
     fn bounded_brute_force_vector_step(
         &self,
         cursor: &mut contextdb_vector::mem::BoundedBruteForceCursor,
@@ -4395,15 +4394,13 @@ fn vector_index_objective_status(
         .filter(|(partition, _)| partition.live_rows != 0)
         .map(|(_, native)| native.and_then(|native| native.objective))
         .collect::<Vec<_>>();
-    Some(
-        if statuses.contains(&Some(Objective::Unmet)) {
-            "unmet"
-        } else if !statuses.is_empty() && statuses.iter().all(|s| *s == Some(Objective::Met)) {
-            "met"
-        } else {
-            "unmeasured"
-        },
-    )
+    Some(if statuses.contains(&Some(Objective::Unmet)) {
+        "unmet"
+    } else if !statuses.is_empty() && statuses.iter().all(|s| *s == Some(Objective::Met)) {
+        "met"
+    } else {
+        "unmeasured"
+    })
 }
 
 #[expect(
@@ -4430,9 +4427,14 @@ fn vector_index_inspection_row(
     let states = partitions
         .iter()
         .zip(native)
-        .map(|(partition, native)| vector_partition_query_state(partition.live_rows, native.as_ref()))
+        .map(|(partition, native)| {
+            vector_partition_query_state(partition.live_rows, native.as_ref())
+        })
         .collect::<Vec<_>>();
-    let unavailable_partitions = states.iter().filter(|state| **state == "unavailable").count();
+    let unavailable_partitions = states
+        .iter()
+        .filter(|state| **state == "unavailable")
+        .count();
     let indexed_available = live_partitions != 0
         && partitions
             .iter()
@@ -4465,7 +4467,9 @@ fn vector_index_inspection_row(
             .try_fold(0usize, |total, lifecycle| {
                 total
                     .checked_add(value(lifecycle).unwrap_or(0))
-                    .ok_or_else(|| Error::Other((format!("vector maintenance {what} overflow")).into()))
+                    .ok_or_else(|| {
+                        Error::Other((format!("vector maintenance {what} overflow")).into())
+                    })
             })
             .map(Some)
     };
@@ -4510,7 +4514,8 @@ fn vector_index_inspection_row(
             .map(serde_json::Value::String)
             .collect(),
     );
-    let optional_int = |value: Option<u32>| value.map_or(Value::Null, |v| Value::Int64(i64::from(v)));
+    let optional_int =
+        |value: Option<u32>| value.map_or(Value::Null, |v| Value::Int64(i64::from(v)));
 
     // Every value below comes from the one passive partition snapshot and the
     // per-partition native inspection. The row builder aggregates them without
@@ -4647,7 +4652,10 @@ fn vector_partition_inspection_row(
         .ivf_refine_factor_hundredths
         .map(|factor| (factor, "declared"));
     let member = |value: Option<(u32, &str)>| match value {
-        Some((value, source)) => (Value::Int64(i64::from(value)), Value::Text(source.to_owned())),
+        Some((value, source)) => (
+            Value::Int64(i64::from(value)),
+            Value::Text(source.to_owned()),
+        ),
         None => (Value::Null, Value::Null),
     };
     let (lists_value, lists_source) = member(lists);
@@ -23528,7 +23536,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             read_memory.clone(),
         )
     }
-
 
     fn bounded_brute_force_vector_step(
         &self,

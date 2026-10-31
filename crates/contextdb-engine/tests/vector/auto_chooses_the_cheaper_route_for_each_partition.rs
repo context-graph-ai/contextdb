@@ -134,7 +134,14 @@ fn partitioned_fixture(partitions: usize, rows_per_partition: usize, table: &str
                 &mut partition_observation_owner_1,
             )
             .expect("inspect partition readiness");
-        if ready.len() == partitions && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == partitions
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             return db;
         }
     }

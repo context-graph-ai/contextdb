@@ -108,7 +108,14 @@ fn seed(path: &std::path::Path) {
             .vector_store_for_test()
             .partition_infos(&VectorIndexRef::new("scoped_rows", "embedding"), &mut owner)
             .expect("inspect readiness");
-        if ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == PARTITIONS
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             db.close().expect("close the sealed fixture");
             return;
         }

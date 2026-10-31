@@ -56,7 +56,7 @@ fn maintenance_row(catalogs: usize, cycles: usize) -> Json {
         exec(
             &db,
             &format!(
- "CREATE TABLE {table} (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2048 SEARCH_MODE INDEXED ) HISTORY CURRENT ONLY SYNC OFF"
+                "CREATE TABLE {table} (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2048 SEARCH_MODE INDEXED ) HISTORY CURRENT ONLY SYNC OFF"
             ),
         );
     }
@@ -92,10 +92,7 @@ fn maintenance_row(catalogs: usize, cycles: usize) -> Json {
     // replacement need not retain an identical predecessor for the old snapshot.
     exec(&db, "UPDATE building SET v = '[0,1,0]' WHERE scope = 0");
     // Publish one superseding generation while its predecessor is protected.
-    exec(
-        &db,
- "ALTER TABLE building ALTER COLUMN v SET IVF DEFAULT",
-    );
+    exec(&db, "ALTER TABLE building ALTER COLUMN v SET IVF DEFAULT");
     for _ in 0..64 {
         db.run_maintenance_cycle().unwrap();
         if state(&db, 0).1 > initial_generation {
@@ -112,10 +109,7 @@ fn maintenance_row(catalogs: usize, cycles: usize) -> Json {
     drop(old);
     // One selected route needs another replacement and one needs its initial build.
     exec(&db, "UPDATE building SET v = '[0,0,1]' WHERE scope = 0");
-    exec(
-        &db,
- "ALTER TABLE building ALTER COLUMN v SET IVF DEFAULT",
-    );
+    exec(&db, "ALTER TABLE building ALTER COLUMN v SET IVF DEFAULT");
     insert_vector(&db, "building", catalogs, Some(catalogs as i64), 3);
     for id in 0..8 {
         exec(

@@ -333,7 +333,6 @@ fn with_source_page_admission_for<T>(
     redb::with_owned_read_page_charge_storage(Arc::new(callback), read)
 }
 
-
 #[cfg(all(test, feature = "test-seams"))]
 mod cleanup_attribution_tests {
     use super::*;

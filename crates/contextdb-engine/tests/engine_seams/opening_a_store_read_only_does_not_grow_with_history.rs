@@ -50,7 +50,7 @@ fn read_only_open(path: &std::path::Path) -> (usize, usize, ReadSession) {
 /// suffix when the writer closes.
 fn vector_suffix_store(path: &std::path::Path, batches: i64) {
     let db = open_writer(path);
- db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIM}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
+    db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIM}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
     for id in 0..16i64 {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $v)",

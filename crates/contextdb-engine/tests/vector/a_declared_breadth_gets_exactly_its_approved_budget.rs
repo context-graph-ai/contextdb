@@ -170,7 +170,14 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path, degree: usize) {
             .vector_store_for_test()
             .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        if ready.len() == PARTITIONS && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == PARTITIONS
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             admin.close().expect("seal the fixture store");
             return;
         }
@@ -186,9 +193,7 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
     let admin = open_admin(path, runtime);
     admin
         .execute(
-            &format!(
- "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = {breadth})"
-            ),
+            &format!("ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = {breadth})"),
             &HashMap::new(),
         )
         .expect("declare the search breadth");
@@ -511,7 +516,7 @@ fn mixed_serving_degrees_are_given_the_widest_admitted_degree() {
     // Rebuild at M = 24, holding the last bucket's rebuild before it
     // publishes, so it keeps serving its M = 16 graph beside the others.
     db.execute(
- "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     )
     .expect("declare the wider degree");

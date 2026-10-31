@@ -229,7 +229,7 @@ fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
         .unwrap();
     assert!(
         !hits.is_empty() && hits[0].0 == target_row_id && hits[0].1 > 0.99,
- "HNSW reindex must rank the reindexed row's NEW vector first; hits={hits:?}"
+        "HNSW reindex must rank the reindexed row's NEW vector first; hits={hits:?}"
     );
     assert!(
         db.__debug_last_query_vector_used_indexed_route_for_test(),
@@ -243,7 +243,7 @@ fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
         !raw_hnsw_hits.is_empty()
             && raw_hnsw_hits[0].0 == target_row_id
             && raw_hnsw_hits[0].1 > 0.99,
- "raw HNSW graph itself must contain the reindexed row's NEW vector; raw_hnsw_hits={raw_hnsw_hits:?}"
+        "raw HNSW graph itself must contain the reindexed row's NEW vector; raw_hnsw_hits={raw_hnsw_hits:?}"
     );
     let post_stats = db
         .__debug_vector_hnsw_stats(idx.clone())
@@ -266,7 +266,7 @@ fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
         if *row_id == target_row_id {
             assert!(
                 *score < 0.5,
- "HNSW still returns the reindexed row for the OLD vector with score {score}; hits={old_hits:?}"
+                "HNSW still returns the reindexed row for the OLD vector with score {score}; hits={old_hits:?}"
             );
         }
     }

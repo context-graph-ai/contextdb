@@ -143,7 +143,13 @@ fn seed_bases_with_changes() -> Fixture {
             .vector_store_for_test()
             .partition_infos(&index(), &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        ready.len() == SHAPE.partitions && ready.iter().all(|partition| partition.graph_available)
+        ready.len() == SHAPE.partitions
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
     });
     assert!(bases_saved, "every Context saves its base graph");
 

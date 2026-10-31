@@ -642,7 +642,6 @@ impl StoredVector {
             } => cosine_query_sq4(query, payload, *len, *min, *max),
         }
     }
-
 }
 
 fn cosine_query_sq8(query: &[f32], payload: &[u8], min: f32, max: f32) -> f32 {

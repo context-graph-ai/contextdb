@@ -612,12 +612,12 @@ fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
     let index = VectorIndexRef::new("sibling_vectors", "embedding");
     let rows = db
         .scan("sibling_vectors", db.snapshot())
- .expect("HNSW fixture must create sibling vector rows");
+        .expect("HNSW fixture must create sibling vector rows");
     let max_row_id = rows
         .iter()
         .map(|row| row.row_id.0)
         .max()
- .expect("HNSW fixture must create sibling vector rows");
+        .expect("HNSW fixture must create sibling vector rows");
     let baseline = warm_hnsw_fixture(
         db,
         index,
@@ -652,12 +652,12 @@ fn seed_host_audit_hnsw(db: &Database) -> (usize, u64, HnswBaseline) {
     let index = VectorIndexRef::new("host_audits", "embedding");
     let rows = db
         .scan("host_audits", db.snapshot())
- .expect("HNSW fixture must create host audit vector rows");
+        .expect("HNSW fixture must create host audit vector rows");
     let max_row_id = rows
         .iter()
         .map(|row| row.row_id.0)
         .max()
- .expect("HNSW fixture must create host audit vector rows");
+        .expect("HNSW fixture must create host audit vector rows");
     let baseline = warm_hnsw_fixture(
         db,
         index,
@@ -2925,7 +2925,7 @@ fn assert_sequential_vector_source_unit_credit() {
         )
         .unwrap();
         db.execute(
- "ALTER TABLE unit_vectors ALTER COLUMN embedding SET IVF (PROBES = 64)",
+            "ALTER TABLE unit_vectors ALTER COLUMN embedding SET IVF (PROBES = 64)",
             &empty(),
         )
         .unwrap();
@@ -2945,7 +2945,7 @@ fn assert_sequential_vector_source_unit_credit() {
             .unwrap();
         source
             .execute(
- "ALTER TABLE unit_vectors ALTER COLUMN embedding SET IVF (PROBES = 64)",
+                "ALTER TABLE unit_vectors ALTER COLUMN embedding SET IVF (PROBES = 64)",
                 &empty(),
             )
             .unwrap();

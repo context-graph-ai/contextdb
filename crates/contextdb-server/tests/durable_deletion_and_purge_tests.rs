@@ -1128,7 +1128,7 @@ fn assert_restored_purge(
         .unwrap_or_else(|error| panic!("materialize {place} ANN/HNSW state: {error}"));
     assert!(
         vector_plan.trace().physical_plan.contains("HNSWSearch"),
- "{place} vector proof must exercise ANN/HNSW"
+        "{place} vector proof must exercise ANN/HNSW"
     );
     let hnsw_len = restored
         .__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding"))
@@ -1681,7 +1681,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             && edge_a
                 .__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding"))
                 .is_some(),
- "fixture must hold the selected vector in a materialized ANN/HNSW graph"
+        "fixture must hold the selected vector in a materialized ANN/HNSW graph"
     );
     assert_eq!(
         edge_a
@@ -2070,7 +2070,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             vector_rows
                 .iter()
                 .all(|(row_id, _)| row_id != local_selected_row_id),
- "{place} vector and ANN/HNSW state must not return the selected entry"
+            "{place} vector and ANN/HNSW state must not return the selected entry"
         );
         assert!(
             vector_rows

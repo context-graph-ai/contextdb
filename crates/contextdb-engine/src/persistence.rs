@@ -7278,11 +7278,8 @@ thread_local! {
 #[cfg(all(test, feature = "test-seams"))]
 mod empty_declared_index_readiness_tests;
 
-
-
 #[cfg(test)]
 mod streamed_raw_loader_tests;
-
 
 #[cfg(all(test, feature = "test-seams"))]
 mod ordered_run_integrity_tests;
@@ -7315,7 +7312,6 @@ mod retained_raw_body_guard_tests;
 #[cfg(test)]
 #[path = "persistence/journal_record_validation_tests.rs"]
 mod journal_record_validation_tests;
-
 
 #[cfg(test)]
 #[path = "persistence/body_placement_publication_tests.rs"]

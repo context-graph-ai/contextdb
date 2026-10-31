@@ -4333,9 +4333,7 @@ impl PullNode {
         match &mut self.kind {
             PullKind::Scan(state) => state.next(db, context),
             PullKind::Graph(state) => state.next(db, context),
-            PullKind::Vector(state) => {
-                state.next(db, context, &mut self.trace)
-            }
+            PullKind::Vector(state) => state.next(db, context, &mut self.trace),
             PullKind::Project(state) => state.next(db, context),
             PullKind::Sort(state) => state.next(db, context),
             PullKind::Window(state) => state.next(db, context),
@@ -10829,11 +10827,10 @@ impl VectorState {
                 VectorPreparation::Candidates(_) => {
                     // A filter the search can check row by row keeps its exact
                     // candidate set only while the read can afford to hold it.
-                    let row_checkable = matches!(
-                        self.preparation,
-                        VectorPreparation::Candidates(Some(_))
-                    ) && self.row_filter.is_some()
-                        && self.search_mode != contextdb_core::VectorSearchMode::Exact;
+                    let row_checkable =
+                        matches!(self.preparation, VectorPreparation::Candidates(Some(_)))
+                            && self.row_filter.is_some()
+                            && self.search_mode != contextdb_core::VectorSearchMode::Exact;
                     let candidate = match &mut self.preparation {
                         VectorPreparation::Candidates(candidate) => candidate,
                         _ => {
@@ -11061,42 +11058,42 @@ impl VectorState {
                             None => Ok(true),
                         };
                         let ranked_limit = self.sort_key.as_ref().map(|_| self.k);
-                        let mut search = || context.with_vector_copies(|vector_copy_owner| {
-                            db.bounded_vector_search(
-                                &self.index,
-                                parameter_query_vector(&self.query_expr, &self.params)
-                                    .unwrap_or(&self.query),
-                                self.candidate_k,
-                                groups.get(),
-                                if self.force_exact_for_relational_fallback {
-                                    contextdb_core::VectorSearchMode::Exact
-                                } else {
-                                    self.search_mode
-                                },
-                                self.query_breadth,
-                                &mut || context.native_source_touch(),
-                                &mut || {
-                                    context.charge(
-                                        BoundedWorkSource::VectorCandidates,
-                                        BoundedSourceTouch::BruteForceVectorCandidate,
-                                    )
-                                },
-                                &mut || {
-                                    context.charge_operator(BoundedWorkSource::VectorCandidates)
-                                },
-                                &mut |bytes| {
-                                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
-                                },
-                                &mut |bytes| context.release_parked(bytes),
-                                vector_copy_owner,
-                                context.reader_budget.clone(),
-                                self.row_checked.then_some(
-                                    contextdb_vector::mem::RowCheck {
-                                        check: &mut row_check,
+                        let mut search = || {
+                            context.with_vector_copies(|vector_copy_owner| {
+                                db.bounded_vector_search(
+                                    &self.index,
+                                    parameter_query_vector(&self.query_expr, &self.params)
+                                        .unwrap_or(&self.query),
+                                    self.candidate_k,
+                                    groups.get(),
+                                    if self.force_exact_for_relational_fallback {
+                                        contextdb_core::VectorSearchMode::Exact
+                                    } else {
+                                        self.search_mode
                                     },
-                                ),
-                            )
-                        });
+                                    self.query_breadth,
+                                    &mut || context.native_source_touch(),
+                                    &mut || {
+                                        context.charge(
+                                            BoundedWorkSource::VectorCandidates,
+                                            BoundedSourceTouch::BruteForceVectorCandidate,
+                                        )
+                                    },
+                                    &mut || {
+                                        context.charge_operator(BoundedWorkSource::VectorCandidates)
+                                    },
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                    },
+                                    &mut |bytes| context.release_parked(bytes),
+                                    vector_copy_owner,
+                                    context.reader_budget.clone(),
+                                    self.row_checked.then_some(contextdb_vector::mem::RowCheck {
+                                        check: &mut row_check,
+                                    }),
+                                )
+                            })
+                        };
                         match ranked_limit {
                             Some(limit) => {
                                 contextdb_vector::mem::with_search_policy_limit(limit, search)?

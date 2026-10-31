@@ -1993,7 +1993,6 @@ impl Database {
                 ));
             };
 
-
             // Candidate discovery and the callback drain both happen before the
             // transaction commit mutex. The complete sorted hash set is then
             // quiesced and acquired atomically; a commit-locked discovery retry

@@ -213,7 +213,14 @@ fn seed_one_partition(path: &std::path::Path, runtime: &std::path::Path) {
             .vector_store_for_test()
             .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        if !ready.is_empty() && ready.iter().all(|partition| partition.graph_available) {
+        if !ready.is_empty()
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             break;
         }
     }
@@ -230,7 +237,12 @@ fn seed_one_partition(path: &std::path::Path, runtime: &std::path::Path) {
     println!(
         "fixture partitions={} graph_available={} maintenance_cycles={cycles}",
         infos.len(),
-        infos.iter().all(|partition| partition.graph_available),
+        infos
+            .iter()
+            .all(|partition| db.__debug_vector_partition_indexed_for_test(
+                partition.partition.index.clone(),
+                partition.partition.partition_key.clone()
+            )),
     );
     admin.close().expect("seal the fixture store");
 }

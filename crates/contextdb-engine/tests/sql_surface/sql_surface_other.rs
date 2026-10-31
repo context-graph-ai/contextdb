@@ -9214,12 +9214,12 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
     let hnsw_literal = hnsw_db
         .execute(
             &prv_literal_query(""),
- &params(vec![("query", Value::Vector(hnsw_f.source_vec.clone()))]),
+            &params(vec![("query", Value::Vector(hnsw_f.source_vec.clone()))]),
         )
         .unwrap();
     assert!(
         hnsw_literal.trace().physical_plan.contains("HNSWSearch"),
- "literal-vector HNSW oracle must use the HNSW path, got {:?}",
+        "literal-vector HNSW oracle must use the HNSW path, got {:?}",
         hnsw_literal.trace()
     );
     let hnsw_persisted = prv_expect_query_ok(
@@ -9227,7 +9227,7 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
             &prv_row_vector_query(""),
             &params(vec![("query_id", Value::Uuid(hnsw_f.source))]),
         ),
- "persisted row vector HNSW parity query",
+        "persisted row vector HNSW parity query",
     );
     prv_assert_same_signature(&hnsw_literal, &hnsw_persisted);
     assert_eq!(
@@ -10369,7 +10369,7 @@ fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
         .unwrap();
     assert!(
         explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
- "EXPLAIN must still describe the vector operator without building HNSW: {explain}"
+        "EXPLAIN must still describe the vector operator without building HNSW: {explain}"
     );
     assert_eq!(
         db.__debug_vector_hnsw_len(index),

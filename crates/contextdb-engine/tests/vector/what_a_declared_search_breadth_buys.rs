@@ -202,9 +202,7 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
     admin.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     admin
         .execute(
-            &format!(
- "ALTER TABLE passages ALTER COLUMN embedding SET IVF (PROBES = {breadth})"
-            ),
+            &format!("ALTER TABLE passages ALTER COLUMN embedding SET IVF (PROBES = {breadth})"),
             &HashMap::new(),
         )
         .expect("declare the search breadth");
@@ -220,7 +218,13 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
         .partition_infos(&index, &mut partition_observation_owner_1)
         .expect("inspect partition readiness");
     assert!(
-        !infos.is_empty() && infos.iter().all(|partition| partition.graph_available),
+        !infos.is_empty()
+            && infos
+                .iter()
+                .all(|partition| db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone()
+                )),
         "declaring a breadth does not withdraw the built graph"
     );
     admin.close().expect("seal the working copy");

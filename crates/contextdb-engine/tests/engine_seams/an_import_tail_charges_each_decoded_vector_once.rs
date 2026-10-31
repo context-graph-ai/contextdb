@@ -440,7 +440,7 @@ fn a_completed_replacement_catches_up_its_import_cohort_under_the_writer() {
         ..DatabaseOpenOptions::default()
     };
     let db = Database::open_with_options(&path, options).unwrap();
- db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
     let small = |db: &Database, id: i64, vector: Vec<f32>| {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $vector)",
@@ -517,7 +517,7 @@ fn options(limit: usize) -> DatabaseOpenOptions {
 /// a native tail, a replacement queued, and one later commit.
 fn queued_replacement_with_a_later_commit(path: &std::path::Path) -> Database {
     let db = Database::open_with_options(path, options(64 * 1024 * 1024)).unwrap();
- db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
     let small = |id: i64, vector: Vec<f32>| {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $vector)",

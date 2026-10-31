@@ -56,11 +56,11 @@ fn graph_index_declarations_are_refused_naming_the_keyword_and_the_search_form()
 
     for (sql, keyword) in [
         (
- "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 64))",
+            "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 64))",
             "HNSW",
         ),
         (
- "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) )",
+            "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) )",
             "HNSW",
         ),
         (
@@ -82,7 +82,7 @@ fn graph_index_declarations_are_refused_naming_the_keyword_and_the_search_form()
         );
     }
 
- let add = "ALTER TABLE add_target ADD COLUMN embedding VECTOR(3) ";
+    let add = "ALTER TABLE add_target ADD COLUMN embedding VECTOR(3) ";
     let error = db
         .execute(add, &empty())
         .expect_err("ADD COLUMN with HNSW is refused");
@@ -91,11 +91,11 @@ fn graph_index_declarations_are_refused_naming_the_keyword_and_the_search_form()
 
     for (alter, keyword) in [
         (
- "ALTER TABLE alter_target ALTER COLUMN embedding SET IVF (PROBES = 64)",
+            "ALTER TABLE alter_target ALTER COLUMN embedding SET IVF (PROBES = 64)",
             "HNSW",
         ),
         (
- "ALTER TABLE alter_target ALTER COLUMN embedding SET IVF DEFAULT",
+            "ALTER TABLE alter_target ALTER COLUMN embedding SET IVF DEFAULT",
             "HNSW",
         ),
         (

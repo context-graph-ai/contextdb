@@ -327,7 +327,7 @@ fn plain_fixture(path: &std::path::Path, indexed: bool) -> Arc<Database> {
         },
     )
     .unwrap();
- db.execute("CREATE TABLE held_filter (id INTEGER PRIMARY KEY, label TEXT, bucket INTEGER NOT NULL, embedding VECTOR(2) PARTITION_KEY (bucket) SEARCH_MODE AUTO IVF (PROBES = 8))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE held_filter (id INTEGER PRIMARY KEY, label TEXT, bucket INTEGER NOT NULL, embedding VECTOR(2) PARTITION_KEY (bucket) SEARCH_MODE AUTO IVF (PROBES = 8))", &HashMap::new()).unwrap();
     for id in 0..64_i64 {
         db.execute(
             "INSERT INTO held_filter VALUES ($id, 'wanted', 1, $vector)",

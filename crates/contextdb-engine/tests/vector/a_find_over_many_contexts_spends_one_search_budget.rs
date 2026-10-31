@@ -206,7 +206,14 @@ fn seed_shape(
             .vector_store_for_test()
             .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        if ready.len() == partitions && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == partitions
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             admin.close().expect("seal the fixture store");
             return;
         }
@@ -864,7 +871,7 @@ fn rejected_neighbours_refill_the_page_on_both_routes() {
     .expect("open fixture for deterministic residual changes");
     admin
         .execute(
- "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = 40)",
+            "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = 40)",
             &HashMap::new(),
         )
         .expect("declare the search breadth");
@@ -1091,7 +1098,7 @@ fn cancellation_after_residual_rejection_restores_memory_on_both_routes() {
     .expect("open residual fixture");
     admin
         .execute(
- "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = 40)",
+            "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = 40)",
             &HashMap::new(),
         )
         .expect("declare search breadth");

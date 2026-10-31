@@ -22,16 +22,16 @@ pub(crate) mod native_custody_selection;
 use contextdb_relational::source::RelationalCursor as _;
 use maintenance_frontier::MaintenanceFrontier;
 pub(crate) mod graph_read_memory;
+#[doc(hidden)]
+mod received_row_graph;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod resident_history_test_seams;
+mod row_graph;
 mod vector_import_tail;
 #[cfg(test)]
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
-#[doc(hidden)]
-mod received_row_graph;
-mod row_graph;
 #[cfg(any(test, feature = "test-seams"))]
 pub(crate) mod writer_ownership_receipt;
 pub(crate) mod writer_read;
@@ -193,8 +193,8 @@ use contextdb_tx::{
 };
 use contextdb_vector::store::{
     DormantRawVectorLoader, DormantRawVectorPartition, DormantVectorLoadRequest,
-    LoadedRawVectorCandidate, LoadedRawVectorPartition, RawVectorBodyScan,
-    RawVectorDirectoryEntry, VectorPartitionRef,
+    LoadedRawVectorCandidate, LoadedRawVectorPartition, RawVectorBodyScan, RawVectorDirectoryEntry,
+    VectorPartitionRef,
 };
 use contextdb_vector::{
     MemVectorExecutor, MemoryBudget, PartitionedVectorEntry, PreparedVectorPublication,

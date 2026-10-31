@@ -4979,9 +4979,7 @@ impl Database {
 
     pub(crate) fn deregister_vector_index(&self, table: &str, column: &str) {
         let index = VectorIndexRef::new(table, column);
-        let receipt = self
-            .vector_store
-            .teardown_index_without_copy(&index);
+        let receipt = self.vector_store.teardown_index_without_copy(&index);
         self.finalization
             .accountant
             .release(receipt.legacy_live_raw_bytes);
@@ -5012,12 +5010,8 @@ impl Database {
         replaced: &VectorIndexRef,
         owner: contextdb_vector::VectorCopyAdmission,
     ) -> Result<contextdb_vector::store::PreparedVectorIndexRename<'a>> {
-        self.vector_store.prepare_index_replacement_rename(
-            old,
-            new,
-            replaced,
-            owner,
-        )
+        self.vector_store
+            .prepare_index_replacement_rename(old, new, replaced, owner)
     }
 
     #[expect(
@@ -5045,9 +5039,7 @@ impl Database {
     }
 
     pub(crate) fn vector_store_deregister_table(&self, table: &str) {
-        let receipt = self
-            .vector_store
-            .teardown_table_without_copy(table);
+        let receipt = self.vector_store.teardown_table_without_copy(table);
         self.finalization
             .accountant
             .release(receipt.legacy_live_raw_bytes);
@@ -5151,7 +5143,9 @@ impl Database {
                     .ok_or_else(|| Error::UnknownVectorIndex {
                         index: index.clone(),
                     })?;
-                let partitions = self.vector_store.partition_infos(&index, vector_copy_owner)?;
+                let partitions = self
+                    .vector_store
+                    .partition_infos(&index, vector_copy_owner)?;
                 Ok((
                     declaration,
                     self.vector_store

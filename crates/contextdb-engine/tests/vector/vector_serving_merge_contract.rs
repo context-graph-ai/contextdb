@@ -130,7 +130,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
         "the preceding UPDATE has a prepared plan"
     );
     db.execute(
- "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 9)",
+        "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 9)",
         &HashMap::new(),
     )
     .unwrap();
@@ -143,12 +143,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
         db.execute(sql, &parameters(&query)).unwrap(),
         bounded_query(&db, sql, &query),
     ] {
-        let serving = &result
-            .trace()
-            .vector_search
-            .as_ref()
-            .unwrap()
-            .partitions[0];
+        let serving = &result.trace().vector_search.as_ref().unwrap().partitions[0];
         assert_eq!(serving.hnsw_m, initial.hnsw_m);
         assert_eq!(
             serving.policy_revision, initial.policy_revision,
@@ -164,12 +159,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     .unwrap();
     db.run_maintenance_cycle().unwrap();
     let current = db.execute(sql, &parameters(&query)).unwrap();
-    let serving = &current
-        .trace()
-        .vector_search
-        .as_ref()
-        .unwrap()
-        .partitions[0];
+    let serving = &current.trace().vector_search.as_ref().unwrap().partitions[0];
     assert_eq!(serving.hnsw_m, 24);
     assert!(serving.policy_revision > initial.policy_revision);
     let old = db
@@ -519,7 +509,7 @@ fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_p
     let directory = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(directory.path().join("online.redb")).unwrap());
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
- db.execute("CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(8) PARTITION_KEY (bucket) MAX_PARTITIONS 256 AUTO_INDEX_AT 1234 )", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(8) PARTITION_KEY (bucket) MAX_PARTITIONS 256 AUTO_INDEX_AT 1234 )", &HashMap::new()).unwrap();
     for id in 1..=200 {
         db.execute(
             "INSERT INTO items VALUES ($id, 0, $query)",
@@ -537,14 +527,14 @@ fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_p
         db.run_maintenance_cycle().unwrap();
     }
     db.execute(
- "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 7)",
+        "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 7)",
         &HashMap::new(),
     )
     .unwrap();
     let sql = "SELECT id FROM items WHERE bucket = 0 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
     let expected = ids(&bounded_query(&db, sql, &generated_vector(9000, 8)));
     db.execute(
- "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     )
     .unwrap();
@@ -569,7 +559,12 @@ fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_p
             .unwrap()
             .execute(sql, &parameters(&generated_vector(9000, 8)))
             .unwrap();
- reader.execute("ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 128)", &HashMap::new()).unwrap();
+        reader
+            .execute(
+                "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 128)",
+                &HashMap::new(),
+            )
+            .unwrap();
         sender.send(ids(&result)).unwrap();
     });
     let completed_before_release = receiver.recv_timeout(Duration::from_secs(5));

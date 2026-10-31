@@ -21,9 +21,9 @@ use contextdb_engine::{
     DirectRankPolicy, DirectReferencePropagation, DirectRetainPolicy, DirectRouteStatus,
     DirectScheduleStatus, DirectSchema, DirectSchemaColumn, DirectSchemaIndex,
     DirectScopeLabelKind, DirectSinkStatus, DirectStateMachine, DirectVectorQuantization,
-    MetadataBody, VectorPartitionDisclosure, VectorQuerySourceDisclosure,
-    VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
-    VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
+    MetadataBody, VectorPartitionDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,
+    VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchRouteEvidence,
+    VectorSearchScopeShape, VectorSearchTailState,
 };
 use std::collections::BTreeMap;
 

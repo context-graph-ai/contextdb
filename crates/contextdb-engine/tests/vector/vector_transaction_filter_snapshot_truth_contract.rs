@@ -309,7 +309,12 @@ fn drive_until_indexed(db: &Database, scope: Uuid) {
                 &mut partition_observation_owner_1,
             )
             .unwrap()
-            .is_some_and(|info| info.graph_available)
+            .is_some_and(|info| {
+                db.__debug_vector_partition_indexed_for_test(
+                    info.partition.index.clone(),
+                    info.partition.partition_key.clone(),
+                )
+            })
         {
             return;
         }
@@ -448,7 +453,7 @@ fn indexed_transaction_overlay_keeps_the_committed_graph_and_scores_only_staged_
     assert_eq!(
         db.__vector_full_index_entries_touched_for_test(),
         0,
- "SQL transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
+        "SQL transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
     );
 
     let mut semantic = SemanticQuery::new("vector_truth", "embedding", vec![1.0, 0.0, 0.0], 4);
@@ -465,7 +470,7 @@ fn indexed_transaction_overlay_keeps_the_committed_graph_and_scores_only_staged_
     assert_eq!(
         db.__vector_full_index_entries_touched_for_test(),
         0,
- "Rust transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
+        "Rust transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
     );
     db.rollback(tx)
         .expect("discard the explicit transaction after both public transaction doors");
@@ -591,7 +596,12 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
                 &mut partition_observation_owner_2,
             )
             .unwrap()
-            .is_some_and(|info| info.graph_available)
+            .is_some_and(|info| {
+                db.__debug_vector_partition_indexed_for_test(
+                    info.partition.index.clone(),
+                    info.partition.partition_key.clone(),
+                )
+            })
         {
             break;
         }
@@ -611,7 +621,10 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
                 &mut partition_observation_owner_3
             )
             .unwrap()
-            .is_some_and(|info| info.graph_available),
+            .is_some_and(|info| db.__debug_vector_partition_indexed_for_test(
+                info.partition.index.clone(),
+                info.partition.partition_key.clone()
+            )),
         "the tie fixture has a maintained committed route before staging its delta"
     );
 

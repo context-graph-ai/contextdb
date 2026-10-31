@@ -188,7 +188,7 @@ fn alter_auto_index_at(db: &Database, value: i64) {
 
 fn alter_hnsw(db: &Database, members: &str) {
     db.execute(
- &format!("ALTER TABLE revision_docs ALTER COLUMN embedding SET IVF DEFAULT"),
+        &format!("ALTER TABLE revision_docs ALTER COLUMN embedding SET IVF DEFAULT"),
         &empty(),
     )
     .expect("declared HNSW policy updates atomically");
@@ -556,9 +556,8 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
         );
         assert_eq!(column.vector_policy_revision, initial_revision as u64 + 1);
         assert!(
-            render_table_meta("revision_docs", &declared).contains(
-                "AUTO_INDEX_AT 1000 IVF (PROBES = 200)"
-            )
+            render_table_meta("revision_docs", &declared)
+                .contains("AUTO_INDEX_AT 1000 IVF (PROBES = 200)")
         );
         let vector_fixture_reader_1 = db
             .declared_reader_memory()
@@ -653,7 +652,7 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
             Some(serial)
         );
         db.execute(
- "ALTER TABLE revision_docs ALTER COLUMN embedding SET IVF DEFAULT",
+            "ALTER TABLE revision_docs ALTER COLUMN embedding SET IVF DEFAULT",
             &empty(),
         )
         .unwrap();

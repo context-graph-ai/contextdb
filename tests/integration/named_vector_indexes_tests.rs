@@ -317,7 +317,7 @@ fn nv03_update_one_column_invalidates_only_that_index() {
     assert_ne!(
         stale_hits.rows()[0][id_idx],
         Value::Uuid(id),
- "stale-vector probe must NOT return the updated row at top-1; HNSW must drop the old entry"
+        "stale-vector probe must NOT return the updated row at top-1; HNSW must drop the old entry"
     );
     let raw_stale_hits = db
         .query_vector(
@@ -2579,7 +2579,7 @@ fn nv_deferred_hnsw_build_per_index() {
     let vision_bytes_before = vision_bytes_before.unwrap();
     assert!(
         text_bytes_before >= text_payload_floor,
- "vector_text bytes must account for the stored vector payload before HNSW build; got {text_bytes_before}"
+        "vector_text bytes must account for the stored vector payload before HNSW build; got {text_bytes_before}"
     );
     assert!(
         vision_bytes_before >= vision_payload_floor,

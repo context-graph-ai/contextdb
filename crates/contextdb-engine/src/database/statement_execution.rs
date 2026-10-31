@@ -1812,15 +1812,16 @@ impl Database {
                 )
             })
             .transpose()?;
-        let uses_indexed = vector_inspection
-            .as_ref()
-            .is_some_and(|(disclosure, indexed_available)| {
-                matches!(
-                    disclosure.route,
-                    Some(VectorSearchRoute::Indexed | VectorSearchRoute::FilteredIndexed)
-                ) && disclosure.refusal.is_none()
-                    && *indexed_available
-            });
+        let uses_indexed =
+            vector_inspection
+                .as_ref()
+                .is_some_and(|(disclosure, indexed_available)| {
+                    matches!(
+                        disclosure.route,
+                        Some(VectorSearchRoute::Indexed | VectorSearchRoute::FilteredIndexed)
+                    ) && disclosure.refusal.is_none()
+                        && *indexed_available
+                });
         let vector_disclosure = vector_inspection.map(|(disclosure, _)| disclosure);
         if uses_indexed {
             physical_plan = annotate_vector_search_strategy(physical_plan, "Indexed");
@@ -2547,9 +2548,15 @@ impl Database {
         }
         let mut disclosure = Vec::new();
         let mut actual_position = 0usize;
-        let mut partitions = contextdb_vector::ScopedVectorCopy::new(vector_copy_owner, |scratch| {
-            self.vector_partition_infos_for_prefixes(index, prefixes, scratch, read_memory.clone())
-        })?;
+        let mut partitions =
+            contextdb_vector::ScopedVectorCopy::new(vector_copy_owner, |scratch| {
+                self.vector_partition_infos_for_prefixes(
+                    index,
+                    prefixes,
+                    scratch,
+                    read_memory.clone(),
+                )
+            })?;
         partitions.sort_by(|left, right| {
             left.partition
                 .partition_key
@@ -4001,7 +4008,9 @@ impl DeclaredIvfMembers {
 
 /// The one reason every disclosed partition shares, or the mixed marker.
 fn common_partition_reason(partitions: &[VectorPartitionDisclosure]) -> String {
-    let mut reasons = partitions.iter().filter_map(|partition| partition.reason.as_deref());
+    let mut reasons = partitions
+        .iter()
+        .filter_map(|partition| partition.reason.as_deref());
     match reasons.next() {
         Some(first) if reasons.all(|reason| reason == first) => first.to_owned(),
         Some(_) => "mixed_partition_routes".to_owned(),

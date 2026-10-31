@@ -123,7 +123,7 @@ fn settle(db: &Database) {
 
 fn breadth(db: &Database, breadth: usize) {
     db.execute(
- &format!("ALTER TABLE grouped ALTER COLUMN embedding SET IVF (PROBES = {breadth})"),
+        &format!("ALTER TABLE grouped ALTER COLUMN embedding SET IVF (PROBES = {breadth})"),
         &HashMap::new(),
     )
     .expect("declare the breadth");

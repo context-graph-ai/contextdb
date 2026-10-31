@@ -33,11 +33,7 @@ impl SearchReceiptState {
         };
     }
 
-    pub(super) fn finish_step(
-        &mut self,
-        exact: u64,
-        complete: bool,
-    ) {
+    pub(super) fn finish_step(&mut self, exact: u64, complete: bool) {
         let Self::Active(receipt) = self else {
             return;
         };

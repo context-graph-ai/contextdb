@@ -658,7 +658,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
 
     // Leg 3 -- hub declares HNSW and AUTO_INDEX_AT.
     hub.execute(
- "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 128)",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 128)",
         &empty(),
     )
     .expect("declare HNSW policy on the hub");
@@ -755,7 +755,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     )
     .expect("desired_policy_revision is always populated");
     hub.execute(
- "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 200)",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 200)",
         &empty(),
     )
     .expect("declare an EF_SEARCH-only change on the hub");
@@ -782,7 +782,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
 
     // Leg 8 -- clearing replicates.
     hub.execute(
- "ALTER TABLE docs ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
     .expect("clear the HNSW declaration on the hub");

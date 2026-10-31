@@ -21,14 +21,17 @@ pub use memory_budget::{
 pub use memory_budget::{ScopedVectorCopy, scoped_index_layout};
 pub use quantized::{stored_vector_resident_bytes, stored_vector_value};
 #[doc(hidden)]
+pub use store::VectorMemoryOwnershipSnapshot;
+#[doc(hidden)]
 pub use store::VectorPartitionSourceMaintenanceMetadata;
 pub use store::{
     OwnedPartitionedVectorEntries, PartitionedVectorDelete, PartitionedVectorEntry,
     PartitionedVectorMove, PreparedLoadedVectorReplacement, PreparedPartitionedVectorBatch,
     PreparedVectorPolicyLayout, PreparedVectorPublication, PreparedVectorTablePublication,
-    VectorIndexInfo, VectorIndexLayout, VectorIndexLayoutInfo,
-    VectorMaintenanceFailure, VectorMaintenanceFailureDetails, VectorMaintenanceReport, VectorMembershipProvenance, VectorPartitionInfo, VectorPartitionRef,
-    VectorStore, VectorTeardownReceipt, VectorVersionIdentity,
+    VectorIndexInfo, VectorIndexLayout, VectorIndexLayoutInfo, VectorMaintenanceFailure,
+    VectorMaintenanceFailureDetails, VectorMaintenanceReport, VectorMembershipProvenance,
+    VectorPartitionInfo, VectorPartitionRef, VectorStore, VectorTeardownReceipt,
+    VectorVersionIdentity,
 };
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
@@ -43,8 +46,6 @@ pub use store::{
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub use store::{VectorMaintenanceProgressPauseHandle, VectorPassiveActivityCounters};
-#[doc(hidden)]
-pub use store::VectorMemoryOwnershipSnapshot;
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]

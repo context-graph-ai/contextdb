@@ -373,7 +373,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         &HashMap::new(),
     )
     .unwrap();
- db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) AUTO_INDEX_AT 1 IVF (PROBES = 17) RANK_POLICY (JOIN outcomes ON item_id, FORMULA 'coalesce({weight}, 0.0)', SORT_KEY priority))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) AUTO_INDEX_AT 1 IVF (PROBES = 17) RANK_POLICY (JOIN outcomes ON item_id, FORMULA 'coalesce({weight}, 0.0)', SORT_KEY priority))", &HashMap::new()).unwrap();
     for id in 1..=3 {
         let vector = match id {
             1 => vec![1.0, 0.0],
@@ -416,7 +416,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
     assert_eq!(bounded_ids(&db, sql, bound.clone()), vec![3]);
     assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     db.execute(
- "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 1)",
+        "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 1)",
         &HashMap::new(),
     )
     .unwrap();
@@ -450,7 +450,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
     );
     semantic.search_mode = None;
     db.execute(
- "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 17)",
+        "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 17)",
         &HashMap::new(),
     )
     .unwrap();
@@ -486,7 +486,7 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
     options.owner_reads.limits.limits.memory = 64 * 1024 * 1024;
     let db = Database::open_with_options(root.path().join("history.db"), options).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
- db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, is_current BOOLEAN, embedding VECTOR(2) AUTO_INDEX_AT 1 IVF (PROBES = 17))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, is_current BOOLEAN, embedding VECTOR(2) AUTO_INDEX_AT 1 IVF (PROBES = 17))", &HashMap::new()).unwrap();
     db.execute(
         "CREATE INDEX current_items ON items(is_current)",
         &HashMap::new(),

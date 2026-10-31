@@ -63,7 +63,7 @@ fn nearest(db: &Database, target: i64) -> Vec<Vec<Value>> {
 /// and never absorbed into the saved index.
 fn suffix_store(path: &std::path::Path, suffix: i64) {
     let db = open(path);
- db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 256) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
+    db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 256) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
     for id in 0..16i64 {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $v)",

@@ -1,7 +1,6 @@
 use super::*;
 
 impl RedbPersistence {
-
     /// Publish a completed checkpoint as a fresh physical database
     /// incarnation. The checkpoint bytes are a snapshot of the source, but
     /// its adjacent companion and authoritative-erasure fence belong only to

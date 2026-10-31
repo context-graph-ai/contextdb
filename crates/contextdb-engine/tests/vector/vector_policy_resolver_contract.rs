@@ -180,7 +180,7 @@ fn declared_fixture(db: &Database) {
         &empty(),
     )
     .expect(
- "vector declarations accept independently declared aggregate AUTO_INDEX_AT and HNSW policy",
+        "vector declarations accept independently declared aggregate AUTO_INDEX_AT and HNSW policy",
     );
 }
 

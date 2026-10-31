@@ -102,7 +102,14 @@ fn drive_maintenance_until_ready(db: &Database, expected_partitions: usize) {
             .vector_store_for_test()
             .partition_infos(&index(), &mut partition_observation_owner_1)
             .unwrap();
-        if infos.len() == expected_partitions && infos.iter().all(|info| info.graph_available) {
+        if infos.len() == expected_partitions
+            && infos.iter().all(|info| {
+                db.__debug_vector_partition_indexed_for_test(
+                    info.partition.index.clone(),
+                    info.partition.partition_key.clone(),
+                )
+            })
+        {
             return;
         }
         db.run_maintenance_cycle()
@@ -945,7 +952,13 @@ fn drive_maintenance_until_ready_for_indices(
                 .vector_store_for_test()
                 .partition_infos(index, &mut partition_observation_owner_2)
                 .unwrap();
-            infos.len() == expected_partitions && infos.iter().all(|info| info.graph_available)
+            infos.len() == expected_partitions
+                && infos.iter().all(|info| {
+                    db.__debug_vector_partition_indexed_for_test(
+                        info.partition.index.clone(),
+                        info.partition.partition_key.clone(),
+                    )
+                })
         });
         if ready {
             return;
@@ -1419,7 +1432,12 @@ fn composite_strict_range_fixture() -> (Database, Uuid) {
             .partition_infos(&vector_index, &mut partition_observation_owner_3)
             .expect("inspect the unpartitioned vector route")
             .iter()
-            .any(|info| info.graph_available)
+            .any(|info| {
+                db.__debug_vector_partition_indexed_for_test(
+                    info.partition.index.clone(),
+                    info.partition.partition_key.clone(),
+                )
+            })
         {
             return (db, allowed_context);
         }
@@ -1604,7 +1622,12 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
                         )
                         .expect("inspect one unpartitioned vector route")
                         .iter()
-                        .any(|info| info.graph_available)
+                        .any(|info| {
+                            db.__debug_vector_partition_indexed_for_test(
+                                info.partition.index.clone(),
+                                info.partition.partition_key.clone(),
+                            )
+                        })
                 });
             if all_ready {
                 break;

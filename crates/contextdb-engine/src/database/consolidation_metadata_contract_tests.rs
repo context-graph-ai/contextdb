@@ -737,15 +737,18 @@ fn seed_with_saved_graphs(db: &Database, rows: usize, saved_graphs: bool) -> Vec
     record_authored(db, &mut after, &mut units);
     if !saved_graphs {
         assert!(
-            graphs(db).iter().all(|(generation, _)| generation.is_none()),
+            graphs(db)
+                .iter()
+                .all(|(generation, _)| generation.is_none()),
             "the pre-query control must not have a published clustered index"
         );
         return units;
     }
     for _ in 0..8 {
-        if ["embedding", "compressed"].iter().all(|name| {
-            db.__debug_vector_indexed_available_for_test(index(name))
-        }) {
+        if ["embedding", "compressed"]
+            .iter()
+            .all(|name| db.__debug_vector_indexed_available_for_test(index(name)))
+        {
             return units;
         }
         db.run_maintenance_cycle().unwrap();

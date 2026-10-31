@@ -5,7 +5,11 @@ fn writer() -> (tempfile::TempDir, RedbPersistence) {
     let path = directory.path().join("purge-errors.db");
     let seed = crate::Database::open(&path).unwrap();
     seed.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
- seed.execute("CREATE TABLE items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED )", &HashMap::new()).unwrap();
+    seed.execute(
+        "CREATE TABLE items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED )",
+        &HashMap::new(),
+    )
+    .unwrap();
     for id in 0..4 {
         seed.execute(
             "INSERT INTO items VALUES ($id, '[1,0,0]')",

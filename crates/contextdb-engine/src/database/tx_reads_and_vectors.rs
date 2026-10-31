@@ -4183,7 +4183,11 @@ impl Database {
                 read_memory.clone(),
             )?;
             let whole_pool = Self::rank_policy_candidate_k(entry_count, query.limit, true);
-            let internal_k = Self::rank_policy_candidate_k(entry_count, query.limit, search_mode == contextdb_core::VectorSearchMode::Exact);
+            let internal_k = Self::rank_policy_candidate_k(
+                entry_count,
+                query.limit,
+                search_mode == contextdb_core::VectorSearchMode::Exact,
+            );
             let (mut raw, mut trace) =
                 contextdb_vector::mem::with_search_policy_limit(query.limit, || {
                     self.query_vector_strict_in_tx_with_strategy(
@@ -4200,10 +4204,9 @@ impl Database {
                     )
                 })?;
             if search_mode == contextdb_core::VectorSearchMode::Auto
-                && !trace
-                    .partition_routes
-                    .iter()
-                    .any(|route| route.route == contextdb_vector::VectorPartitionSearchRoute::Indexed)
+                && !trace.partition_routes.iter().any(|route| {
+                    route.route == contextdb_vector::VectorPartitionSearchRoute::Indexed
+                })
                 && internal_k < whole_pool
                 && raw.len() >= internal_k
             {
@@ -5752,9 +5755,14 @@ impl Database {
     fn native_partition_inspections_for_test(
         &self,
         index: &VectorIndexRef,
-    ) -> Vec<(usize, Option<crate::persistence::vector_ivf::inspection::Inspection>)> {
+    ) -> Vec<(
+        usize,
+        Option<crate::persistence::vector_ivf::inspection::Inspection>,
+    )> {
         let _operation = self.assert_open_operation();
-        let read_memory = self.declared_reader_memory().expect("declared reader memory");
+        let read_memory = self
+            .declared_reader_memory()
+            .expect("declared reader memory");
         let mut owner = crate::vector_read_memory::admission(read_memory.clone());
         let partitions = self
             .vector_store
@@ -5799,7 +5807,9 @@ impl Database {
         partition: VectorPartitionKey,
     ) -> Option<u64> {
         let _operation = self.assert_open_operation();
-        let read_memory = self.declared_reader_memory().expect("declared reader memory");
+        let read_memory = self
+            .declared_reader_memory()
+            .expect("declared reader memory");
         self.native_ivf_inspection(&index, &partition, read_memory, &|| Ok(()))
             .expect("native inspection")
             .and_then(|native| native.manifest)
@@ -5816,7 +5826,9 @@ impl Database {
         partition: VectorPartitionKey,
     ) -> bool {
         let _operation = self.assert_open_operation();
-        let read_memory = self.declared_reader_memory().expect("declared reader memory");
+        let read_memory = self
+            .declared_reader_memory()
+            .expect("declared reader memory");
         self.native_ivf_inspection(&index, &partition, read_memory, &|| Ok(()))
             .expect("native inspection")
             .is_some_and(|native| native.available())

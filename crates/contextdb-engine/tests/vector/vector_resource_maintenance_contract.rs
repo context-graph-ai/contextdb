@@ -14,7 +14,7 @@ use std::{
 fn seed(db: &Database, scopes: usize, m: usize) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let max_partitions = scopes.max(3);
- db.execute(&format!("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS {max_partitions} SEARCH_MODE INDEXED )"), &HashMap::new()).unwrap();
+    db.execute(&format!("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS {max_partitions} SEARCH_MODE INDEXED )"), &HashMap::new()).unwrap();
     for scope in 0..scopes {
         for row in 0..16 {
             db.execute(

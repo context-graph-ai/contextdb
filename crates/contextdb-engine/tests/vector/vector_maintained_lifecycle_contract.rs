@@ -480,7 +480,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
     let inserted = nearest_ids(&db, "lifecycle_items", "embedding_primary", axis(1), 1);
     assert_eq!(inserted, vec![Uuid::from_u128(SENTINEL_ID)]);
     let after_insert_search = graph_serial(&db, &primary)
- .expect("the inserted vector remains searchable through an HNSW route");
+        .expect("the inserted vector remains searchable through an HNSW route");
     record_contract(
         &mut failures,
         after_insert_search == primary_serial,

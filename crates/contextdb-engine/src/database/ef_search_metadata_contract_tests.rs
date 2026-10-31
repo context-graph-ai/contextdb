@@ -27,7 +27,7 @@ fn run(db: &Database, sql: &str) {
 fn alter(db: &Database, members: &str) {
     run(
         db,
- &format!("ALTER TABLE breadth_rows ALTER COLUMN embedding SET HNSW {members}"),
+        &format!("ALTER TABLE breadth_rows ALTER COLUMN embedding SET HNSW {members}"),
     );
 }
 fn column(db: &Database) -> contextdb_core::ColumnDef {
@@ -558,7 +558,7 @@ async fn received_metadata_only_alters_archive_and_rewrite_no_row_population() {
     source.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     run(
         &source,
- "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED IVF (PROBES = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+        "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED IVF (PROBES = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
     );
     for id in 1..=24i64 {
         let x = id as f32;
@@ -585,8 +585,8 @@ async fn received_metadata_only_alters_archive_and_rewrite_no_row_population() {
     let authored = authored_rows(&edge);
     assert_eq!(authored.len(), 25, "24 inserts and one replacement arrived");
     for statement in [
- "ALTER TABLE breadth_rows ALTER COLUMN embedding SET IVF (PROBES = 11)",
- "ALTER TABLE breadth_rows ALTER COLUMN compressed SET IVF (PROBES = 11)",
+        "ALTER TABLE breadth_rows ALTER COLUMN embedding SET IVF (PROBES = 11)",
+        "ALTER TABLE breadth_rows ALTER COLUMN compressed SET IVF (PROBES = 11)",
         "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 11)",
     ] {
         let archived = archived_body_count(&edge);
@@ -839,15 +839,18 @@ fn seed_with_saved_graphs(db: &Database, rows: usize, saved_graphs: bool) -> Vec
     record_authored(db, &mut after, &mut units);
     if !saved_graphs {
         assert!(
-            graphs(db).iter().all(|(generation, _)| generation.is_none()),
+            graphs(db)
+                .iter()
+                .all(|(generation, _)| generation.is_none()),
             "the pre-query control must not have a published clustered index"
         );
         return units;
     }
     for _ in 0..8 {
-        if ["embedding", "compressed"].iter().all(|name| {
-            db.__debug_vector_indexed_available_for_test(index(name))
-        }) {
+        if ["embedding", "compressed"]
+            .iter()
+            .all(|name| db.__debug_vector_indexed_available_for_test(index(name)))
+        {
             return units;
         }
         db.run_maintenance_cycle().unwrap();

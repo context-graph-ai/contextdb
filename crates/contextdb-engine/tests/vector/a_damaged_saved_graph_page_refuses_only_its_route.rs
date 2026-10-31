@@ -58,7 +58,12 @@ fn graph_ready(db: &Database, scope: Uuid) -> bool {
     db.vector_store_for_test()
         .partition_info(&partition.index, &partition.partition_key, &mut owner)
         .unwrap()
-        .is_some_and(|info| info.graph_available)
+        .is_some_and(|info| {
+            db.__debug_vector_partition_indexed_for_test(
+                info.partition.index.clone(),
+                info.partition.partition_key.clone(),
+            )
+        })
 }
 
 fn seed(path: &std::path::Path) {

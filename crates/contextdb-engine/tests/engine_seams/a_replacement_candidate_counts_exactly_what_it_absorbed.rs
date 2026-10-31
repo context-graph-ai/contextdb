@@ -62,7 +62,7 @@ fn later(id: i64) -> Vec<f32> {
 /// queued over it; nothing committed after the replacement's frontier yet.
 fn queued_replacement(path: &std::path::Path) -> Database {
     let db = Database::open_with_options(path, options()).unwrap();
- db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
     for id in 0..16 {
         insert(&db, id, vec![0.0, 1.0, id as f32 + 1.0]);
     }

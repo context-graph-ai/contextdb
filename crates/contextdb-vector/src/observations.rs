@@ -8,8 +8,7 @@ pub struct VectorBacklog {
     pub inserts: usize,
     pub tombstones: usize,
 }
-impl VectorBacklog {
-}
+impl VectorBacklog {}
 
 #[derive(Clone, Debug)]
 pub struct VectorBasePublicationEvent {

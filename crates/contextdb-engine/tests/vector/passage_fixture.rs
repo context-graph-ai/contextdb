@@ -181,7 +181,7 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path, rows: usize) {
             .vector_store_for_test()
             .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
-        if !ready.is_empty() && ready.iter().all(|partition| partition.graph_available) {
+        if !ready.is_empty() && ready.iter().all(|partition| db.__debug_vector_partition_indexed_for_test(partition.partition.index.clone(), partition.partition.partition_key.clone())) {
             break;
         }
     }

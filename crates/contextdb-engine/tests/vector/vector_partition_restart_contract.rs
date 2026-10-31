@@ -88,7 +88,12 @@ fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
     db.vector_store_for_test()
         .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
         .unwrap()
-        .map(|info| info.graph_available)
+        .map(|info| {
+            db.__debug_vector_partition_indexed_for_test(
+                info.partition.index.clone(),
+                info.partition.partition_key.clone(),
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -465,7 +470,7 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_lang_partitioned_table(&db);
     db.execute(
- "ALTER TABLE restart_items ALTER COLUMN embedding SET IVF (PROBES = 200)",
+        "ALTER TABLE restart_items ALTER COLUMN embedding SET IVF (PROBES = 200)",
         &empty(),
     )
     .expect("keep the filtered restart fixture wider than its graph search breadth");

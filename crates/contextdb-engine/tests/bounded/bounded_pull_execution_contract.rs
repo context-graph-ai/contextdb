@@ -1712,7 +1712,8 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     );
     if case.uses_hnsw {
         assert!(
-            case.db.__debug_last_query_vector_used_indexed_route_for_test(),
+            case.db
+                .__debug_last_query_vector_used_indexed_route_for_test(),
             "{} reaches the HNSW candidate loop rather than the brute-force fallback",
             case.name
         );
@@ -1958,7 +1959,7 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     // state, never erase this index-owned cache to make accounting balance.
     let hnsw_sql = "SELECT id FROM matrix_hnsw_vectors ORDER BY embedding <=> $query \
                     USE VECTOR INDEXED LIMIT 5";
- db.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
+    db.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
         .expect("prebuild persistent HNSW state outside the bounded request");
     assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     let hnsw_trace = db
@@ -2023,7 +2024,7 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             uses_hnsw: false,
         },
         ExactLimitMatrixCase {
- name: "HNSW vector candidates",
+            name: "HNSW vector candidates",
             db: &db,
             sql: hnsw_sql,
             params: params([("query", Value::Vector(vector_for(0)))]),

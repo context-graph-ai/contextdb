@@ -371,7 +371,14 @@ fn grouping_fixture(partitions: usize) -> Database {
                 &mut partition_observation_owner_1,
             )
             .expect("inspect grouping partition readiness");
-        if ready.len() == partitions && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == partitions
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             return db;
         }
     }
@@ -519,7 +526,12 @@ fn score_fixture() -> (tempfile::TempDir, Database) {
                 .partition_infos(&index, &mut partition_observation_owner_2)
                 .is_ok_and(|partitions| {
                     partitions.len() == SCORE_PARTITIONS
-                        && partitions.iter().all(|partition| partition.graph_available)
+                        && partitions.iter().all(|partition| {
+                            db.__debug_vector_partition_indexed_for_test(
+                                partition.partition.index.clone(),
+                                partition.partition.partition_key.clone(),
+                            )
+                        })
                 })
         }) {
             break;
@@ -539,7 +551,12 @@ fn score_fixture() -> (tempfile::TempDir, Database) {
             .expect("inspect score graph partitions");
         assert_eq!(partitions.len(), SCORE_PARTITIONS);
         assert!(
-            partitions.iter().all(|partition| partition.graph_available),
+            partitions
+                .iter()
+                .all(|partition| db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone()
+                )),
             "every {column} base partition must be graph-ready before adding a fresh tail"
         );
     }

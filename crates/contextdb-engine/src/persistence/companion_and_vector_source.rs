@@ -719,8 +719,7 @@ pub(super) fn digest_redb_table<K: RedbKey + 'static, V: RedbValue + 'static>(
     Ok(count)
 }
 
-impl RetainedReadSource {
-}
+impl RetainedReadSource {}
 impl std::fmt::Display for IndexValidationFailure<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "durable index {} posting ", self.declaration.name)?;

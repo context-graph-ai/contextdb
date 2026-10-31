@@ -433,7 +433,7 @@ fn explain_reports_the_route_forced_exact_mode_the_query_actually_took() {
 fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition() {
     let db = partitioned_fixture("AUTO");
     db.execute(
- "ALTER TABLE vector_docs ALTER COLUMN embedding SET IVF (PROBES = 500)",
+        "ALTER TABLE vector_docs ALTER COLUMN embedding SET IVF (PROBES = 500)",
         &empty(),
     )
     .expect("declare the breadth whose per-partition exact choice this contract proves");
@@ -878,7 +878,7 @@ fn filtered_many_partition_search_reuses_partition_local_candidates() {
 fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() {
     let db = partitioned_fixture("AUTO");
     db.execute(
- "ALTER TABLE vector_docs ALTER COLUMN embedding SET IVF (PROBES = 200)",
+        "ALTER TABLE vector_docs ALTER COLUMN embedding SET IVF (PROBES = 200)",
         &empty(),
     )
     .expect("keep each healthy fixture partition wider than its graph search breadth");

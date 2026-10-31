@@ -225,10 +225,10 @@ fn partial_alters_member_defaults_and_group_defaults_change_only_the_declared_po
     .expect("declare an explicit complete policy");
 
     db.execute(
- "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
- .expect("partial HNSW ALTER keeps omitted members");
+    .expect("partial HNSW ALTER keeps omitted members");
     let partial = schema(&db, "policy_items");
     assert!(
         partial.contains("IVF (PROBES = 211)"),
@@ -236,14 +236,13 @@ fn partial_alters_member_defaults_and_group_defaults_change_only_the_declared_po
     );
 
     db.execute(
- "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF (PROBES = DEFAULT)",
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF (PROBES = DEFAULT)",
         &empty(),
     )
     .expect("a member DEFAULT clears only that member");
     let member_default = schema(&db, "policy_items");
     assert!(
-        member_default.contains("")
-            && !member_default.contains("EF_SEARCH"),
+        member_default.contains("") && !member_default.contains("EF_SEARCH"),
         "member DEFAULT leaves the other declared members intact: {member_default}"
     );
 
@@ -257,7 +256,7 @@ fn partial_alters_member_defaults_and_group_defaults_change_only_the_declared_po
         "the default crossover is rendered as silence"
     );
     db.execute(
- "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
     .expect("HNSW DEFAULT clears the entire declared group");
@@ -284,10 +283,10 @@ fn invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection
         "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT 0",
         "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT -1",
         "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT 18446744073709551616",
- "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
- "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
- "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
- "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+        "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
     ] {
         let error = db
             .execute(sql, &empty())
@@ -328,10 +327,7 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
             "AUTO_INDEX_AT 4294967296".to_owned(),
             Issue::AutoIndexAtOutOfRange,
         ),
-        (
-            "".to_owned(),
-            Issue::EfConstructionBelowM,
-        ),
+        ("".to_owned(), Issue::EfConstructionBelowM),
     ];
     for member in ["M", "EF_CONSTRUCTION", "EF_SEARCH"] {
         for (value, issue) in [
@@ -347,10 +343,7 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
         // Each partial policy is valid in the small profile but invalid in
         // another profile, even though the new column currently has no rows.
         let ef = if quantization == "F32" { 20 } else { 10 };
-        cases.push((
-            format!(""),
-            Issue::EfConstructionBelowM,
-        ));
+        cases.push((format!(""), Issue::EfConstructionBelowM));
         for (policy, expected_issue) in cases {
             let vector = format!("VECTOR(3) WITH (quantization = '{quantization}') {policy}");
             for (table, sql) in [
@@ -391,8 +384,8 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
         }
     }
     for sql in [
- "CREATE TABLE create_policy (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 4294967295 IVF (PROBES = 4294967295))",
- "ALTER TABLE add_policy ADD COLUMN embedding VECTOR(3) AUTO_INDEX_AT 4294967295 IVF (PROBES = 4294967295)",
+        "CREATE TABLE create_policy (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 4294967295 IVF (PROBES = 4294967295))",
+        "ALTER TABLE add_policy ADD COLUMN embedding VECTOR(3) AUTO_INDEX_AT 4294967295 IVF (PROBES = 4294967295)",
     ] {
         db.execute(sql, &empty())
             .expect("the persisted u32 maximum has no smaller private policy cap");

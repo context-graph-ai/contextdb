@@ -1125,7 +1125,9 @@ fn assert_full_selected_absence_after_reopen(
 /// already uses, and `USE VECTOR INDEXED` refuses instead of scanning.
 fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
     let index = VectorIndexRef::new(NOTES, "embedding");
-    let builds_before = db.__vector_passive_activity_counters_for_test().index_builds;
+    let builds_before = db
+        .__vector_passive_activity_counters_for_test()
+        .index_builds;
     let serial_before = db.__debug_vector_index_generation_for_test(index.clone());
     db.__reset_last_query_vector_trace_for_test();
     let result = db
@@ -1134,7 +1136,9 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
             &HashMap::new(),
         )
         .expect("public INDEXED coverage query");
-    let builds_after = db.__vector_passive_activity_counters_for_test().index_builds;
+    let builds_after = db
+        .__vector_passive_activity_counters_for_test()
+        .index_builds;
     let serial_after = db.__debug_vector_index_generation_for_test(index);
     assert_eq!(
         builds_after, builds_before,
@@ -1363,8 +1367,7 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     // HnswIndex::len documents vector count. The durable-pages arm currently
     // counts points; that production defect must not weaken this N-1 oracle.
     assert_eq!(
-        after_notes.indexed_available,
-        before.indexed_available,
+        after_notes.indexed_available, before.indexed_available,
         "logical vector membership loses exactly the erased row, including shared representations"
     );
     let indexed_after = indexed_note_coverage(&seed.db);

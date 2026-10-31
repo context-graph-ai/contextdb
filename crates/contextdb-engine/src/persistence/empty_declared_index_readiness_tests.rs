@@ -3236,15 +3236,7 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
                 let durable = std::cell::Cell::new(false);
                 arm_currency_reclaim_fault_for_test(boundary, false);
                 let error = store
-                    .prune_currency_scoped(
-                        &[],
-                        &removed,
-                        &[],
-                        &[],
-                        &durable,
-                        &[],
-                        None,
-                    )
+                    .prune_currency_scoped(&[], &removed, &[], &[], &durable, &[], None)
                     .unwrap_err();
                 assert!(
                     matches!(error, Error::Other(ref message) if message == "injected currency cleanup failure")

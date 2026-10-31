@@ -16,13 +16,13 @@ use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorEntry, VectorIndexRef, VectorPartitionKey,
     VectorQuantization, VectorSearchMode,
 };
-use parking_lot::{Mutex, RwLock};
 #[cfg(any(test, feature = "test-seams"))]
 use parking_lot::Condvar;
-#[cfg(any(test, feature = "test-seams"))]
-use std::sync::OnceLock;
+use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(any(test, feature = "test-seams"))]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -8481,11 +8481,9 @@ impl PreparedVectorPublication {
             total.saturating_add(column.raw_allocation_bytes_matching(preserved))
         })
     }
-
 }
 
-impl PreparedVectorPublication {
-}
+impl PreparedVectorPublication {}
 
 /// A prepared purge publication can own HNSW graphs before the durable commit.
 /// If that commit never happens, release those precharged graphs with the
@@ -9752,10 +9750,7 @@ impl VectorStore {
     /// publication. Any outgoing HNSW graph is retired here, after the
     /// replacement is visible, through its existing vector allocation owner.
     /// Preserved state owners continue; engine settlement excludes both.
-    pub fn publish_prepared_received_schema(
-        &self,
-        publication: PreparedVectorPublication,
-    ) {
+    pub fn publish_prepared_received_schema(&self, publication: PreparedVectorPublication) {
         self.registry.assert_not_renaming();
         let _bulk = self.bulk_gate.write();
         let (
@@ -10327,10 +10322,7 @@ impl VectorStore {
     /// partitions; only its declared policy changes. If the index
     /// was replaced since preparation, the prepared change is dropped and
     /// its admitted growth returned.
-    pub fn publish_policy_layout_update(
-        &self,
-        prepared: PreparedVectorPolicyLayout,
-    ) {
+    pub fn publish_policy_layout_update(&self, prepared: PreparedVectorPolicyLayout) {
         self.with_bulk_maintenance(|| {
             let PreparedVectorPolicyLayout {
                 index,
@@ -10575,8 +10567,7 @@ impl VectorStore {
                 &layout,
                 owner,
             )?;
-            if info.pending_inserts != 0 || info.tombstones != 0
-            {
+            if info.pending_inserts != 0 || info.tombstones != 0 {
                 // The cap-time sweep has no authority to discard an
                 // untouched route's pending durability or repair work.
                 return Ok(false);
@@ -12082,10 +12073,7 @@ impl VectorStore {
 
     /// Remove a registry identity without reading or copying any raw body.
     /// Safe after durable commit and from cleanup: no admission can fail.
-    pub fn teardown_index_without_copy(
-        &self,
-        index: &VectorIndexRef,
-    ) -> VectorTeardownReceipt {
+    pub fn teardown_index_without_copy(&self, index: &VectorIndexRef) -> VectorTeardownReceipt {
         self.with_bulk_maintenance(|| {
             let mut receipt = VectorTeardownReceipt::default();
             if let Some(column) = self.registry.write().remove(index) {
@@ -12095,10 +12083,7 @@ impl VectorStore {
         })
     }
 
-    pub fn teardown_table_without_copy(
-        &self,
-        table: &str,
-    ) -> VectorTeardownReceipt {
+    pub fn teardown_table_without_copy(&self, table: &str) -> VectorTeardownReceipt {
         self.with_bulk_maintenance(|| {
             let mut receipt = VectorTeardownReceipt::default();
             let mut registry = self.registry.write();
@@ -12110,9 +12095,7 @@ impl VectorStore {
         })
     }
 
-    pub fn teardown_all_without_copy(
-        &self,
-    ) -> VectorTeardownReceipt {
+    pub fn teardown_all_without_copy(&self) -> VectorTeardownReceipt {
         self.with_bulk_maintenance(|| {
             let mut receipt = VectorTeardownReceipt::default();
             let mut registry = self.registry.write();
@@ -16712,8 +16695,7 @@ impl VectorStore {
                          release: &mut _,
                          owner: &mut VectorCopyAdmission| {
                 state.bounded_score_visible_candidate(
-                    index, row_id, snapshot, query, checkpoint, distance, retain, release,
-                    owner,
+                    index, row_id, snapshot, query, checkpoint, distance, retain, release, owner,
                 )
             };
             column.with_snapshot_visible_partition_for_row(
@@ -17265,9 +17247,7 @@ impl VectorStore {
         self.memory_ownership_snapshot()
     }
 
-    fn memory_ownership_snapshot(
-        &self,
-    ) -> VectorMemoryOwnershipSnapshot {
+    fn memory_ownership_snapshot(&self) -> VectorMemoryOwnershipSnapshot {
         let registry = self.registry.read();
         let components = Self::partition_vector_components(&registry);
         let mut receipt = VectorMemoryOwnershipSnapshot {
@@ -20496,4 +20476,3 @@ mod reverse_probe_lifetime_tests {
 
 #[cfg(test)]
 mod page_cache_budget_tests;
-

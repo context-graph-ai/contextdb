@@ -218,7 +218,13 @@ fn seed(db: &Database, extra_tail: usize) {
                 .vector_store_for_test()
                 .partition_infos(&index(), &mut partition_observation_owner_1)
                 .expect("inspect partition readiness");
-            ready.len() == contexts && ready.iter().all(|info| info.graph_available)
+            ready.len() == contexts
+                && ready.iter().all(|info| {
+                    db.__debug_vector_partition_indexed_for_test(
+                        info.partition.index.clone(),
+                        info.partition.partition_key.clone(),
+                    )
+                })
         },
         "every Context saves its base graph",
     );

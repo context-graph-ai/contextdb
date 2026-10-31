@@ -352,7 +352,7 @@ async fn a_synced_hnsw_topology_change_serves_the_old_graph_until_maintenance_re
     );
     synced
         .alter(
- "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW \
+            "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW \
              (M = 24, EF_CONSTRUCTION = 300)",
         )
         .await;
@@ -401,7 +401,7 @@ async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receive
             "auto_index_at",
         ),
         (
- "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW \
+            "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW \
              (M = 24, EF_CONSTRUCTION = 300)",
             "hnsw",
         ),

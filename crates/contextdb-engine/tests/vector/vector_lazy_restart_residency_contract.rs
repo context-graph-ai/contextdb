@@ -103,7 +103,12 @@ fn graph_ready(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
     db.vector_store_for_test()
         .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
         .unwrap()
-        .is_some_and(|info| info.graph_available)
+        .is_some_and(|info| {
+            db.__debug_vector_partition_indexed_for_test(
+                info.partition.index.clone(),
+                info.partition.partition_key.clone(),
+            )
+        })
 }
 
 fn drive_maintenance_until_all_ready(db: &Database, scopes: &[Uuid]) {
