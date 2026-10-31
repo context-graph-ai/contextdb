@@ -273,11 +273,6 @@
           "features": "test-seams"
         },
         {
-          "shard": "contextdb-hnsw",
-          "crate": "contextdb-hnsw",
-          "features": ""
-        },
-        {
           "shard": "contextdb-graph",
           "crate": "contextdb-graph",
           "features": ""
@@ -703,7 +698,6 @@
         "crates/contextdb-parser/Cargo.toml": "e81967ac9c9a952109e1e89910becd9f564518e567d19ecaab482f16ec273803",
         "crates/contextdb-cli/Cargo.toml": "1cca1d7366bc6ad8617c280d0bc212341f3a7d206056b5d78f21c180c6d421f5",
         "crates/contextdb-redb/Cargo.toml": "09d70a86b93d5cda70b70ea9de622a17ec31f9b5a5f817640dded027b56c43b6",
-        "crates/contextdb-hnsw/Cargo.toml": "4d6d6f75aceef642a3189a9960a7c562de33dab731350e42f33d0eaa98c727d7",
         "crates/contextdb-server/Cargo.toml": "62c118e3550329e5207a16d0c12b843c4cbf64e559cc6474943fd0406f5c7d4b",
         "crates/contextdb-tx/Cargo.toml": "8bf191f7fb44f8f2d594bd12c89f8bf11b9afa48fb867f16813c4caf02451e33",
         "crates/contextdb-engine/Cargo.toml": "f999f5901b5d6bdf64048ca0df48eb91e086478707f73850213ffc98605c3917",
@@ -1213,10 +1207,6 @@
         "cases": [
           [
             "vector_policy_declaration_contract::create_and_add_column_declarations_render_inspect_and_survive_reopen_and_export",
-            "ok"
-          ],
-          [
-            "vector_policy_declaration_contract::full_width_hnsw_m_builds_reloads_and_accounts_at_255_256_and_257",
             "ok"
           ],
           [
@@ -2825,18 +2815,6 @@
             "ok"
           ],
           [
-            "hnsw_rebuild_determinism_tests::consecutive_hnsw_builds_within_one_open_database_are_stable",
-            "ok"
-          ],
-          [
-            "hnsw_rebuild_determinism_tests::hnsw_build_invariant_under_parallel_pressure_does_not_drift",
-            "ok"
-          ],
-          [
-            "hnsw_rebuild_determinism_tests::per_index_independent_progress_reopen_flake_is_fixed_under_repeat",
-            "ok"
-          ],
-          [
             "indexed_equality_cursor_delivers_every_row::an_indexed_lookup_read_one_page_at_a_time_gives_what_one_call_gives",
             "ok"
           ],
@@ -3033,7 +3011,6 @@
           "crates/contextdb-engine/tests/engine/disk_budget_persistence_tests.rs": "551fb36012cafb0bd45d05c162d8d2b06e8ec95a5cf979931de5eb4516933f4c",
           "crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs": "7e9ee01b35f9d6e203e781608b82b96dca4d2603d83a9acb5a6a7f00d8e00299",
           "crates/contextdb-engine/tests/engine/engine_tests.rs": "333dfe6e9f41770aa880cee8fdad252e95c0cd1470142e7dc588cab1c0d09bbe",
-          "crates/contextdb-engine/tests/engine/hnsw_rebuild_determinism_tests.rs": "e6691efd9abbf1028f5a32d0a84911e1727dfeb3813d64c5aeb8fa98b7ee9884",
           "crates/contextdb-engine/tests/engine/indexed_equality_cursor_delivers_every_row.rs": "ba3f67d57ab496225cf94c033982b6210b9c51069d0c28b46abb31c3bb676b1f",
           "crates/contextdb-engine/tests/engine/integer_negation_overflow_tests.rs": "4363a816f14bfffb4e9aa4e664ece8fa35ef731743f89f16bb8039e05e818b66",
           "crates/contextdb-engine/tests/engine/memory_limit_admission_holds_for_text.rs": "d5d163ead6a05372096bfec393b5968d8d7b3804f481e76a7c3937a20b78d691",
@@ -3933,10 +3910,6 @@
           ],
           [
             "bounded_pull_execution_contract::every_bounded_source_has_exact_work_memory_and_cancellation_matrix",
-            "ok"
-          ],
-          [
-            "bounded_pull_execution_contract::hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop",
             "ok"
           ],
           [

@@ -718,11 +718,6 @@
                   "features": "test-seams"
                 },
                 {
-                  "shard": "contextdb-hnsw",
-                  "crate": "contextdb-hnsw",
-                  "features": ""
-                },
-                {
                   "shard": "contextdb-graph",
                   "crate": "contextdb-graph",
                   "features": ""
@@ -1230,11 +1225,6 @@
       "shard": "contextdb-vector-test-seams",
       "crate": "contextdb-vector",
       "features": "test-seams"
-    },
-    {
-      "shard": "contextdb-hnsw",
-      "crate": "contextdb-hnsw",
-      "features": ""
     },
     {
       "shard": "contextdb-graph",
@@ -1827,19 +1817,6 @@
       "kind": "test",
       "name": "history_policy_tail_decode_tests",
       "path": "crates/contextdb-core/tests/history_policy_tail_decode_tests.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-core",
-        "contextdb-core-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-core",
-      "kind": "test",
-      "name": "hnsw_fork_patch_matches_its_sources",
-      "path": "crates/contextdb-core/tests/hnsw_fork_patch_matches_its_sources.rs",
       "required_features": [],
       "jobs": [
         "contextdb-core",
@@ -4169,18 +4146,6 @@
       "execution": "not executed by this audit; existing ignore attributes still apply"
     },
     {
-      "crate": "contextdb-hnsw",
-      "kind": "lib",
-      "name": "hnsw_rs",
-      "path": "crates/contextdb-hnsw/src/lib.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-hnsw"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
       "crate": "contextdb-parser",
       "kind": "lib",
       "name": "contextdb_parser",
@@ -6233,46 +6198,6 @@
       "status": "selected; not executed by this audit"
     },
     {
-      "crate": "contextdb-hnsw",
-      "feature": "default",
-      "declaration": [],
-      "jobs": [
-        "contextdb-core",
-        "contextdb-core-test-seams",
-        "contextdb-tx",
-        "contextdb-tx-test-seams",
-        "contextdb-engine",
-        "contextdb-engine-test-seams",
-        "contextdb-server",
-        "contextdb-server-test-seams",
-        "contextdb-cli",
-        "contextdb-vector",
-        "contextdb-vector-test-seams",
-        "contextdb-hnsw",
-        "contextdb-graph",
-        "contextdb-parser",
-        "contextdb-planner",
-        "contextdb-relational",
-        "nightly/full-test",
-        "ci/installed-smoke"
-      ],
-      "tiers": [
-        "nightly",
-        "normal"
-      ],
-      "status": "selected; not executed by this audit"
-    },
-    {
-      "crate": "contextdb-hnsw",
-      "feature": "stdsimd",
-      "declaration": [
-        "anndists/stdsimd"
-      ],
-      "jobs": [],
-      "tiers": [],
-      "status": "not selected by existing command families; no coverage claimed"
-    },
-    {
       "crate": "contextdb-redb",
       "feature": "logging",
       "declaration": [
@@ -7129,12 +7054,6 @@
       "path": "crates/contextdb-server/tests/durable_deletion_and_purge_tests.rs",
       "line": 1600,
       "declaration": "#[ignore = \"CDB-154: vector-sync defect on dev makes this purge test fail nondeterministically (transport timeout, false frontier corruption, 1000 vs 1001 nodes); re-enable when the storage fix lands\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-vector/src/hnsw.rs",
-      "line": 9581,
-      "declaration": "/// (`a_graph_search_stays_inside_its_serving_cache`) is `#[ignore]`d because",
       "execution": "not selected (--include-ignored absent)"
     },
     {
