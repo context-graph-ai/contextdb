@@ -1038,7 +1038,9 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                     .as_ref()
                     .unwrap()
                     .aggregate_allowed_vectors,
-                Some(32)
+                Some(32),
+                "{mode} history={}: the bounded read discloses exactly the allowed current rows",
+                end - 100
             );
             let source_work = bounded
                 .telemetry
