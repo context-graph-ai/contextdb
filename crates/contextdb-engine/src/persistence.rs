@@ -70,7 +70,6 @@ pub(crate) mod vector_ivf;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
 pub(crate) mod vector_paged;
-mod vector_saved;
 #[cfg(unix)]
 mod wait_diagnostic;
 #[cfg(all(

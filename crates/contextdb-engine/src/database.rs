@@ -27,7 +27,6 @@ mod published_vector_install_tests;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod resident_history_test_seams;
-pub(crate) mod vector_captured_serving;
 #[cfg(test)]
 mod vector_frontier_metadata_admission_tests;
 #[cfg(test)]
@@ -36,7 +35,6 @@ mod vector_import_tail;
 #[cfg(test)]
 mod vector_journal_cleanup_cancellation_tests;
 mod vector_maintenance_inventory;
-pub(crate) mod vector_paged_build;
 #[cfg(all(test, feature = "test-seams"))]
 mod vector_public_cycle_admission_tests;
 #[cfg(test)]
@@ -4701,58 +4699,6 @@ struct LoaderCallbackCaptures {
 struct LoaderCallbackCleanup {
     source: *mut LoaderCallbackCaptures,
     next: u8,
-}
-
-/// Persistence-owned loader attached to one lightweight generation
-/// descriptor. Opening a database registers this object without reading graph
-/// bytes. The first ordinary indexed read reserves the complete decode and
-/// replay working set, verifies the saved graph, and replays only journal
-/// entries after the selected sealed boundary.
-struct DurableVectorGenerationLoader {
-    source: DurableVectorGenerationSource,
-    accountant: crate::memory_accounting::AccountantHandle,
-    partition: VectorPartitionRef,
-    descriptor: VectorPartitionGenerationDescriptor,
-    base_generation_id: u64,
-    is_base: bool,
-    /// The base generation's coverage as the catalog names it; a change
-    /// layer's saved record is checked against it.
-    base_covered: (TxId, Lsn),
-    dimension: usize,
-    quantization: VectorQuantization,
-    /// Only the final selected sealed layer owns fresh-tail replay. A base
-    /// with a selected change layer leaves this `None`; the change loader owns
-    /// the suffix instead.
-    tail_covered_lsn: Option<Lsn>,
-    layout: VectorIndexLayout,
-    live_rows: usize,
-    /// Where this loader reads the declared serving-cache size.
-    ///
-    /// A writable store carries the live cell, so a partition faulted in after
-    /// `SET VECTOR_SERVING_CACHE` sizes from the value in force at LOAD time —
-    /// the same moment the accountant's limit beside it is read. A committed
-    /// image carries the value as of its open, which is what that reader is
-    /// entitled to and cannot change under it.
-    declared_serving_cache: DeclaredServingCache,
-}
-
-/// Where a loader reads the declared serving-cache size from.
-#[derive(Clone)]
-enum DeclaredServingCache {
-    /// The store's live cell; read at load time.
-    Live(Arc<AtomicU64>),
-    /// The value as of a committed image's open.
-    AsOfOpen(Option<usize>),
-}
-
-#[derive(Clone)]
-enum DurableVectorGenerationSource {
-    Writable(Arc<RedbPersistence>),
-    CommittedImage(ReadOnlyVectorGenerationSource),
-    /// One serving operation's already captured root: the exact read, and
-    /// the writer snapshot or committed source that owns it. Every record it
-    /// reads comes from that read; it never begins another one.
-    CapturedRoot(Arc<vector_captured_serving::CapturedVectorRootLease>),
 }
 
 mod legacy_expiry_staging;
@@ -10804,7 +10750,6 @@ mod dormant_raw_vector_loader_tests;
 #[path = "database/bounded_retention_preparation_tests.rs"]
 mod bounded_retention_preparation_tests;
 #[cfg(test)]
-mod generation_route_admission_tests;
 #[cfg(test)]
 #[path = "database/snapshot_pin_pool_tests.rs"]
 mod snapshot_pin_pool_tests;

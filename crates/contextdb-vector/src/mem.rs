@@ -156,22 +156,11 @@ pub fn partition_key_is_selected(index: &VectorIndexRef, key: &VectorPartitionKe
     })
 }
 
-/// A statement filter checked on reached rows. Each selected partition has
-/// `allowance` uncached predicate reads, derived from the unchanged declared
-/// breadth. The caller's bounded identity probe has its own separate allowance.
-/// `check` reads one row under the statement's snapshot and authorization.
+/// A statement filter checked on reached rows. `check` reads one row under the
+/// statement's snapshot and authorization.
 pub struct RowCheck<'a, E> {
-    pub allowance: usize,
     pub check: &'a mut dyn FnMut(RowId) -> std::result::Result<bool, E>,
 }
-
-// These are the union's actual mandatory row-filter doors. Keep reclamation
-// immediately beside the source operation so the source's existing admission,
-// visibility, cancellation, and copied value stay on the original funder.
-
-// The row predicate owns its retained verdict charge. Probe that same funder
-// before asking it to allocate, so optional navigation can yield without
-// changing the predicate's existing charge or work callbacks.
 
 /// Run one vector operation with finite, typed SQL partition prefixes.
 pub fn with_selected_partition_prefixes<T>(

@@ -274,12 +274,7 @@ pub(crate) enum BoundedVectorSearchOutcome {
         BoundedVectorCandidates,
         contextdb_vector::mem::BoundedVectorSearchTrace,
     ),
-    ExactRequired(contextdb_vector::mem::BoundedVectorSearchTrace),
     Unavailable,
-    Incomplete,
-    /// INDEXED found the partition at this scope position holding live rows
-    /// its maintained graph does not connect.
-    Disconnected(usize),
 }
 
 /// The store a bounded read runs against.
@@ -1382,7 +1377,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn bounded_hnsw_vector_search(
+    fn bounded_vector_search(
         &self,
         index: &VectorIndexRef,
         query: &[f32],
@@ -1390,8 +1385,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
         query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
-        is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
-        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_exact_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -1400,7 +1393,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-        load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, BoundedExecutionError>>,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError>;
 
@@ -2864,7 +2856,7 @@ impl ReadExecutionTarget for Database {
         )
     }
 
-    fn bounded_hnsw_vector_search(
+    fn bounded_vector_search(
         &self,
         index: &VectorIndexRef,
         query: &[f32],
@@ -2872,8 +2864,6 @@ impl ReadExecutionTarget for Database {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
         query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
-        is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
-        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_exact_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -2882,10 +2872,9 @@ impl ReadExecutionTarget for Database {
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-        load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, BoundedExecutionError>>,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
-        Database::bounded_hnsw_vector_search(
+        Database::bounded_vector_search(
             self,
             index,
             query,
@@ -2893,8 +2882,6 @@ impl ReadExecutionTarget for Database {
             groups,
             mode,
             query_breadth,
-            is_reader_memory_refusal,
-            allowed_search_limits,
             before_source_entry,
             before_exact_candidate,
             before_distance,
@@ -2902,7 +2889,6 @@ impl ReadExecutionTarget for Database {
             release_retained,
             vector_copy_owner,
             read_memory.clone(),
-            load_transfer,
             row_check,
         )
     }
@@ -24159,7 +24145,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         )
     }
 
-    fn bounded_hnsw_vector_search(
+    fn bounded_vector_search(
         &self,
         index: &VectorIndexRef,
         query: &[f32],
@@ -24167,8 +24153,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
         query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
-        is_reader_memory_refusal: &dyn Fn(&BoundedExecutionError) -> bool,
-        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_exact_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -24177,18 +24161,15 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-        load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, BoundedExecutionError>>,
     ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
-        self.store.bounded_hnsw_vector_search(
+        self.store.bounded_vector_search(
             index,
             query,
             k,
             groups,
             mode,
             query_breadth,
-            is_reader_memory_refusal,
-            allowed_search_limits,
             before_source_entry,
             before_exact_candidate,
             before_distance,
@@ -24196,7 +24177,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             release_retained,
             vector_copy_owner,
             read_memory.clone(),
-            load_transfer,
             row_check,
         )
     }

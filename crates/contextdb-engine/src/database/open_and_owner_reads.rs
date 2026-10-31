@@ -1587,14 +1587,6 @@ impl Database {
             &accountant,
             vector_copy_owner,
         )?;
-        // Generation registration needs the maintained raw partition states.
-        register_dormant_vector_generations(
-            &vector,
-            &persistence,
-            &accountant,
-            DeclaredServingCache::Live(vector_serving_cache_cell.clone()),
-            vector_copy_owner,
-        )?;
         let blob_repository = BlobRepository::shared(persistence.clone());
 
         let db = Self::build_db(
@@ -1655,10 +1647,9 @@ impl Database {
         db.rebuild_rank_formula_cache_from_meta(&all_meta)?;
 
         db.account_loaded_state()?;
-        // Unpublished paged builds restore their construction floors before
+        // In-flight native builds restore their construction floors before
         // any maintenance or cleanup can run against this handle.
-        db.restore_paged_vector_builds(vector_copy_owner)?;
-        maybe_prebuild_hnsw(&db.vector_store, db.accountant());
+        db.restore_native_construction_floors()?;
         db.load_cron_state_from_persistence()?;
         db.load_event_bus_state_from_persistence()?;
         db.load_trigger_state_from_persistence()?;
@@ -1901,19 +1892,6 @@ impl Database {
             .max(commit_index_max_lsn)
             .max(ddl_max_lsn)
             .max(Lsn(read_bounds.source_lsn_floor));
-        register_loaded_dormant_vector_generations(
-            &vector,
-            vector_generation_catalog,
-            DurableVectorGenerationSource::CommittedImage(ReadOnlyVectorGenerationSource::new(
-                retained_source.clone(),
-                max_lsn,
-            )?),
-            &accountant,
-            None,
-            DeclaredServingCache::AsOfOpen(declared_serving_cache_bytes(
-                persisted_vector_serving_cache_bytes,
-            )),
-        )?;
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
         let (initial_table_index, initial_lsn_refcounts) =
@@ -2076,7 +2054,6 @@ impl Database {
         }
         db.rebuild_rank_formula_cache_from_meta(&all_meta)?;
         db.account_loaded_state()?;
-        maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         db.load_cron_state_from_persistence()?;
         db.load_event_bus_state_from_persistence()?;
         db.load_trigger_state_from_persistence()?;
@@ -2238,7 +2215,6 @@ impl Database {
             trigger,
             declared_read_memory,
         )?;
-        maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         Ok(db)
     }
 

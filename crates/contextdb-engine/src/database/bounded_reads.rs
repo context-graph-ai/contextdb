@@ -2632,7 +2632,7 @@ impl Database {
 
     #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn bounded_hnsw_vector_search<E>(
+    pub(crate) fn bounded_vector_search<E>(
         &self,
         index: &VectorIndexRef,
         query: &[f32],
@@ -2640,8 +2640,6 @@ impl Database {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
         query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
-        is_reader_memory_refusal: impl Fn(&E) -> bool,
-        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
         mut before_exact_candidate: impl FnMut() -> std::result::Result<(), E>,
         mut before_distance: impl FnMut() -> std::result::Result<(), E>,
@@ -2649,7 +2647,6 @@ impl Database {
         mut release_retained: impl FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        load_transfer: crate::memory_accounting::VectorLoadReservationTransfer,
         row_check: Option<contextdb_vector::mem::RowCheck<'_, E>>,
     ) -> std::result::Result<crate::executor::BoundedVectorSearchOutcome, E>
     where
@@ -2657,100 +2654,27 @@ impl Database {
     {
         let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
-        if self.persistence.is_some() || self.retained_graph_source.is_some() {
-            if let Some(result) = self.native_ivf_bounded_search(
-                index,
-                query,
-                k,
-                groups,
-                mode,
-                query_breadth,
-                &mut before_source_entry,
-                &mut before_exact_candidate,
-                &mut before_distance,
-                &mut before_retain,
-                &mut release_retained,
-                _read_memory.clone(),
-                row_check,
-            )? {
-                return Ok(result);
-            }
-            // An unavailable native canonical scope retains the existing exact
-            // fallback below. INDEXED already returned its typed refusal.
-            return self.with_vector_read_admission(vector_copy_owner, |_| {
-                Ok(crate::executor::BoundedVectorSearchOutcome::Unavailable)
-            });
+        if let Some(result) = self.native_ivf_bounded_search(
+            index,
+            query,
+            k,
+            groups,
+            mode,
+            query_breadth,
+            &mut before_source_entry,
+            &mut before_exact_candidate,
+            &mut before_distance,
+            &mut before_retain,
+            &mut release_retained,
+            _read_memory.clone(),
+            row_check,
+        )? {
+            return Ok(result);
         }
-        self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
-            self.clear_last_vector_search_trace();
-            let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(
-                contextdb_core::find_attribution::inline_phases::Phase::Adapter,
-            );
-            let _attribution = contextdb_core::find_attribution::stage("vector_search");
-            let result = crate::memory_accounting::with_vector_load_reservation_transfer(
-                &self.finalization.accountant,
-                load_transfer,
-                || {
-                    self.vector
-                        .bounded_hnsw_search_grouped_with_reader_memory_refusal(
-                            index,
-                            query,
-                            k,
-                            groups,
-                            mode,
-                            &is_reader_memory_refusal,
-                            allowed_search_limits,
-                            before_source_entry,
-                            before_exact_candidate,
-                            before_distance,
-                            before_retain,
-                            &mut release_retained,
-                            vector_copy_owner,
-                            row_check,
-                        )
-                },
-            )?;
-            let contextdb_vector::mem::BoundedHnswOutcome::Complete(result) = result else {
-                return Ok(match result {
-                    contextdb_vector::mem::BoundedHnswOutcome::CompleteEmpty => {
-                        crate::executor::BoundedVectorSearchOutcome::CompleteEmpty
-                    }
-                    contextdb_vector::mem::BoundedHnswOutcome::ExactRequired { trace, .. } => {
-                        crate::executor::BoundedVectorSearchOutcome::ExactRequired(trace)
-                    }
-                    contextdb_vector::mem::BoundedHnswOutcome::Unavailable { .. } => {
-                        crate::executor::BoundedVectorSearchOutcome::Unavailable
-                    }
-                    contextdb_vector::mem::BoundedHnswOutcome::Incomplete { .. } => {
-                        crate::executor::BoundedVectorSearchOutcome::Incomplete
-                    }
-                    contextdb_vector::mem::BoundedHnswOutcome::Disconnected { partition } => {
-                        crate::executor::BoundedVectorSearchOutcome::Disconnected(partition)
-                    }
-                    contextdb_vector::mem::BoundedHnswOutcome::Complete(_) => unreachable!(
-                        "the complete bounded vector outcome was matched before disposition mapping"
-                    ),
-                });
-            };
-            let contextdb_vector::mem::BoundedHnswResult {
-                rows,
-                trace,
-                retained_bytes,
-            } = result;
-            // Keep the admitted trace beside the rows until the executor has built
-            // disclosure from it. The executor then moves it to the debug slot and
-            // releases exactly this trace charge.
-            let trace_bytes = trace.retained_bytes();
-            let Some(row_bytes) = retained_bytes.checked_sub(trace_bytes) else {
-                release_retained(retained_bytes);
-                return Err(E::from(Error::Other(
-                    ("bounded vector trace charge exceeds the search charge".to_string()).into(),
-                )));
-            };
-            Ok(crate::executor::BoundedVectorSearchOutcome::Complete(
-                (rows, row_bytes),
-                trace,
-            ))
+        // An unavailable native canonical scope retains the existing exact
+        // fallback. INDEXED already returned its typed refusal.
+        self.with_vector_read_admission(vector_copy_owner, |_| {
+            Ok(crate::executor::BoundedVectorSearchOutcome::Unavailable)
         })
     }
 

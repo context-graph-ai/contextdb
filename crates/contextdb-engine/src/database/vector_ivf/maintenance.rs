@@ -1,5 +1,63 @@
 //! The existing maintenance publisher drives each declared native tuple.
 use super::super::*;
+
+pub(in crate::database) fn install_paged_root_capture(
+    persistence: &RedbPersistence,
+    tx_mgr: &DatabaseTransactionHost,
+) {
+    let manager = tx_mgr.downgrade();
+    let scoped_manager = manager.clone();
+    persistence.set_paged_root_capture(
+        Arc::new(move || {
+            let manager = manager
+                .upgrade()
+                .ok_or_else(|| Error::Other("paged vector reader outlived its writer".into()))?;
+            if let Some(root) = writer_read::scoped_root_for_manager(&manager) {
+                return Ok(root);
+            }
+            writer_read::durable_root(manager.capture_published_read().handle)?
+                .ok_or_else(|| Error::Other("writer has no durable published root".into()))
+        }),
+        Arc::new(move || {
+            let manager = scoped_manager
+                .upgrade()
+                .ok_or_else(|| Error::Other("vector reader outlived its writer".into()))?;
+            Ok(writer_read::scoped_root_for_manager(&manager))
+        }),
+    );
+}
+
+impl Database {
+    /// Hold again the snapshot floor of every in-flight native build, from the
+    /// durable floor table. Runs during open, before any cleanup.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(in crate::database) fn restore_native_construction_floors(&self) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        install_paged_root_capture(persistence, &self.tx_mgr);
+        let mut floor_cursor = None;
+        loop {
+            let _decode = crate::read_image_memory::ImageMemory::operation_writer(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            )?
+            .enter();
+            let Some((key, partition, frontier)) =
+                persistence.next_construction_floor_after(floor_cursor.as_deref())?
+            else {
+                break;
+            };
+            self.snapshot_registry
+                .hold_construction_floor(&partition, SnapshotId::from_tx(frontier));
+            floor_cursor = Some(key);
+        }
+        Ok(())
+    }
+}
+
 impl MaintenanceContext {
     pub(crate) fn run_native_vector_cycle(
         &self,

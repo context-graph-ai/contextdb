@@ -11133,20 +11133,9 @@ impl VectorState {
                                 .as_ref()
                                 .map_or(0, |overlay| overlay.searchable_entry_count),
                         );
-                    let hnsw = {
-                        let remaining_graph_work = context.remaining_vector_graph_work()?;
-                        let allowed_search_limits =
-                            contextdb_vector::hnsw::HnswAllowedSearchLimits {
-                                max_visited_nodes: remaining_graph_work,
-                                max_vector_evaluations: remaining_graph_work,
-                            };
-                        // Funded before the search starts, so a cold graph load
-                        // inside it can hand its credit to the graph's owner.
-                        let load_transfer = funded_graph_credit_transfer(context)?;
-                        // The walk's own checks: one per point it may evaluate,
-                        // never reduced by what the bounded probe before it
-                        // read under its separate half allowance.
-                        let row_check_allowance = self.row_check_allowance;
+                    let searched = {
+                        // The search's own checks: one per candidate it may
+                        // evaluate, each paying its ordinary request work.
                         let mut row_check = |row_id: RowId| match self
                             .row_filter
                             .as_ref()
@@ -11167,77 +11156,44 @@ impl VectorState {
                             }
                             None => Ok(true),
                         };
-                        let mut hnsw_search = || {
-                            let _inline_phase =
-                                contextdb_core::find_attribution::inline_phases::enter(
-                                    contextdb_core::find_attribution::inline_phases::Phase::Hnsw,
-                                );
-                            context.with_vector_copies(|vector_copy_owner| {
-                                db.bounded_hnsw_vector_search(
-                                    &self.index,
-                                    parameter_query_vector(&self.query_expr, &self.params)
-                                        .unwrap_or(&self.query),
-                                    self.candidate_k,
-                                    groups.get(),
-                                    if self.force_exact_for_relational_fallback {
-                                        contextdb_core::VectorSearchMode::Exact
-                                    } else {
-                                        self.search_mode
+                        context.with_vector_copies(|vector_copy_owner| {
+                            db.bounded_vector_search(
+                                &self.index,
+                                parameter_query_vector(&self.query_expr, &self.params)
+                                    .unwrap_or(&self.query),
+                                self.candidate_k,
+                                groups.get(),
+                                if self.force_exact_for_relational_fallback {
+                                    contextdb_core::VectorSearchMode::Exact
+                                } else {
+                                    self.search_mode
+                                },
+                                self.query_breadth,
+                                &mut || context.native_source_touch(),
+                                &mut || {
+                                    context.charge(
+                                        BoundedWorkSource::VectorCandidates,
+                                        BoundedSourceTouch::BruteForceVectorCandidate,
+                                    )
+                                },
+                                &mut || {
+                                    context.charge_operator(BoundedWorkSource::VectorCandidates)
+                                },
+                                &mut |bytes| {
+                                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                },
+                                &mut |bytes| context.release_parked(bytes),
+                                vector_copy_owner,
+                                context.reader_budget.clone(),
+                                self.row_checked.then_some(
+                                    contextdb_vector::mem::RowCheck {
+                                        check: &mut row_check,
                                     },
-                                    self.query_breadth,
-                                    &reader_memory_refusal,
-                                    allowed_search_limits,
-                                    &mut || context.native_source_touch(),
-                                    &mut || {
-                                        context.charge(
-                                            BoundedWorkSource::VectorCandidates,
-                                            BoundedSourceTouch::BruteForceVectorCandidate,
-                                        )
-                                    },
-                                    &mut || {
-                                        context.charge_operator(BoundedWorkSource::VectorCandidates)
-                                    },
-                                    &mut |bytes| {
-                                        context.reserve(BoundedWorkSource::VectorCandidates, bytes)
-                                    },
-                                    &mut |bytes| context.release_parked(bytes),
-                                    vector_copy_owner,
-                                    context.reader_budget.clone(),
-                                    Arc::clone(&load_transfer.value),
-                                    match (self.row_checked, row_check_allowance) {
-                                        (true, Some(allowance)) => {
-                                            Some(contextdb_vector::mem::RowCheck {
-                                                allowance,
-                                                check: &mut row_check,
-                                            })
-                                        }
-                                        (true, None) if db.has_native_ivf_source() => {
-                                            Some(contextdb_vector::mem::RowCheck {
-                                                // This reader declared no separate row-check ceiling.
-                                                // Each callback still pays its ordinary request work.
-                                                allowance: usize::MAX,
-                                                check: &mut row_check,
-                                            })
-                                        }
-                                        _ => None,
-                                    },
-                                )
-                            })
-                        };
-                        #[cfg(any(test, feature = "test-seams"))]
-                        let searched = if let Some(probe) = context.probe() {
-                            contextdb_vector::hnsw::with_hnsw_candidate_observer(
-                                Arc::new(BoundedHnswProbeObserver { probe }),
-                                hnsw_search,
+                                ),
                             )
-                        } else {
-                            hnsw_search()
-                        }?;
-                        #[cfg(not(any(test, feature = "test-seams")))]
-                        let searched = hnsw_search()?;
-                        searched
+                        })?
                     };
-                    match hnsw {
+                    match searched {
                         super::BoundedVectorSearchOutcome::Complete(
                             (mut rows, retained_bytes),
                             mut trace,
@@ -11245,7 +11201,6 @@ impl VectorState {
                             if self.force_exact_for_relational_fallback {
                                 trace.override_exact_reason("filtered_route_exact");
                             }
-                            self.used_hnsw = trace.used_hnsw();
                             // Native finalists have already been ordered by
                             // canonical f64 distances and row-ID ties. Avoid
                             // ordering them again by their exposed f32 scores.
@@ -11288,59 +11243,13 @@ impl VectorState {
                             continue;
                         }
                         super::BoundedVectorSearchOutcome::CompleteEmpty => {
-                            self.used_hnsw = true;
                             self.scores.clear();
                             self.score_bytes = 0;
                             self.score_staged_vectors(db, context)?;
                             self.preparation = VectorPreparation::Materialize;
                             continue;
                         }
-                        super::BoundedVectorSearchOutcome::ExactRequired(mut trace) => {
-                            if self.force_exact_for_relational_fallback {
-                                trace.override_exact_reason("filtered_route_exact");
-                            }
-                            // Cursor terminal observations retain their early
-                            // disclosure, including cancellation/error receipts.
-                            let can_defer = self.force_exact_for_relational_fallback && {
-                                context.state().final_observation.is_none()
-                            };
-                            if can_defer {
-                                // Raw-only groups have no graph holders to lose.
-                                // Preserve their original metadata until the scan
-                                // ends, then build the required result disclosure.
-                                deferred_exact = Some(DeferredExactTrace {
-                                    trace: Some(trace),
-                                    aggregate: aggregate_allowed_count,
-                                    groups: Some(groups.get().disclosure_metadata()),
-                                    context: context.clone(),
-                                });
-                            } else {
-                                if let Err(error) = self.record_disclosure(
-                                    db,
-                                    context,
-                                    published_trace,
-                                    aggregate_allowed_count,
-                                    groups.get(),
-                                    &trace,
-                                ) {
-                                    let trace_bytes = trace.retained_bytes();
-                                    drop(trace);
-                                    context.release(trace_bytes)?;
-                                    return Err(error);
-                                }
-                                let trace = context.own_vector_trace(trace)?;
-                                db.publish_vector_search_trace(trace);
-                            }
-                        }
-                        super::BoundedVectorSearchOutcome::Unavailable
-                        | super::BoundedVectorSearchOutcome::Incomplete => {}
-                        super::BoundedVectorSearchOutcome::Disconnected(partition) => {
-                            return Err(Error::VectorIndexedPartitionDisconnected {
-                                index: self.index.clone(),
-                                partition: partition as u64,
-                            }
-                            .into());
-                        }
+                        super::BoundedVectorSearchOutcome::Unavailable => {}
                     }
                     if self.search_mode == contextdb_core::VectorSearchMode::Indexed {
                         return Err(Error::VectorIndexedRouteUnavailable {
