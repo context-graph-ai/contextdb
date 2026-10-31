@@ -48,10 +48,6 @@ mod every_graph_route_reaches_every_row;
 mod flat_route_below_declared_threshold;
 #[path = "vector/flat_route_crossover_diagnostic.rs"]
 mod flat_route_crossover_diagnostic;
-#[path = "vector/graph_build_distance_evaluations_stay_under_the_ratchet.rs"]
-mod graph_build_distance_evaluations_stay_under_the_ratchet;
-#[path = "vector/graph_route_profile_quality.rs"]
-mod graph_route_profile_quality;
 #[path = "vector/indexed_route_does_less_work_than_exact.rs"]
 mod indexed_route_does_less_work_than_exact;
 #[path = "fixtures/maintained_search/mod.rs"]

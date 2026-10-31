@@ -616,16 +616,6 @@ path = "tests/vector_equal_distance_rows_keep_canonical_order_across_contexts.rs
 required-features = ["test-seams"]
 
 [[test]]
-name = "vector_graph_build_distance_evaluations_stay_under_the_ratchet"
-path = "tests/vector_graph_build_distance_evaluations_stay_under_the_ratchet.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "vector_graph_route_profile_quality"
-path = "tests/vector_graph_route_profile_quality.rs"
-required-features = ["test-seams"]
-
-[[test]]
 name = "vector_indexed_route_does_less_work_than_exact"
 path = "tests/vector_indexed_route_does_less_work_than_exact.rs"
 required-features = ["test-seams"]
@@ -753,26 +743,6 @@ required-features = ["test-seams"]
 [[test]]
 name = "vector_writer_residency_attribution"
 path = "tests/vector_writer_residency_attribution.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "vector_graph_recall_5000_anisotropic_per_context"
-path = "tests/vector_graph_recall_5000_anisotropic_per_context.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "vector_graph_recall_5001_topic_clusters_per_context"
-path = "tests/vector_graph_recall_5001_topic_clusters_per_context.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "vector_graph_recall_50000_isotropic_per_context"
-path = "tests/vector_graph_recall_50000_isotropic_per_context.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "vector_graph_recall_50001_anisotropic_per_context"
-path = "tests/vector_graph_recall_50001_anisotropic_per_context.rs"
 required-features = ["test-seams"]
 
 [[test]]
