@@ -3,6 +3,9 @@ use contextdb_core::Value;
 use contextdb_core::read_contract::{
     DeadlineClock, ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReadRoute,
 };
+use contextdb_engine::direct_file_reader::test_seams::{
+    DirectFileReaderError, DirectReaderConfig, open_for_test,
+};
 use contextdb_engine::local_transport::ManualDeadlineClock;
 use contextdb_engine::owner_read::{OwnerServicePublicationObserver, OwnerServiceSpec};
 use contextdb_engine::{
@@ -935,6 +938,52 @@ fn cross_process_reader_child() {
     control.write_all(answer).unwrap();
 }
 
+/// The reader child of the two direct-publication scenarios. It reads through
+/// the fixed direct file door, which does not reselect a returning writer: the
+/// routing `ReadSession` of `cross_process_reader_child` moves to the owner
+/// channel once the parent's writer is up (second-statement route Owner), so the
+/// final-file publication fence these scenarios pause at is never reached.
+#[test]
+fn direct_file_reader_child() {
+    let Ok(path) = std::env::var(CHILD_PATH) else {
+        return;
+    };
+    let outcome = std::path::PathBuf::from(std::env::var(CHILD_OUTCOME).unwrap());
+    let reader = open_for_test(
+        &path,
+        DirectReaderConfig::new(
+            ReadSessionOptions::default().limits,
+            Arc::new(ManualDeadlineClock::default()),
+        ),
+    )
+    .expect("child opens the fixed direct file reader");
+    assert_eq!(
+        reader
+            .execute("SELECT payload FROM erased_rows", &HashMap::new())
+            .unwrap()
+            .result
+            .rows()
+            .len(),
+        3
+    );
+    let control_path = std::env::var_os(CONTROL_SOCKET).expect("caller sets CONTROL_SOCKET");
+    let mut control = std::os::unix::net::UnixStream::connect(control_path).unwrap();
+    control.write_all(b"r").unwrap();
+    let mut go = [0_u8; 1];
+    control.read_exact(&mut go).unwrap();
+    let answer = match reader.execute("SELECT payload FROM erased_rows", &HashMap::new()) {
+        Err(DirectFileReaderError::ReadFailure(failure))
+            if failure.kind() == ReadFailureKind::AuthoritativeErasure =>
+        {
+            b"erasure".as_slice()
+        }
+        Ok(_) => b"stale".as_slice(),
+        Err(_) => b"wrong-error".as_slice(),
+    };
+    std::fs::write(outcome, answer).unwrap();
+    control.write_all(answer).unwrap();
+}
+
 #[test]
 fn durable_purge_invalidates_a_reader_in_another_process() {
     let directory = tempfile::tempdir().unwrap();
@@ -1001,7 +1050,7 @@ fn direct_result_publication_holds_only_the_final_fence_boundary() {
     let listener = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
     seed(&path);
 
-    let filter = crate::child_test_filter(module_path!(), "cross_process_reader_child");
+    let filter = crate::child_test_filter(module_path!(), "direct_file_reader_child");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg(filter)
@@ -1079,7 +1128,7 @@ fn stopped_direct_publication_releases_on_process_death_without_holding_commit_l
     let listener = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
     seed(&path);
 
-    let filter = crate::child_test_filter(module_path!(), "cross_process_reader_child");
+    let filter = crate::child_test_filter(module_path!(), "direct_file_reader_child");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg(filter)
