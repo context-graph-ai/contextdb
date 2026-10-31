@@ -226,9 +226,11 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
     // partition is a real indexed-route control and the hot partition starts on its maintained route.
     let mut ready = false;
     for _ in 0..4096 {
-        db.run_maintenance_cycle().expect("advance maintenance");
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == 2 && status.remaining_partitions == 0 {
+        let report = db
+            .run_maintenance_cycle()
+            .expect("advance maintenance")
+            .vector;
+        if report.ready_partitions == 2 && report.remaining_partitions == 0 {
             ready = true;
             break;
         }

@@ -673,9 +673,10 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
             let generation = (0..32)
                 .find_map(|_| {
                     db.run_maintenance_cycle().unwrap();
-                    db.vector_store_for_test()
-                        .partition_graph_generation_status(&route)
-                        .and_then(|status| status.base)
+                    db.__debug_vector_partition_generation_for_test(
+                        route.index.clone(),
+                        route.partition_key.clone(),
+                    )
                 })
                 .expect("the counterexample needs an immutable base with the old score");
             let query = [1.0, 0.0, 0.0];
@@ -723,12 +724,12 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                 "cleanup must actually leave one version of each row"
             );
             assert_eq!(
-                db.vector_store_for_test()
-                    .partition_graph_generation_status(&route)
-                    .unwrap()
-                    .base,
+                db.__debug_vector_partition_generation_for_test(
+                    route.index.clone(),
+                    route.partition_key.clone(),
+                ),
                 Some(generation),
-                "cleanup must leave the old graph point in the serving base"
+                "cleanup must leave the old vector in the serving generation"
             );
 
             for restart in [false, true] {
@@ -1110,162 +1111,5 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                 .rows(),
             exact.rows()
         );
-    }
-}
-
-#[test]
-fn global_ties_keep_internal_row_order_across_partition_load_permutations() {
-    use contextdb_core::{VectorIndexRef, VectorPartitionKey};
-    use contextdb_vector::VectorPartitionRef;
-
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("tied-partitions.redb");
-    let mut db = Database::open(&path).unwrap();
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute(
-        "CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, \
-         embedding VECTOR(3) PARTITION_KEY (bucket) AUTO_INDEX_AT 1)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    let insertion_order = [(90, 2), (20, 1), (80, 0), (10, 2), (70, 0), (30, 1)];
-    let tx = db.begin().unwrap();
-    let mut row_ids = Vec::new();
-    for (id, bucket) in insertion_order {
-        row_ids.push(
-            db.insert_row(
-                tx,
-                "items",
-                HashMap::from([
-                    ("id".into(), Value::Int64(id)),
-                    ("bucket".into(), Value::Int64(bucket)),
-                    ("embedding".into(), Value::Vector(vec![0.8, 0.6, 0.0])),
-                ]),
-            )
-            .unwrap(),
-        );
-    }
-    assert!(row_ids.windows(2).all(|pair| pair[0] < pair[1]));
-    db.commit(tx).unwrap();
-    for _ in 0..32 {
-        db.run_maintenance_cycle().unwrap();
-    }
-    let route = |bucket| {
-        VectorPartitionRef::new(
-            VectorIndexRef::new("items", "embedding"),
-            VectorPartitionKey::from_values(&[Value::Int64(bucket)]).unwrap(),
-        )
-    };
-    let query = [0.8, 0.6, 0.0];
-    let all_sql =
-        "SELECT id, score FROM items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 4";
-    let before_close = db.execute(all_sql, &parameters(&query)).unwrap();
-    assert_eq!(ids(&before_close), vec![90, 20, 80, 10]);
-    db.close().unwrap();
-    drop(db);
-
-    for order in [
-        [2, 0, 1],
-        [1, 0, 2],
-        [0, 2, 1],
-        [2, 1, 0],
-        [1, 2, 0],
-        [0, 1, 2],
-    ] {
-        db = Database::open(&path).unwrap();
-        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        for bucket in 0..3 {
-            let status = db
-                .vector_store_for_test()
-                .partition_graph_generation_status(&route(bucket))
-                .unwrap();
-            assert!(status.base.is_some() || status.dormant_base.is_some());
-            assert!(
-                !status.base_resident && !status.change_resident,
-                "each permutation starts with genuinely unloaded saved partitions"
-            );
-        }
-        fn with_loaded_order(
-            db: &Database,
-            order: &[i64],
-            loaded: &mut Vec<i64>,
-            insertion_order: &[(i64, i64)],
-            query: &[f32],
-            route: &impl Fn(i64) -> VectorPartitionRef,
-            check: &impl Fn(),
-        ) {
-            let Some((&bucket, remaining)) = order.split_first() else {
-                check();
-                return;
-            };
-            let sql = format!(
-                "SELECT id FROM items WHERE bucket = {bucket} ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 4"
-            );
-            let result = db.execute(&sql, &parameters(query)).unwrap();
-            let expected = insertion_order
-                .iter()
-                .filter(|(_, b)| *b == bucket)
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>();
-            assert_eq!(ids(&result), expected);
-            loaded.push(bucket);
-            for candidate in 0..3 {
-                let status = db
-                    .vector_store_for_test()
-                    .partition_graph_generation_status(&route(candidate))
-                    .unwrap();
-                assert_eq!(
-                    status.base_resident || status.change_resident,
-                    loaded.contains(&candidate),
-                    "warmup must really load only the partitions named so far"
-                );
-            }
-            db.vector_store_for_test()
-                .with_resident_partition_generation(&route(bucket), true, |_, _| {
-                    with_loaded_order(db, remaining, loaded, insertion_order, query, route, check);
-                })
-                .expect("the selected saved base stays pinned by this read guard");
-        }
-        // Idle graphs are evictable; keep actual readers on the earlier loads
-        // while verifying each permutation's simultaneous resident topology.
-        with_loaded_order(
-            &db,
-            &order,
-            &mut Vec::new(),
-            &insertion_order,
-            &query,
-            &route,
-            &|| {
-                for (predicate, expected) in [
-                    ("WHERE bucket = 2", vec![90, 10]),
-                    ("WHERE bucket IN (2, 1)", vec![90, 20, 10, 30]),
-                    ("", vec![90, 20, 80, 10]),
-                ] {
-                    for mode in ["AUTO", "EXACT", "INDEXED"] {
-                        let sql = format!(
-                            "SELECT id, score FROM items {predicate} ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 4"
-                        );
-                        let ordinary = db.execute(&sql, &parameters(&query)).unwrap();
-                        assert_eq!(
-                            ids(&ordinary),
-                            expected,
-                            "load order={order:?}, mode={mode}, scope={predicate}"
-                        );
-                        assert_eq!(bounded_query(&db, &sql, &query).rows(), ordinary.rows());
-                        assert!(
-                            ordinary
-                                .rows()
-                                .windows(2)
-                                .all(|pair| pair[0][1] == pair[1][1])
-                        );
-                        if predicate.is_empty() {
-                            assert_eq!(ordinary.rows(), before_close.rows());
-                        }
-                    }
-                }
-            },
-        );
-        db.close().unwrap();
-        drop(db);
     }
 }

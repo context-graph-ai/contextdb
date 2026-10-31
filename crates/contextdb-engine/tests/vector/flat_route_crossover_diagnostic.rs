@@ -51,9 +51,8 @@ fn fixture(rows: usize) -> Database {
         .unwrap();
     }
     for _ in 0..64 {
-        db.run_maintenance_cycle().unwrap();
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == 1 && status.remaining_partitions == 0 {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        if report.ready_partitions == 1 && report.remaining_partitions == 0 {
             return db;
         }
     }

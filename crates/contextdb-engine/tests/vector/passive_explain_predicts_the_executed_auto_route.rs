@@ -82,10 +82,11 @@ fn declare(db: &Database) {
         }
     }
     for _ in 0..64 {
-        db.run_maintenance_cycle()
-            .expect("one caller-driven maintenance cycle");
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == PARTITIONS as usize && status.remaining_partitions == 0 {
+        let report = db
+            .run_maintenance_cycle()
+            .expect("one caller-driven maintenance cycle")
+            .vector;
+        if report.ready_partitions == PARTITIONS as usize && report.remaining_partitions == 0 {
             return;
         }
     }

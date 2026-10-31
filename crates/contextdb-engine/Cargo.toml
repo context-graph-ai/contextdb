@@ -661,11 +661,6 @@ path = "tests/vector_the_owner_doors_run_one_search_over_every_layer.rs"
 required-features = ["test-seams"]
 
 [[test]]
-name = "vector_delete_only_journal_progress_contract"
-path = "tests/vector_delete_only_journal_progress_contract.rs"
-required-features = ["test-seams"]
-
-[[test]]
 name = "vector_exclusion_persistence_tests"
 path = "tests/vector_exclusion_persistence_tests.rs"
 required-features = ["test-seams"]

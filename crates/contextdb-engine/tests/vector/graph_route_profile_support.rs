@@ -292,10 +292,11 @@ fn fixture(n: usize, shape: &str, seed: usize) -> Database {
     }
     db.commit(tx).expect("commit frozen profile ingestion");
     for _ in 0..64 {
-        db.run_maintenance_cycle()
-            .expect("run frozen profile maintenance");
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == PARTITIONS && status.remaining_partitions == 0 {
+        let report = db
+            .run_maintenance_cycle()
+            .expect("run frozen profile maintenance")
+            .vector;
+        if report.ready_partitions == PARTITIONS && report.remaining_partitions == 0 {
             return db;
         }
     }

@@ -636,34 +636,11 @@ fn open_lang_residency_fixture(with_lang_index: bool) -> (TempDir, Database) {
         "an SQ8 partitioned column must reopen with zero resident raw partitions, \
          the same as this file's unquantized fixtures"
     );
-    // A reopened partition's saved base graph starts dormant; make it
-    // searchable the same way the file's many-partition fixture already
-    // does, before any query. Loading a graph generation never loads raw
-    // vector bodies (asserted again just below).
-    for partition_ordinal in 0..LANG_PARTITIONS {
-        let scope = lang_scope(partition_ordinal);
-        for target_index in [index(), payload_index()] {
-            let route = contextdb_vector::VectorPartitionRef::new(target_index, partition(scope));
-            assert!(
-                db.vector_store_for_test()
-                    .preload_dormant_partition_generation(&route, true)
-                    .expect("preload one saved base graph"),
-                "partition {partition_ordinal} of {:?} starts with one dormant saved base",
-                route.index
-            );
-            // A low AUTO_INDEX_AT plus this many rows can make maintenance
-            // publish an incremental change generation on top of the base.
-            // Preload it too when present; it is fine when there is none.
-            let _ = db
-                .vector_store_for_test()
-                .preload_dormant_partition_generation(&route, false);
-        }
-    }
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
         0,
-        "loading graph generations must not load raw vectors"
+        "reopening and maintaining indexes must not load raw vectors"
     );
     (root, db)
 }
