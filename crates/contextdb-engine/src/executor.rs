@@ -4285,10 +4285,13 @@ mod vector_inspection_aggregation_tests {
 /// What the clustered index says about one partition, from its live rows and
 /// its authenticated native inspection. A partition with no live rows is
 /// empty; one the index cannot serve is unavailable; one with a published
-/// index is ready; every other populated partition is answered exactly.
+/// index is ready; every other populated partition is answered exactly,
+/// except under a column default of INDEXED, whose ordinary query refuses
+/// until the index is published.
 fn vector_partition_query_state(
     live_rows: usize,
     native: Option<&crate::persistence::vector_ivf::inspection::Inspection>,
+    search_mode: VectorSearchMode,
 ) -> &'static str {
     if live_rows == 0 {
         "empty"
@@ -4296,9 +4299,30 @@ fn vector_partition_query_state(
         "unavailable"
     } else if native.is_some_and(|native| native.available()) {
         "ready"
+    } else if search_mode == VectorSearchMode::Indexed {
+        "unavailable"
     } else {
         "exact"
     }
+}
+
+/// A partition whose index was never published reports why and what to do,
+/// beside its truthful (idle) maintenance state; no build is invented.
+fn vector_missing_publication_lifecycle(
+    mut lifecycle: VectorInspectionLifecycle,
+    query_state: &str,
+    maintenance_policy: MaintenancePolicy,
+) -> VectorInspectionLifecycle {
+    if query_state == "unavailable" && lifecycle.availability_reason == "none" {
+        lifecycle.availability_reason = "initial_build";
+        if lifecycle.maintenance_reason == "none" {
+            lifecycle.maintenance_reason = "initial_build";
+        }
+        if lifecycle.recovery_action == "none" {
+            lifecycle.recovery_action = vector_maintenance_recovery_action(maintenance_policy);
+        }
+    }
+    lifecycle
 }
 
 fn vector_index_query_state(states: &[&'static str]) -> &'static str {
@@ -4428,7 +4452,11 @@ fn vector_index_inspection_row(
         .iter()
         .zip(native)
         .map(|(partition, native)| {
-            vector_partition_query_state(partition.live_rows, native.as_ref())
+            vector_partition_query_state(
+                partition.live_rows,
+                native.as_ref(),
+                declaration.search_mode,
+            )
         })
         .collect::<Vec<_>>();
     let unavailable_partitions = states
@@ -4444,7 +4472,14 @@ fn vector_index_inspection_row(
     let objective_status = vector_index_objective_status(declaration, partitions, native);
     let lifecycle = partitions
         .iter()
-        .map(|partition| vector_partition_inspection_lifecycle(partition, maintenance_policy))
+        .zip(&states)
+        .map(|(partition, state)| {
+            vector_missing_publication_lifecycle(
+                vector_partition_inspection_lifecycle(partition, maintenance_policy),
+                state,
+                maintenance_policy,
+            )
+        })
         .collect::<Vec<_>>();
     let stalled_partitions = lifecycle
         .iter()
@@ -4622,8 +4657,13 @@ fn vector_partition_inspection_row(
     native: Option<&crate::persistence::vector_ivf::inspection::Inspection>,
     maintenance_policy: MaintenancePolicy,
 ) -> Result<Vec<Value>> {
-    let query_state = vector_partition_query_state(partition.live_rows, native);
-    let lifecycle = vector_partition_inspection_lifecycle(&partition, maintenance_policy);
+    let query_state =
+        vector_partition_query_state(partition.live_rows, native, declaration.search_mode);
+    let lifecycle = vector_missing_publication_lifecycle(
+        vector_partition_inspection_lifecycle(&partition, maintenance_policy),
+        query_state,
+        maintenance_policy,
+    );
     let desired = partition.desired_policy;
     let indexed_available =
         partition.live_rows != 0 && native.is_some_and(|native| native.available());

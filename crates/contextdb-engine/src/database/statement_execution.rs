@@ -2320,10 +2320,7 @@ impl Database {
             read_memory.clone(),
         )?;
         vector_copy_owner.reserve(
-            facts.policy.auto_index_at_source.len()
-                + actual_trace
-                    .and_then(|trace| trace.budget_receipt)
-                    .map_or(0, |receipt| receipt.budget_terminal.len()),
+            facts.policy.auto_index_at_source.len(),
         )?;
         Ok((
             VectorSearchDisclosure {
@@ -2365,33 +2362,16 @@ impl Database {
                     _ => VectorQuerySourceDisclosure::Unknown,
                 },
                 partitions,
-                global_candidate_budget: actual_trace.and_then(|trace| {
-                    trace
-                        .budget_receipt
-                        .map(|receipt| receipt.global_candidate_budget)
-                }),
-                admission_evaluations: actual_trace.and_then(|trace| {
-                    trace
-                        .budget_receipt
-                        .map(|receipt| receipt.admission_evaluations)
-                }),
-                expansion_evaluations: actual_trace.and_then(|trace| {
-                    trace
-                        .budget_receipt
-                        .map(|receipt| receipt.expansion_evaluations)
-                }),
+                global_candidate_budget: None,
+                admission_evaluations: None,
+                expansion_evaluations: None,
                 rescore_evaluations: actual_trace.and_then(|trace| {
                     trace
                         .budget_receipt
                         .map(|receipt| receipt.rescore_evaluations)
                 }),
-                layers_admitted: actual_trace
-                    .and_then(|trace| trace.budget_receipt.map(|receipt| receipt.layers_admitted)),
-                budget_terminal: actual_trace.and_then(|trace| {
-                    trace
-                        .budget_receipt
-                        .map(|receipt| receipt.budget_terminal.to_owned())
-                }),
+                layers_admitted: None,
+                budget_terminal: None,
             },
             indexed_available,
         ))
@@ -2875,8 +2855,7 @@ impl Database {
             None
         };
         vector_copy_owner.reserve(
-            policy.auto_index_at_source.len()
-                + budget_receipt.map_or(0, |receipt| receipt.budget_terminal.len()),
+            policy.auto_index_at_source.len(),
         )?;
         Ok(VectorSearchDisclosure {
             route_evidence: VectorSearchRouteEvidence::Executed,
@@ -2913,12 +2892,12 @@ impl Database {
                 _ => VectorQuerySourceDisclosure::Unknown,
             },
             partitions,
-            global_candidate_budget: budget_receipt.map(|receipt| receipt.global_candidate_budget),
-            admission_evaluations: budget_receipt.map(|receipt| receipt.admission_evaluations),
-            expansion_evaluations: budget_receipt.map(|receipt| receipt.expansion_evaluations),
+            global_candidate_budget: None,
+            admission_evaluations: None,
+            expansion_evaluations: None,
             rescore_evaluations: budget_receipt.map(|receipt| receipt.rescore_evaluations),
-            layers_admitted: budget_receipt.map(|receipt| receipt.layers_admitted),
-            budget_terminal: budget_receipt.map(|receipt| receipt.budget_terminal.to_owned()),
+            layers_admitted: None,
+            budget_terminal: None,
         })
     }
 

@@ -567,7 +567,6 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
         "tombstones",
         "durable_vector_bytes",
         "charged_vector_bytes",
-        "durable_index_bytes",
         "charged_index_bytes",
     ] {
         non_null(&indexes, index_row, field);
@@ -578,21 +577,25 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
             + int(&indexes, index_row, "charged_index_bytes"),
         "the compatibility byte total is the two charged categories exactly once"
     );
-    assert_eq!(
-        int(&indexes, index_row, "durable_vector_bytes"),
-        0,
-        "an in-memory database must not relabel charged vector memory as durable file bytes"
+    assert!(
+        int(&indexes, index_row, "durable_vector_bytes") > 0,
+        "the scratch store holds the stored vectors as durable file bytes"
     );
     assert_eq!(
-        int(&indexes, index_row, "durable_index_bytes"),
+        int(&indexes, index_row, "charged_vector_bytes"),
         0,
-        "an in-memory database has no durable index artifact"
+        "durable-only backing charges no resident vector memory"
+    );
+    assert_eq!(
+        value(&indexes, index_row, "durable_index_bytes"),
+        &Value::Null,
+        "no index is published yet, so there is no durable index artifact to size"
     );
     assert!(
         int(&indexes, index_row, "charged_vector_bytes")
             + int(&indexes, index_row, "charged_index_bytes")
             > 0,
-        "the live in-memory fixture has positive charged ownership even though durable bytes are zero"
+        "the scratch fixture has positive charged ownership"
     );
     for field in [
         "oldest_base_tx",
@@ -641,11 +644,15 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
             "tombstones",
             "durable_vector_bytes",
             "charged_vector_bytes",
-            "durable_index_bytes",
             "charged_index_bytes",
         ] {
             non_null(&partitions, partition_row, field);
         }
+        assert_eq!(
+            value(&partitions, partition_row, "durable_index_bytes"),
+            &Value::Null,
+            "no index is published yet, so there is no durable index artifact to size"
+        );
         for field in [
             "base_generation",
             "base_tx",

@@ -11168,6 +11168,12 @@ impl VectorState {
                                 context.release(trace_bytes)?;
                                 return Err(error);
                             }
+                            // Canonical scoring done by partitions that served the native
+                            // indexed route; exact routes are counted at their own touches.
+                            #[cfg(any(test, feature = "test-seams"))]
+                            if let Some(scored) = trace.budget_receipt() {
+                                self.receipt.add_native_scored(scored.rescore_evaluations as u64);
+                            }
                             let trace = context.own_vector_trace(trace)?;
                             db.publish_vector_search_trace(trace);
                             self.preparation = VectorPreparation::Materialize;

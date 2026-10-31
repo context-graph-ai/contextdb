@@ -33,6 +33,14 @@ impl SearchReceiptState {
         };
     }
 
+    /// Canonical scoring by the native indexed route, counted once beside the
+    /// brute-force touches of the routes that score through them.
+    pub(super) fn add_native_scored(&mut self, scored: u64) {
+        if let Self::Active(receipt) = self {
+            receipt.exact = receipt.exact.saturating_add(scored);
+        }
+    }
+
     pub(super) fn finish_step(&mut self, exact: u64, complete: bool) {
         let Self::Active(receipt) = self else {
             return;

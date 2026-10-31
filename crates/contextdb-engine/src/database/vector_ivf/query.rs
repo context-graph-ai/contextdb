@@ -197,6 +197,8 @@ impl Database {
         });
         let mut unavailable = false;
         let mut total = Work::default();
+        let mut indexed_rescored = 0u64;
+        let mut any_indexed = false;
         let result=groups.visit_native_partitions(|tuple,allowed,_count| {
             if unavailable {return Ok(());}
             let mut eligible=|candidate:contextdb_vector::ivf::CandidateIdentity<'_>|->std::result::Result<bool,E>{
@@ -254,6 +256,10 @@ impl Database {
             let Some((count,work))=found? else {unavailable=true;return Ok(());};
             #[cfg(feature="test-seams")]
             crate::vector_ivf_observations::observe_query(index,tuple,work.manifest.generation,work.indexed,work.served_depth,work.objective_met,&work.work);
+            if work.indexed {
+                indexed_rescored += work.work.full_precision_evaluations + work.work.buffer_evaluations;
+                any_indexed = true;
+            }
             add_work(&mut total,work.work);
             let bytes=std::mem::size_of::<VectorPartitionSearchTrace>();before_retain(bytes)?;trace_bytes+=bytes;
             trace_routes.reserve_exact(1);trace_routes.push(VectorPartitionSearchTrace {route:if work.indexed {VectorPartitionSearchRoute::Indexed} else {VectorPartitionSearchRoute::Exact},reason:if work.indexed {"clustered_index"} else {"clustered_exact"}});
@@ -300,7 +306,9 @@ impl Database {
             supplemented_row_count: 0,
             fallback_reason: None,
             partition_routes: trace_routes,
-            budget_receipt: None,
+            budget_receipt: any_indexed.then(|| contextdb_vector::mem::VectorSearchBudgetReceipt {
+                rescore_evaluations: usize::try_from(indexed_rescored).unwrap_or(usize::MAX),
+            }),
         };
         // Keep canonical precision through every tuple merge and LIMIT cut.
         // The public score representation is converted only after ranking.

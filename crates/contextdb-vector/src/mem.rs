@@ -602,18 +602,12 @@ pub struct VectorSearchDebugTrace {
     pub budget_receipt: Option<VectorSearchBudgetReceipt>,
 }
 
-/// Work paid by one statement-wide graph walk.
+/// Scoring paid by the partitions that executed the native indexed route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorSearchBudgetReceipt {
-    pub global_candidate_budget: usize,
-    pub admission_evaluations: usize,
-    pub expansion_evaluations: usize,
-    /// Stored vectors read to score rows -- the walk's for rows updated
-    /// since their graph was built, and final candidate scoring's -- from the
-    /// rescoring allowance the declared breadth sizes.
+    /// Stored vectors compared at full precision by the indexed partitions:
+    /// the canonical re-ranks plus the committed-tail comparisons.
     pub rescore_evaluations: usize,
-    pub layers_admitted: usize,
-    pub budget_terminal: &'static str,
 }
 
 /// Fixed borrowed invoice. Zero-capacity buffers have no native allocation.

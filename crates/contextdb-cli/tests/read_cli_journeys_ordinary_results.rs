@@ -584,13 +584,24 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
         &["--read-work", "5000000", "--owner-read-work", "5000000"],
         "",
     );
-    owner.send_line(".maintenance run");
-    owner.wait_for("\"maintenance_cycle\"");
-    let maintenance_cycle = expect_document(
-        &owner.documents(),
-        "maintenance_cycle",
-        "the writer's JSON maintenance receipt",
-    );
+    // Each maintenance run is one finite cycle; the consumer repeats it until no
+    // partition has work left.
+    let mut cycles = 0usize;
+    let maintenance_cycle = loop {
+        owner.send_line(".maintenance run");
+        cycles += 1;
+        owner.wait_for_count("\"maintenance_cycle\"", cycles);
+        let cycle = documents_named(&owner.documents(), "maintenance_cycle")
+            .pop()
+            .expect("the writer's JSON maintenance receipt");
+        if cycle["vector"]["remaining_partitions"] == 0 {
+            break cycle;
+        }
+        assert!(
+            cycles < 200,
+            "maintenance still had work after {cycles} cycles: {cycle}"
+        );
+    };
     assert_eq!(maintenance_cycle["vector"]["nonempty_partitions"], 1);
     assert_eq!(maintenance_cycle["vector"]["ready_partitions"], 1);
     assert_eq!(maintenance_cycle["vector"]["remaining_partitions"], 0);
@@ -777,10 +788,11 @@ fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_rou
             "5000000",
         ],
         &format!(
-            ".maintenance run\n\
-             INSERT INTO vector_budget_docs (id, kind, embedding) \
+            "{}INSERT INTO vector_budget_docs (id, kind, embedding) \
              VALUES (0, 'eligible', '[1,0,0]');\n\
-             {writer_script}"
+             {writer_script}",
+            // One `.maintenance run` is one finite cycle; 64 cover the build.
+            ".maintenance run\n".repeat(64)
         ),
     );
     assert_eq!(
