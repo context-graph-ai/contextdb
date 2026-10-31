@@ -9,7 +9,10 @@ use crate::{
     owner_read::NativeReadRequest,
     persistence::writer_source::NativeRawConfigCursor,
 };
-use contextdb_core::{Incarnation, Lsn, TenantId, read_memory::ReadShared};
+use contextdb_core::{
+    Incarnation, Lsn, TenantId,
+    read_memory::{ReadMemoryOwner, ReadShared},
+};
 use std::sync::{Arc, Mutex, atomic::Ordering};
 
 // Delivery-order records visited on this thread by the counting pass and by
@@ -115,6 +118,61 @@ impl Source<'_> {
         Ok(())
     }
 }
+/// The group and prefix keys naming `record`'s companions: empty for the
+/// authority group, `None` for a record that has no companions to check.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn companion_keys(
+    record: &RecordView<'_>,
+    owner: &ReadMemoryOwner,
+) -> Selected<Option<NativeSelectionHold<NativeBuffer>>> {
+    let mut text = NativeSelectionHold::try_new(owner, 2)?;
+    match record {
+        RecordView::Control(_) => {}
+        RecordView::Terminal { record: t, .. } => {
+            text.retain(NativeBuffer::format(
+                owner,
+                format_args!("submission:{}", t.submission),
+            )?)?;
+            let object = crate::custody::native_record_codec::terminal_object(t)?;
+            text.retain(NativeBuffer::format(
+                owner,
+                format_args!(
+                    "object:{}",
+                    crate::custody::preparation::BorrowedHex(&object)
+                ),
+            )?)?;
+        }
+        RecordView::Root { submission, .. } => text.retain(NativeBuffer::format(
+            owner,
+            format_args!("submission:{submission}"),
+        )?)?,
+        RecordView::MaterializedOwner(o) => text.retain(NativeBuffer::format(
+            owner,
+            format_args!("submission:{}", o.submission),
+        )?)?,
+        RecordView::ObjectAdmission(a) => {
+            text.retain(NativeBuffer::format(
+                owner,
+                format_args!(
+                    "object:{}",
+                    crate::custody::preparation::BorrowedHex(&a.object_digest)
+                ),
+            )?)?;
+            text.retain(NativeBuffer::format(
+                owner,
+                format_args!(
+                    "delivery_peer_evidence.v1.{}",
+                    crate::custody::preparation::BorrowedHex(&a.certificate)
+                ),
+            )?)?;
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(text))
+}
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -170,91 +228,54 @@ impl Source<'_> {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn validate_companions(&self, selection: &NativeCustodySelection) -> Selected<()> {
-        // Members of one submission name the same companions at this one pinned
-        // root, so a run of them collects those companions once; each member
-        // still verifies against them.
-        let mut collected = None;
-        for selected in selection.windows() {
-            let view = selected.view()?;
-            let record = view.record()?;
-            let owner = self.operation.owner();
-            let mut text = NativeSelectionHold::try_new(&owner, 2)?;
-            match record {
-                RecordView::Control(_) => {}
-                RecordView::Terminal { record: t, .. } => {
-                    text.retain(NativeBuffer::format(
-                        &owner,
-                        format_args!("submission:{}", t.submission),
-                    )?)?;
-                    let object = crate::custody::native_record_codec::terminal_object(&t)?;
-                    text.retain(NativeBuffer::format(
-                        &owner,
-                        format_args!(
-                            "object:{}",
-                            crate::custody::preparation::BorrowedHex(&object)
-                        ),
-                    )?)?;
-                }
-                RecordView::Root { submission, .. } => text.retain(NativeBuffer::format(
-                    &owner,
-                    format_args!("submission:{submission}"),
-                )?)?,
-                RecordView::MaterializedOwner(o) => text.retain(NativeBuffer::format(
-                    &owner,
-                    format_args!("submission:{}", o.submission),
-                )?)?,
-                RecordView::ObjectAdmission(a) => {
-                    text.retain(NativeBuffer::format(
-                        &owner,
-                        format_args!(
-                            "object:{}",
-                            crate::custody::preparation::BorrowedHex(&a.object_digest)
-                        ),
-                    )?)?;
-                    text.retain(NativeBuffer::format(
-                        &owner,
-                        format_args!(
-                            "delivery_peer_evidence.v1.{}",
-                            crate::custody::preparation::BorrowedHex(&a.certificate)
-                        ),
-                    )?)?;
-                }
-                _ => continue,
-            }
-            let unchanged = match &collected {
-                Some((earlier, _)) => same_text(earlier, &text)?,
-                None => false,
+        let owner = self.operation.owner();
+        let members = selection.windows();
+        let mut at = 0;
+        while let Some(first) = members.get(at) {
+            let keys = {
+                let view = first.view()?;
+                companion_keys(&view.record()?, &owner)?
             };
-            if unchanged {
-                drop(text);
-            } else {
-                // The earlier companions return their funds before these exist.
-                collected = None;
-                let companions = {
-                    let mut selectors = NativeSelectionHold::try_new(&owner, 2)?;
-                    if text.as_slice().is_empty() {
-                        selectors.retain(Selector::Group("authority"))?;
-                    }
-                    for key in text.as_slice() {
-                        let key = key.text()?;
-                        selectors.retain(if key.starts_with("delivery_") {
-                            Selector::Prefix(key)
-                        } else {
-                            Selector::Group(key)
-                        })?;
-                    }
-                    self.collect(selectors.as_slice())?
-                };
-                collected = Some((text, companions));
-            }
-            let Some((_, companions)) = &collected else {
-                return Err(Invalid::Canonical.into());
+            let Some(keys) = keys else {
+                at += 1;
+                continue;
+            };
+            let companions = {
+                let mut selectors = NativeSelectionHold::try_new(&owner, 2)?;
+                if keys.as_slice().is_empty() {
+                    selectors.retain(Selector::Group("authority"))?;
+                }
+                for key in keys.as_slice() {
+                    let key = key.text()?;
+                    selectors.retain(if key.starts_with("delivery_") {
+                        Selector::Prefix(key)
+                    } else {
+                        Selector::Group(key)
+                    })?;
+                }
+                self.collect(selectors.as_slice())?
             };
             let mut views = NativeSelectionHold::try_new(&owner, companions.windows().len())?;
             for window in companions.windows() {
                 views.retain(window.view()?)?;
             }
-            verify_companions(&record, views.as_slice(), &owner)?;
+            let mut records = NativeSelectionHold::try_new(&owner, companions.windows().len())?;
+            for view in views.as_slice() {
+                records.retain(view.record()?)?;
+            }
+            // Members of one submission name the same companions at this one
+            // pinned root, so a run of them collects and decodes those companions
+            // once; each member still verifies against them.
+            while let Some(member) = members.get(at) {
+                let view = member.view()?;
+                let record = view.record()?;
+                match companion_keys(&record, &owner)? {
+                    Some(next) if !same_text(&keys, &next)? => break,
+                    Some(_) => verify_companions(&record, records.as_slice(), &owner)?,
+                    None => {}
+                }
+                at += 1;
+            }
         }
         Ok(())
     }

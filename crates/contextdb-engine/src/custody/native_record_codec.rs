@@ -1754,7 +1754,7 @@ fn evidence_eq(a: &RowEvidence<'_>, b: &RowEvidence<'_>) -> Decoded<bool> {
 )]
 pub(crate) fn verify_companions(
     record: &RecordView<'_>,
-    views: &[super::store::NativeCustodyView<'_>],
+    views: &[RecordView<'_>],
     owner: &ReadMemoryOwner,
 ) -> Selected<()> {
     match record {
@@ -1764,7 +1764,7 @@ pub(crate) fn verify_companions(
             let mut admission = false;
             let object = object_digest(1, |e| t.bytes_finite(e), t.signature)?;
             for view in views {
-                match view.record()? {
+                match *view {
                     RecordView::Diagnostic {
                         namespace,
                         submission,
@@ -1804,7 +1804,7 @@ pub(crate) fn verify_companions(
         RecordView::Root { life, submission } => {
             let mut manifest = None;
             for view in views {
-                if let RecordView::Manifest(m) = view.record()?
+                if let RecordView::Manifest(m) = *view
                     && m.id == *submission
                     && life_eq(&m.root_life, life)
                 {
@@ -1821,7 +1821,7 @@ pub(crate) fn verify_companions(
                     submission,
                     seal_digest,
                     ..
-                } = view.record()?
+                } = *view
                     && life_eq(&root, life)
                     && submission == m.id
                     && seal_digest == seal
@@ -1840,7 +1840,7 @@ pub(crate) fn verify_companions(
                         member: o,
                         root,
                         submission,
-                    } = view.record()?
+                    } = *view
                         && life_eq(&member, &o)
                         && life_eq(&root, life)
                         && submission == m.id
@@ -1858,7 +1858,7 @@ pub(crate) fn verify_companions(
             let mut manifest = false;
             let mut terminal = false;
             for view in views {
-                match view.record()? {
+                match *view {
                     RecordView::Manifest(m)
                         if m.id == o.submission
                             && m.tenant == o.namespace.tenant
@@ -1892,7 +1892,7 @@ pub(crate) fn verify_companions(
             let mut certificate = None;
             let mut object = false;
             for view in views {
-                match view.record()? {
+                match *view {
                     RecordView::Certificate(c) if c.id_finite()? == a.certificate => {
                         certificate = Some(c)
                     }
@@ -1928,7 +1928,7 @@ pub(crate) fn verify_companions(
             let mut count = 0usize;
             let mut active = None;
             for view in views {
-                match view.record()? {
+                match *view {
                     RecordView::State(s) if state_birth_eq(&s.state, &c.identity) => {
                         count = count.checked_add(1).ok_or(Invalid::Codec)?
                     }
@@ -1939,7 +1939,7 @@ pub(crate) fn verify_companions(
             let birth = active.ok_or(Invalid::Companions)?;
             let mut states = NativeSelectionHold::try_new(owner, count)?;
             for view in views {
-                if let RecordView::State(s) = view.record()?
+                if let RecordView::State(s) = *view
                     && state_birth_eq(&s.state, &c.identity)
                 {
                     states.retain(s)?
@@ -1969,7 +1969,7 @@ pub(crate) fn verify_companions(
                 let id = id?;
                 let mut found = None;
                 for view in views {
-                    if let RecordView::Birth(b) = view.record()?
+                    if let RecordView::Birth(b) = *view
                         && birth_eq(&b.identity, &id)
                     {
                         found = Some(b);
@@ -1992,7 +1992,7 @@ pub(crate) fn verify_companions(
                     let trigger = trigger?;
                     let mut found = false;
                     for view in views {
-                        if let RecordView::Certificate(cert) = view.record()?
+                        if let RecordView::Certificate(cert) = *view
                             && cert.id_finite()? == trigger
                         {
                             found = true;
