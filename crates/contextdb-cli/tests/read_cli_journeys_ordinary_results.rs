@@ -584,24 +584,20 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
         &["--read-work", "5000000", "--owner-read-work", "5000000"],
         "",
     );
-    // Each maintenance run is one finite cycle; the consumer repeats it until no
-    // partition has work left.
-    let mut cycles = 0usize;
-    let maintenance_cycle = loop {
+    // Each maintenance run is one finite cycle; 64 consecutive runs cover the build, and
+    // the status line after them answers only once every run has been processed.
+    for _ in 0..64 {
         owner.send_line(".maintenance run");
-        cycles += 1;
-        owner.wait_for_count("\"maintenance_cycle\"", cycles);
-        let cycle = documents_named(&owner.documents(), "maintenance_cycle")
-            .pop()
-            .expect("the writer's JSON maintenance receipt");
-        if cycle["vector"]["remaining_partitions"] == 0 {
-            break cycle;
-        }
-        assert!(
-            cycles < 200,
-            "maintenance still had work after {cycles} cycles: {cycle}"
-        );
-    };
+    }
+    owner.send_line(".maintenance status");
+    owner.wait_for("{\"maintenance\":{");
+    let maintenance_cycle = documents_named(&owner.documents(), "maintenance_cycle")
+        .pop()
+        .expect("the writer's JSON maintenance receipt");
+    assert_eq!(
+        maintenance_cycle["vector"]["remaining_partitions"], 0,
+        "the repeated cycles leave no partition with work: {maintenance_cycle}"
+    );
     assert_eq!(maintenance_cycle["vector"]["nonempty_partitions"], 1);
     assert_eq!(maintenance_cycle["vector"]["ready_partitions"], 1);
     assert_eq!(maintenance_cycle["vector"]["remaining_partitions"], 0);
