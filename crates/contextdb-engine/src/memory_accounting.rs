@@ -2740,8 +2740,6 @@ pub struct MemoryAccountant {
     retained_charge_bytes_for_test: AtomicUsize,
     startup_ceiling: AtomicUsize,
     has_ceiling: AtomicBool,
-    idle_graph_reclaimer:
-        parking_lot::Mutex<Option<std::sync::Weak<contextdb_vector::VectorStore>>>,
     #[cfg(any(test, feature = "test-seams"))]
     underflow_count: AtomicUsize,
     #[cfg(any(test, feature = "test-seams"))]
@@ -4714,7 +4712,6 @@ impl MemoryAccountant {
             startup_ceiling: AtomicUsize::new(startup.unwrap_or(0)),
             has_ceiling: AtomicBool::new(startup.is_some()),
             writer_identity: OnceLock::new(),
-            idle_graph_reclaimer: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             underflow_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-seams"))]
@@ -5706,13 +5703,6 @@ impl MemoryAccountant {
         bytes.min(released)
     }
 
-    pub(crate) fn register_idle_graph_reclaimer(
-        &self,
-        vector: &Arc<contextdb_vector::VectorStore>,
-    ) {
-        *self.idle_graph_reclaimer.lock() = Some(Arc::downgrade(vector));
-    }
-
     /// Runtime budget adjustment. None removes limit.
     /// Returns Err if new limit exceeds startup ceiling.
     #[expect(
@@ -5854,17 +5844,6 @@ impl MemoryAccountant {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn current_identity_admission_failure_consumed_for_test(&self) -> bool {
         self.tail_admission_failure.load(Ordering::SeqCst) == 4
-    }
-
-    /// Evict idle graphs of partitions the statement on this thread is not
-    /// searching until `short` more bytes are free, for a graph it is about
-    /// to load. Returns how many graphs were evicted.
-    pub(crate) fn make_room_for_graph_load(&self, short: usize) -> usize {
-        self.idle_graph_reclaimer
-            .lock()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-            .map_or(0, |vector| vector.make_room_for_graph_load(short))
     }
 
     #[expect(
@@ -6070,63 +6049,6 @@ impl MemoryAccountant {
                 bytes,
                 self.used.load(Ordering::SeqCst),
             );
-        }
-        // A saved graph whose topology does not fit is admitted once the
-        // serving pages already resident give way to it: they are re-readable,
-        // the topology is what makes its partition searchable at all.
-        // Idle graphs of partitions the statement is not searching go first;
-        // serving pages give way only after them.
-        if allocation.is_err() && operation == "load_retained_vector_generation" {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            if let Some(vector) = vector {
-                let short = || {
-                    bytes.saturating_sub(
-                        self.available_for_provenance(provenance)
-                            .unwrap_or(usize::MAX),
-                    )
-                };
-                if vector.make_room_for_graph_load(short()) != 0 {
-                    allocation = self.try_allocate_with_provenance(bytes, provenance);
-                }
-                if allocation.is_err() && vector.give_back_serving_pages(short()) != 0 {
-                    allocation = self.try_allocate_with_provenance(bytes, provenance);
-                }
-            }
-        }
-        // Serving pages are a cache a read can always refill, so nothing is
-        // refused while they hold the memory it needs: they give way to any
-        // allocation exactly as they give way to a graph load. The give-back
-        // only tries its locks, so it is safe from inside any caller.
-        if allocation.is_err() && operation != "load_retained_vector_generation" {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            let short = bytes.saturating_sub(
-                self.available_for_provenance(provenance)
-                    .unwrap_or(usize::MAX),
-            );
-            if vector.is_some_and(|vector| vector.give_back_serving_pages(short) != 0) {
-                allocation = self.try_allocate_with_provenance(bytes, provenance);
-            }
-        }
-        if allocation.is_err() && matches!(operation, "read/table_scan" | "read/index_range") {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            let graphs = vector
-                .as_ref()
-                .map_or(0, |vector| vector.evict_idle_graphs());
-            if graphs != 0 {
-                allocation = self.try_allocate_with_provenance(bytes, provenance);
-            }
         }
         // A received schema unit that was already ADMITTED AS A WHOLE is
         // applying against THIS accountant, and an allocation it did not model
@@ -6889,25 +6811,10 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
         operation: &'static str,
         hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        let mut transition =
+        let transition =
             self.transition_reservation_static(old_bytes, new_bytes, subsystem, operation, hint);
         if self.exclusive_activation().is_some() {
             return transition;
-        }
-        if transition.is_err() {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            let short = new_bytes
-                .saturating_sub(old_bytes)
-                .saturating_sub(self.usage().available.unwrap_or(usize::MAX));
-            if vector.is_some_and(|vector| vector.give_back_serving_pages_native(short) != 0) {
-                transition = self.transition_reservation_static(
-                    old_bytes, new_bytes, subsystem, operation, hint,
-                );
-            }
         }
         transition
     }
@@ -6946,7 +6853,7 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
         operation: &str,
         hint: &str,
     ) -> contextdb_core::Result<()> {
-        let mut transition =
+        let transition =
             self.transition_reservation(old_bytes, new_bytes, subsystem, operation, hint);
         // Activation's short exclusive scope never invokes a reclaimer.
         if self.exclusive_activation().is_some() {
@@ -6955,20 +6862,6 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
         // Workspace growth preserves ordinary admission's cache give-back:
         // these pages can be filled again and their release is independent
         // of the caller's still-held old reservation.
-        if transition.is_err() {
-            let vector = self
-                .idle_graph_reclaimer
-                .lock()
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            let short = new_bytes
-                .saturating_sub(old_bytes)
-                .saturating_sub(self.usage().available.unwrap_or(usize::MAX));
-            if vector.is_some_and(|vector| vector.give_back_serving_pages(short) != 0) {
-                transition =
-                    self.transition_reservation(old_bytes, new_bytes, subsystem, operation, hint);
-            }
-        }
         transition
     }
 
@@ -12618,63 +12511,6 @@ impl MemoryAccountant {
                         bytes,
                         self.used.load(Ordering::SeqCst),
                     );
-                }
-            }
-            // A saved graph whose topology does not fit is admitted once the
-            // serving pages already resident give way to it: they are re-readable,
-            // the topology is what makes its partition searchable at all.
-            // Idle graphs of partitions the statement is not searching go first;
-            // serving pages give way only after them.
-            if allocation.is_err() && operation == "load_retained_vector_generation" {
-                let vector = self
-                    .idle_graph_reclaimer
-                    .lock()
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade);
-                if let Some(vector) = vector {
-                    let short = || {
-                        bytes.saturating_sub(
-                            self.available_for_provenance(provenance)
-                                .unwrap_or(usize::MAX),
-                        )
-                    };
-                    if vector.make_room_for_graph_load_native(short()) != 0 {
-                        allocation = self.try_allocate_with_provenance_native(bytes, provenance);
-                    }
-                    if allocation.is_err() && vector.give_back_serving_pages_native(short()) != 0 {
-                        allocation = self.try_allocate_with_provenance_native(bytes, provenance);
-                    }
-                }
-            }
-            // Serving pages are a cache a read can always refill, so nothing is
-            // refused while they hold the memory it needs: they give way to any
-            // allocation exactly as they give way to a graph load. The give-back
-            // only tries its locks, so it is safe from inside any caller.
-            if allocation.is_err() && operation != "load_retained_vector_generation" {
-                let vector = self
-                    .idle_graph_reclaimer
-                    .lock()
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade);
-                let short = bytes.saturating_sub(
-                    self.available_for_provenance(provenance)
-                        .unwrap_or(usize::MAX),
-                );
-                if vector.is_some_and(|vector| vector.give_back_serving_pages_native(short) != 0) {
-                    allocation = self.try_allocate_with_provenance_native(bytes, provenance);
-                }
-            }
-            if allocation.is_err() && matches!(operation, "read/table_scan" | "read/index_range") {
-                let vector = self
-                    .idle_graph_reclaimer
-                    .lock()
-                    .as_ref()
-                    .and_then(std::sync::Weak::upgrade);
-                let graphs = vector
-                    .as_ref()
-                    .map_or(0, |vector| vector.evict_idle_graphs());
-                if graphs != 0 {
-                    allocation = self.try_allocate_with_provenance_native(bytes, provenance);
                 }
             }
             // A received schema unit that was already ADMITTED AS A WHOLE is

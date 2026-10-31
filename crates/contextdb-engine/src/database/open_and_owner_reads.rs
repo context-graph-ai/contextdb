@@ -1922,9 +1922,6 @@ impl Database {
             trigger,
             declared_read_memory,
         )?;
-        _image_memory
-            .accountant
-            .register_idle_graph_reclaimer(&db.vector_store);
         db.maintenance_poll_interval_ms
             .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
         db.vector_serving_cache_bytes

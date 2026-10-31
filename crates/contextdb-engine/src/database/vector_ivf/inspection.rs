@@ -44,7 +44,9 @@ impl Database {
                 boundary: &boundary,
             });
         let Some(mut result) =
-            inspection::inspect(&root, memory, index, tuple, max_runs, selection, checkpoint)?
+            inspection::inspect(
+                &root, memory, index, tuple, column, max_runs, selection, checkpoint,
+            )?
         else {
             return Ok(None);
         };

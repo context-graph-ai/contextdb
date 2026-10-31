@@ -3950,9 +3950,11 @@ const VECTOR_INDEX_INSPECTION_COLUMNS: &[&str] = &[
     "search_mode",
     "declared_auto_index_at",
     "effective_auto_index_at",
-    "declared_hnsw_m",
-    "declared_hnsw_ef_construction",
-    "declared_hnsw_ef_search",
+    "declared_target_accuracy",
+    "declared_expected_vectors",
+    "declared_lists",
+    "declared_probes",
+    "declared_refine_factor",
     "declared_consolidation_mode",
     "declared_consolidation_change_percent",
     "declared_consolidation_tombstone_percent",
@@ -3968,6 +3970,8 @@ const VECTOR_INDEX_INSPECTION_COLUMNS: &[&str] = &[
     "durable_index_bytes",
     "charged_index_bytes",
     "query_state",
+    "indexed_available",
+    "objective_status",
     "maintenance_state",
     "maintenance_vectors_total",
     "maintenance_vectors_done",
@@ -4008,12 +4012,15 @@ const VECTOR_PARTITION_INSPECTION_COLUMNS: &[&str] = &[
     "maintenance_vectors_done",
     "maintenance_vectors_remaining",
     "maintenance_checkpoint_tx",
-    "desired_hnsw_m",
-    "desired_hnsw_ef_construction",
-    "desired_hnsw_ef_search",
-    "serving_hnsw_m",
-    "serving_hnsw_ef_construction",
-    "serving_hnsw_ef_search",
+    "indexed_available",
+    "codebook_identity",
+    "objective_status",
+    "lists",
+    "lists_source",
+    "probes",
+    "probes_source",
+    "refine_factor",
+    "refine_factor_source",
     "declared_consolidation_mode",
     "declared_consolidation_change_percent",
     "declared_consolidation_tombstone_percent",
@@ -4120,42 +4127,6 @@ fn vector_partition_key_json(columns: &[String], key: &VectorPartitionKey) -> Re
     Ok(Value::Json(serde_json::Value::Object(object)))
 }
 
-fn vector_partition_query_state(
-    partition: &contextdb_vector::store::VectorPartitionInfo,
-) -> &'static str {
-    if partition.quarantine_reason.is_some() {
-        "unavailable"
-    } else if partition.live_rows == 0 {
-        "empty"
-    } else if partition.graph_available {
-        "ready"
-    } else {
-        "unavailable"
-    }
-}
-
-fn vector_index_query_state(
-    partitions: &[contextdb_vector::store::VectorPartitionInfo],
-) -> &'static str {
-    let mut routes = 0usize;
-    let mut ready = 0usize;
-    for partition in partitions {
-        if partition.live_rows == 0 && partition.quarantine_reason.is_none() {
-            continue;
-        }
-        routes = routes.saturating_add(1);
-        if partition.graph_available && partition.quarantine_reason.is_none() {
-            ready = ready.saturating_add(1);
-        }
-    }
-    match (routes, ready) {
-        (0, _) => "empty",
-        (routes, ready) if routes == ready => "ready",
-        (_, 0) => "unavailable",
-        _ => "partial",
-    }
-}
-
 fn vector_maintenance_recovery_action(policy: MaintenancePolicy) -> &'static str {
     match policy {
         MaintenancePolicy::CallerDriven => "run_maintenance_cycle",
@@ -4184,15 +4155,10 @@ fn vector_unavailable_failure_reason(
 
 fn vector_maintenance_failure_lifecycle(
     failure: contextdb_vector::store::VectorMaintenanceFailure,
-    graph_available: bool,
     checkpoint_tx: Option<TxId>,
 ) -> VectorInspectionLifecycle {
     VectorInspectionLifecycle {
-        availability_reason: if graph_available {
-            "none"
-        } else {
-            vector_unavailable_failure_reason(failure)
-        },
+        availability_reason: "none",
         maintenance_state: "stalled",
         maintenance_reason: failure.reason(),
         vectors_total: None,
@@ -4238,15 +4204,6 @@ fn whole_index_maintenance_state(lifecycle: &[VectorInspectionLifecycle]) -> &'s
         (false, Some(_), true) => "active",
         (true, None, _) => "stalled",
         (true, Some(_), _) => "mixed",
-    }
-}
-
-fn fanout_broad_route_state(
-    partitions: &[contextdb_vector::store::VectorPartitionInfo],
-) -> &'static str {
-    match vector_index_query_state(partitions) {
-        "empty" => "ready",
-        state => state,
     }
 }
 
@@ -4298,9 +4255,8 @@ mod vector_inspection_aggregation_tests {
 
     #[test]
     fn an_empty_fanout_is_ready_while_the_index_stays_empty() {
-        let partitions = Vec::<contextdb_vector::store::VectorPartitionInfo>::new();
-        assert_eq!(vector_index_query_state(&partitions), "empty");
-        assert_eq!(fanout_broad_route_state(&partitions), "ready");
+        assert_eq!(vector_index_query_state(&[]), "empty");
+        assert_eq!(fanout_broad_route_state(&[]), "ready");
     }
 
     #[test]
@@ -4328,23 +4284,14 @@ mod vector_inspection_aggregation_tests {
                 "inspect_build_failure",
             ),
         ] {
-            let stalled = vector_maintenance_failure_lifecycle(failure, false, Some(TxId(7)));
-            assert_eq!(stalled.availability_reason, available);
+            let stalled = vector_maintenance_failure_lifecycle(failure, Some(TxId(7)));
+            assert_eq!(stalled.availability_reason, "none");
             assert_eq!(stalled.maintenance_reason, maintenance_reason);
             assert_eq!(stalled.recovery_action, action);
-            assert_eq!(broad_route_recovery_action(&[stalled], available), action);
-
-            let serving = vector_maintenance_failure_lifecycle(failure, true, Some(TxId(7)));
-            assert_eq!(serving.availability_reason, "none");
-            assert_eq!(serving.maintenance_reason, maintenance_reason);
-            assert_eq!(serving.recovery_action, action);
-            assert_eq!(broad_route_recovery_action(&[serving], "none"), "none");
+            assert_eq!(broad_route_recovery_action(&[stalled], "none"), "none");
+            assert_eq!(vector_unavailable_failure_reason(failure), available);
         }
 
-        assert_eq!(
-            contextdb_vector::store::VectorRouteQuarantineReason::CorruptChanges.as_str(),
-            "corrupt_changes"
-        );
         assert_eq!(
             published_vector_maintenance_reason("policy_replacement"),
             "new_changes"
@@ -4352,41 +4299,59 @@ mod vector_inspection_aggregation_tests {
     }
 }
 
-/// The store snapshot distinguishes an empty partition, a partition with a
-/// complete maintained route, and a populated partition that has not yet had
-/// its first route built.  Do not turn the last case into a generic failure:
-/// a newly written partition is waiting for ordinary maintenance, and the
-/// operator needs that answer without causing a build by inspecting it.
+/// What the clustered index says about one partition, from its live rows and
+/// its authenticated native inspection. A partition with no live rows is
+/// empty; one the index cannot serve is unavailable; one with a published
+/// index is ready; every other populated partition is answered exactly.
+fn vector_partition_query_state(
+    live_rows: usize,
+    native: Option<&crate::persistence::vector_ivf::inspection::Inspection>,
+) -> &'static str {
+    if live_rows == 0 {
+        "empty"
+    } else if native.is_some_and(|native| native.recovery_action() == "rebuild") {
+        "unavailable"
+    } else if native.is_some_and(|native| native.available()) {
+        "ready"
+    } else {
+        "exact"
+    }
+}
+
+fn vector_index_query_state(states: &[&'static str]) -> &'static str {
+    let routes = states.iter().filter(|state| **state != "empty").count();
+    let count = |wanted: &str| states.iter().filter(|state| **state == wanted).count();
+    match (routes, count("ready"), count("exact"), count("unavailable")) {
+        (0, ..) => "empty",
+        (routes, ready, ..) if routes == ready => "ready",
+        (routes, _, exact, _) if routes == exact => "exact",
+        (routes, _, _, unavailable) if routes == unavailable => "unavailable",
+        _ => "partial",
+    }
+}
+
+fn fanout_broad_route_state(states: &[&'static str]) -> &'static str {
+    match vector_index_query_state(states) {
+        "empty" => "ready",
+        state => state,
+    }
+}
+
+/// A populated partition is always searchable: the index serves it, or its
+/// vectors are compared exactly. Maintenance work and failures are reported
+/// beside that, never as a reason the partition cannot answer.
 fn vector_partition_inspection_lifecycle(
-    layout: &contextdb_vector::store::VectorIndexLayout,
     partition: &contextdb_vector::store::VectorPartitionInfo,
     maintenance_policy: MaintenancePolicy,
 ) -> VectorInspectionLifecycle {
     let recovery_action = vector_maintenance_recovery_action(maintenance_policy);
-    let maintenance_need = layout.maintenance_need(partition);
-    let maintenance_failure = partition
-        .maintenance_failure
-        .filter(|_| maintenance_need.is_some() || partition.maintenance_progress.is_some());
-    let availability_reason = if let Some(reason) = partition.quarantine_reason {
-        reason.as_str()
-    } else if partition.graph_available || partition.live_rows == 0 {
-        "none"
-    } else if let Some(failure) = maintenance_failure {
-        vector_unavailable_failure_reason(failure)
-    } else {
-        "initial_build"
-    };
     // A registered build retains committed progress even when its last batch
     // failed. Report that failure before progress, without hiding its checkpoint.
     if let Some(progress) = partition.maintenance_progress
         && let Some(failure) = partition.maintenance_failure
     {
-        let mut lifecycle = vector_maintenance_failure_lifecycle(
-            failure,
-            partition.graph_available,
-            Some(progress.checkpoint_tx),
-        );
-        lifecycle.availability_reason = availability_reason;
+        let mut lifecycle =
+            vector_maintenance_failure_lifecycle(failure, Some(progress.checkpoint_tx));
         lifecycle.vectors_total = Some(progress.vectors_total);
         lifecycle.vectors_done = Some(progress.vectors_done);
         lifecycle.vectors_remaining =
@@ -4394,11 +4359,10 @@ fn vector_partition_inspection_lifecycle(
         return lifecycle;
     }
     if let Some(progress) = partition.maintenance_progress {
-        let reason = published_vector_maintenance_reason(progress.reason);
         return VectorInspectionLifecycle {
-            availability_reason,
+            availability_reason: "none",
             maintenance_state: progress.state,
-            maintenance_reason: reason,
+            maintenance_reason: published_vector_maintenance_reason(progress.reason),
             vectors_total: Some(progress.vectors_total),
             vectors_done: Some(progress.vectors_done),
             vectors_remaining: Some(progress.vectors_total.saturating_sub(progress.vectors_done)),
@@ -4406,101 +4370,56 @@ fn vector_partition_inspection_lifecycle(
             recovery_action,
         };
     }
-    if let Some(failure) = maintenance_failure
-        && matches!(
-            failure,
-            contextdb_vector::store::VectorMaintenanceFailure::MemoryLimit
-                | contextdb_vector::store::VectorMaintenanceFailure::DiskLimit
-        )
+    if let Some(failure) = partition.maintenance_failure
+        && partition.live_rows != 0
     {
-        let mut lifecycle = vector_maintenance_failure_lifecycle(
-            failure,
-            partition.graph_available,
-            partition.base_tx,
-        );
-        lifecycle.availability_reason = availability_reason;
-        return lifecycle;
+        return vector_maintenance_failure_lifecycle(failure, None);
     }
-    if let Some(reason) = partition.quarantine_reason {
-        return VectorInspectionLifecycle {
-            availability_reason,
-            maintenance_state: "stalled",
-            maintenance_reason: reason.as_str(),
-            vectors_total: None,
-            vectors_done: None,
-            vectors_remaining: None,
-            checkpoint_tx: partition.base_tx,
-            recovery_action,
-        };
-    }
-    if partition.live_rows == 0 {
-        return VectorInspectionLifecycle {
-            availability_reason,
-            maintenance_state: "idle",
-            maintenance_reason: "none",
-            vectors_total: None,
-            vectors_done: None,
-            vectors_remaining: None,
-            checkpoint_tx: None,
-            recovery_action: "none",
-        };
-    }
-    if let Some(failure) = maintenance_failure {
-        return vector_maintenance_failure_lifecycle(
-            failure,
-            partition.graph_available,
-            partition.base_tx,
-        );
-    }
-    if partition.maintenance_policy_revision.is_some() {
-        return VectorInspectionLifecycle {
-            availability_reason: if partition.graph_available {
-                "none"
-            } else {
-                "initial_build"
-            },
-            maintenance_state: "building",
-            maintenance_reason: maintenance_need.map_or("none", |need| need.reason()),
-            vectors_total: Some(partition.live_rows),
-            vectors_done: Some(0),
-            vectors_remaining: Some(partition.live_rows),
-            checkpoint_tx: partition.base_tx,
-            recovery_action,
-        };
-    }
-    if partition.graph_available {
-        let maintenance_reason = maintenance_need.map_or("none", |need| need.reason());
-        let recovery_action = if maintenance_reason == "none" {
-            "none"
-        } else {
-            recovery_action
-        };
-        return VectorInspectionLifecycle {
-            availability_reason: "none",
-            maintenance_state: "idle",
-            maintenance_reason,
-            vectors_total: None,
-            vectors_done: None,
-            vectors_remaining: None,
-            checkpoint_tx: partition.base_tx,
-            recovery_action,
-        };
-    }
-
-    // A maintained partition is omitted from this inspection surface once it
-    // has been retired for historical-only reads.  Therefore a listed,
-    // populated partition without a graph is the first build still pending,
-    // rather than a retired or partially usable graph.
     VectorInspectionLifecycle {
-        availability_reason: "initial_build",
+        availability_reason: "none",
         maintenance_state: "idle",
-        maintenance_reason: "initial_build",
+        maintenance_reason: "none",
         vectors_total: None,
         vectors_done: None,
         vectors_remaining: None,
         checkpoint_tx: None,
-        recovery_action,
+        recovery_action: "none",
     }
+}
+
+/// An SQL decimal for a value held in hundredths, or NULL.
+fn vector_inspection_decimal(hundredths: Option<u32>) -> Value {
+    hundredths.map_or(Value::Null, |value| {
+        Value::Text(crate::database::vector_ivf::policy::Decimal(value).to_string())
+    })
+}
+
+/// The summary of the objective across the partitions it applies to: NULL
+/// without a declared objective, `unmet` if any partition measured a failure,
+/// `met` only when every nonempty partition holds applicable evidence of
+/// success, and `unmeasured` otherwise.
+fn vector_index_objective_status(
+    declaration: &ColumnDef,
+    partitions: &[contextdb_vector::store::VectorPartitionInfo],
+    native: &[Option<crate::persistence::vector_ivf::inspection::Inspection>],
+) -> Option<&'static str> {
+    use crate::persistence::vector_ivf::inspection::Objective;
+    declaration.search_target_accuracy_hundredths?;
+    let statuses = partitions
+        .iter()
+        .zip(native)
+        .filter(|(partition, _)| partition.live_rows != 0)
+        .map(|(_, native)| native.and_then(|native| native.objective))
+        .collect::<Vec<_>>();
+    Some(
+        if statuses.contains(&Some(Objective::Unmet)) {
+            "unmet"
+        } else if !statuses.is_empty() && statuses.iter().all(|s| *s == Some(Objective::Met)) {
+            "met"
+        } else {
+            "unmeasured"
+        },
+    )
 }
 
 #[expect(
@@ -4511,6 +4430,7 @@ fn vector_index_inspection_row(
     declaration: &ColumnDef,
     info: contextdb_vector::store::VectorIndexLayoutInfo,
     partitions: &[contextdb_vector::store::VectorPartitionInfo],
+    native: &[Option<crate::persistence::vector_ivf::inspection::Inspection>],
     maintenance_policy: MaintenancePolicy,
 ) -> Result<Vec<Value>> {
     let vector_count =
@@ -4523,18 +4443,22 @@ fn vector_index_inspection_row(
         .iter()
         .filter(|partition| partition.retained_rows != 0)
         .count();
-    let unavailable_partitions = partitions
+    let states = partitions
         .iter()
-        .filter(|partition| {
-            partition.quarantine_reason.is_some()
-                || (partition.live_rows != 0 && !partition.graph_available)
-        })
-        .count();
+        .zip(native)
+        .map(|(partition, native)| vector_partition_query_state(partition.live_rows, native.as_ref()))
+        .collect::<Vec<_>>();
+    let unavailable_partitions = states.iter().filter(|state| **state == "unavailable").count();
+    let indexed_available = live_partitions != 0
+        && partitions
+            .iter()
+            .zip(native)
+            .filter(|(partition, _)| partition.live_rows != 0)
+            .all(|(_, native)| native.is_some_and(|native| native.available()));
+    let objective_status = vector_index_objective_status(declaration, partitions, native);
     let lifecycle = partitions
         .iter()
-        .map(|partition| {
-            vector_partition_inspection_lifecycle(&info.layout, partition, maintenance_policy)
-        })
+        .map(|partition| vector_partition_inspection_lifecycle(partition, maintenance_policy))
         .collect::<Vec<_>>();
     let stalled_partitions = lifecycle
         .iter()
@@ -4546,55 +4470,24 @@ fn vector_index_inspection_row(
         .filter(|lifecycle| lifecycle.vectors_total.is_some())
         .copied()
         .collect::<Vec<_>>();
-    let maintenance_vectors_total = if active_progress.is_empty() {
-        None
-    } else {
-        Some(
-            active_progress
-                .iter()
-                .try_fold(0usize, |total, lifecycle| {
-                    total
-                        .checked_add(lifecycle.vectors_total.unwrap_or(0))
-                        .ok_or_else(|| {
-                            Error::Other(("vector maintenance total overflow".to_owned()).into())
-                        })
-                })?,
-        )
+    let progress_sum = |value: fn(&VectorInspectionLifecycle) -> Option<usize>,
+                        what: &str|
+     -> Result<Option<usize>> {
+        if active_progress.is_empty() {
+            return Ok(None);
+        }
+        active_progress
+            .iter()
+            .try_fold(0usize, |total, lifecycle| {
+                total
+                    .checked_add(value(lifecycle).unwrap_or(0))
+                    .ok_or_else(|| Error::Other((format!("vector maintenance {what} overflow")).into()))
+            })
+            .map(Some)
     };
-    let maintenance_vectors_done = if active_progress.is_empty() {
-        None
-    } else {
-        Some(
-            active_progress
-                .iter()
-                .try_fold(0usize, |total, lifecycle| {
-                    total
-                        .checked_add(lifecycle.vectors_done.unwrap_or(0))
-                        .ok_or_else(|| {
-                            Error::Other(("vector maintenance done overflow".to_owned()).into())
-                        })
-                })?,
-        )
-    };
-    let maintenance_vectors_remaining = if active_progress.is_empty() {
-        None
-    } else {
-        Some(
-            active_progress
-                .iter()
-                .try_fold(0usize, |total, lifecycle| {
-                    total
-                        .checked_add(lifecycle.vectors_remaining.unwrap_or(0))
-                        .ok_or_else(|| {
-                            Error::Other(
-                                ("vector maintenance remaining overflow".to_owned()).into(),
-                            )
-                        })
-                })?,
-        )
-    };
-    let oldest_base_tx = partitions.iter().filter_map(|row| row.base_tx).min();
-    let newest_base_tx = partitions.iter().filter_map(|row| row.base_tx).max();
+    let maintenance_vectors_total = progress_sum(|l| l.vectors_total, "total")?;
+    let maintenance_vectors_done = progress_sum(|l| l.vectors_done, "done")?;
+    let maintenance_vectors_remaining = progress_sum(|l| l.vectors_remaining, "remaining")?;
     let pending_inserts =
         vector_inspection_partition_sum(partitions, "pending inserts", |row| row.pending_inserts)?;
     let tombstones =
@@ -4607,10 +4500,6 @@ fn vector_index_inspection_row(
         vector_inspection_partition_sum(partitions, "charged vector bytes", |row| {
             row.charged_vector_bytes
         })?;
-    let durable_index_bytes =
-        vector_inspection_partition_sum(partitions, "durable index bytes", |row| {
-            row.durable_index_bytes
-        })?;
     let charged_index_bytes =
         vector_inspection_partition_sum(partitions, "charged index bytes", |row| {
             row.charged_index_bytes
@@ -4620,7 +4509,7 @@ fn vector_index_inspection_row(
         .ok_or_else(|| {
             Error::Other(("vector inspection charged byte total overflow".to_owned()).into())
         })?;
-    let broad_route_state = fanout_broad_route_state(partitions);
+    let broad_route_state = fanout_broad_route_state(&states);
     let broad_route_reason = lifecycle
         .iter()
         .map(|lifecycle| lifecycle.availability_reason)
@@ -4637,10 +4526,11 @@ fn vector_index_inspection_row(
             .map(serde_json::Value::String)
             .collect(),
     );
+    let optional_int = |value: Option<u32>| value.map_or(Value::Null, |v| Value::Int64(i64::from(v)));
 
-    // Every value below comes from the one passive partition snapshot. The
-    // row builder aggregates it without loading a vector or graph page and
-    // leaves facts absent when the store has no represented value.
+    // Every value below comes from the one passive partition snapshot and the
+    // per-partition native inspection. The row builder aggregates them without
+    // loading a vector page and leaves facts absent when nothing represents them.
     Ok(vec![
         Value::Text(info.index.table),
         Value::Text(info.index.column),
@@ -4649,33 +4539,24 @@ fn vector_index_inspection_row(
         vector_inspection_usize(vector_count, "vector_count")?,
         vector_inspection_usize(bytes, "bytes")?,
         Value::Json(partition_key_columns),
-        declaration
-            .max_partitions
-            .map(|value| Value::Int64(i64::from(value)))
-            .unwrap_or(Value::Null),
+        optional_int(declaration.max_partitions),
         vector_inspection_usize(live_partitions, "live_partitions")?,
         vector_inspection_usize(retained_partitions, "retained_partitions")?,
         Value::Text(declaration.search_mode.as_str().to_owned()),
-        declaration
-            .auto_index_at
-            .map(|value| Value::Int64(i64::from(value)))
-            .unwrap_or(Value::Null),
+        optional_int(declaration.auto_index_at),
         vector_inspection_usize(
             info.layout.effective_auto_index_at(),
             "effective_auto_index_at",
         )?,
+        vector_inspection_decimal(declaration.search_target_accuracy_hundredths.map(u32::from)),
         declaration
-            .hnsw_m
-            .map(|value| Value::Int64(i64::from(value)))
+            .search_expected_vectors
+            .map(|value| vector_inspection_u64(value, "declared_expected_vectors"))
+            .transpose()?
             .unwrap_or(Value::Null),
-        declaration
-            .hnsw_ef_construction
-            .map(|value| Value::Int64(i64::from(value)))
-            .unwrap_or(Value::Null),
-        declaration
-            .hnsw_ef_search
-            .map(|value| Value::Int64(i64::from(value)))
-            .unwrap_or(Value::Null),
+        optional_int(declaration.ivf_lists),
+        optional_int(declaration.ivf_probes),
+        vector_inspection_decimal(declaration.ivf_refine_factor_hundredths),
         if declaration.consolidation_disabled {
             Value::Text("none".to_owned())
         } else if declaration.consolidation_change_percent.is_some()
@@ -4685,14 +4566,8 @@ fn vector_index_inspection_row(
         } else {
             Value::Null
         },
-        declaration
-            .consolidation_change_percent
-            .map(|value| Value::Int64(i64::from(value)))
-            .unwrap_or(Value::Null),
-        declaration
-            .consolidation_tombstone_percent
-            .map(|value| Value::Int64(i64::from(value)))
-            .unwrap_or(Value::Null),
+        optional_int(declaration.consolidation_change_percent),
+        optional_int(declaration.consolidation_tombstone_percent),
         Value::Text(
             if info.layout.consolidation_disabled {
                 "none"
@@ -4715,15 +4590,17 @@ fn vector_index_inspection_row(
                 info.layout.effective_consolidation_tombstone_percent(),
             ))
         },
-        vector_inspection_optional_tx(oldest_base_tx, "oldest_base_tx")?,
-        vector_inspection_optional_tx(newest_base_tx, "newest_base_tx")?,
+        Value::Null,
+        Value::Null,
         vector_inspection_usize(pending_inserts, "pending_inserts")?,
         vector_inspection_usize(tombstones, "tombstones")?,
         vector_inspection_usize(durable_vector_bytes, "durable_vector_bytes")?,
         vector_inspection_usize(charged_vector_bytes, "charged_vector_bytes")?,
-        vector_inspection_usize(durable_index_bytes, "durable_index_bytes")?,
+        Value::Null,
         vector_inspection_usize(charged_index_bytes, "charged_index_bytes")?,
-        Value::Text(vector_index_query_state(partitions).to_owned()),
+        Value::Text(vector_index_query_state(&states).to_owned()),
+        Value::Bool(indexed_available),
+        objective_status.map_or(Value::Null, |status| Value::Text(status.to_owned())),
         Value::Text(maintenance_state.to_owned()),
         vector_inspection_optional_usize(maintenance_vectors_total, "maintenance_vectors_total")?,
         vector_inspection_optional_usize(maintenance_vectors_done, "maintenance_vectors_done")?,
@@ -4751,33 +4628,79 @@ fn vector_index_inspection_row(
 fn vector_partition_inspection_row(
     partition_key_columns: &[String],
     layout: &contextdb_vector::store::VectorIndexLayout,
+    declaration: &ColumnDef,
     partition: contextdb_vector::store::VectorPartitionInfo,
+    native: Option<&crate::persistence::vector_ivf::inspection::Inspection>,
     maintenance_policy: MaintenancePolicy,
 ) -> Result<Vec<Value>> {
-    let query_state = vector_partition_query_state(&partition);
-    let lifecycle = vector_partition_inspection_lifecycle(layout, &partition, maintenance_policy);
+    let query_state = vector_partition_query_state(partition.live_rows, native);
+    let lifecycle = vector_partition_inspection_lifecycle(&partition, maintenance_policy);
     let desired = partition.desired_policy;
-    let serving = partition.serving_policy;
+    let indexed_available =
+        partition.live_rows != 0 && native.is_some_and(|native| native.available());
+    let objective_status = declaration
+        .search_target_accuracy_hundredths
+        .map(|_| {
+            native
+                .and_then(|native| native.objective)
+                .map_or("unmeasured", |objective| objective.as_str())
+        })
+        .filter(|_| partition.live_rows != 0);
+    // The partition's list count is only known once an index is published;
+    // probes and the refine factor are known only when declared, because the
+    // engine otherwise chooses them per query.
+    let lists = declaration
+        .ivf_lists
+        .map(|lists| (lists, "declared"))
+        .or_else(|| {
+            native
+                .and_then(|native| native.manifest)
+                .filter(|manifest| manifest.active_lists != 0)
+                .map(|manifest| (manifest.lists, "resolved"))
+        });
+    let probes = declaration.ivf_probes.map(|probes| (probes, "declared"));
+    let refine = declaration
+        .ivf_refine_factor_hundredths
+        .map(|factor| (factor, "declared"));
+    let member = |value: Option<(u32, &str)>| match value {
+        Some((value, source)) => (Value::Int64(i64::from(value)), Value::Text(source.to_owned())),
+        None => (Value::Null, Value::Null),
+    };
+    let (lists_value, lists_source) = member(lists);
+    let (probes_value, probes_source) = member(probes);
+    let (refine_value, refine_source) = match refine {
+        Some((factor, source)) => (
+            vector_inspection_decimal(Some(factor)),
+            Value::Text(source.to_owned()),
+        ),
+        None => (Value::Null, Value::Null),
+    };
     Ok(vec![
         Value::Text(partition.partition.index.table),
         Value::Text(partition.partition.index.column),
         vector_partition_key_json(partition_key_columns, &partition.partition.partition_key)?,
         vector_inspection_usize(partition.live_rows, "live_rows")?,
         vector_inspection_usize(partition.retained_rows, "retained_rows")?,
-        partition
-            .base_generation
-            .map(|generation| vector_inspection_u64(generation, "base_generation"))
+        native
+            .and_then(|native| native.manifest)
+            .map(|manifest| vector_inspection_u64(manifest.generation, "base_generation"))
             .transpose()?
             .unwrap_or(Value::Null),
-        vector_inspection_optional_tx(partition.base_tx, "base_tx")?,
+        Value::Null,
         vector_inspection_usize(partition.pending_inserts, "pending_inserts")?,
         vector_inspection_usize(partition.tombstones, "tombstones")?,
         vector_inspection_usize(partition.durable_vector_bytes, "durable_vector_bytes")?,
         vector_inspection_usize(partition.charged_vector_bytes, "charged_vector_bytes")?,
-        vector_inspection_usize(partition.durable_index_bytes, "durable_index_bytes")?,
+        Value::Null,
         vector_inspection_usize(partition.charged_index_bytes, "charged_index_bytes")?,
         Value::Text(query_state.to_owned()),
-        Value::Text(lifecycle.availability_reason.to_owned()),
+        Value::Text(
+            native
+                .map_or(lifecycle.availability_reason, |native| {
+                    native.state().unwrap_or("none")
+                })
+                .to_owned(),
+        ),
         Value::Text(lifecycle.maintenance_state.to_owned()),
         Value::Text(lifecycle.maintenance_reason.to_owned()),
         vector_inspection_optional_usize(lifecycle.vectors_total, "maintenance_vectors_total")?,
@@ -4787,23 +4710,19 @@ fn vector_partition_inspection_row(
             "maintenance_vectors_remaining",
         )?,
         vector_inspection_optional_tx(lifecycle.checkpoint_tx, "maintenance_checkpoint_tx")?,
-        vector_inspection_usize(desired.hnsw_m, "desired_hnsw_m")?,
-        vector_inspection_usize(desired.hnsw_ef_construction, "desired_hnsw_ef_construction")?,
-        vector_inspection_usize(desired.hnsw_ef_search, "desired_hnsw_ef_search")?,
-        serving
-            .map(|policy| vector_inspection_usize(policy.hnsw_m, "serving_hnsw_m"))
-            .transpose()?
-            .unwrap_or(Value::Null),
-        serving
-            .map(|policy| {
-                vector_inspection_usize(policy.hnsw_ef_construction, "serving_hnsw_ef_construction")
-            })
-            .transpose()?
-            .unwrap_or(Value::Null),
-        serving
-            .map(|_| vector_inspection_usize(desired.hnsw_ef_search, "serving_hnsw_ef_search"))
-            .transpose()?
-            .unwrap_or(Value::Null),
+        Value::Bool(indexed_available),
+        native
+            .and_then(|native| native.codebook())
+            .map_or(Value::Null, |codebook| {
+                Value::Text(codebook.iter().map(|byte| format!("{byte:02x}")).collect())
+            }),
+        objective_status.map_or(Value::Null, |status| Value::Text(status.to_owned())),
+        lists_value,
+        lists_source,
+        probes_value,
+        probes_source,
+        refine_value,
+        refine_source,
         if layout.consolidation_disabled {
             Value::Text("none".to_owned())
         } else if layout.consolidation_change_percent.is_some()
@@ -4842,11 +4761,13 @@ fn vector_partition_inspection_row(
             ))
         },
         vector_inspection_u64(desired.policy_revision, "desired_policy_revision")?,
-        serving
-            .map(|policy| vector_inspection_u64(policy.policy_revision, "serving_policy_revision"))
-            .transpose()?
-            .unwrap_or(Value::Null),
-        Value::Text(lifecycle.recovery_action.to_owned()),
+        Value::Null,
+        Value::Text(
+            native
+                .map(|native| native.recovery_action())
+                .unwrap_or(lifecycle.recovery_action)
+                .to_owned(),
+        ),
     ])
 }
 
@@ -24612,13 +24533,15 @@ fn execute_vector_inspection(
                 .map(|(declaration, info, partitions)| {
                     let mut recovery = "none";
                     let mut state = None;
+                    let mut natives = Vec::with_capacity(partitions.len());
                     for partition in &partitions {
-                        if let Some(native) = db.native_ivf_inspection(
+                        let native = db.native_ivf_inspection(
                             &partition.partition.index,
                             &partition.partition.partition_key,
                             read_memory.clone(),
                             checkpoint,
-                        )? {
+                        )?;
+                        if let Some(native) = native {
                             if native.recovery_action() == "rebuild" {
                                 recovery = "rebuild";
                             }
@@ -24628,11 +24551,13 @@ fn execute_vector_inspection(
                                 }
                             }
                         }
+                        natives.push(native);
                     }
                     let mut row = vector_index_inspection_row(
                         &declaration,
                         info,
                         &partitions,
+                        &natives,
                         maintenance_policy,
                     )?;
                     row.push(Value::Text(recovery.into()));
@@ -24690,43 +24615,11 @@ fn execute_vector_inspection(
                     let mut row = vector_partition_inspection_row(
                         partition_key_columns,
                         &info.layout,
+                        &declaration,
                         partition,
+                        native.as_ref(),
                         maintenance_policy,
                     )?;
-                    if let Some(native) = native {
-                        let position = |name: &str| {
-                            VECTOR_PARTITION_INSPECTION_COLUMNS
-                                .iter()
-                                .position(|column| *column == name)
-                                .expect("declared inspection column")
-                        };
-                        row[position("recovery_action")] =
-                            Value::Text(native.recovery_action().into());
-                        row[position("availability_reason")] = native.state().map_or_else(
-                            || Value::Text("none".into()),
-                            |state| Value::Text(state.into()),
-                        );
-                        row[position("query_state")] = Value::Text(
-                            if native.recovery_action() == "rebuild" {
-                                "unavailable"
-                            } else if native
-                                .manifest
-                                .is_some_and(|manifest| manifest.active_lists != 0)
-                            {
-                                "ready"
-                            } else {
-                                "exact"
-                            }
-                            .into(),
-                        );
-                        row[position("base_generation")] = native
-                            .manifest
-                            .map(|manifest| {
-                                vector_inspection_u64(manifest.generation, "base_generation")
-                            })
-                            .transpose()?
-                            .unwrap_or(Value::Null);
-                    }
                     row.push(
                         native
                             .and_then(|native| native.state())
