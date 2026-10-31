@@ -1197,4 +1197,363 @@ mod local_schema_stage_accounting {
     fn local_schema_commit_matches_an_equivalent_autocommit_database_on_the_owned_host() {
         commit_matches_autocommit(Host::Owned);
     }
+
+    // Refund provenance. Inside a real statement's spend scope, a control the
+    // live counter paid before the statement and a control the scope pays are
+    // dropped side by side on the same counter. Each refund goes to the owner
+    // that paid it: the first back to the live counter (used and the process
+    // aggregate fall by its bytes; the stage credit and ledger do not move),
+    // the second back to the stage (its credit rises and its payload falls;
+    // used and the aggregate do not move).
+    fn mixed_owner_refunds(host: Host) {
+        const PRE_FUNDED: usize = 3000;
+        const SCOPE_FUNDED: usize = 200;
+        let fixture = open_host(host);
+        let db = &fixture.db;
+        let outer = base(db);
+        let (tx, before) = begin(db);
+        db.execute(STATEMENTS[0], &EMPTY()).unwrap();
+        ledger(db, before, "before the mixed-owner statement");
+        let staged = deltas(db, before);
+        let pre_funded = crate::memory_accounting::ControlCredit::admit(
+            &db.finalization.accountant,
+            PRE_FUNDED,
+            "mixed_owner_pre_funded",
+        )
+        .unwrap();
+        let with_pre = deltas(db, before);
+        assert_eq!(
+            (with_pre.0 - staged.0, with_pre.1 - staged.1),
+            (PRE_FUNDED as i128, PRE_FUNDED as i128),
+            "{host:?}: the live counter paid the pre-funded control"
+        );
+        let seen = Arc::new(Mutex::new(None));
+        let probe_seen = seen.clone();
+        seams::arm_scope_probe(move |probe| {
+            let observe = |probe: &seams::ScopeProbe<'_, '_>| {
+                (
+                    probe.used(),
+                    crate::memory_accounting::process_aggregate_bytes_for_test(),
+                    probe.remaining_credit(),
+                    probe.ledger(),
+                )
+            };
+            let entry = observe(probe);
+            let scope_funded = crate::memory_accounting::ControlCredit::admit(
+                probe.accountant(),
+                SCOPE_FUNDED,
+                "mixed_owner_scope_funded",
+            )
+            .expect("the scope pays the second control");
+            let admitted = observe(probe);
+            drop(pre_funded);
+            let after_pre = observe(probe);
+            drop(scope_funded);
+            let after_scoped = observe(probe);
+            *probe_seen.lock() = Some((entry, admitted, after_pre, after_scoped));
+        });
+        db.execute(PROBED, &EMPTY()).unwrap();
+        let (entry, admitted, after_pre, after_scoped) =
+            seen.lock().take().expect("the probe ran inside the scope");
+        // The scope paid the second control out of its credit.
+        assert_eq!((admitted.0, admitted.1), (entry.0, entry.1), "{host:?}: the scope's control charged neither counter");
+        assert_eq!(admitted.2, entry.2 - SCOPE_FUNDED, "{host:?}: the scope's credit paid it");
+        assert_eq!(admitted.3.payload, entry.3.payload + SCOPE_FUNDED, "{host:?}: it is stage payload");
+        // The pre-funded control's refund goes to the live counter only.
+        assert_eq!(after_pre.0, admitted.0 - PRE_FUNDED, "{host:?}: used falls by the pre-funded control");
+        assert_eq!(after_pre.1, admitted.1 - PRE_FUNDED, "{host:?}: the aggregate falls by it");
+        assert_eq!(after_pre.2, admitted.2, "{host:?}: the stage credit does not take it");
+        assert_eq!(after_pre.3, admitted.3, "{host:?}: the stage ledger does not move");
+        // The scope-funded control's refund goes to the stage only.
+        assert_eq!((after_scoped.0, after_scoped.1), (after_pre.0, after_pre.1), "{host:?}: neither counter takes the stage's refund");
+        assert_eq!(after_scoped.2, after_pre.2 + SCOPE_FUNDED, "{host:?}: the stage credit takes it back");
+        assert_eq!(after_scoped.3.payload, after_pre.3.payload - SCOPE_FUNDED, "{host:?}: P falls by it");
+        assert_eq!(after_scoped.3.restores, after_pre.3.restores + SCOPE_FUNDED, "{host:?}: Rs rises by it");
+        assert_eq!(after_scoped.3.draws, after_pre.3.draws, "{host:?}: D does not move");
+        // With the pre-funded control gone, the stage equation holds again.
+        ledger(db, before, "after the mixed-owner statement");
+        db.execute("ROLLBACK", &EMPTY()).unwrap();
+        assert_settled(db, outer, tx, &format!("{host:?} after rollback"));
+    }
+
+    #[test]
+    fn local_schema_refunds_return_to_the_owner_that_paid_on_the_legacy_host() {
+        mixed_owner_refunds(Host::Legacy);
+    }
+
+    #[test]
+    fn local_schema_refunds_return_to_the_owner_that_paid_on_the_owned_host() {
+        mixed_owner_refunds(Host::Owned);
+    }
+
+    /// Statements staged before the one a late shortage refuses, the refused
+    /// statement, and a later statement that must still succeed.
+    const LATE_CASES: [(&str, &[&str]); 6] = [
+        (
+            "CREATE TABLE late_target (id UUID PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b))",
+            &["CREATE TABLE late_prior (id UUID PRIMARY KEY)"],
+        ),
+        (STATEMENTS[1], &[STATEMENTS[0]]),
+        (STATEMENTS[2], &[STATEMENTS[0], STATEMENTS[1]]),
+        ("CREATE INDEX authored_body ON authored_migration (body)", &[STATEMENTS[0]]),
+        (
+            "CREATE TABLE late_vectors (id UUID PRIMARY KEY, embedding VECTOR(4))",
+            &["CREATE TABLE late_prior (id UUID PRIMARY KEY)"],
+        ),
+        ("ALTER TABLE authored_migration ADD COLUMN embedding VECTOR(4)", &[STATEMENTS[0]]),
+    ];
+    const LATER: &str = "CREATE TABLE later_success (id UUID PRIMARY KEY, body TEXT)";
+
+    /// The committed schema of a database: every table's metadata and every
+    /// trigger declaration.
+    fn committed_schema(
+        db: &Database,
+    ) -> (
+        std::collections::BTreeMap<String, TableMeta>,
+        BTreeMap<String, TriggerDeclaration>,
+    ) {
+        (
+            db.relational_store
+                .table_meta
+                .read()
+                .iter()
+                .map(|(name, meta)| (name.clone(), meta.clone()))
+                .collect(),
+            db.trigger.declarations.lock().clone(),
+        )
+    }
+
+    // Statement-level atomicity under a late shortage. For each statement, a
+    // twin measures every draw its scope makes; then, for every draw that
+    // raises the statement's peak need after its first draw (so after its
+    // metadata or first preparation was admitted), a fresh transaction stages
+    // the earlier statements and runs the statement with a reservation one
+    // byte short of that peak. The statement returns the typed stage refusal
+    // at exactly that draw. It undoes only its own work: the stage ledger,
+    // both counters and the image (payload, DDL history, tables, triggers and
+    // event-bus projection) are exactly as before it, and the earlier
+    // statements stay staged. A later statement then succeeds. After COMMIT
+    // the durable schema equals that of a twin that never ran the refused
+    // statement; after ROLLBACK nothing is durable and both counters are back
+    // to their values before BEGIN.
+    fn late_shortage_is_statement_atomic(host: Host) {
+        for (sql, prior) in LATE_CASES {
+            let draws = {
+                let fixture = open_host(host);
+                let db = &fixture.db;
+                db.execute("BEGIN", &EMPTY()).unwrap();
+                for statement in prior {
+                    db.execute(statement, &EMPTY()).unwrap();
+                }
+                records::take_draws();
+                db.execute(sql, &EMPTY()).unwrap();
+                let draws = records::take_draws();
+                db.execute("ROLLBACK", &EMPTY()).unwrap();
+                draws
+            };
+            let mut peak = 0usize;
+            let mut points = Vec::new();
+            for (index, (consumed, bytes)) in draws.iter().copied().enumerate() {
+                let need = consumed + bytes;
+                if need > peak {
+                    points.push((index, need, bytes));
+                    peak = need;
+                }
+            }
+            assert!(
+                points.len() >= 2,
+                "{host:?} {sql}: the statement draws again after its first draw: {draws:?}"
+            );
+            let expected = {
+                let fixture = open_host(host);
+                let db = &fixture.db;
+                db.execute("BEGIN", &EMPTY()).unwrap();
+                for statement in prior {
+                    db.execute(statement, &EMPTY()).unwrap();
+                }
+                db.execute(LATER, &EMPTY()).unwrap();
+                db.execute("COMMIT", &EMPTY()).unwrap();
+                committed_schema(db)
+            };
+            for (index, need, bytes) in points.iter().copied().skip(1) {
+                for commit in [true, false] {
+                    let what = format!("{host:?} {sql} refused at draw {index} commit={commit}");
+                    let fixture = open_host(host);
+                    let db = &fixture.db;
+                    let schema_before = committed_schema(db);
+                    let outer = base(db);
+                    let (tx, before) = begin(db);
+                    for statement in prior {
+                        db.execute(statement, &EMPTY()).unwrap();
+                    }
+                    let staged = ledger(db, before, &what);
+                    let staged_deltas = deltas(db, before);
+                    let image = db.local_schema_image_shape_for_test(tx);
+                    assert!(image.is_some(), "{what}: the earlier statements are staged");
+                    seams::override_next_statement_reservation(need - 1);
+                    records::take_refusals();
+                    let error = db
+                        .execute(sql, &EMPTY())
+                        .expect_err("one byte short of the peak need");
+                    assert!(is_stage_refusal(&error), "{what}: the typed stage refusal: {error:?}");
+                    let refusals = records::take_refusals();
+                    assert_eq!(refusals.len(), 1, "{what}: one refusal: {refusals:?}");
+                    assert_eq!(refusals[0].requested, bytes, "{what}: refused at that draw");
+                    let now = ledger(db, before, &what);
+                    assert_same_accounts(&now, &staged, &what);
+                    assert_eq!(deltas(db, before), staged_deltas, "{what}: both counters as before");
+                    assert_eq!(
+                        db.local_schema_image_shape_for_test(tx),
+                        image,
+                        "{what}: the image is exactly as before the statement"
+                    );
+                    db.execute(LATER, &EMPTY()).unwrap();
+                    ledger(db, before, &format!("{what}: after the later statement"));
+                    if commit {
+                        db.execute("COMMIT", &EMPTY()).unwrap();
+                        assert_eq!(
+                            committed_schema(db),
+                            expected,
+                            "{what}: the durable schema holds the earlier and later statements only"
+                        );
+                    } else {
+                        db.execute("ROLLBACK", &EMPTY()).unwrap();
+                        assert_settled(db, outer, tx, &what);
+                        assert_eq!(committed_schema(db), schema_before, "{what}: nothing durable");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_schema_late_shortage_undoes_only_its_statement_on_the_legacy_host() {
+        late_shortage_is_statement_atomic(Host::Legacy);
+    }
+
+    #[test]
+    fn local_schema_late_shortage_undoes_only_its_statement_on_the_owned_host() {
+        late_shortage_is_statement_atomic(Host::Owned);
+    }
+
+    /// The committed schema the estimate shapes run against.
+    const ESTIMATE_BASE: [&str; 3] = [
+        "CREATE TABLE estimate_parent (id UUID PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b))",
+        "CREATE TABLE wide_target (id UUID PRIMARY KEY, c0 TEXT, c1 TEXT, c2 TEXT, c3 TEXT, \
+         c4 TEXT, c5 TEXT, c6 TEXT, c7 TEXT, c8 TEXT, c9 TEXT, c10 TEXT, c11 TEXT, c12 TEXT, \
+         c13 TEXT, c14 TEXT, c15 TEXT, c16 TEXT, c17 TEXT, c18 TEXT, c19 TEXT, c20 TEXT, \
+         c21 TEXT, c22 TEXT, c23 TEXT, c24 TEXT, c25 TEXT, c26 TEXT, c27 TEXT, c28 TEXT, \
+         c29 TEXT, u0 TEXT UNIQUE, u1 TEXT UNIQUE, u2 TEXT UNIQUE, u3 TEXT UNIQUE, \
+         r0 UUID REFERENCES estimate_parent(id), r1 UUID REFERENCES estimate_parent(id), \
+         UNIQUE (c0, c1), UNIQUE (c2, c3, c4))",
+        "CREATE INDEX wide_target_c5 ON wide_target (c5)",
+    ];
+
+    /// Declaration shapes the statement estimate does not derive exactly:
+    /// added unique and reference columns, composite keys and references,
+    /// duplicate declarations, a key over a column no exact filter can index,
+    /// and statements over a large target table.
+    const ESTIMATE_SHAPES: [&str; 11] = [
+        "ALTER TABLE wide_target ADD COLUMN added_unique TEXT UNIQUE",
+        "ALTER TABLE wide_target ADD COLUMN added_reference UUID REFERENCES estimate_parent(id)",
+        "ALTER TABLE wide_target ADD COLUMN added_both UUID UNIQUE REFERENCES estimate_parent(id)",
+        "CREATE TABLE composite_keys (a TEXT, b TEXT, c UUID, PRIMARY KEY (a, b), UNIQUE (b, c))",
+        "CREATE TABLE composite_child (id UUID PRIMARY KEY, x TEXT, y TEXT, \
+         FOREIGN KEY (x, y) REFERENCES estimate_parent(a, b))",
+        "CREATE TABLE duplicate_unique (id UUID PRIMARY KEY UNIQUE, k TEXT UNIQUE, m TEXT, \
+         UNIQUE (k, m), UNIQUE (k, m))",
+        "CREATE TABLE duplicate_reference (id UUID PRIMARY KEY, p UUID UNIQUE REFERENCES estimate_parent(id), \
+         q TEXT, UNIQUE (p, q), UNIQUE (p, q))",
+        "CREATE TABLE non_indexable_keys (id UUID PRIMARY KEY, j JSON UNIQUE)",
+        "CREATE INDEX wide_target_c6 ON wide_target (c6)",
+        "CREATE INDEX wide_target_c7_c8 ON wide_target (c7, c8)",
+        "ALTER TABLE wide_target ADD COLUMN added_plain TEXT",
+    ];
+
+    // The statement reservation is an admission estimate, not a proof; the
+    // spend scope is the enforcement. For each shape, on a schema with a
+    // large target table, the staged statement either runs within its credit
+    // or refuses with the typed stage refusal: it never panics and never
+    // overdraws. On success the ledger equation holds and both counters grow
+    // by exactly the statement's reservation; on a refusal everything is as
+    // before the statement. A shape the engine rejects for its declaration
+    // fails exactly as the same statement does in autocommit on a twin. Each
+    // shape's estimate and the peak its scope actually drew are printed.
+    fn estimate_shapes_run_within_credit_or_refuse(host: Host) {
+        for sql in ESTIMATE_SHAPES {
+            let autocommit = {
+                let fixture = open_host(host);
+                let db = &fixture.db;
+                for statement in ESTIMATE_BASE {
+                    db.execute(statement, &EMPTY()).unwrap();
+                }
+                db.execute(sql, &EMPTY()).map(|_| ()).map_err(|error| error.to_string())
+            };
+            let fixture = open_host(host);
+            let db = &fixture.db;
+            for statement in ESTIMATE_BASE {
+                db.execute(statement, &EMPTY()).unwrap();
+            }
+            let outer = base(db);
+            let (tx, before) = begin(db);
+            db.execute(STATEMENTS[0], &EMPTY()).unwrap();
+            let staged = ledger(db, before, sql);
+            let staged_deltas = deltas(db, before);
+            let reservation = db.staged_statement_reservation_bytes_for_test(tx, sql);
+            records::take_draws();
+            records::take_refusals();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.execute(sql, &EMPTY())
+            }))
+            .unwrap_or_else(|_| panic!("{host:?} {sql}: a staged statement never panics"));
+            let draws = records::take_draws();
+            let peak = draws
+                .iter()
+                .map(|(consumed, bytes)| consumed + bytes)
+                .max()
+                .unwrap_or(0);
+            eprintln!(
+                "estimate-shape {host:?} estimate={reservation} drawn_peak={peak} ok={} {sql}",
+                outcome.is_ok()
+            );
+            let now = ledger(db, before, sql);
+            match outcome {
+                Ok(_) => {
+                    assert!(peak <= reservation, "{host:?} {sql}: the scope never drew past its credit");
+                    let now_deltas = deltas(db, before);
+                    assert_eq!(
+                        (now_deltas.0 - staged_deltas.0, now_deltas.1 - staged_deltas.1),
+                        (reservation as i128, reservation as i128),
+                        "{host:?} {sql}: both counters grow by exactly the reservation"
+                    );
+                    assert!(autocommit.is_ok(), "{host:?} {sql}: autocommit admits it too: {autocommit:?}");
+                }
+                Err(error) => {
+                    assert_same_accounts(&now, &staged, sql);
+                    assert_eq!(deltas(db, before), staged_deltas, "{host:?} {sql}: counters as before");
+                    if is_stage_refusal(&error) {
+                        assert_eq!(records::take_refusals().len(), 1, "{host:?} {sql}: one typed refusal");
+                    } else {
+                        assert_eq!(
+                            Err(error.to_string()),
+                            autocommit,
+                            "{host:?} {sql}: a declaration error matches autocommit's"
+                        );
+                    }
+                }
+            }
+            db.execute("ROLLBACK", &EMPTY()).unwrap();
+            assert_settled(db, outer, tx, &format!("{host:?} {sql}: after rollback"));
+        }
+    }
+
+    #[test]
+    fn local_schema_estimate_shapes_run_within_credit_or_refuse_on_the_legacy_host() {
+        estimate_shapes_run_within_credit_or_refuse(Host::Legacy);
+    }
+
+    #[test]
+    fn local_schema_estimate_shapes_run_within_credit_or_refuse_on_the_owned_host() {
+        estimate_shapes_run_within_credit_or_refuse(Host::Owned);
+    }
 }

@@ -442,6 +442,18 @@ impl Database {
         })
     }
 
+    /// What `tx`'s pending stage image holds: payload, DDL history and
+    /// schema.
+    #[cfg(test)]
+    pub(super) fn local_schema_image_shape_for_test(
+        &self,
+        tx: TxId,
+    ) -> Option<LocalSchemaImageShape> {
+        let stages = self.pending_local_schema_stages.lock();
+        let pending = stages.get(&tx)?;
+        Some(LocalSchemaImageShape::of(&pending.working, &pending.ledger))
+    }
+
     /// The ledger of `tx`'s pending local schema stage, if one is pending.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
@@ -519,9 +531,38 @@ impl Database {
             Statement::CreateIndex(index) => target_bytes(&index.table).saturating_mul(2),
             _ => 0,
         };
+        // A vector column's layout is installed before the statement
+        // publishes, while the statement's other preparations are still
+        // held, so its registration is admitted alongside them.
+        let vector_registration = |table: &str, column: &contextdb_parser::ast::ColumnDef| {
+            crate::executor::core_column_from_ast(table, column, None)
+                .ok()
+                .and_then(|core| {
+                    vector_index_layout_from_column(&core).map(|layout| {
+                        contextdb_vector::store::VectorStore::new_index_registration_bytes(
+                            &VectorIndexRef::new(table, core.name.clone()),
+                            &layout,
+                        )
+                    })
+                })
+                .unwrap_or(0)
+        };
+        let vector_registrations = match stmt {
+            Statement::CreateTable(create) => create
+                .columns
+                .iter()
+                .map(|column| vector_registration(&create.name, column))
+                .fold(0usize, usize::saturating_add),
+            Statement::AlterTable(alter) => match &alter.action {
+                AlterAction::AddColumn(column) => vector_registration(&alter.table, column),
+                _ => 0,
+            },
+            _ => 0,
+        };
         Self::staged_table_ddl_temporary_bytes(sql)
             .saturating_add(exact_indexes.saturating_mul(contextdb_core::EXACT_PROBE_FILTER_BYTES))
             .saturating_add(rewritten)
+            .saturating_add(vector_registrations)
     }
 
     /// The bytes the stage's private image holds for `table`'s metadata.
@@ -741,7 +782,7 @@ impl Database {
         // this statement's reservation only. The guard owns the stage and the
         // reservation from here: an unwind discards the whole stage, image
         // first, then the statement reservation, then the stage reservation.
-        let payload_before = pending.ledger.spend.payload;
+        let shape_before = LocalSchemaImageShape::of(&pending.working, &pending.ledger);
         let mut guard = LocalSchemaStatementGuard {
             database: self,
             tx,
@@ -795,13 +836,32 @@ impl Database {
             // 4. Execution failed: the scope has ended, the statement
             // reservation releases its unspent credit, and the image keeps no
             // new payload. The stage is republished.
+            // A failed statement, a shortage after its metadata was admitted
+            // included, undoes only its own work: every staged DDL path admits
+            // what it needs before it publishes, and a refused admission
+            // returns what that statement drew. So the image, its payload and
+            // the earlier statements stand exactly as they were, and the
+            // transaction can go on and COMMIT.
             Err((error, false)) => {
                 drop(statement_memory);
-                if pending.ledger.spend.payload != payload_before {
-                    // A refused statement left payload in the image: the image
-                    // no longer matches its funding, so it is discarded.
-                    self.discard_local_schema_stage(tx, pending, None);
-                    return Err(error);
+                let shape_after = LocalSchemaImageShape::of(&pending.working, &pending.ledger);
+                if shape_after != shape_before {
+                    // Unreachable unless a DDL path publishes before a
+                    // fallible step: an engine defect. Under test seams it
+                    // stops the test; otherwise the stage, which no longer
+                    // matches what its statements made, is discarded rather
+                    // than committed.
+                    #[cfg(any(test, feature = "test-seams"))]
+                    panic!(
+                        "engine invariant violated: a failed staged statement changed the \
+                         private schema image ({error}); before {shape_before:?}, after \
+                         {shape_after:?}"
+                    );
+                    #[cfg(not(any(test, feature = "test-seams")))]
+                    {
+                        self.discard_local_schema_stage(tx, pending, None);
+                        return Err(error);
+                    }
                 }
                 if had_pending {
                     token.publish(pending);
@@ -4391,6 +4451,53 @@ impl Database {
     }
 }
 
+/// What a staged statement can change in its stage's private image: the
+/// payload it holds, its DDL history, and its schema (tables, triggers and the
+/// event-bus projection). A failed statement must leave all of it as it was;
+/// an unchanged payload alone does not show an unchanged schema.
+#[derive(Debug, PartialEq)]
+pub(super) struct LocalSchemaImageShape {
+    payload: usize,
+    ddl_log: usize,
+    table_count: usize,
+    triggers: usize,
+    // The full schema copies are unpriced, so only test builds take them.
+    #[cfg(any(test, feature = "test-seams"))]
+    tables: HashMap<String, TableMeta>,
+    #[cfg(any(test, feature = "test-seams"))]
+    trigger_declarations: BTreeMap<String, TriggerDeclaration>,
+    #[cfg(any(test, feature = "test-seams"))]
+    event_bus: event_bus::EventBusDefinitions,
+}
+
+impl LocalSchemaImageShape {
+    fn of(working: &Database, ledger: &LocalSchemaStageLedger) -> Self {
+        // One lock at a time: a guard taken inside a struct literal lives
+        // until the whole literal ends.
+        let ddl_log = working.ddl_log.read().len();
+        let table_count = working.relational_store.table_meta.read().len();
+        let triggers = working.trigger.declarations.lock().len();
+        #[cfg(any(test, feature = "test-seams"))]
+        let tables = working.relational_store.table_meta.read().clone();
+        #[cfg(any(test, feature = "test-seams"))]
+        let trigger_declarations = working.trigger.declarations.lock().clone();
+        #[cfg(any(test, feature = "test-seams"))]
+        let event_bus = working.received_event_bus_projection();
+        Self {
+            payload: ledger.spend.payload,
+            ddl_log,
+            table_count,
+            triggers,
+            #[cfg(any(test, feature = "test-seams"))]
+            tables,
+            #[cfg(any(test, feature = "test-seams"))]
+            trigger_declarations,
+            #[cfg(any(test, feature = "test-seams"))]
+            event_bus,
+        }
+    }
+}
+
 /// Split a staged statement's answer from the charges that fund its carrier.
 /// The charges drop with the returned tuple's caller scope; the data and the
 /// owner that publishes it survive. A staged DDL answer carries no rows.
@@ -4528,6 +4635,10 @@ pub(super) mod local_schema_test_seams {
         }
         pub(crate) fn admitted(&self) -> usize {
             self.accountant.admitted_bytes_for_test()
+        }
+        /// The live accountant the scope draws against.
+        pub(crate) fn accountant(&self) -> &crate::memory_accounting::AccountantHandle {
+            self.accountant
         }
     }
 

@@ -5181,38 +5181,57 @@ fn execute_create_table_plan(
             // the schema lock, never to a stale validation attempt.
             let table_generation =
                 db.next_table_generation_for_create(&p.name, read_memory.clone())?;
+            // Every index storage's read budget is admitted before anything
+            // is published, so a refusal leaves no half-made table behind.
+            let index_budgets = auto_indexes
+                .iter()
+                .map(|_| db.bounded_read_accountant().read_budget())
+                .collect::<Result<Vec<_>>>()?;
             db.accountant().try_allocate_for(
                 metadata_bytes,
                 "ddl",
                 "create_table",
                 "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
             )?;
-            if let Err(error) =
+            // The vector layouts come from the newly prepared declaration,
+            // never the statement's pre-DDL read descriptor, and are
+            // installed before anything is published: a refused registration,
+            // or a refused publication after it, tears down every layout this
+            // CREATE installed, so no half-made table is left behind.
+            let mut registered_vectors = Vec::new();
+            let mut registration = Ok(());
+            for column in &meta.columns {
+                if let Err(error) = db.register_vector_index_for_column(
+                    &p.name,
+                    column,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                ) {
+                    registration = Err(error);
+                    break;
+                }
+                if matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) {
+                    registered_vectors.push(column.name.clone());
+                }
+            }
+            let published = registration.and_then(|()| {
                 db.persist_created_table_generation_and_ddl(&p.name, &meta, table_generation, lsn)
-            {
+            });
+            if let Err(error) = published {
+                for column in &registered_vectors {
+                    db.deregister_vector_index(&p.name, column);
+                }
                 db.accountant().release(metadata_bytes);
                 return Err(error);
             }
             db.relational_store().create_table(&p.name, meta);
-            for idx in &auto_indexes {
+            for (idx, budget) in auto_indexes.iter().zip(index_budgets) {
                 db.relational_store().create_auto_index_storage_with_budget(
                     &p.name,
                     &idx.name,
                     idx.columns.clone(),
-                    db.bounded_read_accountant().read_budget()?,
+                    budget,
                 );
-            }
-            // Publication installs vector layouts from the newly prepared
-            // schema, rather than the statement's pre-DDL read descriptor.
-            if let Some(table_meta) = db.relational_store().table_meta(&p.name) {
-                for column in &table_meta.columns {
-                    db.register_vector_index_for_column(
-                        &p.name,
-                        column,
-                        vector_copy_owner,
-                        read_memory.clone(),
-                    )?;
-                }
             }
             for (column, resolved) in resolved_policies {
                 db.register_rank_formula(&p.name, &column, resolved.formula);
@@ -5231,6 +5250,12 @@ fn execute_create_table_plan(
             }
             let table_generation =
                 db.next_table_generation_for_create(&p.name, read_memory.clone())?;
+            // Every index storage's read budget is admitted before anything
+            // is published, so a refusal leaves no half-made table behind.
+            let index_budgets = auto_indexes
+                .iter()
+                .map(|_| db.bounded_read_accountant().read_budget())
+                .collect::<Result<Vec<_>>>()?;
             db.accountant().try_allocate_for(
                 metadata_bytes,
                 "ddl",
@@ -5244,12 +5269,12 @@ fn execute_create_table_plan(
                 return Err(error);
             }
             db.relational_store().create_table(&p.name, meta);
-            for idx in &auto_indexes {
+            for (idx, budget) in auto_indexes.iter().zip(index_budgets) {
                 db.relational_store().create_auto_index_storage_with_budget(
                     &p.name,
                     &idx.name,
                     idx.columns.clone(),
-                    db.bounded_read_accountant().read_budget()?,
+                    budget,
                 );
             }
             Ok(())
@@ -5726,25 +5751,10 @@ fn execute_alter_table_plan(
                 )?;
                 let projected_indexes =
                     db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
-                let memory_history = db.persist_local_table_projection_and_ddl(
-                    &p.table,
-                    &projected_meta,
-                    &projected_rows,
-                    lsn,
-                    &ddl,
-                    read_memory.clone(),
-                )?;
-                db.publish_local_table_projection_and_ddl(
-                    &p.table,
-                    projected_meta.clone(),
-                    projected_rows.clone(),
-                    lsn,
-                    &ddl,
-                    projected_indexes,
-                    &mut memory_swap,
-                    memory_history,
-                )?;
-                memory_swap.commit_after_swap();
+                // An added vector column's layout is installed before the
+                // column is published, and torn down again if the
+                // publication is refused, so a refusal leaves no half-added
+                // column behind.
                 if added_vector {
                     db.register_vector_index_for_column(
                         &p.table,
@@ -5753,6 +5763,34 @@ fn execute_alter_table_plan(
                         read_memory.clone(),
                     )?;
                 }
+                let published = db
+                    .persist_local_table_projection_and_ddl(
+                        &p.table,
+                        &projected_meta,
+                        &projected_rows,
+                        lsn,
+                        &ddl,
+                        read_memory.clone(),
+                    )
+                    .and_then(|memory_history| {
+                        db.publish_local_table_projection_and_ddl(
+                            &p.table,
+                            projected_meta.clone(),
+                            projected_rows.clone(),
+                            lsn,
+                            &ddl,
+                            projected_indexes,
+                            &mut memory_swap,
+                            memory_history,
+                        )
+                    });
+                if let Err(error) = published {
+                    if added_vector {
+                        db.deregister_vector_index(&p.table, &col.name);
+                    }
+                    return Err(error);
+                }
+                memory_swap.commit_after_swap();
                 if let Some(resolved) = &resolved_policy {
                     db.register_rank_formula(&p.table, &col.name, resolved.formula.clone());
                 }

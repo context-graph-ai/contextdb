@@ -17037,6 +17037,39 @@ impl VectorStore {
         })
     }
 
+    /// The transient reservation registering `index` with `layout` takes.
+    fn registration_scratch_bytes(index: &VectorIndexRef, layout: &VectorIndexLayout) -> usize {
+        layout
+            .estimated_bytes()
+            .saturating_mul(4)
+            .saturating_add(
+                index
+                    .table
+                    .len()
+                    .saturating_add(index.column.len())
+                    .saturating_mul(4),
+            )
+            .saturating_add(std::mem::size_of::<VectorColumnState>())
+            .saturating_add(IndexState::allocation_bytes())
+            .saturating_add(32 * std::mem::size_of::<usize>())
+    }
+
+    /// What registering a new vector index with `layout` admits at its widest
+    /// point: the registration's transient reservation plus the directory the
+    /// new column then retains (its state, its names and its layout; a new
+    /// column has no partitions yet). A caller that sizes an admission for a
+    /// declaration before running it reads the figure here.
+    pub fn new_index_registration_bytes(
+        index: &VectorIndexRef,
+        layout: &VectorIndexLayout,
+    ) -> usize {
+        Self::registration_scratch_bytes(index, layout)
+            .saturating_add(std::mem::size_of::<VectorColumnState>())
+            .saturating_add(index.table.len())
+            .saturating_add(index.column.len())
+            .saturating_add(layout.estimated_bytes())
+    }
+
     /// Register or update a manager-resolved declaration. Policy-only changes
     /// retain every partition; a physical-layout change is accepted only when
     /// the column has no retained vector entry.
@@ -17056,21 +17089,7 @@ impl VectorStore {
         let mut local_copy_admission = owner.local_scratch();
         let owner = local_copy_admission.as_mut().unwrap_or(owner);
         Self::validate_layout(&index, &layout)?;
-        owner.reserve(
-            layout
-                .estimated_bytes()
-                .saturating_mul(4)
-                .saturating_add(
-                    index
-                        .table
-                        .len()
-                        .saturating_add(index.column.len())
-                        .saturating_mul(4),
-                )
-                .saturating_add(std::mem::size_of::<VectorColumnState>())
-                .saturating_add(IndexState::allocation_bytes())
-                .saturating_add(32 * std::mem::size_of::<usize>()),
-        )?;
+        owner.reserve(Self::registration_scratch_bytes(&index, &layout))?;
         let paged_counts = self.paged_partition_counts(&index)?;
         let changed_column = self.with_bulk_maintenance(|| {
             let existing = { self.registry.read().get(&index).cloned() };

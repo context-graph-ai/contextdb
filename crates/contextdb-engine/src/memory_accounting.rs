@@ -3367,6 +3367,77 @@ pub(crate) struct ReservationSpendLedger {
     pub(crate) payload: usize,
     pub(crate) draws: usize,
     pub(crate) restores: usize,
+    /// The funding identity of this ledger's stage, assigned when a scope
+    /// first enters it. Every scope over the same ledger shares it, so an
+    /// owner funded by one statement of a stage is recognised by the next.
+    pub(crate) id: u64,
+}
+
+static NEXT_SPEND_LEDGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The stage-funded part of one control: the ledger whose scope paid it and
+/// how many of the control's bytes that scope paid. A control without it was
+/// paid by its counter, outside any scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StageFunding {
+    ledger: u64,
+    bytes: usize,
+}
+
+impl StageFunding {
+    /// Add `more` to a control's funding record: a growth drawn inside a
+    /// scope adds to that scope's share, and a growth outside any scope adds
+    /// nothing.
+    fn grow(current: Option<Self>, more: Option<Self>) -> Option<Self> {
+        match (current, more) {
+            (current, None) => current,
+            (None, more) => more,
+            (Some(current), Some(more)) => {
+                assert_eq!(
+                    current.ledger, more.ledger,
+                    "engine invariant: one control is funded by one stage"
+                );
+                Some(Self {
+                    ledger: current.ledger,
+                    bytes: current.bytes + more.bytes,
+                })
+            }
+        }
+    }
+}
+
+/// Return a control's stage-funded bytes to the live scope of the ledger that
+/// paid them, exactly. Returns the bytes that take the ordinary counter
+/// refund: the counter-funded part always, and the stage-funded part too when
+/// no scope of its ledger is live on this thread (the image dropping outside a
+/// statement returns its payload to the live budget).
+fn spend_scope_restore_funded(
+    counter: usize,
+    funding: Option<StageFunding>,
+    bytes: usize,
+) -> usize {
+    let Some(funding) = funding else {
+        return bytes;
+    };
+    SPEND_SCOPE.with(|slot| {
+        let Some(mut entry) = slot.get() else {
+            return bytes;
+        };
+        if entry.counter != counter || entry.ledger.id != funding.ledger {
+            return bytes;
+        }
+        assert!(
+            funding.bytes <= entry.ledger.payload && funding.bytes <= bytes,
+            "engine invariant violated: a control's stage-funded {} bytes exceed the stage payload {}",
+            funding.bytes,
+            entry.ledger.payload
+        );
+        entry.ledger.payload -= funding.bytes;
+        entry.ledger.restores = entry.ledger.restores.saturating_add(funding.bytes);
+        entry.credit = entry.credit.saturating_add(funding.bytes);
+        slot.set(Some(entry));
+        bytes - funding.bytes
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3508,6 +3579,9 @@ impl<'a> ReservationSpendScope<'a> {
         let spendable = credit.checked_sub(hold).ok_or_else(|| {
             contextdb_core::Error::Other("reservation spend scope holds more than it owns".into())
         })?;
+        if ledger.id == 0 {
+            ledger.id = NEXT_SPEND_LEDGER.fetch_add(1, Ordering::SeqCst);
+        }
         let accountant = std::ptr::from_ref(target) as usize;
         let counter = target.used.as_ptr() as usize;
         let previous = SPEND_SCOPE.with(|slot| {
@@ -3741,6 +3815,10 @@ pub(crate) struct ControlCredit {
     accountant: Option<AccountantHandle>,
     bytes: usize,
     registration: Option<(usize, usize)>,
+    /// The part of `bytes` a reservation spend scope paid, if any. Its refund
+    /// returns to that stage while the stage's scope is live; the rest goes
+    /// back to the counter that paid it.
+    funding: Option<StageFunding>,
 }
 impl ControlCredit {
     #[cfg(any(test, feature = "test-seams"))]
@@ -3831,6 +3909,7 @@ impl ControlCredit {
             accountant: Some(accountant.as_handle()),
             bytes,
             registration,
+            funding: accountant.as_handle().stage_funding(bytes),
         })
     }
     #[expect(
@@ -3847,6 +3926,7 @@ impl ControlCredit {
             accountant: Some(accountant.as_handle()),
             bytes: bytes | OPEN_RESIDUE_TAG,
             registration: None,
+            funding: None,
         })
     }
     pub(crate) fn admit_open_residue_native(
@@ -3874,6 +3954,7 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes: bytes | OPEN_RESIDUE_TAG,
             registration: None,
+            funding: None,
         })
     }
 
@@ -3899,6 +3980,7 @@ impl ControlCredit {
             "hydrate_owned_image",
             "Raise MEMORY_LIMIT to admit the complete committed read image.",
         )?;
+        self.funding = StageFunding::grow(self.funding, accountant.stage_funding(bytes));
         accountant.change_adapter_control_receipt(bytes, true);
         self.bytes = next;
         Ok(())
@@ -3919,12 +4001,15 @@ impl ControlCredit {
                 "writer_cache_preparation",
                 "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.",
             )?;
-            return Ok(Self::from_admitted(accountant, bytes));
+            let mut credit = Self::from_admitted(accountant, bytes);
+            credit.funding = accountant.stage_funding(bytes);
+            return Ok(credit);
         }
         let mut credit = Self {
             accountant: Some(accountant.clone()),
             bytes: OPEN_RESIDUE_TAG,
             registration: None,
+            funding: None,
         };
         credit.grow_cache_preparation_native(bytes, startup)?;
         Ok(credit)
@@ -3973,6 +4058,8 @@ impl ControlCredit {
                     "writer_cache_preparation",
                     "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.",
                 )?;
+                let more = accountant.stage_funding(bytes);
+                self.funding = StageFunding::grow(self.funding, more);
             }
             accountant.change_adapter_control_receipt(bytes, true);
             self.bytes = next;
@@ -4016,6 +4103,7 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes,
             registration: accountant.prepare_control_refund().1,
+            funding: accountant.stage_funding(bytes),
         })
     }
     pub(crate) fn from_admitted(accountant: &AccountantHandle, bytes: usize) -> Self {
@@ -4026,6 +4114,7 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes,
             registration: accountant.prepare_control_refund().1,
+            funding: None,
         }
     }
     pub(crate) fn retained_startup(accountant: &AccountantHandle, bytes: usize) -> Self {
@@ -4037,6 +4126,7 @@ impl ControlCredit {
             accountant: Some(accountant.clone()),
             bytes,
             registration: accountant.prepare_control_refund().1,
+            funding: None,
         }
     }
     /// The original fixed cache invoice is named by persistence, rather than
@@ -4054,6 +4144,7 @@ impl ControlCredit {
             // No adapter receipt was registered for this cache-data invoice;
             // final release refunds only its original writer counter.
             registration: None,
+            funding: None,
         }
     }
     pub(crate) fn prepare(mut self) -> PendingControlRefund {
@@ -4069,6 +4160,7 @@ impl ControlCredit {
             counter,
             bytes,
             registration,
+            funding: self.funding.take(),
         }
     }
 }
@@ -4082,6 +4174,7 @@ impl Drop for ControlCredit {
                 counter,
                 bytes: std::mem::take(&mut self.bytes),
                 registration,
+                funding: self.funding.take(),
             });
         }
     }
@@ -4101,6 +4194,7 @@ pub(crate) struct PendingControlRefund {
     counter: WriterCounterHandle,
     bytes: usize,
     registration: Option<(usize, usize)>,
+    funding: Option<StageFunding>,
 }
 impl Drop for PendingControlRefund {
     fn drop(&mut self) {
@@ -4128,10 +4222,12 @@ impl Drop for PendingControlRefund {
                 receipt.expect("final control receipt is owned");
             }
         }
-        // A control a spend scope funded returns to the scope's credit,
-        // exactly as an ordinary release inside the scope does.
+        // A control returns its money to whoever paid it: the bytes a stage's
+        // spend scope paid go back to that stage's credit while its scope is
+        // live; bytes its counter paid go back to the counter, even inside a
+        // scope on the same counter.
         let counter = self.counter.as_ptr() as usize;
-        let bytes = spend_scope_restore_where(|entry| entry.counter == counter, self.bytes);
+        let bytes = spend_scope_restore_funded(counter, self.funding, self.bytes);
         // Leaves the process aggregate exactly once, here, whether or not
         // this epoch's registration has retired (retirement never refunds).
         let refund = self.counter.release_owned(bytes);
@@ -5157,8 +5253,10 @@ impl MemoryAccountant {
         Ok(())
     }
 
+    // Only a writer registration's retirement takes this release. The
+    // registration was paid when the writer registered, never by a spend
+    // scope, so its refund always returns to the counter.
     fn release_under_exclusive_gate(&self, bytes: usize) {
-        let bytes = self.spend_scope_restore(bytes);
         if self.used.release_owned(bytes).is_err() {
             refund_invariant_broken("exclusive lifecycle refund must be owned");
         }
@@ -6060,6 +6158,21 @@ impl MemoryAccountant {
     #[doc(hidden)]
     pub fn writer_identity_for_test(&self) -> Option<usize> {
         self.writer_identity.get().copied()
+    }
+
+    /// The funding record of `bytes` this accountant just admitted: the live
+    /// scope's stage when a reservation spend scope for this accountant paid
+    /// them, `None` when its counter did.
+    pub(crate) fn stage_funding(&self, bytes: usize) -> Option<StageFunding> {
+        let me = std::ptr::from_ref(self) as usize;
+        SPEND_SCOPE.with(|slot| {
+            slot.get()
+                .filter(|entry| entry.accountant == me && bytes != 0)
+                .map(|entry| StageFunding {
+                    ledger: entry.ledger.id,
+                    bytes,
+                })
+        })
     }
 
     /// Whether a reservation spend scope for THIS accountant is live on this thread.

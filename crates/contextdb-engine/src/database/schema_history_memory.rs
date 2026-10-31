@@ -184,20 +184,48 @@ impl SchemaHistoryMemory {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    /// Grow the log and the generation map to hold `logs` and `generations`
+    /// more entries. Both growths are admitted before either buffer moves, so
+    /// a refused admission leaves both buffers and their admitted backing
+    /// exactly as they were.
     fn prepare_capacity(&mut self, logs: usize, generations: usize) -> Result<()> {
-        let mut log = self.ddl_log.write();
-        let required = log
-            .len()
-            .checked_add(self.pending_log)
-            .and_then(|n| n.checked_add(logs))
-            .ok_or_else(EngineMetadataJournal::identity_error)?;
-        if required > log.capacity() {
-            let capacity = log
-                .capacity()
-                .checked_mul(2)
-                .map(|n| n.max(required))
+        let log_next = {
+            let log = self.ddl_log.read();
+            let required = log
+                .len()
+                .checked_add(self.pending_log)
+                .and_then(|n| n.checked_add(logs))
                 .ok_or_else(EngineMetadataJournal::identity_error)?;
-            let next = array::<(Lsn, DdlChange)>(capacity);
+            if required > log.capacity() {
+                let capacity = log
+                    .capacity()
+                    .checked_mul(2)
+                    .map(|n| n.max(required))
+                    .ok_or_else(EngineMetadataJournal::identity_error)?;
+                Some((capacity, array::<(Lsn, DdlChange)>(capacity)))
+            } else {
+                None
+            }
+        };
+        let generation_next = {
+            let map = self.generations.lock();
+            let required = map
+                .len()
+                .checked_add(self.pending_generations)
+                .and_then(|n| n.checked_add(generations))
+                .ok_or_else(EngineMetadataJournal::identity_error)?;
+            if required > map.capacity() {
+                let plan = crate::memory_accounting::native_map_plan::<
+                    DdlGenerationKey,
+                    DdlGenerationValue,
+                >(required)?;
+                let next = plan.layout.size().saturating_add(HEADER);
+                Some((required, plan, next))
+            } else {
+                None
+            }
+        };
+        if let Some((_, next)) = log_next {
             grow_preparation_from_original(
                 &mut self.backing,
                 next,
@@ -205,8 +233,45 @@ impl SchemaHistoryMemory {
                 "history_log_capacity",
                 HINT,
             )?;
+        }
+        if let Some((_, _, next)) = &generation_next
+            && let Err(error) = grow_preparation_from_original(
+                &mut self.backing,
+                *next,
+                "ddl",
+                "history_generation_capacity",
+                HINT,
+            )
+        {
+            if let Some((_, log_bytes)) = log_next {
+                release_preparation_original(&mut self.backing, log_bytes);
+            }
+            return Err(error);
+        }
+        // Both growths are paid. Move the generation map first: its failure
+        // still leaves the log untouched.
+        if let Some((required, plan, next)) = generation_next {
+            let mut map = self.generations.lock();
+            let additional = required - map.len();
+            if map.try_reserve(additional).is_err() {
+                drop(map);
+                release_preparation_original(&mut self.backing, next);
+                if let Some((_, log_bytes)) = log_next {
+                    release_preparation_original(&mut self.backing, log_bytes);
+                }
+                return Err(Error::Other(
+                    "DDL generation capacity allocation failed".into(),
+                ));
+            }
+            release_preparation_original(&mut self.backing, self.generation_backing_bytes);
+            self.generation_backing_bytes = next;
+            crate::memory_accounting::validate_native_map_capacity(&map, &plan)?;
+        }
+        if let Some((capacity, next)) = log_next {
+            let mut log = self.ddl_log.write();
             let additional = capacity - log.len();
             if log.try_reserve_exact(additional).is_err() {
+                drop(log);
                 release_preparation_original(&mut self.backing, next);
                 return Err(Error::Other(
                     "DDL history capacity allocation failed".into(),
@@ -216,37 +281,6 @@ impl SchemaHistoryMemory {
             release_preparation_original(&mut self.backing, self.log_backing_bytes);
             self.log_backing_bytes = next;
             assert_eq!(log.capacity(), capacity, "prepared history Vec capacity");
-        }
-        drop(log);
-        let mut map = self.generations.lock();
-        let required = map
-            .len()
-            .checked_add(self.pending_generations)
-            .and_then(|n| n.checked_add(generations))
-            .ok_or_else(EngineMetadataJournal::identity_error)?;
-        if required > map.capacity() {
-            let plan = crate::memory_accounting::native_map_plan::<
-                DdlGenerationKey,
-                DdlGenerationValue,
-            >(required)?;
-            let next = plan.layout.size().saturating_add(HEADER);
-            grow_preparation_from_original(
-                &mut self.backing,
-                next,
-                "ddl",
-                "history_generation_capacity",
-                HINT,
-            )?;
-            let additional = required - map.len();
-            if map.try_reserve(additional).is_err() {
-                release_preparation_original(&mut self.backing, next);
-                return Err(Error::Other(
-                    "DDL generation capacity allocation failed".into(),
-                ));
-            }
-            release_preparation_original(&mut self.backing, self.generation_backing_bytes);
-            self.generation_backing_bytes = next;
-            crate::memory_accounting::validate_native_map_capacity(&map, &plan)?;
         }
         Ok(())
     }
@@ -479,7 +513,9 @@ impl Database {
             .as_mut()
             .expect("initialized schema history custody");
         let prepared = (|| {
-            owner.prepare_capacity(logs, generation_count)?;
+            // The occurrences are admitted before any capacity grows, and the
+            // capacity growth is all or nothing, so a refusal at either step
+            // leaves the history exactly as it was.
             let credit = reserve_preparation_from_original(
                 &owner.payload,
                 scratch.saturating_add(payload_bytes),
@@ -487,6 +523,7 @@ impl Database {
                 "history_occurrences",
                 HINT,
             )?;
+            owner.prepare_capacity(logs, generation_count)?;
             let mut entries = Vec::with_capacity(logs);
             entries.extend(ddl.map(|(lsn, change)| (lsn, change.clone())));
             let ddl = entries;
