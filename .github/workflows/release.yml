@@ -77,7 +77,7 @@ jobs:
           sleep 30
 
           # Batch 1: leaf crates
-          for crate in contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-hnsw contextdb-vector; do
+          for crate in contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-vector; do
             publish_crate "$crate"
             sleep 30
           done

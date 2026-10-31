@@ -2,7 +2,6 @@
 #[doc(hidden)]
 pub mod auto_planning_test_seams;
 pub mod cosine;
-pub mod hnsw;
 pub mod mem;
 mod memory_budget;
 pub(crate) mod quantized;
@@ -11,7 +10,6 @@ pub mod store;
 pub mod test_seam;
 
 pub use cosine::cosine_similarity;
-pub use hnsw::{HnswGraphStats, HnswIndex};
 pub use mem::{
     MemVectorExecutor, OwnedVectorSearchTrace, VectorPartitionSearchRoute,
     VectorPartitionSearchTrace, VectorSearchDebugTrace,

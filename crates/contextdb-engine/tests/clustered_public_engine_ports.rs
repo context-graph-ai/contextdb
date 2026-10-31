@@ -1,4 +1,4 @@
-//! Public SQL companions of the frozen HNSW unit-test ports. Maintenance
+//! Public SQL companions of the clustered-index unit-test ports. Maintenance
 //! advances to its public ready report; no sleeps or cycle-count readiness.
 #![cfg(feature = "test-seams")]
 #![expect(

@@ -890,13 +890,8 @@ path = "tests/native_calibration_window.rs"
 required-features = ["test-seams"]
 
 [[test]]
-name = "hnsw_public_score"
-path = "tests/hnsw_public_score.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "hnsw_public_engine_ports"
-path = "tests/hnsw_public_engine_ports.rs"
+name = "clustered_public_engine_ports"
+path = "tests/clustered_public_engine_ports.rs"
 required-features = ["test-seams"]
 
 [[test]]
