@@ -432,6 +432,8 @@ impl Decoder<'_> {
             len: self.u64(),
         };
         if loc.kind > 2 {
+            #[cfg(any(test, feature = "test-seams"))]
+            crate::persistence::content_identity::note_scratch_locator_refusal(loc.kind);
             return Err(Error::Other("invalid scratch key locator".into()));
         }
         Ok(loc)

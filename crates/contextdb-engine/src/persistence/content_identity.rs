@@ -4543,6 +4543,22 @@ fn mutation_key_capacity(
 
 #[path = "content_identity/writer_window.rs"]
 mod writer_window;
+
+/// Under test seams, name on stderr the exact decoder that refused a scratch
+/// key locator: its source file and line, and the refused kind. A failure
+/// census attributes an `invalid scratch key locator` error to this origin,
+/// which the error's message alone cannot tell apart, since the same message
+/// is built by two decoders.
+#[cfg(any(test, feature = "test-seams"))]
+#[track_caller]
+pub(crate) fn note_scratch_locator_refusal(kind: u64) {
+    let at = std::panic::Location::caller();
+    eprintln!(
+        "contextdb-error-origin: invalid scratch key locator at {}:{} (kind {kind})",
+        at.file(),
+        at.line()
+    );
+}
 #[cfg(test)]
 #[cfg_attr(
     not(feature = "test-seams"),
@@ -12121,6 +12137,8 @@ pub(crate) mod original_writer {
                     len: self.u64(),
                 };
                 if loc.kind > 2 {
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::persistence::content_identity::note_scratch_locator_refusal(loc.kind);
                     return Err(Error::Other("invalid scratch key locator".into()));
                 }
                 Ok(loc)
