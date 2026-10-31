@@ -1,5 +1,3 @@
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
 pub mod cosine;
 pub mod mem;
 mod memory_budget;
