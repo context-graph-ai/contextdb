@@ -46,6 +46,35 @@ pub fn cli_binary() -> &'static str {
     env!("CARGO_BIN_EXE_contextdb")
 }
 
+/// Make a spawned session's SIGINT state explicit: default disposition and
+/// not blocked. A child inherits its launcher's signal state across exec, and a
+/// harness started as a background job (or under nohup/timeout) can hand down an
+/// ignored or blocked SIGINT, which would make the ordinary meaning of an
+/// interrupt untestable. The journeys that interrupt a session depend on this
+/// precondition, so it is set here rather than assumed.
+#[cfg(unix)]
+fn restore_default_sigint(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and calls only
+    // async-signal-safe functions (signal, sigemptyset, sigaddset,
+    // pthread_sigmask) on stack data.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGINT);
+            let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            if rc != 0 {
+                return Err(std::io::Error::from_raw_os_error(rc));
+            }
+            Ok(())
+        });
+    }
+}
+
 fn base_command() -> Command {
     let mut cmd = Command::new(cli_binary());
     for name in CONTEXTDB_ENV_NAMES {
@@ -620,6 +649,8 @@ pub struct Background {
 pub fn background(args: &[&str]) -> Background {
     let mut cmd = base_command();
     cmd.args(args);
+    #[cfg(unix)]
+    restore_default_sigint(&mut cmd);
     // This fixture observes one ordered transcript. One kernel pipe preserves
     // the child's write order across its two descriptors. The stream-purity
     // journeys use run(), which captures stdout and stderr separately.
@@ -734,6 +765,29 @@ impl Background {
             .status()
             .expect("send SIGINT");
         assert!(status.success(), "failed to signal the background session");
+    }
+
+    /// The running child's SIGINT state as the kernel reports it: whether
+    /// SIGINT is ignored (`SigIgn`) and whether it is blocked (`SigBlk`).
+    /// `None` where /proc does not describe processes. The cancellation journey
+    /// asserts both are false before it sends the signal, so its termination
+    /// claim rests on a witnessed precondition.
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation"
+    )]
+    pub fn sigint_state(&self) -> Option<(bool, bool)> {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.pid())).ok()?;
+        let mask = |field: &str| -> Option<bool> {
+            let hex = status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))?
+                .trim();
+            let bits = u64::from_str_radix(hex, 16).ok()?;
+            // Signal n occupies bit n - 1.
+            Some(bits & (1 << (libc::SIGINT - 1)) != 0)
+        };
+        Some((mask("SigIgn:")?, mask("SigBlk:")?))
     }
 
     /// Block until `marker` appears. Waits on an output event; the watchdog only

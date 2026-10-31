@@ -184,6 +184,19 @@ fn a_non_interactive_session_keeps_process_termination() {
     session.send_line(EXPENSIVE_STATEMENT);
     session.wait_for("statement_progress");
 
+    // The precondition this journey rests on, witnessed on the running child:
+    // SIGINT is neither ignored nor blocked, so the signal below has its
+    // ordinary meaning. (The fixture sets this before exec; here the kernel
+    // confirms it.)
+    if let Some((ignored, blocked)) = session.sigint_state() {
+        assert!(
+            !ignored && !blocked,
+            "the scripted session must start with SIGINT at its default disposition and \
+             unblocked (ignored={ignored}, blocked={blocked}).\ntranscript:\n{}",
+            session.transcript()
+        );
+    }
+
     session.interrupt();
     // Termination may close stdin before this write, or the write may win the race.
     let next_statement = session.try_send_line("SELECT id FROM paged ORDER BY id LIMIT 1;");
