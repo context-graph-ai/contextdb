@@ -2710,84 +2710,42 @@ impl Database {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    /// The row checks a statement may spend checking its filter row by row:
-    /// the walk budget its declared breadth gives it for `k`.
+    /// A ranked vector read needs the column's declared rank policy.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn bounded_vector_row_check_allowance(
+    pub(crate) fn bounded_vector_rank_policy<E>(
         &self,
         index: &VectorIndexRef,
-        k: usize,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    ) -> Result<usize> {
-        self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
-            self.vector
-                .bounded_row_check_allowance(index, k, groups, vector_copy_owner)
-        })
-    }
-
-    pub(crate) fn bounded_vector_candidate_k<E>(
-        &self,
-        index: &VectorIndexRef,
-        requested: usize,
-        sort_key: Option<&str>,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        before_source: impl FnMut() -> std::result::Result<(), E>,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> std::result::Result<usize, E>
+        sort_key: &str,
+    ) -> std::result::Result<(), E>
     where
         E: From<Error>,
     {
-        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
-
-        self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
-            self.assert_bounded_vector_read_is_schema_protected()?;
-            let base_candidate_k = if let Some(sort_key) = sort_key {
-                let meta = self
-                    .table_meta(&index.table)
-                    .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
-                let column = meta
-                    .columns
-                    .iter()
-                    .find(|column| column.name == index.column)
-                    .ok_or_else(|| Error::UnknownVectorIndex {
-                        index: index.clone(),
-                    })?;
-                let Some(policy) = column.rank_policy.as_ref() else {
-                    return Err(E::from(Error::RankPolicyNotFound {
-                        index: rank_index_name(&index.table, &index.column),
-                        sort_key: sort_key.to_string(),
-                    }));
-                };
-                if policy.sort_key != sort_key {
-                    return Err(E::from(Error::RankPolicyNotFound {
-                        index: rank_index_name(&index.table, &index.column),
-                        sort_key: sort_key.to_string(),
-                    }));
-                }
-                let _formula = self.rank_formula(&index.table, &index.column)?;
-                // The indexed route's bounded pool. The bounded kernel resolves the
-                // route when it runs and widens this to the whole visible set the
-                // moment the exact route is taken, so the pool always carries the
-                // meaning of the route that answered.
-                self.vector.bounded_rank_candidate_k_grouped(
-                    index,
-                    requested,
-                    groups,
-                    before_source,
-                    vector_copy_owner,
-                )?
-            } else {
-                requested
-            };
-
-            Ok(base_candidate_k)
-        })
+        self.assert_bounded_vector_read_is_schema_protected()?;
+        let meta = self
+            .table_meta(&index.table)
+            .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+        let column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        let declared = column
+            .rank_policy
+            .as_ref()
+            .is_some_and(|policy| policy.sort_key == sort_key);
+        if !declared {
+            return Err(E::from(Error::RankPolicyNotFound {
+                index: rank_index_name(&index.table, &index.column),
+                sort_key: sort_key.to_string(),
+            }));
+        }
+        let _formula = self.rank_formula(&index.table, &index.column)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -11079,23 +11079,29 @@ impl VectorState {
                         groups.get_mut().mark_row_checked();
                     }
                     let aggregate_allowed_count = groups.get().aggregate_allowed_count();
-                    self.candidate_k = context
-                        .with_vector_copies(|vector_copy_owner| {
-                            db.bounded_vector_candidate_k(
-                                &self.index,
-                                self.k,
-                                self.sort_key.as_deref(),
-                                groups.get(),
-                                &mut || context.native_source_touch(),
-                                vector_copy_owner,
-                                context.reader_budget.clone(),
-                            )
-                        })?
-                        .saturating_add(
-                            self.vector_overlay
-                                .as_ref()
-                                .map_or(0, |overlay| overlay.searchable_entry_count),
-                        );
+                    // The indexed route ranks the native candidate pool of the
+                    // route selected for the original limit. EXACT ranks every
+                    // allowed stored vector before the final LIMIT.
+                    let exact_ranked = self.search_mode == contextdb_core::VectorSearchMode::Exact
+                        || self.force_exact_for_relational_fallback;
+                    if let Some(sort_key) = self.sort_key.as_deref() {
+                        db.bounded_vector_rank_policy(&self.index, sort_key)?;
+                    }
+                    let staged_entries = self
+                        .vector_overlay
+                        .as_ref()
+                        .map_or(0, |overlay| overlay.searchable_entry_count);
+                    self.candidate_k = if self.sort_key.is_some() && exact_ranked {
+                        context
+                            .with_vector_copies(|owner| {
+                                db.bounded_vector_entry_count(&self.index, self.snapshot, owner)
+                            })?
+                            .saturating_add(staged_entries)
+                            .max(self.k)
+                    } else {
+                        self.k
+                    }
+                    .saturating_add(staged_entries);
                     let searched = {
                         // The search's own checks: one per candidate it may
                         // evaluate, each paying its ordinary request work.
@@ -11119,7 +11125,8 @@ impl VectorState {
                             }
                             None => Ok(true),
                         };
-                        context.with_vector_copies(|vector_copy_owner| {
+                        let ranked_limit = self.sort_key.as_ref().map(|_| self.k);
+                        let search = || context.with_vector_copies(|vector_copy_owner| {
                             db.bounded_vector_search(
                                 &self.index,
                                 parameter_query_vector(&self.query_expr, &self.params)
@@ -11154,7 +11161,13 @@ impl VectorState {
                                     },
                                 ),
                             )
-                        })?
+                        });
+                        match ranked_limit {
+                            Some(limit) => {
+                                contextdb_vector::mem::with_search_policy_limit(limit, search)?
+                            }
+                            None => search()?,
+                        }
                     };
                     match searched {
                         super::BoundedVectorSearchOutcome::Complete(

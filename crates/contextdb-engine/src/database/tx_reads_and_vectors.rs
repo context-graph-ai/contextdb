@@ -4026,7 +4026,7 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
-    ) -> Result<(Vec<SearchResult>, bool)> {
+    ) -> Result<Vec<SearchResult>> {
         let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
 
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
@@ -4040,9 +4040,8 @@ impl Database {
             executing_owner.clone(),
         )
         .map(|(results, trace)| {
-            let used_hnsw = trace.used_hnsw;
             self.publish_vector_search_trace(trace.into_published());
-            (results, used_hnsw)
+            results
         })
     }
 
@@ -4184,26 +4183,8 @@ impl Database {
                 vector_copy_owner,
                 read_memory.clone(),
             )?;
-            let whole_pool = self.rank_policy_candidate_k(
-                &index,
-                entry_count,
-                query.limit,
-                true,
-                candidate_bitmap.as_ref(),
-                snapshot,
-                vector_copy_owner,
-                read_memory.clone(),
-            )?;
-            let internal_k = self.rank_policy_candidate_k(
-                &index,
-                entry_count,
-                query.limit,
-                search_mode == contextdb_core::VectorSearchMode::Exact,
-                candidate_bitmap.as_ref(),
-                snapshot,
-                vector_copy_owner,
-                read_memory.clone(),
-            )?;
+            let whole_pool = Self::rank_policy_candidate_k(entry_count, query.limit, true);
+            let internal_k = Self::rank_policy_candidate_k(entry_count, query.limit, search_mode == contextdb_core::VectorSearchMode::Exact);
             let (mut raw, mut trace) =
                 contextdb_vector::mem::with_search_policy_limit(query.limit, || {
                     self.query_vector_strict_in_tx_with_strategy(
@@ -4220,7 +4201,10 @@ impl Database {
                     )
                 })?;
             if search_mode == contextdb_core::VectorSearchMode::Auto
-                && !trace.used_hnsw
+                && !trace
+                    .partition_routes
+                    .iter()
+                    .any(|route| route.route == contextdb_vector::VectorPartitionSearchRoute::Indexed)
                 && internal_k < whole_pool
                 && raw.len() >= internal_k
             {
@@ -4535,8 +4519,6 @@ impl Database {
                 read_memory.clone(),
                 vector_copy_owner,
             )?;
-            self.last_vector_search_used_hnsw
-                .store(trace.used_hnsw, Ordering::SeqCst);
             Ok((rows, trace))
         })
     }
@@ -4598,16 +4580,10 @@ impl Database {
                 RetainedVectorSearchTrace::new(
                     VectorSearchDebugTrace {
                         index,
-                        used_hnsw: false,
-                        hnsw_len: None,
-                        hnsw_candidate_count: 0,
-                        hnsw_candidate_row_ids: Vec::new(),
                         final_row_ids: Vec::new(),
                         supplemented_row_count: 0,
                         fallback_reason: Some("empty_limit"),
                         partition_routes: Vec::new(),
-                        hnsw_ef_search: None,
-                        selected_generations: Vec::new(),
                         budget_receipt: None,
                     },
                     executing_owner.clone(),
@@ -4839,9 +4815,6 @@ impl Database {
                 trace.trace.supplemented_row_count = trace
                     .supplemented_row_count
                     .saturating_add(staged_entries.min(scored.len()));
-                let used_hnsw = trace.used_hnsw;
-                self.last_vector_search_used_hnsw
-                    .store(used_hnsw, Ordering::SeqCst);
                         Ok((scored, trace))
             })();
         self.finalization.accountant.release(overlay_bytes);
@@ -4881,16 +4854,10 @@ impl Database {
                 RetainedVectorSearchTrace::new(
                     VectorSearchDebugTrace {
                         index,
-                        used_hnsw: false,
-                        hnsw_len: None,
-                        hnsw_candidate_count: 0,
-                        hnsw_candidate_row_ids: Vec::new(),
                         final_row_ids: Vec::new(),
                         supplemented_row_count: 0,
                         fallback_reason: Some("empty_limit"),
                         partition_routes: Vec::new(),
-                        hnsw_ef_search: None,
-                        selected_generations: Vec::new(),
                         budget_receipt: None,
                     },
                     executing_owner.clone(),
@@ -5048,9 +5015,6 @@ impl Database {
             trace.trace.supplemented_row_count = trace
                 .supplemented_row_count
                 .saturating_add(staged_entries.min(scored.len()));
-            let used_hnsw = trace.used_hnsw;
-            self.last_vector_search_used_hnsw
-                .store(used_hnsw, Ordering::SeqCst);
                 Ok((scored, trace))
         })()
     }
@@ -5194,69 +5158,17 @@ impl Database {
         })
     }
 
-    /// EXACT ranks every allowed vector; indexed ranking uses the column's
-    /// resolved candidate breadth. The caller's LIMIT is resolved only once.
-    #[allow(clippy::too_many_arguments)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
+    /// EXACT ranks every allowed vector; indexed ranking uses the native
+    /// candidate pool of the route selected for the caller's LIMIT.
     pub(super) fn rank_policy_candidate_k(
-        &self,
-        index: &VectorIndexRef,
         entry_count: usize,
         limit: usize,
         exact_route: bool,
-        candidates: Option<&RoaringTreemap>,
-        snapshot: SnapshotId,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<usize> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
+    ) -> usize {
         if entry_count == 0 || limit == 0 {
-            return Ok(limit);
+            return limit;
         }
-        if exact_route {
-            return Ok(entry_count);
-        }
-        let bytes = candidates
-            .map_or(0, |ids| ids.len() as usize)
-            .saturating_mul(std::mem::size_of::<u64>());
-        let _credit = contextdb_core::read_memory::ReadCredit::try_new(
-            read_memory.clone(),
-            bytes,
-            "vector_search",
-            "rank_candidate_ids",
-            "Narrow the authorized scope or raise MEMORY_LIMIT.",
-        )?;
-        let ids = candidates.map(|ids| ids.iter().collect::<Vec<_>>());
-        let groups = self.vector.bounded_candidate_groups(
-            index,
-            ids.as_deref(),
-            snapshot,
-            || Ok::<_, Error>(()),
-            || Ok::<_, Error>(()),
-            |bytes| {
-                read_memory.try_reserve(
-                    bytes,
-                    "vector_search",
-                    "rank_candidate_sources",
-                    "Narrow the authorized scope or raise MEMORY_LIMIT.",
-                )
-            },
-            |bytes| read_memory.release(bytes),
-            vector_copy_owner,
-        )?;
-        let candidate_k = self.vector.bounded_rank_candidate_k_grouped(
-            index,
-            limit,
-            &groups,
-            || Ok::<_, Error>(()),
-            vector_copy_owner,
-        );
-        read_memory.release(groups.into_retained_bytes());
-        candidate_k
+        if exact_route { entry_count } else { limit }
     }
 
     #[expect(

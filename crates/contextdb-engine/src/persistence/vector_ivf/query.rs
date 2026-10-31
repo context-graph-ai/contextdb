@@ -128,7 +128,9 @@ pub(crate) fn search<E: From<Error>>(
             .into(),
         }));
     }
-    let limit = output.len();
+    let limit = contextdb_vector::mem::search_policy_limit()
+        .filter(|limit| *limit <= output.len())
+        .unwrap_or(output.len());
     let route = select_route(
         &source,
         column,

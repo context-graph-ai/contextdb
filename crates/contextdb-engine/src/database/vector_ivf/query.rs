@@ -59,7 +59,6 @@ impl Database {
         groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
         mode: VectorSearchMode,
         query_breadth: crate::database::vector_ivf::policy::QueryBreadth,
-        rank_pool: bool,
         before_source: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_exact: &mut dyn FnMut() -> std::result::Result<(), E>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), E>,
@@ -123,6 +122,8 @@ impl Database {
         // A ranked indexed read keeps the whole refined candidate pool of the
         // route selected for `k`; the pool's extra score and merge space is
         // admitted when a partition reports it.
+        let policy_limit = contextdb_vector::mem::search_policy_limit();
+        let rank_pool = mode != VectorSearchMode::Exact && policy_limit.is_some();
         let mut capacity = k;
         let mut pool_growth = ReadCredit::new(memory.clone());
         let score_bytes = k

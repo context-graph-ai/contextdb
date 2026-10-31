@@ -31,6 +31,13 @@ pub fn with_search_policy_limit<T>(limit: usize, operation: impl FnOnce() -> T) 
     operation()
 }
 
+/// The original limit of an enclosing ranked read, which wants the whole
+/// refined candidate pool of the route selected for that limit.
+#[doc(hidden)]
+pub fn search_policy_limit() -> Option<usize> {
+    SEARCH_POLICY_LIMIT.with(std::cell::Cell::get)
+}
+
 #[cfg(feature = "test-seams")]
 thread_local! {
     static VECTOR_ADMISSION_SITE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };

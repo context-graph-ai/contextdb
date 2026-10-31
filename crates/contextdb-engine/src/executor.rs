@@ -1224,22 +1224,16 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         BoundedExecutionError,
     >;
 
-    #[allow(clippy::too_many_arguments)]
+    /// A ranked vector read needs the column's declared rank policy.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn bounded_vector_candidate_k(
+    fn bounded_vector_rank_policy(
         &self,
         index: &VectorIndexRef,
-        requested: usize,
-        sort_key: Option<&str>,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> std::result::Result<usize, BoundedExecutionError>;
+        sort_key: &str,
+    ) -> std::result::Result<(), BoundedExecutionError>;
 
     #[expect(
         clippy::result_large_err,
@@ -1329,18 +1323,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
     /// The row checks a statement over `index` may spend checking its filter
     /// row by row, or `None` where this target cannot size it.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn bounded_vector_row_check_allowance(
-        &self,
-        index: &VectorIndexRef,
-        k: usize,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    ) -> std::result::Result<Option<usize>, BoundedExecutionError> {
-        let _ = (index, k, groups, vector_copy_owner);
         Ok(None)
     }
 
@@ -2658,28 +2640,12 @@ impl ReadExecutionTarget for Database {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn bounded_vector_candidate_k(
+    fn bounded_vector_rank_policy(
         &self,
         index: &VectorIndexRef,
-        requested: usize,
-        sort_key: Option<&str>,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> std::result::Result<usize, BoundedExecutionError> {
-        Database::bounded_vector_candidate_k(
-            self,
-            index,
-            requested,
-            sort_key,
-            groups,
-            before_source,
-            vector_copy_owner,
-            read_memory.clone(),
-        )
+        sort_key: &str,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        Database::bounded_vector_rank_policy(self, index, sort_key)
     }
 
     fn bounded_vector_entry_count(
@@ -2801,21 +2767,6 @@ impl ReadExecutionTarget for Database {
         )
     }
 
-    fn bounded_vector_row_check_allowance(
-        &self,
-        index: &VectorIndexRef,
-        k: usize,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    ) -> std::result::Result<Option<usize>, BoundedExecutionError> {
-        Ok(Some(Database::bounded_vector_row_check_allowance(
-            self,
-            index,
-            k,
-            groups,
-            vector_copy_owner,
-        )?))
-    }
 
     fn bounded_brute_force_vector_step(
         &self,
@@ -23961,26 +23912,12 @@ impl ReadExecutionTarget for BoundedCursorTarget {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bounded_vector_candidate_k(
+    fn bounded_vector_rank_policy(
         &self,
         index: &VectorIndexRef,
-        requested: usize,
-        sort_key: Option<&str>,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> std::result::Result<usize, BoundedExecutionError> {
-        self.store.bounded_vector_candidate_k(
-            index,
-            requested,
-            sort_key,
-            groups,
-            before_source,
-            vector_copy_owner,
-            read_memory,
-        )
+        sort_key: &str,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.store.bounded_vector_rank_policy(index, sort_key)
     }
 
     fn bounded_vector_entry_count(
@@ -24096,16 +24033,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         )
     }
 
-    fn bounded_vector_row_check_allowance(
-        &self,
-        index: &VectorIndexRef,
-        k: usize,
-        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
-        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-    ) -> std::result::Result<Option<usize>, BoundedExecutionError> {
-        self.store
-            .bounded_vector_row_check_allowance(index, k, groups, vector_copy_owner)
-    }
 
     fn bounded_brute_force_vector_step(
         &self,
