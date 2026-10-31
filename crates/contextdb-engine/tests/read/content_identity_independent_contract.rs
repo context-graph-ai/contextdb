@@ -1903,16 +1903,10 @@ fn generation_publication_keeps_the_root_equal_to_the_independent_committed_cont
     let baseline = observe(&path);
     let published = mutate(&path, |db| {
         let durable_generation = |column: &str| {
-            let state = db
-                .vector_store_for_test()
-                .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
-                    contextdb_core::VectorIndexRef::new("identity_rows", column),
-                    contextdb_core::VectorPartitionKey::unpartitioned(),
-                ))?;
-            state
-                .base
-                .or(state.dormant_base)
-                .filter(|g| g.durable_bytes > 0)
+            db.__debug_vector_partition_generation_for_test(
+                contextdb_core::VectorIndexRef::new("identity_rows", column),
+                contextdb_core::VectorPartitionKey::unpartitioned(),
+            )
         };
         for _ in 0..64 {
             db.run_maintenance_cycle().unwrap();

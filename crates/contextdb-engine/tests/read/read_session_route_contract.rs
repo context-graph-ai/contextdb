@@ -1016,7 +1016,6 @@ impl KernelCancellationGate {
             ReadKernelSource::SortCandidate,
             ReadKernelSource::GraphEdge,
             ReadKernelSource::BruteForceVectorCandidate,
-            ReadKernelSource::HnswCandidate,
             ReadKernelSource::RankCandidate,
             ReadKernelSource::AccessRow,
         ];

@@ -139,19 +139,19 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
     for _ in 0..8 {
         db.run_maintenance_cycle()
             .expect("build maintained generation");
-        if db
-            .vector_store_for_test()
-            .hnsw_maintenance_status()
-            .ready_partitions
-            > 0
-        {
+        if db.__debug_vector_indexed_available_for_test(contextdb_core::VectorIndexRef::new(
+            "generation_probe",
+            "embedding",
+        )) {
             break;
         }
     }
-    let expected_catalog = db.vector_store_for_test().hnsw_maintenance_status();
     assert!(
-        expected_catalog.ready_partitions > 0,
-        "catalog has a ready generation"
+        db.__debug_vector_indexed_available_for_test(contextdb_core::VectorIndexRef::new(
+            "generation_probe",
+            "embedding",
+        )),
+        "catalog has a ready index"
     );
     let mut expected_tables = db.table_names();
     expected_tables.sort();
@@ -159,16 +159,13 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
     db.close().expect("seal schema wall");
 
     let reader = ReadSession::open(&path).expect("open largest committed schema wall");
-    let catalog = reader
-        .file_vector_store_for_test()
-        .expect("file route has a vector catalog")
-        .hnsw_maintenance_status();
-    assert_eq!(catalog.nonempty_indexes, expected_catalog.nonempty_indexes);
-    assert_eq!(
-        catalog.nonempty_partitions,
-        expected_catalog.nonempty_partitions
-    );
-    assert_eq!(catalog.ready_partitions, expected_catalog.ready_partitions);
+    let served = reader
+        .execute(
+            "SELECT id FROM generation_probe ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        )
+        .expect("the opened reader serves the committed index");
+    assert_eq!(served.rows(), vec![vec![Value::Int64(1)]]);
     for (ordinal, expected) in expected_rows.iter().enumerate() {
         let table = format!("schema_{ordinal:03}");
         let actual = reader

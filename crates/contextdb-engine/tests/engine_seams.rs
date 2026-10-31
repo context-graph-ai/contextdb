@@ -75,8 +75,6 @@ mod one_event_append_cost_by_stream_depth;
 mod one_event_append_work_by_family;
 #[path = "engine_seams/one_vector_append_does_not_rescan_the_directory.rs"]
 mod one_vector_append_does_not_rescan_the_directory;
-#[path = "engine_seams/per_index_independent_progress_tests.rs"]
-mod per_index_independent_progress_tests;
 #[path = "engine_seams/pruning_report_names_reader_deferred_rows.rs"]
 mod pruning_report_names_reader_deferred_rows;
 #[path = "engine_seams/rank_policy_joined_row_sees_staged_access_changes.rs"]
@@ -240,8 +238,6 @@ mod import_tail_survives_restart_without_history_reconstruction;
 mod one_import_commit_larger_than_the_cohort_share_is_absorbed;
 #[path = "engine_seams/opening_a_store_charges_the_reader_the_same_however_long_its_history.rs"]
 mod opening_a_store_charges_the_reader_the_same_however_long_its_history;
-#[path = "engine_seams/opening_a_store_does_a_bounded_vector_journal_cleanup.rs"]
-mod opening_a_store_does_a_bounded_vector_journal_cleanup;
 #[path = "engine_seams/opening_a_store_holds_a_bounded_window_of_queued_events.rs"]
 mod opening_a_store_holds_a_bounded_window_of_queued_events;
 #[path = "engine_seams/opening_a_store_read_only_does_not_grow_with_history.rs"]
@@ -250,8 +246,6 @@ mod opening_a_store_read_only_does_not_grow_with_history;
 mod reads_and_writes_are_charged_to_their_own_declared_limits;
 #[path = "engine_seams/trigger_audit_history_is_charged_once_to_the_declared_reader.rs"]
 mod trigger_audit_history_is_charged_once_to_the_declared_reader;
-#[path = "engine_seams/vector_journal_cleanup_lets_writers_commit_between_steps.rs"]
-mod vector_journal_cleanup_lets_writers_commit_between_steps;
 
 #[path = "engine_seams/reads_are_answered_while_a_maintenance_commit_holds_the_commit_gate.rs"]
 mod reads_are_answered_while_a_maintenance_commit_holds_the_commit_gate;
@@ -259,8 +253,6 @@ mod reads_are_answered_while_a_maintenance_commit_holds_the_commit_gate;
 #[path = "engine_seams/a_reads_erasure_check_does_fixed_work_however_much_history_there_is.rs"]
 mod a_reads_erasure_check_does_fixed_work_however_much_history_there_is;
 
-#[path = "engine_seams/many_catalog_maintenance.rs"]
-mod many_catalog_maintenance;
 
 #[path = "engine_seams/allocator_foreign_events.rs"]
 mod allocator_foreign_events;

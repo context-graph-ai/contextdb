@@ -169,7 +169,6 @@ const VECTOR_TOP_K: usize = 10;
 /// about the read; it only keeps the fixture honest about what it exercises.
 #[derive(Default)]
 struct VectorSourceCounter {
-    graph_candidates: AtomicU64,
     exhaustive_candidates: AtomicU64,
 }
 
@@ -178,9 +177,6 @@ impl bounded::ExecutionProbe for VectorSourceCounter {
 
     fn before_source_touch(&self, touch: bounded::TestSourceTouch, _completed_items: u64) {
         match touch {
-            bounded::TestSourceTouch::HnswCandidate => {
-                self.graph_candidates.fetch_add(1, Ordering::SeqCst);
-            }
             bounded::TestSourceTouch::BruteForceVectorCandidate => {
                 self.exhaustive_candidates.fetch_add(1, Ordering::SeqCst);
             }

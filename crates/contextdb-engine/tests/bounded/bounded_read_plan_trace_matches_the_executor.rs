@@ -225,9 +225,7 @@ fn vector_store(rows: u128) -> Database {
         let index = VectorIndexRef::new("docs", "embedding");
         let expected_points = usize::try_from(rows).expect("fixture count fits usize");
         for _ in 0..256 {
-            if database
-                .__debug_vector_hnsw_stats(index.clone())
-                .is_some_and(|stats| stats.point_count >= expected_points)
+            if database.__debug_vector_indexed_available_for_test(index.clone())
             {
                 break;
             }
@@ -236,9 +234,7 @@ fn vector_store(rows: u128) -> Database {
                 .expect("caller-driven graph maintenance succeeds");
         }
         assert!(
-            database
-                .__debug_vector_hnsw_stats(index)
-                .is_some_and(|stats| stats.point_count >= expected_points),
+            database.__debug_vector_indexed_available_for_test(index),
             "the approximate-route fixture has a complete maintained graph"
         );
     }
@@ -378,7 +374,7 @@ fn cases() -> Vec<Case> {
 
 /// The plan words the executor publishes. A run that stops producing one of
 /// these has stopped covering it, which is how a plan quietly loses its pin.
-const PLAN_VOCABULARY: [&str; 10] = [
+const PLAN_VOCABULARY: [&str; 8] = [
     "Scan",
     "Sort",
     "IndexScan",
@@ -387,8 +383,6 @@ const PLAN_VOCABULARY: [&str; 10] = [
     "GraphBfs",
     "Scan -> VectorSearch",
     "IndexScan -> VectorSearch",
-    "Scan -> HNSWSearch",
-    "IndexScan -> HNSWSearch",
 ];
 
 #[test]

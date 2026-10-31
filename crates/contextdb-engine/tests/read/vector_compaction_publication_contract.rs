@@ -73,19 +73,15 @@ fn committed_vector_update_then_compact_publishes_one_generation_to_new_readers(
         )
         .unwrap();
     }
+    let mut ready = 0;
     for _ in 0..8 {
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == 2 && status.remaining_partitions == 0 {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        ready = report.ready_partitions;
+        if report.ready_partitions == 2 && report.remaining_partitions == 0 {
             break;
         }
-        db.run_maintenance_cycle().unwrap();
     }
-    assert_eq!(
-        db.vector_store_for_test()
-            .hnsw_maintenance_status()
-            .ready_partitions,
-        2
-    );
+    assert_eq!(ready, 2);
     db.close().unwrap();
 
     let old = ReadSession::open(&path).unwrap();

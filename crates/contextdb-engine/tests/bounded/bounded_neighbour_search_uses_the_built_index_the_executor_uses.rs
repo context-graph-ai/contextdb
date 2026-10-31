@@ -147,9 +147,7 @@ fn ranked_documents() -> Database {
 fn publish_document_index(database: &Database) {
     let index = VectorIndexRef::new("docs", "embedding");
     for _ in 0..MAX_BUILD_MAINTENANCE_CYCLES {
-        if database
-            .__debug_vector_hnsw_stats(index.clone())
-            .is_some_and(|stats| stats.point_count >= DOCUMENTS)
+        if database.__debug_vector_indexed_available_for_test(index.clone())
         {
             break;
         }
@@ -158,9 +156,7 @@ fn publish_document_index(database: &Database) {
             .expect("one finite caller-driven maintenance cycle completes");
     }
     assert!(
-        database
-            .__debug_vector_hnsw_stats(index)
-            .is_some_and(|stats| stats.point_count >= DOCUMENTS),
+        database.__debug_vector_indexed_available_for_test(index),
         "caller-driven maintenance publishes every document into the graph"
     );
 }
@@ -248,6 +244,21 @@ fn both_doors_take_the_same_route(
         eager.trace().physical_plan
     );
     assert!(
+        eager
+            .trace()
+            .vector_search
+            .as_ref()
+            .is_some_and(|disclosure| matches!(
+                disclosure.route,
+                Some(
+                    contextdb_engine::VectorSearchRoute::Indexed
+                        | contextdb_engine::VectorSearchRoute::FilteredIndexed
+                )
+            )),
+        "{what}: the executor must take the built index: {:?}",
+        eager.trace().vector_search
+    );
+    assert!(
         !eager.rows().is_empty(),
         "{what}: the executor finds neighbours to compare"
     );
@@ -292,7 +303,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "a filtered search whose query vector is read from a stored row",
         FILTERED_PERSISTED,
         &source_params(),
-        "HNSWSearch",
+        "VectorSearch",
         &mut disagreements,
     );
     both_doors_take_the_same_route(
@@ -300,7 +311,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "the same filtered search written with the vector spelled out",
         FILTERED_LITERAL,
         &both_sources(),
-        "HNSWSearch",
+        "VectorSearch",
         &mut disagreements,
     );
 
@@ -311,7 +322,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "the same search again, with the graph already built",
         FILTERED_PERSISTED,
         &source_params(),
-        "HNSWSearch",
+        "VectorSearch",
         &mut disagreements,
     );
 

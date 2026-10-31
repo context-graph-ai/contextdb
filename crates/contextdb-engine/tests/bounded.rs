@@ -44,8 +44,6 @@ mod bounded_read_sees_the_same_transaction_graph_overlay;
 mod bounded_read_sees_the_same_transaction_row_vectors;
 #[path = "bounded/bounded_route_answer_parity.rs"]
 mod bounded_route_answer_parity;
-#[path = "bounded/bounded_route_graph_candidate_shortfall.rs"]
-mod bounded_route_graph_candidate_shortfall;
 #[path = "bounded/bounded_user_table_named_dual.rs"]
 mod bounded_user_table_named_dual;
 #[path = "bounded/composite_prefix_newest_row_examines_constant_entries.rs"]

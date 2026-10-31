@@ -105,7 +105,7 @@ struct Sample {
     anonymous: u64,
     allocated: usize,
     allocated_peak: usize,
-    additional_owners: [usize; 6],
+    additional_owners: [usize; 4],
     startup_peak: usize,
     append_peak: usize,
     redb_allocator_metadata: usize,
@@ -683,7 +683,7 @@ fn writer_reopen_and_doubling_keep_a_fixed_resident_envelope() {
     assert!(
         arms.iter()
             .flatten()
-            .all(|sample| sample.additional_owners == [0; 6]),
+            .all(|sample| sample.additional_owners == [0; 4]),
         "reverse adjacency, sync authors, refusal scans, DDL log, paged publications and vector graphs remain absent at every measured checkpoint: {arms:?}"
     );
     assert!(
