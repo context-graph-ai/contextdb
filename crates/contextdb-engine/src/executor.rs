@@ -4671,6 +4671,7 @@ fn vector_partition_inspection_row(
         vector_inspection_usize(partition.retained_rows, "retained_rows")?,
         native
             .and_then(|native| native.manifest)
+            .filter(|manifest| manifest.active_lists != 0)
             .map(|manifest| vector_inspection_u64(manifest.generation, "base_generation"))
             .transpose()?
             .unwrap_or(Value::Null),
