@@ -1668,7 +1668,7 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
     let source = Arc::new(Database::open_memory());
     source
         .execute(
-            "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3) HNSW (M = DEFAULT)) SYNC TWO WAY",
+ "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3) ) SYNC TWO WAY",
             &empty(),
         )
         .expect("declare docs with an all-default graph policy");
@@ -1738,7 +1738,7 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
     for page in current_transport_pages(&old_pages) {
         assert_ddl_is_parseable_by_the_older_peer(
             &page.ddl,
-            "all-default HNSW at a peer lacking vector vocabulary",
+ "all-default HNSW at a peer lacking vector vocabulary",
         );
     }
     for page in old_pages.iter().chain(current_pages.iter()) {
@@ -1754,7 +1754,7 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
         &source,
         &old_receiver,
         "docs",
-        "all-default HNSW, a peer lacking vector vocabulary",
+ "all-default HNSW, a peer lacking vector vocabulary",
     );
     assert_schema_converged(
         &source,
@@ -1791,13 +1791,13 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
         .expect("declare the compatible control table");
     source
         .execute(
-            "CREATE TABLE hnsw (id UUID PRIMARY KEY, decision_id UUID, search_mode BOOL)",
+ "CREATE TABLE ",
             &empty(),
         )
         .expect("declare a joined table whose name is a reserved-looking word");
     source
         .execute(
-            "CREATE INDEX hnsw_decision_idx ON hnsw(decision_id)",
+ "CREATE INDEX hnsw_decision_idx ON ",
             &empty(),
         )
         .expect("index the joined table's join column");
@@ -1806,7 +1806,7 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
             "CREATE TABLE docs (
                 id UUID PRIMARY KEY,
                 weight REAL,
-                embedding VECTOR(3) AUTO_INDEX_AT 1000 HNSW (M = 8, EF_CONSTRUCTION = 200)
+                embedding VECTOR(3) AUTO_INDEX_AT 1000 
                     RANK_POLICY (
                         JOIN hnsw ON decision_id,
                         FORMULA 'coalesce({weight}, 0.0) * coalesce({search_mode}, 0.0)',
@@ -1829,7 +1829,7 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
         .expect("write compatible control data");
     source
         .execute(
-            "INSERT INTO hnsw (id, decision_id, search_mode) VALUES ($id, $decision_id, $search_mode)",
+            "INSERT INTO  VALUES ($id, $decision_id, $search_mode)",
             &params([
                 ("id", Value::Uuid(joined_row)),
                 ("decision_id", Value::Uuid(doc)),
@@ -1849,7 +1849,7 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
         .expect("write the row carrying the real graph and crossover policy");
     source
         .execute(
-            "ALTER TABLE docs ALTER COLUMN embedding SET HNSW DEFAULT",
+ "ALTER TABLE docs ALTER COLUMN embedding SET IVF DEFAULT",
             &empty(),
         )
         .expect("revert the graph policy to the compatible default");

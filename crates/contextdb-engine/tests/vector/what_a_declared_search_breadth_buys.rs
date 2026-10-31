@@ -1,6 +1,6 @@
 //! What each declared search breadth buys, measured rather than chosen.
 //!
-//! A consumer declares `HNSW (EF_SEARCH = n)` on its vector column and gets a
+//! A consumer declares `IVF (PROBES = n)` on its vector column and gets a
 //! recall and a cost. This records both, over one Context holding 10,000 (and
 //! 12,500) vectors of 768 dimensions, against the exhaustive answer on the
 //! same stored representation: recall@10, distance evaluations per find, and
@@ -203,7 +203,7 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
     admin
         .execute(
             &format!(
-                "ALTER TABLE passages ALTER COLUMN embedding SET HNSW (EF_SEARCH = {breadth})"
+ "ALTER TABLE passages ALTER COLUMN embedding SET IVF (PROBES = {breadth})"
             ),
             &HashMap::new(),
         )

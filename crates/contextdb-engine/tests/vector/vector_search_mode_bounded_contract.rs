@@ -202,7 +202,7 @@ fn disclosed_partition_routes(result: &QueryResult) -> Vec<(VectorSearchRoute, O
         "a query result must label actual execution separately from passive planning"
     );
     disclosure
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| {
             (
@@ -297,7 +297,7 @@ fn a_filtered_search_resolves_one_mode_on_every_door() {
          the graph on the count crossover alone: {ordinary_trace:?}"
     );
     assert!(
-        !db.__debug_last_query_vector_used_hnsw_for_test(),
+        !db.__debug_last_query_vector_used_indexed_route_for_test(),
         "the ordinary door must not use the maintained route for this filtered read"
     );
 
@@ -433,7 +433,7 @@ fn explain_reports_the_route_forced_exact_mode_the_query_actually_took() {
 fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition() {
     let db = partitioned_fixture("AUTO");
     db.execute(
-        "ALTER TABLE vector_docs ALTER COLUMN embedding SET HNSW (EF_SEARCH = 500)",
+ "ALTER TABLE vector_docs ALTER COLUMN embedding SET IVF (PROBES = 500)",
         &empty(),
     )
     .expect("declare the breadth whose per-partition exact choice this contract proves");
@@ -485,7 +485,7 @@ fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_part
         "passive explain must not present its route prediction as an execution receipt"
     );
     assert_eq!(passive_disclosure.resolved_mode, VectorSearchMode::Indexed);
-    assert_eq!(passive_disclosure.partition_hnsw.len(), 2);
+    assert_eq!(passive_disclosure.partitions.len(), 2);
     assert_eq!(
         format!("{passive_disclosure}")
             .matches(" route=exact ")
@@ -506,7 +506,7 @@ fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_part
         .expect("AUTO publishes its aggregate and per-partition route receipt");
     assert_eq!(disclosure.resolved_mode, VectorSearchMode::Indexed);
     assert_eq!(disclosure.aggregate_allowed_vectors, Some(1_000));
-    assert_eq!(disclosure.partition_hnsw.len(), 2);
+    assert_eq!(disclosure.partitions.len(), 2);
     // AUTO decides once for the statement: comparing the 1,000 admitted rows
     // costs less than the one walk the declared breadth would buy, so both
     // partitions are compared, for the statement's reason, not their own.
@@ -516,7 +516,7 @@ fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_part
         "ready small partitions must not be described as a missing maintained index"
     );
     assert!(
-        !db.__debug_last_query_vector_used_hnsw_for_test(),
+        !db.__debug_last_query_vector_used_indexed_route_for_test(),
         "the statement-wide crossover compares the admitted rows exhaustively"
     );
     assert_eq!(
@@ -552,7 +552,7 @@ fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_part
         VectorSearchMode::Indexed,
     );
     assert!(
-        !db.__debug_last_query_vector_used_hnsw_for_test(),
+        !db.__debug_last_query_vector_used_indexed_route_for_test(),
         "the bounded door must make the same statement-wide exact decision"
     );
 
@@ -561,11 +561,11 @@ fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_part
     let indexed = db
         .execute(indexed_sql, &bound)
         .expect("explicit INDEXED traverses the ready graphs even for small partitions");
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     let bounded_indexed = bounded::execute(&db, &bounded_request(indexed_sql, bound))
         .expect("the bounded door preserves explicit INDEXED");
     assert_eq!(bounded_indexed.result.rows(), indexed.rows());
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
 }
 
 #[test]
@@ -878,7 +878,7 @@ fn filtered_many_partition_search_reuses_partition_local_candidates() {
 fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() {
     let db = partitioned_fixture("AUTO");
     db.execute(
-        "ALTER TABLE vector_docs ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)",
+ "ALTER TABLE vector_docs ALTER COLUMN embedding SET IVF (PROBES = 200)",
         &empty(),
     )
     .expect("keep each healthy fixture partition wider than its graph search breadth");

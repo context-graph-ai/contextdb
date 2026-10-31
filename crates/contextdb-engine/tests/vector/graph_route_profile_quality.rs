@@ -13,7 +13,7 @@ fn f32_breadth_below_5001_is_measured_from_frozen_queries() {
         for breadth in BREADTH_CANDIDATES {
             db.execute(
                 &format!(
-                    "ALTER TABLE profile_items ALTER COLUMN embedding SET HNSW (EF_SEARCH = {breadth})"
+ "ALTER TABLE profile_items ALTER COLUMN embedding SET IVF (PROBES = {breadth})"
                 ),
                 &HashMap::new(),
             )
@@ -51,7 +51,7 @@ fn f32_breadth_below_5001_is_measured_from_frozen_queries() {
         }
         let selected = selected.unwrap_or_else(|| panic!("no measured breadth passed at n={n}"));
         db.execute(
-            "ALTER TABLE profile_items ALTER COLUMN embedding SET HNSW (EF_SEARCH = DEFAULT)",
+ "ALTER TABLE profile_items ALTER COLUMN embedding SET IVF (PROBES = DEFAULT)",
             &HashMap::new(),
         )
         .expect("restore the silent compatibility profile");

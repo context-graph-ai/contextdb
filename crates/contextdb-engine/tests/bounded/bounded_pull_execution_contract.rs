@@ -1107,7 +1107,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
     assert_eq!(hnsw_outcome.result.rows().len(), 5);
     assert!(uuid_ids(&hnsw_outcome.result).contains(&hnsw_ids[0]));
     assert!(
-        hnsw.__debug_last_query_vector_used_hnsw_for_test(),
+        hnsw.__debug_last_query_vector_used_indexed_route_for_test(),
         "the bounded production path must exercise HNSW above its real threshold"
     );
     assert!(
@@ -1463,7 +1463,7 @@ fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
                USE VECTOR INDEXED LIMIT 5";
     db.execute(sql, &params([("query", Value::Vector(vector_for(0)))]))
         .expect("prebuild persistent HNSW state before observing request work");
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
 
     let observer = Arc::new(HnswCandidatePathProbe::default());
     let vector_observer: Arc<dyn contextdb_vector::hnsw::HnswCandidateObserver> = observer.clone();
@@ -1712,7 +1712,7 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     );
     if case.uses_hnsw {
         assert!(
-            case.db.__debug_last_query_vector_used_hnsw_for_test(),
+            case.db.__debug_last_query_vector_used_indexed_route_for_test(),
             "{} reaches the HNSW candidate loop rather than the brute-force fallback",
             case.name
         );
@@ -1913,7 +1913,7 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     let matrix_hnsw_index = VectorIndexRef::new("matrix_hnsw_vectors", "embedding");
     for _ in 0..64 {
         if db
-            .__debug_vector_hnsw_build_serial_for_test(matrix_hnsw_index.clone())
+            .__debug_vector_index_generation_for_test(matrix_hnsw_index.clone())
             .is_some()
         {
             break;
@@ -1922,7 +1922,7 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             .expect("one finite caller-driven maintenance cycle completes");
     }
     assert!(
-        db.__debug_vector_hnsw_build_serial_for_test(matrix_hnsw_index.clone())
+        db.__debug_vector_index_generation_for_test(matrix_hnsw_index.clone())
             .is_some(),
         "the matrix must exercise a published maintained graph, not AUTO's exact fallback"
     );
@@ -1958,9 +1958,9 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     // state, never erase this index-owned cache to make accounting balance.
     let hnsw_sql = "SELECT id FROM matrix_hnsw_vectors ORDER BY embedding <=> $query \
                     USE VECTOR INDEXED LIMIT 5";
-    db.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
+ db.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
         .expect("prebuild persistent HNSW state outside the bounded request");
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     let hnsw_trace = db
         .__debug_last_query_vector_trace_for_test(
             db.declared_reader_memory()
@@ -2023,7 +2023,7 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
             uses_hnsw: false,
         },
         ExactLimitMatrixCase {
-            name: "HNSW vector candidates",
+ name: "HNSW vector candidates",
             db: &db,
             sql: hnsw_sql,
             params: params([("query", Value::Vector(vector_for(0)))]),

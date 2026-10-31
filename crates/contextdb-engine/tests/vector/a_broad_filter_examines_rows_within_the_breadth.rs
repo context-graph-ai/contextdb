@@ -47,7 +47,7 @@ fn fixture(searchable: impl Fn(usize) -> bool) -> Database {
              generation_id UUID NOT NULL, is_current BOOLEAN NOT NULL, \
              is_searchable BOOLEAN NOT NULL, \
              embedding VECTOR({DIMENSION}) PARTITION_KEY (context_id, generation_id) \
-             SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = {M}, EF_SEARCH = {BREADTH}))"
+             SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = {BREADTH}))"
         ),
         &HashMap::new(),
     )

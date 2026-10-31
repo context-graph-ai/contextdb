@@ -9,7 +9,7 @@
 
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::{
-    Database, MaintenancePolicy, VectorPartitionHnswDisclosure, VectorSearchDisclosure,
+    Database, MaintenancePolicy, VectorPartitionDisclosure, VectorSearchDisclosure,
     VectorSearchRoute, VectorSearchRouteEvidence,
 };
 use std::collections::HashMap;
@@ -98,9 +98,9 @@ fn declare(db: &Database) {
 /// statement-wide one, is the same on both sides.
 fn routes(disclosure: &VectorSearchDisclosure) -> Vec<(Option<VectorSearchRoute>, Option<String>)> {
     let mut routes = disclosure
-        .partition_hnsw
+        .partitions
         .iter()
-        .map(|partition: &VectorPartitionHnswDisclosure| {
+        .map(|partition: &VectorPartitionDisclosure| {
             let reason = (partition.route == Some(VectorSearchRoute::Exact))
                 .then(|| partition.reason.clone())
                 .flatten();

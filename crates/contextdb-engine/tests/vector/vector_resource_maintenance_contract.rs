@@ -14,7 +14,7 @@ use std::{
 fn seed(db: &Database, scopes: usize, m: usize) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let max_partitions = scopes.max(3);
-    db.execute(&format!("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS {max_partitions} SEARCH_MODE INDEXED HNSW (M = {m}, EF_CONSTRUCTION = 64))"), &HashMap::new()).unwrap();
+ db.execute(&format!("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS {max_partitions} SEARCH_MODE INDEXED )"), &HashMap::new()).unwrap();
     for scope in 0..scopes {
         for row in 0..16 {
             db.execute(
@@ -200,7 +200,7 @@ fn in_memory_consolidation_keeps_an_active_old_snapshot_on_its_indexed_route() {
             id INT PRIMARY KEY,
             scope INT NOT NULL,
             v VECTOR(3) PARTITION_KEY (scope) SEARCH_MODE INDEXED
-                HNSW (M = 4, EF_CONSTRUCTION = 64)
+                
                 CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 1)
         )",
         &HashMap::new(),
@@ -257,7 +257,7 @@ fn changing_the_poll_interval_returns_while_engine_maintenance_is_active() {
             id INT PRIMARY KEY,
             scope INT NOT NULL,
             v VECTOR(3) PARTITION_KEY (scope) SEARCH_MODE INDEXED
-                HNSW (M = 4, EF_CONSTRUCTION = 64)
+                
         )",
         &HashMap::new(),
     )
@@ -315,7 +315,7 @@ fn in_memory_maintenance_honours_declared_consolidation_thresholds() {
          id INT PRIMARY KEY, \
          scope INT NOT NULL, \
          v VECTOR(3) PARTITION_KEY (scope) SEARCH_MODE INDEXED \
-             HNSW (M = 4, EF_CONSTRUCTION = 64) \
+              \
              CONSOLIDATION (CHANGE_PERCENT = 50, TOMBSTONE_PERCENT = 50))",
         &HashMap::new(),
     )

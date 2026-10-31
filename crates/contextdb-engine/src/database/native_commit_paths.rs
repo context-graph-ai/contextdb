@@ -525,8 +525,6 @@ pub(crate) fn returned_loader_rows_for_test() {
             max_partitions: None,
             search_mode: contextdb_core::VectorSearchMode::Exact,
             auto_index_at: None,
-            flat_below: None,
-            auto_expansion_ceiling: None,
             policy_revision: 0,
             consolidation_change_percent: None,
             consolidation_tombstone_percent: None,

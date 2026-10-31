@@ -88,7 +88,7 @@ fn declare(db: &Database, representation: &str) {
         &format!(
             "CREATE TABLE grouped (id UUID PRIMARY KEY, tag TEXT, \
              embedding VECTOR({DIMENSION}){representation} SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
-             HNSW (M = {M}, EF_SEARCH = {NARROW}))"
+             IVF (PROBES = {NARROW}))"
         ),
         &HashMap::new(),
     )
@@ -123,7 +123,7 @@ fn settle(db: &Database) {
 
 fn breadth(db: &Database, breadth: usize) {
     db.execute(
-        &format!("ALTER TABLE grouped ALTER COLUMN embedding SET HNSW (EF_SEARCH = {breadth})"),
+ &format!("ALTER TABLE grouped ALTER COLUMN embedding SET IVF (PROBES = {breadth})"),
         &HashMap::new(),
     )
     .expect("declare the breadth");

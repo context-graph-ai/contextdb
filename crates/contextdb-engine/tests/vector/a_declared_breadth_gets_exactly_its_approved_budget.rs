@@ -127,7 +127,7 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path, degree: usize) {
                 "CREATE TABLE scoped_rows (id INT PRIMARY KEY, context_id UUID NOT NULL CONTEXT_ID, \
                  generation_id UUID NOT NULL, is_current BOOL NOT NULL, \
                  embedding VECTOR(16) PARTITION_KEY (context_id, generation_id) \
-                 MAX_PARTITIONS 8 SEARCH_MODE AUTO AUTO_INDEX_AT 1 HNSW (M = {degree}))"
+                 MAX_PARTITIONS 8 SEARCH_MODE AUTO AUTO_INDEX_AT 1 )"
             ),
             &HashMap::new(),
         )
@@ -187,7 +187,7 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
     admin
         .execute(
             &format!(
-                "ALTER TABLE scoped_rows ALTER COLUMN embedding SET HNSW (EF_SEARCH = {breadth})"
+ "ALTER TABLE scoped_rows ALTER COLUMN embedding SET IVF (PROBES = {breadth})"
             ),
             &HashMap::new(),
         )
@@ -260,7 +260,7 @@ fn disclosed(answer: &QueryResult) -> Vec<(usize, usize, String)> {
         .vector_search
         .as_ref()
         .expect("a vector find discloses its route")
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| {
             (
@@ -457,7 +457,7 @@ fn mixed_serving_degrees_are_given_the_widest_admitted_degree() {
         &format!(
             "CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, \
              embedding VECTOR(16) PARTITION_KEY (bucket) MAX_PARTITIONS 8 AUTO_INDEX_AT 1 \
-             HNSW (M = 16, EF_SEARCH = {BREADTH}))"
+             IVF (PROBES = {BREADTH}))"
         ),
         &HashMap::new(),
     )
@@ -511,7 +511,7 @@ fn mixed_serving_degrees_are_given_the_widest_admitted_degree() {
     // Rebuild at M = 24, holding the last bucket's rebuild before it
     // publishes, so it keeps serving its M = 16 graph beside the others.
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (M = 24)",
+ "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     )
     .expect("declare the wider degree");

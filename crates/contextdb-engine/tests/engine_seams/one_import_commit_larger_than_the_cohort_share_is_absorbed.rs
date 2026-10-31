@@ -88,7 +88,7 @@ fn store_with_one_commit_of(path: &std::path::Path, rows: usize) {
 /// vectors, closed.
 fn store_with_base_and_one_commit(path: &std::path::Path, extra_base: usize, rows: usize) {
     let db = Database::open_with_options(path, options(ROOMY)).unwrap();
-    db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
+ db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
     for id in 0..BASE_ROWS {
         insert_one(&db, id);
     }
@@ -216,7 +216,7 @@ fn an_older_build_publishes_at_its_own_frontier_before_a_fresh_build_absorbs_the
     let path = root.path().join("older-build.db");
     {
         let db = Database::open_with_options(&path, options(ROOMY)).unwrap();
-        db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512))"), &HashMap::new()).unwrap();
+ db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))"), &HashMap::new()).unwrap();
         for id in 0..BASE_ROWS {
             insert_one(&db, id);
         }

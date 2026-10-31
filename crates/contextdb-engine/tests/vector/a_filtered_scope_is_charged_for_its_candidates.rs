@@ -273,7 +273,7 @@ fn query(db: &Database, partitions: usize) -> ChargedQuery {
     })
     .expect("the bounded filtered query succeeds");
     ChargedQuery {
-        used_hnsw: db.__debug_last_query_vector_used_hnsw_for_test(),
+        used_hnsw: db.__debug_last_query_vector_used_indexed_route_for_test(),
         result,
         distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
         query_self_score_computations: query_self_scores.total(),
@@ -442,7 +442,7 @@ fn grouped_query_with_fault(
     }
     .expect("the fixed candidate scope remains affordable");
     ChargedQuery {
-        used_hnsw: db.__debug_last_query_vector_used_hnsw_for_test(),
+        used_hnsw: db.__debug_last_query_vector_used_indexed_route_for_test(),
         result,
         distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
         query_self_score_computations: query_self_scores.total(),
@@ -622,7 +622,7 @@ fn representation_query(db: &Database, column: &str, mode: &str) -> ChargedQuery
     })
     .unwrap_or_else(|error| panic!("bounded {column} {mode} score query: {error:?}"));
     ChargedQuery {
-        used_hnsw: db.__debug_last_query_vector_used_hnsw_for_test(),
+        used_hnsw: db.__debug_last_query_vector_used_indexed_route_for_test(),
         result,
         distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
         query_self_score_computations: query_self_scores.total(),

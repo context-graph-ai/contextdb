@@ -67,7 +67,7 @@ fn a_writer_commits_between_two_steps_of_a_covered_journal_cleanup() {
     };
     options.owner_reads.limits.limits.memory = 1 << 30;
     let db = Arc::new(Database::open_with_options(root.path().join("lock.db"), options).unwrap());
-    db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 64, EF_SEARCH = 256))"), &HashMap::new()).unwrap();
+ db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 256))"), &HashMap::new()).unwrap();
     db.execute(
         "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)",
         &HashMap::new(),

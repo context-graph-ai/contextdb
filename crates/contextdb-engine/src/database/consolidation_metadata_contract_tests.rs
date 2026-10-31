@@ -37,55 +37,6 @@ fn record_authored(db: &Database, after: &mut Lsn, units: &mut Vec<ChangeSet>) {
 fn seed(db: &Database, rows: usize) -> Vec<ChangeSet> {
     seed_with_saved_graphs(db, rows, true)
 }
-fn seed_with_saved_graphs(db: &Database, rows: usize, saved_graphs: bool) -> Vec<ChangeSet> {
-    let mut units = Vec::new();
-    let mut after = Lsn(0);
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    run(
-        db,
-        "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED HNSW (EF_SEARCH = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
-    );
-    record_authored(db, &mut after, &mut units);
-    run(db, "CREATE INDEX breadth_bucket ON breadth_rows (bucket)");
-    record_authored(db, &mut after, &mut units);
-    for id in 1..=rows {
-        let x = id as f32;
-        db.execute("INSERT INTO breadth_rows (id, bucket, body, embedding, compressed) VALUES ($id, $bucket, $body, $vector, $vector)",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id as i64)),
-                ("bucket".into(), Value::Int64((id % 2) as i64)),
-                ("body".into(), Value::Text(format!("authored-{id}"))),
-                ("vector".into(), Value::Vector(vec![x, rows as f32 + 1.0 - x, 1.0])),
-            ])).unwrap();
-        record_authored(db, &mut after, &mut units);
-    }
-    run(
-        db,
-        "UPDATE breadth_rows SET body = 'replacement' WHERE id = 1",
-    );
-    record_authored(db, &mut after, &mut units);
-    // Populate authored custody BEFORE the narrow ALTER. An empty-family
-    // assertion would reject valid stores and miss the move-out regression.
-    run(db, "ALTER TABLE breadth_rows ADD COLUMN marker TEXT");
-    record_authored(db, &mut after, &mut units);
-    if !saved_graphs {
-        assert!(
-            graphs(db).iter().all(|(serial, _)| serial.is_none()),
-            "the pre-query control must not have a materialized serving graph"
-        );
-        return units;
-    }
-    for _ in 0..8 {
-        if ["embedding", "compressed"].iter().all(|name| {
-            db.__debug_vector_hnsw_build_serial_for_test(index(name))
-                .is_some()
-        }) {
-            return units;
-        }
-        db.run_maintenance_cycle().unwrap();
-    }
-    panic!("fixture must have both saved serving graphs before ALTER");
-}
 fn visible(db: &Database) -> Vec<Vec<Value>> {
     db.execute(
         "SELECT id, bucket, body, embedding, compressed, marker FROM breadth_rows ORDER BY id",
@@ -94,17 +45,6 @@ fn visible(db: &Database) -> Vec<Vec<Value>> {
     .unwrap()
     .rows()
     .to_vec()
-}
-fn graphs(db: &Database) -> Vec<(Option<u64>, Option<u64>)> {
-    ["embedding", "compressed"]
-        .iter()
-        .map(|name| {
-            (
-                db.__debug_vector_hnsw_build_serial_for_test(index(name)),
-                db.__debug_vector_hnsw_topology_digest_for_test(index(name)),
-            )
-        })
-        .collect()
 }
 #[cfg_attr(
     any(test, feature = "test-seams"),
@@ -228,124 +168,6 @@ fn assert_frontier(db: &Database) {
         let root = db.writer_read_root().unwrap().unwrap();
         let recovery = RedbPersistence::writer_recovery_floors_in_read(&root).unwrap();
         assert!(recovery.source_lsn_floor >= db.current_lsn().0);
-    }
-}
-
-#[test]
-fn consolidation_only_preserves_rows_history_graphs_and_old_snapshot_without_projection() {
-    for file in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("consolidation.db");
-        let db = if file {
-            Database::open(&path).unwrap()
-        } else {
-            Database::open_memory()
-        };
-        let _ = seed(&db, 24);
-        let rows = visible(&db);
-        let authored = authored_rows(&db);
-        let roots = physical_roots(&db);
-        let serving = graphs(&db);
-        let old_root = db.writer_read_root().unwrap();
-        let snapshot = db.snapshot();
-        let old_metadata = canonical(&db.table_meta("breadth_rows").unwrap());
-        let revision = column(&db).vector_policy_revision;
-        let mut occurrences = db.ddl_log_since(Lsn(0)).unwrap().len();
-        for (members, expected) in [
-            (
-                "(CHANGE_PERCENT = 11, TOMBSTONE_PERCENT = 17)",
-                (Some(11), Some(17), false),
-            ),
-            ("(CHANGE_PERCENT = 19)", (Some(19), Some(17), false)),
-            ("(CHANGE_PERCENT = 19)", (Some(19), Some(17), false)),
-            ("NONE", (None, None, true)),
-            ("DEFAULT", (None, None, false)),
-        ] {
-            take_projected_rows();
-            db.relational_store.reset_index_maintenance_visits();
-            let identity = declared_identity(&db);
-            run(
-                &db,
-                &format!(
-                    "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION {members}"
-                ),
-            );
-            let projected = take_projected_rows();
-            let posting_work = db.relational_store.index_maintenance_visits();
-            occurrences += 1;
-            assert_eq!(db.ddl_log_since(Lsn(0)).unwrap().len(), occurrences);
-            let c = column(&db);
-            assert_eq!(
-                (
-                    c.consolidation_change_percent,
-                    c.consolidation_tombstone_percent,
-                    c.consolidation_disabled
-                ),
-                expected
-            );
-            assert_eq!(c.vector_policy_revision, revision);
-            assert_eq!(c.hnsw_ef_search, Some(7));
-            assert_eq!(
-                projected, 0,
-                "consolidation-only publication must not decode row versions"
-            );
-            assert_eq!(
-                posting_work, 0,
-                "consolidation-only publication must not rebuild postings"
-            );
-            assert_eq!(physical_roots(&db), roots);
-            assert_eq!(graphs(&db), serving);
-            assert_eq!(visible(&db), rows);
-            assert_eq!(authored_rows(&db), authored);
-            assert_frontier(&db);
-            if let (Some(before), Some(after)) = (identity, declared_identity(&db)) {
-                assert_eq!(
-                    (after.relational, after.f32_vectors, after.sq8_vectors),
-                    (before.relational, before.f32_vectors, before.sq8_vectors)
-                );
-                assert_ne!(
-                    after.change_and_ddl, before.change_and_ddl,
-                    "a repeated declaration still authors its own occurrence"
-                );
-            }
-            if let Some(root) = &old_root {
-                assert_eq!(
-                    canonical(root.borrow_captured_table_meta("breadth_rows").unwrap()),
-                    old_metadata
-                );
-                let current = db.writer_read_root().unwrap().unwrap();
-                assert_eq!(
-                    canonical(current.borrow_captured_table_meta("breadth_rows").unwrap()),
-                    canonical(&db.table_meta("breadth_rows").unwrap())
-                );
-            }
-            assert_eq!(
-                db.execute_at_snapshot(
-                    "SELECT body FROM breadth_rows WHERE id = 1",
-                    &empty(),
-                    snapshot
-                )
-                .unwrap()
-                .rows(),
-                vec![vec![Value::Text("replacement".into())]]
-            );
-        }
-        let metadata = canonical(&db.table_meta("breadth_rows").unwrap());
-        let history = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
-        drop(old_root);
-        db.close().unwrap();
-        drop(db);
-        if file {
-            let reopened = Database::open(&path).unwrap();
-            assert_eq!(
-                canonical(&reopened.table_meta("breadth_rows").unwrap()),
-                metadata
-            );
-            assert_eq!(canonical(&reopened.ddl_log_since(Lsn(0)).unwrap()), history);
-            assert_eq!(visible(&reopened), rows);
-            assert_eq!(authored_rows(&reopened), authored);
-            reopened.close().unwrap();
-        }
     }
 }
 
@@ -764,193 +586,6 @@ fn phase_file_is_visible_before_an_isolated_child_completes() {
     assert!(child.0.wait().unwrap().success());
 }
 
-#[test]
-fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks() {
-    let directory = tempfile::tempdir().unwrap();
-    let db = Database::open(directory.path().join("recheck.db")).unwrap();
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    run(
-        &db,
-        "CREATE TABLE recheck_rows (id INT PRIMARY KEY, scope_id TEXT NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope_id) SEARCH_MODE INDEXED HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200) CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 100))",
-    );
-    for id in 0..32 {
-        db.execute(
-            "INSERT INTO recheck_rows VALUES ($id, 'scope', '[1,0,0]')",
-            &HashMap::from([("id".into(), Value::Int64(id))]),
-        )
-        .unwrap();
-    }
-    assert_eq!(
-        db.run_maintenance_cycle().unwrap().vector.built_partitions,
-        1
-    );
-    let vector = VectorIndexRef::new("recheck_rows", "embedding");
-    let key =
-        contextdb_core::VectorPartitionKey::from_values(&[Value::Text("scope".into())]).unwrap();
-    let info = || {
-        let mut owner = crate::vector_read_memory::admission(db.declared_reader_memory().unwrap());
-        db.vector_store_for_test()
-            .partition_info(&vector, &key, &mut owner)
-            .unwrap()
-            .unwrap()
-    };
-    // A change-threshold publication can keep the valid base and publish
-    // a sealed change generation. Compare the actual durable serving chain,
-    // rather than incorrectly requiring every upkeep cycle to replace its base.
-    let published_generation = || {
-        let catalog = db
-            .persistence
-            .as_ref()
-            .unwrap()
-            .load_vector_partition_generation_catalog_for(&vector, &key)
-            .unwrap()
-            .unwrap();
-        catalog.change.map_or(catalog.base.generation_id, |change| {
-            change.generation_id.max(catalog.base.generation_id)
-        })
-    };
-    let initial = published_generation();
-    run(
-        &db,
-        "UPDATE recheck_rows SET embedding = '[0,1,0]' WHERE id = 0",
-    );
-    let pending = info().pending_inserts;
-    assert!(pending > 0);
-    assert_eq!(
-        db.run_maintenance_cycle().unwrap().vector.built_partitions,
-        0,
-        "the old high threshold must leave the same changes ineligible"
-    );
-    assert_eq!(info().pending_inserts, pending);
-    take_projected_rows();
-    run(
-        &db,
-        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
-    );
-    assert_eq!(take_projected_rows(), 0);
-    assert_eq!(published_generation(), initial);
-    assert_eq!(info().pending_inserts, pending);
-    for pass in 0..8 {
-        let report = db.run_maintenance_cycle().unwrap();
-        let current = info();
-        eprintln!(
-            "consolidation_recheck pass={pass} built={} base={:?} base_tx={:?} pending={} tombstones={}",
-            report.vector.built_partitions,
-            current.base_generation,
-            current.base_tx,
-            current.pending_inserts,
-            current.tombstones
-        );
-        if published_generation() > initial {
-            break;
-        }
-    }
-    let replacement = published_generation();
-    assert!(
-        replacement > initial,
-        "newly due work must publish a complete successor serving generation within finite maintenance passes"
-    );
-    assert_eq!(info().pending_inserts, 0);
-    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = $scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-        &HashMap::from([("q".into(),Value::Vector(vec![0.0,1.0,0.0])), ("scope".into(), Value::Text("scope".into()))])).unwrap().rows(),
-        vec![vec![Value::Int64(0)]], "the complete serving chain must include the newly published insert");
-    let original_limit = db.memory_limit();
-    run(
-        &db,
-        "UPDATE recheck_rows SET embedding = '[0,0,1]' WHERE id = 1",
-    );
-    // The narrow budget exercises maintenance, after its pending change is prepared.
-    let native_receipt = crate::persistence::native_storage_admission::StorageAdmissionScope::receipt_layout_for_scan_test().size();
-    db.set_memory_limit(Some(
-        db.accountant()
-            .usage()
-            .used
-            .saturating_add(96 * 1024)
-            .saturating_add(native_receipt),
-    ))
-    .unwrap();
-    let before_failure = info();
-    let retained_changes = (before_failure.pending_inserts, before_failure.tombstones);
-    assert!(retained_changes.0 > 0);
-    assert_eq!(
-        db.run_maintenance_cycle().unwrap().vector.first_failure,
-        Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
-    );
-    assert_eq!(
-        info().maintenance_failure,
-        Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
-    );
-    let after_failure = info();
-    assert_eq!(
-        (after_failure.pending_inserts, after_failure.tombstones),
-        retained_changes,
-        "a refused replacement must preserve every pending insert and tombstone"
-    );
-    // This new guard deliberately isolates the post-durability recheck from
-    // the separately retained, unchanged low-headroom ALTER contract test.
-    db.set_memory_limit(original_limit).unwrap();
-    take_projected_rows();
-    run(
-        &db,
-        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
-    );
-    assert_eq!(take_projected_rows(), 0);
-    assert_eq!(published_generation(), replacement);
-    let retained = info();
-    assert_eq!(
-        (retained.pending_inserts, retained.tombstones),
-        retained_changes
-    );
-    assert_eq!(
-        info().maintenance_failure,
-        None,
-        "a successful NONE publication must clear its obsolete failure mark"
-    );
-    assert_eq!(
-        db.run_maintenance_cycle().unwrap().vector.built_partitions,
-        0
-    );
-    assert_eq!(published_generation(), replacement);
-    let retained = info();
-    assert_eq!(
-        (retained.pending_inserts, retained.tombstones),
-        retained_changes
-    );
-    run(
-        &db,
-        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
-    );
-    let eligible = info();
-    assert_eq!(
-        (eligible.pending_inserts, eligible.tombstones),
-        retained_changes
-    );
-    for pass in 0..8 {
-        let report = db.run_maintenance_cycle().unwrap();
-        let current = info();
-        eprintln!(
-            "consolidation_reenable pass={pass} built={} base={:?} pending={} tombstones={}",
-            report.vector.built_partitions,
-            current.base_generation,
-            current.pending_inserts,
-            current.tombstones
-        );
-        if published_generation() > replacement {
-            break;
-        }
-    }
-    assert!(published_generation() > replacement);
-    assert_eq!(
-        info().pending_inserts,
-        0,
-        "reenabling must consume the actual retained insert work"
-    );
-    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = $scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-        &HashMap::from([("q".into(),Value::Vector(vec![0.0,0.0,1.0])), ("scope".into(), Value::Text("scope".into()))])).unwrap().rows(),
-        vec![vec![Value::Int64(1)]], "reenabling must publish the actual retained insert in the maintained route");
-    db.close().unwrap();
-}
-
 // Fixed, nonallocating observation at the two actual stored-row decode doors.
 // Parent usage includes legitimate growing proof/index state; this guard only
 // compares the decoder's own original-funded row window for identical shapes.
@@ -1068,4 +703,63 @@ fn scalar_schema_projection_uses_one_fresh_original_funded_decoder_per_actual_ro
         );
         db.close().unwrap();
     }
+}
+fn seed_with_saved_graphs(db: &Database, rows: usize, saved_graphs: bool) -> Vec<ChangeSet> {
+    let mut units = Vec::new();
+    let mut after = Lsn(0);
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    run(
+        db,
+        "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED IVF (PROBES = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+    );
+    record_authored(db, &mut after, &mut units);
+    run(db, "CREATE INDEX breadth_bucket ON breadth_rows (bucket)");
+    record_authored(db, &mut after, &mut units);
+    for id in 1..=rows {
+        let x = id as f32;
+        db.execute("INSERT INTO breadth_rows (id, bucket, body, embedding, compressed) VALUES ($id, $bucket, $body, $vector, $vector)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id as i64)),
+                ("bucket".into(), Value::Int64((id % 2) as i64)),
+                ("body".into(), Value::Text(format!("authored-{id}"))),
+                ("vector".into(), Value::Vector(vec![x, rows as f32 + 1.0 - x, 1.0])),
+            ])).unwrap();
+        record_authored(db, &mut after, &mut units);
+    }
+    run(
+        db,
+        "UPDATE breadth_rows SET body = 'replacement' WHERE id = 1",
+    );
+    record_authored(db, &mut after, &mut units);
+    // Populate authored custody BEFORE the narrow ALTER. An empty-family
+    // assertion would reject valid stores and miss the move-out regression.
+    run(db, "ALTER TABLE breadth_rows ADD COLUMN marker TEXT");
+    record_authored(db, &mut after, &mut units);
+    if !saved_graphs {
+        assert!(
+            graphs(db).iter().all(|(generation, _)| generation.is_none()),
+            "the pre-query control must not have a published clustered index"
+        );
+        return units;
+    }
+    for _ in 0..8 {
+        if ["embedding", "compressed"].iter().all(|name| {
+            db.__debug_vector_indexed_available_for_test(index(name))
+        }) {
+            return units;
+        }
+        db.run_maintenance_cycle().unwrap();
+    }
+    panic!("fixture must have both published clustered indexes before ALTER");
+}
+fn graphs(db: &Database) -> Vec<(Option<u64>, bool)> {
+    ["embedding", "compressed"]
+        .iter()
+        .map(|name| {
+            (
+                db.__debug_vector_index_generation_for_test(index(name)),
+                db.__debug_vector_indexed_available_for_test(index(name)),
+            )
+        })
+        .collect()
 }

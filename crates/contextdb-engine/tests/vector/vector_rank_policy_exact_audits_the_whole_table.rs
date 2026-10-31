@@ -141,7 +141,7 @@ fn passage_table_with_a_buried_best_scoring_row() -> Database {
     db.execute(
         "CREATE TABLE passages (
             id UUID PRIMARY KEY,
-            embedding VECTOR(2) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 1500) RANK_POLICY (
+            embedding VECTOR(2) SEARCH_MODE INDEXED IVF (PROBES = 1500) RANK_POLICY (
                 JOIN passage_outcomes ON passage_id,
                 FORMULA 'coalesce({weight}, 0.0)',
                 SORT_KEY effective_confidence

@@ -72,7 +72,7 @@ fn admitted(shape: Shape, percent: usize, row: usize) -> bool {
 fn fill(db: &Database, shape: Shape, percent: usize, breadth: Option<usize>) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     let hnsw = breadth.map_or(String::new(), |breadth| {
-        format!(" HNSW (M = 8, EF_SEARCH = {breadth})")
+        format!(" IVF (PROBES = {breadth})")
     });
     db.execute(
         &format!(
@@ -323,7 +323,7 @@ fn declare_flat_passages(db: &Database, flat_below: usize) {
              is_searchable BOOLEAN NOT NULL, \
              embedding VECTOR({DIMENSION}) PARTITION_KEY (context_id) \
              SEARCH_MODE INDEXED AUTO_INDEX_AT 1 FLAT_BELOW {flat_below} \
-             HNSW (M = {EXHAUSTION_M}, EF_SEARCH = {EXHAUSTION_EF}))"
+             IVF (PROBES = {EXHAUSTION_EF}))"
         ),
         &HashMap::new(),
     )
@@ -397,7 +397,7 @@ fn assert_one_exact_partition(result: &QueryResult, label: &str, reason: &str) {
         .as_ref()
         .unwrap_or_else(|| panic!("{label}: the find discloses its route"));
     let routes: Vec<_> = search
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| {
             (
@@ -477,7 +477,7 @@ fn indexed_flat_row_check_exhaustion_before_later_matches_is_refused() {
             .vector_search
             .as_ref()
             .unwrap()
-            .partition_hnsw
+            .partitions
             .len(),
         1
     );

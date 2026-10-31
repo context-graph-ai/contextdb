@@ -169,7 +169,7 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         )
         .unwrap();
         let params = HashMap::new();
-        db.execute("CREATE TABLE receipt_answers (id INTEGER PRIMARY KEY, v VECTOR(4) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 4, EF_CONSTRUCTION = 16, EF_SEARCH = 16)) HISTORY ALL", &params).unwrap();
+ db.execute("CREATE TABLE receipt_answers (id INTEGER PRIMARY KEY, v VECTOR(4) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 16)) HISTORY ALL", &params).unwrap();
         for id in 0..rows {
             db.execute(
                 "INSERT INTO receipt_answers VALUES ($id,$v)",

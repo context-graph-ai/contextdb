@@ -388,8 +388,6 @@ fn prepaid_generation_and_search_directory_funders_cover_shared_controls_until_p
                 covered_lsn: Lsn(1),
                 durable_bytes: bytes.len() as u64,
                 policy_revision: 1,
-                hnsw_m: m as u32,
-                hnsw_ef_construction: ef_construction as u32,
             },
             graph,
             actual,

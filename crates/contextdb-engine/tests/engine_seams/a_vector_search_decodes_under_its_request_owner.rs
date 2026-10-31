@@ -20,7 +20,7 @@ fn an_indexed_vector_search_decodes_nothing_without_its_request_owner() {
         },
     )
     .unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)", &HashMap::new()).unwrap();
+ db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)", &HashMap::new()).unwrap();
     for id in 0..64i64 {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $vector)",

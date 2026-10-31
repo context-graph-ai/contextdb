@@ -319,8 +319,6 @@ fn publish_base(state: &IndexState, budget: &Arc<Budget>, generation: u64) {
                 covered_tx: TxId(generation * 10),
                 covered_lsn: Lsn(generation * 10),
                 durable_bytes: 0,
-                hnsw_m: 32,
-                hnsw_ef_construction: 96,
                 policy_revision: 3,
             },
             LoadedVectorGraphGeneration {
@@ -437,8 +435,6 @@ fn purge_and_empty_tail_keep_the_declared_graph_policy() {
                 covered_tx: TxId(1),
                 covered_lsn: Lsn(1),
                 durable_bytes: 0,
-                hnsw_m: 32,
-                hnsw_ef_construction: 96,
                 policy_revision: 3,
             },
             layout().resolve_policy(state.vector_count(), 1),
@@ -541,8 +537,6 @@ fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
         covered_tx: TxId(1),
         covered_lsn: Lsn(1),
         durable_bytes: 0,
-        hnsw_m: 32,
-        hnsw_ef_construction: 96,
         policy_revision: 3,
     };
     let (bytes, resident) = state

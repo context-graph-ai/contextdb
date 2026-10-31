@@ -52,16 +52,16 @@ fn state_machine_constraint_rendering_is_deterministic() {
 fn projected_vector_defaults_render_like_the_durable_declaration() {
     for (declaration, expected) in [
         (
-            "VECTOR(3) AUTO_INDEX_AT DEFAULT HNSW (M = DEFAULT, EF_CONSTRUCTION = DEFAULT, EF_SEARCH = DEFAULT)",
+ "VECTOR(3) AUTO_INDEX_AT DEFAULT IVF (PROBES = DEFAULT)",
             "VECTOR(3)",
         ),
         (
-            "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope) MAX_PARTITIONS 0008 SEARCH_MODE AUTO AUTO_INDEX_AT 0005001 HNSW (M = DEFAULT, EF_CONSTRUCTION = 00064, EF_SEARCH = DEFAULT)",
-            "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope) MAX_PARTITIONS 8 AUTO_INDEX_AT 5001 HNSW (EF_CONSTRUCTION = 64)",
+ "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope) MAX_PARTITIONS 0008 SEARCH_MODE AUTO AUTO_INDEX_AT 0005001 IVF (PROBES = DEFAULT)",
+ "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope) MAX_PARTITIONS 8 AUTO_INDEX_AT 5001 ",
         ),
         (
-            "VECTOR(3) AUTO_INDEX_AT 0001000 HNSW (M = 00016, EF_CONSTRUCTION = 00200, EF_SEARCH = 00200)",
-            "VECTOR(3) AUTO_INDEX_AT 1000 HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200)",
+ "VECTOR(3) AUTO_INDEX_AT 0001000 IVF (PROBES = 00200)",
+ "VECTOR(3) AUTO_INDEX_AT 1000 IVF (PROBES = 200)",
         ),
     ] {
         let db = Database::open_memory();

@@ -173,7 +173,7 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
         .expect("the source accepts AUTO_INDEX_AT policy vocabulary");
     source
         .execute(
-            "CREATE TABLE hnsw_policy_vectors (id UUID PRIMARY KEY, embedding VECTOR(3) HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 401)) SYNC TWO WAY",
+ "CREATE TABLE hnsw_policy_vectors (id UUID PRIMARY KEY, embedding VECTOR(3) IVF (PROBES = 401)) SYNC TWO WAY",
             &empty(),
         )
         .expect("the source accepts grouped HNSW policy vocabulary");

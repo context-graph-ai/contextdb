@@ -34,7 +34,7 @@ const LIVE_ROWS: usize = 300;
 /// of 28 selected links plus the 4 reachability owes, the 32 this pricing
 /// was set at. Every graph is connected until a row is cut off on purpose.
 const POLICY: &str = "SEARCH_MODE INDEXED AUTO_INDEX_AT 1 AUTO_EXPANSION_CEILING 1 \
-                      HNSW (M = 14, EF_SEARCH = 300)";
+                      IVF (PROBES = 300)";
 
 struct Counter(AtomicU64);
 
@@ -182,7 +182,7 @@ fn reasons(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<String>)> {
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route")
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| {
             (

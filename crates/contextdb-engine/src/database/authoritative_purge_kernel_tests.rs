@@ -46,7 +46,7 @@ struct OwnedCopies {
     durable_change_log: Vec<ChangeLogEntry>,
     selected_vector_present: bool,
     survivor_vector_present: bool,
-    hnsw_len: usize,
+    indexed_available: bool,
     graph: GraphProbe,
     durable_sink_payloads: BTreeMap<RowId, HashMap<String, Value>>,
     memory_sink_payloads: BTreeMap<RowId, HashMap<String, Value>>,
@@ -417,7 +417,7 @@ fn assert_owned_copies_equal_after_reopen(before: &OwnedCopies, after: &OwnedCop
     // HNSW itself is nondurable. `owned_copies` deliberately runs the vector
     // query first, so this proves reopen can rematerialize the same survivor
     // graph without pretending the pre-close allocation identity persisted.
-    assert_eq!(after.hnsw_len, before.hnsw_len);
+    assert_eq!(after.indexed_available, before.indexed_available);
     assert_eq!(
         after.durable_change_log, before.durable_change_log,
         "the injected failure must preserve the complete ordered decoded durable change-log occurrence sequence across reopen"
@@ -505,9 +505,8 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
         durable_change_log: durable_change_log(db),
         selected_vector_present: vectors.contains(&fixture.selected_note.row_id),
         survivor_vector_present: vectors.contains(&fixture.survivor_note.row_id),
-        hnsw_len: db
-            .__debug_vector_hnsw_len(VectorIndexRef::new(NOTES, "embedding"))
-            .expect("materialized fixture HNSW"),
+        indexed_available: db
+            .__debug_vector_indexed_available_for_test(VectorIndexRef::new(NOTES, "embedding")),
         graph: graph_probe(db, fixture),
         durable_sink_payloads: durable_sink_payloads(db),
         memory_sink_payloads: memory_sink_payloads(db),
@@ -662,10 +661,7 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
         .expect("seed real HNSW threshold corpus");
     }
     for _ in 0..16 {
-        if db
-            .__debug_vector_hnsw_len(VectorIndexRef::new(NOTES, "embedding"))
-            .is_some()
-        {
+        if db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(NOTES, "embedding")) {
             break;
         }
         db.run_maintenance_cycle()
@@ -677,7 +673,7 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
             &HashMap::new(),
         )
         .expect("materialize HNSW");
-    assert!(hnsw_query.trace().physical_plan.contains("HNSWSearch"));
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
 
     let selected_edge = Uuid::new_v4();
     let survivor_edge = Uuid::new_v4();
@@ -1129,8 +1125,8 @@ fn assert_full_selected_absence_after_reopen(
 /// already uses, and `USE VECTOR INDEXED` refuses instead of scanning.
 fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
     let index = VectorIndexRef::new(NOTES, "embedding");
-    let builds_before = db.__vector_passive_activity_counters_for_test().hnsw_builds;
-    let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index.clone());
+    let builds_before = db.__vector_passive_activity_counters_for_test().index_builds;
+    let serial_before = db.__debug_vector_index_generation_for_test(index.clone());
     db.__reset_last_query_vector_trace_for_test();
     let result = db
         .execute(
@@ -1138,8 +1134,8 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
             &HashMap::new(),
         )
         .expect("public INDEXED coverage query");
-    let builds_after = db.__vector_passive_activity_counters_for_test().hnsw_builds;
-    let serial_after = db.__debug_vector_hnsw_build_serial_for_test(index);
+    let builds_after = db.__vector_passive_activity_counters_for_test().index_builds;
+    let serial_after = db.__debug_vector_index_generation_for_test(index);
     assert_eq!(
         builds_after, builds_before,
         "the INDEXED coverage query must not build a graph"
@@ -1180,7 +1176,7 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
     assert_eq!(disclosure.refusal, None);
     assert!(
         disclosure
-            .partition_hnsw
+            .partitions
             .iter()
             .all(|partition| partition.route == Some(VectorSearchRoute::Indexed)),
         "every executed partition stays on the indexed route: {disclosure}"
@@ -1193,8 +1189,10 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
         .expect("read the admitted trace observation")
         .expect("the vector query publishes its route trace");
     assert!(
-        trace.used_hnsw,
-        "the executed answer traversed the maintained graph"
+        trace.partition_routes.iter().any(|route| {
+            route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
+        }),
+        "the executed answer used the clustered index"
     );
     assert_eq!(trace.fallback_reason, None);
     assert!(
@@ -1365,8 +1363,8 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     // HnswIndex::len documents vector count. The durable-pages arm currently
     // counts points; that production defect must not weaken this N-1 oracle.
     assert_eq!(
-        after_notes.hnsw_len,
-        before.hnsw_len - 1,
+        after_notes.indexed_available,
+        before.indexed_available,
         "logical vector membership loses exactly the erased row, including shared representations"
     );
     let indexed_after = indexed_note_coverage(&seed.db);

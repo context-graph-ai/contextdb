@@ -21,7 +21,7 @@ use contextdb_engine::{
     DirectRankPolicy, DirectReferencePropagation, DirectRetainPolicy, DirectRouteStatus,
     DirectScheduleStatus, DirectSchema, DirectSchemaColumn, DirectSchemaIndex,
     DirectScopeLabelKind, DirectSinkStatus, DirectStateMachine, DirectVectorQuantization,
-    MetadataBody, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
+    MetadataBody, VectorPartitionDisclosure, VectorQuerySourceDisclosure,
     VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
     VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
@@ -387,13 +387,10 @@ fn an_explained_statement_survives_the_wire() {
             rescore_evaluations: None,
             layers_admitted: None,
             budget_terminal: None,
-            partition_hnsw: vec![VectorPartitionHnswDisclosure {
+            partition_hnsw: vec![VectorPartitionDisclosure {
                 partition: "<redacted:1>".to_owned(),
                 route: Some(VectorSearchRoute::FilteredIndexed),
                 reason: Some("predicted_indexed_route".to_owned()),
-                hnsw_m: 24,
-                hnsw_ef_construction: 240,
-                hnsw_ef_search: 96,
                 ef_search_source: "declared".to_owned(),
                 policy_revision: 7,
             }],

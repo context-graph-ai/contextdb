@@ -95,8 +95,6 @@ pub(crate) mod received_working_graph;
 pub(crate) mod received_working_source;
 pub(crate) mod received_working_vector;
 mod schema_projection;
-#[cfg(test)]
-mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
 pub(crate) mod writer_cleanup_progress;
 mod writer_commit_directory;
@@ -7280,17 +7278,11 @@ thread_local! {
 #[cfg(all(test, feature = "test-seams"))]
 mod empty_declared_index_readiness_tests;
 
-#[cfg(test)]
-mod bounded_catalog_tests;
 
-#[cfg(test)]
-mod prior_base_decode_tests;
 
 #[cfg(test)]
 mod streamed_raw_loader_tests;
 
-#[cfg(test)]
-mod quarantine_inventory_tests;
 
 #[cfg(all(test, feature = "test-seams"))]
 mod ordered_run_integrity_tests;
@@ -7324,8 +7316,6 @@ mod retained_raw_body_guard_tests;
 #[path = "persistence/journal_record_validation_tests.rs"]
 mod journal_record_validation_tests;
 
-#[cfg(all(test, feature = "test-seams"))]
-mod change_reload_decode_tests;
 
 #[cfg(test)]
 #[path = "persistence/body_placement_publication_tests.rs"]

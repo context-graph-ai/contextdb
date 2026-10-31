@@ -115,7 +115,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     )
     .unwrap();
     let first = db.execute(sql, &parameters(&query)).unwrap();
-    let initial = first.trace().vector_search.as_ref().unwrap().partition_hnsw[0].clone();
+    let initial = first.trace().vector_search.as_ref().unwrap().partitions[0].clone();
     assert_eq!(
         initial.hnsw_ef_search, 100,
         "the compatibility profile resolves graph breadth from k, independent of the 201-row physical population"
@@ -123,14 +123,14 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     for result in [first, bounded_query(&db, sql, &query)] {
         let disclosure = result.trace().vector_search.as_ref().unwrap();
         assert_eq!(disclosure.aggregate_allowed_vectors, Some(100));
-        assert_eq!(disclosure.partition_hnsw[0], initial);
+        assert_eq!(disclosure.partitions[0], initial);
     }
     assert!(
         db.__statement_cache_len() > 0,
         "the preceding UPDATE has a prepared plan"
     );
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (M = 24, EF_SEARCH = 9)",
+ "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 9)",
         &HashMap::new(),
     )
     .unwrap();
@@ -148,7 +148,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
             .vector_search
             .as_ref()
             .unwrap()
-            .partition_hnsw[0];
+            .partitions[0];
         assert_eq!(serving.hnsw_m, initial.hnsw_m);
         assert_eq!(
             serving.policy_revision, initial.policy_revision,
@@ -169,13 +169,13 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
         .vector_search
         .as_ref()
         .unwrap()
-        .partition_hnsw[0];
+        .partitions[0];
     assert_eq!(serving.hnsw_m, 24);
     assert!(serving.policy_revision > initial.policy_revision);
     let old = db
         .execute_at_snapshot(sql, &parameters(&query), snapshot)
         .unwrap();
-    let serving = &old.trace().vector_search.as_ref().unwrap().partition_hnsw[0];
+    let serving = &old.trace().vector_search.as_ref().unwrap().partitions[0];
     assert_eq!(serving.hnsw_m, initial.hnsw_m);
     assert_eq!(serving.policy_revision, initial.policy_revision);
 }
@@ -519,7 +519,7 @@ fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_p
     let directory = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(directory.path().join("online.redb")).unwrap());
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(8) PARTITION_KEY (bucket) MAX_PARTITIONS 256 AUTO_INDEX_AT 1234 HNSW (M = 24, EF_CONSTRUCTION = 400))", &HashMap::new()).unwrap();
+ db.execute("CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(8) PARTITION_KEY (bucket) MAX_PARTITIONS 256 AUTO_INDEX_AT 1234 )", &HashMap::new()).unwrap();
     for id in 1..=200 {
         db.execute(
             "INSERT INTO items VALUES ($id, 0, $query)",
@@ -537,14 +537,14 @@ fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_p
         db.run_maintenance_cycle().unwrap();
     }
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 7)",
+ "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 7)",
         &HashMap::new(),
     )
     .unwrap();
     let sql = "SELECT id FROM items WHERE bucket = 0 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
     let expected = ids(&bounded_query(&db, sql, &generated_vector(9000, 8)));
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (M = 32, EF_CONSTRUCTION = 500)",
+ "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     )
     .unwrap();
@@ -569,7 +569,7 @@ fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_p
             .unwrap()
             .execute(sql, &parameters(&generated_vector(9000, 8)))
             .unwrap();
-        reader.execute("ALTER TABLE items ALTER COLUMN embedding SET HNSW (M = 28, EF_CONSTRUCTION = 420, EF_SEARCH = 128)", &HashMap::new()).unwrap();
+ reader.execute("ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 128)", &HashMap::new()).unwrap();
         sender.send(ids(&result)).unwrap();
     });
     let completed_before_release = receiver.recv_timeout(Duration::from_secs(5));
@@ -900,10 +900,10 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                     activity_after.raw_partition_loads,
                     activity_before.raw_partition_loads
                 );
-                assert_eq!(activity_after.hnsw_builds, activity_before.hnsw_builds);
+                assert_eq!(activity_after.index_builds, activity_before.index_builds);
                 assert_eq!(
-                    activity_after.hnsw_repairs_or_compactions,
-                    activity_before.hnsw_repairs_or_compactions
+                    activity_after.index_repairs_or_compactions,
+                    activity_before.index_repairs_or_compactions
                 );
                 let again = db.compact_currency_versions().unwrap();
                 assert_eq!(again.pruned_versions, 0);
@@ -941,7 +941,7 @@ fn embedded_graph_scratch_obeys_memory_admission_and_returns_its_charge() {
             answer(&db.semantic_search(query.clone()).unwrap()),
             answer(&control)
         );
-        assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+        assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
         assert_eq!(db.accountant().usage().used, resident);
     }
 }
@@ -967,7 +967,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
     db.execute(
         "CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, is_current BOOLEAN NOT NULL, \
          embedding VECTOR(3) PARTITION_KEY (bucket) AUTO_INDEX_AT 16 \
-         HNSW (M = 8, EF_CONSTRUCTION = 64, EF_SEARCH = 64))",
+         IVF (PROBES = 64))",
         &HashMap::new(),
     )
     .unwrap();

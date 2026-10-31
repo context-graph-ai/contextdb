@@ -24037,7 +24037,7 @@ mod tests {
             }
             let disclosure = explained.vector_search.unwrap();
             assert_eq!(disclosure.aggregate_allowed_vectors, Some(1));
-            assert!(disclosure.partition_hnsw.is_empty());
+            assert!(disclosure.partitions.is_empty());
             disclosure
         };
         let refused = passive(sql);
@@ -24096,7 +24096,7 @@ mod tests {
         let pull = scoped.execute(sql, &HashMap::new()).unwrap();
         assert_eq!(eager.rows, pull.rows());
         assert_eq!(pull.rows(), vec![vec![Value::Int64(1)]]);
-        assert!(scoped.__debug_last_query_vector_used_hnsw_for_test());
+        assert!(scoped.__debug_last_query_vector_used_indexed_route_for_test());
         let ready = passive(sql);
         assert_eq!(ready.route, Some(VectorSearchRoute::FilteredIndexed));
         assert_eq!(ready.residual, VectorSearchResidual::Bounded);
@@ -24186,7 +24186,7 @@ mod tests {
             executor_fixture_reader_4,
         )
         .unwrap();
-        assert!(!scoped.__debug_last_query_vector_used_hnsw_for_test());
+        assert!(!scoped.__debug_last_query_vector_used_indexed_route_for_test());
         let pull = scoped.execute(&auto, &HashMap::new()).unwrap();
         assert_eq!(eager.rows, pull.rows());
         let eager_disc = eager.trace.vector_search.as_ref().unwrap();

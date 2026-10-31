@@ -159,7 +159,7 @@ fn fixture(rows: usize, partitions: usize) -> Database {
              generation_id UUID NOT NULL, \
              embedding VECTOR({DIMENSIONS}) PARTITION_KEY (context_id, generation_id) \
              MAX_PARTITIONS 64 SEARCH_MODE AUTO AUTO_INDEX_AT 1 \
-             HNSW (M = {DECLARED_M}, EF_SEARCH = {DECLARED_EF_SEARCH}))"
+             IVF (PROBES = {DECLARED_EF_SEARCH}))"
         ),
         &HashMap::new(),
     )
@@ -252,7 +252,7 @@ fn observe(rows: usize, partitions: usize) -> Observed {
         .as_ref()
         .expect("a vector find discloses its route");
     let routes = disclosure
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| match partition.route {
             Some(VectorSearchRoute::Exact) => Route::Exhaustive,

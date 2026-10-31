@@ -59,7 +59,7 @@ fn a_replaced_vector_cannot_end_a_tied_frontier_on_either_reader_route() {
                 "CREATE TABLE {table} (id INT PRIMARY KEY, bucket INT NOT NULL, \
                  embedding VECTOR(3) WITH (quantization = '{quantization}') \
                  PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
-                 HNSW (M = 8, EF_CONSTRUCTION = 64, EF_SEARCH = 32))"
+                 IVF (PROBES = 32))"
             ),
             &HashMap::new(),
         )

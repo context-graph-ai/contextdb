@@ -1143,10 +1143,6 @@ fn graph_retention_row() -> (TableMeta, VersionedRow) {
             auto_index_at: None,
             flat_below: None,
             auto_expansion_ceiling: None,
-            hnsw_m: None,
-            hnsw_ef_construction: None,
-            hnsw_ef_search: None,
-            hnsw_search_radius_millionths: None,
             vector_policy_revision: 0,
             consolidation_change_percent: None,
             consolidation_tombstone_percent: None,
@@ -1480,7 +1476,6 @@ fn assert_graph_distinct_maintenance_rows(directory: &Path) {
                     &[],
                     Some((&[], std::slice::from_ref(&predecessor), &deferred)),
                     &[],
-                    &Vec::new(),
                     &[("graph_fixture_progress".into(), vec![1])],
                 )
                 .unwrap();
@@ -3246,7 +3241,6 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
                         &removed,
                         &[],
                         &[],
-                        &Vec::new(),
                         &durable,
                         &[],
                         None,
@@ -3277,7 +3271,6 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
                     &[],
                     Some((&[], std::slice::from_ref(&predecessor), &deferred)),
                     &[],
-                    &Vec::new(),
                     &[("graph_fixture_progress".into(), vec![1])],
                 )
                 .unwrap();
@@ -3560,10 +3553,6 @@ fn graph_durability_state(store: &RedbPersistence) -> GraphDurabilityState {
                 VECTOR_OPEN_DIRECTORY_TABLE,
                 VECTOR_PARTITION_JOURNAL_TABLE,
                 VECTOR_PARTITION_TOMBSTONE_TABLE,
-                VECTOR_PARTITION_BASE_GENERATION_TABLE,
-                VECTOR_PARTITION_CHANGE_GENERATION_TABLE,
-                VECTOR_PARTITION_GRAPH_PAGE_TABLE,
-                VECTOR_PARTITION_GENERATION_CATALOG_TABLE,
                 vector_membership_pages::SOURCE,
                 vector_membership_pages::REVERSE,
                 vector_membership_pages::SUMMARY,
@@ -3640,7 +3629,6 @@ fn graph_durability_publication(
         &[],
         Some((&[], std::slice::from_ref(predecessor), &deferred)),
         &[],
-        &Vec::new(),
         &[("graph_fixture_progress".into(), vec![1])],
     )
 }

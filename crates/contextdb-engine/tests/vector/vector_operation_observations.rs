@@ -127,7 +127,7 @@ fn publication_keeps_commits_after_its_snapshot_in_the_observed_durable_tail() {
     .unwrap();
     db.run_maintenance_cycle().unwrap();
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (M = 24)",
+ "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     )
     .unwrap();

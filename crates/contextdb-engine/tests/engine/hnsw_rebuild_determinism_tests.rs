@@ -181,7 +181,7 @@ fn assert_public_hnsw_trace(
         .expect("read the admitted trace observation")
         .unwrap_or_else(|| panic!("{context}: missing public query_vector debug trace"));
     assert!(
-        db.__debug_last_query_vector_used_hnsw_for_test(),
+        db.__debug_last_query_vector_used_indexed_route_for_test(),
         "{context}: public query_vector must use the HNSW strategy for the all-visible no-candidate top-k path"
     );
     assert!(
@@ -229,7 +229,7 @@ fn assert_public_hnsw_trace(
     if trace.supplemented_row_count > 0 {
         assert!(
             trace.hnsw_candidate_count.saturating_add(64) >= expected_hnsw_len,
-            "{context}: public HNSW search supplemented results without a near-complete candidate set; trace={trace:?}"
+ "{context}: public HNSW search supplemented results without a near-complete candidate set; trace={trace:?}"
         );
         assert!(
             trace.supplemented_row_count
@@ -250,7 +250,7 @@ fn assert_public_hnsw_trace(
         );
         assert!(
             trace.hnsw_candidate_count.saturating_add(64) >= expected_hnsw_len,
-            "{context}: public rows came from a supplement even though HNSW did not return a near-complete candidate set; trace={trace:?}"
+ "{context}: public rows came from a supplement even though HNSW did not return a near-complete candidate set; trace={trace:?}"
         );
     }
 }
@@ -313,7 +313,7 @@ fn assert_hnsw_built_and_used_for_query(
     );
     assert_eq!(
         stats.dimension, 3,
-        "{context}: HNSW graph dimension must match the vector column; stats={stats:?}"
+ "{context}: HNSW graph dimension must match the vector column; stats={stats:?}"
     );
     let raw_hnsw_hits = db
         .query_vector(index, query, TOP_K, None, db.snapshot())
@@ -338,7 +338,7 @@ fn assert_hnsw_built_and_used_for_query(
         "{context}: HNSW topology digest must not be the empty digest"
     );
     let build_serial = db
-        .__debug_vector_hnsw_build_serial_for_test(index_ref(table))
+        .__debug_vector_index_generation_for_test(index_ref(table))
         .unwrap_or_else(|| panic!("{context}: expected an HNSW build serial for {table}"));
     assert_ne!(
         build_serial, 0,
@@ -554,7 +554,7 @@ fn consecutive_hnsw_builds_within_one_open_database_are_stable() {
             assert_eq!(
                 live_raw.raw_top_k.first().map(|(row_id, _)| *row_id),
                 Some(sentinel_row_id),
-                "live-sentinel rebuild attempt {attempt}: sentinel vector must be the raw HNSW top hit; raw={:?}",
+ "live-sentinel rebuild attempt {attempt}: sentinel vector must be the raw HNSW top hit; raw={:?}",
                 live_raw.raw_top_k
             );
             assert_ne!(

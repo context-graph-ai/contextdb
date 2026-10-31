@@ -428,7 +428,7 @@ fn reopened_rollback_absence_failure(
         );
         if !live_vector_leaks.is_empty() || !raw_hnsw_leaks.is_empty() || hnsw_failure.is_some() {
             failures.push(format!(
-                "vector leaks for {index:?}: live={live_vector_leaks:?}, raw_hnsw={raw_hnsw_leaks:?}, hnsw_failure={hnsw_failure:?}"
+ "vector leaks for {index:?}: live={live_vector_leaks:?}, raw_hnsw={raw_hnsw_leaks:?}, hnsw_failure={hnsw_failure:?}"
             ));
         }
     }
@@ -612,12 +612,12 @@ fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
     let index = VectorIndexRef::new("sibling_vectors", "embedding");
     let rows = db
         .scan("sibling_vectors", db.snapshot())
-        .expect("HNSW fixture must create sibling vector rows");
+ .expect("HNSW fixture must create sibling vector rows");
     let max_row_id = rows
         .iter()
         .map(|row| row.row_id.0)
         .max()
-        .expect("HNSW fixture must create sibling vector rows");
+ .expect("HNSW fixture must create sibling vector rows");
     let baseline = warm_hnsw_fixture(
         db,
         index,
@@ -652,12 +652,12 @@ fn seed_host_audit_hnsw(db: &Database) -> (usize, u64, HnswBaseline) {
     let index = VectorIndexRef::new("host_audits", "embedding");
     let rows = db
         .scan("host_audits", db.snapshot())
-        .expect("HNSW fixture must create host audit vector rows");
+ .expect("HNSW fixture must create host audit vector rows");
     let max_row_id = rows
         .iter()
         .map(|row| row.row_id.0)
         .max()
-        .expect("HNSW fixture must create host audit vector rows");
+ .expect("HNSW fixture must create host audit vector rows");
     let baseline = warm_hnsw_fixture(
         db,
         index,
@@ -2925,7 +2925,7 @@ fn assert_sequential_vector_source_unit_credit() {
         )
         .unwrap();
         db.execute(
-            "ALTER TABLE unit_vectors ALTER COLUMN embedding SET HNSW (EF_SEARCH = 64)",
+ "ALTER TABLE unit_vectors ALTER COLUMN embedding SET IVF (PROBES = 64)",
             &empty(),
         )
         .unwrap();
@@ -2945,7 +2945,7 @@ fn assert_sequential_vector_source_unit_credit() {
             .unwrap();
         source
             .execute(
-                "ALTER TABLE unit_vectors ALTER COLUMN embedding SET HNSW (EF_SEARCH = 64)",
+ "ALTER TABLE unit_vectors ALTER COLUMN embedding SET IVF (PROBES = 64)",
                 &empty(),
             )
             .unwrap();
@@ -2953,7 +2953,7 @@ fn assert_sequential_vector_source_unit_credit() {
         for unit in 0..units {
             let breadth = if unit % 2 == 0 { 128 } else { 64 };
             source.execute(
-                &format!("ALTER TABLE unit_vectors ALTER COLUMN embedding SET HNSW (EF_SEARCH = {breadth})"),
+ &format!("ALTER TABLE unit_vectors ALTER COLUMN embedding SET IVF (PROBES = {breadth})"),
                 &empty(),
             ).unwrap();
             assert_eq!(
@@ -5695,7 +5695,7 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             || changeset_has_data(&leaked_changes)
         {
             failures.push(format!(
-                "cascade UNIQUE violation must abort firing plus relational/graph/vector cascade writes without historical leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, leaked_hnsw_rows={leaked_hnsw_rows:?}, hnsw_failure={hnsw_failure:?}, leaked_changes={leaked_changes:?}",
+ "cascade UNIQUE violation must abort firing plus relational/graph/vector cascade writes without historical leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, leaked_hnsw_rows={leaked_hnsw_rows:?}, hnsw_failure={hnsw_failure:?}, leaked_changes={leaked_changes:?}",
                 count_rows(&db, "host_writes"),
                 count_rows(&db, "host_audits"),
                 db.edge_count(uuid(20), "ROLLBACK_EDGE", db.snapshot())
@@ -5822,7 +5822,7 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             || changeset_has_data(&leaked_changes)
         {
             failures.push(format!(
-                "callback-returned Err after relational/graph/vector side effects must roll back the firing tx without live, raw-HNSW, or changelog leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, leaked_hnsw_rows={leaked_hnsw_rows:?}, hnsw_failure={hnsw_failure:?}, leaked_changes={leaked_changes:?}",
+ "callback-returned Err after relational/graph/vector side effects must roll back the firing tx without live, raw-HNSW, or changelog leakage; result={result:?}, host_rows={}, audit_rows={}, leaked_edges={}, leaked_vector_rows={leaked_vector_rows:?}, leaked_hnsw_rows={leaked_hnsw_rows:?}, hnsw_failure={hnsw_failure:?}, leaked_changes={leaked_changes:?}",
                 count_rows(&db, "host_writes"),
                 count_rows(&db, "host_audits"),
                 db.edge_count(uuid(25), "ERR_ROLLBACK_EDGE", db.snapshot())

@@ -448,7 +448,7 @@ fn indexed_transaction_overlay_keeps_the_committed_graph_and_scores_only_staged_
     assert_eq!(
         db.__vector_full_index_entries_touched_for_test(),
         0,
-        "SQL transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
+ "SQL transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
     );
 
     let mut semantic = SemanticQuery::new("vector_truth", "embedding", vec![1.0, 0.0, 0.0], 4);
@@ -465,7 +465,7 @@ fn indexed_transaction_overlay_keeps_the_committed_graph_and_scores_only_staged_
     assert_eq!(
         db.__vector_full_index_entries_touched_for_test(),
         0,
-        "Rust transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
+ "Rust transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
     );
     db.rollback(tx)
         .expect("discard the explicit transaction after both public transaction doors");
@@ -1461,7 +1461,7 @@ fn old_snapshot_indexed_uses_its_retained_generation_and_ignores_unselected_grow
         vector_touches(&after_counter),
         baseline_touches,
         "unselected growth leaves every available selected-query source counter unchanged: \
-         table/index/sort, graph-distance/adjacency, raw-vector/HNSW, rank, and access work"
+ table/index/sort, graph-distance/adjacency, raw-vector/HNSW, rank, and access work"
     );
     assert_eq!(
         after_counter.brute_force_vectors.load(Ordering::SeqCst),

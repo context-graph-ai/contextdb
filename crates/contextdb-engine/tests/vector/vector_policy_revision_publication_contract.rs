@@ -150,7 +150,7 @@ fn create_current_control(db: &Database) {
 
 fn drive_until_indexed(db: &Database) -> u64 {
     for _ in 0..MAX_MAINTENANCE_CYCLES {
-        if let Some(serial) = db.__debug_vector_hnsw_build_serial_for_test(index()) {
+        if let Some(serial) = db.__debug_vector_index_generation_for_test(index()) {
             return serial;
         }
         db.run_maintenance_cycle()
@@ -171,7 +171,7 @@ fn assert_current_control(db: &Database) -> u64 {
         "the existing complete graph remains an INDEXED serving route"
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         Some(serial),
         "the current control query must not create a replacement graph"
     );
@@ -188,7 +188,7 @@ fn alter_auto_index_at(db: &Database, value: i64) {
 
 fn alter_hnsw(db: &Database, members: &str) {
     db.execute(
-        &format!("ALTER TABLE revision_docs ALTER COLUMN embedding SET HNSW ({members})"),
+ &format!("ALTER TABLE revision_docs ALTER COLUMN embedding SET IVF DEFAULT"),
         &empty(),
     )
     .expect("declared HNSW policy updates atomically");
@@ -271,7 +271,7 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
         "AUTO_INDEX_AT does not create a topology-policy revision"
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         Some(serving_serial),
         "AUTO_INDEX_AT changes query routing, never HNSW topology"
     );
@@ -328,7 +328,7 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
         &Value::Int64(2)
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         Some(serving_serial),
         "EF_SEARCH applies to newly opened queries without a replacement build"
     );
@@ -449,7 +449,7 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
         "the released older build cannot publish before a later maintenance cycle builds revision +2"
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         Some(serving_serial),
         "the released older build cannot replace the complete graph after revision +2 is declared"
     );
@@ -484,7 +484,7 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
         &Value::Int64(64)
     );
     assert_ne!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         Some(serving_serial),
         "only the newest desired policy may publish a replacement graph"
     );
@@ -557,7 +557,7 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
         assert_eq!(column.vector_policy_revision, initial_revision as u64 + 1);
         assert!(
             render_table_meta("revision_docs", &declared).contains(
-                "AUTO_INDEX_AT 1000 HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200)"
+                "AUTO_INDEX_AT 1000 IVF (PROBES = 200)"
             )
         );
         let vector_fixture_reader_1 = db
@@ -602,7 +602,7 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
             &Value::Text("none".into())
         );
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             Some(serial)
         );
         assert_eq!(indexed_query(&db).len(), 3);
@@ -637,7 +637,7 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
                 initial_revision
             );
             assert_eq!(
-                db.__debug_vector_hnsw_build_serial_for_test(index()),
+                db.__debug_vector_index_generation_for_test(index()),
                 Some(serial)
             );
         }
@@ -649,11 +649,11 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
         );
         db.run_maintenance_cycle().unwrap();
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             Some(serial)
         );
         db.execute(
-            "ALTER TABLE revision_docs ALTER COLUMN embedding SET HNSW DEFAULT",
+ "ALTER TABLE revision_docs ALTER COLUMN embedding SET IVF DEFAULT",
             &empty(),
         )
         .unwrap();
@@ -672,7 +672,7 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
                 .contains("HNSW")
         );
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             Some(serial)
         );
 
@@ -699,7 +699,7 @@ fn explicit_current_defaults_keep_their_identity_without_rebuilding_matching_gra
             &Value::Int64(400)
         );
         assert_ne!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             Some(serial)
         );
     }
@@ -882,7 +882,7 @@ fn restoring_explicit_defaults_abandons_an_inflight_revision_without_a_redundant
         initial_revision
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         Some(serial),
         "the superseded build cannot publish"
     );
@@ -903,7 +903,7 @@ fn restoring_explicit_defaults_abandons_an_inflight_revision_without_a_redundant
         &Value::Text("none".into())
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         Some(serial),
         "the compatible serving graph needs no replacement"
     );

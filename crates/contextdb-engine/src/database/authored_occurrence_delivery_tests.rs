@@ -18,13 +18,13 @@ fn identical_alters_authored_separately_stay_two_signed_occurrences_and_redelive
     author
         .db
         .execute(
-            "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+ "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
             &HashMap::new(),
         )
         .expect("author creates the table");
     pushed_to(&hub, &author, served_by(&author, Lsn(0)));
 
-    let statement = "ALTER TABLE notes ALTER COLUMN embedding SET HNSW (EF_SEARCH = 11)";
+ let statement = "ALTER TABLE notes ALTER COLUMN embedding SET IVF (PROBES = 11)";
     let mut units = Vec::new();
     for _ in 0..2 {
         let since = author.db.current_lsn();

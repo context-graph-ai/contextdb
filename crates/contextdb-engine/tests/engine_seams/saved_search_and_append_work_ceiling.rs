@@ -112,7 +112,7 @@ const IMPORT_CEILING: Work = Work {
 fn create(db: &Database) {
     exec(
         db,
-        "CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(8) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE) HISTORY ALL",
+ "CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(8) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE) HISTORY ALL",
     );
 }
 fn maintain(db: &Database) {
@@ -202,10 +202,10 @@ fn first_saved_search_stays_inside_its_primitive_ceiling() {
     let after = db
         .vector_store_for_test()
         .passive_activity_counters_for_test();
-    assert_eq!(before.hnsw_builds, after.hnsw_builds);
+    assert_eq!(before.index_builds, after.index_builds);
     assert_eq!(
-        before.hnsw_repairs_or_compactions,
-        after.hnsw_repairs_or_compactions
+        before.index_repairs_or_compactions,
+        after.index_repairs_or_compactions
     );
     assert!(
         query.saved_graph_loads > 0 && query.saved_graph_bytes > 0,

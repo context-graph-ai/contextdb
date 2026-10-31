@@ -191,7 +191,7 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: &
     };
     admin
         .execute(
-            &format!("ALTER TABLE passages ALTER COLUMN embedding SET HNSW (EF_SEARCH = {value})"),
+ &format!("ALTER TABLE passages ALTER COLUMN embedding SET IVF (PROBES = {value})"),
             &HashMap::new(),
         )
         .expect("declare the search breadth");
@@ -365,7 +365,7 @@ fn what_the_approved_budget_does_to_one_large_context() {
                     answered += 1;
                     let disclosure = answer.trace().vector_search.as_ref();
                     if let Some(partition) =
-                        disclosure.and_then(|disclosure| disclosure.partition_hnsw.first())
+                        disclosure.and_then(|disclosure| disclosure.partitions.first())
                     {
                         profile = format!(
                             "hnsw_m={} ef_search={} ef_search_source={}",

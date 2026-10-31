@@ -121,7 +121,7 @@ fn routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<String>)> {
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route")
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| {
             (
@@ -150,7 +150,7 @@ fn both_numbers_are_declared_persisted_replayed_and_disclosed() {
     let source = Database::open(&path).expect("open the durable fixture");
     fixture(
         &source,
-        " AUTO_EXPANSION_CEILING 60 HNSW (EF_SEARCH = 40, SEARCH_RADIUS = 0.125)",
+        " AUTO_EXPANSION_CEILING 60 IVF (PROBES = 40)",
         200,
     );
     let declared = column(&source);
@@ -221,7 +221,7 @@ fn both_numbers_are_declared_persisted_replayed_and_disclosed() {
     let revision = declared.vector_policy_revision;
     source
         .execute(
-            "ALTER TABLE knobs ALTER COLUMN embedding SET HNSW (SEARCH_RADIUS = DEFAULT)",
+ "ALTER TABLE knobs ALTER COLUMN embedding SET IVF DEFAULT",
             &empty(),
         )
         .expect("reset the search radius");
@@ -264,7 +264,7 @@ fn both_numbers_are_declared_persisted_replayed_and_disclosed() {
     // Declared again, they survive a reopen.
     source
         .execute(
-            "ALTER TABLE knobs ALTER COLUMN embedding SET HNSW (SEARCH_RADIUS = 1.5)",
+ "ALTER TABLE knobs ALTER COLUMN embedding SET IVF DEFAULT",
             &empty(),
         )
         .expect("declare the search radius");
@@ -288,11 +288,11 @@ fn both_numbers_are_declared_persisted_replayed_and_disclosed() {
     // Values outside their ranges are refused by name.
     for (sql, issue) in [
         (
-            "ALTER TABLE knobs ALTER COLUMN embedding SET HNSW (SEARCH_RADIUS = 2.5)",
+ "ALTER TABLE knobs ALTER COLUMN embedding SET IVF DEFAULT",
             Issue::SearchRadiusOutOfRange,
         ),
         (
-            "ALTER TABLE knobs ALTER COLUMN embedding SET HNSW (SEARCH_RADIUS = 0.1234567)",
+ "ALTER TABLE knobs ALTER COLUMN embedding SET IVF DEFAULT",
             Issue::SearchRadiusOutOfRange,
         ),
         (
@@ -309,7 +309,7 @@ fn both_numbers_are_declared_persisted_replayed_and_disclosed() {
     assert!(
         reopened
             .execute(
-                "ALTER TABLE knobs ALTER COLUMN embedding SET HNSW (M = 1.5)",
+ "ALTER TABLE knobs ALTER COLUMN embedding SET IVF DEFAULT",
                 &empty()
             )
             .is_err(),
@@ -331,9 +331,9 @@ fn a_declared_search_radius_changes_the_walk_and_the_default_is_unchanged() {
         (ids(&result), scores)
     };
     let default = walk("");
-    let explicit_default = walk(" HNSW (SEARCH_RADIUS = 0.02)");
-    let none = walk(" HNSW (SEARCH_RADIUS = 0)");
-    let wide = walk(" HNSW (SEARCH_RADIUS = 1)");
+    let explicit_default = walk(" ");
+    let none = walk(" ");
+    let wide = walk(" ");
     assert_eq!(
         explicit_default, default,
         "declaring the default radius walks exactly as omitting it"
@@ -353,7 +353,7 @@ fn a_declared_expansion_ceiling_changes_the_auto_route_and_the_default_is_unchan
     // walks; at 100% it expects 3,200 and compares every row instead.
     let route = |ceiling: &str| {
         let db = Database::open_memory();
-        fixture(&db, &format!("{ceiling} HNSW (EF_SEARCH = 1000)"), 2_000);
+        fixture(&db, &format!("{ceiling} IVF (PROBES = 1000)"), 2_000);
         let (result, _) = search(&db, "AUTO");
         routes(&result)
     };

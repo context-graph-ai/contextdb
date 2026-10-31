@@ -42,7 +42,7 @@ fn ordinary_import_persistence_advances_durable_coverage_without_an_observer() {
     let path = root.path().join("unobserved-import.db");
     let db = Database::open_with_options(&path, options()).unwrap();
     db.execute(
-        "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)",
+ "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)",
         &HashMap::new(),
     )
     .unwrap();

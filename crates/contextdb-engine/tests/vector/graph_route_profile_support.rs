@@ -152,7 +152,7 @@ fn execute_and_measure(
         .as_ref()
         .expect("profile query publishes vector disclosure");
     let ef_search = disclosure
-        .partition_hnsw
+        .partitions
         .first()
         .map_or(0, |partition| partition.hnsw_ef_search);
     QueryMeasurement {
@@ -163,7 +163,7 @@ fn execute_and_measure(
             .saturating_add(native.0.load(Ordering::SeqCst)),
         micros,
         ef_search,
-        used_hnsw: db.__debug_last_query_vector_used_hnsw_for_test(),
+        used_hnsw: db.__debug_last_query_vector_used_indexed_route_for_test(),
     }
 }
 

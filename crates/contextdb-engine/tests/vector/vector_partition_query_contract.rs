@@ -1237,7 +1237,7 @@ fn explain_names_the_same_one_partition_a_typed_literal_selects() {
         contextdb_engine::VectorSearchScopeShape::One
     );
     assert_eq!(
-        disclosure.partition_hnsw.len(),
+        disclosure.partitions.len(),
         1,
         "a UUID-typed literal scope must select the one stored partition it names, \
          not zero: {disclosure:?}"
@@ -2150,7 +2150,7 @@ mod restricted_access_scan_accounting {
         assert_eq!(ids, fixture.authorized_ids);
         assert_eq!(scoped.__relational_scan_rows_touched(), 0);
         assert!(
-            scoped.__debug_last_query_vector_used_hnsw_for_test(),
+            scoped.__debug_last_query_vector_used_indexed_route_for_test(),
             "recovery must use the maintained graph"
         );
     }
@@ -2385,7 +2385,7 @@ fn restricted_inspection_keeps_adaptive_partition_populations_private() {
             let explain = scoped.explain_output(sql).unwrap();
             let disclosure = explain.vector_search.unwrap();
             assert!(
-                disclosure.partition_hnsw.is_empty(),
+                disclosure.partitions.is_empty(),
                 "{hidden_by:?}: {disclosure:?}"
             );
             assert_eq!(
@@ -2465,7 +2465,7 @@ fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
                         reader.route()
                     );
                     assert!(
-                        disclosure.partition_hnsw.is_empty(),
+                        disclosure.partitions.is_empty(),
                         "{hidden_by:?} {:?} {mode}: per-partition adaptive facts stay redacted",
                         reader.route()
                     );

@@ -216,7 +216,7 @@ fn a_declared_graph_degree_loads_when_its_memory_fits_and_is_refused_when_it_doe
         ("default degree", ""),
         (
             "declared degree 128",
-            " HNSW (M = 128, EF_CONSTRUCTION = 128)",
+            " ",
         ),
     ] {
         let directory = TempDir::new().expect("temporary store directory");

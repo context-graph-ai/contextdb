@@ -298,8 +298,6 @@ fn with_source_page_admission_for<T>(
             let layout = std::alloc::Layout::new::<SourcePageCharge>();
             callback_accountant.admit_box_control_native(layout.size(), operation, hint)?;
             charge.own_layout = layout;
-            #[cfg(test)]
-            tests::observe_source_charge_allocation(&charge);
             redb::OwnedReadPageCharge::try_new_prepaid(charge).map_err(|layout| {
                 contextdb_core::read_memory::NativeRefusal::AllocatorFailed {
                     site: "source page credit control",
@@ -335,8 +333,6 @@ fn with_source_page_admission_for<T>(
     redb::with_owned_read_page_charge_storage(Arc::new(callback), read)
 }
 
-#[cfg(test)]
-mod tests;
 
 #[cfg(all(test, feature = "test-seams"))]
 mod cleanup_attribution_tests {

@@ -81,11 +81,9 @@ pub struct VectorPassiveActivityCounters {
     pub raw_candidate_point_loads: u64,
     pub raw_candidate_point_body_bytes: u64,
     pub sealed_generation_loads: u64,
-    pub hnsw_builds: u64,
-    pub hnsw_repairs_or_compactions: u64,
-    /// Actual legacy constructions plus native candidate constructions.
+    /// Native candidate constructions.
     pub index_builds: u64,
-    /// Actual legacy repairs plus native coalescing/remap steps.
+    /// Native coalescing/remap steps.
     pub index_repairs_or_compactions: u64,
     pub raw_partition_evictions: u64,
     pub sealed_generation_evictions: u64,
@@ -169,8 +167,6 @@ struct VectorPassiveActivity {
     raw_candidate_point_loads: AtomicU64,
     raw_candidate_point_body_bytes: AtomicU64,
     sealed_generation_loads: AtomicU64,
-    hnsw_builds: AtomicU64,
-    hnsw_repairs_or_compactions: AtomicU64,
     native_builds: AtomicU64,
     native_rewrites: AtomicU64,
     raw_partition_evictions: AtomicU64,
@@ -180,8 +176,6 @@ struct VectorPassiveActivity {
 #[cfg(any(test, feature = "test-seams"))]
 impl VectorPassiveActivity {
     fn snapshot(&self) -> VectorPassiveActivityCounters {
-        let legacy_builds = self.hnsw_builds.load(Ordering::SeqCst);
-        let legacy_rewrites = self.hnsw_repairs_or_compactions.load(Ordering::SeqCst);
         VectorPassiveActivityCounters {
             raw_partition_loads: self.raw_partition_loads.load(Ordering::SeqCst),
             whole_entry_slice_requests: self.whole_entry_slice_requests.load(Ordering::SeqCst),
@@ -193,14 +187,8 @@ impl VectorPassiveActivity {
                 .raw_candidate_point_body_bytes
                 .load(Ordering::SeqCst),
             sealed_generation_loads: self.sealed_generation_loads.load(Ordering::SeqCst),
-            hnsw_builds: legacy_builds,
-            hnsw_repairs_or_compactions: legacy_rewrites,
-            index_builds: legacy_builds
-                .checked_add(self.native_builds.load(Ordering::SeqCst))
-                .expect("vector construction observation count overflow"),
-            index_repairs_or_compactions: legacy_rewrites
-                .checked_add(self.native_rewrites.load(Ordering::SeqCst))
-                .expect("vector rewrite observation count overflow"),
+            index_builds: self.native_builds.load(Ordering::SeqCst),
+            index_repairs_or_compactions: self.native_rewrites.load(Ordering::SeqCst),
             raw_partition_evictions: self.raw_partition_evictions.load(Ordering::SeqCst),
             sealed_generation_evictions: self.sealed_generation_evictions.load(Ordering::SeqCst),
         }
@@ -5854,14 +5842,6 @@ impl IndexState {
         self.raw_resident_bytes
             .store(vectors.unique_payload_bytes(), Ordering::SeqCst);
         drop(vectors);
-        #[cfg(any(test, feature = "test-seams"))]
-        if released != 0 {
-            self.note_passive_activity(|activity| {
-                activity
-                    .hnsw_repairs_or_compactions
-                    .fetch_add(1, Ordering::SeqCst);
-            });
-        }
         released
     }
 

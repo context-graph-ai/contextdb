@@ -489,12 +489,12 @@ fn assert_scoped_trace(result: &QueryResult, partitions: usize) -> bool {
         "the disclosed allowed set excludes the non-current half"
     );
     assert_eq!(
-        disclosure.partition_hnsw.len(),
+        disclosure.partitions.len(),
         partitions,
         "the two IN lists name only the real Context/generation pairs; invalid cross-pairs are empty"
     );
     disclosure
-        .partition_hnsw
+        .partitions
         .iter()
         .any(|partition| ROWS_PER_PARTITION > partition.hnsw_ef_search)
 }
@@ -966,7 +966,7 @@ fn declared_flat_multi_context_cells_are_never_slower_than_exact() {
             .vector_search
             .as_ref()
             .expect("the executed search reports its route")
-            .partition_hnsw
+            .partitions
             .iter()
             .map(|partition| (partition.route.clone(), partition.reason.clone()))
             .collect();

@@ -130,7 +130,7 @@ fn routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<String>)> {
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route")
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| {
             (
@@ -456,7 +456,7 @@ fn routes_at(db: &Database, snapshot: contextdb_core::SnapshotId) -> Vec<Option<
     .vector_search
     .as_ref()
     .expect("the snapshot search discloses its route")
-    .partition_hnsw
+    .partitions
     .iter()
     .map(|partition| partition.reason.clone())
     .collect()
@@ -765,7 +765,7 @@ fn comparable_routes(
     disclosure: &contextdb_engine::VectorSearchDisclosure,
 ) -> Vec<(Option<VectorSearchRoute>, Option<String>)> {
     disclosure
-        .partition_hnsw
+        .partitions
         .iter()
         .map(|partition| {
             let reason = (partition.route == Some(VectorSearchRoute::Exact))

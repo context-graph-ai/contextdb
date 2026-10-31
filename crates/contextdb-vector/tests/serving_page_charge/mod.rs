@@ -494,8 +494,6 @@ pub fn fixture() -> Fixture {
                 covered_lsn: Lsn(1),
                 durable_bytes: span as u64,
                 policy_revision: 1,
-                hnsw_m: m as u32,
-                hnsw_ef_construction: ef_construction as u32,
             },
             LoadedVectorGraphGeneration {
                 graph,

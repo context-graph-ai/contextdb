@@ -465,7 +465,7 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_lang_partitioned_table(&db);
     db.execute(
-        "ALTER TABLE restart_items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)",
+ "ALTER TABLE restart_items ALTER COLUMN embedding SET IVF (PROBES = 200)",
         &empty(),
     )
     .expect("keep the filtered restart fixture wider than its graph search breadth");
@@ -502,7 +502,7 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
         .expect("CONTROL: pre-close unfiltered INDEXED search answers on the live handle"));
     assert_eq!(unfiltered_before, expected_unfiltered);
     assert!(
-        db.__debug_last_query_vector_used_hnsw_for_test(),
+        db.__debug_last_query_vector_used_indexed_route_for_test(),
         "CONTROL: pre-close unfiltered INDEXED must use the maintained graph"
     );
 
@@ -516,7 +516,7 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
                 .expect("live filtered INDEXED query")
         };
         assert_eq!(ids(&result), expected_filtered);
-        assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+        assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     }
     let mut live_rust_query = SemanticQuery::new("restart_items", "embedding", query.clone(), 5);
     live_rust_query.search_mode = Some(VectorSearchMode::Indexed);
@@ -525,7 +525,7 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
         semantic_ids(db.semantic_search(live_rust_query).unwrap()),
         expected_filtered
     );
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
 
     db.close().expect("close the sealed lang-filtered fixture");
 

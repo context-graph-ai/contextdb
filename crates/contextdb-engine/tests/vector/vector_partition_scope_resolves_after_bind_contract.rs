@@ -236,19 +236,19 @@ fn explain_reports_no_count_or_route_for_an_unbound_key() {
     // above, through a different field, and it slips past a check that only looks
     // at `scope`.
     assert_eq!(
-        eq_disclosure.partition_hnsw.len(),
+        eq_disclosure.partitions.len(),
         1,
         "an unbound partition key must report the partition-detail list as one redacted state, \
          not one entry per authorized partition in the whole column -- that is the same leak as \
          the aggregate count, through a different field: {:?}",
-        eq_disclosure.partition_hnsw
+        eq_disclosure.partitions
     );
     assert_eq!(
-        eq_disclosure.partition_hnsw.len(),
-        in_disclosure.partition_hnsw.len(),
+        eq_disclosure.partitions.len(),
+        in_disclosure.partitions.len(),
         "the partition-detail list for an unbound key must be one redacted state regardless of \
          how many unbound branches the predicate names: eq={:?} in={:?}",
-        eq_disclosure.partition_hnsw,
-        in_disclosure.partition_hnsw
+        eq_disclosure.partitions,
+        in_disclosure.partitions
     );
 }

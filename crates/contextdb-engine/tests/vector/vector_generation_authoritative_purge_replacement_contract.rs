@@ -711,7 +711,7 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
              scope_id UUID NOT NULL, \
              embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 4 \
              SEARCH_MODE INDEXED AUTO_INDEX_AT 3 \
-             HNSW (M = 24, EF_CONSTRUCTION = 128, EF_SEARCH = 7)\
+             IVF (PROBES = 7)\
              )",
             &empty(),
         )
@@ -823,7 +823,7 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
             )
             .unwrap();
         let disclosure = disclosure_answer.trace().vector_search.as_ref().unwrap();
-        let serving = &disclosure.partition_hnsw[0];
+        let serving = &disclosure.partitions[0];
         assert_eq!(
             (
                 serving.hnsw_m,

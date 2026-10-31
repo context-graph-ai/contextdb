@@ -1735,7 +1735,7 @@ fn hnsw_threshold_999_brute_force_boundary() {
     assert_eq!(results.len(), 10);
     assert_eq!(result_ids(&results), expected);
     assert!(results.iter().all(|r| r.rank == 1.0));
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     assert_eq!(db.__rank_policy_eval_count(), 999);
 }
 
@@ -1769,7 +1769,7 @@ fn hnsw_threshold_1001_hnsw_boundary() {
             .map(|n| 1.0 + n as f32 * 0.01)
             .collect::<Vec<_>>()
     );
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     // AUTO evaluates the rank pool at the store's resolved search breadth,
     // strictly below this partition's size, while retaining exact top-k quality.
     let resolved =
@@ -1786,18 +1786,18 @@ fn hnsw_threshold_1001_hnsw_boundary() {
     let exact = db
         .semantic_search(exact_query)
         .expect("exact semantic search");
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     assert_eq!(db.__rank_policy_eval_count(), 1001);
     assert_eq!(result_ids(&results), result_ids(&exact));
     // A declared breadth bounds the rank pool without rebuilding its ready graph.
     db.execute(
-        "ALTER TABLE decisions ALTER COLUMN embedding SET HNSW (EF_SEARCH = 128)",
+ "ALTER TABLE decisions ALTER COLUMN embedding SET IVF (PROBES = 128)",
         &empty_params(),
     )
     .unwrap();
     db.__reset_rank_policy_eval_count();
     let narrowed = semantic_results(&db, Some("effective_confidence"), 10);
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     assert_eq!(result_ids(&narrowed), expected);
     assert_eq!(db.__rank_policy_eval_count(), 128);
 }

@@ -5746,6 +5746,82 @@ impl Database {
             .with_index_layout(index, |layout| layout.quantization.storage_bytes(dimension))
     }
 
+    /// The native inspection of every partition of `index`, in key order.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    fn native_partition_inspections_for_test(
+        &self,
+        index: &VectorIndexRef,
+    ) -> Vec<(usize, Option<crate::persistence::vector_ivf::inspection::Inspection>)> {
+        let _operation = self.assert_open_operation();
+        let read_memory = self.declared_reader_memory().expect("declared reader memory");
+        let mut owner = crate::vector_read_memory::admission(read_memory.clone());
+        let partitions = self
+            .vector_store
+            .partition_infos(index, &mut owner)
+            .expect("partition infos");
+        partitions
+            .into_iter()
+            .map(|partition| {
+                let native = self
+                    .native_ivf_inspection(
+                        &partition.partition.index,
+                        &partition.partition.partition_key,
+                        read_memory.clone(),
+                        &|| Ok(()),
+                    )
+                    .expect("native inspection");
+                (partition.live_rows, native)
+            })
+            .collect()
+    }
+
+    /// The newest published clustered-index generation among the partitions of
+    /// `index`, or `None` while no partition has published one.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __debug_vector_index_generation_for_test(&self, index: VectorIndexRef) -> Option<u64> {
+        self.native_partition_inspections_for_test(&index)
+            .into_iter()
+            .filter_map(|(_, native)| native.and_then(|native| native.manifest))
+            .filter(|manifest| manifest.active_lists != 0)
+            .map(|manifest| manifest.generation)
+            .max()
+    }
+
+    /// Whether every populated partition of `index` has a usable clustered
+    /// index, and at least one is populated.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __debug_vector_indexed_available_for_test(&self, index: VectorIndexRef) -> bool {
+        let populated = self
+            .native_partition_inspections_for_test(&index)
+            .into_iter()
+            .filter(|(live, _)| *live != 0)
+            .collect::<Vec<_>>();
+        !populated.is_empty()
+            && populated
+                .iter()
+                .all(|(_, native)| native.is_some_and(|native| native.available()))
+    }
+
+    /// Whether the last vector search routed any partition through the
+    /// clustered index.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __debug_last_query_vector_used_indexed_route_for_test(&self) -> bool {
+        let _operation = self.assert_open_operation();
+        self.last_vector_search_trace
+            .read()
+            .as_ref()
+            .is_some_and(|trace| {
+                trace
+                    .partition_routes()
+                    .iter()
+                    .any(|route| route.route == VectorPartitionSearchRoute::Indexed)
+            })
+    }
+
     /// Borrow the current trace's receipt and original payer without copying its payload.
     #[doc(hidden)]
     #[cfg(feature = "test-seams")]

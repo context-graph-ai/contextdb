@@ -1,7 +1,7 @@
 //! The `ALTER TABLE` that `.explain` prints can be run as printed.
 //!
 //! `SET MAINTAIN COUNT` replaces a table's whole declared set — that is its
-//! contract, the same one `SET HNSW (...)` has. So advice that names only the
+//! contract, the same one `SET IVF DEFAULT` has. So advice that names only the
 //! missing column list is advice that silently drops every count the table
 //! already declares: a consumer that follows the engine's own suggestion to
 //! make one read O(1) makes its other reads O(rows). The printed statement

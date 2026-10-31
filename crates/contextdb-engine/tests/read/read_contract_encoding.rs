@@ -6,7 +6,7 @@ use contextdb_core::read_contract::{
 use contextdb_core::{TxId, Value, VectorIndexRef, VectorSearchMode};
 use contextdb_engine::read_contract::{
     CanonicalCascadeReport, CanonicalIndexCandidate, CanonicalQueryResult, CanonicalQueryTrace,
-    CanonicalVectorPartitionHnswDisclosure, CanonicalVectorSearchDisclosure, ReadEncodingError,
+    CanonicalVectorPartitionDisclosure, CanonicalVectorSearchDisclosure, ReadEncodingError,
     cursor_page_encoded_size, decode_cursor_page, decode_metadata_page, decode_query_result,
     encode_cursor_page as encode_cursor_page_native,
     encode_metadata_page as encode_metadata_page_native,
@@ -14,7 +14,7 @@ use contextdb_engine::read_contract::{
     query_result_encoded_size,
 };
 use contextdb_engine::{
-    CascadeReport, IndexCandidate, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
+    CascadeReport, IndexCandidate, VectorPartitionDisclosure, VectorQuerySourceDisclosure,
     VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
     VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
@@ -443,13 +443,10 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         rescore_evaluations: Some(0),
         layers_admitted: Some(2),
         budget_terminal: Some("answer_complete".to_owned()),
-        partition_hnsw: vec![VectorPartitionHnswDisclosure {
+        partition_hnsw: vec![VectorPartitionDisclosure {
             partition: "<redacted:1>".to_owned(),
             route: Some(VectorSearchRoute::Exact),
             reason: Some("live_count_at_or_below_ef_search".to_owned()),
-            hnsw_m: 16,
-            hnsw_ef_construction: 100,
-            hnsw_ef_search: 32,
             ef_search_source: "column".to_owned(),
             policy_revision: 3,
         }],
@@ -484,13 +481,10 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         rescore_evaluations: Some(0),
         layers_admitted: Some(2),
         budget_terminal: Some("answer_complete".to_owned()),
-        partition_hnsw: vec![CanonicalVectorPartitionHnswDisclosure {
+        partition_hnsw: vec![CanonicalVectorPartitionDisclosure {
             partition: "<redacted:1>".to_owned(),
             route: Some("exact".to_owned()),
             reason: Some("live_count_at_or_below_ef_search".to_owned()),
-            hnsw_m: 16,
-            hnsw_ef_construction: 100,
-            hnsw_ef_search: 32,
             ef_search_source: "column".to_owned(),
             policy_revision: 3,
         }],

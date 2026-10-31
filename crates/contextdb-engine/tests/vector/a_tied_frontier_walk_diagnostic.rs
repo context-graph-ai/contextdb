@@ -29,7 +29,7 @@ fn a_tied_frontier_walk_diagnostic() {
                     "CREATE TABLE {table} (id INT PRIMARY KEY, bucket INT NOT NULL, \
                      embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 \
                      SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
-                     HNSW (M = 4, EF_CONSTRUCTION = 64, EF_SEARCH = 32))"
+                     IVF (PROBES = 32))"
                 ),
                 &HashMap::new(),
             )

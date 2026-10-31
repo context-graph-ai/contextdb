@@ -70,7 +70,7 @@ fn seeded_uniform_store(quantization: &str) -> Database {
              embedding VECTOR(768) WITH (quantization = '{quantization}') \
              PARTITION_KEY (scope_id) MAX_PARTITIONS 8 \
              SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
-             HNSW (M = 16, EF_CONSTRUCTION = 200))"
+             )"
         ),
         &HashMap::new(),
     )

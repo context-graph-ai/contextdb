@@ -64,8 +64,10 @@ pub(super) fn seed(path: &Path, rows_per_context: usize) {
     for _ in 0..64 {
         db.run_maintenance_cycle()
             .expect("drive caller-owned build");
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == CONTEXTS && status.remaining_partitions == 0 {
+        if db.__debug_vector_indexed_available_for_test(contextdb_core::VectorIndexRef::new(
+            "search_work",
+            "embedding",
+        )) {
             break;
         }
     }

@@ -173,14 +173,14 @@ fn declared_fixture(db: &Database) {
          id UUID PRIMARY KEY, \
          scope INTEGER NOT NULL, \
          f32 VECTOR(3) PARTITION_KEY (scope) AUTO_INDEX_AT 4 \
-             HNSW (M = 12, EF_CONSTRUCTION = 64, EF_SEARCH = 17), \
+             IVF (PROBES = 17), \
          sq8 VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope) AUTO_INDEX_AT 3, \
          sq4 VECTOR(3) WITH (quantization = 'SQ4') PARTITION_KEY (scope) AUTO_INDEX_AT 5\
          )",
         &empty(),
     )
     .expect(
-        "vector declarations accept independently declared aggregate AUTO_INDEX_AT and HNSW policy",
+ "vector declarations accept independently declared aggregate AUTO_INDEX_AT and HNSW policy",
     );
 }
 
@@ -327,13 +327,13 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
         "the declared aggregate F32 route has stable nearest ids"
     );
     assert!(
-        !db.__debug_last_query_vector_used_hnsw_for_test(),
+        !db.__debug_last_query_vector_used_indexed_route_for_test(),
         "the aggregate crossover resolves INDEXED, then the statement compares its four rows because that costs less than one walk"
     );
     let bounded = bounded::execute(&db, &bounded_request(sql, bound.clone()))
         .expect("bounded reader honors the declared F32 threshold");
     assert_eq!(bounded.result.rows(), ordinary.rows());
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     let rust = db
         .semantic_search(SemanticQuery::new(
             "resolver_policy_docs",
@@ -350,7 +350,7 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
         })
         .collect::<Vec<_>>();
     assert_eq!(rust_ids, ids(&ordinary));
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     let explain = db.explain(sql).expect("explain the declared AUTO route");
     assert_explain_fact(&explain, "aggregate_allowed_vectors", "4");
     assert_explain_fact(&explain, "effective_auto_index_at", "4");
@@ -384,7 +384,7 @@ fn declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor(
     db.execute(
         "CREATE TABLE breadth_docs (\
          id UUID PRIMARY KEY, \
-         declared VECTOR(3) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 32), \
+         declared VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 32), \
          silent VECTOR(3) SEARCH_MODE INDEXED\
          )",
         &empty(),
@@ -486,7 +486,7 @@ fn assert_executed_default_boundary(
 
     let index = VectorIndexRef::new("boundary_defaults", column_name);
     let serial = db
-        .__debug_vector_hnsw_build_serial_for_test(index.clone())
+        .__debug_vector_index_generation_for_test(index.clone())
         .expect("a maintained graph exists below the automatic crossover");
     for override_mode in [None, Some(VectorSearchMode::Indexed)] {
         let indexed = override_mode.is_some() || auto_uses_indexed;
@@ -506,7 +506,7 @@ fn assert_executed_default_boundary(
         let ordinary_ids = ids(&ordinary);
         assert_eq!(ordinary_ids, vec![Uuid::from_u128(expected_id)]);
         assert_eq!(
-            db.__debug_last_query_vector_used_hnsw_for_test(),
+            db.__debug_last_query_vector_used_indexed_route_for_test(),
             indexed,
             "SQL {column_name} at {count}"
         );
@@ -515,7 +515,7 @@ fn assert_executed_default_boundary(
             .expect("bounded reader executes the same boundary search");
         assert_eq!(bounded.result.rows(), ordinary.rows());
         assert_eq!(
-            db.__debug_last_query_vector_used_hnsw_for_test(),
+            db.__debug_last_query_vector_used_indexed_route_for_test(),
             indexed,
             "bounded {column_name} at {count}"
         );
@@ -532,7 +532,7 @@ fn assert_executed_default_boundary(
             Some(&Value::Uuid(ordinary_ids[0]))
         );
         assert_eq!(
-            db.__debug_last_query_vector_used_hnsw_for_test(),
+            db.__debug_last_query_vector_used_indexed_route_for_test(),
             indexed,
             "Rust {column_name} at {count}"
         );
@@ -575,7 +575,7 @@ fn assert_executed_default_boundary(
             "column={column_name} count={count} threshold={threshold} indexed={indexed} id={expected_id}"
         );
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index.clone()),
+            db.__debug_vector_index_generation_for_test(index.clone()),
             Some(serial),
             "queries and explanation never build at a crossover"
         );
@@ -619,7 +619,7 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
     }
     assert_executed_default_boundary(&db, "f32", 999, 1_000, false, 1);
     let f32_serial = db
-        .__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new("boundary_defaults", "f32"));
+        .__debug_vector_index_generation_for_test(VectorIndexRef::new("boundary_defaults", "f32"));
     db.execute(
         "INSERT INTO boundary_defaults (id, f32, sq8, sq4) VALUES ($id, $nearest, $other, $other)",
         &params([
@@ -630,7 +630,7 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
     )
     .unwrap();
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new(
+        db.__debug_vector_index_generation_for_test(VectorIndexRef::new(
             "boundary_defaults",
             "f32"
         )),
@@ -661,7 +661,7 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
         assert_executed_default_boundary(&db, column_name, 5_000, 5_001, false, 1);
     }
     let serials = ["sq8", "sq4"].map(|column_name| {
-        db.__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new(
+        db.__debug_vector_index_generation_for_test(VectorIndexRef::new(
             "boundary_defaults",
             column_name,
         ))
@@ -676,7 +676,7 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
     .unwrap();
     for (column_name, serial) in ["sq8", "sq4"].into_iter().zip(serials) {
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new(
+            db.__debug_vector_index_generation_for_test(VectorIndexRef::new(
                 "boundary_defaults",
                 column_name
             )),

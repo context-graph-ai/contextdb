@@ -511,7 +511,7 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
 // ---------------------------------------------------------------------------
 // Synced vector policy applies on the receiver.
 //
-// Vector build policy is schema: a `SET HNSW (...)` or `SET AUTO_INDEX_AT`
+// Vector build policy is schema: a `SET IVF DEFAULT` or `SET AUTO_INDEX_AT`
 // declared once on the hub must govern every node that can read the clause.
 // The receiver's existing-column merge must carry `auto_index_at`, every
 // HNSW member, and the desired `vector_policy_revision`, not only
@@ -658,7 +658,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
 
     // Leg 3 -- hub declares HNSW and AUTO_INDEX_AT.
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 128)",
+ "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 128)",
         &empty(),
     )
     .expect("declare HNSW policy on the hub");
@@ -755,7 +755,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     )
     .expect("desired_policy_revision is always populated");
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)",
+ "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 200)",
         &empty(),
     )
     .expect("declare an EF_SEARCH-only change on the hub");
@@ -782,7 +782,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
 
     // Leg 8 -- clearing replicates.
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET HNSW DEFAULT",
+ "ALTER TABLE docs ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
     .expect("clear the HNSW declaration on the hub");

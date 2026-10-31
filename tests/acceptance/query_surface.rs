@@ -1175,7 +1175,7 @@ fn f105_public_type_documentation_api_surface_check() {
         "CascadeReport, Database, ExplainOutput, ExportReport, IndexCandidate, QueryResult, QueryTrace,"
     ));
     assert!(lib.contains(
-        "VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,"
+        "VectorPartitionDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,"
     ));
     assert!(lib.contains(
         "VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchRouteEvidence,"

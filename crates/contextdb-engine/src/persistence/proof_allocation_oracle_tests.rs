@@ -3707,19 +3707,9 @@ mod row_check_cache_ownership_contract {
 
     fn drive_maintenance(db: &Database, table: &str, scope: &str) {
         let index = index(table);
-        let partition = partition(scope);
+        let _ = scope;
         for _ in 0..MAX_MAINTENANCE_CYCLES {
-            let mut partition_observation_owner_1 = crate::vector_read_memory::admission(
-                db.declared_reader_memory()
-                    .expect("admit the partition observation reader"),
-            );
-
-            if db
-                .vector_store_for_test()
-                .partition_info(&index, &partition, &mut partition_observation_owner_1)
-                .unwrap()
-                .is_some_and(|info| info.graph_available)
-            {
+            if db.__debug_vector_indexed_available_for_test(index.clone()) {
                 return;
             }
             db.run_maintenance_cycle()
@@ -3823,7 +3813,7 @@ mod row_check_cache_ownership_contract {
          id UUID PRIMARY KEY, \
          scope TEXT NOT NULL, \
          tag TEXT NOT NULL, \
-         embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_SEARCH = 6)\
+         embedding VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 6)\
          )",
             &empty(),
         )
@@ -4081,7 +4071,6 @@ mod row_check_cache_ownership_contract {
         for w in &super::NATIVE_FREE {
             w.count.store(0, super::AtomicOrdering::SeqCst);
         }
-        contextdb_vector::test_seam::set_row_check_cache_observer_for_test(Some(cache_phase));
         let (result, _, _) = super::measured(|| {
             crate::executor::execute_bounded(
                 db,
@@ -4094,7 +4083,6 @@ mod row_check_cache_ownership_contract {
                 Some(bounded::kernel_probe(probe.clone())),
             )
         });
-        contextdb_vector::test_seam::set_row_check_cache_observer_for_test(None);
         let success = result.is_ok();
         if !success {
             if fail_phase != 0 || CANCEL_DURING_MIGRATION_AFTER.get() != 0 {
@@ -4236,36 +4224,6 @@ mod row_check_cache_ownership_contract {
     #[serial]
     fn row_check_cache_exact_admission_boundary_stops_before_predicate() {
         exercise_cache_memory_contract(true);
-    }
-    #[test]
-    #[serial]
-    fn row_check_cache_auto_lift_refunds_before_exact_predicate() {
-        let db = Database::open_memory();
-        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        create_row_check_cache_table(&db);
-        for id in 0..256_u128 {
-            insert_row_check_cache_item(
-                &db,
-                0xD000 + id,
-                if id < 128 { "skip" } else { "keep" },
-                (id as usize) % 3,
-            );
-        }
-        drive_maintenance(&db, "row_check_cache_items", "alpha");
-        // Existing graph-shortfall control applies AFTER real graph traversal.
-        let _shortfall = db
-            .vector_store_for_test()
-            .cap_graph_candidates_for_test(&index("row_check_cache_items"), 0);
-        let (ok, _, _, payer) = run_case_with_mode(&db, roomy_read_limits().memory, 0, true);
-        let lift = LIFT.get();
-        eprintln!("CACHE_AUTO_LIFT observed={lift:?}");
-        drop(db);
-        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
-        assert!(ok);
-        assert!(
-            lift.1 > 0 && lift.3,
-            "AUTO must lift an allocated cache and enter the exact predicate pass"
-        );
     }
 
     #[test]

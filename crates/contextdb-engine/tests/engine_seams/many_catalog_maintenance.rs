@@ -56,7 +56,7 @@ fn maintenance_row(catalogs: usize, cycles: usize) -> Json {
         exec(
             &db,
             &format!(
-                "CREATE TABLE {table} (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2048 SEARCH_MODE INDEXED HNSW (M = 4, EF_CONSTRUCTION = 16)) HISTORY CURRENT ONLY SYNC OFF"
+ "CREATE TABLE {table} (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 2048 SEARCH_MODE INDEXED ) HISTORY CURRENT ONLY SYNC OFF"
             ),
         );
     }
@@ -94,7 +94,7 @@ fn maintenance_row(catalogs: usize, cycles: usize) -> Json {
     // Publish one superseding generation while its predecessor is protected.
     exec(
         &db,
-        "ALTER TABLE building ALTER COLUMN v SET HNSW (M = 8, EF_CONSTRUCTION = 16)",
+ "ALTER TABLE building ALTER COLUMN v SET IVF DEFAULT",
     );
     for _ in 0..64 {
         db.run_maintenance_cycle().unwrap();
@@ -114,7 +114,7 @@ fn maintenance_row(catalogs: usize, cycles: usize) -> Json {
     exec(&db, "UPDATE building SET v = '[0,0,1]' WHERE scope = 0");
     exec(
         &db,
-        "ALTER TABLE building ALTER COLUMN v SET HNSW (M = 16, EF_CONSTRUCTION = 16)",
+ "ALTER TABLE building ALTER COLUMN v SET IVF DEFAULT",
     );
     insert_vector(&db, "building", catalogs, Some(catalogs as i64), 3);
     for id in 0..8 {

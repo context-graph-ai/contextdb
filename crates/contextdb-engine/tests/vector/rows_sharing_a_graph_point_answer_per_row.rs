@@ -438,7 +438,7 @@ fn a_replaced_row_is_answered_at_its_current_vector_not_its_old_point() {
             );
         };
         let fill = |db: &Database| {
-            declare(db, "replaced", representation, " HNSW (EF_SEARCH = 16)");
+            declare(db, "replaced", representation, " IVF (PROBES = 16)");
             for seed in 1..=60 {
                 put(db, "replaced", seed, shared());
             }
@@ -478,7 +478,7 @@ fn member_reads_stay_within_the_declared_tombstone_share_as_history_grows() {
     const K: usize = 10;
     let query = query();
     let db = Database::open_memory();
-    declare(&db, "churn", "", " HNSW (EF_SEARCH = 64)");
+    declare(&db, "churn", "", " IVF (PROBES = 64)");
     for seed in 1..=LIVE {
         put(&db, "churn", seed, shared());
     }
@@ -529,7 +529,7 @@ fn member_reads_stay_within_the_declared_tombstone_share_as_history_grows() {
 fn a_large_shared_point_beside_a_cut_off_row_is_counted_and_given_back() {
     let query = query();
     let db = Database::open_memory();
-    declare(&db, "cut", "", " HNSW (EF_SEARCH = 400)");
+    declare(&db, "cut", "", " IVF (PROBES = 400)");
     for seed in 1..=250 {
         put(&db, "cut", seed, shared());
     }
@@ -693,7 +693,7 @@ fn replaced_point_rows_of_many_groups_do_not_crowd_out_current_rows() {
     let far = vec![-1.0; DIMENSION];
     for representation in REPRESENTATIONS {
         let fill = |db: &Database| {
-            declare(db, "groups", representation, " HNSW (EF_SEARCH = 16)");
+            declare(db, "groups", representation, " IVF (PROBES = 16)");
             for group in 0..9 {
                 // The first row of a group is its point's own row.
                 put(db, "groups", group * 2 + 1, near(group));
@@ -811,7 +811,7 @@ fn unsuccessful_member_probes_of_a_reopened_filtered_count_are_each_charged() {
     let path = root.path().join("probes.redb");
     {
         let db = Database::open(&path).expect("open the durable fixture");
-        declare(&db, "probes", "", " HNSW (EF_SEARCH = 400)");
+        declare(&db, "probes", "", " IVF (PROBES = 400)");
         let put_tagged = |seed: usize, tag: &str, vector: Vec<f32>| {
             db.execute(
                 "INSERT INTO probes (id, tag, embedding) VALUES ($id, $tag, $embedding)",
@@ -924,7 +924,7 @@ fn restamped_and_replaced_rows_of_shared_points_answer_at_their_visible_scores()
     };
     for representation in REPRESENTATIONS {
         let fill = |db: &Database| {
-            declare(db, "restamped", representation, " HNSW (EF_SEARCH = 16)");
+            declare(db, "restamped", representation, " IVF (PROBES = 16)");
             for group in 0..9 {
                 // The first row of a group is its point's own row.
                 for row in 1..=3 {

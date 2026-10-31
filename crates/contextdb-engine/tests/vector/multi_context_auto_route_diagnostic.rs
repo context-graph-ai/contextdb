@@ -130,7 +130,7 @@ fn multi_context_auto_route_diagnostic() {
             &format!("{:?}", maintained_search::held_out_vector(0)),
         ));
         let breadths: Vec<_> = disclosure
-            .partition_hnsw
+            .partitions
             .iter()
             .map(|partition| {
                 (

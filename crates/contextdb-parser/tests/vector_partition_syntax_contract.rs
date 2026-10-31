@@ -143,8 +143,8 @@ fn vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter(
     use contextdb_parser::{AlterAction, VectorPolicyValue, VectorSearchMode};
 
     for declaration in [
-        "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 17 HNSW (EF_SEARCH = DEFAULT, M = 12, EF_CONSTRUCTION = 64)",
-        "vector(3) with (quantization = 'SQ8') partition_key (scope_id) max_partitions 8 search_mode indexed auto_index_at 17 hnsw (ef_search = default, m = 12, ef_construction = 64)",
+ "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 17 IVF (PROBES = DEFAULT)",
+ "vector(3) with (quantization = 'SQ8') partition_key (scope_id) max_partitions 8 search_mode indexed auto_index_at 17 IVF (PROBES = default)",
     ] {
         for sql in [
             format!(
@@ -187,7 +187,7 @@ fn vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter(
         assert_eq!(auto_index_at.as_deref(), expected);
     }
     let Statement::AlterTable(table) = parse_sql(
-        "ALTER TABLE vector_items ALTER COLUMN embedding SET hnsw (ef_search = default, M = 12)",
+ "ALTER TABLE vector_items ALTER COLUMN embedding SET IVF (PROBES = default)",
     ) else {
         panic!("expected ALTER TABLE")
     };
@@ -204,7 +204,7 @@ fn vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter(
     );
     assert_eq!(policy.ef_search, Some(VectorPolicyValue::Default));
     let Statement::AlterTable(table) =
-        parse_sql("ALTER TABLE vector_items ALTER COLUMN embedding SET HNSW DEFAULT")
+ parse_sql("ALTER TABLE vector_items ALTER COLUMN embedding SET IVF DEFAULT")
     else {
         panic!("expected ALTER TABLE")
     };

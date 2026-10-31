@@ -87,7 +87,7 @@ fn seeded_store(fixture: Fixture) -> Database {
         "CREATE TABLE union_recall (id INTEGER PRIMARY KEY, scope_id INTEGER NOT NULL, \
          embedding VECTOR(768) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 \
          SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
-         HNSW (M = 16, EF_CONSTRUCTION = 200))",
+         )",
         &HashMap::new(),
     )
     .expect("declare eight maintained vector partitions");

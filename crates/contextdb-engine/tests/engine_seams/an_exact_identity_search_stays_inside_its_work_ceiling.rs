@@ -82,7 +82,7 @@ fn an_exact_identity_search_over_a_maintained_partition_stays_inside_its_work_ce
     let db = open(&dir.path().join("exact-work.db"), Some(64 * 1024 * 1024));
     exec(
         &db,
-        "CREATE TABLE building (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED HNSW (M = 16, EF_CONSTRUCTION = 32)) HISTORY ALL",
+ "CREATE TABLE building (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED ) HISTORY ALL",
     );
     for id in 0..ROWS {
         insert_vector(&db, "building", id, Some(0), DIM);

@@ -290,7 +290,7 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
             id INT PRIMARY KEY, \
             scope_id TEXT NOT NULL, \
             embedding VECTOR(3) PARTITION_KEY (scope_id) SEARCH_MODE INDEXED \
-                HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200) \
+                IVF (PROBES = 200) \
                 CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)\
         )",
         &empty(),
@@ -520,7 +520,7 @@ fn assert_ready_layer_facts(explain: &str) {
 fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts() {
     let (db, source_id) = fixture();
     let before_charge = db.accountant().usage().used;
-    let before_serial = db.__debug_vector_hnsw_build_serial_for_test(index());
+    let before_serial = db.__debug_vector_index_generation_for_test(index());
     let before_activity = db.__vector_passive_activity_counters_for_test();
     assert_eq!(
         before_serial, None,
@@ -663,7 +663,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     }
 
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         before_serial,
         "SHOW VECTOR_* must not build or load the maintained route"
     );
@@ -680,7 +680,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
 
     drive_to_ready(&db);
     let ready_charge_before = db.accountant().usage().used;
-    let ready_serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+    let ready_serial_before = db.__debug_vector_index_generation_for_test(index());
     let ready_activity_before = db.__vector_passive_activity_counters_for_test();
     let ready_generation_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
         db.vector_store_for_test()
@@ -788,7 +788,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     }
     assert_eq!(db.accountant().usage().used, ready_charge_before);
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         ready_serial_before
     );
     let ready_generation_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
@@ -1180,7 +1180,7 @@ fn active_inspection_reports_one_atomic_progress_snapshot_without_advancing_it()
 fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_build() {
     let (db, _) = fixture();
     drive_to_ready(&db);
-    let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+    let serial_before = db.__debug_vector_index_generation_for_test(index());
     db.set_maintenance_policy(MaintenancePolicy::EngineOwned);
     let charge_before = db.accountant().usage().used;
     let activity_before = db.__vector_passive_activity_counters_for_test();
@@ -1206,7 +1206,7 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
         "the healthy whole-index broad route reports no recovery action"
     );
     assert_eq!(
-        db.__debug_vector_hnsw_build_serial_for_test(index()),
+        db.__debug_vector_index_generation_for_test(index()),
         serial_before,
         "inspection itself must not be the action that builds an EngineOwned route"
     );
@@ -1317,7 +1317,7 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
     let literal_vector = "[0.1234567,0.2345678,0.3456789]".to_owned();
     let explain_passively = |sql: &str| {
         let charge_before = db.accountant().usage().used;
-        let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+        let serial_before = db.__debug_vector_index_generation_for_test(index());
         let activity_before = db.__vector_passive_activity_counters_for_test();
         let scan_before = db.__relational_scan_rows_touched();
         let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO, SCOPE_HIDDEN].map(|scope| {
@@ -1344,7 +1344,7 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
             "explain cannot load a graph or vector body"
         );
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             serial_before,
             "explain cannot build a route"
         );
@@ -1666,7 +1666,7 @@ fn explaining_a_prepared_partition_predicate_binds_nothing_and_names_the_shape()
 
     let explain_passively = |sql: &str| -> String {
         let charge_before = db.accountant().usage().used;
-        let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index());
+        let serial_before = db.__debug_vector_index_generation_for_test(index());
         let activity_before = db.__vector_passive_activity_counters_for_test();
         let explain = db
             .explain(sql)
@@ -1677,7 +1677,7 @@ fn explaining_a_prepared_partition_predicate_binds_nothing_and_names_the_shape()
             "a prepared-predicate explain cannot load a graph or vector body"
         );
         assert_eq!(
-            db.__debug_vector_hnsw_build_serial_for_test(index()),
+            db.__debug_vector_index_generation_for_test(index()),
             serial_before,
             "a prepared-predicate explain cannot build a route"
         );

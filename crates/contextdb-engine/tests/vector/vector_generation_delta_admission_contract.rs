@@ -67,7 +67,7 @@ fn seed(db: &Database, rows: usize, m: usize, ef: usize) {
         &format!(
             "CREATE TABLE delta_admission_items (id INT PRIMARY KEY, scope INT NOT NULL, \
              embedding VECTOR({DIMENSIONS}) PARTITION_KEY (scope) MAX_PARTITIONS 1 \
-             SEARCH_MODE INDEXED HNSW (M = {m}, EF_CONSTRUCTION = {ef}) \
+             SEARCH_MODE INDEXED  \
              CONSOLIDATION (CHANGE_PERCENT = 10))"
         ),
         &HashMap::new(),

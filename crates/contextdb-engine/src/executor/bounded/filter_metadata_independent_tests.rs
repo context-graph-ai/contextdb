@@ -327,7 +327,7 @@ fn plain_fixture(path: &std::path::Path, indexed: bool) -> Arc<Database> {
         },
     )
     .unwrap();
-    db.execute("CREATE TABLE held_filter (id INTEGER PRIMARY KEY, label TEXT, bucket INTEGER NOT NULL, embedding VECTOR(2) PARTITION_KEY (bucket) SEARCH_MODE AUTO HNSW (M = 2, EF_SEARCH = 8))", &HashMap::new()).unwrap();
+ db.execute("CREATE TABLE held_filter (id INTEGER PRIMARY KEY, label TEXT, bucket INTEGER NOT NULL, embedding VECTOR(2) PARTITION_KEY (bucket) SEARCH_MODE AUTO IVF (PROBES = 8))", &HashMap::new()).unwrap();
     for id in 0..64_i64 {
         db.execute(
             "INSERT INTO held_filter VALUES ($id, 'wanted', 1, $vector)",
@@ -416,7 +416,7 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
                 );
                 if indexed {
                     assert!(
-                        db.__debug_last_query_vector_used_hnsw_for_test(),
+                        db.__debug_last_query_vector_used_indexed_route_for_test(),
                         "the indexed fixture must reach the graph callback"
                     );
                     assert!(
@@ -424,7 +424,7 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
                         "the graph callback owns its copied authorization metadata"
                     );
                     assert!(
-                        vector.row_checks.get() > vector.row_check_allowance.unwrap() / 2,
+                        vector.row_checks.get() > vector.k,
                         "the callback must inspect rows beyond the bounded candidate probe"
                     );
                 } else {
@@ -628,7 +628,7 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
         assert!(first.has_more());
         if mode == "INDEXED" {
             assert!(
-                reader.__debug_last_query_vector_used_hnsw_for_test(),
+                reader.__debug_last_query_vector_used_indexed_route_for_test(),
                 "INDEXED uses the maintained graph"
             );
         }

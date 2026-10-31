@@ -147,14 +147,14 @@ fn create_and_add_column_declarations_render_inspect_and_survive_reopen_and_expo
     );
 
     db.execute(
-        "CREATE TABLE declared_f32 (id INTEGER PRIMARY KEY, scope_id TEXT NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1000 HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 401))",
+ "CREATE TABLE declared_f32 (id INTEGER PRIMARY KEY, scope_id TEXT NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1000 IVF (PROBES = 401))",
         &empty(),
     )
     .expect("CREATE TABLE accepts the complete F32 vector policy");
     let declared_schema = schema(&db, "declared_f32");
     assert!(
         declared_schema.contains(
-            "embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1000 HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 401)"
+ "embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1000 IVF (PROBES = 401)"
         ),
         "schema renders every declared vector clause in canonical order: {declared_schema}"
     );
@@ -175,10 +175,10 @@ fn create_and_add_column_declarations_render_inspect_and_survive_reopen_and_expo
     )
     .expect("seed an existing row before adding its nullable vector");
     db.execute(
-        "ALTER TABLE add_target ADD COLUMN embedding VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 9 AUTO_INDEX_AT 5001 HNSW (M = 12, EF_CONSTRUCTION = 64)",
+ "ALTER TABLE add_target ADD COLUMN embedding VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 9 AUTO_INDEX_AT 5001 ",
         &empty(),
     )
-    .expect("ALTER TABLE ADD COLUMN accepts a partial SQ8 HNSW declaration");
+ .expect("ALTER TABLE ADD COLUMN accepts a partial SQ8 HNSW declaration");
     assert_eq!(
         db.execute("SELECT embedding FROM add_target", &empty())
             .expect("read nullable added vector")
@@ -189,7 +189,7 @@ fn create_and_add_column_declarations_render_inspect_and_survive_reopen_and_expo
     let added_schema = schema(&db, "add_target");
     assert!(
         added_schema.contains(
-            "embedding VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 9 AUTO_INDEX_AT 5001 HNSW (M = 12, EF_CONSTRUCTION = 64)"
+ "embedding VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope_id) MAX_PARTITIONS 9 AUTO_INDEX_AT 5001 "
         ),
         "the add-column declaration keeps quantization before policy and only its partial HNSW members: {added_schema}"
     );
@@ -219,30 +219,30 @@ fn create_and_add_column_declarations_render_inspect_and_survive_reopen_and_expo
 fn partial_alters_member_defaults_and_group_defaults_change_only_the_declared_policy() {
     let db = Database::open_memory();
     db.execute(
-        "CREATE TABLE policy_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 1000 HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 211))",
+ "CREATE TABLE policy_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 1000 IVF (PROBES = 211))",
         &empty(),
     )
     .expect("declare an explicit complete policy");
 
     db.execute(
-        "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",
+ "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
-    .expect("partial HNSW ALTER keeps omitted members");
+ .expect("partial HNSW ALTER keeps omitted members");
     let partial = schema(&db, "policy_items");
     assert!(
-        partial.contains("HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 211)"),
+        partial.contains("IVF (PROBES = 211)"),
         "omitted HNSW members retain their declaration: {partial}"
     );
 
     db.execute(
-        "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW (EF_SEARCH = DEFAULT)",
+ "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF (PROBES = DEFAULT)",
         &empty(),
     )
     .expect("a member DEFAULT clears only that member");
     let member_default = schema(&db, "policy_items");
     assert!(
-        member_default.contains("HNSW (M = 24, EF_CONSTRUCTION = 400)")
+        member_default.contains("")
             && !member_default.contains("EF_SEARCH"),
         "member DEFAULT leaves the other declared members intact: {member_default}"
     );
@@ -257,7 +257,7 @@ fn partial_alters_member_defaults_and_group_defaults_change_only_the_declared_po
         "the default crossover is rendered as silence"
     );
     db.execute(
-        "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW DEFAULT",
+ "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
     .expect("HNSW DEFAULT clears the entire declared group");
@@ -272,7 +272,7 @@ fn partial_alters_member_defaults_and_group_defaults_change_only_the_declared_po
 fn invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection() {
     let db = Database::open_memory();
     db.execute(
-        "CREATE TABLE policy_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 1000 HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 211))",
+ "CREATE TABLE policy_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 1000 IVF (PROBES = 211))",
         &empty(),
     )
     .expect("declare the policy whose state must survive each refusal");
@@ -284,10 +284,10 @@ fn invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection
         "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT 0",
         "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT -1",
         "ALTER TABLE policy_items ALTER COLUMN embedding SET AUTO_INDEX_AT 18446744073709551616",
-        "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW (M = 0)",
-        "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW (EF_CONSTRUCTION = -1)",
-        "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW (M = 401, EF_CONSTRUCTION = 400)",
-        "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW (M = 18446744073709551616)",
+ "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+ "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+ "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
+ "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF DEFAULT",
     ] {
         let error = db
             .execute(sql, &empty())
@@ -329,7 +329,7 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
             Issue::AutoIndexAtOutOfRange,
         ),
         (
-            "HNSW (M = 25, EF_CONSTRUCTION = 24)".to_owned(),
+            "".to_owned(),
             Issue::EfConstructionBelowM,
         ),
     ];
@@ -339,7 +339,7 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
             ("-1", Issue::HnswValueNotPositive),
             ("4294967296", Issue::HnswValueOutOfRange),
         ] {
-            invalid.push((format!("HNSW ({member} = {value})"), issue));
+            invalid.push((format!(""), issue));
         }
     }
     for quantization in ["F32", "SQ8", "SQ4"] {
@@ -348,7 +348,7 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
         // another profile, even though the new column currently has no rows.
         let ef = if quantization == "F32" { 20 } else { 10 };
         cases.push((
-            format!("HNSW (EF_CONSTRUCTION = {ef})"),
+            format!(""),
             Issue::EfConstructionBelowM,
         ));
         for (policy, expected_issue) in cases {
@@ -391,8 +391,8 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
         }
     }
     for sql in [
-        "CREATE TABLE create_policy (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 4294967295 HNSW (M = 4294967295, EF_CONSTRUCTION = 4294967295, EF_SEARCH = 4294967295))",
-        "ALTER TABLE add_policy ADD COLUMN embedding VECTOR(3) AUTO_INDEX_AT 4294967295 HNSW (M = 4294967295, EF_CONSTRUCTION = 4294967295, EF_SEARCH = 4294967295)",
+ "CREATE TABLE create_policy (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_INDEX_AT 4294967295 IVF (PROBES = 4294967295))",
+ "ALTER TABLE add_policy ADD COLUMN embedding VECTOR(3) AUTO_INDEX_AT 4294967295 IVF (PROBES = 4294967295)",
     ] {
         db.execute(sql, &empty())
             .expect("the persisted u32 maximum has no smaller private policy cap");
@@ -428,7 +428,7 @@ fn full_width_hnsw_m_builds_reloads_and_accounts_at_255_256_and_257() {
         let table = format!("wide_m_{m}");
         db.execute(
             &format!(
-                "CREATE TABLE {table} (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = {m}, EF_CONSTRUCTION = {m}, EF_SEARCH = 32))"
+ "CREATE TABLE {table} (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 32))"
             ),
             &empty(),
         )

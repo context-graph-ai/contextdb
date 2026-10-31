@@ -7,7 +7,7 @@ use contextdb_vector::VectorPartitionRef;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
-const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 32, EF_CONSTRUCTION = 96, EF_SEARCH = 17))";
+const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 17))";
 
 fn index() -> VectorIndexRef {
     VectorIndexRef::new("items", "embedding")
@@ -373,7 +373,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         &HashMap::new(),
     )
     .unwrap();
-    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) AUTO_INDEX_AT 1 HNSW (M = 32, EF_CONSTRUCTION = 96, EF_SEARCH = 17) RANK_POLICY (JOIN outcomes ON item_id, FORMULA 'coalesce({weight}, 0.0)', SORT_KEY priority))", &HashMap::new()).unwrap();
+ db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) AUTO_INDEX_AT 1 IVF (PROBES = 17) RANK_POLICY (JOIN outcomes ON item_id, FORMULA 'coalesce({weight}, 0.0)', SORT_KEY priority))", &HashMap::new()).unwrap();
     for id in 1..=3 {
         let vector = match id {
             1 => vec![1.0, 0.0],
@@ -407,16 +407,16 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         "SELECT id FROM items ORDER BY embedding <=> $q USE VECTOR AUTO USE RANK priority LIMIT 1";
     let bound = HashMap::from([("q".to_owned(), Value::Vector(vec![1.0, 0.0]))]);
     let indexed = db.execute(sql, &bound).unwrap();
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     assert_eq!(
         indexed.rows()[0][0],
         Value::Int64(3),
         "declared breadth includes all three vector candidates"
     );
     assert_eq!(bounded_ids(&db, sql, bound.clone()), vec![3]);
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 1)",
+ "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 1)",
         &HashMap::new(),
     )
     .unwrap();
@@ -427,9 +427,9 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         db.execute(sql, &bound).unwrap().rows()[0][0],
         Value::Int64(3)
     );
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     assert_eq!(bounded_ids(&db, sql, bound.clone()), vec![3]);
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     // The declared breadth is still the ranked walk's breadth: the walk asked
     // for outright keeps one candidate and misses the distant high-weight row.
     let indexed_sql = sql.replace("USE VECTOR AUTO", "USE VECTOR INDEXED");
@@ -437,9 +437,9 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         db.execute(&indexed_sql, &bound).unwrap().rows()[0][0],
         Value::Int64(3)
     );
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     assert_ne!(bounded_ids(&db, &indexed_sql, bound.clone()), vec![3]);
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     let mut semantic =
         contextdb_engine::SemanticQuery::new("items", "embedding", vec![1.0, 0.0], 1);
     semantic.sort_key = Some("priority".into());
@@ -450,7 +450,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
     );
     semantic.search_mode = None;
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 17)",
+ "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 17)",
         &HashMap::new(),
     )
     .unwrap();
@@ -458,7 +458,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         db.semantic_search(semantic).unwrap()[0].values["id"],
         Value::Int64(3)
     );
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
 
     db.execute(
         "ALTER TABLE items ALTER COLUMN embedding SET AUTO_INDEX_AT 4",
@@ -469,13 +469,13 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         db.execute(sql, &bound).unwrap().rows()[0][0],
         Value::Int64(3)
     );
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
     assert_eq!(
         bounded_ids(&db, sql, bound),
         vec![3],
         "below the declared crossover, exact ranking sees the distant high-weight row"
     );
-    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_indexed_route_for_test());
 }
 
 #[test]
@@ -486,7 +486,7 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
     options.owner_reads.limits.limits.memory = 64 * 1024 * 1024;
     let db = Database::open_with_options(root.path().join("history.db"), options).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, is_current BOOLEAN, embedding VECTOR(2) AUTO_INDEX_AT 1 HNSW (M = 32, EF_CONSTRUCTION = 96, EF_SEARCH = 17))", &HashMap::new()).unwrap();
+ db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, is_current BOOLEAN, embedding VECTOR(2) AUTO_INDEX_AT 1 IVF (PROBES = 17))", &HashMap::new()).unwrap();
     db.execute(
         "CREATE INDEX current_items ON items(is_current)",
         &HashMap::new(),
@@ -542,7 +542,7 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
         );
         let result = bounded::execute(&db, &request).unwrap();
         assert_eq!(result.result.rows(), expected);
-        assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+        assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
         assert!(
             result
                 .telemetry

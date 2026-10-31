@@ -65,7 +65,7 @@ fn store(path: &std::path::Path, writer: usize, reader: u64) -> Database {
     .unwrap();
     db.register_trigger_callback("fire_guard", |_, _| Ok(()))
         .unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(32) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)", &HashMap::new()).unwrap();
+ db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(32) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)", &HashMap::new()).unwrap();
     db.complete_initialization().unwrap();
     for id in 0..32i64 {
         db.execute(

@@ -55,7 +55,7 @@ fn declare(db: &Database, representation: &str) {
             "CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, tag TEXT NOT NULL, \
              embedding VECTOR({DIMENSION}){representation} PARTITION_KEY (bucket) \
              MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
-             HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512) CONSOLIDATION NONE)"
+             IVF (PROBES = 512) CONSOLIDATION NONE)"
         ),
         &HashMap::new(),
     )

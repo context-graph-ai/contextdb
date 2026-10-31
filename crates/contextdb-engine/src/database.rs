@@ -22,29 +22,13 @@ pub(crate) mod native_custody_selection;
 use contextdb_relational::source::RelationalCursor as _;
 use maintenance_frontier::MaintenanceFrontier;
 pub(crate) mod graph_read_memory;
-#[cfg(test)]
-mod published_vector_install_tests;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod resident_history_test_seams;
-#[cfg(test)]
-mod vector_frontier_metadata_admission_tests;
-#[cfg(test)]
-mod vector_generation_decode_owner_tests;
 mod vector_import_tail;
-#[cfg(test)]
-mod vector_journal_cleanup_cancellation_tests;
-#[cfg(all(test, feature = "test-seams"))]
-mod vector_public_cycle_admission_tests;
-#[cfg(test)]
-mod vector_published_retry_source_admission_tests;
-#[cfg(test)]
-mod vector_quarantine_inventory_admission_tests;
 #[cfg(test)]
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
-#[cfg(test)]
-mod vector_suffix_inspection_tests;
 #[doc(hidden)]
 mod received_row_graph;
 mod row_graph;

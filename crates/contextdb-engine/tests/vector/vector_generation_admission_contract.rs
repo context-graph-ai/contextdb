@@ -35,7 +35,7 @@ fn repeated_generation_publication_keeps_only_live_charged_owners() {
             .unwrap();
         }
         db.commit(tx).unwrap();
-        db.execute(&format!("ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = {}, EF_CONSTRUCTION = 400)", 24 + cycle % 2), &HashMap::new()).unwrap();
+ db.execute(&format!("ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT", 24 + cycle % 2), &HashMap::new()).unwrap();
         let report = db.run_maintenance_cycle().unwrap();
         let receipt = db.vector_memory_ownership_receipt_for_test();
         let retention = db.__debug_vector_partition_generation_retention_for_test(&route());
@@ -138,7 +138,7 @@ fn seed(db: &Database, rows: usize, m: usize, ef: usize) {
         &format!(
             "CREATE TABLE admission_items (id INT PRIMARY KEY, scope INT NOT NULL, \
              embedding VECTOR({DIMENSIONS}) PARTITION_KEY (scope) MAX_PARTITIONS 1 \
-             SEARCH_MODE INDEXED HNSW (M = {m}, EF_CONSTRUCTION = {ef}))"
+             SEARCH_MODE INDEXED )"
         ),
         &HashMap::new(),
     )
@@ -315,7 +315,7 @@ fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph()
         "the deleted rows remain in retained history"
     );
     db.execute(
-        "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",
+ "ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     ).unwrap();
     assert_indexed(&db, 9_999, 0);
@@ -370,7 +370,7 @@ fn tiny_limit_refuses_with_typed_details_without_partial_generation() {
     );
     assert_indexed(&db, 63, 0);
     db.execute(
-        "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",
+ "ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     ).unwrap();
     let before = db
@@ -478,7 +478,7 @@ fn multiple_pinned_generations_remain_charged_until_their_final_snapshot_release
     let first_pin = db.pin_snapshot(first_snapshot).unwrap();
     replace_vectors(&db, 1);
     db.execute(
-        "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 20, EF_CONSTRUCTION = 300)",
+ "ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     ).unwrap();
     let second_report = db.run_maintenance_cycle().unwrap();
@@ -503,7 +503,7 @@ fn multiple_pinned_generations_remain_charged_until_their_final_snapshot_release
     let second_pin_again = db.pin_snapshot(second_snapshot).unwrap();
     replace_vectors(&db, 2);
     db.execute(
-        "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",
+ "ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     ).unwrap();
     assert_published(&db, db.run_maintenance_cycle().unwrap());
@@ -595,7 +595,7 @@ fn growing_persistence_transitions_refuse_atomically_for_base_and_change_publica
             replace_vectors(&db, 1);
         } else {
             db.execute(
-                "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",
+ "ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT",
                 &HashMap::new(),
             ).unwrap();
         }
@@ -767,7 +767,7 @@ fn encoding_shrink_transfers_held_workspace_without_additive_headroom() {
     );
     assert_indexed(&db, 63, 0);
     db.execute(
-        "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",
+ "ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     ).unwrap();
     let old_generation = generation(&db);
@@ -840,7 +840,7 @@ fn candidate_shrink_transfers_held_workspace_without_additive_headroom() {
             replace_vectors(&db, 1);
         } else {
             db.execute(
-                "ALTER TABLE admission_items ALTER COLUMN embedding SET HNSW (M = 24, EF_CONSTRUCTION = 400)",
+ "ALTER TABLE admission_items ALTER COLUMN embedding SET IVF DEFAULT",
                 &HashMap::new(),
             ).unwrap();
         }

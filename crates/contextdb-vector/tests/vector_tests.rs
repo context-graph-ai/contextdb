@@ -168,8 +168,6 @@ fn quarantined_cancel_fixture() -> (
                     covered_lsn: Lsn(1),
                     durable_bytes: 1,
                     policy_revision: 1,
-                    hnsw_m: 8,
-                    hnsw_ef_construction: 32,
                 },
                 resident_bytes: 1,
                 load_bytes: 1,
@@ -745,8 +743,6 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
                 covered_lsn: entries.iter().map(|entry| entry.lsn).max().unwrap(),
                 durable_bytes: u64::try_from(bytes.len()).unwrap(),
                 policy_revision: policy.policy_revision,
-                hnsw_m: u32::try_from(m).unwrap(),
-                hnsw_ef_construction: u32::try_from(ef_construction).unwrap(),
             },
             resident_bytes: limit,
             load_bytes: limit,
@@ -1151,8 +1147,6 @@ fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() 
                             covered_lsn: Lsn(tx),
                             durable_bytes,
                             policy_revision: 1,
-                            hnsw_m: 8,
-                            hnsw_ef_construction: 32,
                         },
                         generation,
                     )
@@ -2649,8 +2643,6 @@ fn selected_index_row_pruning_preserves_unrelated_resident_generation_and_indexe
                     covered_lsn: Lsn(1),
                     durable_bytes: encoded.len() as u64,
                     policy_revision: 1,
-                    hnsw_m: 8,
-                    hnsw_ef_construction: 32,
                 },
                 LoadedVectorGraphGeneration {
                     graph,
@@ -3325,7 +3317,7 @@ fn memory_accountant_rejection_on_a_leaves_b_accountant_byte_balance_correct() {
 
 #[cfg(feature = "test-seams")]
 #[test]
-fn concurrent_distinct_hnsw_builds_do_not_oversubscribe_transient_budget() {
+fn concurrent_distinct_index_builds_do_not_oversubscribe_transient_budget() {
     use contextdb_vector::test_seam::{
         PauseWindow, estimate_hnsw_build_reservation_for_test, estimate_hnsw_final_bytes_for_test,
     };

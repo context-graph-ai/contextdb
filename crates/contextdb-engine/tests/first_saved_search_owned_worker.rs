@@ -105,12 +105,12 @@ fn child(path: &Path) {
             .vector_store_for_test()
             .passive_activity_counters_for_test();
         assert_eq!(
-            after.hnsw_builds, before.hnsw_builds,
+            after.index_builds, before.index_builds,
             "queries never build the maintained index"
         );
         assert_eq!(
-            after.hnsw_repairs_or_compactions,
-            before.hnsw_repairs_or_compactions
+            after.index_repairs_or_compactions,
+            before.index_repairs_or_compactions
         );
     }
     drop(reader);

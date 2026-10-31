@@ -75,7 +75,7 @@ pub fn populate(db: &Database) {
     db.commit(tx).expect("fixture graph commit");
     run(
         db,
-        "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED HNSW (EF_SEARCH = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+ "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED IVF (PROBES = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
     );
     for id in 1..=4i64 {
         let x = id as f32;
@@ -96,7 +96,7 @@ pub fn populate(db: &Database) {
     );
     for _ in 0..8 {
         if ["embedding", "compressed"].iter().all(|column| {
-            db.__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new(
+            db.__debug_vector_index_generation_for_test(VectorIndexRef::new(
                 "breadth_rows",
                 *column,
             ))
@@ -109,11 +109,11 @@ pub fn populate(db: &Database) {
     }
     run(
         db,
-        "ALTER TABLE breadth_rows ALTER COLUMN embedding SET HNSW (EF_SEARCH = 11)",
+ "ALTER TABLE breadth_rows ALTER COLUMN embedding SET IVF (PROBES = 11)",
     );
     run(
         db,
-        "ALTER TABLE breadth_rows ALTER COLUMN embedding SET HNSW (EF_SEARCH = 11)",
+ "ALTER TABLE breadth_rows ALTER COLUMN embedding SET IVF (PROBES = 11)",
     );
     run(db, "ALTER TABLE breadth_rows DROP COLUMN body");
 }
