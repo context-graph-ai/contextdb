@@ -2599,7 +2599,7 @@ pub(super) fn prune_expired_rows(
     .enter();
     let maintenance_read_memory = read_memory.clone();
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
-    let persistence = ctx.persistence.as_ref();
+    let persistence = &ctx.persistence;
     let change_log = &ctx.change_log;
     let change_log_table_index = &ctx.change_log_table_index;
     let change_log_lsn_refcounts = &ctx.change_log_lsn_refcounts;
@@ -2620,7 +2620,7 @@ pub(super) fn prune_expired_rows(
         )?;
         carried.nodes.clone()
     };
-    if let Some(persistence) = persistence {
+    {
         carried_edge_nodes.extend(persistence.load_retention_deferred_edge_nodes_prepaid(
             &mut workspace,
             prepaid_durable_carry_bytes,
@@ -3230,17 +3230,14 @@ pub(super) fn prune_expired_rows(
 
     // Capture candidate membership before the same durable transaction removes
     // it. The file directory has no second resident map to remove afterward.
-    let durable_directory_removals = if persistence.is_some() {
+    let durable_directory_removals =
         commit_index_candidates
             .iter()
             .try_fold(0u64, |count, lsn| {
                 tx_mgr
                     .try_commit_index_contains(*lsn)
                     .map(|present| count + u64::from(present))
-            })?
-    } else {
-        0
-    };
+            })?;
 
     let generation_cleanup = prepare_retention_cleanup_generations(
         vector_store,
@@ -3254,89 +3251,8 @@ pub(super) fn prune_expired_rows(
         row_keys.iter().map(|(_, row, _, lsn)| (*row, *lsn)),
         ctx.finalization.accountant.read_budget()?,
     )?;
-    let mut memory_retirement_removals = Vec::new();
-    if persistence.is_none() {
-        let carry = ctx.retention_deferred_edge_nodes.lock();
-        for (table, row, created, lsn) in &row_keys {
-            let prefix = crate::persistence::row_graph::retirement_version_prefix(
-                table, *row, *created, *lsn,
-            )?;
-            for (key, _) in carry.retired.range::<str, _>((
-                std::ops::Bound::Included(prefix.as_str()),
-                std::ops::Bound::Unbounded,
-            )) {
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                workspace.try_grow_for(
-                    key.len().saturating_add(2 * std::mem::size_of::<String>()),
-                    "retention",
-                    "prepare_prune",
-                    "Raise MEMORY_LIMIT to prepare retirement cleanup keys.",
-                )?;
-                memory_retirement_removals.push(key.clone());
-            }
-        }
-    }
-    let mut memory_retirements = Vec::new();
-    if persistence.is_none() {
-        workspace.try_grow_for(
-            removed_owned_edges
-                .len()
-                .saturating_mul(std::mem::size_of::<(String, MemoryRowRetirement)>()),
-            "retention",
-            "prepare_prune",
-            "Raise MEMORY_LIMIT to prepare memory retirement controls.",
-        )?;
-        for owned in &removed_owned_edges {
-            let key = crate::persistence::row_graph::retirement_key(&owned.owner)?;
-            if ctx
-                .retention_deferred_edge_nodes
-                .lock()
-                .retired
-                .contains_key(&key)
-            {
-                continue;
-            }
-            if row_keys.iter().any(|(table, row, created, lsn)| {
-                table == &owned.owner.table
-                    && *row == owned.owner.row_id
-                    && *created == owned.owner.created_tx
-                    && *lsn == owned.owner.lsn
-            }) {
-                continue;
-            }
-            let mut memory = crate::memory_accounting::OwnedMemoryReservation::new(
-                crate::memory_accounting::AccountantHandle::clone(&ctx.finalization.accountant),
-            );
-            let node = 2
-                * (11 * std::mem::size_of::<(String, MemoryRowRetirement)>()
-                    + 12 * std::mem::size_of::<usize>()
-                    + 4 * std::mem::size_of::<usize>()
-                    + crate::sync_types::held::ALLOCATION_BYTES);
-            memory.try_grow_for(
-                owned
-                    .estimated_bytes()
-                    .saturating_add(node)
-                    .saturating_add(crate::persistence::row_graph::RETIRED_PREFIX.len())
-                    .saturating_add(owned.owner.table.len().saturating_mul(2))
-                    .saturating_add(84),
-                "retention",
-                "row_graph_retirement",
-                "Raise MEMORY_LIMIT to retain exact memory retirement controls.",
-            )?;
-            let key = crate::persistence::row_graph::retirement_key(&owned.owner)?;
-            memory_retirements.push((
-                key,
-                MemoryRowRetirement {
-                    owned: owned.clone(),
-                    memory,
-                },
-            ));
-        }
-    }
-    let mut publication_watch = None;
-    if let Some(persistence) = persistence {
+    let publication_watch;
+    {
         publication.reserve()?;
         let watch = PublicationInterruptionWatch::arm(&ctx.publication_interrupted);
         // Point-removes in ONE redb write transaction: exactly the pruned
@@ -3390,16 +3306,8 @@ pub(super) fn prune_expired_rows(
     // `scoped_commit_index_removal`'s own doc comment).
     let pruned_commit_index_entries = if commit_index_candidates.is_empty() {
         0
-    } else if persistence.is_some() {
-        durable_directory_removals
     } else {
-        let removed = tx_mgr.try_remove_commit_index_entries(&commit_index_candidates)?;
-        if persistence.is_none() {
-            accountant.release(
-                (removed as usize).saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
-            );
-        }
-        removed
+        durable_directory_removals
     };
 
     relational_store.publish_schema_history_erasure(schema_history);
@@ -3491,19 +3399,6 @@ pub(super) fn prune_expired_rows(
         let mut carry = ctx.retention_deferred_edge_nodes.lock();
         carry.nodes = deferred_edge_nodes;
         carry._memory = Some(deferred_edge_memory);
-        for (key, value) in memory_retirements {
-            if let Some(old) = carry.retired.insert(key, value) {
-                drop(old.owned);
-                drop(old.memory);
-            }
-        }
-        for key in memory_retirement_removals {
-            if let Some((key, value)) = carry.retired.remove_entry(&key) {
-                drop(key);
-                drop(value.owned);
-                drop(value.memory);
-            }
-        }
     }
 
     // Reclaimed physical bytes are reported in full below; only the versions
@@ -3547,15 +3442,12 @@ pub(super) fn prune_expired_rows(
 )]
 pub(super) fn prepare_retention_cleanup_generations<'a>(
     vector: &VectorStore,
-    persistence: Option<&Arc<RedbPersistence>>,
+    persistence: &Arc<RedbPersistence>,
     metas: &HashMap<String, TableMeta>,
     tables: impl Iterator<Item = &'a str>,
     snapshots: &[SnapshotId],
     workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
 ) -> Result<crate::persistence::VectorGenerationCleanup> {
-    let Some(persistence) = persistence else {
-        return Ok(Vec::new());
-    };
     let mut cleanup = Vec::new();
     for table in tables {
         let Some(meta) = metas.get(table) else {
@@ -3620,14 +3512,11 @@ pub(super) fn prepare_retention_cleanup_generations<'a>(
 )]
 pub(super) fn prepare_cleanup_generations<'a>(
     vector: &VectorStore,
-    persistence: Option<&Arc<RedbPersistence>>,
+    persistence: &Arc<RedbPersistence>,
     tables: impl Iterator<Item = &'a str>,
     snapshots: &[SnapshotId],
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
 ) -> Result<crate::persistence::VectorGenerationCleanup> {
-    let Some(persistence) = persistence else {
-        return Ok(Vec::new());
-    };
     let tables = tables.collect::<HashSet<_>>();
     let mut cleanup = Vec::new();
     for index in vector.index_layout_infos(vector_copy_owner)? {

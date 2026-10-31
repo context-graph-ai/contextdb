@@ -1,9 +1,8 @@
 //! Durable scratch storage on disk.
 //!
-//! contextdb is a durable database and has no in-memory mode. Anything the
-//! engine builds only to throw away -- the `:memory:` scratch database and the
-//! private working images that schema changes use -- is an ordinary file-backed
-//! store inside a scratch directory.
+//! contextdb is a durable database and has no in-memory mode. A database opened
+//! only to be thrown away is an ordinary file-backed store inside a scratch
+//! directory.
 //!
 //! A scratch directory holds an exclusive lock file while its owner lives and
 //! is removed when the owner drops it. A process that is killed leaves its

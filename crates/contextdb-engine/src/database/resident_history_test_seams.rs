@@ -308,7 +308,7 @@ impl Database {
         stop: Arc<AtomicBool>,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<MaintenanceReport> {
-        let mut context = self.maintenance_context();
+        let mut context = self.maintenance_context()?;
         context.worker_stop = Some(stop);
         context.run_cycle(CurrencyGate::Always, read_memory.clone())
     }

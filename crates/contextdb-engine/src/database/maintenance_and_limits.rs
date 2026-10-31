@@ -474,7 +474,7 @@ impl Database {
         let _guard = MaintenanceReceiptGuard::lock(&self.pruning_guard);
         #[cfg(any(test, feature = "test-seams"))]
         let _held = crate::persistence::PruningGuardHeldForTest::enter();
-        self.maintenance_context().run_pruning(read_memory.clone())
+        self.maintenance_context()?.run_pruning(read_memory.clone())
     }
 
     /// Run ONE maintenance cycle synchronously: generic retention, the
@@ -534,7 +534,7 @@ impl Database {
         let _held = crate::persistence::PruningGuardHeldForTest::enter();
         let result = self
             .maintenance_context()
-            .run_cycle(CurrencyGate::Always, read_memory);
+            .and_then(|context| context.run_cycle(CurrencyGate::Always, read_memory));
         // The operation root can retain decoded source windows until exit.
         // Retire those physical holders before the closing observation, while
         // this caller still holds maintenance exclusion.
@@ -2059,7 +2059,7 @@ impl Database {
 
         let _operation = self.assert_open_operation();
         let _guard = MaintenanceReceiptGuard::lock(&self.pruning_guard);
-        self.maintenance_context()
+        self.maintenance_context()?
             .run_currency(CurrencyGate::Always, read_memory.clone())
     }
 
@@ -2088,7 +2088,7 @@ impl Database {
 
         let _operation = self.assert_open_operation();
         let _guard = MaintenanceReceiptGuard::lock(&self.pruning_guard);
-        self.maintenance_context()
+        self.maintenance_context()?
             .run_currency_for_tables(tables, read_memory.clone())
     }
 
@@ -2319,8 +2319,16 @@ impl Database {
         !self.vector_store.is_empty()
     }
 
-    pub(super) fn maintenance_context(&self) -> MaintenanceContext {
-        {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn maintenance_context(&self) -> Result<MaintenanceContext> {
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| Error::Other("maintenance requires a file-backed database".into()))?;
+        Ok({
             let mut storage = std::mem::MaybeUninit::<MaintenanceContext>::uninit();
             let mut construction = MaintenanceCleanup {
                 source: storage.as_mut_ptr(),
@@ -2410,7 +2418,7 @@ impl Database {
 
                 {
                     std::ptr::addr_of_mut!((*construction.source).persistence)
-                        .write(self.persistence.clone());
+                        .write(Arc::clone(persistence));
                     construction.initialized[11] = true;
                 }
 
@@ -2496,7 +2504,7 @@ impl Database {
             }
             construction.initialized.fill(false);
             unsafe { storage.assume_init() }
-        }
+        })
     }
 
     /// Read the established retention hub back out of database metadata at
@@ -2621,7 +2629,10 @@ impl Database {
         let wakes = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let thread_wakes = wakes.clone();
-        let mut context = self.maintenance_context();
+        // A private image or a read image never runs a maintenance worker.
+        let Ok(mut context) = self.maintenance_context() else {
+            return;
+        };
         context.worker_stop = Some(shutdown.clone());
         let pruning_guard = self.pruning_guard.clone();
         let thread_shutdown = shutdown.clone();
@@ -2955,7 +2966,8 @@ impl Database {
 
         let frontier = match &self.persistence {
             Some(persistence) => persistence.global_erasure_frontier(memory.clone())?,
-            None => self.lineage_state_lock.lock().erasure_frontiers.global(),
+            // Erasure completes only on a durable owner, so no other handle has a frontier.
+            None => Lsn(0),
         };
         if frontier <= snapshot_lsn {
             return Ok(());
@@ -3067,11 +3079,8 @@ impl Database {
                     .unwrap_or_else(|| self.declared_reader_memory())?;
                 persistence.validate_erasure_frontiers(scope, memory)?;
             }
-            None => self
-                .lineage_state_lock
-                .lock()
-                .erasure_frontiers
-                .validate(scope)?,
+            // Erasure completes only on a durable owner, so no other handle has a frontier.
+            None => {}
         }
         scope.check_publication_budget()?;
         Ok(publication)
@@ -3175,7 +3184,6 @@ impl Database {
             checkpoint_source,
             writer_root,
             recovery_floors,
-            memory_erasure_frontiers,
         ) = self.with_commit_lock(|| -> Result<_> {
             let watermark = self.tx_mgr.current_tx_max();
             let snapshot_lsn = self.tx_mgr.current_lsn();
@@ -3217,7 +3225,6 @@ impl Database {
                 checkpoint_source,
                 writer_root,
                 recovery_floors,
-                self.lineage_state_lock.lock().erasure_frontiers.clone(),
             ))
         })?;
         #[cfg(any(test, feature = "test-seams"))]
@@ -3763,7 +3770,6 @@ impl Database {
                     // and trigger declarations live only in memory and export
                     // exactly as file-backed DDL persistence would have written
                     // them.
-                    memory_erasure_frontiers.copy_into(artifact, read_memory.clone())?;
                     let mut config_values = self.export_cron_config_values()?;
                     config_values.extend(self.export_event_bus_config_values()?);
                     config_values.extend(self.export_trigger_config_values()?);
@@ -4675,13 +4681,7 @@ impl Database {
                 .try_commit_index_census()
                 .expect("authenticated test commit census")
                 .0;
-            receipt.commit_index_charge = if self.persistence.is_none() {
-                receipt
-                    .commit_index_entries
-                    .saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES)
-            } else {
-                0
-            };
+            receipt.commit_index_charge = 0;
             receipt.persistence_cache = self.persistence.as_ref().map_or(0, |p| {
                 let cache = p.cache_charge();
                 #[cfg(feature = "test-seams")]
@@ -7527,8 +7527,9 @@ impl Database {
         let _operation = self.open_operation()?;
         let _update = self.limit_update_lock.lock();
         if self.persistence.is_none() {
-            self.disk_limit.store(0, Ordering::SeqCst);
-            return Ok(());
+            return Err(Error::Other(
+                "a disk limit requires a file-backed database".into(),
+            ));
         }
 
         let ceiling = self.disk_limit_startup_ceiling();

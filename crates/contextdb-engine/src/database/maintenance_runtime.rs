@@ -484,7 +484,6 @@ impl Drop for MaintenanceContext {
         #[cfg(any(test, feature = "test-seams"))]
         drop(self.writer_receipt_observer.take());
         drop(self.worker_stop.take());
-        drop(self.persistence.take());
     }
 }
 
@@ -583,9 +582,7 @@ impl MaintenanceContext {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn reclaim_deferred_storage(&self) -> Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
-        };
+        let persistence = &self.persistence;
         // A storage compaction sweep reclaims deferred frees in its own batches while it relocates
         // pages toward the front of the file; extra commits here would allocate behind it. The
         // stage resumes on the first cycle after the sweep completes.
@@ -802,9 +799,7 @@ impl MaintenanceContext {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         self.build_checkpoint()?;
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(VectorJournalCleanupRetryOutcome::default());
-        };
+        let persistence = &self.persistence;
         let stream = self.maintenance_catalog_stream()?;
         #[cfg(test)]
         vector_journal_cleanup_cancellation_tests::after_inventory_capture_for_test(
@@ -1001,9 +996,7 @@ impl MaintenanceContext {
             self.finalization.accountant.vector_budget()?,
         );
         let _publication_read = writer_read::suspend_root_for_manager(&self.tx_mgr);
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
-        };
+        let persistence = &self.persistence;
         // Final-delete publication still advances and cleans the durable
         // catalog, but retired raw history must not regain an indexed route.
         if self
@@ -1131,9 +1124,8 @@ impl MaintenanceContext {
     }
 
     pub(super) fn file_bytes(&self) -> Option<u64> {
-        self.persistence
-            .as_ref()
-            .and_then(|persistence| std::fs::metadata(persistence.path()).ok())
+        std::fs::metadata(self.persistence.path())
+            .ok()
             .map(|meta| meta.len())
     }
 
@@ -1168,9 +1160,7 @@ impl MaintenanceContext {
             policy,
             ..CompactionReport::default()
         };
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(not_run(None));
-        };
+        let persistence = &self.persistence;
         let due = self
             .last_auto_compact_at
             .lock()
@@ -1951,10 +1941,8 @@ impl MaintenanceContext {
             )?;
             bytes
         };
-        let prepaid_durable_carry_bytes = match &self.persistence {
-            Some(persistence) => persistence.retention_deferred_edge_workspace_bytes()?,
-            None => 0,
-        };
+        let prepaid_durable_carry_bytes =
+            self.persistence.retention_deferred_edge_workspace_bytes()?;
         carry_workspace.try_grow_for(
             prepaid_durable_carry_bytes,
             "retention",
@@ -1975,10 +1963,7 @@ impl MaintenanceContext {
         // The sample is the allocator's maintained free-page ratio, read
         // without visiting a page, so a cycle's decision costs the same at
         // any store size. `None` (untrusted totals) takes no decision.
-        let fragmentation_before = match self.persistence.as_ref() {
-            Some(persistence) => persistence.allocator_free_page_ratio()?,
-            None => None,
-        };
+        let fragmentation_before = self.persistence.allocator_free_page_ratio()?;
         let now = Wallclock::now();
         self.stamp_expired_rows_for(now, RetentionPreparation::Prune)?;
         let mut report = self
@@ -2009,13 +1994,12 @@ impl MaintenanceContext {
         // `fragmentation_before` is that same observed value — the decision
         // input and the receipt are one number, never a derived stand-in.
         if report.pruned_rows > 0
-            && let Some(persistence) = self.persistence.as_ref()
             && let Some(fragmentation_before) = fragmentation_before
             && fragmentation_before >= policy.start_ratio()
         {
             let progress = publish_storage_compaction_batch_with_deferral(
                 &self.tx_mgr,
-                persistence,
+                &self.persistence,
                 &self.finalization.accountant,
                 &self.publication_interrupted,
                 Some(fragmentation_before),
@@ -2107,7 +2091,7 @@ impl MaintenanceContext {
                     &self.graph,
                     &self.vector,
                     &self.finalization.accountant,
-                    self.persistence.as_ref(),
+                    &self.persistence,
                     &self.change_log,
                     &self.change_log_table_index,
                     &self.change_log_lsn_refcounts,
@@ -2115,7 +2099,6 @@ impl MaintenanceContext {
                     &self.snapshot_registry,
                     publication,
                     &self.publication_interrupted,
-                    &self.retention_deferred_edge_nodes,
                     &tables,
                     read_memory.clone(),
                 )?;
@@ -2157,7 +2140,7 @@ impl MaintenanceContext {
                     &self.graph,
                     &self.vector,
                     &self.finalization.accountant,
-                    self.persistence.as_ref(),
+                    &self.persistence,
                     &self.change_log,
                     &self.change_log_table_index,
                     &self.change_log_lsn_refcounts,
@@ -2165,7 +2148,6 @@ impl MaintenanceContext {
                     &self.snapshot_registry,
                     publication,
                     &self.publication_interrupted,
-                    &self.retention_deferred_edge_nodes,
                     tables,
                     read_memory.clone(),
                 )?;
@@ -2187,19 +2169,7 @@ impl MaintenanceContext {
         let now = Wallclock::now();
         let window = Duration::from_secs(self.trigger_audit_retention_secs.load(Ordering::SeqCst));
         let cutoff = now.0.saturating_sub(window.as_millis() as u64);
-        match self.persistence.as_ref() {
-            Some(persistence) => {
-                self.publish_direct_metadata(|| persistence.prune_trigger_audit_history(cutoff))
-            }
-            None => {
-                let mut history = self.trigger.volatile_audit_history.lock();
-                let before = history.len();
-                history.retain(|(stamped_at, _)| stamped_at.0 >= cutoff);
-                let removed = (before - history.len()) as u64;
-                drop(history);
-                Ok(removed.saturating_add(self.trigger.prune_original_audit_history(cutoff)))
-            }
-        }
+        self.publish_direct_metadata(|| self.persistence.prune_trigger_audit_history(cutoff))
     }
 
     /// Cheap pre-check for `retire_snapshot_free_vector_partitions`: whether
@@ -2214,10 +2184,9 @@ impl MaintenanceContext {
     pub(super) fn vector_partition_retirement_is_possible(&self) -> bool {
         self.vector.has_snapshot_free_retirement_candidate()
             || self.vector.has_retired_graph_generations()
-            || (self.persistence.is_some()
-                && self
-                    .snapshot_registry
-                    .no_snapshots_besides_construction_floors())
+            || self
+                .snapshot_registry
+                .no_snapshots_besides_construction_floors()
     }
 
     #[expect(
@@ -2338,9 +2307,7 @@ impl MaintenanceContext {
 
         let mut maintenance_vector_copy_owner =
             crate::vector_read_memory::admission(read_memory.clone());
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(VectorPartitionPublicationOutcome::default());
-        };
+        let persistence = &self.persistence;
         // Every retry re-enters format selection. A captured frontier that
         // outgrew an earlier estimate forces the existing paged base route.
         // A quarantined catalog is not a serving-format source. Repair must
@@ -3855,11 +3822,7 @@ impl MaintenanceContext {
             }
             Err(error) => return Err(error),
         };
-        let candidate_sample = self
-            .persistence
-            .as_ref()
-            .map(|_| self.vector_partitions_requiring_build())
-            .transpose()?;
+        let candidate_sample = Some(self.vector_partitions_requiring_build()?);
         if let Some(sample) = candidate_sample.as_ref() {
             cycle_failures.first = cycle_failures.first.or(sample.failures.first);
         }
@@ -3870,7 +3833,9 @@ impl MaintenanceContext {
         // An unpublished paged build keeps advancing even when this cycle's
         // sampled inventory does not select its route.
         let unselected_paged_builds = self.unselected_paged_builds(pending_vector_partitions)?;
-        let mut vector = if self.persistence.is_some() {
+        // Step 41 deletes this selection with the graph bodies below it.
+        let graph_route_store = Some(&self.persistence);
+        let mut vector = if graph_route_store.is_some() {
             self.run_native_vector_cycle(read_memory.clone())?
         } else if !pending_vector_partitions.is_empty() || !unselected_paged_builds.is_empty() {
             // File-backed construction publishes through the durable catalog
@@ -3925,7 +3890,7 @@ impl MaintenanceContext {
             report.first_failure = first_failure_details.map(|details| details.failure);
             report.first_failure_details = first_failure_details;
             report
-        } else if self.persistence.is_some() {
+        } else if graph_route_store.is_some() {
             let mut report = self.vector.hnsw_maintenance_status();
             let first_failure_details = cycle_failures.first.or(report.first_failure_details);
             report.first_failure = first_failure_details.map(|details| details.failure);

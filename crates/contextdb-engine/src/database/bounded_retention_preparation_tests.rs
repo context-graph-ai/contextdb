@@ -194,6 +194,7 @@ fn impossible_expiry_limit_preserves_old_state_with_typed_refusal() {
     db.accountant.set_budget(Some(used + 800)).unwrap();
     let failure = db
         .maintenance_context()
+        .unwrap()
         .stamp_expired_rows(Wallclock(1_000_000))
         .unwrap_err();
     match failure {
@@ -332,6 +333,7 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
     }
     db.commit(tx).unwrap();
     db.maintenance_context()
+        .unwrap()
         .stamp_expired_rows(Wallclock(1_000_000))
         .unwrap();
     let row = durable_observation::rows(&db, "retained")[0].row_id;
@@ -608,6 +610,7 @@ fn surviving_wide_index_rebuild_is_admitted_before_durable_reclamation() {
         .unwrap();
     }
     db.maintenance_context()
+        .unwrap()
         .stamp_expired_rows(Wallclock(1_000_000))
         .unwrap();
     let used = db.accountant.usage().used;
@@ -689,6 +692,7 @@ fn affected_lsn_siblings_are_admitted_before_reclamation() {
     }
     db.commit(tx).unwrap();
     db.maintenance_context()
+        .unwrap()
         .stamp_expired_rows(Wallclock(1_000_000))
         .unwrap();
     let used = db.accountant.usage().used;
@@ -747,6 +751,7 @@ fn wide_partition_inventory_is_admitted_before_reclamation() {
         .unwrap();
     }
     db.maintenance_context()
+        .unwrap()
         .stamp_expired_rows(Wallclock(1_000_000))
         .unwrap();
     let used = db.accountant.usage().used;
@@ -817,6 +822,7 @@ fn repeated_wide_membership_copies_are_admitted_before_reclamation() {
         .unwrap();
     }
     db.maintenance_context()
+        .unwrap()
         .stamp_expired_rows(Wallclock(1_000_000))
         .unwrap();
     let used = db.accountant.usage().used;

@@ -3460,21 +3460,6 @@ impl DatabaseTransactionHost {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn try_remove_commit_index_entries(&self, lsns: &[Lsn]) -> Result<u64> {
-        match self {
-            Self::Legacy(manager) => manager.try_remove_commit_index_entries(lsns),
-            Self::Owned(handle) => handle.with_host(|host| {
-                host.transactions.with_transactions(|transactions| {
-                    transactions.try_remove_commit_index_entries(lsns)
-                })
-            }),
-        }
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(super) fn allocate_ddl_lsn<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(Lsn) -> Result<R>,

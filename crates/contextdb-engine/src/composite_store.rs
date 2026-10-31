@@ -513,42 +513,6 @@ pub(crate) fn build_received_schema_change_log_entries(
     entries
 }
 
-/// Infallibly append an already-prepared log payload and its two derived
-/// indexes. Received-schema publication calls this after Redb succeeds,
-/// without replaying any data WriteSet into the stores a second time.
-pub(crate) fn publish_prepared_change_log_entries(
-    accountant: &MemoryAccountant,
-    change_log: &RwLock<Vec<ChangeLogEntry>>,
-    table_index: &RwLock<ChangeLogTableIndex>,
-    lsn_refcounts: &RwLock<ChangeLogLsnRefcounts>,
-    structurally_dropped_tables: &HashSet<String>,
-    entries: Vec<ChangeLogEntry>,
-) {
-    let mut table_index = table_index.write();
-    let mut lsn_refcounts = lsn_refcounts.write();
-    let mut change_log = change_log.write();
-    accountant.charge_retained(change_log_retained_bytes(&entries));
-    if !structurally_dropped_tables.is_empty() {
-        let before = change_log_retained_bytes(&change_log);
-        change_log.retain(|entry| match entry {
-            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } => {
-                !structurally_dropped_tables.contains(table)
-            }
-            ChangeLogEntry::VectorInsert { index, .. }
-            | ChangeLogEntry::VectorDelete { index, .. } => {
-                !structurally_dropped_tables.contains(&index.table)
-            }
-            ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => true,
-        });
-        accountant.release(before.saturating_sub(change_log_retained_bytes(&change_log)));
-        table_index.clear();
-        lsn_refcounts.clear();
-        record_change_log_entries(&mut table_index, &mut lsn_refcounts, &change_log);
-    }
-    record_change_log_entries(&mut table_index, &mut lsn_refcounts, &entries);
-    change_log.extend(entries);
-}
-
 pub struct CompositeStore {
     private_working_graph: bool,
     pub(crate) row_retirements: Arc<Mutex<crate::database::RetentionDeferredEdges>>,
@@ -2475,58 +2439,6 @@ mod tests {
         assert!(entries.iter().any(
             |entry| matches!(entry, ChangeLogEntry::VectorDelete { index, .. } if index.table == "kept")
         ));
-
-        let historic = vec![
-            ChangeLogEntry::RowInsert {
-                table: "dropped".to_string(),
-                row_id: RowId(1),
-                lsn: Lsn(4),
-            },
-            ChangeLogEntry::VectorInsert {
-                index: VectorIndexRef::new("dropped", "embedding"),
-                row_id: RowId(1),
-                lsn: Lsn(4),
-            },
-            ChangeLogEntry::RowInsert {
-                table: "kept".to_string(),
-                row_id: RowId(2),
-                lsn: Lsn(5),
-            },
-        ];
-        let change_log = RwLock::new(historic.clone());
-        let table_index = RwLock::new(ChangeLogTableIndex::new());
-        let lsn_refcounts = RwLock::new(ChangeLogLsnRefcounts::new());
-        record_change_log_entries(
-            &mut table_index.write(),
-            &mut lsn_refcounts.write(),
-            &historic,
-        );
-
-        publish_prepared_change_log_entries(
-            &MemoryAccountant::no_limit(),
-            &change_log,
-            &table_index,
-            &lsn_refcounts,
-            &structurally_dropped_tables,
-            entries,
-        );
-
-        assert!(!change_log.read().iter().any(|entry| match entry {
-            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } =>
-                table == "dropped",
-            ChangeLogEntry::VectorInsert { index, .. }
-            | ChangeLogEntry::VectorDelete { index, .. } => index.table == "dropped",
-            _ => false,
-        }));
-        assert_eq!(
-            table_index.read().get("dropped"),
-            None,
-            "retired generation coordinates leave the auxiliary index too"
-        );
-        assert!(
-            table_index.read().contains_key("kept"),
-            "unaffected table history and newly published deletes remain indexed"
-        );
     }
 }
 

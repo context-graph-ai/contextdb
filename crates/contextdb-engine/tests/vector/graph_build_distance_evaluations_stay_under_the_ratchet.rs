@@ -33,7 +33,7 @@ fn graph_build_distance_evaluations_stay_under_the_ratchet() {
     let db = Database::open(root.path().join("graph-baseline.redb"))
         .expect("open the durable baseline fixture");
     assert!(
-        !db.is_memory_backed(),
+        db.disk_file_size().is_some(),
         "the ratchet must use the frozen baseline's file-backed storage"
     );
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);

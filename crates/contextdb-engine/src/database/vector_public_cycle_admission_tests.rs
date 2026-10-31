@@ -883,6 +883,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     if matches!(kind, UnknownCatalog::Incomplete) {
         let inventory = db
             .maintenance_context()
+            .unwrap()
             .maintenance_catalog_inventory()
             .unwrap();
         assert!(!inventory.complete);
@@ -926,6 +927,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         );
         let candidates = db
             .maintenance_context()
+            .unwrap()
             .maintenance_build_candidates()
             .unwrap();
         assert!(
@@ -942,6 +944,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     if matches!(kind, UnknownCatalog::Miskey) {
         let inventory = db
             .maintenance_context()
+            .unwrap()
             .maintenance_catalog_inventory()
             .unwrap();
         assert!(inventory.complete);
@@ -1711,6 +1714,7 @@ fn public_cycle_candidate_sort_heap_refusal_releases_and_retries_stably() {
     CANDIDATE_SORT_FOR_TEST.with(|active| active.borrow_mut().refuse = false);
     let candidates = db
         .maintenance_context()
+        .unwrap()
         .maintenance_build_candidates()
         .unwrap();
     assert_eq!(candidates.candidates.len(), 22);

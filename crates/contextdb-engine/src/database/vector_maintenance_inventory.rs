@@ -330,9 +330,7 @@ impl MaintenanceContext {
                 Err(error) => return Err(error),
             }
         }
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(phase);
-        };
+        let persistence = &self.persistence;
         let scanned = vector_source_page_admission::with_preparation_source_page_admission(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || {
@@ -705,17 +703,10 @@ impl MaintenanceContext {
             );
         }
         let cursor = if phase.complete {
-            match self.persistence.as_ref() {
-                Some(persistence) => {
-                    vector_source_page_admission::with_preparation_source_page_admission(
-                        crate::memory_accounting::AccountantHandle::clone(
-                            &self.finalization.accountant,
-                        ),
-                        || persistence.maintenance_vector_catalog_cursor(),
-                    )?
-                }
-                None => None,
-            }
+            vector_source_page_admission::with_preparation_source_page_admission(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                || self.persistence.maintenance_vector_catalog_cursor(),
+            )?
         } else {
             None
         };
@@ -752,9 +743,8 @@ impl MaintenanceContext {
         let mut failures = MaintenanceMetadataFailures {
             first: stream.inventory.failures.first,
         };
-        if let (Some(persistence), Some(cursor)) =
-            (self.persistence.as_ref(), stream.cursor.as_mut())
-        {
+        let persistence = &self.persistence;
+        if let Some(cursor) = stream.cursor.as_mut() {
             loop {
                 self.build_checkpoint()?;
                 let next = vector_source_page_admission::with_preparation_source_page_admission(
@@ -1044,9 +1034,7 @@ impl MaintenanceContext {
         publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
         registered_snapshots: &[SnapshotId],
     ) -> Result<usize> {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(0);
-        };
+        let persistence = &self.persistence;
         let mut reclaimed = 0usize;
         let mut first_failure = None;
         let mut reclaim = |entry: &mut AdmittedMaintenanceCatalog| -> Result<bool> {
@@ -1209,7 +1197,7 @@ impl MaintenanceContext {
                     // released every other catalog body.
                     let fixed = fixed.saturating_add(Self::vector_route_inventory_bytes(&route));
                     workspace.resize_static(fixed, PREPARE, HINT)?;
-                    let catalog = match self.persistence.as_ref().filter(|_| phase.sources[source_position].quarantine.is_none()) {
+                    let catalog = match phase.sources[source_position].quarantine.is_none().then_some(&self.persistence) {
                         Some(persistence) => vector_source_page_admission::with_preparation_source_page_admission(
                             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             || persistence.load_vector_partition_generation_catalog_for(&route.index, &route.partition_key),
@@ -1243,7 +1231,8 @@ impl MaintenanceContext {
                             continue;
                         }
                     };
-                    let retired_rebuild = if let Some(persistence) = self.persistence.as_ref() {
+                    let retired_rebuild = {
+                        let persistence = &self.persistence;
                         match vector_source_page_admission::with_preparation_source_page_admission(
                             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), || persistence.retired_vector_rebuild_pending(&route),
                         ) {
@@ -1257,7 +1246,7 @@ impl MaintenanceContext {
                             }
                             Err(error) => return Err(error),
                         }
-                    } else { false };
+                    };
 
                     info.quarantine_reason = phase.sources[source_position].quarantine;
                     let fresh = phase.sources[source_position]
@@ -1269,7 +1258,8 @@ impl MaintenanceContext {
                         .unwrap_or(Lsn(0));
                     let uncovered = if retired_rebuild || info.quarantine_reason.is_some() {
                         false
-                    } else if let Some(persistence) = self.persistence.as_ref() {
+                    } else {
+                        let persistence = &self.persistence;
                         match vector_source_page_admission::with_preparation_source_page_admission(
                             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                             || {
@@ -1306,8 +1296,6 @@ impl MaintenanceContext {
                             }
                             Err(error) => return Err(error),
                         }
-                    } else {
-                        false
                     };
                     let ordinary_need = layout.maintenance_need(&info).is_some();
                     let reader_need = if ordinary_need || info.quarantine_reason.is_some() {
@@ -1371,9 +1359,7 @@ impl MaintenanceContext {
                 {
                     return Ok(false);
                 }
-                let Some(persistence) = self.persistence.as_ref() else {
-                    return Ok(false);
-                };
+                let persistence = &self.persistence;
                 let heap = RedbPersistence::maintenance_vector_catalog_heap_bytes(catalog);
                 let fixed =
                     heap.saturating_add(RedbPersistence::vector_journal_cleanup_key_reservation(

@@ -213,11 +213,11 @@ fn lineage_projection_repair_preserves_a_discard_only_frontier() {
     db.close().unwrap();
 }
 
-fn export_preserves_canonical_control(memory_source: bool) {
+fn export_preserves_canonical_control(scratch_source: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("source.db");
     let artifact = directory.path().join("artifact.db");
-    let db = if memory_source {
+    let db = if scratch_source {
         let db = Database::open_memory();
         db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT) HISTORY ALL SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST", &HashMap::new()).unwrap();
         db.execute(
@@ -229,18 +229,8 @@ fn export_preserves_canonical_control(memory_source: bool) {
     } else {
         seed(&path)
     };
-    if memory_source {
-        db.execute("DELETE FROM items WHERE id = 1", &HashMap::new())
-            .unwrap();
-        db.publish_memory_erasure_frontier_for_test(
-            &BTreeSet::from(["items".to_owned()]),
-            db.current_lsn(),
-        )
+    db.execute("DISCARD FROM items WHERE id = 1", &HashMap::new())
         .unwrap();
-    } else {
-        db.execute("DISCARD FROM items WHERE id = 1", &HashMap::new())
-            .unwrap();
-    }
     let erased = db.current_lsn();
     let report = db.export_snapshot(&artifact).unwrap();
     assert!(report.snapshot_lsn >= erased);
@@ -252,22 +242,18 @@ fn export_preserves_canonical_control(memory_source: bool) {
     drop(persistence);
     let restored = Database::open(&artifact).unwrap();
     assert!(restored.current_lsn() >= erased);
-    // The memory fixture proves canonical controls and local coordinates;
-    // fresh life after durable DISCARD is the file-backed contract.
-    if !memory_source {
+    restored
+        .execute("INSERT INTO items VALUES (1, 'fresh')", &HashMap::new())
+        .unwrap();
+    assert_eq!(
         restored
-            .execute("INSERT INTO items VALUES (1, 'fresh')", &HashMap::new())
-            .unwrap();
-        assert_eq!(
-            restored
-                .read_session(ReadLimits::default())
-                .unwrap()
-                .execute("SELECT body FROM items WHERE id = 1", &HashMap::new())
-                .unwrap()
-                .rows(),
-            vec![vec![contextdb_core::Value::Text("fresh".into())]]
-        );
-    }
+            .read_session(ReadLimits::default())
+            .unwrap()
+            .execute("SELECT body FROM items WHERE id = 1", &HashMap::new())
+            .unwrap()
+            .rows(),
+        vec![vec![contextdb_core::Value::Text("fresh".into())]]
+    );
     restored.close().unwrap();
 }
 #[test]
@@ -275,7 +261,7 @@ fn a_file_export_preserves_discard_controls_and_their_local_lsn_floor() {
     export_preserves_canonical_control(false);
 }
 #[test]
-fn a_memory_export_preserves_canonical_controls_and_their_local_lsn_floor() {
+fn a_scratch_export_preserves_discard_controls_and_their_local_lsn_floor() {
     export_preserves_canonical_control(true);
 }
 

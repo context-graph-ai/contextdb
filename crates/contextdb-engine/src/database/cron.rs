@@ -712,6 +712,9 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Lsn> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        if self.persistence.is_none() {
+            return Err(Error::Other("cron requires a file-backed database".into()));
+        }
 
         (|| {
             let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
@@ -832,7 +835,7 @@ impl Database {
                             self.event_bus
                                 .ensure_queue_capacity(&prepared_sink_events)?;
                         }
-                        if self.persistence.is_some() && !prepared_sink_events.is_empty() {
+                        if !prepared_sink_events.is_empty() {
                             ws.config_writes.push((
                                 super::event_bus::NEXT_ACTION_ID_CONFIG_KEY.to_string(),
                                 RedbPersistence::encode_config_value(
@@ -840,9 +843,7 @@ impl Database {
                                 )?,
                             ));
                         }
-                        if self.persistence.is_some()
-                            && let Some(lsn) = ws.commit_lsn
-                        {
+                        if let Some(lsn) = ws.commit_lsn {
                             self.event_bus
                                 .stage_sink_events_for_persistence(lsn, prepared_sink_events);
                         } else {
@@ -882,15 +883,13 @@ impl Database {
                         self.release_delete_allocations_from_bytes(&delete_release_bytes.borrow());
                         drop(vector_schema_guard.take());
                         self.plugin.post_commit(&ws, CommitSource::AutoCommit);
-                        let sink_events_to_publish = if self.persistence.is_some() {
-                            ws.commit_lsn
-                                .and_then(|lsn| {
-                                    self.event_bus.take_staged_sink_events_for_persistence(lsn)
-                                })
+                        let sink_events_to_publish = match ws.commit_lsn {
+                            Some(lsn) => self
+                                .event_bus
+                                .take_staged_sink_events_for_persistence(lsn)
                                 .map(EventBusState::materialize_staged_sink_events)
-                                .unwrap_or_default()
-                        } else {
-                            pending_sink_events
+                                .unwrap_or_default(),
+                            None => pending_sink_events,
                         };
                         self.publish_prepared_sink_events_to_memory(sink_events_to_publish);
                         self.append_trigger_audits_to_memory(committed_trigger_audit_entries);

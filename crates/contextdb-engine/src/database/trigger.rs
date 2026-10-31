@@ -2213,6 +2213,23 @@ impl Database {
         })
     }
 
+    /// Runs a callback copied onto this handle exactly as a firing does.
+    #[cfg(test)]
+    pub(super) fn fire_copied_trigger_callback_for_test(
+        &self,
+        name: &str,
+        ctx: &TriggerContext,
+    ) -> Result<()> {
+        let callback = self
+            .trigger
+            .callbacks
+            .read()
+            .get(name)
+            .cloned()
+            .expect("the callback was copied onto this handle");
+        self.run_trigger_callback(ctx.tx, ctx, callback)
+    }
+
     fn run_trigger_callback(
         &self,
         tx: TxId,
@@ -5193,41 +5210,6 @@ impl Database {
         drop(persistence);
         drop(next);
         drop(_memory);
-    }
-}
-
-impl TriggerState {
-    pub(crate) fn prune_original_audit_history(&self, cutoff: u64) -> u64 {
-        let mut removed_count = 0;
-        loop {
-            let removed = {
-                let mut head = self.native_audit_history.lock();
-                let mut slot = &mut *head;
-                loop {
-                    match slot.as_ref() {
-                        Some(link) if link.node.stamped_at.0 < cutoff => {
-                            let mut removed =
-                                slot.take().expect("expired original audit history entry");
-                            *slot = removed.node.next.take();
-                            break Some(removed);
-                        }
-                        Some(_) => {
-                            slot = &mut slot
-                                .as_mut()
-                                .expect("live original history entry")
-                                .node
-                                .next;
-                        }
-                        None => break None,
-                    }
-                }
-            };
-            if removed.is_none() {
-                return removed_count;
-            }
-            drop(removed);
-            removed_count += 1;
-        }
     }
 }
 

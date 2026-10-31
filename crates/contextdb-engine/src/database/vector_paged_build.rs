@@ -464,13 +464,12 @@ impl MaintenanceContext {
         }
         // An oversized selected base must be replaced, rather than retaining
         // it underneath a small sealed change that would still be unservable.
-        let catalog = match self.persistence.as_ref() {
-            Some(persistence) => persistence.load_vector_partition_generation_catalog_for(
+        let catalog = self
+            .persistence
+            .load_vector_partition_generation_catalog_for(
                 &partition.index,
                 &partition.partition_key,
-            )?,
-            None => None,
-        };
+            )?;
         Ok(!self.reader_serving_replacement_needed(partition, catalog.as_ref())?)
     }
 
@@ -489,9 +488,7 @@ impl MaintenanceContext {
         let Some(catalog) = catalog else {
             return Ok(false);
         };
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(false);
-        };
+        let persistence = &self.persistence;
         // Metadata only, under an admitted route workspace. A native base
         // stays native regardless of a small reader's per-request limit:
         // it is never repeatedly rebuilt for whole-graph serving feasibility.
@@ -590,9 +587,7 @@ impl MaintenanceContext {
     ) -> Result<Option<VectorPartitionPublicationOutcome>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(None);
-        };
+        let persistence = &self.persistence;
         // A quarantined route leaves this path for repair before anything
         // reads its retired generations: that inspection reads generation
         // records, which repair admits as source pages of its own.
@@ -1717,9 +1712,7 @@ impl MaintenanceContext {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn reclaim_paged_vector_storage(&self) -> Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
-        };
+        let persistence = &self.persistence;
         // One exit guard starts before the first fallible read/admission.
         // An intentional UNKNOWN result retains its admitted progress; every
         // unexpected error/cancellation, including early reads, releases it.
@@ -1804,20 +1797,14 @@ impl MaintenanceContext {
                 return Err(error);
             }
             Err(error) => {
-                if !self
-                    .persistence
-                    .as_ref()
-                    .is_some_and(|p| p.repair_orphan_audit_blocked())
-                {
+                if !self.persistence.repair_orphan_audit_blocked() {
                     return Err(error);
                 }
                 // UNKNOWN ownership is still a durable erasure fence. The
                 // existing typed fence refusal below is the PURGE answer.
             }
         }
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
-        };
+        let persistence = &self.persistence;
         vector_source_page_admission::with_preparation_source_page_admission(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
             || {
@@ -1865,9 +1852,7 @@ impl MaintenanceContext {
         &self,
         selected: &[MaintenanceBuildCandidate],
     ) -> Result<Vec<VectorPartitionRef>> {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(Vec::new());
-        };
+        let persistence = &self.persistence;
         Ok(persistence
             .load_paged_build_records()?
             .into_iter()
@@ -1896,9 +1881,7 @@ impl<'a> WholeBuildFloor<'a> {
 
 impl Drop for WholeBuildFloor<'_> {
     fn drop(&mut self) {
-        let Some(persistence) = self.context.persistence.as_ref() else {
-            return;
-        };
+        let persistence = &self.context.persistence;
         if let Err(error) = persistence.clear_construction_floor(self.partition) {
             tracing::warn!(%error, "could not clear a whole vector build's durable floor");
             return;

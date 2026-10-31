@@ -25,7 +25,7 @@ pub(super) fn compact_currency_versions_inner(
     _graph_store: &Arc<GraphStore>,
     vector_store: &Arc<VectorStore>,
     accountant: &crate::memory_accounting::AccountantHandle,
-    persistence: Option<&Arc<RedbPersistence>>,
+    persistence: &Arc<RedbPersistence>,
     change_log: &Arc<RwLock<Vec<ChangeLogEntry>>>,
     change_log_table_index: &Arc<RwLock<ChangeLogTableIndex>>,
     change_log_lsn_refcounts: &Arc<RwLock<ChangeLogLsnRefcounts>>,
@@ -33,7 +33,6 @@ pub(super) fn compact_currency_versions_inner(
     snapshot_registry: &Arc<SnapshotFloorRegistry>,
     publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
     publication_interrupted: &Arc<AtomicBool>,
-    row_retirements: &Arc<Mutex<RetentionDeferredEdges>>,
     tables: &[&str],
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<CurrencyCompactionReport> {
@@ -410,17 +409,14 @@ pub(super) fn compact_currency_versions_inner(
 
     // Capture candidate membership before the same durable transaction removes
     // it. The file directory has no second resident map to remove afterward.
-    let durable_directory_removals = if persistence.is_some() {
+    let durable_directory_removals =
         commit_index_candidates
             .iter()
             .try_fold(0u64, |count, lsn| {
                 tx_mgr
                     .try_commit_index_contains(*lsn)
                     .map(|present| count + u64::from(present))
-            })?
-    } else {
-        0
-    };
+            })?;
 
     // Only tables with selected row or vector removals belong to this
     // atomic cleanup. Unchanged tables' generation catalogs are handled by
@@ -439,21 +435,14 @@ pub(super) fn compact_currency_versions_inner(
         active_removal_pass.registered_snapshots(),
         &mut vector_copy_owner,
     )?;
-    let mut vector_keys_rewritten = 0u64;
-    let mut first_failure_details: Option<VectorMaintenanceFailureDetails> = None;
+    let vector_keys_rewritten;
+    let first_failure_details: Option<VectorMaintenanceFailureDetails>;
     let schema_history = relational_store.prepare_schema_history_erasure(
         row_keys.iter().map(|(_, row, _, lsn)| (*row, *lsn)),
         accountant.read_budget()?,
     )?;
-    let memory_retirement_keys = if persistence.is_none() {
-        row_retirements
-            .lock()
-            .prepare_version_retirement_cleanup(&row_keys, &mut workspace)?
-    } else {
-        Vec::new()
-    };
-    let mut publication_watch = None;
-    if let Some(persistence) = persistence {
+    let publication_watch;
+    {
         // Fail before any durable or in-memory removal. The same selected
         // identities remain available to a later cycle after an error.
         if take_currency_compaction_persist_fault_for_test() {
@@ -521,20 +510,9 @@ pub(super) fn compact_currency_versions_inner(
     // count is always 0 even though the in-memory index genuinely shrinks).
     let commit_index_keys_removed = if commit_index_candidates.is_empty() {
         0
-    } else if persistence.is_some() {
-        durable_directory_removals
     } else {
-        let removed = tx_mgr.try_remove_commit_index_entries(&commit_index_candidates)?;
-        if persistence.is_none() {
-            accountant.release(
-                (removed as usize).saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
-            );
-        }
-        removed
+        durable_directory_removals
     };
-    row_retirements
-        .lock()
-        .discard_prepared_retirements(memory_retirement_keys);
     relational_store.publish_schema_history_erasure(schema_history);
     for (table, versions) in &pruned_versions_by_table {
         relational_store.remove_row_versions(table, versions);

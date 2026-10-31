@@ -4095,6 +4095,9 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            Error::Other("a hub push reply requires a file-backed database".into())
+        })?;
 
         if ordinary_refused_rows.is_empty()
             && purge_refused_rows.is_empty()
@@ -4102,19 +4105,10 @@ impl Database {
             && pending.is_none()
             && let Some(through) = confirmed_through
         {
-            if let Some(persistence) = &self.persistence {
-                self.publish_direct_metadata(|| persistence.flush_sync_progress_value(
-                    &tenant_id.config_key("sync_push_watermark"),
-                    &through.0,
-                ))?;
-            } else {
-                self.in_memory_sync_progress
-                    .lock()
-                    .tenants
-                    .entry(tenant_id.as_str().to_string())
-                    .or_default()
-                    .push_watermark = through;
-            }
+            self.publish_direct_metadata(|| persistence.flush_sync_progress_value(
+                &tenant_id.config_key("sync_push_watermark"),
+                &through.0,
+            ))?;
             return Ok(());
         }
         self.tx_mgr.with_maintenance_publication(|publication| {
@@ -4129,7 +4123,7 @@ impl Database {
             };
             let context_key = Self::terminal_refusal_context_key(&context);
             let mut scans = self.terminal_refusal_scans.write();
-            let mut lineage = self.lineage_state_lock.lock();
+            let lineage = self.lineage_state_lock.lock();
             let prior_scan = scans.get(&context_key).cloned().or(
                 self.persistence.as_ref().map(|p| p.load_config_value::<TerminalRefusalScanState>(
                     &Self::terminal_refusal_scan_config_key(&context),
@@ -4206,30 +4200,8 @@ impl Database {
                 writes.push((tenant_id.config_key("sync_pending_push_confirmation"), RedbPersistence::encode_config_value(&through.0)?));
                 writes.push((tenant_id.config_key("sync_pending_push_result"), RedbPersistence::encode_config_value(&crate::protocol::WireApplyResult::from(result.clone()))?));
             }
-            let pending_source = if self.persistence.is_none()
-                && (!deletes.is_empty() || !accepted_deletes.is_empty()) {
-                Some(self.prepare_resident_pending_changes(
-                    &lineage,
-                    deletes.iter().map(|key| (key.as_str(), None)).chain(
-                        accepted_deletes.iter().map(|(key, record)| (key.as_str(), Some(record))),
-                    ),
-                )?)
-            } else { None };
             publication.reserve()?;
-            if let Some(persistence) = &self.persistence {
-                persistence.commit_sync_reply_effects(&sources, &writes, &deletes)?;
-            } else {
-                for key in &deletes { lineage.records.remove(key); }
-                lineage.records.extend(accepted_deletes);
-                if let Some(pending_source) = pending_source { pending_source.publish(); }
-                let mut progress = self.in_memory_sync_progress.lock();
-                let progress = progress.tenants.entry(tenant_id.as_str().to_string()).or_default();
-                if let Some(through) = confirmed_through { progress.push_watermark = through; }
-                if let Some((through, result)) = pending {
-                    progress.pending_push_confirmation = Some(through);
-                    progress.pending_push_result = Some(result.clone().into());
-                }
-            }
+            persistence.commit_sync_reply_effects(&sources, &writes, &deletes)?;
             self.relational_store.set_sync_source_lsns(sources.iter().map(|(table, row, lsn, _)| (table.clone(), *row, *lsn)).collect::<Vec<_>>());
             self.relational_store.set_sync_source_kinds(sources.into_iter().map(|(table, row, _, _)|
                 (table, row, contextdb_relational::store::SyncSourceKind::AcceptedLocal)));

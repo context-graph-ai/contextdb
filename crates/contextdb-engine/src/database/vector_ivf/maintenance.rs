@@ -7,9 +7,7 @@ impl MaintenanceContext {
     ) -> Result<VectorMaintenanceReport> {
         #[cfg(feature = "test-seams")]
         let _native_activity = self.vector.native_index_activity_scope_for_test();
-        let Some(persistence) = &self.persistence else {
-            return Ok(VectorMaintenanceReport::default());
-        };
+        let persistence = &self.persistence;
         let mut copy_owner = crate::vector_read_memory::admission(memory.clone());
         let mut report = VectorMaintenanceReport::default();
         let routes = match super::super::maintenance_runtime::vector_partition_routes(

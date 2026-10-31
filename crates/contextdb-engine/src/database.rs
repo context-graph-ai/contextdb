@@ -10,14 +10,12 @@ mod custody_store;
 use contextdb_core::read_memory::ReadMemoryBudget as _;
 #[cfg(feature = "test-seams")]
 pub use custody_store::HeldCustodyRootForTest;
-mod erasure_frontiers;
 mod publication_registration;
 use publication_registration::{ReadPublicationReaders, ReadPublicationRegistration};
 mod schema_history_memory;
 use schema_history_memory::{PreparedSchemaHistory, SchemaHistoryMemory};
 mod graph_cursor_claims;
 mod maintenance_frontier;
-use erasure_frontiers::MemoryErasureFrontiers;
 pub(crate) use graph_cursor_claims::{EngineGraphBfsCursor, GraphCursorReadGuard};
 #[cfg(feature = "sync-orchestration")]
 pub(crate) mod native_custody_selection;
@@ -72,7 +70,7 @@ use crate::blob_repository::BlobRepository;
 use crate::composite_store::{
     ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,
     VectorPartitionSnapshotStageRegistry, build_received_schema_change_log_entries,
-    publish_prepared_change_log_entries, record_change_log_entries,
+    record_change_log_entries,
 };
 pub use crate::custody_types::{DeliveryManifest, DeliveryOutcome};
 #[cfg(any(test, feature = "test-seams"))]
@@ -520,7 +518,6 @@ struct ReceivedSchemaMemoryMirrors {
     received_ddl_arrivals: HashMap<(Lsn, u32), DurableReceivedDdlArrival>,
     superseded_ddl_occurrences: HashMap<(Lsn, u32), DurableSupersededDdlOccurrence>,
     source_state: HashMap<(String, String), SyncTombstoneArrival>,
-    graph_arrivals: HashMap<GraphIdentity, FundedGraphArrival>,
     accepted_authors: HashMap<(String, Vec<u8>), String>,
     terminal_markers: HashMap<TerminalRefusalMarkerKey, TerminalRefusalMarkerRecord>,
     terminal_scans: HashMap<TerminalRefusalContextKey, TerminalRefusalScanState>,
@@ -586,11 +583,6 @@ pub(crate) struct ReceivedSchemaStage {
     /// staged receiver commit has crossed durability; test-only receipt
     /// observation copies it immediately before this stage is consumed.
     apply_result: ApplyResult,
-    /// Absent for an unattested unit: a manifest is the replay identity of a
-    /// SIGNED migration, and a unit with no provenance has nothing to be
-    /// idempotent against.
-    received_schema_manifest: Option<(String, DurableReceivedSchemaManifest)>,
-    in_memory_lineage_delta: InMemoryLineageDelta,
     /// Moved (never copied) into the committing transaction by the
     /// pre-commit callback, through the registry's shared access; the lock is
     /// inline and allocates nothing.
@@ -1482,7 +1474,6 @@ struct DurableUnboundCreationLineage {
 /// A new `Database::open_memory()` always creates an empty instance.
 #[derive(Default, Clone)]
 struct InMemoryLineageState {
-    erasure_frontiers: MemoryErasureFrontiers,
     connected_membership: contextdb_relational::membership::MembershipImage,
     unbound_creations: HashMap<String, DurableUnboundCreationLineage>,
     row_sidecars: HashMap<String, DurableRowLineageSidecar>,
@@ -4847,6 +4838,9 @@ impl Drop for RetentionDeferredEdges {
 /// synchronously (`Database::run_maintenance_cycle`) or the engine's own loop
 /// dispatches it on a tick.
 pub(crate) struct MaintenanceContext {
+    /// Declared first: it retires ahead of every other payload field, right
+    /// after the optional worker owners that `Drop` takes.
+    persistence: Arc<RedbPersistence>,
     /// The store declaration, independent of a request choosing a lower limit.
     reader_memory_limit: u64,
     read_request_provider: crate::vector_read_memory::ReadRequestProvider,
@@ -4860,7 +4854,6 @@ pub(crate) struct MaintenanceContext {
     relational: Arc<RelationalStore>,
     graph: Arc<GraphStore>,
     vector: Arc<VectorStore>,
-    persistence: Option<Arc<RedbPersistence>>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
     change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
     change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,

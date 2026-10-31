@@ -150,8 +150,8 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
     persistence.attach_memory_accountant(db.accountant.clone());
-    let mut context = db.maintenance_context();
-    context.persistence = Some(Arc::clone(&persistence));
+    let mut context = db.maintenance_context().unwrap();
+    context.persistence = Arc::clone(&persistence);
     let baseline = db.accountant.usage().used;
     let snapshot_holds = db.snapshot_registry.state.lock().active.len();
     let headroom = 512 * 1024;
@@ -428,8 +428,8 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     // No cached or write-buffer page can mask the physical source extent.
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
     persistence.attach_memory_accountant(db.accountant.clone());
-    let mut context = db.maintenance_context();
-    context.persistence = Some(Arc::clone(&persistence));
+    let mut context = db.maintenance_context().unwrap();
+    context.persistence = Arc::clone(&persistence);
     let baseline = db.accountant.usage().used;
     let snapshot_holds = db.snapshot_registry.state.lock().active.len();
     let headroom = 512 * 1024;
@@ -659,8 +659,8 @@ fn wide_text_partition_metadata_refuses_before_cold_catalog_lookup() {
     drop(persistence);
     let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
     persistence.attach_memory_accountant(db.accountant.clone());
-    let mut context = db.maintenance_context();
-    context.persistence = Some(Arc::clone(&persistence));
+    let mut context = db.maintenance_context().unwrap();
+    context.persistence = Arc::clone(&persistence);
 
     let baseline = db.accountant.usage().used;
     let headroom = 4096;

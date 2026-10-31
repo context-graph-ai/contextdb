@@ -6109,7 +6109,7 @@ fn integrity_04_edge_delete_releases_memory() {
     // equal `used_after_insert` plus exactly this commit's own retained change-log charge,
     // computed the same way the commit path computes it (no slack).
     let expected_delete_commit_charge =
-        db.__change_log_commit_charge_since_for_test(pre_delete_lsn, 1);
+        db.__change_log_commit_charge_since_for_test(pre_delete_lsn);
     let expected_after_delete = used_after_insert + expected_delete_commit_charge;
     let used_after_delete = accountant.usage().used;
     assert_eq!(

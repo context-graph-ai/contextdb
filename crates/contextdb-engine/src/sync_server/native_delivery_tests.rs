@@ -2287,7 +2287,7 @@ async fn the_iroh_native_root_is_retired_by_every_way_its_serve_ends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_throwaway_hub_is_durable_and_served_natively_under_run_until_stopped() {
     let world = World::with_hub_store(true);
-    assert!(!world.hub_db.is_memory_backed());
+    assert!(world.hub_db.disk_file_size().is_some());
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
     let server = world.server(&requests);

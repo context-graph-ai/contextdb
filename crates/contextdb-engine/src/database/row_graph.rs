@@ -1533,39 +1533,6 @@ impl Database {
 }
 
 impl RetentionDeferredEdges {
-    #[expect(
-        clippy::result_large_err,
-        reason = "Preserve typed inline storage errors."
-    )]
-    pub(super) fn prepare_version_retirement_cleanup(
-        &self,
-        rows: &[(String, RowId, TxId, Lsn)],
-        workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
-    ) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
-        for (table, row, created, lsn) in rows {
-            let prefix = crate::persistence::row_graph::retirement_version_prefix(
-                table, *row, *created, *lsn,
-            )?;
-            for (key, _) in self.retired.range::<str, _>((
-                std::ops::Bound::Included(prefix.as_str()),
-                std::ops::Bound::Unbounded,
-            )) {
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                workspace.try_grow_for(
-                    key.len().saturating_add(2 * std::mem::size_of::<String>()),
-                    "retention",
-                    "prepare_cleanup",
-                    "Raise MEMORY_LIMIT to prepare exact retirement cleanup keys.",
-                )?;
-                keys.push(key.clone());
-            }
-        }
-        Ok(keys)
-    }
-
     pub(super) fn discard_prepared_retirements(&mut self, keys: Vec<String>) {
         for key in keys {
             if let Some((key, record)) = self.retired.remove_entry(&key) {

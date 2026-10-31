@@ -608,6 +608,19 @@ impl Database {
 
     /// Reserve the complete transient vector image and replacement-generation
     /// disk envelope before either erasure path faults a selected partition in.
+    /// Erasure owns every engine-held copy and completes on the durable owner.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn authoritative_purge_store(&self) -> Result<&Arc<RedbPersistence>> {
+        self.persistence.as_ref().ok_or_else(|| {
+            Error::SyncError(
+                ("authoritative purge requires a file-backed database".to_string()).into(),
+            )
+        })
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -618,6 +631,7 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<crate::read_image_memory::ImageVectorCopy> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        self.authoritative_purge_store()?;
 
         #[cfg(test)]
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
@@ -631,7 +645,7 @@ impl Database {
             .vector_store
             .purge_workspace_bounds(&selected_rows, &mut vector_copy_owner)?;
         if disk_bound != 0 {
-            self.maintenance_context()
+            self.maintenance_context()?
                 .admit_generation_disk(disk_bound)?;
         }
         let rows_bound = self
@@ -708,6 +722,7 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<AuthoritativePurgePreparedSet> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let persistence = self.authoritative_purge_store()?;
 
         #[cfg(test)]
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
@@ -846,7 +861,7 @@ impl Database {
                     }),
             )
             .collect::<HashSet<_>>();
-        let removed_graph_arrivals = if self.persistence.is_some() {
+        let removed_graph_arrivals = {
             let mut removed = Vec::new();
             for (source, target, edge_type, lsn, deleted) in &selected_graph_occurrences {
                 let identity = (*source, *target, edge_type.clone());
@@ -865,21 +880,6 @@ impl Database {
                 )?;
             }
             removed
-        } else {
-            self.sync_graph_arrivals
-                .read()
-                .iter()
-                .filter(|((source, target, edge_type), marker)| {
-                    selected_graph_occurrences.contains(&(
-                        *source,
-                        *target,
-                        edge_type.clone(),
-                        marker.local_lsn,
-                        marker.deleted,
-                    ))
-                })
-                .map(|(identity, marker)| (identity.clone(), (**marker).clone()))
-                .collect::<Vec<_>>()
         };
         let graph_arrival_config_keys = removed_graph_arrivals
             .iter()
@@ -943,10 +943,6 @@ impl Database {
                 ("authoritative purge edge change-log ownership is incomplete".to_string()).into(),
             ));
         }
-        let selected_change_log_position_set = selected_change_log_positions
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
         let change_log_entries = selected_change_log_positions
             .iter()
             .copied()
@@ -997,11 +993,6 @@ impl Database {
                 vector_partition_selectors.push(selector);
             }
         }
-        let persistence = self.persistence.as_ref().ok_or_else(|| {
-            Error::SyncError(
-                ("authoritative purge requires a file-backed database".to_string()).into(),
-            )
-        })?;
         let vector_partition_identities =
             persistence.resolve_vector_partition_version_identities(&vector_partition_selectors)?;
         let mut affected_vector_partitions = selected_partitioned_vector_entries
@@ -1165,17 +1156,7 @@ impl Database {
                 self.engine_sync_read_memory()?,
             )?);
         relational.admit_current_memberships(self.finalization.accountant.read_budget()?)?;
-        let replacement_change_log = if self.persistence.is_some() {
-            Vec::new()
-        } else {
-            change_log
-                .into_iter()
-                .enumerate()
-                .filter_map(|(position, entry)| {
-                    (!selected_change_log_position_set.contains(&position)).then_some(entry)
-                })
-                .collect::<Vec<_>>()
-        };
+        let replacement_change_log = Vec::new();
         let mut replacement_change_log_table_index = ChangeLogTableIndex::new();
         let mut replacement_change_log_lsn_refcounts = ChangeLogLsnRefcounts::new();
         record_change_log_entries(
@@ -1472,7 +1453,8 @@ impl Database {
             "Database::commit_authoritative_purge_tables");
         // A no-match PURGE must not falsely certify erasure while unknown
         // native storage may still contain the selected lineage.
-        self.maintenance_context()
+        self.authoritative_purge_store()?;
+        self.maintenance_context()?
             .prepare_vector_authoritative_erasure()?;
         let mut selections = Vec::new();
         for (table, matched) in tables {
@@ -2175,7 +2157,7 @@ impl Database {
                 ));
             };
 
-            self.maintenance_context()
+            self.maintenance_context()?
                 .prepare_vector_authoritative_erasure()?;
 
             // Candidate discovery and the callback drain both happen before the
@@ -2712,10 +2694,7 @@ impl Database {
         selected_table: &str,
         selected_row_ids: &HashSet<RowId>,
     ) -> Result<Vec<(String, RowId, Lsn, u8)>> {
-        if self.persistence.is_none() {
-            return self
-                .authoritative_purge_memory_source_provenance(selected_table, selected_row_ids);
-        }
+        self.authoritative_purge_store()?;
         let memory = self.engine_sync_read_memory()?;
         let _source = self.writer_read_scope(memory.clone())?;
         let root = self
@@ -2737,49 +2716,6 @@ impl Database {
                 )?;
                 rows.reserve_exact(1);
                 rows.push((selected_table.to_owned(), *row, lsn, kind));
-            }
-        }
-        self.retain_writer_output(output);
-        Ok(rows)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn authoritative_purge_memory_source_provenance(
-        &self,
-        table: &str,
-        selected_row_ids: &HashSet<RowId>,
-    ) -> Result<Vec<(String, RowId, Lsn, u8)>> {
-        let mut output =
-            contextdb_core::read_memory::ReadCredit::new(self.engine_sync_read_memory()?);
-        let mut rows = Vec::new();
-        for row_id in selected_row_ids {
-            if let (Some(lsn), Some(kind)) = (
-                self.relational_store.sync_source_lsn(table, *row_id),
-                self.relational_store.sync_source_kind(table, *row_id),
-            ) {
-                output.try_grow_for(
-                    table
-                        .len()
-                        .saturating_add(std::mem::size_of::<(String, RowId, Lsn, u8)>())
-                        .saturating_add(32),
-                    "writer_source",
-                    "selected_erasure_provenance",
-                    "Raise MEMORY_LIMIT to prepare selected erasure provenance.",
-                )?;
-                rows.reserve_exact(1);
-                rows.push((
-                    table.to_owned(),
-                    *row_id,
-                    lsn,
-                    match kind {
-                        contextdb_relational::store::SyncSourceKind::Pulled => 0,
-                        contextdb_relational::store::SyncSourceKind::AcceptedLocal => 1,
-                        contextdb_relational::store::SyncSourceKind::AcceptedLocalPending => 2,
-                    },
-                ));
             }
         }
         self.retain_writer_output(output);

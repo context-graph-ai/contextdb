@@ -2111,6 +2111,13 @@ impl Database {
     where
         F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
     {
+        // A callback can hand application code the private image it runs on.
+        // Delivery has one lifetime, owned by the database that was opened.
+        if self.persistence.is_none() {
+            return Err(Error::SinkRegistrationRequiresOpenedDatabase {
+                sink: name.to_owned(),
+            });
+        }
         if !self.event_bus.definitions.lock().sinks.contains_key(name) {
             return Err(Error::Other((format!("sink not found: {name}")).into()));
         }
@@ -2133,6 +2140,17 @@ impl Database {
         }
         self.event_bus.waiters.notify_all();
         Ok(())
+    }
+
+    /// How many delivery lifetimes this handle's event bus has started for a sink.
+    #[cfg(test)]
+    pub(super) fn sink_dispatcher_starts_for_test(&self, sink: &str) -> u64 {
+        self.event_bus
+            .runtime_starts
+            .lock()
+            .get(sink)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Current delivery counters and durable queue depth for a declared sink.
@@ -3170,6 +3188,11 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn ensure_sink_dispatcher_running(&self, sink: &str) -> Result<()> {
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            Error::SinkRegistrationRequiresOpenedDatabase {
+                sink: sink.to_owned(),
+            }
+        })?;
         #[cfg(target_os = "linux")]
         crate::owned_worker::ensure_finisher()?;
         if self.event_bus.runtimes.lock().contains_key(sink) {
@@ -3177,40 +3200,16 @@ impl Database {
         }
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             return handle.with_host(|host| {
-                // Admission/copy happens before the runtime-map guard. Both
-                // persistent and memory delivery use the exact owning host.
-                let persistent_worker = self
-                    .persistence
-                    .as_ref()
-                    .map(|persistence| {
-                        OwnedEventBusWorker::try_new(
-                            host.events.clone(),
-                            sink,
-                            persistence.clone(),
-                            self.tx_mgr.clone(),
-                            &self.finalization.accountant,
-                        )
-                    })
-                    .transpose()?;
-                let memory_worker = if persistent_worker.is_none() {
-                    Some(OwnedEventBusWorker::try_new(
-                        host.events.clone(),
-                        sink,
-                        OwnedMemoryQueuePersistence,
-                        self.tx_mgr.clone(),
-                        &self.finalization.accountant,
-                    )?)
-                } else {
-                    None
-                };
-                match persistent_worker {
-                    Some(worker) => self.start_owned_sink_worker(&host.events, sink, worker),
-                    None => self.start_owned_sink_worker(
-                        &host.events,
-                        sink,
-                        memory_worker.expect("prepared native memory worker"),
-                    ),
-                }
+                // Admission/copy happens before the runtime-map guard. Delivery
+                // uses the exact owning host.
+                let worker = OwnedEventBusWorker::try_new(
+                    host.events.clone(),
+                    sink,
+                    persistence.clone(),
+                    self.tx_mgr.clone(),
+                    &self.finalization.accountant,
+                )?;
+                self.start_owned_sink_worker(&host.events, sink, worker)
             });
         }
         let mut runtimes = self.event_bus.runtimes.lock();
@@ -3227,7 +3226,7 @@ impl Database {
         let worker = EventBusWorker {
             sink: sink.to_string(),
             event_bus: self.event_bus.clone(),
-            persistence: self.persistence.clone(),
+            persistence: persistence.clone(),
             tx_mgr: self.tx_mgr.clone(),
         };
         let thread_shutdown = shutdown.clone();
@@ -3533,7 +3532,7 @@ struct SinkRefillPlan {
 struct EventBusWorker {
     sink: String,
     event_bus: Arc<EventBusState>,
-    persistence: Option<Arc<RedbPersistence>>,
+    persistence: Arc<RedbPersistence>,
     tx_mgr: DatabaseTransactionHost,
 }
 
@@ -3907,11 +3906,11 @@ impl EventBusWorker {
             .lock()
             .as_ref()
             .map(crate::memory_accounting::AccountantHandle::clone);
-        let (Some(persistence), Some(accountant)) = (self.persistence.as_ref(), accountant) else {
+        let Some(accountant) = accountant else {
             clear(&self.event_bus);
             return false;
         };
-        let read = match persistence.load_sink_queue_window::<SinkQueueEntry>(
+        let read = match self.persistence.load_sink_queue_window::<SinkQueueEntry>(
             &self.sink,
             plan.after,
             plan.upper,
@@ -4092,9 +4091,7 @@ impl EventBusWorker {
             } else {
                 0
             };
-            if self.persistence.is_some() {
-                publication.reserve()?;
-            }
+            publication.reserve()?;
             // The durable rewrite encodes the resident entry itself with its
             // new attempt count: no copy of the payload is made.
             with_rewritten_attempts(entry, rewritten, |updated| {
@@ -4107,9 +4104,7 @@ impl EventBusWorker {
                     unconfirmed_delta,
                 )
             })?;
-            if self.persistence.is_some() {
-                publication.complete();
-            }
+            publication.complete();
             if start {
                 self.event_bus
                     .metrics
@@ -4159,18 +4154,14 @@ impl EventBusWorker {
                             removed.contains(&entry.id) && entry.attempts & UNCONFIRMED_ATTEMPT != 0
                         })
                         .count() as u64;
-                    if self.persistence.is_some() {
-                        publication.reserve()?;
-                    }
+                    publication.reserve()?;
                     persist_sink_queue_removals(
                         &self.persistence,
                         &self.sink,
                         &removable,
                         unconfirmed,
                     )?;
-                    if self.persistence.is_some() {
-                        publication.complete();
-                    }
+                    publication.complete();
                     queue.publish_removals(&removed, removable.len() as u64);
                     let mut metrics = self.event_bus.metrics.lock();
                     let state = metrics.entry(self.sink.clone()).or_default();
@@ -4353,16 +4344,13 @@ fn principal_matches_grant(principal: &Principal, grant: &HashMap<String, Value>
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn persist_sink_queue_update(
-    persistence: &Option<Arc<RedbPersistence>>,
+    persistence: &RedbPersistence,
     sink: &str,
     remove_id: Option<u64>,
     put: Option<&SinkQueueEntry>,
     uncertain: bool,
     unconfirmed_delta: i8,
 ) -> Result<()> {
-    let Some(persistence) = persistence.as_ref() else {
-        return Ok(());
-    };
     persistence.update_sink_queue_entry(
         sink,
         remove_id,
@@ -4377,14 +4365,11 @@ fn persist_sink_queue_update(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn persist_sink_queue_removals(
-    persistence: &Option<Arc<RedbPersistence>>,
+    persistence: &RedbPersistence,
     sink: &str,
     remove_ids: &[u64],
     unconfirmed: u64,
 ) -> Result<()> {
-    let Some(persistence) = persistence.as_ref() else {
-        return Ok(());
-    };
     persistence.remove_sink_queue_entries(sink, remove_ids, unconfirmed)
 }
 
@@ -8303,43 +8288,6 @@ pub(crate) trait OwnedSinkQueuePersistence {
             completion.mark_success();
         }
         failure.capture(result);
-    }
-}
-
-struct OwnedMemoryQueuePersistence;
-impl OwnedSinkQueuePersistence for OwnedMemoryQueuePersistence {
-    type Update<'o> = ();
-    type Removals<'o> = ();
-    fn is_durable(&self) -> bool {
-        false
-    }
-    fn prepare_update<'o>(
-        &self,
-        original: &'o OwnedMemoryReservation,
-        _sink: &'o str,
-        _id: u64,
-        _encoded: &[u8],
-        _uncertain: bool,
-        _delta: i8,
-    ) -> Result<()> {
-        crate::memory_accounting::persistence_original_projection(original)?;
-        Ok(())
-    }
-    fn commit_update(&self, _: ()) -> Result<()> {
-        Ok(())
-    }
-    fn prepare_removals<'o>(
-        &self,
-        original: &'o OwnedMemoryReservation,
-        _sink: &'o str,
-        _ids: &'o [u64],
-        _unconfirmed: u64,
-    ) -> Result<()> {
-        crate::memory_accounting::persistence_original_projection(original)?;
-        Ok(())
-    }
-    fn commit_removals(&self, _: ()) -> Result<()> {
-        Ok(())
     }
 }
 

@@ -1303,20 +1303,13 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        if self.persistence.is_none() {
+            return Err(Error::Other(
+                "a custody push requires a file-backed database".into(),
+            ));
+        }
 
         self.commit_sync_apply_receipt_only(receipt, vector_copy_owner, read_memory.clone())?;
-        if self.persistence.is_none() {
-            let key = Self::applied_push_watermark_node_incarnation_key(
-                &receipt.tenant_id,
-                &receipt.node_id,
-                receipt.incarnation,
-            );
-            self.in_memory_applied_push_watermarks
-                .lock()
-                .entry(key)
-                .and_modify(|old| *old = (*old).max(receipt.source_lsn))
-                .or_insert(receipt.source_lsn);
-        }
         Ok(())
     }
     // Retain ordinary arbitration, provenance and diagnostics

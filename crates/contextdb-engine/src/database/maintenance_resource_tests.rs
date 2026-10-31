@@ -200,7 +200,7 @@ fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
         let persistence = db.persistence.as_ref().unwrap().clone();
         vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
         let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
-        let context = db.maintenance_context();
+        let context = db.maintenance_context().unwrap();
         let record = context
             .start_paged_vector_build(&route, &persistence, &mut owner, true)
             .unwrap()
@@ -517,6 +517,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         let small_child = small_parent.child().unwrap();
         let error = db
             .maintenance_context()
+            .unwrap()
             .run_currency(CurrencyGate::Always, small_child.clone())
             .unwrap_err();
         assert!(
@@ -539,6 +540,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         small_parent.assert_only_original_root_and_free_for_test();
         let report = db
             .maintenance_context()
+            .unwrap()
             .run_currency(CurrencyGate::Always, spy.clone())
             .unwrap();
         assert_eq!(report.pruned_versions, 4);
@@ -591,7 +593,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         let persistence = db.persistence.as_ref().unwrap().clone();
         vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
         let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
-        let context = db.maintenance_context();
+        let context = db.maintenance_context().unwrap();
         let record = context
             .start_paged_vector_build(&route, &persistence, &mut owner, true)
             .unwrap()
@@ -714,7 +716,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
                 }
             })
         };
-        let mut context = db.maintenance_context();
+        let mut context = db.maintenance_context().unwrap();
         context.worker_stop = Some(stop);
         let interrupted = resident_history_test_seams::with_checkpoint_observer(observer, || {
             context.reclaim_paged_vector_storage()
@@ -774,7 +776,7 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         .unwrap();
     let pause = db.__arm_vector_maintenance_progress_pause_for_test(&partition, 3);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut context = db.maintenance_context();
+    let mut context = db.maintenance_context().unwrap();
     context.worker_stop = Some(stop.clone());
     let fixture_operation_reader_1 = context
         .read_request_provider
@@ -883,7 +885,7 @@ fn cancellation_after_durable_repair_publication_preserves_repair_and_skips_cycl
     let retirement_passes_before = db.vector_partition_retirement_pass_count_for_test();
     let pause = db.__arm_one_shot_vector_repair_snapshot_sample_transition_pause_for_test();
     let stop = Arc::new(AtomicBool::new(false));
-    let mut context = db.maintenance_context();
+    let mut context = db.maintenance_context().unwrap();
     context.worker_stop = Some(stop.clone());
     let fixture_operation_reader_2 = context
         .read_request_provider
@@ -1070,6 +1072,7 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
             });
             with_hnsw_build_observer(observer, || {
                 db.maintenance_context()
+                    .unwrap()
                     .persist_built_vector_partition(&route, db.declared_reader_memory().unwrap())
             })
             .expect("a fitting finite repair reaches its existing pre-batch observer");
@@ -1134,7 +1137,7 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
             fixture_answer_66.rows().to_vec()
         };
         assert_eq!(exact.len(), 1);
-        let context = db.maintenance_context();
+        let context = db.maintenance_context().unwrap();
         for _ in 0..16 {
             context
                 .persist_built_vector_partition(&route, db.declared_reader_memory().unwrap())
@@ -1332,7 +1335,7 @@ fn switching_to_caller_driven_during_build_reports_pending_before_retry() {
         let persistence = db.persistence.as_ref().unwrap().clone();
         vector_paged_build::install_paged_root_capture(&persistence, &db.tx_mgr);
         let mut owner = VectorCopyAdmission::new(db.accountant.vector_budget().unwrap());
-        let context = db.maintenance_context();
+        let context = db.maintenance_context().unwrap();
         let record = context
             .start_paged_vector_build(&route, &persistence, &mut owner, true)
             .unwrap()
@@ -2866,7 +2869,7 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         drop(operation);
         let baseline = db.accountant.usage().used;
         db.accountant.set_budget(Some(baseline + HEADROOM)).unwrap();
-        let context = db.maintenance_context();
+        let context = db.maintenance_context().unwrap();
         for _ in 0..64 {
             assert_eq!(
                 db.execute(healthy_sql, &HashMap::new()).unwrap().rows(),
@@ -3474,11 +3477,13 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
         .set_budget(Some(baseline + finite_floor - 1))
         .unwrap();
     let refuse = || {
-        db.maintenance_context().persist_built_vector_partition(
-            &partition,
-            db.declared_reader_memory()
-                .expect("admit the partition fixture reader"),
-        )
+        db.maintenance_context()
+            .unwrap()
+            .persist_built_vector_partition(
+                &partition,
+                db.declared_reader_memory()
+                    .expect("admit the partition fixture reader"),
+            )
     };
     #[cfg(feature = "test-seams")]
     let result = {

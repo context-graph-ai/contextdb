@@ -288,37 +288,29 @@ impl SinkDispatchDriveForTest<'_> {
     }
 
     fn drive_iteration(&self, sink: &str, identity: u64) -> Result<()> {
+        let persistence = self.database.persistence.as_ref().ok_or_else(|| {
+            Error::SinkRegistrationRequiresOpenedDatabase {
+                sink: sink.to_owned(),
+            }
+        })?;
         let _drive_thread = DriveThread::enter(identity);
         let shutdown = Arc::new(AtomicBool::new(false));
         if let DatabaseTransactionHost::Owned(handle) = &self.database.tx_mgr {
-            if let Some(persistence) = &self.database.persistence {
-                let worker = handle.with_host(|host| {
-                    OwnedEventBusWorker::try_new(
-                        host.events.clone(),
-                        sink,
-                        persistence.clone(),
-                        self.database.tx_mgr.clone(),
-                        &self.database.finalization.accountant,
-                    )
-                })?;
-                worker.dispatch_loop(shutdown);
-            } else {
-                let worker = handle.with_host(|host| {
-                    OwnedEventBusWorker::try_new(
-                        host.events.clone(),
-                        sink,
-                        OwnedMemoryQueuePersistence,
-                        self.database.tx_mgr.clone(),
-                        &self.database.finalization.accountant,
-                    )
-                })?;
-                worker.dispatch_loop(shutdown);
-            }
+            let worker = handle.with_host(|host| {
+                OwnedEventBusWorker::try_new(
+                    host.events.clone(),
+                    sink,
+                    persistence.clone(),
+                    self.database.tx_mgr.clone(),
+                    &self.database.finalization.accountant,
+                )
+            })?;
+            worker.dispatch_loop(shutdown);
         } else {
             EventBusWorker {
                 sink: sink.to_owned(),
                 event_bus: self.database.event_bus.clone(),
-                persistence: self.database.persistence.clone(),
+                persistence: persistence.clone(),
                 tx_mgr: self.database.tx_mgr.clone(),
             }
             .dispatch_loop(shutdown);

@@ -3863,17 +3863,10 @@ impl SyncServer {
         Ok(stop)
     }
 
-    /// Which route serves this hub's delivery requests, and why. A sync hub
-    /// is a durable store; a memory-backed hub is a test fixture, not a
-    /// supported deployment shape, and keeps the Legacy handler.
+    /// Which route serves this hub's delivery requests, and why.
     fn delivery_route(&self) -> (&'static str, &'static str) {
         if self.local_node_id.is_none() || self.lineage_identity.is_none() {
             ("legacy", "the hub has no fabric identity")
-        } else if self.db.is_memory_backed() {
-            (
-                "legacy",
-                "in-memory hub: served Legacy; not a supported deployment shape; native delivery requires a durable store",
-            )
         } else if crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str()).len()
             > crate::transport::MAX_NATIVE_SUBJECT_BYTES
         {

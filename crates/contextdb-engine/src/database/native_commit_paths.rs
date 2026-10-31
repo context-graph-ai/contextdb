@@ -4358,35 +4358,6 @@ impl Database {
     }
 }
 
-// Persistence export fixtures exercise the canonical producer without giving
-// memory databases the durable edge-local DISCARD operation.
-#[cfg(test)]
-impl Database {
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub(crate) fn publish_memory_erasure_frontier_for_test(
-        &self,
-        tables: &BTreeSet<String>,
-        frontier: Lsn,
-    ) -> Result<()> {
-        assert!(self.persistence.is_none());
-        assert!(frontier <= self.current_lsn());
-        let _publication = self.read_publication_gate.acquire_write(tables);
-        let mut lineage = self.lineage_state_lock.lock();
-        let prepared =
-            lineage
-                .erasure_frontiers
-                .prepare(tables, frontier, self.accountant.clone())?;
-        lineage.erasure_frontiers = prepared.publish();
-        Ok(())
-    }
-}
-
 impl Database {
     /// Delivery records keep their established named MessagePack encoding.
     /// The temporary encoder and key die before their original reservation;

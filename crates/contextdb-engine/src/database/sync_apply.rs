@@ -674,6 +674,10 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        // A public receiver entry; private replay enters at its own door.
+        if self.persistence.is_none() {
+            return Err(Error::Other("receiving sync changes requires a file-backed database".into()));
+        }
 
         let result =
             self.apply_changes_impl(
@@ -693,21 +697,7 @@ impl Database {
                 None,
                 None,
              vector_copy_owner, read_memory.clone())?;
-        if self.persistence.is_none() {
-            let edge_key = Self::applied_push_watermark_node_incarnation_key(
-                &receipt.tenant_id,
-                &receipt.node_id,
-                receipt.incarnation,
-            );
-            let mut watermarks = self.in_memory_applied_push_watermarks.lock();
-            for key in [edge_key, receipt.tenant_id.as_str().to_string()] {
-                watermarks
-                    .entry(key)
-                    .and_modify(|current| *current = (*current).max(receipt.source_lsn))
-                    .or_insert(receipt.source_lsn);
-            }
-        }
-        Ok(result)
+                Ok(result)
     }
     }
 
@@ -765,6 +755,12 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        // A public receiver entry; private replay enters at its own door.
+        if self.persistence.is_none() {
+            return Err(Error::Other(
+                "receiving sync changes requires a file-backed database".into(),
+            ));
+        }
 
         let push_lock = push_outcome_key.map(|key| self.sync_push_apply_lock_for_key(key));
         let _push_apply = push_lock.as_ref().map(|lock| lock.lock());
@@ -893,20 +889,6 @@ impl Database {
         };
         if wholly_refused_by_policy {
             return Ok(result);
-        }
-        if self.persistence.is_none() {
-            let edge_key = Self::applied_push_watermark_node_incarnation_key(
-                &receipt.tenant_id,
-                &receipt.node_id,
-                receipt.incarnation,
-            );
-            let mut watermarks = self.in_memory_applied_push_watermarks.lock();
-            for key in [edge_key, receipt.tenant_id.as_str().to_string()] {
-                watermarks
-                    .entry(key)
-                    .and_modify(|current| *current = (*current).max(receipt.source_lsn))
-                    .or_insert(receipt.source_lsn);
-            }
         }
         if let Some(key) = push_outcome_key {
             return self.replay_sync_push_outcome(key)?.ok_or_else(|| {

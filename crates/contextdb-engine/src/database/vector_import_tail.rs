@@ -56,7 +56,7 @@ impl Database {
         let mut operation = self.assert_open_operation();
         operation.release_schema_publication_for_online_maintenance();
         let _guard = MaintenanceReceiptGuard::lock(&self.pruning_guard);
-        self.maintenance_context()
+        self.maintenance_context()?
             .persist_import_vector_tails(read_memory)
     }
 }
@@ -82,10 +82,8 @@ impl Database {
         column: &str,
     ) -> Result<Vec<(Lsn, TxId, Option<TxId>, usize)>> {
         let _operation = self.assert_open_operation();
-        let context = self.maintenance_context();
-        let Some(persistence) = &context.persistence else {
-            return Ok(Vec::new());
-        };
+        let context = self.maintenance_context()?;
+        let persistence = &context.persistence;
         let _decode = context.writer_maintenance_decode()?;
         let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
             context.finalization.accountant.vector_budget()?,
@@ -140,10 +138,8 @@ impl Database {
         column: &str,
     ) -> Result<Vec<(PagedVectorPhase, usize, Lsn)>> {
         let _operation = self.assert_open_operation();
-        let context = self.maintenance_context();
-        let Some(persistence) = &context.persistence else {
-            return Ok(Vec::new());
-        };
+        let context = self.maintenance_context()?;
+        let persistence = &context.persistence;
         let _decode = context.writer_maintenance_decode()?;
         let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
             context.finalization.accountant.vector_budget()?,
@@ -179,10 +175,8 @@ impl Database {
         column: &str,
     ) -> Result<Vec<((TxId, u64, u64), Option<(TxId, u64, u64)>)>> {
         let _operation = self.assert_open_operation();
-        let context = self.maintenance_context();
-        let Some(persistence) = &context.persistence else {
-            return Ok(Vec::new());
-        };
+        let context = self.maintenance_context()?;
+        let persistence = &context.persistence;
         let _decode = context.writer_maintenance_decode()?;
         let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
             context.finalization.accountant.vector_budget()?,
@@ -507,9 +501,7 @@ impl MaintenanceContext {
     ) -> Result<bool> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let Some(persistence) = &self.persistence else {
-            return Ok(true);
-        };
+        let persistence = &self.persistence;
         let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
             self.finalization.accountant.vector_budget()?,
         );

@@ -2513,10 +2513,8 @@ impl Database {
                         .unwrap_or(local_lsn)
                 };
                 *bytes = RedbPersistence::encode_config_value(&record)?;
-                if working.persistence.is_none() {
-                    let (identity, record) = working.prepare_graph_arrival_memory(&record)?;
-                    working.sync_graph_arrivals.write().insert(identity, record);
-                }
+                let (identity, record) = working.prepare_graph_arrival_memory(&record)?;
+                working.sync_graph_arrivals.write().insert(identity, record);
             }
             if key.starts_with("sync_lineage.v1.")
                 && let Ok(mut record) =
@@ -3147,6 +3145,10 @@ impl Database {
         working_preparation: &ReceivedWorkingPreparation<'_>,
     ) -> Result<ReceivedSchemaStage> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        // Its working preparation is a loan from the live store's write.
+        if self.persistence.is_none() {
+            return Err(received_schema_requires_durable_receiver());
+        }
         // Every received image keeps its rows in the live store's unpublished
         // write; a receiver whose committed bodies are not on disk has no such
         // source to page from.
@@ -3265,15 +3267,8 @@ impl Database {
         // vector itself restates, stops being outbound work. The comparison
         // uses the log as it stood before the received occurrences were
         // appended so the vector cannot match itself.
-        let mut superseded_occurrences = if self.persistence.is_some() {
-            self.durable_superseded_local_ddl_occurrences(&changes.ddl, read_memory.clone())?
-        } else {
-            self.superseded_local_ddl_occurrences(
-                &self.ddl_log.read(),
-                &changes.ddl,
-                read_memory.clone(),
-            )?
-        };
+        let mut superseded_occurrences =
+            self.durable_superseded_local_ddl_occurrences(&changes.ddl, read_memory.clone())?;
         for (_, occurrence) in superseded_occurrences.iter() {
             persistence.superseded_occurrence_values.push((
                 Self::durable_superseded_ddl_occurrence_key(
@@ -3421,11 +3416,6 @@ impl Database {
             if let Some(coordinates) = coordinates {
                 coordinates.stage_membership(&mut write_set.config_writes)?;
             }
-            let in_memory_lineage_delta = if self.persistence.is_none() {
-                self.prepare_in_memory_lineage_delta(&write_set.config_writes)?
-            } else {
-                InMemoryLineageDelta::default()
-            };
             let mut mirrors =
                 self.received_schema_memory_mirrors(local_lsn, &source_order, HashMap::new());
             mirrors
@@ -3485,22 +3475,7 @@ impl Database {
                     0,
                 )?,
             };
-            let memory_history = if self.persistence.is_none() {
-                Some(
-                    self.prepare_memory_history_entries(
-                        persistence
-                            .ddl_log_replacement
-                            .iter()
-                            .map(|(lsn, change)| (*lsn, change)),
-                        mirrors
-                            .ddl_generations
-                            .iter()
-                            .map(|(key, (table, generation))| (*key, (table, *generation))),
-                    )?,
-                )
-            } else {
-                None
-            };
+            let memory_history = None;
             return Ok(ReceivedSchemaStage {
                 memory_history,
                 _working_row_owner: None,
@@ -3543,8 +3518,6 @@ impl Database {
                 next_row_id: self.relational_store.next_row_id(),
                 persistence,
                 apply_result,
-                received_schema_manifest,
-                in_memory_lineage_delta,
                 write_set: parking_lot::Mutex::new(write_set),
                 retired_custody_keys: parking_lot::Mutex::new(Vec::new()),
                 durable_projection: ReceivedSchemaPersistenceProjection {
@@ -4169,28 +4142,15 @@ impl Database {
                     // The detached image supplies final schema/rows; custody authority
                     // remains the receiver's current committed view until publication.
                     *working.sync_incarnations.lock() = self.sync_incarnations.lock().clone();
-                    match &self.persistence {
-                        // The working image reads the receiver's committed journal
-                        // durably; nothing of the journal is copied into it.
-                        Some(_) => {
-                            // Pinned to the receiver's committed root at preparation:
-                            // every custody read of the unit sees that one root.
-                            *working.custody_cache.lock() =
-                                Some(crate::custody::store::Store::durable_pinned(
-                                    self.latest_custody_root()?,
-                                    self.accountant.clone(),
-                                )?);
-                        }
-                        None => {
-                            *working.custody_metadata.lock() = self
-                                .custody_records(read_memory.clone())?
-                                .iter()
-                                .map(|record| {
-                                    Ok((record.key()?, crate::custody::records::encode(record)?))
-                                })
-                                .collect::<Result<BTreeMap<_, _>>>()?;
-                        }
-                    }
+                    // The working image reads the receiver's committed journal
+                    // durably; nothing of the journal is copied into it. Pinned to
+                    // the receiver's committed root at preparation: every custody
+                    // read of the unit sees that one root.
+                    *working.custody_cache.lock() =
+                        Some(crate::custody::store::Store::durable_pinned(
+                            self.latest_custody_root()?,
+                            self.accountant.clone(),
+                        )?);
                     for record in prepare.prepare(&working, &mut finalized_write_set)? {
                         record.verify()?;
                         finalized_write_set
@@ -4203,11 +4163,6 @@ impl Database {
                     read_memory.clone(),
                     &mut retired_custody_keys,
                 )?;
-                let in_memory_lineage_delta = if self.persistence.is_none() {
-                    self.prepare_in_memory_lineage_delta(&finalized_write_set.config_writes)?
-                } else {
-                    InMemoryLineageDelta::default()
-                };
                 // The detached apply owns no externally visible receiver LSN. The
                 // active transaction reserved this identity before preparation, so
                 // preserve every observed outcome field and restamp only `new_lsn`.
@@ -5010,19 +4965,6 @@ impl Database {
                 // Only records actually finalized by this acceptance enter the delta.
                 // The working map owns each admitted payload; publication shares that
                 // root instead of cloning the full receiver map or refunding live data.
-                if self.persistence.is_none() {
-                    let arrivals = working.sync_graph_arrivals.read();
-                    for (key, bytes) in &finalized_write_set.config_writes {
-                        if key.starts_with(SYNC_GRAPH_ARRIVAL_PREFIX) {
-                            let record: DurableGraphArrival =
-                                RedbPersistence::decode_config_value(bytes)?;
-                            let identity = Self::graph_arrival_key(&record);
-                            if let Some(record) = arrivals.get(&identity) {
-                                mirrors.graph_arrivals.insert(identity, record.clone());
-                            }
-                        }
-                    }
-                }
                 mirrors.source_state = working.sync_tombstone_arrivals.read().clone();
                 mirrors.accepted_authors = working.accepted_sync_row_authors.read().clone();
                 mirrors.terminal_markers = working.terminal_refusal_markers.read().clone();
@@ -5434,22 +5376,7 @@ impl Database {
                 } else {
                     None
                 };
-                let memory_history = if self.persistence.is_none() {
-                    Some(
-                        self.prepare_memory_history_entries(
-                            persistence
-                                .ddl_log_replacement
-                                .iter()
-                                .map(|(lsn, change)| (*lsn, change)),
-                            mirrors
-                                .ddl_generations
-                                .iter()
-                                .map(|(key, (table, generation))| (*key, (table, *generation))),
-                        )?,
-                    )
-                } else {
-                    None
-                };
+                let memory_history = None;
                 Ok(Some(ReceivedSchemaStage {
                     memory_history,
                     _working_row_owner: working_row_owner,
@@ -5486,8 +5413,6 @@ impl Database {
                     next_row_id: projected_next_row_id,
                     persistence: std::mem::take(&mut persistence),
                     apply_result,
-                    received_schema_manifest,
-                    in_memory_lineage_delta,
                     write_set: parking_lot::Mutex::new(finalized_write_set),
                     retired_custody_keys: parking_lot::Mutex::new(retired_custody_keys),
                     durable_projection,
@@ -5830,23 +5755,6 @@ impl Database {
         if let Some(delta) = stage.custody_memory.take() {
             self.publish_custody_delta(delta);
         }
-        if self.persistence.is_none() {
-            self.publish_in_memory_lineage_delta(std::mem::take(
-                &mut stage.in_memory_lineage_delta,
-            ));
-            if let Some((key, manifest)) = stage.received_schema_manifest.as_ref() {
-                let mut manifests = self.in_memory_received_schema_manifests.lock();
-                for marker in &manifest.markers {
-                    manifests.markers.insert(
-                        marker.key.clone(),
-                        DurableReceivedDdlMarker {
-                            digest: marker.digest.clone(),
-                        },
-                    );
-                }
-                manifests.manifests.insert(key.clone(), manifest.clone());
-            }
-        }
         if stage.durable_projection.schema_noop {
             let mut metadata = self.relational_store.table_meta.write();
             for (table, replacement) in std::mem::take(&mut stage.durable_projection.table_meta) {
@@ -5984,19 +5892,6 @@ impl Database {
             .lock()
             .extend(std::mem::take(&mut stage.mirrors.table_generations));
         self.publish_memory_schema_history(stage.memory_history.take());
-        if self.persistence.is_none() {
-            self.received_ddl_arrivals
-                .write()
-                .extend(std::mem::take(&mut stage.mirrors.received_ddl_arrivals));
-            self.superseded_ddl_occurrences
-                .write()
-                .extend(std::mem::take(
-                    &mut stage.mirrors.superseded_ddl_occurrences,
-                ));
-            self.sync_graph_arrivals
-                .write()
-                .extend(std::mem::take(&mut stage.mirrors.graph_arrivals));
-        }
         {
             let mut sources = self.sync_tombstone_arrivals.write();
             sources.retain(|(table, _), _| !stage.affected_tables.contains(table));
@@ -6023,24 +5918,6 @@ impl Database {
                     .and_modify(|current| *current = (*current).max(value))
                     .or_insert(value);
             }
-        }
-        if self.persistence.is_none() {
-            publish_prepared_change_log_entries(
-                &self.finalization.accountant,
-                &self.change_log,
-                &self.change_log_table_index,
-                &self.change_log_lsn_refcounts,
-                &stage.structurally_dropped_tables,
-                std::mem::take(&mut stage.change_log_entries),
-            );
-        }
-        // This prepared path bypasses CompositeStore::apply_write_set, whose
-        // ordinary path charges the commit-index entry alongside log entries.
-        // The transaction manager still retains one entry for this commit.
-        if self.persistence.is_none() {
-            self.finalization
-                .accountant
-                .charge_retained(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES);
         }
         self.relational_store
             .fetch_max_next_row_id(stage.next_row_id);
@@ -6551,12 +6428,6 @@ impl Database {
         if let Some(stage) = published_stage.borrow_mut().as_mut() {
             self.publish_received_schema_stage_retaining(stage);
             self.vector_schema_gates.bump_epochs(&changed_vector_refs);
-            if self.persistence.is_none() {
-                self.in_memory_sync_progress
-                    .lock()
-                    .policy_hold_releases
-                    .extend(policy_releases.borrow_mut().drain(..));
-            }
         }
         // Whatever the outcome, the registration stops holding the stage here.
         drop(registration.into_inner());

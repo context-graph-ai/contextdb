@@ -141,7 +141,7 @@ fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservati
         .collect::<Vec<_>>();
     let baseline = db.vector_memory_ownership_receipt_for_test();
     let stop = Arc::new(AtomicBool::new(false));
-    let mut context = db.maintenance_context();
+    let mut context = db.maintenance_context().unwrap();
     context.worker_stop = Some(Arc::clone(&stop));
     let captured_workspace = Arc::new(AtomicUsize::new(usize::MAX));
     let retry_count = Arc::new(AtomicUsize::new(0));
@@ -225,7 +225,7 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
     let baseline = db.vector_memory_ownership_receipt_for_test();
     let baseline_writer = db.writer_memory_ownership_receipt_for_test();
     let stop = Arc::new(AtomicBool::new(false));
-    let mut context = db.maintenance_context();
+    let mut context = db.maintenance_context().unwrap();
     context.worker_stop = Some(Arc::clone(&stop));
     let completed = Arc::new(Mutex::new(Vec::new()));
     let captured_workspace = Arc::new(AtomicUsize::new(usize::MAX));
@@ -544,7 +544,7 @@ fn publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_f
             .store(true, Ordering::SeqCst);
     });
     *db.last_maintenance_cycle_at.lock() = None;
-    let context = db.maintenance_context();
+    let context = db.maintenance_context().unwrap();
     let fixture_operation_reader_3 = context
         .read_request_provider
         .request_budget()

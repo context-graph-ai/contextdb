@@ -974,15 +974,6 @@ impl Database {
             .iter()
             .map(|selection| selection.table.clone())
             .collect::<BTreeSet<_>>();
-        let memory_erasure = if self.persistence.is_none() {
-            Some(self.lineage_state_lock.lock().erasure_frontiers.prepare(
-                &erased_tables,
-                lsn,
-                self.accountant.clone(),
-            )?)
-        } else {
-            None
-        };
         let writer_erasure = self
             .persistence
             .as_ref()
@@ -1050,9 +1041,6 @@ impl Database {
                     }
                     {
                         let mut lineage = lineage_state_lock.lock();
-                        if let Some(memory_erasure) = memory_erasure {
-                            lineage.erasure_frontiers = memory_erasure.publish();
-                        }
                         for (sidecar, creation, lifecycle) in lineage_keys {
                             lineage.row_sidecars.remove(&sidecar);
                             lineage.unbound_creations.remove(&creation);
@@ -1473,7 +1461,7 @@ impl Database {
             .vector_store
             .purge_workspace_bounds(&row_keys, &mut quote_owner)?;
         if disk_bytes != 0 {
-            self.maintenance_context()
+            self.maintenance_context()?
                 .admit_generation_disk(disk_bytes)?;
         }
         // The image and its budget/control owners remain inside this complete

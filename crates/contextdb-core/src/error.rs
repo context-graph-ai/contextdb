@@ -929,6 +929,13 @@ pub enum StorageCompactionDeclarationIssue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Sink delivery starts only from a database a caller opened. A trigger
+    /// callback running inside a schema change holds that change's private
+    /// working image, and nothing it holds may be delivered before the outer commit.
+    #[error(
+        "sink {sink} can only be registered on an opened database: this handle is a schema change's private working image"
+    )]
+    SinkRegistrationRequiresOpenedDatabase { sink: String },
     /// A setting was understood but its value is outside the allowed range.
     #[error("invalid {name} value {value}; allowed: {allowed}")]
     InvalidSetting {

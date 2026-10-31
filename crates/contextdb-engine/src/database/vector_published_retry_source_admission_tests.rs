@@ -133,8 +133,8 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         Arc::new(|| Ok(None)),
     );
     drop(source_root);
-    let mut context = db.maintenance_context();
-    context.persistence = Some(Arc::clone(&persistence));
+    let mut context = db.maintenance_context().unwrap();
+    context.persistence = Arc::clone(&persistence);
     let selected = catalog.change.unwrap_or(catalog.base).generation_id;
     let before = context
         .vector

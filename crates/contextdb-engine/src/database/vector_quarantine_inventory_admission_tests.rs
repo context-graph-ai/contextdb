@@ -140,8 +140,8 @@ fn quarantined_inventory_refuses_cold_oversized_source(missing_catalog: bool) {
         db.vector_store
             .quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase)
     );
-    let mut context = db.maintenance_context();
-    context.persistence = Some(Arc::clone(&persistence));
+    let mut context = db.maintenance_context().unwrap();
+    context.persistence = Arc::clone(&persistence);
     let baseline = db.accountant.usage().used;
     let largest_read = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&largest_read);

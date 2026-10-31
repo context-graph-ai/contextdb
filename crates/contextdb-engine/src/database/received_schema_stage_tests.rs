@@ -6423,7 +6423,10 @@ fn an_expiry_commit_whose_publication_is_interrupted_stops_serving_until_reopene
     unwind_at_publication(
         LocalCommitStageFaultPoint::AfterReservedLsnDurableCommit,
         || {
-            let _ = db.maintenance_context().stamp_expired_rows(far_future);
+            let _ = db
+                .maintenance_context()
+                .unwrap()
+                .stamp_expired_rows(far_future);
         },
     );
     assert_refuses_service_after_interrupted_publication(&db, "unwind_notes");
@@ -7412,3 +7415,98 @@ include!("received_legacy_growth_guards.rs");
 include!("received_export_sync_guards.rs");
 
 include!("local_schema_stage_accounting.rs");
+
+/// Registering a handler through the handle a received-schema callback was given
+/// starts no delivery of its own: nothing can be delivered before the outer
+/// commit, and a refused or abandoned outer change leaves nothing behind.
+#[test]
+fn a_received_callback_cannot_start_sink_delivery_from_its_private_image() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::open(directory.path().join("receiver.db")).unwrap();
+    for statement in [
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY)",
+        "CREATE EVENT TYPE note_inserted WHEN INSERT ON notes",
+        "CREATE SINK archive TYPE callback",
+        "CREATE ROUTE archive_notes EVENT note_inserted TO archive",
+        "CREATE TRIGGER note_audit ON notes WHEN INSERT",
+    ] {
+        db.execute(statement, &HashMap::new()).unwrap();
+    }
+    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let refusals = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let callback_delivered = Arc::clone(&delivered);
+    let callback_refusals = Arc::clone(&refusals);
+    db.register_trigger_callback("note_audit", move |handle, _ctx| {
+        let scoped = handle.scoped_with_constraints(None, None, None);
+        for target in [handle, &scoped] {
+            let deliveries = Arc::clone(&callback_delivered);
+            let answer = target.register_sink("archive", None, move |_| {
+                deliveries.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            callback_refusals.lock().push(answer);
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+
+    let tables = db.relational_store.table_meta.read().clone();
+    let affected = HashSet::from(["notes".to_string()]);
+    let read_memory = db.engine_sync_read_memory().unwrap();
+    let mut copy_owner = crate::vector_read_memory::admission(read_memory.clone());
+    db.with_detached_received_schema_working_database(
+        &tables,
+        &affected,
+        &HashSet::new(),
+        true,
+        None,
+        None,
+        None,
+        &mut copy_owner,
+        read_memory,
+        |_, working| {
+            assert!(working.persistence.is_none());
+            let context = TriggerContext {
+                trigger_name: "note_audit".to_string(),
+                table: "notes".to_string(),
+                event: TriggerEvent::Insert,
+                tx: TxId(1),
+                depth: 1,
+                row_values: HashMap::new(),
+            };
+            working.fire_copied_trigger_callback_for_test("note_audit", &context)?;
+            assert_eq!(
+                working.sink_dispatcher_starts_for_test("archive"),
+                0,
+                "the private image starts no delivery lifetime"
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let refusals = std::mem::take(&mut *refusals.lock());
+    assert_eq!(
+        refusals.len(),
+        2,
+        "the handle and a handle narrowed from it"
+    );
+    for refusal in refusals {
+        assert!(
+            matches!(
+                &refusal,
+                Err(Error::SinkRegistrationRequiresOpenedDatabase { sink }) if sink == "archive"
+            ),
+            "{refusal:?}"
+        );
+    }
+    // The abandoned image left the receiver with no handler and no delivery.
+    assert_eq!(db.sink_dispatcher_starts_for_test("archive"), 0);
+    assert_eq!(delivered.load(Ordering::SeqCst), 0);
+    // The database a caller opened still installs delivery.
+    db.register_sink("archive", None, |_| Ok(())).unwrap();
+    assert_eq!(db.sink_dispatcher_starts_for_test("archive"), 1);
+    assert_eq!(delivered.load(Ordering::SeqCst), 0);
+    db.close().unwrap();
+}

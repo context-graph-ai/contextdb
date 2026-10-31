@@ -496,8 +496,7 @@ impl Database {
 
     /// What committing the change-log entries recorded since `since_lsn`
     /// actually charged the accountant: `change_log_retained_bytes` over
-    /// those entries, plus one `COMMIT_INDEX_ENTRY_BYTES` per commit's own
-    /// transaction-manager entry -- the exact arithmetic
+    /// those entries -- the exact arithmetic
     /// `composite_store::apply` performs at commit time
     /// (`crates/contextdb-engine/src/composite_store.rs:1341-1343`). A test
     /// that must prove the accountant charges exactly what a commit's own
@@ -505,11 +504,7 @@ impl Database {
     /// arithmetic any other way from outside the crate.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
-    pub fn __change_log_commit_charge_since_for_test(
-        &self,
-        since_lsn: Lsn,
-        commits: usize,
-    ) -> usize {
+    pub fn __change_log_commit_charge_since_for_test(&self, since_lsn: Lsn) -> usize {
         let entries = self
             .change_log_since_with_read_memory(
                 since_lsn,
@@ -517,13 +512,7 @@ impl Database {
                     .expect("change-log observation read owner"),
             )
             .expect("change-log charge observation must admit its source read");
-        crate::composite_store::change_log_retained_bytes(&entries).saturating_add(
-            if self.persistence.is_none() {
-                crate::composite_store::COMMIT_INDEX_ENTRY_BYTES.saturating_mul(commits)
-            } else {
-                0
-            },
-        )
+        crate::composite_store::change_log_retained_bytes(&entries)
     }
 
     #[expect(
@@ -6536,16 +6525,6 @@ impl Database {
         } else {
             self.tx_mgr.with_maintenance_publication(|_| operation())
         }
-    }
-
-    /// Whether this handle has no on-disk persistence backing it. A
-    /// caller-side convenience default -- e.g. the CLI's own zero-config
-    /// event/cron callback registration -- can use this to stay scoped to
-    /// ephemeral sessions and leave a file-backed store's
-    /// durable-until-explicitly-registered contract untouched for a later,
-    /// possibly different, process to consume.
-    pub fn is_memory_backed(&self) -> bool {
-        self.persistence.is_none()
     }
 
     /// Arm one fault at one point of taking delivery. It fires once and

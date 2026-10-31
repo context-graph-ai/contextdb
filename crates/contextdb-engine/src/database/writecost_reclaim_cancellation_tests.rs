@@ -157,7 +157,7 @@ fn worker_stop_after_one_committed_step_leaves_a_resumable_remainder() {
     let store = store_with_backlog();
     let before = backlog(&store.db);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut context = store.db.maintenance_context();
+    let mut context = store.db.maintenance_context().unwrap();
     context.worker_stop = Some(Arc::clone(&stop));
     let observed = Arc::new(Observed::default());
     redb::commit_work::reset_commit_pages_for_test();
@@ -199,7 +199,7 @@ fn worker_stop_after_one_committed_step_leaves_a_resumable_remainder() {
 fn resource_closed_after_one_committed_step_leaves_a_resumable_remainder() {
     let store = store_with_backlog();
     let before = backlog(&store.db);
-    let context = store.db.maintenance_context();
+    let context = store.db.maintenance_context().unwrap();
     let observed = Arc::new(Observed::default());
     redb::commit_work::reset_commit_pages_for_test();
     let (observer_state, flag) = (Arc::clone(&observed), Arc::clone(&store.db.resource_closed));
@@ -240,7 +240,7 @@ fn resource_closed_after_one_committed_step_leaves_a_resumable_remainder() {
 )]
 fn foreground_writes_between_steps_do_not_extend_the_cycle_or_lose_data() {
     let store = store_with_backlog();
-    let context = store.db.maintenance_context();
+    let context = store.db.maintenance_context().unwrap();
     let observed = Arc::new(Observed::default());
     let added = Arc::new(AtomicU64::new(0));
     redb::commit_work::reset_commit_pages_for_test();
@@ -298,7 +298,7 @@ fn a_crash_between_steps_leaves_the_remainder_and_reopen_resumes_it() {
     const ROLE: &str = "WRITECOST_ENGINE_CRASH_CHILD";
     if let Ok(path) = std::env::var(ROLE) {
         let store = store_with_backlog_in(PathBuf::from(path), None);
-        let context = store.db.maintenance_context();
+        let context = store.db.maintenance_context().unwrap();
         let observed = Arc::new(Observed::default());
         redb::commit_work::reset_commit_pages_for_test();
         let observer_state = Arc::clone(&observed);
