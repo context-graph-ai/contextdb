@@ -5819,10 +5819,8 @@ impl Database {
                 .store(cache.len() as u64, Ordering::SeqCst);
         }
         if let Some(vector) = stage.vector.take() {
-            self.vector_store.publish_prepared_received_schema_tables(
-                vector,
-                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-            );
+            self.vector_store
+                .publish_prepared_received_schema_tables(vector);
         }
         let vector_policy_changed = !stage.vector_policy_layouts.is_empty();
         for prepared in std::mem::take(&mut stage.vector_policy_layouts) {

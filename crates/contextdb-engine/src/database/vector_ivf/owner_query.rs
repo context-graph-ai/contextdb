@@ -117,16 +117,10 @@ impl Database {
                     BoundedVectorSearchTrace::from_prepaid(
                         VectorSearchDebugTrace {
                             index: index.clone(),
-                            used_hnsw: false,
-                            hnsw_len: None,
-                            hnsw_candidate_count: 0,
-                            hnsw_candidate_row_ids: Vec::new(),
                             final_row_ids: Vec::new(),
                             supplemented_row_count: 0,
                             fallback_reason: None,
                             partition_routes: Vec::new(),
-                            hnsw_ef_search: None,
-                            selected_generations: Vec::new(),
                             budget_receipt: None,
                         },
                         bytes,

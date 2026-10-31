@@ -136,42 +136,6 @@ impl Database {
             .damage_checkpoint_f32_projection_for_test()
     }
 
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn open_with_writer_vector_session(
-        path: impl AsRef<Path>,
-        options: DatabaseOpenOptions,
-        session: &WriterVectorSession,
-    ) -> Result<Self> {
-        #[cfg(any(test, feature = "test-seams"))]
-        {
-            let interceptor = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.borrow().clone());
-            if let Some(interceptor) = interceptor {
-                let result = interceptor.intercept(path.as_ref(), &options);
-                match &result {
-                    Ok(db) => db.reattach_writer_vector_session(session),
-                    Err(_) => session.clear(),
-                }
-                return result;
-            }
-        }
-        let saved = session.take();
-        let had_saved = saved.is_some();
-        let retry_options = options.clone();
-        let (config, binding) = OpenConfiguration::take_options(options);
-        match Self::open_constructed_carrying(path.as_ref(), config, binding, saved) {
-            Err(Error::MemoryBudgetExceeded { .. }) if had_saved => {
-                // The optional cache must never cause an open refusal.
-                let (config, binding) = OpenConfiguration::take_options(retry_options);
-                Self::open_constructed(path.as_ref(), config, binding)
-            }
-            result => result,
-        }
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -180,19 +144,6 @@ impl Database {
         path: &Path,
         config: OpenConfiguration,
         binding: PluginBinding,
-    ) -> Result<Self> {
-        Self::open_constructed_carrying(path, config, binding, None)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn open_constructed_carrying(
-        path: &Path,
-        config: OpenConfiguration,
-        binding: PluginBinding,
-        carried: Option<vector_writer_session::CarriedWriterTail>,
     ) -> Result<Self> {
         let OpenConfiguration {
             owner_reads,
@@ -211,7 +162,7 @@ impl Database {
             #[cfg(any(test, feature = "test-seams"))]
             test_kernel_observer,
         } = config;
-        Self::open_configured_carrying(
+        Self::open_configured(
             path,
             DatabaseOpenOptions {
                 owner_reads,
@@ -231,7 +182,6 @@ impl Database {
                 #[cfg(any(test, feature = "test-seams"))]
                 test_kernel_observer,
             },
-            carried,
         )
     }
 
@@ -239,17 +189,8 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn open_configured_carrying(
-        path: &Path,
-        options: DatabaseOpenOptions,
-        carried: Option<vector_writer_session::CarriedWriterTail>,
-    ) -> Result<Self> {
-        Self::open_configured_carrying_with_host(
-            path,
-            options,
-            carried,
-            DatabaseHostConstruction::Legacy,
-        )
+    pub(super) fn open_configured(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
+        Self::open_configured_with_host(path, options, DatabaseHostConstruction::Legacy)
     }
 
     /// Unit modules use the real open assembly, including file reopen.
@@ -262,22 +203,16 @@ impl Database {
         )
     )]
     pub(super) fn open_owned_for_test(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
-        Self::open_configured_carrying_with_host(
-            path,
-            options,
-            None,
-            DatabaseHostConstruction::Owned,
-        )
+        Self::open_configured_with_host(path, options, DatabaseHostConstruction::Owned)
     }
 
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn open_configured_carrying_with_host(
+    pub(super) fn open_configured_with_host(
         path: &Path,
         options: DatabaseOpenOptions,
-        mut carried: Option<vector_writer_session::CarriedWriterTail>,
         host_construction: DatabaseHostConstruction,
     ) -> Result<Self> {
         if path.as_os_str() == MEMORY_DATABASE_PATH {
@@ -286,7 +221,7 @@ impl Database {
             let mut options = options;
             options.open_disposition = OpenDisposition::CreateIfMissing;
             return Self::open_in_scratch(|file| {
-                Self::open_configured_carrying_with_host(file, options, carried, host_construction)
+                Self::open_configured_with_host(file, options, host_construction)
             });
         }
         let DatabaseOpenOptions {
@@ -319,12 +254,6 @@ impl Database {
             reader_wait_deadline,
             accountant.writer_wait_payer(),
         );
-        if carried
-            .as_mut()
-            .is_some_and(|tail| tail.recharge(accountant.vector_accountant()).is_err())
-        {
-            carried = None;
-        }
         let declared_read_memory =
             crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 owner_reads.limits.limits.memory,
@@ -429,7 +358,6 @@ impl Database {
             persistence.settle_writer_cache_budget(0)?;
             persistence.settle_writer_cache_budget(capacity)?;
         }
-        db.reattach_carried_writer_tail(carried);
         Ok(db)
     }
 
@@ -1455,8 +1383,7 @@ impl Database {
         let graph_source = Arc::new(writer_read::ScopedGraphSource::new());
         let graph = Arc::new(GraphStore::with_source(graph_source.clone()));
 
-        let hnsw = Arc::new(OnceLock::new());
-        let vector = Arc::new(VectorStore::new(hnsw.clone()));
+        let vector = Arc::new(VectorStore::new());
         register_vector_layouts(
             &vector,
             &all_meta,
@@ -1594,7 +1521,6 @@ impl Database {
             relational,
             graph,
             vector,
-            hnsw,
             change_log,
             change_log_table_index,
             change_log_lsn_refcounts,
@@ -1840,8 +1766,7 @@ impl Database {
             crate::persistence::graph_read::RetainedGraphSource(retained_source.clone()),
         )));
 
-        let hnsw = Arc::new(OnceLock::new());
-        let vector = Arc::new(VectorStore::new(hnsw.clone()));
+        let vector = Arc::new(VectorStore::new());
         register_vector_layouts(
             &vector,
             &all_meta,
@@ -1972,7 +1897,6 @@ impl Database {
             relational,
             graph,
             vector,
-            hnsw,
             change_log,
             change_log_table_index,
             change_log_lsn_refcounts,
@@ -2111,8 +2035,7 @@ impl Database {
             }
             None => GraphStore::new(),
         });
-        let hnsw = Arc::new(OnceLock::new());
-        let vector = Arc::new(VectorStore::new(hnsw.clone()));
+        let vector = Arc::new(VectorStore::new());
         vector.account_loaded_state(vector_accountant.clone())?;
         let change_log = Arc::new(RwLock::new(Vec::new()));
         let change_log_table_index = Arc::new(RwLock::new(ChangeLogTableIndex::new()));
@@ -2188,7 +2111,6 @@ impl Database {
             relational,
             graph,
             vector,
-            hnsw,
             change_log,
             change_log_table_index,
             change_log_lsn_refcounts,

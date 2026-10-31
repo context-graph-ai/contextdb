@@ -2198,11 +2198,6 @@ impl DatabaseConstruction {
                             ));
                         }
                     }
-                    116 => {
-                        std::ptr::drop_in_place(std::ptr::addr_of_mut!(
-                            (*self.source).last_vector_search_used_hnsw
-                        ));
-                    }
                     117 => {
                         std::ptr::drop_in_place(std::ptr::addr_of_mut!(
                             (*self.source).last_vector_search_trace
@@ -3239,14 +3234,6 @@ pub(super) fn prune_expired_rows(
                     .map(|present| count + u64::from(present))
             })?;
 
-    let generation_cleanup = prepare_retention_cleanup_generations(
-        vector_store,
-        persistence,
-        &metas,
-        pruned_versions_by_table.keys().map(String::as_str),
-        active_removal_pass.registered_snapshots(),
-        &mut workspace,
-    )?;
     let schema_history = relational_store.prepare_schema_history_erasure(
         row_keys.iter().map(|(_, row, _, lsn)| (*row, *lsn)),
         ctx.finalization.accountant.read_budget()?,
@@ -3275,7 +3262,6 @@ pub(super) fn prune_expired_rows(
                 &deferred_edge_nodes,
             )),
             &commit_index_candidates,
-            &generation_cleanup,
             &retention_progress,
         );
         if let Err(error) = persisted {
@@ -3331,17 +3317,10 @@ pub(super) fn prune_expired_rows(
         vector_store.prune_row_ids_in_indexes(
             &fully_pruned_row_ids,
             &removed_vector_indexes,
-            accountant,
             &mut vector_copy_owner,
         )?
     };
 
-    for (catalog, _) in &generation_cleanup {
-        vector_store.reclaim_snapshot_free_partition_graph_generations(
-            &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),
-            active_removal_pass.registered_snapshots(),
-        );
-    }
     let mut released_edge_bytes = 0usize;
     // Every adjacency entry this pass removes is charged until it is removed,
     // whether it was stamped `deleted_tx` by an earlier commit or was still
@@ -3436,107 +3415,6 @@ pub(super) fn prune_expired_rows(
 }
 
 // Retention owns its catalog/key/reader-chain buffers until publication.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn prepare_retention_cleanup_generations<'a>(
-    vector: &VectorStore,
-    persistence: &Arc<RedbPersistence>,
-    metas: &HashMap<String, TableMeta>,
-    tables: impl Iterator<Item = &'a str>,
-    snapshots: &[SnapshotId],
-    workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
-) -> Result<crate::persistence::VectorGenerationCleanup> {
-    let mut cleanup = Vec::new();
-    for table in tables {
-        let Some(meta) = metas.get(table) else {
-            continue;
-        };
-        for column in &meta.columns {
-            if !matches!(column.column_type, ColumnType::Vector(_)) {
-                continue;
-            }
-            workspace.try_grow_for(
-                1024usize
-                    .saturating_add(table.len().saturating_mul(4))
-                    .saturating_add(column.name.len().saturating_mul(4)),
-                "retention",
-                "prepare_prune",
-                "Raise MEMORY_LIMIT to prepare retention generation identities.",
-            )?;
-            let index = VectorIndexRef::new(table, &column.name);
-            let keys = vector.with_partition_sources(&index, |sources| {
-                let mut keys = Vec::new();
-                sources.visit(|key, _| {
-                    workspace.try_grow_for(
-                        1024usize.saturating_add(key.estimated_bytes().saturating_mul(8)),
-                        "retention",
-                        "prepare_prune",
-                        "Raise MEMORY_LIMIT to prepare retention partition identities.",
-                    )?;
-                    keys.push(key.clone());
-                    Ok::<_, Error>(())
-                })?;
-                Ok::<_, Error>(keys)
-            })?;
-            for key in keys {
-                if let Some(catalog) = persistence
-                    .load_vector_partition_generation_catalog_for_admitted(
-                        &index, &key, workspace,
-                    )?
-                {
-                    workspace.try_grow_for(
-                        snapshots.len().saturating_mul(256),
-                        "retention",
-                        "prepare_prune",
-                        "Raise MEMORY_LIMIT to prepare retention reader-chain identities.",
-                    )?;
-                    let partition = VectorPartitionRef::new(index.clone(), key);
-                    cleanup.push((
-                        catalog,
-                        vector.snapshot_retained_partition_chain_ids(&partition, snapshots),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(cleanup)
-}
-
-/// Capture snapshot-protected chains before any durable cleanup. The caller
-/// holds its commit and removal guards until disk and memory both agree.
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn prepare_cleanup_generations<'a>(
-    vector: &VectorStore,
-    persistence: &Arc<RedbPersistence>,
-    tables: impl Iterator<Item = &'a str>,
-    snapshots: &[SnapshotId],
-    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
-) -> Result<crate::persistence::VectorGenerationCleanup> {
-    let tables = tables.collect::<HashSet<_>>();
-    let mut cleanup = Vec::new();
-    for index in vector.index_layout_infos(vector_copy_owner)? {
-        if !tables.contains(index.index.table.as_str()) {
-            continue;
-        }
-        for key in vector.partition_keys_including_historical(&index.index, vector_copy_owner)? {
-            if let Some(catalog) =
-                persistence.load_vector_partition_generation_catalog_for(&index.index, &key)?
-            {
-                let partition = VectorPartitionRef::new(index.index.clone(), key);
-                cleanup.push((
-                    catalog,
-                    vector.snapshot_retained_partition_chain_ids(&partition, snapshots),
-                ));
-            }
-        }
-    }
-    Ok(cleanup)
-}
 
 /// Select without mutating either durable or in-memory state. Currency cleanup
 /// includes these candidates in the same transaction as their last references.

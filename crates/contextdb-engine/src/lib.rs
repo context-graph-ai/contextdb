@@ -185,7 +185,6 @@ pub use database::MemoryHeldReceivedSchemaUnit;
 pub use database::PolicyHeldReceivedTable;
 pub use database::TriggerProgressTelemetrySnapshot;
 #[doc(hidden)]
-pub use database::WriterVectorSession;
 pub use database::{
     ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, CronScheduleStatus,
     EventBusStatus, EventTypeStatus, RouteStatus, SinkError, SinkEvent, SinkMetrics, SinkStatus,

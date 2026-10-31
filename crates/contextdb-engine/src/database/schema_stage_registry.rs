@@ -2514,11 +2514,6 @@ struct Pre2Database {
     /// independently opened database, and present only for test observation.
     #[cfg(any(test, feature = "test-seams"))]
     candidate_rows_materialized: Arc<AtomicU64>,
-    #[allow(
-        dead_code,
-        reason = "HNSW: goes with the HNSW index when it is replaced"
-    )]
-    last_vector_search_used_hnsw: Arc<AtomicBool>,
     last_vector_search_trace: Arc<RwLock<Option<contextdb_vector::mem::OwnedVectorSearchTrace>>>,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
     /// The rank-policy formulas this STORE has registered, held once and read

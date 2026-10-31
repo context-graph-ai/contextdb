@@ -46,10 +46,8 @@ impl Database {
             .publish_prepared_dag_edge_types(stage.dag_edge_types);
         self.publish_prepared_rank_formula_cache(stage.rank_formulas);
         if let Some(vector) = stage.vector {
-            self.vector_store.publish_prepared_received_schema_tables(
-                vector,
-                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-            );
+            self.vector_store
+                .publish_prepared_received_schema_tables(vector);
         }
         if let Some(publication) = stage.native_event_bus.get_mut().take() {
             let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr else {

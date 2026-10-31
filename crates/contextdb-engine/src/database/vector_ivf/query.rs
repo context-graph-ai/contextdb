@@ -294,16 +294,10 @@ impl Database {
         trace_bytes += identity;
         let trace = VectorSearchDebugTrace {
             index: index.clone(),
-            used_hnsw: false,
-            hnsw_len: None,
-            hnsw_candidate_count: 0,
-            hnsw_candidate_row_ids: Vec::new(),
             final_row_ids: Vec::new(),
             supplemented_row_count: 0,
             fallback_reason: None,
             partition_routes: trace_routes,
-            hnsw_ef_search: None,
-            selected_generations: Vec::new(),
             budget_receipt: None,
         };
         // Keep canonical precision through every tuple merge and LIMIT cut.

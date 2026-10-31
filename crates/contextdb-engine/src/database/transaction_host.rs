@@ -4127,17 +4127,16 @@ impl DatabaseTransactionHost {
     pub(super) fn vector_executor(
         &self,
         store: Arc<VectorStore>,
-        hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
         accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
     ) -> MemVectorExecutor<DynStore> {
         let accountant: contextdb_vector::MemoryBudgetOwner = accountant.into();
 
         match self {
             Self::Legacy(manager) => {
-                MemVectorExecutor::new_with_accountant(store, manager.clone(), hnsw, accountant)
+                MemVectorExecutor::new_with_accountant(store, manager.clone(), accountant)
             }
             Self::Owned(handle) => handle.with_host(|host| {
-                MemVectorExecutor::new_engine(store, host.transactions.clone(), hnsw, accountant)
+                MemVectorExecutor::new_engine(store, host.transactions.clone(), accountant)
             }),
         }
     }

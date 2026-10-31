@@ -1020,7 +1020,7 @@ impl Database {
                     *change_log_table_index.write() = publication.change_log_table_index;
                     *change_log_lsn_refcounts.write() = publication.change_log_lsn_refcounts;
                     graph_store.publish_prepared_received_schema(publication.graph);
-                    vector_store.publish_prepared_received_schema(publication.vector, accountant);
+                    vector_store.publish_prepared_received_schema(publication.vector);
                     event_bus.publish_prepared_authoritative_purge_queue_replacement(
                         publication.event_bus,
                     );
@@ -1773,10 +1773,7 @@ impl Database {
             *change_index.write() = replacement.publication.change_log_table_index;
             *change_counts.write() = replacement.publication.change_log_lsn_refcounts;
             graph_store.publish_prepared_received_schema(replacement.publication.graph);
-            vector_store.publish_prepared_received_schema(
-                replacement.publication.vector,
-                vector_accountant,
-            );
+            vector_store.publish_prepared_received_schema(replacement.publication.vector);
             queue.publish();
             {
                 let mut authors = authors.write();

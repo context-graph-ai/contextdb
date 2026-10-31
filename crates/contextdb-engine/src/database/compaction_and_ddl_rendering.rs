@@ -418,23 +418,6 @@ pub(super) fn compact_currency_versions_inner(
                     .map(|present| count + u64::from(present))
             })?;
 
-    // Only tables with selected row or vector removals belong to this
-    // atomic cleanup. Unchanged tables' generation catalogs are handled by
-    // catalog maintenance, without occupying this batch's removal workspace.
-    let generation_cleanup = prepare_cleanup_generations(
-        vector_store,
-        persistence,
-        row_keys
-            .iter()
-            .map(|(table, _, _, _)| table.as_str())
-            .chain(
-                released_vectors
-                    .iter()
-                    .map(|version| version.index.table.as_str()),
-            ),
-        active_removal_pass.registered_snapshots(),
-        &mut vector_copy_owner,
-    )?;
     let vector_keys_rewritten;
     let first_failure_details: Option<VectorMaintenanceFailureDetails>;
     let schema_history = relational_store.prepare_schema_history_erasure(
@@ -466,7 +449,6 @@ pub(super) fn compact_currency_versions_inner(
             &pruned_change_keys_vec,
             &released_vectors,
             &commit_index_candidates,
-            &generation_cleanup,
             &durable,
             &cleanup_progress,
             cleanup_rotation,
@@ -528,12 +510,6 @@ pub(super) fn compact_currency_versions_inner(
     // the per-insert admission, which this pass is the one release for.
     let released_vector_bytes =
         vector_store.prune_superseded_versions(&released_vectors, &mut vector_copy_owner)?;
-    for (catalog, _) in &generation_cleanup {
-        vector_store.reclaim_snapshot_free_partition_graph_generations(
-            &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),
-            active_removal_pass.registered_snapshots(),
-        );
-    }
 
     accountant.release(accounted_row_bytes.saturating_add(released_vector_bytes));
 

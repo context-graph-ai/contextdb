@@ -1435,7 +1435,6 @@ impl Database {
                     std::ptr::addr_of_mut!((*construction.source).vector).write(
                         self.tx_mgr.vector_executor(
                             self.vector_store.clone(),
-                            Arc::new(OnceLock::new()),
                             contextdb_vector::MemoryBudgetOwner::clone(
                                 &self.finalization.vector_accountant,
                             ),
@@ -1961,14 +1960,6 @@ impl Database {
                     construction.initialized[115] = true;
                     #[cfg(all(test, feature = "test-seams"))]
                     super::r1_database_field_for_test(115);
-                }
-
-                {
-                    std::ptr::addr_of_mut!((*construction.source).last_vector_search_used_hnsw)
-                        .write(Arc::clone(&self.last_vector_search_used_hnsw));
-                    construction.initialized[116] = true;
-                    #[cfg(all(test, feature = "test-seams"))]
-                    super::r1_database_field_for_test(116);
                 }
 
                 {

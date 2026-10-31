@@ -5025,7 +5025,7 @@ impl Database {
         let index = VectorIndexRef::new(table, column);
         let receipt = self
             .vector_store
-            .teardown_index_without_copy(&index, self.accountant());
+            .teardown_index_without_copy(&index);
         self.finalization
             .accountant
             .release(receipt.legacy_live_raw_bytes);
@@ -5060,7 +5060,6 @@ impl Database {
             old,
             new,
             replaced,
-            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
             owner,
         )
     }
@@ -5092,7 +5091,7 @@ impl Database {
     pub(crate) fn vector_store_deregister_table(&self, table: &str) {
         let receipt = self
             .vector_store
-            .teardown_table_without_copy(table, self.accountant());
+            .teardown_table_without_copy(table);
         self.finalization
             .accountant
             .release(receipt.legacy_live_raw_bytes);

@@ -45,9 +45,7 @@ mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
 #[cfg(test)]
 mod vector_suffix_inspection_tests;
-mod vector_writer_session;
 #[doc(hidden)]
-pub use vector_writer_session::WriterVectorSession;
 mod received_row_graph;
 mod row_graph;
 #[cfg(any(test, feature = "test-seams"))]
@@ -3372,7 +3370,6 @@ pub struct Database {
     /// independently opened database, and present only for test observation.
     #[cfg(any(test, feature = "test-seams"))]
     candidate_rows_materialized: Arc<AtomicU64>,
-    last_vector_search_used_hnsw: Arc<AtomicBool>,
     last_vector_search_trace: Arc<RwLock<Option<contextdb_vector::mem::OwnedVectorSearchTrace>>>,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
     /// The rank-policy formulas this STORE has registered, held once and read
@@ -5263,7 +5260,6 @@ impl Database {
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
         vector_store: Arc<VectorStore>,
-        hnsw: Arc<OnceLock<parking_lot::RwLock<Option<HnswIndex>>>>,
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
         change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
@@ -5687,7 +5683,6 @@ impl Database {
                     std::ptr::addr_of_mut!((*construction.source).vector).write(
                         tx_mgr.vector_executor(
                             vector_store,
-                            hnsw,
                             contextdb_vector::MemoryBudgetOwner::clone(&vector_accountant),
                         ),
                     );
@@ -6250,8 +6245,6 @@ impl Database {
                 }
 
                 {
-                    std::ptr::addr_of_mut!((*construction.source).last_vector_search_used_hnsw)
-                        .write(Arc::new(AtomicBool::new(false)));
                     construction.initialized[116] = true;
                     #[cfg(test)]
                     r1_database_field_for_test(116);
@@ -7427,8 +7420,6 @@ impl Database {
                 }
 
                 {
-                    std::ptr::addr_of_mut!((*construction.source).last_vector_search_used_hnsw)
-                        .write(Arc::clone(&self.last_vector_search_used_hnsw));
                     construction.initialized[116] = true;
                     #[cfg(test)]
                     r1_database_field_for_test(116);
