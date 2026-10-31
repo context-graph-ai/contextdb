@@ -763,6 +763,47 @@ fn maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli()
     }
 }
 
+/// Counts every attempted index page read while a closure runs.
+#[derive(Default)]
+struct PageReadAttempts(std::sync::atomic::AtomicUsize);
+
+impl contextdb_engine::vector_ivf_observations::NativeIvfSealObserver for PageReadAttempts {
+    fn observe(&self, event: contextdb_engine::vector_ivf_observations::NativeIvfSealEvent<'_>) {
+        if matches!(
+            event,
+            contextdb_engine::vector_ivf_observations::NativeIvfSealEvent::PageReadAttempt { .. }
+        ) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn before_boundary(
+        &self,
+        _boundary: contextdb_engine::vector_ivf_observations::NativeIvfFaultBoundary<'_>,
+    ) -> contextdb_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Opens the ordinary read-only session with the page-read observer installed
+/// for the open alone, and returns the attempts it made before any query.
+fn open_counting_page_read_attempts(
+    path: &std::path::Path,
+) -> (usize, contextdb_engine::ReadSession) {
+    let attempts = std::sync::Arc::new(PageReadAttempts::default());
+    let session = contextdb_engine::vector_ivf_observations::with_native_ivf_seal_observer_for_test(
+        attempts.clone(),
+        || {
+            contextdb_engine::ReadSession::open_with_options(
+                path,
+                contextdb_engine::ReadSessionOptions::default(),
+            )
+            .expect("open the ordinary read session")
+        },
+    );
+    (attempts.0.load(std::sync::atomic::Ordering::SeqCst), session)
+}
+
 #[test]
 fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_route() {
     let store = auto_vector_store(1_024);
@@ -875,39 +916,93 @@ fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_rou
             .is_some_and(|bytes| bytes > 0),
         "the read-only catalog exposes the durable graph: {reader_inspection_row}"
     );
-    // Independent metadata-only control: a store with the same declarations and
-    // committed vectors whose index was never published charges only the index
-    // metadata. Opening the saved image must charge exactly that, never the body.
+    // Independent metadata-only control: the same declaration, key and committed
+    // rows (row zero included) as the maintained fixture, with no maintenance
+    // driven, so no index was ever published.
     let control_store = auto_vector_store(1_024);
-    let control = run(
-        &[control_store.path_str(), "--json"],
-        "SHOW VECTOR_INDEXES;\n",
+    {
+        let control_db = contextdb_engine::Database::open_with_options(
+            &control_store.path,
+            contextdb_engine::DatabaseOpenOptions {
+                maintenance_policy: contextdb_engine::MaintenancePolicy::CallerDriven,
+                ..contextdb_engine::DatabaseOpenOptions::default()
+            },
+        )
+        .expect("open the caller-driven control");
+        control_db
+            .execute(
+                "INSERT INTO vector_budget_docs (id, kind, embedding) \
+                 VALUES (0, 'eligible', '[1,0,0]')",
+                &std::collections::HashMap::new(),
+            )
+            .expect("commit row zero into the control");
+    }
+    // The page-read observer wraps only the ordinary session open: the CLI
+    // subprocess above is a different process and cannot be observed from here.
+    let (control_open_page_reads, control_session) = open_counting_page_read_attempts(&control_store.path);
+    let (image_open_page_reads, image_session) =
+        open_counting_page_read_attempts(std::path::Path::new(store.path_str()));
+    assert_eq!(
+        control_open_page_reads, 0,
+        "opening the unpublished control attempts no index page read"
     );
     assert_eq!(
-        control.code,
-        Some(0),
-        "the unpublished control inspects.\n{}",
-        control.describe()
+        image_open_page_reads, 0,
+        "opening the committed image attempts no index page read"
     );
-    let control_inspection_row = inspection_row_for(&result_documents(&control));
+    for session in [&control_session, &image_session] {
+        assert_eq!(
+            session.route(),
+            contextdb_engine::ReadRoute::File,
+            "the ordinary session opens the ownerless file route"
+        );
+    }
+    let session_value = |session: &contextdb_engine::ReadSession, sql: &str, column: &str| {
+        let result = session
+            .execute(sql, &std::collections::HashMap::new())
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let at = result
+            .columns()
+            .iter()
+            .position(|name| name == column)
+            .unwrap_or_else(|| panic!("{sql} has {column}"));
+        result.rows()[0][at].clone()
+    };
+    let partitions = "SHOW VECTOR_PARTITIONS FOR vector_budget_docs.embedding";
     assert_eq!(
-        control_inspection_row["durable_index_bytes"],
-        serde_json::Value::Null,
-        "the control has no published index: {control_inspection_row}"
+        session_value(&control_session, partitions, "base_generation"),
+        contextdb_core::Value::Null,
+        "the control publishes no generation"
     );
     assert_eq!(
-        reader_inspection_row["charged_index_bytes"], control_inspection_row["charged_index_bytes"],
+        session_value(&control_session, partitions, "durable_index_bytes"),
+        contextdb_core::Value::Null,
+        "the control has no published durable index bytes"
+    );
+    let indexes = "SHOW VECTOR_INDEXES";
+    let control_charge = session_value(&control_session, indexes, "charged_index_bytes");
+    assert_eq!(
+        session_value(&image_session, indexes, "charged_index_bytes"),
+        control_charge,
+        "the in-process image session charges the metadata-only control amount"
+    );
+    assert_eq!(
+        session_value(&image_session, indexes, "charged_index_bytes"),
+        control_charge,
+        "passive inspection leaves the charge unchanged"
+    );
+    assert_eq!(
+        reader_inspection_row["charged_index_bytes"].as_i64(),
+        match control_charge {
+            contextdb_core::Value::Int64(bytes) => Some(bytes),
+            other => panic!("charged_index_bytes is an integer, got {other:?}"),
+        },
         "opening the committed image registers only the index metadata; it must not load the index body. \
-         control={control_inspection_row} reader={reader_inspection_row}"
+         reader={reader_inspection_row}"
     );
     assert_eq!(
         reader_inspection_row["charged_index_bytes"], writer_inspection_row["charged_index_bytes"],
-        "both doors charge the same index metadata: writer={writer_inspection_row} reader={reader_inspection_row}"
-    );
-    assert!(
-        reader_inspection_row["charged_index_bytes"].as_i64()
-            < reader_inspection_row["durable_index_bytes"].as_i64(),
-        "the charge stays below the durable index it describes: {reader_inspection_row}"
+        "supporting: both doors charge the same index metadata: writer={writer_inspection_row} reader={reader_inspection_row}"
     );
 
     let vector_results = |documents: &[serde_json::Value]| {
