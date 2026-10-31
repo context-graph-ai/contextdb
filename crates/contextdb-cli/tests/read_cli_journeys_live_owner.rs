@@ -5,9 +5,11 @@
 //! over that owner's authenticated local channel and says so once; a second
 //! writer is refused with `held_by_writer` and told to drop `--write`; the
 //! owner's ceilings are the ones that apply and a caller cannot raise them; the
-//! refusal on that route names the writer-side change and the cursor; and when
-//! the owner disappears the session fails visibly instead of quietly rereading
-//! the file.
+//! refusal on that route names the writer-side change and the cursor; and a
+//! reader outlives its writer: when the owner disappears the reader answers
+//! from what was last saved, says which route it took, and goes back to the
+//! writer on its own when one returns (owner ruling 2026-10-26, reader
+//! lifetime).
 //!
 //! Every owner here is a genuinely separate process. An in-process stand-in
 //! cannot prove any of this.
@@ -328,56 +330,108 @@ fn an_owner_reader_sees_committed_state_only() {
     owner.send_line("ROLLBACK;");
 }
 
+/// The route each `read_route` notice in a transcript announced, in order.
+fn routes_announced(transcript: &str) -> Vec<String> {
+    lenient_json_lines(transcript)
+        .into_iter()
+        .filter_map(|d| d.get("notice").cloned())
+        .filter(|n| detail_kind(n).as_deref() == Some("read_route"))
+        .filter_map(|n| {
+            n.get("detail")
+                .and_then(|d| d.get("route"))
+                .and_then(|r| r.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Reader lifetime: the session outlives its writer. The owner dies between two
+/// commands; the next command is answered completely from the last saved file
+/// and the route notice says so, with the point in the data it reads from; when
+/// a writer returns, the same session switches to it on its own.
 #[test]
-fn a_vanished_owner_fails_the_session_visibly_and_never_rereads_the_file() {
+fn a_session_outlives_its_owner_reads_the_saved_file_and_returns_to_a_new_owner() {
     let store = store_with(&create_seeded_table("shared", 3));
     let mut owner = live_owner(&store.path, "");
 
     let mut session = background(&[store.path_str(), "--json"]);
-    session.send_line("SELECT id FROM shared ORDER BY id;");
-    session.wait_for("\"result\"");
-    let routes_before = lenient_json_lines(&session.transcript())
-        .into_iter()
-        .filter_map(|d| d.get("notice").cloned())
-        .filter(|n| detail_kind(n).as_deref() == Some("read_route"))
-        .count();
+    session.send_line("SELECT id, 'before-death' AS phase FROM shared ORDER BY id;");
+    session.wait_for("before-death");
     assert_eq!(
-        routes_before,
-        1,
+        routes_announced(&session.transcript()),
+        vec!["owner".to_owned()],
         "the session routed once, through the owner.\ntranscript:\n{}",
         session.transcript()
     );
 
     owner.kill();
 
-    session.send_line("SELECT id FROM shared ORDER BY id;");
-    let (code, transcript) = session.finish();
-
-    let documents = lenient_json_lines(&transcript);
-    let kinds: Vec<String> = documents
-        .iter()
-        .filter_map(|d| d.get("error").cloned())
-        .filter_map(|e| detail_kind(&e))
-        .collect();
-    assert!(
-        kinds.iter().any(|k| k == "owner_disconnected"),
-        "when the selected owner disappears the session says so.\ntranscript:\n{transcript}"
+    session.send_line("SELECT id, 'saved-file' AS phase FROM shared ORDER BY id;");
+    session.wait_for("saved-file");
+    let after_death = session.transcript();
+    assert_eq!(
+        routes_announced(&after_death),
+        vec!["owner".to_owned(), "file".to_owned()],
+        "with the writer down the reader answers from what was last saved, and says so.\
+         \ntranscript:\n{after_death}"
     );
-    let routes_after = documents
-        .iter()
+    let file_notice = lenient_json_lines(&after_death)
+        .into_iter()
         .filter_map(|d| d.get("notice").cloned())
         .filter(|n| detail_kind(n).as_deref() == Some("read_route"))
-        .count();
-    assert_eq!(
-        routes_after, 1,
-        "and never silently re-routes to the file: a new invocation is how you route afresh.\
-         \ntranscript:\n{transcript}"
+        .nth(1)
+        .expect("the file-route notice");
+    assert!(
+        file_notice
+            .get("detail")
+            .and_then(|d| d.get("snapshot_lsn"))
+            .is_some_and(|lsn| lsn.is_u64()),
+        "the notice names the point in the data the reader is now reading from: {file_notice}"
     );
+    let docs = lenient_json_lines(&after_death);
+    let results = documents_named(&docs, "result");
+    assert_eq!(results.len(), 2, "transcript:\n{after_death}");
+    assert_eq!(
+        rows_of(&results[1])
+            .iter()
+            .filter_map(|row| row.get("id").and_then(serde_json::Value::as_i64))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the saved file answers completely.\ntranscript:\n{after_death}"
+    );
+    assert!(
+        docs.iter().all(|d| d.get("error").is_none()),
+        "a writer that went away between commands is not an error for the reader.\
+         \ntranscript:\n{after_death}"
+    );
+
+    // A writer returns over the same store; nobody reopens the reader.
+    let returned = live_owner(&store.path, "");
+    session.send_line("SELECT id, 'returned-owner' AS phase FROM shared ORDER BY id;");
+    session.wait_for("returned-owner");
+    let after_return = session.transcript();
+    assert_eq!(
+        routes_announced(&after_return),
+        vec!["owner".to_owned(), "file".to_owned(), "owner".to_owned()],
+        "when the writer is back the reader switches to it on its own.\
+         \ntranscript:\n{after_return}"
+    );
+    let docs = lenient_json_lines(&after_return);
+    let results = documents_named(&docs, "result");
+    assert_eq!(results.len(), 3, "transcript:\n{after_return}");
+    assert_eq!(
+        rows_of(&results[2]).len(),
+        3,
+        "and the returned owner answers completely.\ntranscript:\n{after_return}"
+    );
+
+    let (code, transcript) = session.finish();
     assert_eq!(
         code,
-        Some(1),
-        "the run failed, and says so in its exit code.\ntranscript:\n{transcript}"
+        Some(0),
+        "a writer that came and went never fails the reader's run.\ntranscript:\n{transcript}"
     );
+    drop(returned);
 }
 
 #[test]
@@ -432,29 +486,50 @@ fn a_fresh_invocation_after_the_owner_leaves_reads_the_idle_file() {
 }
 
 #[test]
-fn a_fresh_invocation_after_the_owner_dies_is_refused_until_a_writer_reopens_the_store() {
+fn a_fresh_invocation_after_the_owner_dies_reads_the_saved_file_and_routes_to_a_replacement() {
     let store = store_with(&create_seeded_table("shared", 3));
     let mut owner = live_owner(&store.path, "");
     owner.kill();
 
-    // The store was never closed: its committed image is intact, but the
-    // file says a writer was inside it. A reader never repairs and never
-    // guesses, so the answer is the refusal that names the step that does.
-    let refused = run(
+    // The store was never closed: its committed image is intact, but the file
+    // says a writer was inside it. A reader never repairs and never guesses;
+    // it answers from what was last saved and says that it did.
+    let saved = run(
         &[store.path_str(), "--json"],
         "SELECT id FROM shared ORDER BY id;\n",
     );
     assert_eq!(
-        refused.code,
-        Some(1),
-        "after an abrupt owner death, a bare-path read is refused, not served stale.\n{}",
-        refused.describe()
+        saved.code,
+        Some(0),
+        "after an abrupt owner death, a bare-path read is served from the saved file.\n{}",
+        saved.describe()
+    );
+    let docs = saved.stdout_docs();
+    let result = expect_document(&docs, "result", "the saved-state read after owner death");
+    assert_eq!(
+        rows_of(&result)
+            .iter()
+            .filter_map(|row| row.get("id").and_then(serde_json::Value::as_i64))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the saved file answers completely.\n{}",
+        saved.describe()
     );
     assert_eq!(
-        refused.error_kinds(),
-        vec!["direct_read_requires_writer".to_owned()],
-        "the refusal names what happened and what clears it.\n{}",
-        refused.describe()
+        saved
+            .route_notices()
+            .first()
+            .and_then(|n| n.get("detail"))
+            .and_then(|d| d.get("route"))
+            .and_then(|r| r.as_str()),
+        Some("file"),
+        "and says it read the file.\n{}",
+        saved.describe()
+    );
+    assert!(
+        saved.errors().is_empty(),
+        "an ordinary writer disappearance is not a refusal.\n{}",
+        saved.describe()
     );
 
     // One writable open closes the file cleanly; the idle file reads again.
@@ -484,6 +559,25 @@ fn a_fresh_invocation_after_the_owner_dies_is_refused_until_a_writer_reopens_the
         Some("file"),
         "and says which route it took.\n{}",
         idle.describe()
+    );
+
+    // A replacement writer is routed to, per invocation.
+    let _replacement = live_owner(&store.path, "");
+    let routed = run(
+        &[store.path_str(), "--json"],
+        "SELECT id FROM shared ORDER BY id;\n",
+    );
+    assert_eq!(routed.code, Some(0), "{}", routed.describe());
+    assert_eq!(
+        routed
+            .route_notices()
+            .first()
+            .and_then(|n| n.get("detail"))
+            .and_then(|d| d.get("route"))
+            .and_then(|r| r.as_str()),
+        Some("owner"),
+        "with a writer back, a new invocation reaches it.\n{}",
+        routed.describe()
     );
 }
 
