@@ -2,14 +2,10 @@
 //! Legacy admits the element-layout delta; native assembly carries an
 //! explicit original for the full backing. Individual payload/sole prepaid Box
 //! owners retain their existing independent custody.
-#[cfg(test)]
-use super::MemoryAccountant;
 use super::{Error, Result, StagedCopyCharge};
 use crate::memory_accounting::{ControlCredit, PendingControlRefund, WriterUse};
 use std::alloc::Layout;
 use std::mem::ManuallyDrop;
-#[cfg(test)]
-use std::sync::Arc;
 
 // Field-for-field pre2 database.rs StagedCopyCharge. Never constructed: its
 // compiler layout is the same-capacity baseline, not a guessed word count.

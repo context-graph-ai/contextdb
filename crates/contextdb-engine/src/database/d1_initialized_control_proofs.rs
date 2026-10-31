@@ -2,16 +2,12 @@
 //! No sibling tests, allocator, production field, or baseline price is added.
 use super::*;
 use crate::persistence::content_identity::proof_allocation_oracle_tests::{
-    candidate_payload_free_observation_for_test, last_request_for_test,
-    last_request_pointer_for_test, measured, watch_candidate_payload_for_test,
+    last_request_for_test,
+    last_request_pointer_for_test,
 };
 use crate::persistence::vector_membership_source::{
-    DurableColumnSourceFactory, DurableLoaderBuilder, DurableMembershipSource,
-    DurableReverseMembershipSource, MembershipOwner,
-};
-use contextdb_vector::store::{
-    DurableRawPartitionFactory, RawVectorMembershipSource, RawVectorMembershipSummary,
-    RawVectorReverseMembershipSource,
+    DurableColumnSourceFactory, DurableLoaderBuilder,
+    DurableReverseMembershipSource,
 };
 
 #[derive(Clone, Copy, Default)]

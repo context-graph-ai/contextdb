@@ -1,10 +1,6 @@
 //! Source extents are separate owners from generation decode/build workspaces.
 //! In particular, a borrowed graph still holds its entire redb source page.
 
-#[cfg(test)]
-use crate::memory_accounting::MemoryAccountant;
-#[cfg(test)]
-use contextdb_core::Error;
 use contextdb_core::Result;
 use std::sync::Arc;
 

@@ -3140,7 +3140,7 @@ mod row_check_cache_ownership_contract {
     use crate::executor::bounded_read_test_support as bounded;
     use crate::{Database, MaintenancePolicy};
     use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
-    use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
+    use contextdb_core::{Value, VectorIndexRef};
     use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};

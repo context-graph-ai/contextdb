@@ -134,7 +134,7 @@ use contextdb_core::{
     AdjEntry, ColumnType, DirectedValue, Error, ForeignKeyReference, IndexDecl, IndexKey,
     IndexKind, Lsn, NodeId, PropagationRule, RankPolicy, Result, RowId, SnapshotId,
     StateMachineConstraint, TableMeta, TotalOrdAsc, TotalOrdDesc, TxId, Value, VectorEntry,
-    VectorIndexRef, VectorPartitionComponent, VectorPartitionKey, VectorQuantization, VersionedRow,
+    VectorIndexRef, VectorPartitionKey, VectorQuantization, VersionedRow,
     Wallclock,
 };
 use contextdb_relational::store::SyncSourceKind;
