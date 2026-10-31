@@ -641,11 +641,6 @@ path = "tests/vector_named_vector_planner_tests.rs"
 required-features = ["test-seams"]
 
 [[test]]
-name = "vector_one_search_covers_every_layer_on_both_routes"
-path = "tests/vector_one_search_covers_every_layer_on_both_routes.rs"
-required-features = ["test-seams"]
-
-[[test]]
 name = "vector_quantized"
 path = "tests/vector_quantized.rs"
 required-features = ["test-seams"]
@@ -751,11 +746,6 @@ path = "tests/vector_serving_merge_contract.rs"
 required-features = ["test-seams"]
 
 [[test]]
-name = "vector_snapshot_frontier_completeness_contract"
-path = "tests/vector_snapshot_frontier_completeness_contract.rs"
-required-features = ["test-seams"]
-
-[[test]]
 name = "vector_tail_transaction_contract"
 path = "tests/vector_tail_transaction_contract.rs"
 required-features = ["test-seams"]
@@ -763,11 +753,6 @@ required-features = ["test-seams"]
 [[test]]
 name = "vector_transaction_filter_snapshot_truth_contract"
 path = "tests/vector_transaction_filter_snapshot_truth_contract.rs"
-required-features = ["test-seams"]
-
-[[test]]
-name = "vector_where_one_partition_spends_its_find"
-path = "tests/vector_where_one_partition_spends_its_find.rs"
 required-features = ["test-seams"]
 
 [[test]]

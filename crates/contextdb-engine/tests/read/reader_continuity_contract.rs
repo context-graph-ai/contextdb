@@ -205,25 +205,10 @@ fn expected_replay_tables() -> BTreeSet<String> {
 }
 fn replace_generation(db: &Database) {
     let index = VectorIndexRef::new("continuity_vectors", "embedding");
-    let generation = || {
-        let state = db
-            .vector_store_for_test()
-            .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
-                index.clone(),
-                contextdb_core::VectorPartitionKey::unpartitioned(),
-            ))
-            .unwrap();
-        (
-            state.base.or(state.dormant_base).map(|g| g.generation_id),
-            state
-                .change
-                .or(state.dormant_change)
-                .map(|g| g.generation_id),
-        )
-    };
+    let generation = || db.__debug_vector_index_generation_for_test(index.clone());
     let before = generation();
     assert!(
-        before.0.is_some(),
+        before.is_some(),
         "the fixture has a healthy saved generation"
     );
     let count = db

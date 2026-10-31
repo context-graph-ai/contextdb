@@ -622,7 +622,9 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
     }
     .expect("the filtered AUTO query must publish a debug trace");
     assert!(
-        auto_trace.used_hnsw && auto_trace.fallback_reason.is_none(),
+        auto_trace.partition_routes.iter().any(|route| {
+            route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
+        }) && auto_trace.fallback_reason.is_none(),
         "filtered AUTO after reopen must take the maintained graph route with no fallback, \
          trace={auto_trace:?}"
     );

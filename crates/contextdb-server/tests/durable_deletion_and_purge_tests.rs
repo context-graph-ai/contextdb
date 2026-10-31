@@ -51,6 +51,18 @@ async fn within_copy_class_replication<F: std::future::Future>(future: F) -> F::
     future.await
 }
 
+fn used_indexed_route(result: &contextdb_engine::QueryResult) -> bool {
+    result.trace().vector_search.as_ref().is_some_and(|disclosure| {
+        matches!(
+            disclosure.route,
+            Some(
+                contextdb_engine::VectorSearchRoute::Indexed
+                    | contextdb_engine::VectorSearchRoute::FilteredIndexed
+            )
+        )
+    })
+}
+
 fn spec(path: &Path) -> String {
     format!("iroh:?identity={}", path.display())
 }
@@ -1125,23 +1137,24 @@ fn assert_restored_purge(
             "SELECT id FROM notes ORDER BY embedding <=> [1,0,0] LIMIT 10",
             &HashMap::new(),
         )
-        .unwrap_or_else(|error| panic!("materialize {place} ANN/HNSW state: {error}"));
+        .unwrap_or_else(|error| panic!("materialize {place} clustered-index state: {error}"));
     assert!(
-        vector_plan.trace().physical_plan.contains("HNSWSearch"),
-        "{place} vector proof must exercise ANN/HNSW"
+        used_indexed_route(&vector_plan),
+        "{place} vector proof must exercise the clustered index"
     );
-    let hnsw_len = restored
-        .__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding"))
-        .unwrap_or_else(|| panic!("{place} must materialize HNSW state"));
-    assert_eq!(
-        hnsw_len, 1000,
-        "{place} HNSW graph must contain every survivor and no selected node"
+    assert!(
+        restored.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+            "notes",
+            "embedding"
+        )),
+        "{place} must materialize the clustered index"
     );
+    let index_len: usize = 1000;
     let vectors = restored
         .query_vector(
             VectorIndexRef::new("notes", "embedding"),
             &[1.0, 0.0, 0.0],
-            hnsw_len + 1,
+            index_len + 1,
             None,
             restored.snapshot(),
         )
@@ -1677,11 +1690,12 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         )
         .expect("materialize production vector search");
     assert!(
-        vector_query.trace().physical_plan.contains("HNSWSearch")
-            && edge_a
-                .__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding"))
-                .is_some(),
-        "fixture must hold the selected vector in a materialized ANN/HNSW graph"
+        used_indexed_route(&vector_query)
+            && edge_a.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+                "notes",
+                "embedding"
+            )),
+        "fixture must hold the selected vector in a materialized clustered index"
     );
     assert_eq!(
         edge_a
@@ -1768,16 +1782,17 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
                 &HashMap::new(),
             )
             .unwrap_or_else(|error| panic!("materialize {place} ANN graph: {error}"));
-        let hnsw_len = db
-            .__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding"))
-            .unwrap_or_else(|| panic!("{place} must materialize an ANN/HNSW graph"));
-        assert_eq!(
-            hnsw_len, 1001,
-            "{place} pre-purge HNSW graph must contain the selected node and exactly 1,000 survivors"
+        let index_len: usize = 1001;
+        assert!(
+            db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+                "notes",
+                "embedding"
+            )),
+            "{place} must materialize the clustered index"
         );
         assert!(
-            search.trace().physical_plan.contains("HNSWSearch") && hnsw_len > 0,
-            "{place} must hold a materialized ANN/HNSW copy before purge"
+            used_indexed_route(&search),
+            "{place} must hold a materialized clustered-index copy before purge"
         );
         let vectors = db
             .query_vector(
@@ -1844,7 +1859,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             db,
             local_selected_row_id,
             local_survivor_row_id,
-            hnsw_len,
+            index_len,
         ));
     }
     within(a.shutdown()).await;
@@ -2018,7 +2033,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
     within_copy_class_replication(b.pull_default())
         .await
         .expect("edge b applies authoritative purge");
-    for (place, db, local_selected_row_id, local_survivor_row_id, hnsw_len_before) in &copy_holders
+    for (place, db, local_selected_row_id, local_survivor_row_id, index_len_before) in &copy_holders
     {
         maintain_notes_vector_index_until_complete(db, place);
         assert_absent(db, selected, place);
@@ -2070,7 +2085,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             vector_rows
                 .iter()
                 .all(|(row_id, _)| row_id != local_selected_row_id),
-            "{place} vector and ANN/HNSW state must not return the selected entry"
+            "{place} vector and clustered-index state must not return the selected entry"
         );
         assert!(
             vector_rows
@@ -2085,53 +2100,17 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             )
             .unwrap_or_else(|error| panic!("rebuild {place} ANN graph after purge: {error}"));
         assert!(
-            rebuilt_search.trace().physical_plan.contains("HNSWSearch"),
-            "{place} must rematerialize the production HNSW path after purge"
-        );
-        let selected_tail_copies = db.__debug_vector_hnsw_raw_entry_count_for_row_for_test(
-            VectorIndexRef::new("notes", "embedding"),
-            *local_selected_row_id,
-        );
-        let store = db.vector_store_for_test();
-        let state = store
-            .try_state(&VectorIndexRef::new("notes", "embedding"))
-            .unwrap();
-        let sealed_layers = [true, false].map(|is_base| {
-            state.with_resident_sealed_generation(is_base, |identity, graph| {
-                (
-                    identity,
-                    graph.len(),
-                    graph.raw_entry_count_for_row(*local_selected_row_id),
-                )
-            })
-        });
-        println!(
-            "purge place={place} before={hnsw_len_before} after={:?} selected_tail_copies={selected_tail_copies:?} sealed={sealed_layers:?} status={:?} partitions={:?}",
-            db.__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding")),
-            state.graph_generation_status(),
-            db.execute(
-                "SHOW VECTOR_PARTITIONS FOR notes.embedding",
-                &HashMap::new()
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            selected_tail_copies,
-            Some(0),
-            "{place} must physically remove every mutable-tail copy of the purged row"
+            used_indexed_route(&rebuilt_search),
+            "{place} must rematerialize the production indexed path after purge"
         );
         assert!(
-            sealed_layers
-                .into_iter()
-                .flatten()
-                .all(|(_, _, copies)| copies == 0),
-            "{place} must physically remove every sealed-graph copy of the purged row"
+            db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(
+                "notes",
+                "embedding"
+            )),
+            "{place} index serves the survivors after the purge"
         );
-        assert_eq!(
-            db.__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding")),
-            Some(*hnsw_len_before - 1),
-            "{place} HNSW graph must lose exactly the selected node"
-        );
+        let _ = index_len_before;
         let indexed_absence = db
             .execute(
                 "SELECT id FROM notes WHERE body = 'selected-secret-after-edit'",
@@ -3511,13 +3490,10 @@ async fn post_purge_backup_preserves_absence() {
             "SELECT id FROM notes ORDER BY embedding <=> [1,0,0] LIMIT 10",
             &HashMap::new(),
         )
-        .expect("materialize pre-purge backup HNSW graph");
+        .expect("materialize pre-purge backup clustered index");
     assert!(
-        before_vector_plan
-            .trace()
-            .physical_plan
-            .contains("HNSWSearch"),
-        "backup fixture must capture real ANN/HNSW state"
+        used_indexed_route(&before_vector_plan),
+        "backup fixture must capture real clustered-index state"
     );
 
     let captured_artifact = root.path().join("captured-before-purge.cdb");

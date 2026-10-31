@@ -683,8 +683,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     let ready_serial_before = db.__debug_vector_index_generation_for_test(index());
     let ready_activity_before = db.__vector_passive_activity_counters_for_test();
     let ready_generation_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .expect("ready partition has generation state")
     });
     let ready_indexes = show_indexes(&db);
@@ -792,8 +791,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
         ready_serial_before
     );
     let ready_generation_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .expect("ready partition still has generation state")
     });
     assert_eq!(
@@ -862,8 +860,7 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
     let charge_before = db.accountant().usage().used;
     let activity_before = db.__vector_passive_activity_counters_for_test();
     let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .expect("reopened partition has dormant generation state")
     });
 
@@ -916,8 +913,7 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
         "repeated file-backed inspection cannot load dormant raw bodies or graphs and then evict them"
     );
     let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .expect("inspection leaves reopened generation state present")
     });
     assert_eq!(generations_after, generations_before);
@@ -967,8 +963,7 @@ fn inspect_reopened_backlog_without_maintenance(backlog: usize) -> usize {
     let activity_before = db.__vector_passive_activity_counters_for_test();
     let charged_before = db.accountant().usage().used;
     let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .unwrap()
     });
     db.__reset_vector_membership_records_decoded_for_test();
@@ -1003,8 +998,7 @@ fn inspect_reopened_backlog_without_maintenance(backlog: usize) -> usize {
     );
     assert_eq!(db.accountant().usage().used, charged_before);
     let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .unwrap()
     });
     assert_eq!(generations_after, generations_before);
@@ -1056,8 +1050,7 @@ fn active_inspection_reports_one_atomic_progress_snapshot_without_advancing_it()
         let charge_before = db.accountant().usage().used;
         let activity_before = db.__vector_passive_activity_counters_for_test();
         let generation_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
+            db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
                 .unwrap_or_else(|| panic!("the partition {scope:?} has generation state"))
         });
         let partitions = show_partitions(&db);
@@ -1065,8 +1058,7 @@ fn active_inspection_reports_one_atomic_progress_snapshot_without_advancing_it()
         let charge_after = db.accountant().usage().used;
         let activity_after = db.__vector_passive_activity_counters_for_test();
         let generation_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
+            db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
                 .unwrap_or_else(|| panic!("inspection leaves partition {scope:?} present"))
         });
         (
@@ -1185,8 +1177,7 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
     let charge_before = db.accountant().usage().used;
     let activity_before = db.__vector_passive_activity_counters_for_test();
     let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .expect("ready engine-owned partition has generation state")
     });
 
@@ -1221,8 +1212,7 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
         "engine-owned inspection cannot trigger and then undo vector lifecycle work"
     );
     let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&route(scope))
+        db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
             .expect("engine-owned inspection leaves generation state present")
     });
     assert_eq!(
@@ -1321,8 +1311,7 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
         let activity_before = db.__vector_passive_activity_counters_for_test();
         let scan_before = db.__relational_scan_rows_touched();
         let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO, SCOPE_HIDDEN].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
+            db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
                 .expect("ready partition has generation state before explain")
         });
         let explain = scoped
@@ -1349,8 +1338,7 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
             "explain cannot build a route"
         );
         let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO, SCOPE_HIDDEN].map(|scope| {
-            db.vector_store_for_test()
-                .partition_graph_generation_status(&route(scope))
+            db.__debug_vector_partition_generation_for_test(route(scope).index, route(scope).partition_key)
                 .expect("ready partition has generation state after explain")
         });
         assert_eq!(
@@ -1401,8 +1389,8 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
         assert_ready_layer_facts(&explain);
         if requested_mode == "EXACT" {
             assert!(
-                !explain.contains("HNSW"),
-                "explicit EXACT must never be described as an HNSW route: {explain}"
+                !explain.contains("strategy=Indexed"),
+                "explicit EXACT must never be described as an indexed route: {explain}"
             );
         }
         assert!(
@@ -1445,8 +1433,8 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
         assert_ready_layer_facts(&runtime_explain);
         if requested_mode == "EXACT" {
             assert!(
-                !runtime_explain.contains("HNSW"),
-                "explicit EXACT runtime explain must never describe HNSW: {runtime_explain}"
+                !runtime_explain.contains("strategy=Indexed"),
+                "explicit EXACT runtime explain must never describe an indexed route: {runtime_explain}"
             );
         }
         assert!(
@@ -1484,7 +1472,7 @@ fn vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_
         assert_explain_fact(&explain, "refusal", "none");
         assert_ready_layer_facts(&explain);
         assert!(
-            !explain.contains("HNSW"),
+            !explain.contains("strategy=Indexed"),
             "every explicit EXACT scope shape remains an exact route: {explain}"
         );
         assert!(

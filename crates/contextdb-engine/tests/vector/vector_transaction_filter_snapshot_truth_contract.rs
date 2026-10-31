@@ -714,7 +714,7 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
     ] {
         let request = bounded_request(sql, params([("query", Value::Vector(vec![1.0, 0.0, 0.0]))]));
         reset_index_trace(&db);
-        let result = execute_observed(&db, &request, &counter)
+        let result = bounded::execute(&db, &request)
             .unwrap_or_else(|error| panic!("bounded equal-score query {sql:?}: {error:?}"));
         assert_eq!(
             ids(&result.result),
@@ -1464,7 +1464,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
             resume: std::sync::Mutex::new(resume_rx),
         }));
         let reader = db.clone();
-        let task = std::thread::spawn(move || execute_observed(&reader, &request, &counter).unwrap().result);
+        let task = std::thread::spawn(move || bounded::execute(&reader, &request).unwrap().result);
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -1613,7 +1613,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
                 }));
                 let reader = hub.clone();
                 let task =
-                    std::thread::spawn(move || execute_observed(&reader, &request, &counter).unwrap().result);
+                    std::thread::spawn(move || bounded::execute(&reader, &request).unwrap().result);
                 receiver
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();

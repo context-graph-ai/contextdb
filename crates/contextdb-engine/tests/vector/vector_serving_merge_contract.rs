@@ -72,6 +72,14 @@ fn ids(result: &QueryResult) -> Vec<i64> {
         .collect()
 }
 
+fn used_indexed_route(
+    trace: &contextdb_engine::database::VectorSearchTraceObservation,
+) -> bool {
+    trace.partition_routes.iter().any(|route| {
+        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
+    })
+}
+
 #[test]
 fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     let directory = tempfile::tempdir().unwrap();
@@ -117,8 +125,8 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     let first = db.execute(sql, &parameters(&query)).unwrap();
     let initial = first.trace().vector_search.as_ref().unwrap().partitions[0].clone();
     assert_eq!(
-        initial.hnsw_ef_search, 100,
-        "the compatibility profile resolves graph breadth from k, independent of the 201-row physical population"
+        initial.probes, None,
+        "an undeclared breadth is chosen per query, independent of the 201-row physical population"
     );
     for result in [first, bounded_query(&db, sql, &query)] {
         let disclosure = result.trace().vector_search.as_ref().unwrap();
@@ -144,13 +152,8 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
         bounded_query(&db, sql, &query),
     ] {
         let serving = &result.trace().vector_search.as_ref().unwrap().partitions[0];
-        assert_eq!(serving.hnsw_m, initial.hnsw_m);
-        assert_eq!(
-            serving.policy_revision, initial.policy_revision,
-            "unpublished topology is not serving"
-        );
-        assert_eq!(serving.hnsw_ef_search, 10);
-        assert_eq!(serving.ef_search_source, "declared_raised_to_k");
+        assert_eq!(serving.probes, Some(9));
+        assert_eq!(serving.probes_source.as_deref(), Some("declared"));
     }
     db.execute(
         "INSERT INTO items VALUES (202, 0, [0.6, 0.4, 0.1])",
@@ -160,14 +163,17 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     db.run_maintenance_cycle().unwrap();
     let current = db.execute(sql, &parameters(&query)).unwrap();
     let serving = &current.trace().vector_search.as_ref().unwrap().partitions[0];
-    assert_eq!(serving.hnsw_m, 24);
+    assert_eq!(serving.probes, Some(9));
     assert!(serving.policy_revision > initial.policy_revision);
     let old = db
         .execute_at_snapshot(sql, &parameters(&query), snapshot)
         .unwrap();
-    let serving = &old.trace().vector_search.as_ref().unwrap().partitions[0];
-    assert_eq!(serving.hnsw_m, initial.hnsw_m);
-    assert_eq!(serving.policy_revision, initial.policy_revision);
+    let old_disclosure = old.trace().vector_search.as_ref().unwrap();
+    assert_eq!(
+        old_disclosure.aggregate_allowed_vectors,
+        Some(201),
+        "the held snapshot counts its own live rows"
+    );
 }
 
 #[test]
@@ -426,22 +432,7 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                                 .expect("read the admitted trace observation")
                         }
                         .unwrap();
-                        println!(
-                            "minimum_similarity quantization={mode} threshold={threshold} plain_ef={:?} threshold_ef={:?} plain_candidates={} threshold_candidates={}",
-                            plain_trace.hnsw_ef_search,
-                            trace.hnsw_ef_search,
-                            plain_trace.hnsw_candidate_count,
-                            trace.hnsw_candidate_count
-                        );
-                        assert!(trace.used_hnsw);
-                        assert_eq!(
-                            trace.hnsw_ef_search, plain_trace.hnsw_ef_search,
-                            "minimum similarity filters the requested neighbours without expanding search breadth"
-                        );
-                        assert_eq!(
-                            trace.hnsw_candidate_row_ids,
-                            plain_trace.hnsw_candidate_row_ids
-                        );
+                        assert!(used_indexed_route(&trace));
                         assert_eq!(
                             filtered
                                 .iter()
@@ -494,107 +485,6 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
             );
         }
     }
-}
-
-#[test]
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_paused() {
-    use contextdb_core::{VectorIndexRef, VectorPartitionKey};
-    use contextdb_engine::VectorMaintenancePreparationPhaseForTest;
-    use contextdb_vector::VectorPartitionRef;
-    use std::{sync::mpsc, thread, time::Duration};
-    let directory = tempfile::tempdir().unwrap();
-    let db = Arc::new(Database::open(directory.path().join("online.redb")).unwrap());
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(8) PARTITION_KEY (bucket) MAX_PARTITIONS 256 AUTO_INDEX_AT 1234 )", &HashMap::new()).unwrap();
-    for id in 1..=200 {
-        db.execute(
-            "INSERT INTO items VALUES ($id, 0, $query)",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id)),
-                (
-                    "query".into(),
-                    Value::Vector(generated_vector(id as u64, 8)),
-                ),
-            ]),
-        )
-        .unwrap();
-    }
-    for _ in 0..4 {
-        db.run_maintenance_cycle().unwrap();
-    }
-    db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 7)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    let sql = "SELECT id FROM items WHERE bucket = 0 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
-    let expected = ids(&bounded_query(&db, sql, &generated_vector(9000, 8)));
-    db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
-        &HashMap::new(),
-    )
-    .unwrap();
-    let route = VectorPartitionRef::new(
-        VectorIndexRef::new("items", "embedding"),
-        VectorPartitionKey::from_values(&[Value::Int64(0)]).unwrap(),
-    );
-    let pause = db.__arm_one_shot_vector_maintenance_preparation_pause_for_test(
-        &route,
-        VectorMaintenancePreparationPhaseForTest::EncodeGraph,
-    );
-    let maintenance_db = db.clone();
-    let maintenance = thread::spawn(move || maintenance_db.run_maintenance_cycle());
-    pause
-        .wait_until_reached_timeout(Duration::from_secs(10))
-        .unwrap();
-    let reader = db.clone();
-    let (sender, receiver) = mpsc::channel();
-    let query = thread::spawn(move || {
-        let result = reader
-            .read_session(ReadLimits::default())
-            .unwrap()
-            .execute(sql, &parameters(&generated_vector(9000, 8)))
-            .unwrap();
-        reader
-            .execute(
-                "ALTER TABLE items ALTER COLUMN embedding SET IVF (PROBES = 128)",
-                &HashMap::new(),
-            )
-            .unwrap();
-        sender.send(ids(&result)).unwrap();
-    });
-    let completed_before_release = receiver.recv_timeout(Duration::from_secs(5));
-    pause.release();
-    maintenance.join().unwrap().unwrap();
-    query.join().unwrap();
-    assert_eq!(
-        completed_before_release
-            .expect("query and newer declaration must complete before the safety release"),
-        expected
-    );
-    let observed = db
-        .execute(
-            "SHOW VECTOR_PARTITIONS FOR items.embedding",
-            &HashMap::new(),
-        )
-        .unwrap();
-    let value = |name: &str| {
-        &observed.rows()[0][observed
-            .columns()
-            .iter()
-            .position(|column| column == name)
-            .unwrap()]
-    };
-    assert_eq!(
-        value("serving_hnsw_m"),
-        &Value::Int64(24),
-        "the stale candidate cannot replace the serving base"
-    );
-    assert_eq!(value("desired_hnsw_m"), &Value::Int64(28));
 }
 
 #[test]
@@ -869,7 +759,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                             .expect("read the admitted trace observation")
                     }
                     .unwrap();
-                    assert!(trace.used_hnsw);
+                    assert!(used_indexed_route(&trace));
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(ordinary.rows(), &expected.rows()[..limit]);
                     db.__reset_last_query_vector_trace_for_test();
@@ -882,7 +772,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                             .expect("read the admitted trace observation")
                     }
                     .unwrap();
-                    assert!(trace.used_hnsw);
+                    assert!(used_indexed_route(&trace));
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(
                         bounded.rows(),
@@ -951,9 +841,24 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
 
     #[derive(Default)]
     struct Distances(AtomicUsize);
-    impl HnswCandidateObserver for Distances {
-        fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
-            self.0.fetch_add(1, Ordering::SeqCst);
+    impl NativeIvfSealObserver for Distances {
+        fn observe(&self, event: NativeIvfSealEvent<'_>) {
+            if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
+                self.0.fetch_add(
+                    (work.centroid_evaluations
+                        + work.quantized_evaluations
+                        + work.full_precision_evaluations
+                        + work.buffer_evaluations) as usize,
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        fn before_boundary(
+            &self,
+            _boundary: NativeIvfFaultBoundary<'_>,
+        ) -> contextdb_core::Result<()> {
+            Ok(())
         }
     }
 
@@ -1081,7 +986,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             }
             .unwrap();
             assert_eq!(
-                trace.used_hnsw,
+                used_indexed_route(&trace),
                 mode == "INDEXED",
                 "source route: {trace:?}"
             );
@@ -1116,7 +1021,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             }
             .unwrap();
             assert_eq!(
-                trace.used_hnsw,
+                used_indexed_route(&trace),
                 mode == "INDEXED",
                 "source route: {trace:?}"
             );

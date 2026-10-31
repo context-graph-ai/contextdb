@@ -397,7 +397,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         .expect("successor statement must observe its own actual physical page root");
     displace();
     // Only the three answer rows have vectors; the maintained vector route excludes NULLs.
-    let (_, _indexed_transaction_work) = observe_target("reader_items", || {
+    let (_, _) = observe_target("reader_items", || {
         for (offset, vector) in old_vectors.iter().enumerate() {
             assert_eq!(database.execute_in_tx(transaction,
                 "SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
@@ -712,10 +712,6 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         ("captured transaction", transaction_work),
         ("durable vector reload", raw_reload_work),
         ("initial transaction", initial_transaction_work),
-        (
-            "captured transaction maintained generation",
-            indexed_transaction_work,
-        ),
     ]
     .into_iter()
     .chain(

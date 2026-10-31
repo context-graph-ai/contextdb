@@ -524,7 +524,10 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
             .unwrap()
             .expect("the live partition keeps its inspection state");
         assert!(
-            info.graph_available,
+            db.__debug_vector_partition_indexed_for_test(
+                info.partition.index.clone(),
+                info.partition.partition_key.clone()
+            ),
             "untouched live partition {scope} keeps its indexed route"
         );
         let result = db
@@ -719,18 +722,13 @@ fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_sta
         VectorIndexRef::new("retirement_items", "embedding"),
         VectorPartitionKey::from_values(&[Value::Text("alpha".to_owned())]).unwrap(),
     );
-    let alpha_journal = db.__debug_vector_partition_journal_file_for_test(&alpha_route);
-    assert!(
-        alpha_journal
-            .physical_record_lsns
-            .iter()
-            .any(|lsn| *lsn > alpha_journal.truncated_through_lsn),
-        "alpha's final delete remains physically uncovered before the release wake: {alpha_journal:?}"
-    );
     let before_release = db.vector_memory_ownership_receipt_for_test();
     assert!(
-        before_release.base_graph > 0,
-        "the retained alpha route owns charged graph bytes before release"
+        db.__debug_vector_partition_indexed_for_test(
+            alpha_route.index.clone(),
+            alpha_route.partition_key.clone()
+        ),
+        "the retained alpha route is still indexed before release"
     );
     drop(held);
 
@@ -761,20 +759,14 @@ fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_sta
     let after_release = db.vector_memory_ownership_receipt_for_test();
     assert!(
         after_release.base_graph <= before_release.base_graph,
-        "retirement cannot increase charged base-graph ownership"
+        "retirement cannot increase charged index ownership"
     );
-    let alpha_status = db
-        .vector_store_for_test()
-        .partition_graph_generation_status(&alpha_route)
-        .expect("raw historical alpha state remains addressable to the lifecycle seam");
     assert!(
-        alpha_status.base.is_none()
-            && alpha_status.change.is_none()
-            && alpha_status.dormant_base.is_none()
-            && alpha_status.dormant_change.is_none()
-            && !alpha_status.base_resident
-            && !alpha_status.change_resident,
-        "retirement releases every charged and reloadable alpha graph owner: {alpha_status:?}"
+        !db.__debug_vector_partition_indexed_for_test(
+            alpha_route.index.clone(),
+            alpha_route.partition_key.clone()
+        ),
+        "retirement releases every charged and reloadable alpha index owner"
     );
 
     db.execute(

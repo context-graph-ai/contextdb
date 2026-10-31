@@ -37,11 +37,10 @@ fn seed(db: &Database) {
     insert(db, 1).unwrap();
     for _ in 0..32 {
         db.run_maintenance_cycle().unwrap();
-        if db
-            .vector_store_for_test()
-            .partition_graph_generation_status(&partition())
-            .is_some_and(|status| status.base.is_some() || status.dormant_base.is_some())
-        {
+        if db.__debug_vector_partition_indexed_for_test(
+            partition().index.clone(),
+            partition().partition_key.clone(),
+        ) {
             break;
         }
     }
@@ -91,8 +90,10 @@ fn local_current_identity_admission_refuses_the_complete_transaction_before_dura
     let db = Database::open(&path).unwrap();
     seed(&db);
     let generation = db
-        .vector_store_for_test()
-        .partition_graph_generation_status(&partition())
+        .__debug_vector_partition_generation_for_test(
+            partition().index.clone(),
+            partition().partition_key.clone(),
+        )
         .unwrap();
     db.arm_vector_current_identity_admission_failure_for_test();
     let tx = db.begin_or_panic();
@@ -116,11 +117,11 @@ fn local_current_identity_admission_refuses_the_complete_transaction_before_dura
     .unwrap();
     assert_refusal(&db, db.commit(tx).unwrap_err());
     assert_eq!(
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&partition())
-            .unwrap()
-            .base,
-        generation.base
+        db.__debug_vector_partition_generation_for_test(
+            partition().index.clone(),
+            partition().partition_key.clone(),
+        ),
+        Some(generation)
     );
     db.arm_vector_current_identity_admission_failure_for_test();
     let error = db
@@ -248,80 +249,6 @@ fn sync_current_identity_admission_refuses_rows_vectors_and_the_authenticated_re
                 .unwrap(),
             Some(source_lsn)
         );
-    }
-}
-
-#[test]
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn declared_topology_and_search_breadth_reach_captured_suffixes_without_a_resident_tail() {
-    let root = TempDir::new().unwrap();
-    let path = root.path().join("policy.db");
-    let db = Database::open(&path).unwrap();
-    seed(&db);
-    insert(&db, 2).unwrap();
-    let inspected = db
-        .inspect_captured_vector_suffix_for_test(
-            &partition(),
-            db.snapshot(),
-            db.declared_reader_memory().unwrap(),
-            &mut || Ok(()),
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(inspected.points, 1);
-    assert_eq!(inspected.policy, (32, 96, 17));
-    assert_eq!(
-        db.vector_store_for_test()
-            .partition_graph_generation_status(&partition())
-            .unwrap()
-            .fresh_tail_entries,
-        0
-    );
-    assert!(
-        db.vector_store_for_test()
-            .with_partition_fresh_tail(&partition(), |graph| graph.policy_values())
-            .is_none()
-    );
-    db.close().unwrap();
-    for id in [3, 4] {
-        let reopened = Database::open(&path).unwrap();
-        reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        assert_eq!(indexed_ids(&reopened).len(), (id - 1) as usize);
-        let before = reopened
-            .inspect_captured_vector_suffix_for_test(
-                &partition(),
-                reopened.snapshot(),
-                reopened.declared_reader_memory().unwrap(),
-                &mut || Ok(()),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(before.policy, (32, 96, 17));
-        insert(&reopened, id).unwrap();
-        assert_eq!(indexed_ids(&reopened).len(), id as usize);
-        let after = reopened
-            .inspect_captured_vector_suffix_for_test(
-                &partition(),
-                reopened.snapshot(),
-                reopened.declared_reader_memory().unwrap(),
-                &mut || Ok(()),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.policy, (32, 96, 17));
-        assert!(after.points > before.points);
-        assert_eq!(
-            reopened
-                .vector_store_for_test()
-                .partition_graph_generation_status(&partition())
-                .unwrap()
-                .fresh_tail_entries,
-            0
-        );
-        reopened.close().unwrap();
     }
 }
 

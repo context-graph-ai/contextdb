@@ -74,14 +74,10 @@ mod retained_query_rows;
 mod row_delete_and_guards_honor_vector_columns;
 #[path = "vector/the_owner_doors_run_one_search_over_every_layer.rs"]
 mod the_owner_doors_run_one_search_over_every_layer;
-#[path = "vector/vector_delete_only_journal_progress_contract.rs"]
-mod vector_delete_only_journal_progress_contract;
 #[path = "vector/vector_exclusion_persistence_tests.rs"]
 mod vector_exclusion_persistence_tests;
 #[path = "vector/vector_generation_authoritative_purge_contract.rs"]
 mod vector_generation_authoritative_purge_contract;
-#[path = "vector/vector_generation_authoritative_purge_replacement_contract.rs"]
-mod vector_generation_authoritative_purge_replacement_contract;
 #[path = "vector/vector_generation_ddl_cleanup_contract.rs"]
 mod vector_generation_ddl_cleanup_contract;
 #[path = "vector/vector_held_out_native_reference.rs"]

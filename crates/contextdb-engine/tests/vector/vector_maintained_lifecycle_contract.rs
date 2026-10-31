@@ -159,16 +159,12 @@ fn graph_serial(db: &Database, vector_index: &VectorIndexRef) -> Option<u64> {
     db.__debug_vector_index_generation_for_test(vector_index.clone())
 }
 
-fn graph_generation_status(
-    db: &Database,
-    vector_index: &VectorIndexRef,
-) -> contextdb_vector::store::VectorGraphGenerationStatus {
-    db.vector_store_for_test()
-        .partition_graph_generation_status(&VectorPartitionRef::new(
-            vector_index.clone(),
-            VectorPartitionKey::unpartitioned(),
-        ))
-        .expect("the declared unpartitioned vector column has one graph state")
+fn used_indexed_route(
+    trace: &contextdb_engine::database::VectorSearchTraceObservation,
+) -> bool {
+    trace.partition_routes.iter().any(|route| {
+        route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
+    })
 }
 
 fn inspected_query_state(db: &Database, vector_index: &VectorIndexRef) -> String {
@@ -272,7 +268,7 @@ fn engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopene
             db.__take_last_query_vector_trace_for_test(seam_read_memory)
                 .expect("read the admitted trace observation")
         }
-        .is_some_and(|trace| trace.used_hnsw),
+        .is_some_and(|trace| used_indexed_route(&trace)),
         "the publisher's successful query uses the maintained route"
     );
     drop(worker_clock);
@@ -283,17 +279,10 @@ fn engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopene
         .__hold_engine_owned_vector_maintenance_clock_for_test()
         .expect("the reopened declaration starts its real engine-owned worker");
     assert_eq!(reader.maintenance_policy(), MaintenancePolicy::EngineOwned);
-    let before_read = graph_generation_status(&reader, &primary);
     assert_eq!(
-        before_read
-            .dormant_base
-            .map(|generation| generation.generation_id),
+        graph_serial(&reader, &primary),
         Some(published_generation),
         "the separately reopened reader receives the exact durable generation before any query"
-    );
-    assert!(
-        !before_read.base_resident,
-        "opening the reader must not eagerly decode or rebuild the published graph"
     );
     reader.__reset_last_query_vector_trace_for_test();
     let reopened_result = reader
@@ -309,12 +298,11 @@ fn engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopene
                 .__take_last_query_vector_trace_for_test(seam_read_memory)
                 .expect("read the admitted trace observation")
         }
-        .is_some_and(|trace| trace.used_hnsw),
+        .is_some_and(|trace| used_indexed_route(&trace)),
         "the reopened reader uses the durable indexed route rather than row presence alone"
     );
-    let after_read = graph_generation_status(&reader, &primary);
     assert_eq!(
-        after_read.base.map(|generation| generation.generation_id),
+        graph_serial(&reader, &primary),
         Some(published_generation),
         "the indexed reader loaded the generation the publisher actually committed"
     );
@@ -429,7 +417,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
             db.__debug_last_query_vector_trace_for_test(seam_read_memory)
                 .expect("read the admitted trace observation")
         }
-        .is_some_and(|trace| trace.used_hnsw),
+        .is_some_and(|trace| used_indexed_route(&trace)),
         "INDEXED execution must use the published route"
     );
 
