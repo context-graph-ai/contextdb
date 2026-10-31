@@ -33,7 +33,7 @@ const ERASURE_TENANT: &str = "vector-schema-recovery-purge-order";
 const TRIGGER_TENANT: &str = "vector-schema-recovery-trigger-bootstrap";
 const REVERTED_BEFORE_HOLDBACK_TENANT: &str = "vector-schema-recovery-reverted-before-holdback";
 const RELEASED_AFTER_ALTER_TENANT: &str = "vector-schema-recovery-released-after-alter";
-const ALL_DEFAULT_HNSW_TENANT: &str = "vector-schema-recovery-all-default-hnsw";
+const ALL_DEFAULT_IVF_TENANT: &str = "vector-schema-recovery-all-default-ivf";
 const REVERTED_GRAPH_AND_CROSSOVER_TENANT: &str =
     "vector-schema-recovery-reverted-graph-and-crossover";
 const DROPPED_PARTITIONED_TABLE_TENANT: &str = "vector-schema-recovery-dropped-partitioned-table";
@@ -539,7 +539,7 @@ const UNSUPPORTED_VECTOR_CLAUSES: [&str; 5] = [
     "MAX_PARTITIONS",
     "SEARCH_MODE",
     "AUTO_INDEX_AT",
-    "HNSW",
+    "IVF",
 ];
 
 /// `ALTER COLUMN` is a candidate-only `alter_action`
@@ -552,8 +552,8 @@ const UNSUPPORTED_ALTER_PHRASE: &str = "ALTER COLUMN";
 /// Split a rendered column-type string into grammar-shaped tokens: a bare run
 /// of non-whitespace, non-`(` characters, or one balanced parenthesised group
 /// (quote-aware, so a `'...'` value cannot desynchronize the paren count).
-/// This is what lets `RANK_POLICY (JOIN hnsw ON search_mode, ...)` stay one
-/// opaque token instead of exposing `hnsw` and `search_mode` as look-alike
+/// This is what lets `RANK_POLICY (JOIN ivf ON search_mode, ...)` stay one
+/// opaque token instead of exposing `ivf` and `search_mode` as look-alike
 /// keyword positions.
 fn tokenize_rendered_column_type(rendered_type: &str) -> Vec<&str> {
     let bytes = rendered_type.as_bytes();
@@ -1683,21 +1683,21 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
         )
         .expect("write the row");
 
-    let (running, _) = start_server(&broker, ALL_DEFAULT_HNSW_TENANT, source.clone()).await;
+    let (running, _) = start_server(&broker, ALL_DEFAULT_IVF_TENANT, source.clone()).await;
 
     let old_receiver = Arc::new(Database::open_memory());
     let old_identity = Arc::new(FabricIdentity::generate());
     let old_node = old_identity.node_id();
     let old_transport = Arc::new(ObservePullPages {
         inner: broker.client_as(&old_node),
-        subject: pull_subject(ALL_DEFAULT_HNSW_TENANT),
+        subject: pull_subject(ALL_DEFAULT_IVF_TENANT),
         pages: Mutex::new(Vec::new()),
         cut_one_old_reply: AtomicBool::new(false),
     });
     let old_client = SyncClient::with_authenticated_transport_and_identity_for_test(
         old_receiver.clone(),
         old_transport.clone(),
-        TenantId::from(ALL_DEFAULT_HNSW_TENANT),
+        TenantId::from(ALL_DEFAULT_IVF_TENANT),
         old_identity,
     )
     .expect("construct the authenticated sync endpoint");
@@ -1714,14 +1714,14 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
     let current_node = current_identity.node_id();
     let current_transport = Arc::new(ObservePullPages {
         inner: broker.client_as(&current_node),
-        subject: pull_subject(ALL_DEFAULT_HNSW_TENANT),
+        subject: pull_subject(ALL_DEFAULT_IVF_TENANT),
         pages: Mutex::new(Vec::new()),
         cut_one_old_reply: AtomicBool::new(false),
     });
     let current_client = SyncClient::with_authenticated_transport_and_identity_for_test(
         current_receiver.clone(),
         current_transport.clone(),
-        TenantId::from(ALL_DEFAULT_HNSW_TENANT),
+        TenantId::from(ALL_DEFAULT_IVF_TENANT),
         current_identity,
     )
     .expect("construct the authenticated sync endpoint");
@@ -1738,15 +1738,15 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
     for page in current_transport_pages(&old_pages) {
         assert_ddl_is_parseable_by_the_older_peer(
             &page.ddl,
-            "all-default HNSW at a peer lacking vector vocabulary",
+            "all-default IVF at a peer lacking vector vocabulary",
         );
     }
     for page in old_pages.iter().chain(current_pages.iter()) {
         assert!(
             !page.ddl.iter().any(|ddl| ddl_column_types(ddl)
                 .iter()
-                .any(|(_, rendered_type)| rendered_type.to_ascii_uppercase().contains("HNSW"))),
-            "an all-default graph policy is spelled as silence; no page at either protocol may carry an HNSW clause"
+                .any(|(_, rendered_type)| rendered_type.to_ascii_uppercase().contains("IVF"))),
+            "an all-default graph policy is spelled as silence; no page at either protocol may carry an IVF clause"
         );
     }
     assert_eq!(running.server.schema_sync_holdbacks(), Vec::new());
@@ -1754,13 +1754,13 @@ async fn an_all_default_graph_policy_is_spelled_as_silence() {
         &source,
         &old_receiver,
         "docs",
-        "all-default HNSW, a peer lacking vector vocabulary",
+        "all-default IVF, a peer lacking vector vocabulary",
     );
     assert_schema_converged(
         &source,
         &current_receiver,
         "docs",
-        "all-default HNSW, current protocol",
+        "all-default IVF, current protocol",
     );
     assert_eq!(
         ids(old_receiver
@@ -1790,10 +1790,16 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
         )
         .expect("declare the compatible control table");
     source
-        .execute("CREATE TABLE ", &empty())
+        .execute(
+            "CREATE TABLE ivf (id UUID PRIMARY KEY, decision_id UUID, search_mode BOOL)",
+            &empty(),
+        )
         .expect("declare a joined table whose name is a reserved-looking word");
     source
-        .execute("CREATE INDEX hnsw_decision_idx ON ", &empty())
+        .execute(
+            "CREATE INDEX ivf_decision_idx ON ivf(decision_id)",
+            &empty(),
+        )
         .expect("index the joined table's join column");
     source
         .execute(
@@ -1802,7 +1808,7 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
                 weight REAL,
                 embedding VECTOR(3) AUTO_INDEX_AT 1000 
                     RANK_POLICY (
-                        JOIN hnsw ON decision_id,
+                        JOIN ivf ON decision_id,
                         FORMULA 'coalesce({weight}, 0.0) * coalesce({search_mode}, 0.0)',
                         SORT_KEY graph_relevance
                     )
@@ -1823,7 +1829,7 @@ async fn reverted_graph_and_crossover_history_remains_authored_until_upgrade() {
         .expect("write compatible control data");
     source
         .execute(
-            "INSERT INTO  VALUES ($id, $decision_id, $search_mode)",
+            "INSERT INTO ivf (id, decision_id, search_mode) VALUES ($id, $decision_id, $search_mode)",
             &params([
                 ("id", Value::Uuid(joined_row)),
                 ("decision_id", Value::Uuid(doc)),

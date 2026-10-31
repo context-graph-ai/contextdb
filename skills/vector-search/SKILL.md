@@ -152,16 +152,16 @@ printf ".explain SELECT id FROM evidence ORDER BY vector_text <=> [1.0, 0.0, 0.0
 and safe refusal or recovery reason. It does not build or repair an index.
 <!-- enforced by: vector_inspection_explain_truth_contract::vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_secrets, vector_inspection_explain_truth_contract::vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts -->
 
-`AUTO_INDEX_AT` and `HNSW (M, EF_CONSTRUCTION, EF_SEARCH)` are per-column declarations for that
-threshold and graph workload; they are not process-wide switches. `AUTO_INDEX_AT` and `EF_SEARCH`
-take effect for newly opened queries without rebuilding, while `M` or `EF_CONSTRUCTION` schedule a
-replacement graph and the previous complete graph continues serving. Leave them silent to keep the
-compatibility profile, or alter them online with `ALTER TABLE ... ALTER COLUMN ... SET ...`. Use
+`AUTO_INDEX_AT`, `SEARCH (TARGET_ACCURACY, EXPECTED_VECTORS)` and
+`IVF (LISTS, PROBES, REFINE_FACTOR)` are per-column declarations for that threshold and index
+workload; they are not process-wide switches. `AUTO_INDEX_AT` and `PROBES` take effect for newly
+opened queries without rebuilding, while `LISTS` or `TARGET_ACCURACY` schedule a replacement index
+and the previous complete index continues serving. Leave them silent to keep the default policy, or
+alter them online with `ALTER TABLE ... ALTER COLUMN ... SET ...`. Use
 [the query-language reference](../../docs/query-language.md#vector-similarity-search) for the
-canonical syntax, `DEFAULT` behavior, rendering, and defaults. Inspection separates desired topology
-from the serving graph and its build revision. `EF_SEARCH` takes effect immediately; the serving
-breadth follows current query policy even if that build revision is older. Actual queries raise an
-explicit breadth only to `k`, or an omitted breadth to at least the profile and `10 * k`.
+canonical syntax, `DEFAULT` behavior, rendering, and defaults. Inspection separates the desired
+layout from the serving index and its build revision. `PROBES` takes effect immediately; the
+serving breadth follows current query policy even if that build revision is older.
 <!-- enforced by: vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_resolver_contract::declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor, vector_serving_merge_contract::query_policy_discloses_serving_snapshot_and_full_partition_search_breadth -->
 
 When `AUTO` chooses exhaustive comparison and a dormant raw partition cannot fit in memory,
@@ -275,8 +275,8 @@ Expected ordering — the vector-nearest row comes **last**, because it failed:
 
 `{confidence}` binds a column on the anchor row, `{success}` a column on the joined row, and
 `{vector_score}` the raw cosine score if you want similarity in the formula. Ranking is applied to
-the candidates **before** the top-k cutoff. On a large HNSW-backed index it ranks the candidates
-ANN retrieval returned — when outcome ranking must be deterministic, keep a single current summary
+the candidates **before** the top-k cutoff. On a large indexed column it ranks the candidates
+the index returned — when outcome ranking must be deterministic, keep a single current summary
 row on the joined side.
 
 **Rank policies are schema.** To change one today, recreate the table with the new `RANK_POLICY`

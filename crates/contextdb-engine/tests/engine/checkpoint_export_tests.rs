@@ -1658,7 +1658,7 @@ fn ce21_export_during_open_transaction_excludes_uncommitted_state() {
 // ---------------------------------------------------------------------------
 // CE22 — vector completeness at scale: 999 vectors round-trip with exact
 // searchable id set and pinned beacon neighbors. RED.
-// (999, not 1000: HNSW_THRESHOLD is 1000, so 999 keeps both sides on the
+// (999, not 1000: the default AUTO_INDEX_AT is 1000, so 999 keeps both sides on the
 // brute-force-exact search path and the full-recall assertion deterministic.)
 // ---------------------------------------------------------------------------
 #[test]

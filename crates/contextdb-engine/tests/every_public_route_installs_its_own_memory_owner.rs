@@ -471,9 +471,6 @@ const VECTOR_STORE_ROUTES: &[&str] = &[
     "contextdb_vector::MemVectorExecutor::bounded_brute_force_step",
     "contextdb_vector::MemVectorExecutor::bounded_brute_force_step_charged",
     "contextdb_vector::MemVectorExecutor::bounded_brute_force_step_with_query",
-    "contextdb_vector::MemVectorExecutor::bounded_hnsw_search",
-    "contextdb_vector::MemVectorExecutor::bounded_hnsw_search_grouped",
-    "contextdb_vector::MemVectorExecutor::bounded_hnsw_search_grouped_with_reader_memory_refusal",
     "contextdb_vector::MemVectorExecutor::search_with_mode",
     "contextdb_vector::MemVectorExecutor::search_with_mode_admission",
     "contextdb_vector::MemVectorExecutor::search_with_mode_owned",
@@ -510,8 +507,6 @@ const VECTOR_STORE_ROUTES: &[&str] = &[
     "contextdb_vector::VectorStore::prepare_partitioned_batch_with_registered_snapshots",
     "contextdb_vector::VectorStore::recheck_policy_maintenance_failures",
     "contextdb_vector::VectorStore::register_index_with_layout",
-    "contextdb_vector::VectorStore::run_hnsw_maintenance_cycle",
-    "contextdb_vector::VectorStore::run_hnsw_maintenance_cycle_with",
     "contextdb_vector::VectorStore::step_partition_paged_build",
     "contextdb_vector::VectorStore::step_partition_paged_build_with_plan",
     "contextdb_vector::VectorStore::storage_bytes_per_entry",
@@ -521,40 +516,12 @@ const VECTOR_STORE_ROUTES: &[&str] = &[
     "contextdb_vector::VectorStore::try_live_entry_for_row_in_partition",
     "contextdb_vector::VectorStore::try_partition_info",
     "contextdb_vector::VectorStore::try_partitioned_entries_matching",
-    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::abandon",
-    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::publish",
-    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::reclaim",
-    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::step",
     "contextdb_vector::mem::BoundedVectorCandidateGroups::has_pending_tail_without_load",
     "contextdb_vector::store::IndexState::preload_dormant_sealed_generation",
-    "contextdb_vector::store::IndexState::raw_hnsw_search",
 ];
 
-/// Routes in a crate with no path to either refusal. `contextdb-hnsw`
-/// depends on no other workspace crate; its traced call chain is a name
-/// match of `std::fs::metadata` against the engine's custody `metadata`.
-const CANNOT_REACH_EITHER_REFUSAL: &[(&str, &str)] = &[
-    (
-        "hnsw_rs::datamap::DataMap::from_hnswdump",
-        "contextdb-hnsw depends on no workspace crate",
-    ),
-    (
-        "hnsw_rs::hnswio::DumpInit::new",
-        "contextdb-hnsw depends on no workspace crate",
-    ),
-    (
-        "hnsw_rs::hnswio::HnswIo::load_hnsw",
-        "contextdb-hnsw depends on no workspace crate",
-    ),
-    (
-        "hnsw_rs::hnswio::HnswIo::load_hnsw_owned",
-        "contextdb-hnsw depends on no workspace crate",
-    ),
-    (
-        "hnsw_rs::hnswio::HnswIo::load_hnsw_owned_with_dist",
-        "contextdb-hnsw depends on no workspace crate",
-    ),
-];
+/// Routes in a crate with no path to either refusal. None remain.
+const CANNOT_REACH_EITHER_REFUSAL: &[(&str, &str)] = &[];
 
 fn driven_rows() -> Vec<Row> {
     let mut rows = Vec::new();

@@ -26,6 +26,9 @@ pub(crate) struct Inspection {
     pub manifest: Option<Manifest>,
     pub catalog: Option<CatalogState>,
     pub objective: Option<Objective>,
+    /// Bytes of the selected generation's persisted index tables; absent
+    /// while nothing is published.
+    pub durable_index_bytes: Option<u64>,
 }
 impl Inspection {
     /// A published index that can serve this partition.
@@ -78,10 +81,15 @@ pub(crate) fn inspect(
     let manifest = source.manifest(0)?;
     let catalog = contextdb_vector::ivf::inspect_catalog(&source, 0, max_delta_runs)?;
     let objective = objective(&source, column, tuple, manifest)?;
+    let durable_index_bytes = manifest
+        .filter(|manifest| manifest.active_lists != 0)
+        .map(|manifest| source.durable_index_bytes(manifest.generation))
+        .transpose()?;
     Ok(Some(Inspection {
         manifest,
         catalog,
         objective,
+        durable_index_bytes,
     }))
 }
 /// The declared objective judged only by evidence for this generation and

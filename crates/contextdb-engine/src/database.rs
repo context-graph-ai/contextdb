@@ -204,8 +204,7 @@ use contextdb_vector::{
 };
 #[cfg(any(test, feature = "test-seams"))]
 use contextdb_vector::{
-    VectorGraphCallbackPhaseForTest, VectorJournalTruncationFaultHandle,
-    VectorJournalTruncationPhaseForTest, VectorLifecyclePauseHandle,
+    VectorJournalTruncationFaultHandle, VectorJournalTruncationPhaseForTest, VectorLifecyclePauseHandle,
     VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
 };
 #[cfg(any(test, feature = "test-seams"))]

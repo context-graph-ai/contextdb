@@ -332,7 +332,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
     assert_eq!(
         graph_serial(&db, &VectorIndexRef::new("control_items", "embedding")),
         None,
-        "the small exact-search control must not need an HNSW graph"
+        "the small exact-search control must not need the index"
     );
 
     let mut failures = Vec::new();
@@ -370,7 +370,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
     record_contract(
         &mut failures,
         graph_serial(&db, &primary).is_none(),
-        "an ordinary query secretly built the primary HNSW graph under CallerDriven maintenance",
+        "an ordinary query secretly built the primary index under CallerDriven maintenance",
     );
 
     assert_eq!(graph_serial(&db, &untouched), None);
@@ -468,7 +468,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
     let inserted = nearest_ids(&db, "lifecycle_items", "embedding_primary", axis(1), 1);
     assert_eq!(inserted, vec![Uuid::from_u128(SENTINEL_ID)]);
     let after_insert_search = graph_serial(&db, &primary)
-        .expect("the inserted vector remains searchable through an HNSW route");
+        .expect("the inserted vector remains searchable through an indexed route");
     record_contract(
         &mut failures,
         after_insert_search == primary_serial,
@@ -495,7 +495,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
     let replaced = nearest_ids(&db, "lifecycle_items", "embedding_primary", axis(2), 1);
     assert_eq!(replaced, vec![Uuid::from_u128(SENTINEL_ID)]);
     let after_replacement_search = graph_serial(&db, &primary)
-        .expect("the replacement remains searchable through an HNSW route");
+        .expect("the replacement remains searchable through an indexed route");
     record_contract(
         &mut failures,
         after_replacement_search == primary_serial,
@@ -519,7 +519,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
     let after_delete = nearest_ids(&db, "lifecycle_items", "embedding_primary", axis(2), 10);
     assert!(!after_delete.contains(&Uuid::from_u128(SENTINEL_ID)));
     let after_delete_search = graph_serial(&db, &primary)
-        .expect("the surviving vectors remain searchable through an HNSW route");
+        .expect("the surviving vectors remain searchable through an indexed route");
     record_contract(
         &mut failures,
         after_delete_search == primary_serial,

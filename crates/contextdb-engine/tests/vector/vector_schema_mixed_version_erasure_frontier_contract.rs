@@ -514,7 +514,7 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
 // Vector build policy is schema: a `SET IVF DEFAULT` or `SET AUTO_INDEX_AT`
 // declared once on the hub must govern every node that can read the clause.
 // The receiver's existing-column merge must carry `auto_index_at`, every
-// HNSW member, and the desired `vector_policy_revision`, not only
+// IVF member, and the desired `vector_policy_revision`, not only
 // `partition_key_columns`, `max_partitions`, and `search_mode`: leg 4 checks
 // the declared values replicate, leg 5 that a revision advance is scheduled,
 // and leg 6 that the edge serves the new crossover threshold.
@@ -636,11 +636,11 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     let baseline = show_vector_indexes(&edge);
     let baseline_row = index_row_for(&baseline, "docs", "embedding");
     assert_eq!(
-        int_or_null_at(&baseline, baseline_row, "declared_hnsw_m"),
+        int_or_null_at(&baseline, baseline_row, "declared_lists"),
         None
     );
     assert_eq!(
-        int_or_null_at(&baseline, baseline_row, "declared_hnsw_ef_construction"),
+        int_or_null_at(&baseline, baseline_row, "declared_probes"),
         None
     );
     assert_eq!(
@@ -656,12 +656,12 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     )
     .expect("desired_policy_revision is always populated");
 
-    // Leg 3 -- hub declares HNSW and AUTO_INDEX_AT.
+    // Leg 3 -- hub declares IVF and AUTO_INDEX_AT.
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 128)",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (LISTS = 24, PROBES = 128)",
         &empty(),
     )
-    .expect("declare HNSW policy on the hub");
+    .expect("declare IVF policy on the hub");
     hub.execute(
         "ALTER TABLE docs ALTER COLUMN embedding SET AUTO_INDEX_AT 2500",
         &empty(),
@@ -681,12 +681,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     let hub_row = index_row_for(&hub_indexes, "docs", "embedding");
     let edge_indexes = show_vector_indexes(&edge);
     let edge_row = index_row_for(&edge_indexes, "docs", "embedding");
-    for field in [
-        "declared_hnsw_m",
-        "declared_hnsw_ef_construction",
-        "declared_hnsw_ef_search",
-        "declared_auto_index_at",
-    ] {
+    for field in ["declared_lists", "declared_probes", "declared_auto_index_at"] {
         assert_eq!(
             int_or_null_at(&edge_indexes, edge_row, field),
             int_or_null_at(&hub_indexes, hub_row, field),
@@ -694,7 +689,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         );
     }
     assert_eq!(
-        int_or_null_at(&edge_indexes, edge_row, "declared_hnsw_m"),
+        int_or_null_at(&edge_indexes, edge_row, "declared_lists"),
         Some(24)
     );
 
@@ -747,37 +742,37 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         "the effective crossover must be sourced from the declaration, not the compatibility profile: {disclosure:?}"
     );
 
-    // Leg 7 -- EF_SEARCH-only does not schedule a rebuild.
-    let revision_after_hnsw = int_or_null_at(
+    // Leg 7 -- PROBES-only does not schedule a rebuild.
+    let revision_after_ivf = int_or_null_at(
         &show_vector_partitions(&edge, "docs", "embedding"),
         0,
         "desired_policy_revision",
     )
     .expect("desired_policy_revision is always populated");
     hub.execute(
-        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (PROBES = 200)",
+        "ALTER TABLE docs ALTER COLUMN embedding SET IVF (LISTS = 24, PROBES = 200)",
         &empty(),
     )
-    .expect("declare an EF_SEARCH-only change on the hub");
+    .expect("declare a PROBES-only change on the hub");
     client
         .pull_default()
         .await
-        .expect("the edge pulls the EF_SEARCH-only ALTER");
-    let ef_search_indexes = show_vector_indexes(&edge);
-    let ef_search_row = index_row_for(&ef_search_indexes, "docs", "embedding");
+        .expect("the edge pulls the PROBES-only ALTER");
+    let probes_indexes = show_vector_indexes(&edge);
+    let probes_row = index_row_for(&probes_indexes, "docs", "embedding");
     assert_eq!(
-        int_or_null_at(&ef_search_indexes, ef_search_row, "declared_hnsw_ef_search"),
+        int_or_null_at(&probes_indexes, probes_row, "declared_probes"),
         Some(200)
     );
-    let revision_after_ef_search = int_or_null_at(
+    let revision_after_probes = int_or_null_at(
         &show_vector_partitions(&edge, "docs", "embedding"),
         0,
         "desired_policy_revision",
     )
     .expect("desired_policy_revision is always populated");
     assert_eq!(
-        revision_after_ef_search, revision_after_hnsw,
-        "an EF_SEARCH-only change must not advance the desired policy revision"
+        revision_after_probes, revision_after_ivf,
+        "a PROBES-only change must not advance the desired policy revision"
     );
 
     // Leg 8 -- clearing replicates.
@@ -785,7 +780,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         "ALTER TABLE docs ALTER COLUMN embedding SET IVF DEFAULT",
         &empty(),
     )
-    .expect("clear the HNSW declaration on the hub");
+    .expect("clear the IVF declaration on the hub");
     hub.execute(
         "ALTER TABLE docs ALTER COLUMN embedding SET AUTO_INDEX_AT DEFAULT",
         &empty(),
@@ -797,12 +792,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         .expect("the edge pulls the DEFAULT clauses");
     let cleared_indexes = show_vector_indexes(&edge);
     let cleared_row = index_row_for(&cleared_indexes, "docs", "embedding");
-    for field in [
-        "declared_hnsw_m",
-        "declared_hnsw_ef_construction",
-        "declared_hnsw_ef_search",
-        "declared_auto_index_at",
-    ] {
+    for field in ["declared_lists", "declared_probes", "declared_auto_index_at"] {
         assert_eq!(
             int_or_null_at(&cleared_indexes, cleared_row, field),
             None,
@@ -816,8 +806,8 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     )
     .expect("desired_policy_revision is always populated");
     assert!(
-        revision_after_clear > revision_after_ef_search,
-        "clearing M and EF_CONSTRUCTION must advance the desired policy revision again"
+        revision_after_clear > revision_after_probes,
+        "clearing LISTS must advance the desired policy revision again"
     );
 
     // Leg 9 -- rows keep flowing: an ordinary insert after every ALTER reaches the edge.

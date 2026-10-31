@@ -141,7 +141,7 @@ fn ranked_documents() -> Database {
     database
 }
 
-/// HNSW publication is caller-driven work. The route comparison starts only
+/// index publication is caller-driven work. The route comparison starts only
 /// once finite maintenance has made the route the executor is entitled to
 /// choose; the assertions below still reject a brute-force trace.
 fn publish_document_index(database: &Database) {

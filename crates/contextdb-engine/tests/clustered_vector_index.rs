@@ -36,8 +36,6 @@ mod depth_coverage;
 mod disk_ceiling;
 #[path = "clustered_vector_index/exact_and_indexed_work.rs"]
 mod exact_and_indexed_work;
-#[path = "clustered_vector_index/graph_option_refusal.rs"]
-mod graph_option_refusal;
 #[path = "clustered_vector_index/import_tail_coverage.rs"]
 mod import_tail_coverage;
 #[path = "clustered_vector_index/index_corruption.rs"]

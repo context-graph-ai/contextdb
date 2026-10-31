@@ -527,6 +527,25 @@ impl<'a> PageSource<'a> {
     pub(super) fn native(&self) -> NativeIo<'_> {
         self.authority.native()
     }
+    /// Bytes the generation's published kind tables hold: persisted entry
+    /// count times the page size, from table metadata with no page walk.
+    pub(super) fn durable_index_bytes(&self, generation: u64) -> Result<u64> {
+        let record = self.record.borrow();
+        let family = record.family(generation).ok_or_else(corrupt)?;
+        let mut entries = 0u64;
+        for tag in 1..=16u8 {
+            if family.kinds.present & (1u16 << (tag - 1)) == 0 {
+                continue;
+            }
+            let name = KindTableName::new(family.storage, header::kind_from_tag(tag)?)?;
+            entries = entries
+                .checked_add(self.native().table_entries(name.as_str()?)?)
+                .ok_or_else(corrupt)?;
+        }
+        entries
+            .checked_mul(PAGE_BYTES as u64)
+            .ok_or_else(corrupt)
+    }
     fn family_slot(&self, generation: u64) -> Option<usize> {
         self.record
             .borrow()

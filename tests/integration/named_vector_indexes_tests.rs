@@ -233,7 +233,7 @@ fn nv03_update_one_column_invalidates_only_that_index() {
     let original_text = vec![1.0_f32, 0.0, 0.0, 0.0];
     let original_vision = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     // other_text is strictly closer to original_text than new_text=[0,0,1,0] (orthogonal, sim 0).
-    // Without HNSW invalidation, probing original_text returns id at top-1 (stale entry); with
+    // Without index invalidation, probing original_text returns id at top-1 (stale entry); with
     // invalidation, the new vector at [0,0,1,0] is still orthogonal to the probe, so other_id wins
     // deterministically. Avoids equidistant-tiebreak flake on a correct implementation.
     let other_text = vec![0.9_f32, 0.1, 0.0, 0.0];
@@ -317,7 +317,7 @@ fn nv03_update_one_column_invalidates_only_that_index() {
     assert_ne!(
         stale_hits.rows()[0][id_idx],
         Value::Uuid(id),
-        "stale-vector probe must NOT return the updated row at top-1; HNSW must drop the old entry"
+        "stale-vector probe must NOT return the updated row at top-1; index must drop the old entry"
     );
     let raw_stale_hits = db
         .query_vector(
@@ -1023,7 +1023,7 @@ fn nv13b_multi_vector_update_partial_failure_rolls_back_atomically() {
         "vector_vision must remain at its original value"
     );
 
-    // ANN against original vector_text still returns the row at top-1 — HNSW for vector_text was not invalidated.
+    // ANN against original vector_text still returns the row at top-1 — index for vector_text was not invalidated.
     let hits = db
         .execute(
             "SELECT id FROM evidence ORDER BY vector_text <=> $q LIMIT 1",
@@ -1932,7 +1932,7 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
     assert_eq!(
         digest_hits.rows()[0][digest_id_idx],
         Value::Uuid(digest_id),
-        "DROP TABLE evidence must not clear payload/HNSW state for digests.vector_text"
+        "DROP TABLE evidence must not clear payload/index state for digests.vector_text"
     );
 
     // The emitted changeset carries a DropTable DDL change; receivers replicate the deregistration.
@@ -1947,7 +1947,7 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
     );
 
     // Recreating the table with same column names but DIFFERENT dimensions opens cleanly — no stale
-    // HNSW state inherited from the dropped table.
+    // index state inherited from the dropped table.
     db.execute(
         "CREATE TABLE evidence (
             id UUID PRIMARY KEY,

@@ -36,8 +36,8 @@ of truth.
   authorized layouts produce one global top-k; a partition is not a tenant, authorization rule, or
   sync direction. <!-- enforced by: vector_partition_declaration_contract::partitioned_vector_schema_survives_reopen_with_canonical_defaults, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_partition_query_contract::partition_scope_does_not_weaken_context_scope_or_principal_filters, vector_partition_sync_inspection_contract::partitioned_sync_derives_receiver_membership_without_changing_owner_pairing --> Maintained indexed routes have an at-least-95% recall-at-10 acceptance target
   against exact search on the same stored column. <!-- enforced by: vector_held_out_native_reference::held_out_unfiltered_native_reference_recovers_the_required_neighbors, vector_serving_merge_contract::held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectivities -->
-  `AUTO_INDEX_AT` and HNSW (`M`, `EF_CONSTRUCTION`, `EF_SEARCH`) are
-  declarable per-column workload policy; default silence keeps the compatibility profile. See
+  `AUTO_INDEX_AT`, `SEARCH` (`TARGET_ACCURACY`, `EXPECTED_VECTORS`) and `IVF`
+  (`LISTS`, `PROBES`, `REFINE_FACTOR`) are declarable per-column workload policy; default silence keeps the default policy. See
   [Query Language](query-language.md) and [Architecture](architecture.md).
   <!-- enforced by: vector_policy_declaration_contract::create_and_add_column_declarations_render_inspect_and_survive_reopen_and_export, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries -->
 

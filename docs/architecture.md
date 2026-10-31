@@ -13,8 +13,7 @@ contextdb-tx            MVCC transaction manager, WriteSet, WriteSetApplicator t
     │
     ├── contextdb-relational    Row storage, scan, insert, upsert, delete
     ├── contextdb-graph         Adjacency index, bounded BFS, DAG enforcement
-    └── contextdb-vector        Partitioned maintained search, durable base/change/tail generations
-            └── contextdb-hnsw  Vendored third-party HNSW index (see below)
+    └── contextdb-vector        Partitioned maintained search, clustered disk index
             │
 contextdb-parser        pest grammar → AST (SQL + GRAPH_TABLE + vector extensions)
     │
@@ -31,8 +30,7 @@ Modules that carry the bounded writer working set (details in each crate's `AGEN
 | Crate | Module | What it does |
 |---|---|---|
 | `contextdb-redb` | `tree_store/page_store/allocator_pager.rs` | Pages allocator bitmap words through 32 fixed windows with same-directory scratch spill |
-| `contextdb-hnsw` | `paged.rs` | Builds and searches an HNSW graph over caller-supplied point storage, keeping one insertion's workspace |
-| `contextdb-vector` | `hnsw/paged_builder.rs`, `store/membership.rs` | Transactional paged graph builder and tail; durable raw-membership sources with no retained directory |
+| `contextdb-vector` | `ivf/`, `store/membership.rs` | Clustered index pages read and written a page at a time; durable raw-membership sources with no retained directory |
 | `contextdb-relational` | `source.rs` | Root-pinned row and index reads with staged-row merge |
 | `contextdb-graph` | `source.rs` | Root-pinned adjacency reads with an edge overlay |
 | `contextdb-tx` | `commit_directory.rs`, `ordered_staged.rs` | Durable commit-history seam; ordered staged rows |
@@ -44,13 +42,6 @@ and releases pages, indexes and history after use; readers keep the view they op
 <!-- enforced by: writable_open_never_touches_history_families::writable_open_never_touches_history_families, writer_reopen_and_doubling_keep_a_fixed_resident_envelope::writer_reopen_and_doubling_keep_a_fixed_resident_envelope, writer_reader_root_survives_commit_eviction_and_cleanup::writer_reader_root_survives_commit_eviction_and_cleanup -->
 
 Dependencies flow downward. `contextdb-engine` owns the `Database` struct and is the crate applications depend on.
-
-`contextdb-hnsw` is the eleventh crate and the one exception to "in-house surface": it is a
-**vendored third-party crate** — the upstream `hnsw_rs` 0.3.4 HNSW implementation, carried here
-under its own upstream authorship and its `MIT OR Apache-2.0` licence, with deterministic seeded
-builds on top. Treat it as vendored dependency code: `contextdb-vector` is where a change to how
-contextdb *uses* an HNSW index belongs, and a change inside `contextdb-hnsw` itself is a change to
-vendored upstream code, to be made deliberately and kept minimal.
 
 The engine depends on the maintained **`contextdb-redb`** package (library name `redb`) at
 `crates/contextdb-redb`, based on upstream redb 4.1.0
@@ -117,7 +108,7 @@ audio, or policy embeddings with different dimensions and quantization choices.
 
 - Cosine similarity via `<=>` operator
 - `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` per column
-- SQ8/SQ4 columns keep quantized live payloads and quantized HNSW payloads;
+- SQ8/SQ4 columns keep quantized live payloads and quantized index payloads;
   f32 is reconstructed only at API/materialization boundaries
 - A two-level local registry: `(table, column)` identifies a vector index and a typed declared
   partition key identifies one local search layout. The unpartitioned column has one empty key.
@@ -127,7 +118,7 @@ audio, or policy embeddings with different dimensions and quantization choices.
   fresh searchable tail; deletes and replacements add tombstones. Searches merge the valid base,
   sealed committed changes, and tail under one MVCC snapshot.
   <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_current_identity_admission_refuses_the_complete_transaction_before_durability -->
-- `AUTO_INDEX_AT` and HNSW (`M`, `EF_CONSTRUCTION`, `EF_SEARCH`) are declarable per-column
+- `AUTO_INDEX_AT`, `SEARCH` (`TARGET_ACCURACY`, `EXPECTED_VECTORS`) and `IVF` (`LISTS`, `PROBES`, `REFINE_FACTOR`) are declarable per-column
   workload policy; silence keeps the compatibility profile. `AUTO` applies its effective threshold
   to the aggregate allowed set, while `EXACT` and `INDEXED` remain explicit whole-query contracts.
   The canonical SQL reference defines syntax, defaults, and online effects.
@@ -545,8 +536,8 @@ Two implementations:
 
 This trait is the extension point for additional backends if required. The
 applicator borrows the commit `WriteSet`; stores clone only the row, edge, or
-vector data they retain. The engine owns compute state (in-memory stores, HNSW
-cache). The applicator owns durability.
+vector data they retain. The engine owns compute state (in-memory stores and
+index caches). The applicator owns durability.
 
 ### Persistence (`redb`)
 
@@ -642,7 +633,7 @@ candidate. The state digest equals the BLAKE3 hash of the canonical encoding of 
 owns the candidate and its encoding, validation and durable-write copies. Only change publication
 loads the prior base. The shared accountant atomically replaces each phase's held charge without
 exposing its capacity or charging both phases; refusal leaves the old charge intact.
-<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-vector/src/hnsw.rs::durable_codec_capacity_bounds_all_stored_representations_and_checks_overflow, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::streamed_state_digest_preserves_the_canonical_live_entry_encoding, vector_generation_admission_contract::encoding_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::candidate_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::growing_persistence_transitions_refuse_atomically_for_base_and_change_publication, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
+<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::streamed_state_digest_preserves_the_canonical_live_entry_encoding, vector_generation_admission_contract::encoding_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::candidate_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::growing_persistence_transitions_refuse_atomically_for_base_and_change_publication, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
 Page preparation
 retains one graph body and frames each physical key and page only during insertion. Reader-held
 old generations remain charged until their final holder releases them.
@@ -884,8 +875,7 @@ Fan-out to multiple subscribers. Dead channels are cleaned up automatically. Gra
 `SET MEMORY_LIMIT`, `SHOW MEMORY_LIMIT`, and the `--memory-limit` startup option all
 feed the same global memory accountant.
 Vector operations attribute allocations with tags such as
-`vector_insert@evidence.vector_text` and `build_hnsw@evidence.vector_vision` so
-operators can identify the offending index from errors.
+`vector_insert@evidence.vector_text` so operators can identify the offending index from errors.
 
 The 2 GB edge working-set target guides constrained deployments. For a constrained device, SQ8 can
 reduce the stored vector footprint:

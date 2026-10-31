@@ -6,8 +6,8 @@
 //! So a receiver that pulls only such an ALTER keeps answering `USE VECTOR
 //! INDEXED` from the graphs it maintained before, with no maintenance run in
 //! between, and adopts the new policy; a later ordinary vector update leaves
-//! the other partitions' graphs serving. A changed HNSW topology keeps the old
-//! graph serving until maintenance replaces it. Driven through the
+//! the other partitions' graphs serving. A changed IVF layout keeps the old
+//! index serving until maintenance replaces it. Driven through the
 //! authenticated pull path, the same received-schema transaction a real edge
 //! uses.
 
@@ -111,8 +111,23 @@ fn embedding_column(db: &Database) -> contextdb_core::ColumnDef {
         .expect("the vector column")
 }
 
-/// (desired HNSW M, serving HNSW M) for every partition of the receiver.
-fn hnsw_m(db: &Database) -> Vec<(Value, Value)> {
+/// The declared IVF `LISTS` of the receiver's column, as SHOW VECTOR_INDEXES
+/// reports it.
+fn declared_lists(db: &Database) -> Value {
+    let result = db
+        .execute("SHOW VECTOR_INDEXES", &HashMap::new())
+        .expect("inspect the receiver's indexes");
+    let column = result
+        .columns()
+        .iter()
+        .position(|column| column == "declared_lists")
+        .expect("SHOW VECTOR_INDEXES has declared_lists");
+    result.rows()[0][column].clone()
+}
+
+/// (desired policy revision, serving policy revision) for every partition of
+/// the receiver.
+fn policy_revisions(db: &Database) -> Vec<(Value, Value)> {
     let result = db
         .execute(
             "SHOW VECTOR_PARTITIONS FOR policy_items.embedding",
@@ -126,7 +141,10 @@ fn hnsw_m(db: &Database) -> Vec<(Value, Value)> {
             .position(|column| column == name)
             .unwrap_or_else(|| panic!("SHOW VECTOR_PARTITIONS has {name}"))
     };
-    let (desired, serving) = (column("desired_hnsw_m"), column("serving_hnsw_m"));
+    let (desired, serving) = (
+        column("desired_policy_revision"),
+        column("serving_policy_revision"),
+    );
     result
         .rows()
         .iter()
@@ -340,42 +358,41 @@ async fn a_vector_update_after_a_synced_policy_change_keeps_the_other_partitions
     }
 }
 
-/// A synced HNSW topology change keeps the old graph serving INDEXED until
-/// maintenance builds the new topology, which then serves.
+/// A synced IVF layout change keeps the old index serving INDEXED until
+/// maintenance builds the new layout, which then serves.
 #[tokio::test]
-async fn a_synced_hnsw_topology_change_serves_the_old_graph_until_maintenance_replaces_it() {
+async fn a_synced_ivf_layout_change_serves_the_old_index_until_maintenance_replaces_it() {
     let synced = Synced::start().await;
-    let before = hnsw_m(&synced.edge);
+    let before = policy_revisions(&synced.edge);
     assert!(
         before.iter().all(|(desired, serving)| desired == serving),
-        "every partition serves its declared topology before the change: {before:?}"
+        "every partition serves its declared layout before the change: {before:?}"
     );
     synced
         .alter(
-            "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW \
-             (M = 24, EF_CONSTRUCTION = 300)",
+            "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF (LISTS = 24)",
         )
         .await;
-    let pending = hnsw_m(&synced.edge);
+    let pending = policy_revisions(&synced.edge);
+    assert_eq!(declared_lists(&synced.edge), Value::Int64(24));
     assert!(
-        pending
-            .iter()
-            .all(|(desired, serving)| *desired == Value::Int64(24) && serving != desired),
-        "the receiver adopts the new topology but still serves the old one: {pending:?}"
+        pending.iter().all(|(desired, serving)| serving != desired),
+        "the receiver adopts the new layout but still serves the old one: {pending:?}"
     );
     assert_indexed_answers(
         &synced.edge,
-        "the old graph serves INDEXED until maintenance replaces it",
+        "the old index serves INDEXED until maintenance replaces it",
     );
     synced.maintain();
-    let replaced = hnsw_m(&synced.edge);
+    let replaced = policy_revisions(&synced.edge);
+    assert_eq!(declared_lists(&synced.edge), Value::Int64(24));
     assert!(
         replaced
             .iter()
-            .all(|(desired, serving)| *desired == Value::Int64(24) && serving == desired),
-        "bounded maintenance serves the new topology: {replaced:?}"
+            .all(|(desired, serving)| serving == desired),
+        "bounded maintenance serves the new layout: {replaced:?}"
     );
-    assert_indexed_answers(&synced.edge, "the new graph serves INDEXED");
+    assert_indexed_answers(&synced.edge, "the new index serves INDEXED");
     synced.stop().await;
 }
 
@@ -387,7 +404,7 @@ async fn a_synced_hnsw_topology_change_serves_the_old_graph_until_maintenance_re
 /// place; the update takes the ordinary path. The receiver adopts the policy
 /// without discarding its graphs: the untouched partition still answers
 /// INDEXED with no maintenance, a snapshot held from before the pull still
-/// sees the old vector, and a changed HNSW topology keeps the old one serving
+/// sees the old vector, and a changed IVF layout keeps the old one serving
 /// until maintenance.
 #[tokio::test]
 async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receivers_graphs() {
@@ -401,9 +418,8 @@ async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receive
             "auto_index_at",
         ),
         (
-            "ALTER TABLE policy_items ALTER COLUMN embedding SET HNSW \
-             (M = 24, EF_CONSTRUCTION = 300)",
-            "hnsw",
+            "ALTER TABLE policy_items ALTER COLUMN embedding SET IVF (LISTS = 24)",
+            "ivf",
         ),
     ] {
         let synced = Synced::start().await;
@@ -449,11 +465,10 @@ async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receive
                 VectorSearchMode::Auto
             ),
             "auto_index_at" => assert_eq!(embedding_column(&synced.edge).auto_index_at, Some(7)),
-            _ => assert!(
-                hnsw_m(&synced.edge)
-                    .iter()
-                    .all(|(desired, _)| *desired == Value::Int64(24)),
-                "{alter}: the receiver adopts the new topology"
+            _ => assert_eq!(
+                declared_lists(&synced.edge),
+                Value::Int64(24),
+                "{alter}: the receiver adopts the new layout"
             ),
         }
         let (other_id, other_scope, other_embedding) = row(1);
@@ -466,12 +481,12 @@ async fn a_synced_policy_change_and_a_vector_update_in_one_pull_keep_the_receive
             ),
             vec![other_id]
         );
-        if adopted == "hnsw" {
+        if adopted == "ivf" {
             assert!(
-                hnsw_m(&synced.edge)
+                policy_revisions(&synced.edge)
                     .iter()
                     .any(|(desired, serving)| serving != desired),
-                "{alter}: the old topology keeps serving until maintenance"
+                "{alter}: the old layout keeps serving until maintenance"
             );
         }
         assert_eq!(

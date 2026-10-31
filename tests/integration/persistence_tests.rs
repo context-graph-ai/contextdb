@@ -621,7 +621,7 @@ fn p04_vectors_survive_reopen_and_ann_works() {
 }
 
 #[test]
-fn p05_hnsw_recall_stable_across_reopen() {
+fn p05_indexed_recall_stable_across_reopen() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("recall.db");
     let db = Database::open(&path).unwrap();
@@ -1047,7 +1047,7 @@ fn p13_single_file_operation() {
 }
 
 #[test]
-fn p14_hnsw_recall_at_10_meets_threshold() {
+fn p14_indexed_recall_at_10_meets_threshold() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE vecs (id UUID PRIMARY KEY, embedding VECTOR(384))",

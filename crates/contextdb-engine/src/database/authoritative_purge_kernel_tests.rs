@@ -414,9 +414,9 @@ fn current_row_change(db: &Database, table: &str, key: &NaturalKey) -> RowChange
 }
 
 fn assert_owned_copies_equal_after_reopen(before: &OwnedCopies, after: &OwnedCopies) {
-    // HNSW itself is nondurable. `owned_copies` deliberately runs the vector
-    // query first, so this proves reopen can rematerialize the same survivor
-    // graph without pretending the pre-close allocation identity persisted.
+    // `owned_copies` deliberately runs the vector query first, so this proves
+    // reopen serves the same survivor index without pretending the pre-close
+    // allocation identity persisted.
     assert_eq!(after.indexed_available, before.indexed_available);
     assert_eq!(
         after.durable_change_log, before.durable_change_log,
@@ -658,21 +658,21 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
             "INSERT INTO notes (id, body, embedding) VALUES ($id, $body, '[-1,0,0]')",
             &params(Uuid::new_v4(), &format!("threshold-corpus-{ordinal}")),
         )
-        .expect("seed real HNSW threshold corpus");
+        .expect("seed real index threshold corpus");
     }
     for _ in 0..16 {
         if db.__debug_vector_indexed_available_for_test(VectorIndexRef::new(NOTES, "embedding")) {
             break;
         }
         db.run_maintenance_cycle()
-            .expect("deterministically materialize fixture HNSW");
+            .expect("deterministically materialize fixture index");
     }
-    let hnsw_query = db
+    let indexed_query = db
         .execute(
             "SELECT id FROM notes ORDER BY embedding <=> [1,0,0] LIMIT 10",
             &HashMap::new(),
         )
-        .expect("materialize HNSW");
+        .expect("materialize index");
     assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
 
     let selected_edge = Uuid::new_v4();
@@ -1149,7 +1149,7 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
         "the INDEXED coverage query must not publish another graph build"
     );
     assert!(
-        result.trace().physical_plan.contains("HNSWSearch"),
+        result.trace().physical_plan.contains("strategy=Indexed"),
         "INDEXED coverage must execute the maintained route, plan {}",
         result.trace().physical_plan
     );
@@ -1364,8 +1364,8 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert_eq!(after_notes.selected_history_count, 0);
     assert!(!after_notes.selected_vector_present);
     assert!(after_notes.survivor_vector_present);
-    // HnswIndex::len documents vector count. The durable-pages arm currently
-    // counts points; that production defect must not weaken this N-1 oracle.
+    // Availability counts logical vector membership; shared representations
+    // must not weaken this N-1 oracle.
     assert_eq!(
         after_notes.indexed_available, before.indexed_available,
         "logical vector membership loses exactly the erased row, including shared representations"

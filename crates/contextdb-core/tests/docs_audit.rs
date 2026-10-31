@@ -106,7 +106,7 @@ fn docs_query_language_lists_txid_column_type() {
 //   `crates/*/tests/<file_stem>/main.rs`, or `crates/*/tests/*/<file_stem>.rs`
 //   defines a test `fn test_fn`;
 // - `<path>.rs::test_fn` — a repository-relative test file (for example
-//   `tests/integration/hnsw_tests.rs::h04_hnsw_recall_is_at_least_ninety_five_percent`)
+//   `tests/integration/clustered_index_tests.rs::h04_indexed_recall_is_at_least_ninety_five_percent`)
 //   defines a test `fn test_fn`;
 // - `<crate>::<file_stem>` — the whole test target
 //   `crates/<crate>/tests/<file_stem>.rs` enforces the claim.

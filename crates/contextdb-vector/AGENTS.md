@@ -2,48 +2,37 @@
 
 Repo-wide rules are in the [root `AGENTS.md`](../../AGENTS.md). This crate answers nearest-neighbour
 queries over every `VECTOR(n)` column: one index per `(table, column)`, split into partition
-layouts, each served from a sealed base graph, sealed change graphs and a mutable tail under one
-MVCC snapshot.
+layouts, each served from its published clustered index plus the committed vectors that index does
+not yet cover, under one MVCC snapshot.
 
 ## Owns, and must not own
 
 Owns: the index registry and partition layouts (`store.rs`: `VectorStore`, `IndexState`,
 `VectorIndexLayout`, `ResolvedVectorPolicy`); exact, filtered and indexed search and the global
-top-k merge; the in-memory generation lifecycle (register, preload, evict, quarantine, publish a
-replacement, reclaim once no snapshot needs it); one partition's maintenance step
-(`VectorStore::run_hnsw_maintenance_cycle`); the graph wrapper and its owned generation bytes
-(`hnsw.rs`: `HnswIndex`); the one unfiltered F32 traversal that serves both a resident graph and
-a saved graph read page by page (`hnsw/unfiltered.rs`) and the multi-partition union search
-(`hnsw/union.rs`); `SQ8`/`SQ4` payloads (`quantized.rs`); memory charge ownership
-(`memory_budget.rs`); the core `VectorExecutor` implementation (`mem.rs`: `MemVectorExecutor`).
+top-k merge; the clustered index format, its search, catalog and recovery (`ivf/`: pages, codec,
+lists, search, versions, writer); one partition's maintenance step; `SQ8`/`SQ4` payloads
+(`quantized.rs`); memory charge ownership (`memory_budget.rs`); the core `VectorExecutor`
+implementation (`mem.rs`: `MemVectorExecutor`).
 
-Large partitions are served and built without holding the population in memory. A partition can
-register a paged builder or reclaimer (`register_partition_paged_builder`,
-`register_partition_paged_reclaimer`, progress and publish/abandon calls in `store.rs`) that
-inserts a durable batch at a time through `hnsw/paged_builder.rs`: the engine supplies authenticated
-point pages and lookup directories (`PagedVectorReader`, `PagedVectorTransaction`,
-`PagedVectorGraphSource`, `PagedVectorPersistence`), and this crate retains no all-node graph or
-row-to-vector map. The mutable tail can be paged the same way (`PagedVectorTail`, installed and
-appended through `install_partition_paged_tail` / `append_partition_paged_tail`), so a search sees
-saved base, change graphs and tail with the same visibility, tie order and work charges.
-Raw memberships are read through durable sources pinned to one root (`store/membership.rs`:
-`RawVectorMembershipSource`, cursors, `LazyRawVectorMembershipSource`); no decoded directory is
-retained, and partition membership is verified on first use.
+Large partitions are served and built without holding the population in memory: the engine
+supplies authenticated index pages and raw-membership sources, and this crate retains no all-node
+structure or row-to-vector map. Raw memberships are read through durable sources pinned to one
+root (`store/membership.rs`: `RawVectorMembershipSource`, cursors,
+`LazyRawVectorMembershipSource`); no decoded directory is retained, and partition membership is
+verified on first use.
 <!-- enforced by: crates/contextdb-engine/tests/engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs::unpartitioned_vector_membership_pages_reload_at_constant_residency, crates/contextdb-engine/tests/engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs::paged_initial_replacement_and_reclamation_progress_under_writes, crates/contextdb-engine/tests/engine_seams/first_search_after_writer_reopen_uses_saved_pages_without_build.rs::first_search_after_writer_reopen_uses_saved_pages_without_build -->
 
 Must not own: where generation bytes, raw vectors, the catalog or the change journal are stored,
 or when a maintenance cycle runs — the engine does both. SQL grammar, planning, row
-authorization and sync belong to the parser, planner and engine. A second graph implementation
-never goes here or anywhere: graph algorithms come from `contextdb-hnsw`, and anything new that
-vector search needs from a graph is written here, in `hnsw.rs`, on top of that fork.
+authorization and sync belong to the parser, planner and engine. A second index implementation
+never goes here: the clustered index in `ivf/` is the one index.
 
 ## Seams
 
 - **Above:** `contextdb-engine` owns a `VectorStore`, drives maintenance from
-  `Database::run_maintenance_cycle`, and implements `DormantVectorGraphLoader` and
-  `DormantRawVectorLoader` (`database.rs`) so a partition loads only when a query or a
-  maintenance step needs it.
-- **Below:** `contextdb-hnsw` (library name `hnsw_rs`) for graphs; `contextdb-core` for
+  `Database::run_maintenance_cycle`, and implements `DormantRawVectorLoader` (`database.rs`) so a
+  partition loads only when a query or a maintenance step needs it.
+- **Below:** `contextdb-core` for
   `VectorExecutor`, `VectorIndexRef`, `VectorEntry`, `Error`; `contextdb-tx` for snapshots and
   `WriteSetApplicator`.
 - **Test seams:** pause, fault and observation hooks are `#[doc(hidden)]`, behind the `test-seams`
@@ -60,33 +49,24 @@ guards are in `src/test_seam/pause_lifecycle_tests.rs`.
 | Invariant | Guard (file → test) |
 |---|---|
 | Search on one `(table, column)` never returns another column's vectors | `tests/vector_tests.rs` → `search_on_ref_a_returns_only_ref_a_vectors_under_10000_iteration_apply_storm` |
-| Equal scores order by ascending row id on the exact and the graph path | `tests/vector_tests.rs` → `public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths` |
+| Equal scores order by ascending row id on the exact and the indexed path | `tests/vector_tests.rs` → `public_search_ties_order_by_row_id_over_a_large_population` |
 | A snapshot sees exactly the vectors committed at it | `tests/vector_tests.rs` → `mvcc_snapshot_isolation`; `src/store/transaction_visibility_tests.rs` |
-| Concurrent updates and deletes leave one live vector and no graph ghosts | `tests/vector_tests.rs` → `concurrent_same_ref_updates_leave_single_live_vector_after_commit`, `same_ref_concurrent_deletes_leave_no_zombie_hnsw_entries` |
+| Concurrent updates and deletes leave one live vector and no deleted rows in results | `tests/vector_tests.rs` → `concurrent_same_ref_updates_leave_single_live_vector_after_commit`, `same_ref_concurrent_deletes_leave_no_deleted_rows_in_results` |
 | A wrong dimension is a typed error for the named index | `tests/vector_tests.rs` → `dimension_mismatch_typed_error_with_positive_control` |
-| Building one index never blocks search or ingest on another | `tests/vector_tests.rs` → `index_b_search_completes_while_index_a_hnsw_build_paused`, `reindex_on_index_a_does_not_block_ingest_on_index_b` |
-| Retention pruning in selected columns leaves an unrelated column's resident generation, graph and indexed answers intact | `tests/vector_tests.rs` → `selected_index_row_pruning_preserves_unrelated_resident_generation_and_indexed_answers` |
-| Charged bytes balance: a refusal on one index leaves every other index's charge exact | `tests/vector_tests.rs` → `memory_accountant_rejection_on_a_leaves_b_accountant_byte_balance_correct`, `clear_hnsw_keeps_accounting_charged_while_search_holds_graph` |
-| A generation with no live vectors loads as an empty graph | `tests/vector_tests.rs` → `a_durable_generation_with_no_live_vectors_loads_as_an_empty_graph` |
-| Corrupt or incompatible generation bytes are refused, never searched | `src/hnsw.rs` → `tests::durable_generation_refuses_corruption_and_incompatible_column_definition` |
-| A saved graph read page by page returns the same neighbours, order and ties, and charges the same distance work and refusals, as the same graph resident in memory | `src/hnsw.rs` → `tests::saved_graph_pages_preserve_owned_neighbor_ids_and_order_across_search_breadths`, `tests::saved_graph_pages_charge_the_same_distance_expansions_as_owned_graphs`, `tests::saved_graph_pages_refuse_the_same_distance_budget_as_owned_graphs`, `tests::saved_graph_pages_return_the_exact_lowest_row_ids_for_equal_vectors` |
-| A saved base plus resident tail preserves row-id ties even at search breadth one | `src/hnsw.rs` → `tests::mixed_saved_base_and_resident_tail_keep_exact_row_id_ties_at_breadth_one` |
+| Maintenance on one index never blocks search or ingest on another | `tests/vector_tests.rs` → `concurrent_distinct_ref_applies_both_enter_maintenance_window`, `two_independent_vector_stores_do_not_share_maintenance_locks` |
+| Retention pruning in selected columns leaves an unrelated column's rows and answers intact | `tests/vector_tests.rs` → `selected_index_row_pruning_preserves_unrelated_index_rows_and_answers` |
+| Corrupt or incompatible index bytes are refused, never searched | `crates/contextdb-engine/tests/clustered_public_engine_ports.rs` → `durable_generation_refuses_corruption_and_incompatible_column_definition` |
 | Exhaustive AUTO can stream a dormant partition one body at a time when bulk loading is refused; unrestricted explicit EXACT on a writer still requires that load | `crates/contextdb-engine/tests/vector/vector_lazy_raw_residency_contract.rs` → `auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition` |
-| Unfiltered search descends each upper level until no closer neighbour remains before searching the bottom level | `src/hnsw.rs` → `tests::unfiltered_upper_descent_finishes_each_level_before_searching_bottom` |
-| A multi-partition search stays within its one statement work budget (`max(EF_SEARCH, k)` × stored bottom-level degree, `2 × M` plus the 4 links that keep every point reachable) and completes its answer; a distance already computed while admitting partitions is reused rather than recomputed, without changing any answer | `crates/contextdb-engine/tests/vector/multi_partition_union_recovers_nearest_rows.rs` → `uniform_three_and_eight_partition_shared_walk_regression`, `clustered_one_three_and_eight_partition_shared_walk_regression` |
-| Filtered search charges no work for excluded history | `src/hnsw.rs` → `tests::ordinary_allowed_search_excluded_history_adds_no_visit_or_distance_work` |
 | Recall-at-10 of the indexed route is at least 95% of exact | `crates/contextdb-engine/tests/vector/vector_held_out_native_reference.rs` → `held_out_unfiltered_native_reference_recovers_the_required_neighbors` |
 | Every search, index and consolidation threshold comes from the declared column policy resolved in one place (`VectorIndexLayout::resolve_policy` / `effective_auto_index_at` in `store.rs`); an undeclared value falls back to a documented default there, but a declared value is never silently overridden by a constant elsewhere | `crates/contextdb-engine/tests/vector/vector_policy_resolver_contract.rs` → `declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries` |
-| Default HNSW breadth and topology follow the live partition size and quantization; partial declarations remain valid across profile boundaries | `src/store.rs` → `tests::compatibility_profile_edges_and_partial_policy_validation_agree` |
 | Scalar publications preserve every MVCC membership and interval while unchanged raw bodies share one allocation, charged through its final holder | `src/store/shared_payload_tests.rs::retained_scalar_memberships_share_one_body_and_keep_all_snapshot_intervals`, `src/store/shared_payload_tests.rs::shared_cross_partition_body_survives_source_removal_and_final_external_holder`, `src/store/shared_payload_tests.rs::shared_allocation_header_stays_charged_until_final_holder_after_store_drop` |
 | Received columns prepare directory, shared-header and required copied-move body growth with their own funder even without a store-wide accountant; inserted bodies are caller-admitted beforehand, abort or refusal releases only preparation reservations, and published payload charges last until the final holder drops | `src/store/received_publication_accounting_tests.rs::received_publication_prepares_next_insert_and_releases_its_last_holder`, `src/store/received_publication_accounting_tests.rs::received_columns_keep_distinct_funders_and_legacy_columns_in_a_mixed_batch` |
 | Detached-copy hydration moves unique uncharged bodies out of shared headers; shared histories and charged or resident sources keep their representation and final-holder charge | `src/store/detached_copy_payload_tests.rs::detached_copy_unique_unwrap_moves_the_body_and_preserves_shared_or_charged_owners`, `src/store/detached_copy_payload_tests.rs::detached_copy_hydration_retains_only_new_singleton_bodies_and_releases_headers`, `src/store/detached_copy_payload_tests.rs::detached_copy_header_refusal_releases_loader_body_workspace_and_retries`, `src/store/detached_copy_payload_tests.rs::detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges`, `src/store/detached_copy_payload_tests.rs::detached_copy_already_resident_sources_keep_representation_charge_and_funder` |
 | Resident generation selection copies only frontier-live entries after the optional LSN boundary, preserving representations and history; inconsistent directory metadata refuses before body materialization | `src/store/generation_selection_tests.rs::selected_generation_materialization_preserves_all_representations_and_snapshot_intervals`, `src/store/generation_selection_tests.rs::selected_generation_refuses_inconsistent_metadata_before_body_materialization` |
 | Borrowed source metadata and scalar marking copy no giant partition key; stale source identities cannot mark a replacement column or partition | `tests/borrowed_route_metadata_adapter.rs::giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding`, `tests/borrowed_route_metadata_adapter.rs::replacement_column_rejects_the_old_state_without_marking_the_new_source`, `tests/borrowed_route_metadata_adapter.rs::removed_and_recreated_partition_rejects_the_old_state_in_the_same_column` |
-| A writable reopen searches saved pages without rebuilding the graph | `crates/contextdb-engine/tests/engine_seams/first_search_after_writer_reopen_uses_saved_pages_without_build.rs` → `first_search_after_writer_reopen_uses_saved_pages_without_build` |
+| A writable reopen searches saved pages without rebuilding the index | `crates/contextdb-engine/tests/engine_seams/first_search_after_writer_reopen_uses_saved_pages_without_build.rs` → `first_search_after_writer_reopen_uses_saved_pages_without_build` |
 | Unpartitioned membership pages reload at constant residency | `crates/contextdb-engine/tests/engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs` → `unpartitioned_vector_membership_pages_reload_at_constant_residency` |
 | Initial build, replacement and reclamation progress in finite batches beside live writes | `crates/contextdb-engine/tests/engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs` → `paged_initial_replacement_and_reclamation_progress_under_writes` |
-| The AUTO index threshold is judged on the aggregate across partitions, before partition cost | `crates/contextdb-engine/tests/engine_seams/aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope.rs` → `aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope` |
 
 Publication, restart, repair and partition behaviour end to end are guarded by the engine's
 `crates/contextdb-engine/tests/vector_*_contract.rs` files; the claims they bind are tagged in
@@ -98,15 +78,13 @@ Publication, restart, repair and partition behaviour end to end are guarded by t
 |---|---|
 | Streaming exhaustive bodies after refused bulk admission | `mem.rs::BoundedBruteForceCursor`; `store.rs::DormantRawVectorLoader` tells it whether a committed-image exact read can stream. The engine supplies the loader. |
 | A search route, merge order or refusal | `store.rs` (per-layout search, global merge), `mem.rs` for the `VectorExecutor` entry |
-| Graph build or search behaviour, the owned generation byte format | `hnsw.rs`; unfiltered F32 search in `hnsw/unfiltered.rs` (one walk for resident and saved graphs — never a second copy), multi-partition union in `hnsw/union.rs`; the fork only for a primitive `hnsw.rs` cannot build on |
-| Paged (transactional) graph build, reclaim and tail; durable point/row/exact lookup records | `hnsw/paged_builder.rs`; the graph algorithm is `contextdb-hnsw` `src/paged.rs`; the engine supplies the page and directory storage. |
+| Index build or search behaviour, the page format | `ivf/` (`search.rs`, `codec.rs`, `storage.rs`, `writer.rs`) — never a second index implementation |
 | Reading raw memberships from durable storage | `store/membership.rs` traits; `store.rs` registers sources (`register_lazy_durable_raw_partition`, `register_durable_raw_reverse_source`). Never retain a decoded directory here. |
 | A quantization format | `quantized.rs`, plus the resident-byte estimate beside it |
-| Per-column policy resolution (`AUTO_INDEX_AT`, `HNSW`, `CONSOLIDATION`, limits) | `store.rs` (`VectorIndexLayout`, `ResolvedVectorPolicy`); the grammar is the parser's |
-| Store-size-dependent default search breadth profile | `src/store.rs::compatibility_hnsw_profile`, used by `VectorIndexLayout::resolve_policy`; test all size-band boundaries and partial policy validation in `src/store.rs::compatibility_profile_edges_and_partial_policy_validation_agree`. |
-| What one maintenance step does to a partition | `store.rs` (`run_hnsw_maintenance_cycle`, `maintenance_need`) |
+| Per-column policy resolution (`AUTO_INDEX_AT`, `SEARCH`, `IVF`, `CONSOLIDATION`, limits) | `store.rs` (`VectorIndexLayout`, `ResolvedVectorPolicy`); the grammar is the parser's |
+| What one maintenance step does to a partition | `store.rs`, with the index build in `ivf/writer.rs` |
 | When maintenance runs, what is persisted, how a partition is loaded from disk | Engine crate (`database.rs`, `persistence.rs`) |
-| Read-only test observations | `test_seam.rs`, exported from `lib.rs` under the test feature; search behavior remains in `store.rs` and `hnsw.rs`. |
+| Read-only test observations | `test_seam.rs`, exported from `lib.rs` under the test feature; search behavior remains in `store.rs` and `ivf/`. |
 | Transaction-visible vector state | `store/transaction_visibility_tests.rs` guards overlay behavior; implementation stays in `store.rs` and `mem.rs`. |
 | Shared raw-body ownership, received-column funders or detached-copy hydration | `store.rs` owns preparation, adoption and receipts; `quantized.rs` owns private payload representations and final-drop charges. Public `VectorEntry` and durable encoding stay owned-Vec based. |
 | Resident generation input selection or borrowed maintenance metadata | `store.rs::entries_for_partition_generation_at_snapshot` and `VectorPartitionSourceMaintenanceMetadata`; engine owns frontier admission, catalog inventory and durable cleanup. |
@@ -127,8 +105,8 @@ per-test gates); without the flag they build and run nothing. `cargo test --work
 through feature unification.
 
 Retention uses `prune_row_ids_in_indexes` for selected columns, borrows partition states and removes
-whole-row reverse-map entries in place; unrelated indexes retain their resident graph state.
-<!-- enforced by: crates/contextdb-vector/tests/vector_tests.rs::selected_index_row_pruning_preserves_unrelated_resident_generation_and_indexed_answers, crates/contextdb-engine/src/database/bounded_retention_preparation_tests.rs::reclamation_admits_vector_and_edge_identities_without_payload_copies -->
+whole-row reverse-map entries in place; unrelated indexes keep their rows.
+<!-- enforced by: crates/contextdb-vector/tests/vector_tests.rs::selected_index_row_pruning_preserves_unrelated_index_rows_and_answers, crates/contextdb-engine/src/database/bounded_retention_preparation_tests.rs::reclamation_admits_vector_and_edge_identities_without_payload_copies -->
 
 Raw bodies have two private owners. Legacy void insertion, loading and moves keep their Vec inline,
 adopting only the caller-admitted body bytes and allocating no shared header; their existing

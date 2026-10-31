@@ -252,7 +252,7 @@ fn ambiguous_order_by_column_across_join_is_an_error_not_silently_unsorted() {
 // ============================================================================
 // Regression lock (documentary; no new test authored here): a
 // vector-similarity ORDER BY (`embedding <=> $q USE RANK ...`) is a
-// structurally distinct code path — planned as `VectorSearch`/`HnswSearch`,
+// structurally distinct code path — planned as `VectorSearch`,
 // never the generic `Sort` node the tests above exercise (`plan_select_body`
 // gates the plain `Sort` branch on `!uses_vector_search`) — so plain-column
 // ORDER BY validation must not regress it. Already covered by

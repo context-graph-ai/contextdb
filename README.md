@@ -274,7 +274,7 @@ per-column storage footprint; omitted quantization defaults to `F32`.
 
 **Graph (SQL/PGQ-style)** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded BFS, typed edges, variable-length paths (`{1,3}`), and direction control. DAG constraint enforcement prevents cycles. State propagation cascades changes along graph edges.
 
-**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Construction and repair of each column's index run only through maintenance ([query-language reference](docs/query-language.md#vector-similarity-search)), and a column can be partitioned by key so a search looks only inside the partitions it names: `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW VECTOR_PARTITIONS FOR table.column` shows each partition's state. `AUTO_INDEX_AT` and HNSW settings are declared per column; leaving them unset keeps the defaults. Pre-filtered search narrows candidates before scoring. <!-- enforced by: sql_surface_other::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap -->
+**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Construction and repair of each column's index run only through maintenance ([query-language reference](docs/query-language.md#vector-similarity-search)), and a column can be partitioned by key so a search looks only inside the partitions it names: `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW VECTOR_PARTITIONS FOR table.column` shows each partition's state. `SEARCH_MODE`, `AUTO_INDEX_AT`, `SEARCH` and `IVF` settings are declared per column; leaving them unset keeps the defaults. Pre-filtered search narrows candidates before scoring. <!-- enforced by: sql_surface_other::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/clustered_index_tests.rs::h08_prefiltered_search_respects_candidate_bitmap -->
 
 **Unified transactions** — One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. MVCC with consistent snapshots — readers never block writers.
 
@@ -309,7 +309,7 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 
 ## Architecture
 
-11-crate Rust workspace:
+10-crate Rust workspace:
 
 | Crate | Role |
 |-------|------|
@@ -317,8 +317,7 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 | `contextdb-tx` | MVCC transaction manager with deferred-apply write sets |
 | `contextdb-relational` | Relational executor (scan, insert, upsert, delete) |
 | `contextdb-graph` | Graph executor (bounded BFS, adjacency index, DAG enforcement) |
-| `contextdb-vector` | Vector executor (cosine similarity, HNSW, pre-filtered search) |
-| `contextdb-hnsw` | HNSW graph index used by the vector executor |
+| `contextdb-vector` | Vector executor (cosine similarity, clustered disk index, pre-filtered search) |
 | `contextdb-parser` | SQL parser (pest grammar with GRAPH_TABLE + vector extensions) |
 | `contextdb-planner` | Rule-based query planner |
 | `contextdb-engine` | Database engine — wires all subsystems, plugin API, subscriptions |

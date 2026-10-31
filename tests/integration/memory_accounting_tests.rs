@@ -377,10 +377,10 @@ fn m05_vector_search_rejected_over_budget() {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[test]
-fn m06_hnsw_fallback_to_brute_force_under_budget() {
-    // Budget too small for HNSW index build but large enough for brute-force.
-    // HNSW requires significant memory for graph structure.
-    // We set budget to allow inserts but not the HNSW build.
+fn m06_indexed_fallback_to_brute_force_under_budget() {
+    // Budget too small for the index build but large enough for brute-force.
+    // The index requires significant memory.
+    // We set budget to allow inserts but not the index build.
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024)); // 256KB
     let db = Database::open_memory_with_accountant(accountant);
     db.execute(
@@ -389,7 +389,7 @@ fn m06_hnsw_fallback_to_brute_force_under_budget() {
     )
     .unwrap();
 
-    // Insert >= 1000 vectors to trigger HNSW build attempt.
+    // Insert >= 1000 vectors to trigger index build attempt.
     for i in 0..1000 {
         let mut vec = vec![0.0f32; 128];
         vec[0] = i as f32;
@@ -404,15 +404,15 @@ fn m06_hnsw_fallback_to_brute_force_under_budget() {
         );
     }
 
-    // EXPLAIN should show brute-force, not HNSW — budget prevented HNSW build.
+    // EXPLAIN should show brute-force, not index — budget prevented index build.
     let explain_output = db.explain("SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 5");
     assert!(explain_output.is_ok(), "explain must succeed");
     let explain_output = explain_output.unwrap();
-    // After implementation: tight budget prevents HNSW build → BruteForce scan.
-    // Without memory accounting: HNSW would build → HnswSearch.
+    // After implementation: tight budget prevents index build → BruteForce scan.
+    // Without memory accounting: index would build → VectorSearch.
     assert!(
         explain_output.contains("BruteForce"),
-        "tight budget should prevent HNSW, showing BruteForce: {explain_output}"
+        "tight budget should prevent index, showing BruteForce: {explain_output}"
     );
 }
 
@@ -1287,11 +1287,11 @@ fn mt4_failed_vector_alloc_releases_row_bytes() {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[test]
-fn mt5_hnsw_build_failure_no_leaked_bytes() {
-    // Budget allows inserts but not the HNSW index build.
-    // HNSW needs ~entries * dim * 4 * 3 bytes.
-    // 1000 entries * 4 dims * 4 bytes * 3 = 48000 bytes for HNSW.
-    // Budget allows all rows but not the HNSW structure.
+fn mt5_indexed_build_failure_no_leaked_bytes() {
+    // Budget allows inserts but not the index build.
+    // The index needs ~entries * dim * 4 * 3 bytes.
+    // 1000 entries * 4 dims * 4 bytes * 3 = 48000 bytes for index.
+    // Budget allows all rows but not the index structure.
     let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 40_000)));
     let db = Database::open_memory_with_accountant(accountant.clone());
 
@@ -1301,7 +1301,7 @@ fn mt5_hnsw_build_failure_no_leaked_bytes() {
     )
     .unwrap();
 
-    // Insert enough vectors to trigger HNSW build attempt (>= 1000).
+    // Insert enough vectors to trigger index build attempt (>= 1000).
     let mut inserted = 0;
     for i in 0..1100 {
         let mut vec = vec![0.0f32; 4];
@@ -1321,23 +1321,23 @@ fn mt5_hnsw_build_failure_no_leaked_bytes() {
     // Some inserts must succeed.
     assert!(inserted > 0, "at least some inserts must succeed");
 
-    // HNSW build should have been skipped due to budget.
-    // Verify no phantom HNSW bytes leaked: usage should reflect only
-    // actual rows + vectors + metadata, not the HNSW structure.
+    // The index build should have been skipped due to budget.
+    // Verify no phantom index bytes leaked: usage should reflect only
+    // actual rows + vectors + metadata, not the index structure.
     let usage = accountant.usage();
     assert!(
         usage.used <= budget_over_schema(1, 40_000),
-        "usage must not exceed budget (no HNSW leak): used={} of {}",
+        "usage must not exceed budget (no index leak): used={} of {}",
         usage.used,
         budget_over_schema(1, 40_000),
     );
 
-    // EXPLAIN should show BruteForce, not Hnsw.
+    // EXPLAIN should show BruteForce, not Index.
     let explain = db.explain("SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 5");
     assert!(explain.is_ok(), "explain must succeed");
     let explain_text = explain.unwrap();
     assert!(
         explain_text.contains("BruteForce"),
-        "HNSW build must be skipped under budget: {explain_text}"
+        "index build must be skipped under budget: {explain_text}"
     );
 }

@@ -26,9 +26,11 @@ const INDEX_COLUMNS: &[&str] = &[
     "search_mode",
     "declared_auto_index_at",
     "effective_auto_index_at",
-    "declared_hnsw_m",
-    "declared_hnsw_ef_construction",
-    "declared_hnsw_ef_search",
+    "declared_target_accuracy",
+    "declared_expected_vectors",
+    "declared_lists",
+    "declared_probes",
+    "declared_refine_factor",
     "declared_consolidation_mode",
     "declared_consolidation_change_percent",
     "declared_consolidation_tombstone_percent",
@@ -44,6 +46,8 @@ const INDEX_COLUMNS: &[&str] = &[
     "durable_index_bytes",
     "charged_index_bytes",
     "query_state",
+    "indexed_available",
+    "objective_status",
     "maintenance_state",
     "maintenance_vectors_total",
     "maintenance_vectors_done",
@@ -58,6 +62,8 @@ const INDEX_COLUMNS: &[&str] = &[
     "broad_route_vectors_remaining",
     "broad_route_reason",
     "broad_route_recovery_action",
+    "recovery_action",
+    "state",
 ];
 
 const PARTITION_COLUMNS: &[&str] = &[
@@ -100,6 +106,7 @@ const PARTITION_COLUMNS: &[&str] = &[
     "desired_policy_revision",
     "serving_policy_revision",
     "recovery_action",
+    "state",
 ];
 
 fn empty() -> HashMap<String, Value> {

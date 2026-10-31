@@ -4620,7 +4620,17 @@ fn vector_index_inspection_row(
         vector_inspection_usize(tombstones, "tombstones")?,
         vector_inspection_usize(durable_vector_bytes, "durable_vector_bytes")?,
         vector_inspection_usize(charged_vector_bytes, "charged_vector_bytes")?,
-        Value::Null,
+        native
+            .iter()
+            .flatten()
+            .filter_map(|native| native.durable_index_bytes)
+            .try_fold(None::<u64>, |total, bytes| {
+                total.unwrap_or(0).checked_add(bytes).map(Some)
+            })
+            .ok_or_else(|| Error::Other("vector inspection durable index byte overflow".into()))?
+            .map_or(Ok(Value::Null), |bytes| {
+                vector_inspection_u64(bytes, "durable_index_bytes")
+            })?,
         vector_inspection_usize(charged_index_bytes, "charged_index_bytes")?,
         Value::Text(vector_index_query_state(&states).to_owned()),
         Value::Bool(indexed_available),
@@ -4723,7 +4733,11 @@ fn vector_partition_inspection_row(
         vector_inspection_usize(partition.tombstones, "tombstones")?,
         vector_inspection_usize(partition.durable_vector_bytes, "durable_vector_bytes")?,
         vector_inspection_usize(partition.charged_vector_bytes, "charged_vector_bytes")?,
-        Value::Null,
+        native
+            .and_then(|native| native.durable_index_bytes)
+            .map_or(Ok(Value::Null), |bytes| {
+                vector_inspection_u64(bytes, "durable_index_bytes")
+            })?,
         vector_inspection_usize(partition.charged_index_bytes, "charged_index_bytes")?,
         Value::Text(query_state.to_owned()),
         Value::Text(
@@ -24562,7 +24576,7 @@ fn execute_vector_inspection(
                     let mut state = None;
                     let mut natives = Vec::with_capacity(partitions.len());
                     for partition in &partitions {
-                        let native = db.native_ivf_inspection(
+                        let native = db.native_ivf_pure_inspection(
                             &partition.partition.index,
                             &partition.partition.partition_key,
                             read_memory.clone(),
@@ -24633,7 +24647,7 @@ fn execute_vector_inspection(
                     .as_deref()
                     .unwrap_or_default();
                 for partition in partitions {
-                    let native = db.native_ivf_inspection(
+                    let native = db.native_ivf_pure_inspection(
                         &partition.partition.index,
                         &partition.partition.partition_key,
                         read_memory.clone(),

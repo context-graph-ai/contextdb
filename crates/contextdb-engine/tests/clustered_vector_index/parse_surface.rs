@@ -3,11 +3,9 @@
 //! percent with at most two fractional digits, and may override the clustered index's layout with
 //! `IVF (LISTS, PROBES, REFINE_FACTOR)`, the refine factor a decimal
 //! multiplier of LIMIT of at least 1.00; a query may raise its own target
-//! with `USE VECTOR INDEXED (TARGET_ACCURACY = n)`. The graph index spelling
-//! `HNSW (...)` and the graph-only clauses are no longer declarations: each is
-//! refused with a parse error naming the offending keyword and the SEARCH
-//! form, and nothing is published. Both groups render canonically, round-trip
-//! through their own rendering, and refuse invalid members.
+//! with `USE VECTOR INDEXED (TARGET_ACCURACY = n)`. Both groups render
+//! canonically, round-trip through their own rendering, and refuse invalid
+//! members.
 
 use super::support::{
     drive_until_serving, empty, int_ids, open_caller_driven, params, unit_vector,
@@ -16,107 +14,11 @@ use contextdb_core::{Error, Value, VectorIndexRef};
 use contextdb_engine::Database;
 use contextdb_engine::cli_render::render_table_meta;
 
-const SEARCH_FORM: &str = "SEARCH (TARGET_ACCURACY = n, EXPECTED_VECTORS = n)";
-
 fn schema(db: &Database, table: &str) -> String {
     let meta = db
         .table_meta(table)
         .unwrap_or_else(|| panic!("table metadata exists for {table}"));
     render_table_meta(table, &meta)
-}
-
-/// The refusal is exactly this text, with the offending keyword:
-/// "Remove the <KEYWORD> clause: the default search policy applies; to
-/// declare a target use SEARCH (TARGET_ACCURACY = n, EXPECTED_VECTORS = n)".
-fn assert_removal_refusal(error: &Error, keyword: &str, sql: &str) {
-    let expected = format!(
-        "Remove the {keyword} clause: the default search policy applies; to declare a target use {SEARCH_FORM}"
-    );
-    match error {
-        Error::ParseError(message) => assert!(
-            message.contains(&expected),
-            "the refusal of {sql} is exactly {expected:?}: {message}"
-        ),
-        other => panic!("{sql} is refused with a parse error, got {other:?}"),
-    }
-}
-
-#[test]
-fn graph_index_declarations_are_refused_naming_the_keyword_and_the_search_form() {
-    let db = Database::open_memory();
-    db.execute("CREATE TABLE add_target (id INTEGER PRIMARY KEY)", &empty())
-        .expect("create the add-column target");
-    db.execute(
-        "CREATE TABLE alter_target (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
-        &empty(),
-    )
-    .expect("create the alter target");
-    let add_before = schema(&db, "add_target");
-    let alter_before = schema(&db, "alter_target");
-
-    for (sql, keyword) in [
-        (
-            "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 64))",
-            "HNSW",
-        ),
-        (
-            "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) )",
-            "HNSW",
-        ),
-        (
-            "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) FLAT_BELOW 100)",
-            "FLAT_BELOW",
-        ),
-        (
-            "CREATE TABLE graph_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) AUTO_EXPANSION_CEILING 50)",
-            "AUTO_EXPANSION_CEILING",
-        ),
-    ] {
-        let error = db
-            .execute(sql, &empty())
-            .expect_err("the graph declaration is refused");
-        assert_removal_refusal(&error, keyword, sql);
-        assert!(
-            db.table_meta("graph_items").is_none(),
-            "{sql} publishes no table"
-        );
-    }
-
-    let add = "ALTER TABLE add_target ADD COLUMN embedding VECTOR(3) ";
-    let error = db
-        .execute(add, &empty())
-        .expect_err("ADD COLUMN with HNSW is refused");
-    assert_removal_refusal(&error, "HNSW", add);
-    assert_eq!(schema(&db, "add_target"), add_before, "{add} adds nothing");
-
-    for (alter, keyword) in [
-        (
-            "ALTER TABLE alter_target ALTER COLUMN embedding SET IVF (PROBES = 64)",
-            "HNSW",
-        ),
-        (
-            "ALTER TABLE alter_target ALTER COLUMN embedding SET IVF DEFAULT",
-            "HNSW",
-        ),
-        (
-            "ALTER TABLE alter_target ALTER COLUMN embedding SET FLAT_BELOW 10",
-            "FLAT_BELOW",
-        ),
-        (
-            "ALTER TABLE alter_target ALTER COLUMN embedding SET AUTO_EXPANSION_CEILING 50",
-            "AUTO_EXPANSION_CEILING",
-        ),
-    ] {
-        let error = db
-            .execute(alter, &empty())
-            .expect_err("the graph ALTER is refused");
-        assert_removal_refusal(&error, keyword, alter);
-        assert_eq!(
-            schema(&db, "alter_target"),
-            alter_before,
-            "{alter} changes nothing"
-        );
-    }
 }
 
 #[test]

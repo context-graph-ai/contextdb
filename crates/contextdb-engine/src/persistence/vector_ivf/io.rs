@@ -1,7 +1,7 @@
 //! Actual native views and borrowed writes; no owned decoded page directory.
 use super::*;
 use contextdb_vector::ivf::storage::PageKind;
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 
 pub(super) const PENDING: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ivf_pending_seals");
 // The allocator is shared authority and therefore lives under SCOPES and its
@@ -40,6 +40,23 @@ pub(super) enum NativeIo<'a> {
     Borrowed(&'a redb::WriteTransaction),
 }
 impl NativeIo<'_> {
+    /// Persisted entry count of one physical table, from table metadata only.
+    pub fn table_entries(&self, name: &str) -> Result<u64> {
+        let definition = TableDefinition::<&[u8], &[u8]>::new(name);
+        match self {
+            Self::CapturedTransaction { read, admission } => {
+                admission.run_original_unqualified(|| match read.open_untyped_table(definition) {
+                    Ok(table) => table.len().map_err(RedbPersistence::storage_error),
+                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+                    Err(error) => Err(RedbPersistence::storage_error(error)),
+                })
+            }
+            Self::Borrowed(write) => match write.open_table(definition) {
+                Ok(table) => table.len().map_err(RedbPersistence::storage_error),
+                Err(error) => Err(RedbPersistence::storage_error(error)),
+            },
+        }
+    }
     pub fn fingerprint(&self, name: &str) -> Result<Option<[u8; 32]>> {
         let definition = TableDefinition::<&[u8], &[u8]>::new(name);
         match self {

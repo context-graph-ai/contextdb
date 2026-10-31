@@ -71,7 +71,7 @@ fn admitted(shape: Shape, percent: usize, row: usize) -> bool {
 
 fn fill(db: &Database, shape: Shape, percent: usize, breadth: Option<usize>) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    let hnsw = breadth.map_or(String::new(), |breadth| {
+    let indexed = breadth.map_or(String::new(), |breadth| {
         format!(" IVF (PROBES = {breadth})")
     });
     db.execute(
@@ -79,7 +79,7 @@ fn fill(db: &Database, shape: Shape, percent: usize, breadth: Option<usize>) {
             "CREATE TABLE passages (id UUID PRIMARY KEY, context_id UUID NOT NULL, \
              is_searchable BOOLEAN NOT NULL, \
              embedding VECTOR({DIMENSION}) PARTITION_KEY (context_id) \
-             SEARCH_MODE INDEXED AUTO_INDEX_AT 1{hnsw})"
+             SEARCH_MODE INDEXED AUTO_INDEX_AT 1{indexed})"
         ),
         &HashMap::new(),
     )

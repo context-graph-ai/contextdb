@@ -46,8 +46,6 @@ mod equal_distance_rows_keep_canonical_order_across_contexts;
 mod every_graph_route_reaches_every_row;
 #[path = "vector/flat_route_below_declared_threshold.rs"]
 mod flat_route_below_declared_threshold;
-#[path = "vector/flat_route_crossover_diagnostic.rs"]
-mod flat_route_crossover_diagnostic;
 #[path = "vector/indexed_route_does_less_work_than_exact.rs"]
 mod indexed_route_does_less_work_than_exact;
 #[path = "fixtures/maintained_search/mod.rs"]

@@ -12,6 +12,26 @@ impl Database {
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Option<Inspection>> {
+        self.native_ivf_inspect(index, tuple, memory, checkpoint, false)
+    }
+    /// SHOW's inspection: uncached, selects nothing and records no damage.
+    pub(crate) fn native_ivf_pure_inspection(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<Option<Inspection>> {
+        self.native_ivf_inspect(index, tuple, memory, checkpoint, true)
+    }
+    fn native_ivf_inspect(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+        checkpoint: &dyn Fn() -> Result<()>,
+        pure: bool,
+    ) -> Result<Option<Inspection>> {
         let Some(root) = self.native_ivf_root()? else {
             return Ok(None);
         };
@@ -37,7 +57,7 @@ impl Database {
         let selection = self
             .persistence
             .as_ref()
-            .filter(|_| !historical)
+            .filter(|_| !historical && !pure)
             .map(|persistence| Selection {
                 cache: &persistence.native_ivf_cache,
                 owner: &owner,
@@ -49,7 +69,7 @@ impl Database {
         else {
             return Ok(None);
         };
-        if let Some(catalog) = result.catalog {
+        if let Some(catalog) = result.catalog.filter(|_| !pure) {
             result.catalog = Some(self.record_selected_native_ivf_damage(
                 &root, index, tuple, max_runs, catalog, checkpoint,
             )?);

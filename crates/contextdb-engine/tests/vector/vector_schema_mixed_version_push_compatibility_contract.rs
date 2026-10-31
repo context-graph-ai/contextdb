@@ -72,7 +72,7 @@ const UNSUPPORTED_VECTOR_CLAUSES: [&str; 5] = [
     "MAX_PARTITIONS",
     "SEARCH_MODE",
     "AUTO_INDEX_AT",
-    "HNSW",
+    "IVF",
 ];
 
 /// `ALTER COLUMN` is a candidate-only `alter_action`
@@ -85,8 +85,8 @@ const UNSUPPORTED_ALTER_PHRASE: &str = "ALTER COLUMN";
 /// Split a rendered column-type string into grammar-shaped tokens: a bare run
 /// of non-whitespace, non-`(` characters, or one balanced parenthesised group
 /// (quote-aware, so a `'...'` value cannot desynchronize the paren count).
-/// This is what lets `RANK_POLICY (JOIN hnsw ON search_mode, ...)` stay one
-/// opaque token instead of exposing `hnsw` and `search_mode` as look-alike
+/// This is what lets `RANK_POLICY (JOIN ivf ON search_mode, ...)` stay one
+/// opaque token instead of exposing `ivf` and `search_mode` as look-alike
 /// keyword positions.
 fn tokenize_rendered_column_type(rendered_type: &str) -> Vec<&str> {
     let bytes = rendered_type.as_bytes();

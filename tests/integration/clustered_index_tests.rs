@@ -115,7 +115,7 @@ fn setup_items_table(db: &Database, dimension: usize) {
     .expect("create table");
 }
 
-fn drive_hnsw_maintenance(db: &Database) {
+fn drive_indexed_maintenance(db: &Database) {
     let index = VectorIndexRef::new("items", "embedding");
     for _ in 0..32 {
         if db.__debug_vector_indexed_available_for_test(index.clone()) {
@@ -182,11 +182,11 @@ fn h01_below_threshold_uses_vector_search() {
 }
 
 #[test]
-fn h02_at_threshold_explain_shows_hnsw_search() {
+fn h02_at_threshold_explain_shows_indexed_search() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     insert_items(&db, 1_000, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -221,7 +221,7 @@ fn h03_transition_across_threshold_switches_explain() {
     )
     .expect("insert vector");
     db.commit(tx).expect("commit");
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
     let explain_after = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain after");
@@ -232,11 +232,11 @@ fn h03_transition_across_threshold_switches_explain() {
 }
 
 #[test]
-fn h04_hnsw_recall_is_at_least_ninety_five_percent() {
+fn h04_indexed_recall_is_at_least_ninety_five_percent() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_500, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -248,13 +248,13 @@ fn h04_hnsw_recall_is_at_least_ninety_five_percent() {
 }
 
 #[test]
-fn h05_hnsw_recall_is_stable_after_reopen() {
+fn h05_indexed_recall_is_stable_after_reopen() {
     let tmp = TempDir::new().expect("tempdir");
-    let path = tmp.path().join("hnsw_reopen.db");
+    let path = tmp.path().join("indexed_reopen.db");
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_500, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
     db.close().expect("close");
 
     let db2 = Database::open(&path).expect("reopen");
@@ -268,11 +268,11 @@ fn h05_hnsw_recall_is_stable_after_reopen() {
 }
 
 #[test]
-fn h06_deleted_vectors_are_excluded_under_hnsw() {
+fn h06_deleted_vectors_are_excluded_under_indexed() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_200, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
     let all_rids = all_vectors.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
 
     let tx = db.begin_or_panic();
@@ -338,7 +338,7 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
         tx1_rids.insert(rid);
     }
     db.commit(tx1).expect("commit tx1");
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
     let snap_after_tx1 = db.snapshot();
 
     let tx2 = db.begin_or_panic();
@@ -385,7 +385,7 @@ fn h08_prefiltered_search_respects_candidate_bitmap() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_200, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let mut candidates = RoaringTreemap::new();
     for (rid, _) in all_vectors.iter().step_by(2) {
@@ -414,9 +414,9 @@ fn h08_prefiltered_search_respects_candidate_bitmap() {
 }
 
 #[test]
-fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
+fn h09_indexed_rebuild_after_reopen_returns_same_results() {
     let tmp = TempDir::new().expect("tempdir");
-    let path = tmp.path().join("hnsw_rebuild.db");
+    let path = tmp.path().join("indexed_rebuild.db");
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
 
@@ -459,7 +459,7 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
         .expect("insert vector");
     }
     db.commit(tx).expect("commit");
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let pre_results = db
         .query_vector(
@@ -496,7 +496,7 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
 #[test]
 fn h10_row_id_continuity_survives_reopen() {
     let tmp = TempDir::new().expect("tempdir");
-    let path = tmp.path().join("hnsw_counter.db");
+    let path = tmp.path().join("indexed_counter.db");
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
 
@@ -550,11 +550,11 @@ fn h10_row_id_continuity_survives_reopen() {
 }
 
 #[test]
-fn h11_concurrent_reads_during_hnsw_search_do_not_panic() {
+fn h11_concurrent_reads_during_indexed_search_do_not_panic() {
     let db = Arc::new(Database::open_memory());
     setup_items_table(&db, DIMENSION);
     insert_items(&db, 1_100, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let mut handles = Vec::new();
     for t in 0..4 {
@@ -581,11 +581,11 @@ fn h11_concurrent_reads_during_hnsw_search_do_not_panic() {
 }
 
 #[test]
-fn h12_insert_after_hnsw_activation_is_searchable() {
+fn h12_insert_after_indexed_activation_is_searchable() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     insert_items(&db, 1_000, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -625,11 +625,11 @@ fn h12_insert_after_hnsw_activation_is_searchable() {
 }
 
 #[test]
-fn h13_exact_threshold_has_hnsw_and_high_recall() {
+fn h13_exact_threshold_has_indexed_and_high_recall() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_000, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -645,7 +645,7 @@ fn h14_all_deleted_vectors_return_empty_results() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_100, 0);
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
     let all_rids = all_vectors.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
 
     let tx = db.begin_or_panic();
@@ -713,7 +713,7 @@ fn h15_single_surviving_vector_is_returned() {
         all_rids.push(rid);
     }
     db.commit(tx1).expect("commit tx1");
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let tx2 = db.begin_or_panic();
     for rid in &all_rids {
@@ -748,7 +748,7 @@ fn h15_single_surviving_vector_is_returned() {
 }
 
 #[test]
-fn h16_dimension_mismatch_is_rejected_when_hnsw_would_be_active() {
+fn h16_dimension_mismatch_is_rejected_when_indexed_would_be_active() {
     let db = Database::open_memory();
     setup_items_table(&db, 3);
 
@@ -811,7 +811,7 @@ fn h17_below_threshold_explain_stays_vector_search() {
 }
 
 #[test]
-fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
+fn h19_relational_graph_and_vector_atomicity_hold_under_indexed() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
 
@@ -832,7 +832,7 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
         item_uuids.push(uuid);
     }
     db.commit(tx).expect("commit");
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -946,9 +946,9 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
 }
 
 #[test]
-fn h20_hnsw_and_other_data_persist_across_reopen() {
+fn h20_indexed_and_other_data_persist_across_reopen() {
     let tmp = TempDir::new().expect("tempdir");
-    let path = tmp.path().join("hnsw_persistence.db");
+    let path = tmp.path().join("indexed_persistence.db");
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
 
@@ -969,7 +969,7 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
         all_uuids.push(uuid);
     }
     db.commit(tx).expect("commit");
-    drive_hnsw_maintenance(&db);
+    drive_indexed_maintenance(&db);
 
     let explain_pre = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")

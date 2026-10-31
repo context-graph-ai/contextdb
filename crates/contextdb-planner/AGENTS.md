@@ -35,8 +35,8 @@ seeks or the Sort-and-rank fallback.
   (`Error`, `Direction`, `PropagationRule`).
 - Entry point: `contextdb_planner::plan(&Statement) -> Result<PhysicalPlan>`.
 - Above: `contextdb-engine` executes the plan (`executor.rs`, `executor/bounded.rs`) and is the
-  only consumer. `HnswSearch` exists in the enum but the planner emits `VectorSearch`; the engine
-  decides whether a built index answers it.
+  only consumer. The planner emits `VectorSearch`; the engine decides whether a published index
+  answers it.
 
 ## Invariants and their guards
 

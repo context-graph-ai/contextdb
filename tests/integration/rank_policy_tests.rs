@@ -1707,7 +1707,7 @@ fn seed_many_with_policy_boost(db: &Database, count: usize, boost_start: usize) 
         .collect()
 }
 
-fn seed_many_hnsw_frontier_policy(db: &Database, count: usize) -> Vec<Uuid> {
+fn seed_many_indexed_frontier_policy(db: &Database, count: usize) -> Vec<Uuid> {
     for n in 0..count {
         let id = uuid(10_000 + n as u128);
         let score = 1.0 - (n as f32 / (count as f32 + 1.0)) * 0.4;
@@ -1726,7 +1726,7 @@ fn seed_many_hnsw_frontier_policy(db: &Database, count: usize) -> Vec<Uuid> {
 }
 
 #[test]
-fn hnsw_threshold_999_brute_force_boundary() {
+fn indexed_threshold_999_brute_force_boundary() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_policy_schema(&db, "coalesce({confidence}, 0.0)");
@@ -1747,7 +1747,7 @@ fn indexed_threshold_1001_indexed_boundary() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_policy_schema(&db, "coalesce({confidence}, 0.0)");
-    let expected = seed_many_hnsw_frontier_policy(&db, 1001);
+    let expected = seed_many_indexed_frontier_policy(&db, 1001);
     // Finite calls until no partition has work left are the public caller-driven operation;
     // this is not a timing wait.
     for _ in 0..2_100 {
@@ -1801,9 +1801,9 @@ fn indexed_threshold_1001_indexed_boundary() {
     assert!(db.__rank_policy_eval_count() >= 10);
 }
 
-/// REGRESSION GUARD: HNSW with no sort_key remains byte-for-byte raw cosine search.
+/// REGRESSION GUARD: index with no sort_key remains byte-for-byte raw cosine search.
 #[test]
-fn hnsw03_sort_key_none_unchanged() {
+fn index03_sort_key_none_unchanged() {
     let db = Database::open_memory();
     create_policy_schema(&db, "0.9");
     seed_many(&db, 1001);

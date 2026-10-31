@@ -24,12 +24,6 @@ fn run(db: &Database, sql: &str) {
     db.execute(sql, &empty())
         .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
 }
-fn alter(db: &Database, members: &str) {
-    run(
-        db,
-        &format!("ALTER TABLE breadth_rows ALTER COLUMN embedding SET HNSW {members}"),
-    );
-}
 fn column(db: &Database) -> contextdb_core::ColumnDef {
     db.table_meta("breadth_rows")
         .unwrap()
@@ -207,7 +201,7 @@ fn assert_frontier(db: &Database) {
 // moves resident values out without replacing rows; or skip authored custody.
 
 // New function: the narrow route must distinguish post-merge semantics and
-// explicit staging. Mutant: classify every SET HNSW AST as EF-only.
+// explicit staging. Mutant: classify every SET IVF AST as probes-only.
 
 // New function: declaration validation tests do not prove real writer pressure
 // leaves the same durable data and occurrence history. This exercises an actual

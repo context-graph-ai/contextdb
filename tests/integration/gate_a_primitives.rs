@@ -1381,8 +1381,8 @@ fn a4_10_float32_precision_roundtrip() {
 }
 
 #[test]
-fn a4_11_hnsw_recall_threshold() {
-    // Use a dedicated table with a higher-dimensional vector to get good HNSW recall.
+fn a4_11_indexed_recall_threshold() {
+    // Use a dedicated table with a higher-dimensional vector to get good index recall.
     let db = setup_ontology_db();
     let dim = 32usize;
     let n = 1_500u64;
@@ -1395,7 +1395,7 @@ fn a4_11_hnsw_recall_threshold() {
     )
     .expect("create table");
 
-    // Insert enough vectors to trigger HNSW (threshold = 1000).
+    // Insert enough vectors to trigger index (threshold = 1000).
     let tx = db.begin_or_panic();
     let mut all_vectors = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -1475,12 +1475,12 @@ fn a4_11_hnsw_recall_threshold() {
     let avg_recall = total_recall / queries as f64;
     assert!(
         avg_recall >= 0.95,
-        "avg HNSW recall@{k} was {avg_recall}, expected >= 0.95"
+        "avg index recall@{k} was {avg_recall}, expected >= 0.95"
     );
 }
 
 #[test]
-fn a4_12_hnsw_with_mvcc_visibility() {
+fn a4_12_indexed_with_mvcc_visibility() {
     let db = setup_ontology_db();
     let dim = 32usize;
 

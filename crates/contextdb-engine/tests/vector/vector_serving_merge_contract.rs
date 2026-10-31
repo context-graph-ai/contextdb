@@ -841,10 +841,12 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
-    struct Distances(AtomicUsize);
+    struct Distances(AtomicUsize, AtomicUsize);
     impl NativeIvfSealObserver for Distances {
         fn observe(&self, event: NativeIvfSealEvent<'_>) {
             if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
+                self.1
+                    .fetch_add(work.exact_score_count as usize, Ordering::SeqCst);
                 self.0.fetch_add(
                     (work.centroid_evaluations
                         + work.quantized_evaluations
@@ -933,25 +935,20 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
         let before = db
             .vector_store_for_test()
             .passive_activity_counters_for_test();
-        let all = db
-            .execute(
+        let exact_scores = Arc::new(Distances::default());
+        let all = with_native_ivf_seal_observer_for_test(exact_scores.clone(), || {
+            db.execute(
                 "SELECT id FROM items ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 5",
                 &parameters(&query),
             )
-            .unwrap();
+            .unwrap()
+        });
         assert_eq!(ids(&all), vec![100, 101, 102, 103, 104]);
         let after = db
             .vector_store_for_test()
             .passive_activity_counters_for_test();
         let scored = (end - 100 + 32) as u64;
-        assert_eq!(
-            after.raw_candidate_point_loads - before.raw_candidate_point_loads,
-            scored
-        );
-        assert_eq!(
-            after.raw_candidate_point_body_bytes - before.raw_candidate_point_body_bytes,
-            scored * 3 * std::mem::size_of::<f32>() as u64
-        );
+        assert_eq!(exact_scores.1.load(Ordering::SeqCst) as u64, scored);
         assert_eq!(after.raw_partition_loads, before.raw_partition_loads);
         assert_eq!(
             after.whole_entry_slice_requests,

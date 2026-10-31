@@ -677,20 +677,22 @@ partitioned column has no detail row until a key tuple receives a vector.
 
 `broad_route` is `fanout` when a broad filter searches the eligible partitions separately and `maintained` when it uses the maintained broad route. `broad_route_state` is `ready`, `partial`, or `unavailable`; `partial` reports maintained-route build progress and never permits a partial answer.
 
-`query_state` is `empty`, `ready`, or `unavailable` for a layout; the whole-index view can also say
-`partial`. A layout's `maintenance_state` is `idle`, `building`, `replaying`, `compacting`,
+`query_state` is `empty`, `ready`, `exact`, or `unavailable` for a layout; the whole-index view can also say
+`partial`. `exact` means no index is published and the column's mode searches exactly; a
+`SEARCH_MODE INDEXED` column with no published index is `unavailable` with reason `initial_build`. A layout's `maintenance_state` is `idle`, `building`, `replaying`, `compacting`,
 `repairing`, or `stalled`. The whole-index summary is `idle` when every layout is idle; it reports
 `building`, `replaying`, `compacting`, or `repairing` only when all non-idle work has that one state;
 it reports `active` when several non-stalled activities coexist, `stalled` only when every busy
 layout is stalled, and `mixed` when stalled and live work coexist. Per-partition inspection reports
-desired topology (`desired_hnsw_m`, `desired_hnsw_ef_construction`) separately from the complete
-serving graph (`serving_hnsw_m`, `serving_hnsw_ef_construction`) and their policy revisions.
-`desired_hnsw_ef_search` is the current query policy resolved for inspection (`k = 1`);
-`serving_hnsw_ef_search` reports that same current breadth when a serving graph exists, and is
-`NULL` without one. It is not a frozen build setting. An actual query resolves breadth at its own
-`k`: explicit `EF_SEARCH` is raised only to `k`, while omission uses at least the profile and
-`10 * k`. Query-only changes therefore need not advance `serving_policy_revision`, which identifies
-the graph's build. A pending topology replacement remains visible in the desired/serving values. The response uses stable
+the layout each partition runs on: `lists`, `probes` and `refine_factor`, each beside its
+`_source`, with `base_generation`, `indexed_available` (an index is published and can serve),
+`codebook_identity` (the published codebook) and `objective_status` (`met`, `unmet` or `unmeasured`
+against the declared `TARGET_ACCURACY`). The desired and serving policy revisions are reported
+separately. `durable_index_bytes` is the size of the index pages the selected published generation
+holds, and is `NULL` while nothing is published. Query-only changes, such as `PROBES`, need not
+advance `serving_policy_revision`, which identifies the layout the published index was built for;
+they never start a rebuild or repair. A pending layout replacement remains visible in the
+desired/serving revisions. The response uses stable
 words, not free-form errors:
 
 - `availability_reason` is `none`, `initial_build`, `replay`, `corrupt_base`,
@@ -734,23 +736,22 @@ route, or starts repair. It reports current local lifecycle state and recovery a
 
 These `SHOW VECTOR_*` commands require the existing unrestricted admin database handle. A narrowed
 handle is refused rather than receiving partial totals. Use `.explain` for that caller's redacted
-route instead. Restricted explanations omit per-partition adaptive HNSW values as well as hidden
-keys and populations. Unrestricted explanations pair the snapshot's serving topology/build revision
-with the query's current `EF_SEARCH`; a stale build revision does not imply stale search breadth.
+route instead. Restricted explanations omit per-partition index values as well as hidden
+keys and populations. Unrestricted explanations pair the snapshot's serving layout/build revision
+with the query's current `PROBES`; a stale build revision does not imply stale search breadth.
 When a partition limit blocks a write, raise it with `ALTER TABLE ... ALTER COLUMN
 ... SET MAX_PARTITIONS ...`; lowering below live-plus-retained use is refused until retained
 snapshots finish.
 
 `SET MEMORY_LIMIT 2G` and CLI `--memory-limit 2G` both resolve to **2147483648 bytes**.
 `SHOW MEMORY_LIMIT` reports the resolved limit; it counts charged memory, which is separate from
-whole-process RSS. Under pressure, idle vector graphs are reclaimed in least-recently-used order
-only until the selected graph's complete load fits. Without `SET MEMORY_LIMIT` or
-`--memory-limit`, loaded graphs remain resident.
+whole-process RSS. A search reads index pages from the store as it needs them and is charged for
+them while it holds them.
 
 ### Vector column policy
 
-Use SQL to declare or change a vector column's `AUTO_INDEX_AT`, HNSW, and `CONSOLIDATION` policy;
-`CONSOLIDATION` controls when maintenance rebuilds a healthy graph, and its rules and defaults are
+Use SQL to declare or change a vector column's `AUTO_INDEX_AT`, `SEARCH`, `IVF`, and `CONSOLIDATION` policy;
+`CONSOLIDATION` controls when maintenance rebuilds a healthy index, and its rules and defaults are
 in [Vector Similarity Search](query-language.md#vector-similarity-search). Foreground vector writes
 remain searchable while construction runs.
 `AUTO_INDEX_AT` and `EF_SEARCH` affect newly opened queries without a graph rebuild; changing `M`

@@ -82,7 +82,8 @@ ALTER TABLE t ALTER COLUMN vector_col SET SEARCH_MODE AUTO | EXACT | INDEXED
 ALTER TABLE t ALTER COLUMN vector_col SET AUTO_INDEX_AT positive_integer | DEFAULT
 ALTER TABLE t ALTER COLUMN vector_col SET AUTO_EXPANSION_CEILING percent_1_to_100 | DEFAULT
 ALTER TABLE t ALTER COLUMN vector_col SET FLAT_BELOW non_negative_integer | DEFAULT
-ALTER TABLE t ALTER COLUMN vector_col SET HNSW DEFAULT | (M = positive_integer | DEFAULT, EF_CONSTRUCTION = positive_integer | DEFAULT, EF_SEARCH = positive_integer | DEFAULT, SEARCH_RADIUS = decimal_0_to_2 | DEFAULT)
+ALTER TABLE t ALTER COLUMN vector_col SET SEARCH DEFAULT | (TARGET_ACCURACY = decimal_percent | DEFAULT, EXPECTED_VECTORS = positive_integer | DEFAULT)
+ALTER TABLE t ALTER COLUMN vector_col SET IVF DEFAULT | (LISTS = positive_integer | DEFAULT, PROBES = positive_integer | DEFAULT, REFINE_FACTOR = decimal_at_least_1 | DEFAULT)
 ```
 
 `COLUMN` is optional on `ADD` and on `DROP` — `ALTER TABLE t DROP a` and `ALTER TABLE t DROP COLUMN a` both parse.
@@ -1617,7 +1618,8 @@ CREATE TABLE vector_items (
     MAX_PARTITIONS 256
     SEARCH_MODE AUTO
     AUTO_INDEX_AT 10000
-    HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 128)
+    SEARCH (TARGET_ACCURACY = 95, EXPECTED_VECTORS = 1000000)
+    IVF (LISTS = 64, PROBES = 8)
     CONSOLIDATION (CHANGE_PERCENT = 25, TOMBSTONE_PERCENT = 5)
 );
 ```
@@ -1634,22 +1636,22 @@ snapshot. A NULL vector creates no layout. A write that would exceed the limit i
 atomic write; it does not leave a row accepted without its vector.
 <!-- enforced by: vector_partition_declaration_contract::partitioned_vector_schema_survives_reopen_with_canonical_defaults, vector_partition_declaration_contract::invalid_partition_components_are_refused_without_partial_schema, vector_partition_declaration_contract::max_partitions_without_a_partition_key_is_a_typed_refusal, vector_partition_declaration_contract::every_exact_identity_type_is_valid_in_a_composite_partition_key, vector_partition_query_contract::a_partition_key_value_of_the_wrong_type_gets_its_own_typed_refusal_naming_the_column, vector_partition_query_contract::a_partition_key_value_of_the_wrong_type_arriving_through_sync_gets_the_same_typed_refusal, vector_partition_cleanup_inspection_contract::second_vector_column_cap_refusal_rolls_back_the_row_and_both_columns -->
 
-`AUTO_INDEX_AT`, `HNSW`, and `CONSOLIDATION` are optional per-column policy clauses and follow
-`SEARCH_MODE` in
-the canonical rendered order. `AUTO_INDEX_AT` is the first aggregate allowed-vector count for the
-whole requested answer at which `AUTO` requires the maintained indexed route; below it, `AUTO`
+`AUTO_INDEX_AT`, `SEARCH`, `IVF`, and `CONSOLIDATION` are optional per-column policy clauses and follow
+`SEARCH_MODE` in the canonical rendered order. `AUTO_INDEX_AT` is the first aggregate allowed-vector
+count for the whole requested answer at which `AUTO` requires the indexed route; below it, `AUTO`
 compares exactly only when the existing resource limits permit. It is not a per-partition
-threshold. `HNSW` names the maintained graph's `M` (neighbour links per point),
-`EF_CONSTRUCTION` (candidate work while building), and `EF_SEARCH` (candidate work while
-searching), and `SEARCH_RADIUS` (how far past its beam's edge distance a walk keeps expanding, a
-decimal from 0 through 2 with at most six decimal places; default 0.02). `EF_CONSTRUCTION` must be
-at least `M`; the other members take integers. One search's walk budget is `max(EF_SEARCH, k)`
-times its graph's bottom-level degree: the `2 × M` links neighbour selection keeps, plus up to 4
-links that keep every point reachable from the entry point. `EF_SEARCH = 400` at `M = 24` buys
-400 × 52 = 20,800 evaluations beyond opening the graph's layers. A row updated since its graph was
-built is scored from its visible stored vector before it competes; those reads have an allowance
-of the same size beside the walk's, so one search computes at most twice its walk budget, and a
-search that would need more is refused rather than answered in part.
+threshold. `SEARCH` declares the answer quality the index must reach: `TARGET_ACCURACY` is a
+percent (a decimal above 0 and at most 100, with at most two fractional digits) and
+`EXPECTED_VECTORS` is the vector count a partition is expected to reach. `IVF` overrides how the
+clustered index is laid out and searched: `LISTS` is the number of clusters the vectors are divided
+into, `PROBES` the number of clusters one search reads, and `REFINE_FACTOR` the multiple of `LIMIT`
+(at least 1.00, a decimal) of candidates re-scored at full precision. An omitted member is resolved
+by the engine from the declared target and the partition's size, and `SHOW VECTOR_INDEXES`,
+`SHOW VECTOR_PARTITIONS` and `EXPLAIN` report each resolved value beside its source. A search that
+would need more work than the statement's budget allows is refused rather than answered in part.
+A query may raise its own target for one statement with
+`USE VECTOR INDEXED (TARGET_ACCURACY = n)`.
+<!-- enforced by: crates/contextdb-engine/tests/clustered_vector_index/parse_surface.rs::explicit_members_render_canonically_and_round_trip -->
 
 `AUTO_EXPANSION_CEILING` follows `AUTO_INDEX_AT` in the canonical order. It is the most of its walk
 budget, in percent from 1 through 100, `AUTO` expects one partition's graph search to spend when it
@@ -1700,38 +1702,24 @@ percentage is explicit, and `none` for explicit `CONSOLIDATION NONE`; effective 
 `thresholds` or `none`.
 <!-- enforced by: vector_partition_declaration_contract::consolidation_and_maintenance_poll_declarations_round_trip_and_reset, vector_resource_maintenance_contract::in_memory_maintenance_honours_declared_consolidation_thresholds, vector_partition_sync_inspection_contract::every_consolidation_form_keeps_schema_identity_across_sync -->
 
-On `CREATE TABLE`, omitting either clause preserves the compatibility profile and `.schema`
-renders that silence. Its current defaults are: F32 uses `(M, EF_CONSTRUCTION, profile
-EF_SEARCH)` of `(16, 200, 10)` through 2,500 live vectors, `(16, 200, 20)` from 2,501 through
-5,000, `(24, 400, 400)` from 5,001 through 50,000, and `(16, 200, 200)` above 50,000;
-SQ8/SQ4 use `(8, 32,
-min(96,max(32,n)))` through 5,000 and `(12, 64, 128)` above 5,000. The undeclared
-`AUTO_INDEX_AT` defaults are 1,000 for F32 and 5,001 for SQ8/SQ4. An undeclared `EF_SEARCH` uses
-at least its profile and the existing `10 * k` query default; an explicit value is raised only to
-reach `k`.
-
-**The F32 search breadth default is now narrower for small layouts.** An F32 vector column that
-does not declare `EF_SEARCH` now searches a layout of up to 2,500 live vectors with a profile
-breadth of 10, and a layout of 2,501 through 5,000 with 20. The query default of `10 * k`
-still applies, so a top-10 query searches at least 100
-candidates. `M` and `EF_CONSTRUCTION` for these bands are unchanged, and the bands above 5,000 are
-unchanged. A column that declares `EF_SEARCH` keeps exactly its declared breadth; declare one, for
-example `ALTER TABLE t ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)`, to search more widely.
-<!-- enforced by: crates/contextdb-vector/src/store.rs::compatibility_profile_edges_and_partial_policy_validation_agree -->
+On `CREATE TABLE`, omitting `SEARCH` and `IVF` preserves the default policy and `.schema` renders
+that silence. The undeclared `AUTO_INDEX_AT` defaults are 1,000 for F32 and 5,001 for SQ8/SQ4. An
+omitted `SEARCH` or `IVF` member is resolved by the engine from the declared target and the
+partition's size; a declared member is used exactly as written.
 
 Change the policy online with the `ALTER` forms above. `DEFAULT` on `AUTO_INDEX_AT` clears that
-declaration; `SET HNSW DEFAULT` clears the whole group, while `DEFAULT` for a named HNSW member
-clears only that member and omitted members retain their declarations. Each statement changes its
-named HNSW members atomically. `AUTO_INDEX_AT`, `AUTO_EXPANSION_CEILING`, `FLAT_BELOW`, `EF_SEARCH`
-and `SEARCH_RADIUS` affect newly opened
-queries without rebuilding a graph. These policies are not versioned by snapshot: a statement run
-against a held older snapshot reads the column's current declaration, and both routes it may take
-return that snapshot's correct answer. The row count a route is chosen by is the snapshot's own. A change to the effective `M` or `EF_CONSTRUCTION` topology schedules a bounded
-replacement generation; the previous complete graph continues serving, and an older policy revision
-cannot publish over a newer declaration. An explicit value that resolves to the serving topology
-retains its authored identity without forcing a redundant build. Explicit `AUTO_INDEX_AT`, `HNSW`,
-and `CONSOLIDATION` values persist, participate in schema identity, and render in this canonical
-order.
+declaration; `SET SEARCH DEFAULT` and `SET IVF DEFAULT` clear the whole group, while `DEFAULT` for a
+named member clears only that member and omitted members retain their declarations. Each statement
+changes its named members atomically. `AUTO_INDEX_AT`, `AUTO_EXPANSION_CEILING`, `FLAT_BELOW` and
+`PROBES` affect newly opened queries without rebuilding an index. These policies are not versioned
+by snapshot: a statement run against a held older snapshot reads the column's current declaration,
+and both routes it may take return that snapshot's correct answer. The row count a route is chosen
+by is the snapshot's own. A change to the effective `LISTS` or `TARGET_ACCURACY` schedules a bounded
+replacement index; the previous complete index continues serving, and an older policy revision
+cannot publish over a newer declaration. An explicit value that resolves to the serving layout
+retains its authored identity without forcing a redundant build. Explicit `AUTO_INDEX_AT`, `SEARCH`,
+`IVF`, and `CONSOLIDATION` values persist, participate in schema identity, and render in this
+canonical order.
 <!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_policy_declaration_contract::partial_alters_member_defaults_and_group_defaults_change_only_the_declared_policy, vector_policy_declaration_contract::invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection, vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_revision_publication_contract::explicit_current_defaults_keep_their_identity_without_rebuilding_matching_graphs -->
 
 An operator can raise the limit online, but cannot lower it below live-plus-retained use:
@@ -1740,7 +1728,7 @@ An operator can raise the limit online, but cannot lower it below live-plus-reta
 ALTER TABLE vector_items ALTER COLUMN embedding SET MAX_PARTITIONS 512;
 ALTER TABLE vector_items ALTER COLUMN embedding SET SEARCH_MODE INDEXED;
 ALTER TABLE vector_items ALTER COLUMN embedding SET AUTO_INDEX_AT 10000;
-ALTER TABLE vector_items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 128);
+ALTER TABLE vector_items ALTER COLUMN embedding SET IVF (PROBES = 16);
 ALTER TABLE vector_items ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 11);
 ALTER TABLE vector_items ALTER COLUMN embedding SET CONSOLIDATION NONE;
 ```
@@ -1855,10 +1843,9 @@ behind indexed search.
 `.explain` reports the requested and resolved mode, declared partition key, whether the query
 selects one, several, or all authorized layouts, the route used by each Context, the global
 candidate merge, and any safe fallback or refusal reason. It redacts unauthorized keys and counts.
-A constrained handle's explanation omits per-partition HNSW numbers, whose adaptive values could reveal
-the hidden population. For an unrestricted caller, disclosed `M`, `EF_CONSTRUCTION`, and policy
-revision describe the snapshot's serving graph; `EF_SEARCH` describes the current query policy at
-its requested `k`. A query-only policy change therefore applies immediately even while the serving
+A constrained handle's explanation omits per-partition index numbers, whose adaptive values could reveal
+the hidden population. For an unrestricted caller, disclosed `LISTS`, `REFINE_FACTOR`, and policy
+revision describe the snapshot's serving index; `PROBES` describes the current query policy. A query-only policy change therefore applies immediately even while the serving
 build revision is older. Its authorized count and memory refusals use only authorized identities
 and the operation's available headroom. Explaining is
 metadata-only: it does not build an index, replay a journal, start repair, or fault every graph or
@@ -1916,7 +1903,7 @@ CREATE INDEX idx_items ON items (context_id, item_type, created_at DESC, id DESC
 Indexable column types: `INTEGER`, `TEXT`, `UUID`, `TIMESTAMP`, `TXID`,
 `BOOLEAN`, `REAL`. `JSON` and `VECTOR` columns are rejected at DDL time
 with `ColumnNotIndexable`; extract JSON fields into typed columns or use
-HNSW for vectors.
+vector search for vectors.
 
 Index names are scoped to the table. A duplicate name on the same table
 returns `DuplicateIndex`; the same name on two different tables is allowed.

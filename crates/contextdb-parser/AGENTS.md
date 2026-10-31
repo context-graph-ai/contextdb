@@ -27,9 +27,9 @@ is the engine's decision.
 The vector declaration grammar lives here, as syntax only. On a `VECTOR(n)` column, after
 `WITH (quantization = ...)`, the clauses come in this fixed order, each at most once:
 `PARTITION_KEY (col, ...)`, `MAX_PARTITIONS n`, `SEARCH_MODE AUTO|EXACT|INDEXED`,
-`AUTO_INDEX_AT n`, `HNSW (M = v, EF_CONSTRUCTION = v, EF_SEARCH = v)` (any value may be
-`DEFAULT`), `CONSOLIDATION NONE | (CHANGE_PERCENT = v, TOMBSTONE_PERCENT = v)`. Online changes are
-`ALTER TABLE t ALTER COLUMN c SET MAX_PARTITIONS | SEARCH_MODE | AUTO_INDEX_AT | HNSW (...)|DEFAULT
+`AUTO_INDEX_AT n`, `SEARCH (TARGET_ACCURACY = v, EXPECTED_VECTORS = v)`,
+`IVF (LISTS = v, PROBES = v, REFINE_FACTOR = v)` (any value may be `DEFAULT`), `CONSOLIDATION NONE | (CHANGE_PERCENT = v, TOMBSTONE_PERCENT = v)`. Online changes are
+`ALTER TABLE t ALTER COLUMN c SET MAX_PARTITIONS | SEARCH_MODE | AUTO_INDEX_AT | SEARCH (...)|DEFAULT | IVF (...)|DEFAULT
 | CONSOLIDATION ...|DEFAULT`. Queries take `ORDER BY col <=> q [USE VECTOR mode] [USE RANK name]
 LIMIT k`. Store-level forms: `SET/SHOW MAINTENANCE_POLL_INTERVAL` (`MILLISECONDS|SECONDS`),
 `SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT n [OFFSET m]]`, `SHOW VECTOR_INDEXES`,

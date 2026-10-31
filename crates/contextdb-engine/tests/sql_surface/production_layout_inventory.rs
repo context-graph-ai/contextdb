@@ -65,7 +65,7 @@ const PRODUCTION_SHAPED: &[&str] = &[
     "sql_surface_other::prv_05_row_vector_query_respects_candidate_filter",
     "sql_surface_other::prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants",
     "sql_surface_other::prv_09_existing_literal_and_parameter_cosine_distance_unchanged",
-    "sql_surface_other::prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active",
+    "sql_surface_other::prv_10_row_vector_composes_with_use_rank_and_emits_indexed_label_when_active",
     "sql_surface_other::prv_11_row_vector_query_accepts_parameter_bound_key",
     "sql_surface_other::prv_12_row_vector_query_in_active_tx_sees_active_tx_view",
     "sql_surface_other::prv_13_row_vector_query_honors_scoped_handle_context_isolation",

@@ -1,4 +1,4 @@
-//! Independent native ports of public assertions in the frozen HNSW inventory.
+//! Independent native ports of public assertions in the frozen graph-index inventory.
 //! The assertion map and private-counterpart gaps live in the index-ports receipt.
 #![cfg(feature = "test-seams")]
 #![expect(
@@ -1093,7 +1093,7 @@ fn durable_generation_round_trip_keeps_search_maps_and_seals_the_graph() {
         29
     );
     // Published pages are read only: ReadPages has no mutation operation.
-    // The old sealed-HnswIndex::insert refusal has no native object counterpart.
+    // The old sealed index insert refusal has no native object counterpart.
 }
 #[test]
 fn durable_codec_capacity_bounds_all_stored_representations_and_checks_overflow() {
@@ -1562,7 +1562,7 @@ fn a_search_locks_its_serving_cache_once_per_page_it_resolves() {
     .0;
     assert_eq!(first, unchanged, "cache lookup does not change scores");
     assert_eq!(first, reread, "scores survive source reload");
-    // HNSW serving-cache lock/directory/eviction counters have no native hook.
+    // Index serving-cache lock/directory/eviction counters have no native hook.
 }
 #[test]
 fn optional_base_body_refusal_preserves_navigation_and_unwind_refunds_it() {

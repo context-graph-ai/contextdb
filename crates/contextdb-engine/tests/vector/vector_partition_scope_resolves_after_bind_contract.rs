@@ -230,7 +230,7 @@ fn explain_reports_no_count_or_route_for_an_unbound_key() {
     );
 
     // Partition-detail list: the same "one redacted state" contract that governs
-    // `scope` above also governs the sibling per-partition HNSW disclosure list.
+    // `scope` above also governs the sibling per-partition index disclosure list.
     // An unbound key must not enumerate one entry per authorized partition in the
     // whole column -- that is the same count leak as `aggregate_allowed_vectors`
     // above, through a different field, and it slips past a check that only looks

@@ -20,8 +20,8 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::Duration;
 
-const HNSW_THRESHOLD_FOR_TEST: usize = 1000;
-const HNSW_ROWS_FOR_TEST: usize = 1024;
+const AUTO_INDEX_THRESHOLD_FOR_TEST: usize = 1000;
+const INDEXED_ROWS_FOR_TEST: usize = 1024;
 const MIN_EXACT_COSINE: f32 = 0.99999;
 #[cfg(feature = "test-seams")]
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -420,18 +420,18 @@ fn public_search_ties_order_by_row_id_over_a_large_population() {
         vec![RowId(10), RowId(20), RowId(30)]
     );
 
-    let hnsw_entries = (0..HNSW_ROWS_FOR_TEST)
+    let indexed_entries = (0..INDEXED_ROWS_FOR_TEST)
         .rev()
         .map(|i| test_entry(&r, 1_000 + i as u64, exact_vector(2, 0), 20_000 + i as u64))
         .collect::<Vec<_>>();
     insert_fixture_vectors(
         &store,
-        hnsw_entries,
+        indexed_entries,
         Some(accountant.as_ref()),
         VectorCopyAdmission::new(Arc::new(MemoryAccountant::no_limit())),
     )
     .unwrap();
-    let hnsw = exec
+    let indexed = exec
         .search(
             r.clone(),
             &exact_vector(2, 0),
@@ -442,7 +442,7 @@ fn public_search_ties_order_by_row_id_over_a_large_population() {
         )
         .unwrap();
     assert_eq!(
-        hnsw.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        indexed.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
         vec![
             RowId(10),
             RowId(20),
@@ -454,7 +454,7 @@ fn public_search_ties_order_by_row_id_over_a_large_population() {
             RowId(1_004),
         ]
     );
-    assert!(hnsw.iter().all(|(_, score)| (*score - 1.0).abs() < 1e-6));
+    assert!(indexed.iter().all(|(_, score)| (*score - 1.0).abs() < 1e-6));
 }
 
 #[test]
@@ -720,7 +720,7 @@ fn concurrent_same_ref_updates_in_order(first_tx: u64) {
     let r = index();
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 4)], accountant.clone());
-    seed_ranked(&store, &r, 1, HNSW_ROWS_FOR_TEST, 4, 10, &accountant);
+    seed_ranked(&store, &r, 1, INDEXED_ROWS_FOR_TEST, 4, 10, &accountant);
     exec.search(
         r.clone(),
         &ranked_vector(0, 4),
@@ -837,7 +837,7 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
     let r = index();
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 4)], accountant.clone());
-    seed_ranked(&store, &r, 1, HNSW_ROWS_FOR_TEST, 4, 10, &accountant);
+    seed_ranked(&store, &r, 1, INDEXED_ROWS_FOR_TEST, 4, 10, &accountant);
     // Exercise raw-store publication directly. Database commits restamp a
     // late lower transaction above the watermark before applying vectors.
     for (tx, vector) in [
@@ -890,14 +890,14 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
             1,
             "each snapshot must expose exactly one physical version of logical row 7 at {snapshot:?}"
         );
-        assert_eq!(visible.len(), HNSW_ROWS_FOR_TEST);
+        assert_eq!(visible.len(), INDEXED_ROWS_FOR_TEST);
         {
             let mode = contextdb_core::VectorSearchMode::Exact;
             let (rows, _) = exec
                 .search_with_mode(
                     r.clone(),
                     &exact_vector(4, 2),
-                    HNSW_ROWS_FOR_TEST + 2,
+                    INDEXED_ROWS_FOR_TEST + 2,
                     None,
                     snapshot,
                     mode,
@@ -906,7 +906,7 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
                 .unwrap();
             assert_eq!(
                 rows.len(),
-                HNSW_ROWS_FOR_TEST,
+                INDEXED_ROWS_FOR_TEST,
                 "complete unfiltered {mode:?} result at {snapshot:?}"
             );
             assert_eq!(
@@ -932,7 +932,7 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
             .bounded_brute_force_cursor::<Error>(
                 r.clone(),
                 &exact_vector(4, 2),
-                HNSW_ROWS_FOR_TEST + 2,
+                INDEXED_ROWS_FOR_TEST + 2,
                 None,
                 snapshot,
                 || Ok(()),
@@ -965,7 +965,7 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
             .search_with_mode(
                 r.clone(),
                 &exact_vector(4, 2),
-                HNSW_ROWS_FOR_TEST + 2,
+                INDEXED_ROWS_FOR_TEST + 2,
                 None,
                 snapshot,
                 contextdb_core::VectorSearchMode::Exact,
@@ -984,16 +984,16 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
                 &mut VectorCopyAdmission::new(Arc::new(MemoryAccountant::no_limit())),
             )
             .unwrap();
-        assert_eq!(count, HNSW_ROWS_FOR_TEST);
+        assert_eq!(count, INDEXED_ROWS_FOR_TEST);
     }
 }
 
 #[test]
-fn same_ref_concurrent_writes_brute_force_and_hnsw_agree() {
+fn same_ref_concurrent_writes_brute_force_and_indexed_agree() {
     let r = index();
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 4)], accountant.clone());
-    let entries = (0..HNSW_THRESHOLD_FOR_TEST)
+    let entries = (0..AUTO_INDEX_THRESHOLD_FOR_TEST)
         .map(|i| {
             test_entry(
                 &r,
@@ -1053,7 +1053,7 @@ fn same_ref_concurrent_writes_brute_force_and_hnsw_agree() {
     }
 
     let snapshot = SnapshotId(40_000);
-    let hnsw = exec
+    let indexed = exec
         .search(
             r.clone(),
             &exact_vector(4, 0),
@@ -1080,13 +1080,13 @@ fn same_ref_concurrent_writes_brute_force_and_hnsw_agree() {
             accountant.clone().into(),
         )
         .unwrap();
-    assert_eq!(hnsw.len(), brute.len());
-    let hnsw_rows = hnsw.iter().map(|(row, _)| *row).collect::<HashSet<_>>();
+    assert_eq!(indexed.len(), brute.len());
+    let indexed_rows = indexed.iter().map(|(row, _)| *row).collect::<HashSet<_>>();
     let brute_rows = brute.iter().map(|(row, _)| *row).collect::<HashSet<_>>();
     let expected_rows = (1..=50u64).map(RowId).collect::<HashSet<_>>();
-    assert_eq!(hnsw_rows, expected_rows);
+    assert_eq!(indexed_rows, expected_rows);
     assert_eq!(brute_rows, expected_rows);
-    assert!(hnsw.iter().all(|(_, cos)| (*cos - 1.0).abs() < 1e-6));
+    assert!(indexed.iter().all(|(_, cos)| (*cos - 1.0).abs() < 1e-6));
     assert!(brute.iter().all(|(_, cos)| (*cos - 1.0).abs() < 1e-6));
 }
 
@@ -1095,7 +1095,7 @@ fn same_ref_concurrent_deletes_leave_no_deleted_rows_in_results() {
     let r = index();
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 4)], accountant.clone());
-    seed_ranked(&store, &r, 1, HNSW_ROWS_FOR_TEST, 4, 10, &accountant);
+    seed_ranked(&store, &r, 1, INDEXED_ROWS_FOR_TEST, 4, 10, &accountant);
     exec.search(
         r.clone(),
         &exact_vector(4, 0),
@@ -1514,12 +1514,12 @@ fn replace_loaded_vectors_post_state_is_correct() {
     let b = ref_named("b", "embedding");
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let (store, _tx_mgr, exec) = setup_refs(&[(a.clone(), 3), (b.clone(), 3)], accountant.clone());
-    seed_ranked(&store, &a, 1, HNSW_ROWS_FOR_TEST, 3, 10, &accountant);
+    seed_ranked(&store, &a, 1, INDEXED_ROWS_FOR_TEST, 3, 10, &accountant);
     seed_ranked(
         &store,
         &b,
         100_000,
-        HNSW_ROWS_FOR_TEST,
+        INDEXED_ROWS_FOR_TEST,
         3,
         20_000,
         &accountant,
@@ -1559,18 +1559,18 @@ fn replace_loaded_vectors_blocks_per_ref_apply() {
     let b = ref_named("b", "embedding");
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let (store, _tx_mgr, _exec) = setup_refs(&[(a.clone(), 3), (b.clone(), 3)], accountant.clone());
-    seed_ranked(&store, &a, 1, HNSW_ROWS_FOR_TEST, 3, 10, &accountant);
+    seed_ranked(&store, &a, 1, INDEXED_ROWS_FOR_TEST, 3, 10, &accountant);
     seed_ranked(
         &store,
         &b,
         100_000,
-        HNSW_ROWS_FOR_TEST,
+        INDEXED_ROWS_FOR_TEST,
         3,
         20_000,
         &accountant,
     );
     let bulk_pause = store.arm_maintenance_pause_for_test(&default_bulk_ref(), PauseWindow::Bulk);
-    let replacements = (0..HNSW_ROWS_FOR_TEST)
+    let replacements = (0..INDEXED_ROWS_FOR_TEST)
         .flat_map(|i| {
             [
                 test_entry(
@@ -1626,11 +1626,11 @@ fn replace_loaded_vectors_blocks_per_ref_apply() {
     done_apply_rx.recv_timeout(TEST_TIMEOUT).unwrap();
     assert_eq!(
         vector_count_for(&store, &a, &accountant),
-        HNSW_ROWS_FOR_TEST
+        INDEXED_ROWS_FOR_TEST
     );
     assert_eq!(
         vector_count_for(&store, &b, &accountant),
-        HNSW_ROWS_FOR_TEST + 1
+        INDEXED_ROWS_FOR_TEST + 1
     );
 }
 

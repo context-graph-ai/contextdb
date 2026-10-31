@@ -222,7 +222,7 @@ application copies formula text into its queries.
 - Grammar — `RANK_POLICY`, `JOIN`, the `FORMULA` placeholders, `SORT_KEY`, `USE RANK`:
   [`docs/query-language.md`](query-language.md#rank-policies).
 - Runnable walkthrough with the expected ordering, the same query without `USE RANK` for
-  contrast, the join-index requirement, the HNSW/ANN caveat, and how to change a policy:
+  contrast, the join-index requirement, the approximate-search caveat, and how to change a policy:
   [`skills/vector-search/SKILL.md`](../skills/vector-search/SKILL.md).
 
 ## Use as a Library

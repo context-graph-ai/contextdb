@@ -1,6 +1,6 @@
 ---
 fixture_basis: hypothetical
-source: "ANN search input with 10 observations of 4-dim embeddings validating cosine-similarity top-k retrieval via HNSW index"
+source: "ANN search input with 10 observations of 4-dim embeddings validating cosine-similarity top-k retrieval via the clustered index"
 ---
 
 # ANN Search — Input Fixture

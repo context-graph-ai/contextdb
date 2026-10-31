@@ -231,14 +231,6 @@ pub enum VectorMaintenancePreparationPhaseForTest {
     PrepareDurableGeneration,
 }
 
-/// The callback boundary at which an HNSW layer is handed to query code.
-#[doc(hidden)]
-#[cfg(any(test, feature = "test-seams"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VectorGraphCallbackPhaseForTest {
-    BeforeSearchCallback,
-}
-
 /// Durable boundary after Redb T1 and before the verified journal-prefix T2.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-seams"))]
@@ -689,12 +681,6 @@ impl VectorMaintenanceFailureDetails {
     const BUILD_RECOVERY: &'static str = "inspect the reported operation and message, repair the underlying store failure, then run another maintenance cycle";
 
     fn safe_operation(operation: &str) -> &'static str {
-        if operation.starts_with("build_hnsw@") {
-            return "build_hnsw";
-        }
-        if operation.starts_with("prepare_authoritative_purge_hnsw@") {
-            return "prepare_authoritative_purge_hnsw";
-        }
         match operation {
             "prepare_vector_generation" => "prepare_vector_generation",
             "finalize_repaired_vector_partition" => "finalize_repaired_vector_partition",
@@ -702,7 +688,6 @@ impl VectorMaintenanceFailureDetails {
             "load_durable_vector_generation" => "load_durable_vector_generation",
             "read_vector_generation_source_page" => "read_vector_generation_source_page",
             "inspect_vector_generation_inventory" => "inspect_vector_generation_inventory",
-            "prepare_hnsw_tail" => "prepare_hnsw_tail",
             "clustered_calibration_capture" => "clustered_calibration_capture",
             "clustered_calibration_dependency" => "clustered_calibration_dependency",
             "clustered_calibration_metadata_control" => "clustered_calibration_metadata_control",
@@ -749,15 +734,10 @@ impl VectorMaintenanceFailureDetails {
 
     fn safe_memory_operation(operation: &contextdb_core::error::DiagnosticLabel) -> &'static str {
         // Native static labels already name the actual refusal site. Preserve
-        // them without allocation; keep private legacy suffixes normalized.
+        // them without allocation.
         match operation.static_text() {
-            Some(name)
-                if !name.starts_with("build_hnsw@")
-                    && !name.starts_with("prepare_authoritative_purge_hnsw@") =>
-            {
-                name
-            }
-            _ => Self::safe_operation(operation),
+            Some(name) => name,
+            None => Self::safe_operation(operation),
         }
     }
 
@@ -882,20 +862,6 @@ impl VectorMaintenanceFailureDetails {
                 message: "the maintained vector generation could not be encoded",
                 recovery_instruction: Self::BUILD_RECOVERY,
             },
-            Error::Other(message)
-                if message.contains("durable HNSW") || message.contains("HNSW build") =>
-            {
-                Self {
-                    failure: VectorMaintenanceFailure::BuildFailure,
-                    operation: "build_or_validate_hnsw_generation",
-                    requested_bytes: None,
-                    available_bytes: None,
-                    current_bytes: None,
-                    budget_limit_bytes: None,
-                    message: "maintained HNSW construction or durable validation failed",
-                    recovery_instruction: Self::BUILD_RECOVERY,
-                }
-            }
             Error::Other(message) if message.starts_with("storage error:") => Self {
                 failure: VectorMaintenanceFailure::BuildFailure,
                 operation: "read_or_publish_vector_storage",
@@ -8471,9 +8437,9 @@ impl PreparedVectorPublication {
 
 impl PreparedVectorPublication {}
 
-/// A prepared purge publication can own HNSW graphs before the durable commit.
-/// If that commit never happens, release those precharged graphs with the
-/// publication rather than leaking their final allocation.
+/// A prepared purge publication can own precharged index state before the
+/// durable commit. If that commit never happens, release it with the
+/// publication rather than leaking its final allocation.
 impl Drop for PreparedVectorPublication {
     fn drop(&mut self) {
         for column in self.registry.values() {
@@ -9733,7 +9699,7 @@ impl VectorStore {
     }
 
     /// Replace an already prepared registry after durable received-schema
-    /// publication. Any outgoing HNSW graph is retired here, after the
+    /// publication. Any outgoing index state is retired here, after the
     /// replacement is visible, through its existing vector allocation owner.
     /// Preserved state owners continue; engine settlement excludes both.
     pub fn publish_prepared_received_schema(&self, publication: PreparedVectorPublication) {
@@ -10225,7 +10191,7 @@ impl VectorStore {
 
     /// Admit a policy-only layout change for a registered index: the same
     /// dimension, quantization and partition key, with any change to search
-    /// mode, `AUTO_INDEX_AT`, `MAX_PARTITIONS`, HNSW or consolidation. Like
+    /// mode, `AUTO_INDEX_AT`, `MAX_PARTITIONS`, IVF or consolidation. Like
     /// `register_index_with_layout` for such a change, it keeps every
     /// partition and every graph. Everything that can fail happens here; a
     /// caller that must publish after durability applies the result with
@@ -15775,7 +15741,7 @@ impl VectorStore {
     /// counterpart of `prune_row_ids`, which removes EVERY entry for a row
     /// whose live version is entirely gone (retention); this removes only
     /// specific superseded copies while the row stays live, so it never
-    /// mutates an immutable HNSW graph. Old graph points remain until generation
+    /// mutates an immutable index generation. Old index points remain until generation
     /// replacement; candidate merge checks snapshot visibility and resolves each
     /// logical row's native score from its visible body before ranking. A single
     /// remaining directory version does not make an old graph score current.
