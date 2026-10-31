@@ -229,11 +229,6 @@ pub use direct_file_reader::{
 #[cfg(feature = "sync-orchestration")]
 pub use identity::FabricIdentity;
 pub use persistence::HistoricalIndexVerification;
-#[cfg(any(test, feature = "test-seams"))]
-pub use persistence::PagedRouteFaultForTest;
-#[cfg(any(test, feature = "test-seams"))]
-#[doc(hidden)]
-pub use persistence::VectorGenerationCatalogRecordFaultForTest;
 pub use plugin::DatabasePlugin;
 pub use read_progress::{ReadPhase, ReadProgress, ReadProgressObserver};
 pub use read_session::{

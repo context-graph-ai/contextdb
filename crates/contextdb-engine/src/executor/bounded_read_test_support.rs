@@ -59,11 +59,6 @@ pub trait ExecutionProbe: Send + Sync {
     fn after_source_capture(&self) {}
     fn before_work(&self, source: TestWorkSource, completed_work: u64);
     fn before_source_touch(&self, _touch: TestSourceTouch, _completed_items: u64) {}
-    fn after_hnsw_residual_rejection(
-        &self,
-        _event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
-    ) {
-    }
     fn before_temporary_reservation(
         &self,
         _source: TestWorkSource,
@@ -87,12 +82,6 @@ pub trait ExecutionProbe: Send + Sync {
 struct ProbeAdapter(Arc<dyn ExecutionProbe>);
 
 impl BoundedExecutionProbe for ProbeAdapter {
-    fn after_hnsw_residual_rejection(
-        &self,
-        event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
-    ) {
-        self.0.after_hnsw_residual_rejection(event);
-    }
     fn registered_snapshot_for_test(&self, snapshot: contextdb_core::SnapshotId) {
         self.0.registered_snapshot_for_test(snapshot);
     }
@@ -108,22 +97,9 @@ impl BoundedExecutionProbe for ProbeAdapter {
     }
 
     fn before_source_touch(&self, touch: BoundedSourceTouch, completed_items: u64) {
-        assert_ne!(
-            touch,
-            BoundedSourceTouch::HnswCandidate,
-            "HNSW touches must come from the sealed vector distance-loop handoff"
-        );
         if let Some(touch) = TestSourceTouch::from_bounded(touch) {
             self.0.before_source_touch(touch, completed_items);
         }
-    }
-
-    fn before_hnsw_candidate_distance(
-        &self,
-        event: contextdb_vector::hnsw::HnswCandidateDistanceEvent,
-    ) {
-        self.0
-            .before_source_touch(TestSourceTouch::HnswCandidate, event.completed_candidates());
     }
 
     fn before_temporary_reservation(
@@ -191,7 +167,6 @@ pub enum TestSourceTouch {
     GraphEdge,
     AdjacencyEntry,
     BruteForceVectorCandidate,
-    HnswCandidate,
     RankCandidate,
     AccessRow,
 }
@@ -206,7 +181,6 @@ impl TestSourceTouch {
             BoundedSourceTouch::GraphEdge => Self::GraphEdge,
             BoundedSourceTouch::AdjacencyEntry => Self::AdjacencyEntry,
             BoundedSourceTouch::BruteForceVectorCandidate => Self::BruteForceVectorCandidate,
-            BoundedSourceTouch::HnswCandidate => Self::HnswCandidate,
             BoundedSourceTouch::RankCandidate => Self::RankCandidate,
             BoundedSourceTouch::AccessRow => Self::AccessRow,
         })

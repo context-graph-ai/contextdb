@@ -1778,30 +1778,6 @@ impl Database {
             }))
     }
 
-    /// Observe physical summaries, the selected route's covered frontiers,
-    /// and global generation/page counts, including orphaned and hashed pages.
-    #[cfg(any(test, feature = "test-seams"))]
-    #[doc(hidden)]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn __durable_vector_storage_inventory_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> Result<DurableVectorStorageInventoryForTest> {
-        let persistence = self.persistence.as_ref().ok_or_else(|| {
-            Error::Other("durable vector inventory requires a file-backed store".into())
-        })?;
-        let mut owner = contextdb_vector::VectorCopyAdmission::new(
-            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
-        );
-        persistence.durable_vector_storage_inventory_for_test(partition, &mut owner)
-    }
-
     /// Test-only forced log-gap seam. Durable store state remains intact, so
     /// the next extraction must exercise the same persisted-state fallback a
     /// peer encounters when its requested watermark predates available logs.

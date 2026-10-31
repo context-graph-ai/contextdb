@@ -4816,32 +4816,6 @@ impl Database {
 
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn inspect_captured_vector_suffix_for_test(
-        &self,
-        partition: &contextdb_vector::VectorPartitionRef,
-        snapshot: SnapshotId,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-        checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Option<contextdb_vector::store::CapturedVectorSuffixInspectionForTest>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let _operation = self.open_operation()?;
-        let _schema = self.vector_schema_read(&partition.index);
-        let _source = self.writer_read_scope(read_memory.clone())?;
-        let mut owner = crate::vector_read_memory::admission(read_memory);
-        self.vector_store
-            .inspect_captured_vector_suffix_for_test(partition, snapshot, &mut owner, checkpoint)
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    #[doc(hidden)]
     pub fn arm_vector_tail_admission_failure_for_test(&self) {
         self.finalization
             .accountant

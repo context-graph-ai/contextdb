@@ -3642,8 +3642,6 @@ pub(crate) enum BoundedSourceTouch {
     /// themselves, which is what the executor reports as examined.
     AdjacencyEntry,
     BruteForceVectorCandidate,
-    #[cfg(any(test, feature = "test-seams"))]
-    HnswCandidate,
     RankCandidate,
     AccessRow,
 }
@@ -3883,8 +3881,7 @@ pub(crate) fn observe_bounded_rank_candidate() {
 
 /// A deterministic probe is compiled only with the existing test-seams
 /// feature. Supported bounded source loops call `before_source_touch`
-/// immediately before inspecting a real item. HNSW observation comes from the
-/// sealed distance event while the adjacent fallible control callback enforces
+/// immediately before inspecting a real item. The adjacent fallible control callback enforces
 /// work, time, and cancellation before distance evaluation. Temporary memory
 /// callbacks bracket the real database-accountant reservation.
 ///
@@ -3900,19 +3897,6 @@ pub(crate) trait BoundedExecutionProbe: Send + Sync {
     fn after_source_capture(&self) {}
     fn before_work(&self, source: BoundedWorkSource, completed_work: u64);
     fn before_source_touch(&self, touch: BoundedSourceTouch, completed_items: u64);
-    /// This callback can only arrive through the vector crate's sealed
-    /// `HnswCandidateDistanceEvent`, emitted immediately before real distance
-    /// work.  Calling `before_source_touch(HnswCandidate, ..)` in executor
-    /// post-processing is rejected by the test adapter.
-    fn before_hnsw_candidate_distance(
-        &self,
-        event: contextdb_vector::hnsw::HnswCandidateDistanceEvent,
-    );
-    fn after_hnsw_residual_rejection(
-        &self,
-        _event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
-    ) {
-    }
     fn before_temporary_reservation(
         &self,
         source: BoundedWorkSource,

@@ -10040,22 +10040,6 @@ fn bounded_graph_static_starts(
     }
 }
 
-#[cfg(any(test, feature = "test-seams"))]
-struct BoundedHnswProbeObserver {
-    probe: Arc<dyn BoundedExecutionProbe>,
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-impl contextdb_vector::hnsw::HnswCandidateObserver for BoundedHnswProbeObserver {
-    fn before_candidate_distance(&self, event: contextdb_vector::hnsw::HnswCandidateDistanceEvent) {
-        self.probe.before_hnsw_candidate_distance(event);
-    }
-
-    fn after_residual_rejection(&self, event: contextdb_vector::hnsw::HnswResidualRejectionEvent) {
-        self.probe.after_hnsw_residual_rejection(event);
-    }
-}
-
 /// The capacity an accumulating collection starts at before doubling. Small
 /// enough that a read accumulating a handful of items pays for a handful.
 const AMORTIZED_GROWTH_FLOOR: usize = 4;
@@ -10793,26 +10777,7 @@ impl VectorState {
         {
             self.receipt.begin();
             let before = vector_search_receipt::exact_candidates(context);
-            let observer = self.receipt.observer();
-            let insertion_observer = self.receipt.insertion_observer();
-            // The graph walk/build is synchronous on this request worker.
-            // Restore its prior TLS observer before returning across a fetch.
-            let result = match observer {
-                Some(observer) => {
-                    contextdb_vector::hnsw::with_additional_hnsw_build_observer(observer, || {
-                        match insertion_observer {
-                            Some(observer) => {
-                                contextdb_vector::hnsw::with_additional_hnsw_insert_observer(
-                                    observer,
-                                    || self.next_unobserved(db, context, published_trace),
-                                )
-                            }
-                            None => self.next_unobserved(db, context, published_trace),
-                        }
-                    })
-                }
-                None => self.next_unobserved(db, context, published_trace),
-            };
+            let result = self.next_unobserved(db, context, published_trace);
             let terminal = result
                 .as_ref()
                 .err()
@@ -10823,7 +10788,6 @@ impl VectorState {
             );
             self.receipt.finish_step(
                 vector_search_receipt::exact_candidates(context).saturating_sub(before),
-                published_trace.vector_search.as_deref(),
                 completed || terminal,
             );
             result

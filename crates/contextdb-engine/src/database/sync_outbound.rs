@@ -6774,18 +6774,6 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
-    pub fn __arm_one_shot_vector_graph_callback_pause_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-        phase: VectorGraphCallbackPhaseForTest,
-    ) -> VectorLifecyclePauseHandle {
-        let _operation = self.assert_open_operation();
-        self.vector_store
-            .arm_graph_callback_pause_for_test(partition, phase)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
     pub fn __arm_vector_journal_truncation_crash_for_test(
         &self,
         partition: &VectorPartitionRef,
@@ -6836,17 +6824,6 @@ impl Database {
 
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
-    pub fn __try_vector_generation_publication_lock_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> bool {
-        let _operation = self.assert_open_operation();
-        self.vector_store
-            .try_generation_publication_lock_for_test(partition)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
     pub fn __try_global_commit_lock_for_test(&self) -> bool {
         let _operation = self.assert_open_operation();
         let manager = self.tx_mgr.clone();
@@ -6859,88 +6836,6 @@ impl Database {
         received
             .recv_timeout(std::time::Duration::from_millis(100))
             .is_ok()
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_partition_journal_file_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> VectorPartitionJournalFileForTest {
-        let _operation = self.assert_open_operation();
-        // Inspection is a read of the physical journal, funded by this store's
-        // declared reader child even when the writer is at its admission limit.
-        let decode_owner = crate::read_image_memory::ImageMemory::operation_reader(
-            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-            self.declared_reader_memory()
-                .expect("journal inspection reader admission"),
-        )
-        .expect("journal inspection decode-owner admission");
-        let _decode_scope = decode_owner.enter();
-        let persistence = self
-            .persistence
-            .as_ref()
-            .expect("journal-file inspection requires a durable database");
-        let (truncated_through_lsn, physical_record_lsns) = persistence
-            .debug_vector_partition_journal_for_test(partition)
-            .expect("journal-file inspection verifies the physical route");
-        VectorPartitionJournalFileForTest {
-            truncated_through_lsn,
-            physical_record_lsns,
-        }
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_partition_generation_retention_for_test(
-        &self,
-        partition: &VectorPartitionRef,
-    ) -> VectorPartitionGenerationRetentionForTest {
-        let _operation = self.assert_open_operation();
-        let (resident_superseded_generations, resident_superseded_bytes) = self
-            .vector_store
-            .partition_superseded_generation_retention_for_test(partition);
-        let (durable_superseded_generations, durable_superseded_bytes) = self
-            .persistence
-            .as_ref()
-            .and_then(|persistence| {
-                persistence
-                    .load_vector_partition_generation_catalog_for(
-                        &partition.index,
-                        &partition.partition_key,
-                    )
-                    .ok()
-                    .flatten()
-                    .and_then(|catalog| {
-                        persistence
-                            .debug_superseded_vector_generation_retention_for_test(&catalog)
-                            .ok()
-                    })
-            })
-            .unwrap_or((0, 0));
-        VectorPartitionGenerationRetentionForTest {
-            durable_superseded_generations,
-            resident_superseded_generations,
-            durable_superseded_bytes,
-            resident_superseded_bytes,
-        }
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn __mutate_vector_generation_catalog_record_for_test(
-        path: &Path,
-        partition: &VectorPartitionRef,
-        fault: crate::persistence::VectorGenerationCatalogRecordFaultForTest,
-    ) -> Result<()> {
-        RedbPersistence::mutate_vector_generation_catalog_record_for_test(path, partition, fault)
     }
 
     /// Journal records the vector journal cleanup (T2) read on this thread
@@ -6981,88 +6876,6 @@ impl Database {
         partition: &VectorPartitionRef,
     ) -> Result<()> {
         RedbPersistence::corrupt_last_vector_partition_journal_record_for_test(path, partition)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn __corrupt_vector_partition_base_record_for_test(
-        path: &Path,
-        partition: &VectorPartitionRef,
-    ) -> Result<()> {
-        RedbPersistence::corrupt_vector_partition_base_record_for_test(path, partition)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn __corrupt_vector_partition_change_record_for_test(
-        path: &Path,
-        partition: &VectorPartitionRef,
-    ) -> Result<()> {
-        RedbPersistence::corrupt_vector_partition_change_record_for_test(path, partition)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn __corrupt_vector_partition_saved_graph_for_test(
-        path: &Path,
-        partition: &VectorPartitionRef,
-    ) -> Result<()> {
-        RedbPersistence::corrupt_vector_partition_saved_graph_for_test(path, partition)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn __damage_paged_route_pages_for_test(
-        path: &Path,
-        partition: &VectorPartitionRef,
-        other: Option<&VectorPartitionRef>,
-        fault: crate::persistence::PagedRouteFaultForTest,
-    ) -> Result<()> {
-        RedbPersistence::damage_paged_route_pages_for_test(path, partition, other, fault)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub fn __corrupt_vector_partition_graph_page_for_test(
-        path: &Path,
-        partition: &VectorPartitionRef,
-    ) -> Result<()> {
-        RedbPersistence::corrupt_vector_partition_graph_page_for_test(path, partition)
     }
 
     /// Declared relational indexes whose physical table no longer matches the
@@ -7111,13 +6924,6 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __strict_index_root_checks_for_test() -> u64 {
         crate::persistence::history_root_witness::strict_index_root_checks_for_test()
-    }
-
-    /// (route page-set verifications, pages walked, bytes hashed) on this thread.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __paged_route_verifications_for_test() -> (u64, u64, u64) {
-        crate::persistence::vector_paged::route_verifications_for_test()
     }
 
     #[cfg(any(test, feature = "test-seams"))]

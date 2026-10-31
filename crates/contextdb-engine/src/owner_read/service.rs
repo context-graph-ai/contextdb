@@ -281,15 +281,6 @@ impl BoundedExecutionProbe for OwnerBoundedProbeAdapter {
         }
     }
 
-    fn before_hnsw_candidate_distance(
-        &self,
-        event: contextdb_vector::hnsw::HnswCandidateDistanceEvent,
-    ) {
-        self.observe_start();
-        self.observer
-            .before_source_touch(TestSourceTouch::HnswCandidate, event.completed_candidates());
-    }
-
     fn before_temporary_reservation(
         &self,
         source: BoundedWorkSource,

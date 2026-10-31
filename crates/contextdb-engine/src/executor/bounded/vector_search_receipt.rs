@@ -5,23 +5,6 @@ use std::time::Instant;
 
 static SEARCH_ORDINAL: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Default)]
-struct Builds {
-    builds: AtomicU64,
-    inserts: AtomicU64,
-}
-impl contextdb_vector::hnsw::HnswBuildObserver for Builds {
-    fn before_hnsw_build(&self) {
-        self.builds.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-impl contextdb_vector::hnsw::HnswInsertObserver for Builds {
-    fn after_hnsw_insert(&self) {
-        self.inserts.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 pub(super) enum SearchReceiptState {
     Unstarted,
     Active(Box<SearchReceipt>),
@@ -31,7 +14,6 @@ pub(super) enum SearchReceiptState {
 pub(super) struct SearchReceipt {
     ordinal: u64,
     started: Instant,
-    builds: Arc<Builds>,
     exact: u64,
 }
 
@@ -44,7 +26,6 @@ impl SearchReceiptState {
             Self::Active(Box::new(SearchReceipt {
                 ordinal: SEARCH_ORDINAL.fetch_add(1, Ordering::Relaxed),
                 started: Instant::now(),
-                builds: Arc::new(Builds::default()),
                 exact: 0,
             }))
         } else {
@@ -52,26 +33,9 @@ impl SearchReceiptState {
         };
     }
 
-    pub(super) fn observer(&self) -> Option<Arc<dyn contextdb_vector::hnsw::HnswBuildObserver>> {
-        match self {
-            Self::Active(receipt) => Some(receipt.builds.clone()),
-            _ => None,
-        }
-    }
-
-    pub(super) fn insertion_observer(
-        &self,
-    ) -> Option<Arc<dyn contextdb_vector::hnsw::HnswInsertObserver>> {
-        match self {
-            Self::Active(receipt) => Some(receipt.builds.clone()),
-            _ => None,
-        }
-    }
-
     pub(super) fn finish_step(
         &mut self,
         exact: u64,
-        disclosure: Option<&VectorSearchDisclosure>,
         complete: bool,
     ) {
         let Self::Active(receipt) = self else {
@@ -85,17 +49,12 @@ impl SearchReceiptState {
         let Self::Active(receipt) = std::mem::replace(self, Self::Finished) else {
             unreachable!("active search receipt was inspected above");
         };
-        let hnsw = disclosure.map_or(0, |disclosure| {
-            disclosure
-                .admission_evaluations
-                .unwrap_or(0)
-                .saturating_add(disclosure.expansion_evaluations.unwrap_or(0)) as u64
-        });
         crate::database::writer_ownership_receipt::emit_vector_search_receipt(
             receipt.ordinal,
-            receipt.builds.builds.load(Ordering::Relaxed),
-            receipt.builds.inserts.load(Ordering::Relaxed),
-            receipt.exact.saturating_add(hnsw),
+            // The clustered index never builds or inserts into a graph.
+            0,
+            0,
+            receipt.exact,
             receipt.started.elapsed().as_micros(),
         );
     }

@@ -514,7 +514,6 @@ mod route_observation {
         SortCandidate,
         GraphEdge,
         BruteForceVectorCandidate,
-        HnswCandidate,
         RankCandidate,
         AccessRow,
     }
@@ -679,7 +678,6 @@ impl From<TestSourceTouch> for ReadKernelSource {
             // walk takes over them. No new source is published for it.
             TestSourceTouch::GraphEdge | TestSourceTouch::AdjacencyEntry => Self::GraphEdge,
             TestSourceTouch::BruteForceVectorCandidate => Self::BruteForceVectorCandidate,
-            TestSourceTouch::HnswCandidate => Self::HnswCandidate,
             TestSourceTouch::RankCandidate => Self::RankCandidate,
             TestSourceTouch::AccessRow => Self::AccessRow,
         }
@@ -829,19 +827,6 @@ struct SessionKernelProbe {
 
 #[cfg(any(test, feature = "test-seams"))]
 impl ExecutionProbe for SessionKernelProbe {
-    fn after_hnsw_residual_rejection(
-        &self,
-        event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
-    ) {
-        self.observer.after_vector_residual_rejection(
-            ReadKernelResidualRejectionEvent {
-                operation: self.operation,
-                route: self.route,
-                row_id: event.row_id(),
-            },
-            self.cancellation.clone(),
-        );
-    }
     fn registered_snapshot_for_test(&self, snapshot: contextdb_core::SnapshotId) {
         self.observer
             .registered_snapshot_for_test(self.route, self.operation, snapshot);

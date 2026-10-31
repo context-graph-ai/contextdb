@@ -3676,12 +3676,6 @@ impl RedbPersistence {
             .3
             .as_ref()
             .map_or(0, |memory| memory.bytes())
-            .saturating_add(
-                self.vector_repair_audit
-                    .lock()
-                    .as_ref()
-                    .map_or(0, |audit| audit._memory.bytes()),
-            )
     }
 
     /// One bounded durable relocation batch. Only a position survives the

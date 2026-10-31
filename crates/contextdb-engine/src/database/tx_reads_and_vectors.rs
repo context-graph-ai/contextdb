@@ -5839,52 +5839,6 @@ impl Database {
         self.vector_store.full_index_entries_touched_for_test()
     }
 
-    #[cfg(any(test, feature = "test-seams"))]
-    #[cfg_attr(
-        any(test, feature = "test-seams"),
-        expect(
-            clippy::result_large_err,
-            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-        )
-    )]
-    pub(super) fn captured_hnsw_observation_for_test(
-        &self,
-        index: &VectorIndexRef,
-        topology: bool,
-    ) -> Result<Option<(HnswGraphStats, usize, u64, u64)>> {
-        let reader = self.declared_reader_memory()?;
-        let _source = self.writer_read_scope(reader.clone())?;
-        let mut owner = crate::vector_read_memory::admission(reader);
-        match self.vector_store.try_state(index) {
-            Some(state) => {
-                state.captured_hnsw_observation_for_test(self.snapshot(), &mut owner, topology)
-            }
-            None => Ok(None),
-        }
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_hnsw_len(&self, index: VectorIndexRef) -> Option<usize> {
-        let _operation = self.assert_open_operation();
-        let _vector_schema = self.vector_schema_read(&index);
-        match self.captured_hnsw_observation_for_test(&index, false) {
-            Ok(Some(observation)) => Some(observation.1),
-            Ok(None) => self.vector_hnsw_len_under_schema_read(&index),
-            Err(_) => None,
-        }
-    }
-
-    #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn vector_hnsw_len_under_schema_read(
-        &self,
-        index: &VectorIndexRef,
-    ) -> Option<usize> {
-        self.vector_store
-            .try_state(index)
-            .and_then(|state| state.hnsw_len())
-    }
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -5912,76 +5866,6 @@ impl Database {
         actual: usize,
     ) -> Result<()> {
         self.vector_store.validate_vector(index, actual)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_hnsw_stats(&self, index: VectorIndexRef) -> Option<HnswGraphStats> {
-        let _operation = self.assert_open_operation();
-        let _vector_schema = self.vector_schema_read(&index);
-        match self.captured_hnsw_observation_for_test(&index, false) {
-            Ok(Some(observation)) => Some(observation.0),
-            Ok(None) => self
-                .vector_store
-                .try_state(&index)
-                .and_then(|state| state.hnsw_stats()),
-            Err(_) => None,
-        }
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_hnsw_raw_search_for_test(
-        &self,
-        index: VectorIndexRef,
-        query: &[f32],
-        k: usize,
-    ) -> Option<Vec<(RowId, f32)>> {
-        let _operation = self.assert_open_operation();
-        let _vector_schema = self.vector_schema_read(&index);
-        self.vector_store
-            .raw_hnsw_search(&index, query, k)
-            .and_then(Result::ok)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_hnsw_raw_entry_count_for_row_for_test(
-        &self,
-        index: VectorIndexRef,
-        row_id: RowId,
-    ) -> Option<usize> {
-        let _operation = self.assert_open_operation();
-        let _vector_schema = self.vector_schema_read(&index);
-        self.vector_store
-            .raw_hnsw_entry_count_for_row(&index, row_id)
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_hnsw_topology_digest_for_test(
-        &self,
-        index: VectorIndexRef,
-    ) -> Option<u64> {
-        let _operation = self.assert_open_operation();
-        let _vector_schema = self.vector_schema_read(&index);
-        match self.captured_hnsw_observation_for_test(&index, true) {
-            Ok(Some(observation)) => Some(observation.2),
-            Ok(None) => self.vector_store.raw_hnsw_topology_digest_for_test(&index),
-            Err(_) => None,
-        }
-    }
-
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __debug_vector_hnsw_build_serial_for_test(&self, index: VectorIndexRef) -> Option<u64> {
-        let _operation = self.assert_open_operation();
-        let _vector_schema = self.vector_schema_read(&index);
-        match self.captured_hnsw_observation_for_test(&index, false) {
-            Ok(Some(observation)) => Some(observation.3),
-            Ok(None) => self.vector_store.raw_hnsw_build_serial_for_test(&index),
-            Err(_) => None,
-        }
     }
 
     #[doc(hidden)]
