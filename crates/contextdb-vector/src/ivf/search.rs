@@ -1,5 +1,5 @@
 use super::{
-    book::{Codebook, list_page_used},
+    book::{Codebook, list_block_layout, list_page_used},
     catalog::{Catalog, Entry, Run, tail_slot},
     codec,
     memory::{Invoice, bytes, corrupt, dimension, overflow},
@@ -217,21 +217,44 @@ fn search_impl<E>(
                         while remaining > 0 {
                             source.check_cancel()?;
                             let mut page = [0; PAGE_BYTES];
-                            if page_id == 0
-                                || !super::storage::read_page(
-                                    source,
-                                    manifest.key(PageKind::Lists, *list, page_id - 1),
-                                    &mut page,
-                                )?
-                            {
+                            if page_id == 0 {
                                 return Err(corrupt().into());
                             }
-                            let used = list_page_used(source, manifest, *list, page_id)?;
                             let stride = 16 + policy.dimensions;
-                            if used == 0 || used > PAGE_BYTES / stride || used as u64 > remaining {
+                            let (capacity, block_pages) =
+                                list_block_layout(policy.dimensions).ok_or_else(corrupt)?;
+                            let first_page = (page_id - 1)
+                                .checked_mul(block_pages as u64)
+                                .ok_or_else(corrupt)?;
+                            // A wider record spans pages into the admitted canonical scratch,
+                            // which no canonical read uses during this list scan.
+                            let block: &[u8] = if stride <= PAGE_BYTES {
+                                if !super::storage::read_page(
+                                    source,
+                                    manifest.key(PageKind::Lists, *list, first_page),
+                                    &mut page,
+                                )? {
+                                    return Err(corrupt().into());
+                                }
+                                &page
+                            } else {
+                                codec::read(
+                                    source,
+                                    manifest,
+                                    PageKind::Lists,
+                                    *list,
+                                    first_page
+                                        .checked_mul(PAGE_BYTES as u64)
+                                        .ok_or_else(corrupt)?,
+                                    &mut raw[..stride],
+                                )?;
+                                &raw[..stride]
+                            };
+                            let used = list_page_used(source, manifest, *list, page_id)?;
+                            if used == 0 || used > capacity || used as u64 > remaining {
                                 return Err(corrupt().into());
                             }
-                            for record in page.chunks_exact(stride).take(used) {
+                            for record in block.chunks_exact(stride).take(used) {
                                 let slot = u64::from_le_bytes(
                                     record[..8].try_into().map_err(|_| corrupt())?,
                                 );

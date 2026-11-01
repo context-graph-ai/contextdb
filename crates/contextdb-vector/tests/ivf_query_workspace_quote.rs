@@ -161,4 +161,110 @@ fn the_query_quote_matches_real_debits_and_one_byte_short_refuses_before_constru
             }
         }
     }
+    // Row: a list scan whose records span pages stays inside the same quote.
+    {
+        const DIMENSIONS: usize = 4096;
+        let build = Arc::new(ivf_pages::Budget::default());
+        let policy = Policy::checked(DIMENSIONS, 4, 4, 16, 1 << 20, true).unwrap();
+        let training = TrainingPolicy {
+            iterations: 1,
+            reservoir_samples: 8,
+            seed: 7,
+            ingest_batch_keys: 8,
+            phase_batch_entries: 8,
+        };
+        let vector = |row: usize| {
+            let mut values = vec![0.25_f32; DIMENSIONS];
+            values[row] = 1.0;
+            values
+        };
+        let mut index = ClusteredIndex::new(
+            ivf_pages::Pages::default(),
+            policy,
+            training,
+            build.clone().into(),
+        )
+        .unwrap();
+        index
+            .build_partition(0, (0..8).map(|row| (row as u64, vector(row))))
+            .unwrap();
+        let pages = index.into_storage();
+        let query = vector(0);
+        for mode in [Mode::Exact, Mode::Indexed] {
+            let quote = query_workspace_allocation_bytes(policy, 3).unwrap();
+            let book = if mode == Mode::Indexed {
+                codebook_allocation_layout(DIMENSIONS, 4, false)
+                    .unwrap()
+                    .charged_bytes
+            } else {
+                0
+            };
+            let owner = Arc::new(Limit {
+                cap: quote + book,
+                live: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            });
+            let seen = Arc::new(Seen::default());
+            let mut out = vec![Hit::default(); 3];
+            let (count, work) = with_ivf_constructor_observer_for_test(seen.clone(), || {
+                search(
+                    &pages,
+                    policy,
+                    &owner.clone().into(),
+                    &query,
+                    Some(&[0]),
+                    mode,
+                    &mut out,
+                )
+            })
+            .unwrap();
+            assert_eq!(count, 3);
+            assert_eq!(out[0].row, 0);
+            if mode == Mode::Indexed {
+                assert!(
+                    work.list_pages_read >= 2,
+                    "the search really read a record across its pages"
+                );
+            }
+            assert_eq!(*seen.0.lock().unwrap(), vec![quote]);
+            assert_eq!(owner.live.load(Ordering::SeqCst), 0);
+            assert_eq!(owner.peak.load(Ordering::SeqCst), quote + book);
+            let short = Arc::new(Limit {
+                cap: quote - 1,
+                live: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            });
+            assert!(matches!(
+                search(
+                    &pages,
+                    policy,
+                    &short.clone().into(),
+                    &query,
+                    Some(&[0]),
+                    mode,
+                    &mut out
+                ),
+                Err(Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    ..
+                }) if requested_bytes == quote && available_bytes == quote - 1
+            ));
+            assert_eq!(short.live.load(Ordering::SeqCst), 0);
+            pages.cancelled.set(true);
+            assert!(matches!(
+                search(
+                    &pages,
+                    policy,
+                    &owner.clone().into(),
+                    &query,
+                    Some(&[0]),
+                    mode,
+                    &mut out
+                ),
+                Err(Error::ReadCancelled)
+            ));
+            pages.cancelled.set(false);
+        }
+    }
 }

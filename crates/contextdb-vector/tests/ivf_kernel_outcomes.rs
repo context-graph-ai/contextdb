@@ -11,8 +11,9 @@
 //!   InvalidTrainingValue policy refusal naming its member, and a build call
 //!   out of phase is a typed state-transition refusal naming the phase, never
 //!   store corruption;
-//! - a policy at the largest dimension a page holds is accepted and searched,
-//!   and one dimension more is refused before anything is built;
+//! - a policy whose list record fills a page, or spans pages, is accepted and
+//!   searched, a missing continuation page refuses INDEXED and leaves EXACT
+//!   answering, and only an unrepresentable dimension is refused;
 //! - a missing accumulator page is typed corruption when training resumes,
 //!   and a search reads no accumulator page at all.
 #[path = "support/hiding_pages.rs"]
@@ -425,35 +426,82 @@ fn caller_mistakes_are_typed_refusals_not_store_corruption() {
 }
 
 #[test]
-fn a_policy_at_the_largest_page_dimension_is_searched_and_one_more_is_refused() {
-    let largest = PAGE_BYTES - 16;
+fn a_policy_past_one_list_page_is_searched_and_an_unrepresentable_one_is_refused() {
     assert!(
-        Policy::checked(largest + 1, 2, 1, 4, 1 << 20, true).is_none(),
-        "a dimension a list page cannot hold is refused before anything is built"
+        Policy::checked(usize::MAX, 2, 1, 4, usize::MAX, true).is_none(),
+        "a dimension whose record cannot be represented is refused before anything is built"
     );
-    let policy = Policy::checked(largest, 2, 2, 4, 1 << 20, true)
-        .expect("the largest dimension a page holds");
-    let budget = Arc::new(ivf_pages::Budget::default());
-    let mut index = ClusteredIndex::new(
-        ivf_pages::Pages::default(),
-        policy,
-        training(),
-        budget.clone().into(),
-    )
-    .expect("open at the largest dimension");
-    let vector = |seed: u64| {
-        let mut values = vec![0.0_f32; largest];
-        values[(seed as usize) % largest] = 1.0;
-        values
-    };
-    let rows: BTreeMap<u64, Vec<f32>> = (0..4).map(|n| (n, vector(n * 7))).collect();
-    index
-        .build_partition(0, rows.iter().map(|(id, v)| (*id, v.as_slice())))
-        .expect("build at the largest dimension");
-    for (row, values) in &rows {
+    // Each dimension with the fixed pages one of its list records spans.
+    for (dimensions, record_pages) in [(PAGE_BYTES - 16, 1_u64), (PAGE_BYTES - 15, 2), (4096, 2)] {
+        let policy =
+            Policy::checked(dimensions, 2, 2, 4, 1 << 20, true).expect("an accepted dimension");
+        let budget = Arc::new(ivf_pages::Budget::default());
+        let mut index =
+            ClusteredIndex::new(Hiding::default(), policy, training(), budget.clone().into())
+                .expect("open at this dimension");
+        let vector = |seed: u64| {
+            let mut values = vec![0.0_f32; dimensions];
+            values[(seed as usize) % dimensions] = 1.0;
+            values
+        };
+        let rows: BTreeMap<u64, Vec<f32>> = (0..4).map(|n| (n, vector(n * 7))).collect();
+        index
+            .build_partition(0, rows.iter().map(|(id, v)| (*id, v.as_slice())))
+            .expect("build at this dimension");
+        for mode in [Mode::Indexed, Mode::Exact] {
+            for (row, values) in &rows {
+                assert_eq!(
+                    top(index.storage(), policy, &budget, values, 1, mode).unwrap(),
+                    vec![*row],
+                    "{dimensions} dimensions, {mode:?}"
+                );
+            }
+        }
+        let mut hits = [Hit::default(); 4];
+        let (found, work) = search(
+            index.storage(),
+            policy,
+            &budget.clone().into(),
+            &rows[&0],
+            None,
+            Mode::Indexed,
+            &mut hits,
+        )
+        .unwrap();
+        assert_eq!(found, 4);
         assert_eq!(
-            top(index.storage(), policy, &budget, values, 1, Mode::Indexed).unwrap(),
-            vec![*row]
+            work.list_pages_read,
+            4 * record_pages,
+            "a full probe at {dimensions} dimensions reads every page of every record once"
+        );
+        if record_pages == 1 {
+            continue;
+        }
+        let manifest = index.storage().manifest(0).unwrap().unwrap();
+        let mut page = [0; PAGE_BYTES];
+        let continuation = (0..2)
+            .map(|list| manifest.key(PageKind::Lists, list, 1))
+            .find(|key| index.storage().read_admitted_page(*key, &mut page).unwrap())
+            .expect("a continuation page of a real record");
+        index.storage().hide_key.set(Some(continuation));
+        assert!(
+            matches!(
+                top(
+                    index.storage(),
+                    policy,
+                    &budget,
+                    &rows[&0],
+                    4,
+                    Mode::Indexed
+                ),
+                Err(Error::StoreCorrupted { .. })
+            ),
+            "a missing continuation page refuses INDEXED at {dimensions} dimensions"
+        );
+        assert_eq!(
+            top(index.storage(), policy, &budget, &rows[&0], 1, Mode::Exact).unwrap(),
+            vec![0],
+            "EXACT does not depend on a list page"
         );
     }
 }

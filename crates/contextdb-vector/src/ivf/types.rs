@@ -1,5 +1,3 @@
-use super::storage::PAGE_BYTES;
-
 /// Already resolved engine policy. SQL validation/default resolution lives above this layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
@@ -71,7 +69,7 @@ impl Policy {
         {
             return None;
         }
-        dimensions.checked_add(16).filter(|n| *n <= PAGE_BYTES)?;
+        dimensions.checked_add(16)?;
         dimensions.checked_mul(5)?;
         dimensions.checked_mul(lists as usize)?.checked_mul(4)?;
         Some(Self {

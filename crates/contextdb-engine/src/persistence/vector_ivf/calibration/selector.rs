@@ -158,13 +158,11 @@ impl Lattice<'_> {
         let shortlist = shortlist(self.depth, factor)?;
         let candidates = (shortlist as u128).min(u128::from(self.population)) as f64;
         let projected = self.population as f64 * f64::from(probes) / f64::from(self.active);
-        let records = PAGE_BYTES / self.dimensions.checked_add(16).ok_or_else(corrupt)?;
-        if records == 0 {
-            return Err(corrupt());
-        }
+        let (records, block_pages) =
+            contextdb_vector::ivf::list_block_layout(self.dimensions).ok_or_else(corrupt)?;
         // The accepted selector's byte/score estimate orders trials. It is
         // not memory admission; the producer quote alone supplies capacity.
-        let pages = (projected / records as f64).ceil();
+        let pages = (projected / records as f64).ceil() * block_pages as f64;
         let cost = (pages + 2.0 * candidates) * PAGE_BYTES as f64
             + self.dimensions as f64
                 * (2.0 * f64::from(self.active) * 4.0 + 2.0 * projected + 2.0 * candidates * 4.0);

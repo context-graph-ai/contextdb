@@ -496,6 +496,211 @@ fn native_indexed_file_search_survives_restart_replacement_and_erasure() {
             assert!(work.quantized_evaluations > 0);
         }
     }
+    // Rows: the same lifecycle where a list record fills a page or spans pages.
+    {
+        use contextdb_core::Error;
+        use contextdb_vector::ivf::storage::{PAGE_BYTES, PageKey, PageKind};
+        use std::collections::BTreeMap;
+        const LIVE: i64 = 8;
+        // Each dimension with the fixed pages one of its list records spans.
+        for (dimensions, record_pages) in [(3888_usize, 1_u64), (3889, 2), (4096, 2)] {
+            let bound = |seed: u64| params([("q", Value::Vector(unit_vector(seed, dimensions)))]);
+            let store = |path: &std::path::Path| {
+                let db = open_caller_driven(path);
+                db.execute(
+                &format!(
+                    "CREATE TABLE items (id INT PRIMARY KEY, v VECTOR({dimensions}) SEARCH_MODE INDEXED \
+                     IVF (LISTS = 2, PROBES = 2, REFINE_FACTOR = 8.00) \
+                     WITH (training_samples = 8, training_iterations = 1))"
+                ),
+                &empty(),
+            )
+            .unwrap();
+                let tx = db.begin_or_panic();
+                for id in 0..LIVE {
+                    db.execute_in_tx(
+                        tx,
+                        "INSERT INTO items VALUES ($id, $v)",
+                        &params([
+                            ("id", Value::Int64(id)),
+                            ("v", Value::Vector(unit_vector(id as u64, dimensions))),
+                        ]),
+                    )
+                    .unwrap();
+                }
+                db.commit(tx).unwrap();
+                drive_until_serving(&db, LIVE as usize, 1, 1);
+                db
+            };
+            let search = |db: &Database, mode: &str, seed: u64| {
+                db.execute(
+                    &format!("SELECT id FROM items ORDER BY v <=> $q USE VECTOR {mode} LIMIT 16"),
+                    &bound(seed),
+                )
+            };
+            let ids =
+                |db: &Database, mode: &str, seed: u64| int_ids(&search(db, mode, seed).unwrap());
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("wide-lifecycle.db");
+            let db = store(&path);
+            for id in 0..LIVE {
+                for mode in ["INDEXED", "EXACT"] {
+                    assert_eq!(
+                        ids(&db, mode, id as u64).first(),
+                        Some(&id),
+                        "{dimensions} {mode}"
+                    );
+                }
+            }
+            let (found, work) = observe_search(&db, || ids(&db, "INDEXED", 0));
+            assert_eq!(found, ids(&db, "EXACT", 0));
+            assert!(work.clustered_route);
+            assert_eq!(
+                work.list_pages_read,
+                LIVE as u64 * record_pages,
+                "a full probe at {dimensions} dimensions reads every page of every record once"
+            );
+
+            let first = serving(&db, "items", "v", &[]).unwrap();
+            db.execute(
+                "ALTER TABLE items ALTER COLUMN v SET WITH (training_seed = 7)",
+                &empty(),
+            )
+            .unwrap();
+            drive_until_serving(&db, LIVE as usize, 1, 1);
+            assert_ne!(
+                first.generation,
+                serving(&db, "items", "v", &[]).unwrap().generation
+            );
+            assert_eq!(ids(&db, "INDEXED", 0), ids(&db, "EXACT", 0));
+
+            // A row committed after the build is served beside the replacement's lists.
+            db.execute(
+                "INSERT INTO items VALUES ($id, $v)",
+                &params([
+                    ("id", Value::Int64(LIVE)),
+                    ("v", Value::Vector(unit_vector(LIVE as u64, dimensions))),
+                ]),
+            )
+            .unwrap();
+            assert_eq!(ids(&db, "INDEXED", LIVE as u64).first(), Some(&LIVE));
+            drive_until_serving(&db, LIVE as usize + 1, 1, 1);
+
+            // Whole-record needles, over payloads joined in page order across continuations.
+            let victim = unit_vector(3, dimensions);
+            let norm = victim
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let code: Vec<u8> = victim
+                .iter()
+                .map(|value| {
+                    ((f64::from(*value) / norm * 127.0)
+                        .round()
+                        .clamp(-127.0, 127.0) as i8) as u8
+                })
+                .collect();
+            let joined = |db: &Database| {
+                let mut pages = BTreeMap::<(u64, PageKey), [u8; PAGE_BYTES]>::new();
+                db.visit_native_ivf_physical_pages_for_test(&index(), &mut |page| {
+                    pages.insert((page.storage, page.key), *page.payload);
+                })
+                .unwrap();
+                pages.values().flatten().copied().collect::<Vec<u8>>()
+            };
+            let canonical = little_endian_bytes(&victim);
+            let before = joined(&db);
+            assert!(
+                contains_bytes(&before, &canonical),
+                "{dimensions} stored vector"
+            );
+            assert!(contains_bytes(&before, &code), "{dimensions} list record");
+            assert_eq!(
+                db.execute("PURGE FROM items WHERE id = 3", &empty())
+                    .unwrap()
+                    .rows_affected(),
+                1
+            );
+            let after = joined(&db);
+            assert!(
+                !contains_bytes(&after, &canonical),
+                "{dimensions} stored vector erased"
+            );
+            assert!(
+                !contains_bytes(&after, &code),
+                "{dimensions} list record erased"
+            );
+            let expected = ids(&db, "EXACT", 0);
+            assert_eq!(expected.len(), LIVE as usize);
+            assert!(!expected.contains(&3));
+            assert_eq!(ids(&db, "INDEXED", 0), expected);
+
+            db.close().unwrap();
+            drop(db);
+            let reader = ReadSession::open(&path).unwrap();
+            assert_eq!(reader.route(), ReadRoute::File);
+            for mode in ["INDEXED", "EXACT"] {
+                let found = reader
+                    .execute(
+                        &format!(
+                            "SELECT id FROM items ORDER BY v <=> $q USE VECTOR {mode} LIMIT 16"
+                        ),
+                        &bound(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    int_ids(&found),
+                    expected,
+                    "{dimensions} {mode} from the file"
+                );
+            }
+            drop(reader);
+            let db = open_caller_driven(&path);
+            for mode in ["INDEXED", "EXACT"] {
+                assert_eq!(
+                    ids(&db, mode, 0),
+                    expected,
+                    "{dimensions} {mode} after reopen"
+                );
+            }
+            db.close().unwrap();
+            drop(db);
+
+            // Damage the last page of a real record on its own store, once per fault.
+            for remove in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let db = store(&root.path().join("wide-damage.db"));
+                let healthy = ids(&db, "EXACT", 0);
+                let generation = serving(&db, "items", "v", &[]).unwrap().generation;
+                let mut target = None;
+                db.visit_native_ivf_physical_pages_for_test(&index(), &mut |page| {
+                    if target.is_none()
+                        && !page.building
+                        && page.key.generation == generation
+                        && page.key.kind == PageKind::Lists
+                        && page.key.ordinal == record_pages - 1
+                    {
+                        target = Some((page.storage, page.key));
+                    }
+                })
+                .unwrap();
+                let (storage, key) = target.expect("the last page of a real record");
+                if remove {
+                    db.remove_native_ivf_page_for_test(storage, key).unwrap();
+                } else {
+                    db.corrupt_native_ivf_page_for_test(storage, key, true, 0, 1)
+                        .unwrap();
+                }
+                assert!(
+                    matches!(search(&db, "INDEXED", 0), Err(Error::StoreCorrupted { .. })),
+                    "{dimensions} dimensions, removed {remove}: damage refuses INDEXED"
+                );
+                assert_eq!(ids(&db, "EXACT", 0), healthy, "EXACT stays usable");
+                db.close().unwrap();
+            }
+        }
+    }
 }
 #[test]
 fn first_saved_search_loads_compact_serving_descriptor_as_real_manifest_source() {

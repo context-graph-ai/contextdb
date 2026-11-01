@@ -1,5 +1,5 @@
 //! In-place authoritative erasure under the caller's existing transaction/fence.
-use super::super::storage::PAGE_BYTES;
+use super::super::{book::list_block_layout, storage::PAGE_BYTES};
 use super::*;
 
 impl<S: PageStore> ClusteredIndex<S> {
@@ -24,6 +24,8 @@ impl<S: PageStore> ClusteredIndex<S> {
             .ok_or_else(overflow)?;
         let offset = slot.checked_mul(stride as u64).ok_or_else(overflow)?;
         let list_stride = manifest.dimensions.checked_add(16).ok_or_else(overflow)?;
+        let (block_records, block_pages) =
+            list_block_layout(manifest.dimensions).ok_or_else(overflow)?;
         let buffer_stride = self.buffer_stride();
         codec::read(
             &self.store,
@@ -82,12 +84,31 @@ impl<S: PageStore> ClusteredIndex<S> {
                     &mut count,
                 )?;
                 let used = usize::try_from(u64::from_le_bytes(count)).map_err(|_| corrupt())?;
-                if used > PAGE_BYTES / list_stride {
+                if used > block_records {
                     return Err(corrupt());
                 }
-                let key = manifest.key(PageKind::Lists, list, ordinal);
+                let first_page = ordinal
+                    .checked_mul(block_pages as u64)
+                    .ok_or_else(overflow)?;
+                let key = manifest.key(PageKind::Lists, list, first_page);
                 if !super::super::storage::read_page(&tx, key, &mut page)? {
                     return Err(super::super::memory::corrupt_page(key));
+                }
+                if list_stride > PAGE_BYTES {
+                    if used != 0
+                        && u64::from_le_bytes(page[..8].try_into().map_err(|_| corrupt())?) == slot
+                    {
+                        // A missing or refused continuation fails here, and the
+                        // dropped transaction rolls back every staged erasure write.
+                        let offset = first_page
+                            .checked_mul(PAGE_BYTES as u64)
+                            .ok_or_else(overflow)?;
+                        let record = &mut self.encoded[..list_stride];
+                        codec::read(&tx, manifest, PageKind::Lists, list, offset, record)?;
+                        record[8..].fill(0);
+                        codec::write(&mut tx, manifest, PageKind::Lists, list, offset, record)?;
+                    }
+                    continue;
                 }
                 let mut changed = false;
                 for record in page[..used * list_stride].chunks_exact_mut(list_stride) {

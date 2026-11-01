@@ -167,8 +167,12 @@ pub(super) fn derive(
             if key.list >= m.lists || key.run != 0 {
                 return Err(corrupt());
             }
+            let (capacity, block_pages) =
+                contextdb_vector::ivf::list_block_layout(m.dimensions).ok_or_else(corrupt)?;
+            // The key is physical; allocation, links and used counts are per logical block.
+            let block = key.ordinal / block_pages as u64;
             let allocation_end = allocated(view, m, key.list, related)?;
-            if key.ordinal >= allocation_end {
+            if block >= allocation_end {
                 return Err(corrupt());
             }
             // Every list page, including its terminal page, has a real link
@@ -179,24 +183,27 @@ pub(super) fn derive(
                 m,
                 PageKind::ListLinks,
                 key.list,
-                mul(key.ordinal, 8)?,
+                mul(block, 8)?,
                 related,
             )?;
-            if next > allocation_end || next == add(key.ordinal, 1)? {
+            if next > allocation_end || next == add(block, 1)? {
                 return Err(corrupt());
             }
-            // Lists ordinal l = allocated id - 1; metadata offset is l*8.
+            // Logical block l = allocated id - 1; metadata offset is l*8.
             let used = scalar(
                 view,
                 m,
                 PageKind::ListUsed,
                 key.list,
-                mul(key.ordinal, 8)?,
+                mul(block, 8)?,
                 related,
             )?;
-            let capacity = PAGE_BYTES as u64 / add(m.dimensions as u64, 16)?;
-            if used > capacity {
+            if used > capacity as u64 {
                 return Err(corrupt());
+            }
+            // A continuation page owns no record prefix, as a canonical one does not.
+            if !key.ordinal.is_multiple_of(block_pages as u64) {
+                return records(0, 0);
             }
             let first = if used == 0 { 0 } else { word(payload, 0)? };
             if used != 0 && first >= m.slots {
@@ -440,8 +447,18 @@ pub(super) fn payload_dependencies(
                 .enumerate()
             {
                 if old != new {
-                    let list_ordinal = add(mul(key.ordinal, (PAGE_BYTES / 8) as u64)?, at as u64)?;
-                    mark_present(view, m.key(PageKind::Lists, key.list, list_ordinal), window)?;
+                    let block = add(mul(key.ordinal, (PAGE_BYTES / 8) as u64)?, at as u64)?;
+                    let (_, block_pages) = contextdb_vector::ivf::list_block_layout(m.dimensions)
+                        .ok_or_else(corrupt)?;
+                    let first_page = mul(block, block_pages as u64)?;
+                    // Every page of the block validates against this used count.
+                    for page in 0..block_pages as u64 {
+                        mark_present(
+                            view,
+                            m.key(PageKind::Lists, key.list, add(first_page, page)?),
+                            window,
+                        )?;
+                    }
                 }
             }
         }

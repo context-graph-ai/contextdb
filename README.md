@@ -266,7 +266,7 @@ value, so a search whose `WHERE` names a key looks only inside that partition.
 `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW
 VECTOR_PARTITIONS FOR table.column` shows each partition's state. Use `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` to choose the
 per-column storage footprint; omitted quantization defaults to `F32`.
-<!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_lazy_raw_residency_contract::reopen_and_selected_queries_keep_raw_vector_residency_partition_local, vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms -->
+<!-- enforced by: engine_stage::native_indexed_file_search_survives_restart_replacement_and_erasure, vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_lazy_raw_residency_contract::reopen_and_selected_queries_keep_raw_vector_residency_partition_local, vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms -->
 
 ## What It Does
 

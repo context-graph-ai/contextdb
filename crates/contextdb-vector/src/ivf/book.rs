@@ -344,6 +344,13 @@ pub(crate) fn read_vector(
     }
     Ok(row)
 }
+/// One logical list block for a declared dimension, as (records it holds, fixed pages it
+/// spans). Records that fit a page pack into one page; a wider record is alone in its block.
+/// Links, used counts and the allocator stay logical.
+pub fn list_block_layout(dimensions: usize) -> Option<(usize, usize)> {
+    let stride = dimensions.checked_add(16)?;
+    Some(((PAGE_BYTES / stride).max(1), stride.div_ceil(PAGE_BYTES)))
+}
 pub(crate) fn append_list(
     target: &mut impl WritePages,
     manifest: Manifest,
@@ -356,7 +363,7 @@ pub(crate) fn append_list(
     let mut directory = codec::directory(target, manifest, list)?;
     let count = directory.count;
     let stride = encoded.len();
-    let per_page = PAGE_BYTES / stride;
+    let (per_page, block_pages) = list_block_layout(manifest.dimensions).ok_or_else(corrupt)?;
     encoded[..8].copy_from_slice(&slot.to_le_bytes());
     encoded[8..16].copy_from_slice(&row.to_le_bytes());
     let norm = vector
@@ -380,7 +387,8 @@ pub(crate) fn append_list(
     if directory.tail != 0 {
         used = list_page_used(target, manifest, list, directory.tail)?;
     }
-    if directory.tail == 0 || used == per_page {
+    let fresh = directory.tail == 0 || used == per_page;
+    if fresh {
         let id = codec::allocate_list_page(target, manifest, list)?;
         if directory.tail != 0 {
             codec::set_next_list_page(target, manifest, list, directory.tail, id)?;
@@ -389,19 +397,23 @@ pub(crate) fn append_list(
         }
         directory.tail = id;
         used = 0;
-    } else if !super::storage::read_page(
-        target,
-        manifest.key(PageKind::Lists, list, directory.tail - 1),
-        &mut page,
-    )? {
+    }
+    let first_page = (directory.tail - 1)
+        .checked_mul(block_pages as u64)
+        .ok_or_else(corrupt)?;
+    let key = manifest.key(PageKind::Lists, list, first_page);
+    if !fresh && !super::storage::read_page(target, key, &mut page)? {
         return Err(corrupt());
     }
-    page[used * stride..(used + 1) * stride].copy_from_slice(encoded);
-    super::storage::put_page(
-        target,
-        manifest.key(PageKind::Lists, list, directory.tail - 1),
-        &page,
-    )?;
+    if stride <= PAGE_BYTES {
+        page[used * stride..(used + 1) * stride].copy_from_slice(encoded);
+        super::storage::put_page(target, key, &page)?;
+    } else {
+        let offset = first_page
+            .checked_mul(PAGE_BYTES as u64)
+            .ok_or_else(corrupt)?;
+        codec::write(target, manifest, PageKind::Lists, list, offset, encoded)?;
+    }
     set_list_page_used(target, manifest, list, directory.tail, used + 1)?;
     directory.count = count.checked_add(1).ok_or_else(corrupt)?;
     codec::set_directory(target, manifest, list, directory)
@@ -424,12 +436,7 @@ pub(crate) fn list_page_used(
             .ok_or_else(corrupt)?,
         &mut raw,
     )?;
-    let capacity = m
-        .dimensions
-        .checked_add(16)
-        .filter(|n| *n != 0)
-        .map(|stride| PAGE_BYTES / stride)
-        .ok_or_else(corrupt)?;
+    let (capacity, _) = list_block_layout(m.dimensions).ok_or_else(corrupt)?;
     let used = usize::try_from(u64::from_le_bytes(raw)).map_err(|_| corrupt())?;
     if used > capacity {
         let ordinal = id

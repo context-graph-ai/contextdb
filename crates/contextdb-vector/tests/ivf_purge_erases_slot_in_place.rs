@@ -1,8 +1,11 @@
 #![cfg(feature = "test-seams")]
 //! Purge overwrites both physical representations in the serving generation.
+#[path = "support/hiding_pages.rs"]
+mod hiding_pages;
 #[path = "support/ivf_pages.rs"]
 mod ivf_pages;
 
+use contextdb_core::Error;
 use contextdb_vector::ivf::storage::{PAGE_BYTES, PageKind, ReadPages};
 use contextdb_vector::ivf::{ClusteredIndex, Hit, Mode, Policy, TrainingPolicy, search};
 use std::sync::Arc;
@@ -120,5 +123,134 @@ fn purge_overwrites_canonical_and_quantized_slot_without_rebuilding() {
             vec![11],
             "{mode:?} retains the survivor and excludes the erased row"
         );
+    }
+    // Rows: a list record that fills one page, then records spanning two.
+    {
+        // Each dimension with the fixed pages one of its list records spans.
+        for (dimensions, record_pages) in
+            [(PAGE_BYTES - 16, 1_u64), (PAGE_BYTES - 15, 2), (4096, 2)]
+        {
+            let budget = Arc::new(ivf_pages::Budget::default());
+            let policy = Policy::checked(dimensions, 1, 1, 16, 1 << 20, true).unwrap();
+            let training = TrainingPolicy {
+                iterations: 1,
+                reservoir_samples: 2,
+                seed: 0,
+                ingest_batch_keys: 2,
+                phase_batch_entries: 2,
+            };
+            let mut index = ClusteredIndex::new(
+                hiding_pages::Hiding::default(),
+                policy,
+                training,
+                budget.clone().into(),
+            )
+            .unwrap();
+            // Every coordinate is nonzero, so every record byte past its identities is too.
+            let vector = |odd: usize| -> Vec<f32> {
+                (0..dimensions)
+                    .map(|at| if at % 2 == odd { 1.0 } else { 0.25 })
+                    .collect()
+            };
+            let (survivor, victim) = (vector(0), vector(1));
+            index
+                .build_partition(
+                    0,
+                    [(11, survivor.clone()), (37, victim.clone())].into_iter(),
+                )
+                .unwrap();
+            let manifest = index.storage().manifest(0).unwrap().unwrap();
+            let read = |index: &ClusteredIndex<hiding_pages::Hiding>, ordinal: u64| {
+                let mut page = [0; PAGE_BYTES];
+                assert!(
+                    index
+                        .storage()
+                        .read_admitted_page(manifest.key(PageKind::Lists, 0, ordinal), &mut page)
+                        .unwrap()
+                );
+                page
+            };
+            let answers = |index: &ClusteredIndex<hiding_pages::Hiding>, mode: Mode| -> Vec<u64> {
+                let mut hits = [Hit::default(); 2];
+                let (count, _) = search(
+                    index.storage(),
+                    policy,
+                    &budget.clone().into(),
+                    &victim,
+                    None,
+                    mode,
+                    &mut hits,
+                )
+                .unwrap();
+                hits[..count].iter().map(|hit| hit.row).collect()
+            };
+            // Slots follow row order, each record alone in its block: survivor then victim.
+            let survivor_pages: Vec<_> = (0..record_pages).map(|at| read(&index, at)).collect();
+            let victim_pages: Vec<_> = (record_pages..2 * record_pages)
+                .map(|at| read(&index, at))
+                .collect();
+            let tail = dimensions.min(PAGE_BYTES - 16);
+            assert_eq!(&victim_pages[0][..8], &1_u64.to_le_bytes());
+            assert_eq!(&victim_pages[0][8..16], &37_u64.to_le_bytes());
+            assert!(victim_pages[0][16..16 + tail].iter().all(|byte| *byte != 0));
+            let last = *victim_pages.last().unwrap();
+            if record_pages > 1 {
+                let spilled = dimensions + 16 - PAGE_BYTES;
+                assert!(
+                    last[..spilled].iter().all(|byte| *byte != 0),
+                    "the continuation holds this vector's bytes before the erasure"
+                );
+            }
+
+            // A missing last page of the record refuses and commits no part of the erasure.
+            let last_key = manifest.key(PageKind::Lists, 0, 2 * record_pages - 1);
+            index.storage().hide_key.set(Some(last_key));
+            assert!(
+                matches!(index.erase_row(0, 1), Err(Error::StoreCorrupted { .. })),
+                "a missing record page refuses the erasure at {dimensions} dimensions"
+            );
+            index.storage().hide_key.set(None);
+            for (offset, before) in victim_pages.iter().enumerate() {
+                assert_eq!(
+                    &read(&index, record_pages + offset as u64),
+                    before,
+                    "the refused erasure rolled back at {dimensions} dimensions"
+                );
+            }
+            for mode in [Mode::Exact, Mode::Indexed] {
+                assert_eq!(
+                    answers(&index, mode),
+                    vec![37, 11],
+                    "the refused erasure left the row answering, {mode:?}"
+                );
+            }
+
+            index.erase_row(0, 1).unwrap();
+            let erased: Vec<_> = (record_pages..2 * record_pages)
+                .map(|at| read(&index, at))
+                .collect();
+            assert_eq!(
+                &erased[0][..8],
+                &1_u64.to_le_bytes(),
+                "the slot address stays"
+            );
+            assert!(erased[0][8..].iter().all(|byte| *byte == 0));
+            for continuation in &erased[1..] {
+                assert!(
+                    continuation.iter().all(|byte| *byte == 0),
+                    "no vector byte survives in a continuation at {dimensions} dimensions"
+                );
+            }
+            for (at, before) in survivor_pages.iter().enumerate() {
+                assert_eq!(
+                    &read(&index, at as u64),
+                    before,
+                    "the neighbouring record is untouched"
+                );
+            }
+            for mode in [Mode::Exact, Mode::Indexed] {
+                assert_eq!(answers(&index, mode), vec![11], "{mode:?}");
+            }
+        }
     }
 }

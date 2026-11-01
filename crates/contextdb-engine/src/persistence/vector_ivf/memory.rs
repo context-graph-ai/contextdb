@@ -339,19 +339,16 @@ pub(crate) fn native_receipt_reserve(
     include(rows)?; // row-version header pages can have unrelated row ids
     include(pages(add(mul(rows, 24)?, PAGE_BYTES - 1)?))?; // journal copy links
     include(pages(add(mul(rows, 8)?, PAGE_BYTES - 1)?))?; // durable tail slots
-    let record_bytes = add(dimensions, 16)?;
-    let records_per_page = PAGE_BYTES
-        .checked_div(record_bytes)
-        .filter(|n| *n != 0)
-        .ok_or_else(overflow)?;
+    let (records_per_block, block_pages) =
+        contextdb_vector::ivf::list_block_layout(dimensions).ok_or_else(overflow)?;
     let nonempty = rows.min(active_lists as usize);
-    let list_pages = if nonempty == 0 {
+    let list_blocks = if nonempty == 0 {
         0
     } else {
-        add(nonempty, (rows - nonempty) / records_per_page)?
+        add(nonempty, (rows - nonempty) / records_per_block)?
     };
-    include(list_pages)?;
-    include(mul(pages(add(mul(list_pages, 8)?, PAGE_BYTES - 1)?), 2)?)?; // used and next links
+    include(mul(list_blocks, block_pages)?)?;
+    include(mul(pages(add(mul(list_blocks, 8)?, PAGE_BYTES - 1)?), 2)?)?; // used and next links
     include(usize::from(active_lists != 0))?; // list allocator
     // Directory records contain three u64 words and never straddle a page.
     let directory_pages =

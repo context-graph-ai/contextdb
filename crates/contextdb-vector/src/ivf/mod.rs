@@ -30,7 +30,7 @@ pub use types::{
 pub use writer::{ClusteredIndex, RemapProgress};
 
 pub use book::{
-    CodebookAllocationLayouts, RetainedCodebook, codebook_allocation_layout,
+    CodebookAllocationLayouts, RetainedCodebook, codebook_allocation_layout, list_block_layout,
     retained_codebook_manifest,
 };
 pub use writer::{WriterWorkspaceLayout, workspace_allocation_layout};
