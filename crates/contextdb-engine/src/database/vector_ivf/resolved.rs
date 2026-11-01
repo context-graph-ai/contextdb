@@ -316,9 +316,10 @@ pub(crate) fn resolve_with_native_receipts(
         )
     };
     let available = if fixed_rows.is_some() {
+        let receipt_bytes = receipt_quote(workspace_available)?;
         workspace_available
-            .checked_sub(receipt_quote(workspace_available)?)
-            .ok_or_else(|| memory(usize::MAX, workspace_available, build_budget_bytes))?
+            .checked_sub(receipt_bytes)
+            .ok_or_else(|| memory(receipt_bytes, workspace_available, build_budget_bytes))?
     } else {
         // The predicate is monotone: both the phase capacity and its receipt
         // quote grow with available workspace. Choose the largest compatible
