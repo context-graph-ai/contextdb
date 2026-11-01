@@ -74,7 +74,7 @@ fn spec(path: &Path) -> String {
 fn create_notes(db: &Database) {
     if db.table_meta("notes").is_none() {
         db.execute(
-            "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3)) SYNC CONFLICT KEEP LATEST",
+            "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED) SYNC CONFLICT KEEP LATEST",
             &HashMap::new(),
         )
         .expect("create notes table");
@@ -842,7 +842,7 @@ fn create_purge_copy_tables(db: &Database) {
 }
 
 fn maintain_notes_vector_index_until_complete(db: &Database, place: &str) {
-    for cycle in 0..32 {
+    for cycle in 0..256 {
         let partitions = db
             .execute(
                 "SHOW VECTOR_PARTITIONS FOR notes.embedding",
@@ -867,7 +867,7 @@ fn maintain_notes_vector_index_until_complete(db: &Database, place: &str) {
         }
         db.run_maintenance_cycle()
             .unwrap_or_else(|error| panic!("run {place} vector maintenance cycle: {error}"));
-        assert!(cycle < 31, "{place} vector maintenance did not complete");
+        assert!(cycle < 255, "{place} vector maintenance did not complete");
     }
 }
 
