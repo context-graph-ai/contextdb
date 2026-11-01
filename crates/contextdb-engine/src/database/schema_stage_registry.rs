@@ -416,6 +416,10 @@ impl<K: Eq + Hash + Copy, V, P> OccupiedRegistry<K, V, P> {
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
     }
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn stages(&self) -> impl Iterator<Item = &V> {
+        self.0.map.values().filter_map(|cell| cell.stage.as_ref())
+    }
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(

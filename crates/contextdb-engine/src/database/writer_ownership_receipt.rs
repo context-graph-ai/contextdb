@@ -26,6 +26,9 @@ impl Database {
         checkpoint: &'a str,
     ) -> Option<WriterReceiptEmission<'a>> {
         let path = std::env::var_os("CONTEXTDB_TEST_SEAMS_RECEIPT_PATH")?;
+        // A private working image has no store of its own and funds everything
+        // from its parent writer. It is not a writer, and its total is not its own.
+        self.persistence.as_ref()?;
         // Ordering is acquired after maintenance and commit exclusions. Return
         // the captured values and EMISSION guard; the maintenance caller drops
         // its own outer guard before serialization or append.

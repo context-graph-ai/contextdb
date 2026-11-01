@@ -51,6 +51,8 @@ const NAMED_WRITER: &[&str] = &[
     "current_membership_charge",
     "captured_membership_charge",
     "sink_window_charge",
+    "calibration_capture_charge",
+    "pending_schema_stage_charge",
 ];
 /// A named writer owner the checkpoint line carries outside the receipt type.
 const NAMED_WRITER_EMITTED_ONLY: &[&str] = &["schema_history_charge"];
@@ -410,4 +412,120 @@ fn every_writer_checkpoint_names_every_charged_byte_while_pins_and_commits_are_l
         lines.len(),
         failures.join("\n")
     );
+}
+
+/// A schema statement staged in a transaction charges its private working image
+/// to this writer, and calibration holds its capture between maintenance cycles.
+fn stage_and_calibration_workload(path: &Path) {
+    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let db = open(path);
+    db.execute(
+        "CREATE TABLE passages (id INT PRIMARY KEY, v VECTOR(64))",
+        &HashMap::new(),
+    )
+    .expect("declare the passages table");
+    let insert = |id: usize| {
+        db.execute(
+            "INSERT INTO passages (id, v) VALUES ($id, $v)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id as i64)),
+                ("v".into(), Value::Vector(embedding(id))),
+            ]),
+        )
+        .expect("commit one passage");
+    };
+    for id in 0..39 {
+        insert(id);
+    }
+    let staged = db.begin().expect("open the schema transaction");
+    db.execute_in_tx(
+        staged,
+        "CREATE TABLE staged (id INT PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .expect("stage a table in the transaction");
+    // The parent writer's own checkpoint, taken while the stage is open.
+    insert(39);
+    db.commit(staged).expect("commit the staged table");
+    for _ in 0..256 {
+        let report = db
+            .run_maintenance_cycle()
+            .expect("drive one maintenance cycle")
+            .vector;
+        assert!(report.first_failure.is_none(), "{:?}", report.first_failure);
+        if report.remaining_partitions == 0 {
+            break;
+        }
+    }
+    db.close().expect("close the census store");
+}
+
+#[test]
+fn writer_checkpoints_name_an_open_schema_stage_and_a_calibration_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::env::var_os(RECEIPT_PATH).is_some() {
+        stage_and_calibration_workload(&dir.path().join("census.db"));
+        return;
+    }
+    let receipts = dir.path().join("writer.jsonl");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &crate::child_test_filter(
+                module_path!(),
+                "writer_checkpoints_name_an_open_schema_stage_and_a_calibration_capture",
+            ),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RECEIPT_PATH, &receipts)
+        .output()
+        .expect("launch the workload with checkpoint lines enabled");
+    assert!(
+        output.status.success(),
+        "workload failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&receipts).expect("the workload emitted checkpoint lines");
+    let lines = text
+        .lines()
+        .map(|line| serde_json::from_str::<Json>(line).expect("one JSON checkpoint per line"))
+        .filter(|line| line["kind"] == "writer_memory_ownership")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line["database_id"].as_u64())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "only the writer emits checkpoints; a private working image is not a writer"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["receipt"]["pending_schema_stages"].as_u64() > Some(0)),
+        "a checkpoint was taken while the schema stage was open"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["receipt"]["calibration_capture_charge"].as_u64() > Some(0)),
+        "a checkpoint was taken while a calibration capture was held"
+    );
+    let unnamed = lines
+        .iter()
+        .filter(|line| line["receipt"]["reconciliation_gap"].as_i64() != Some(0))
+        .map(|line| {
+            format!(
+                "{} at LSN {}: {} unnamed bytes, {} schema stages",
+                line["checkpoint"],
+                line["lsn"],
+                line["receipt"]["reconciliation_gap"],
+                line["receipt"]["pending_schema_stages"]
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(unnamed.is_empty(), "{}", unnamed.join("\n"));
 }

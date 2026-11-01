@@ -86,6 +86,40 @@ pub(in crate::persistence::vector_ivf) struct Capture {
     pub finished: AtomicBool,
     pub(super) state: Mutex<State>,
 }
+#[cfg(any(test, feature = "test-seams"))]
+impl RedbPersistence {
+    /// The active candidate capture's invoices: the capture, its verification
+    /// window and any external source declaration.
+    pub(crate) fn calibration_capture_charge_for_test(&self) -> usize {
+        self.native_ivf_cache
+            .calibration
+            .lock()
+            .as_ref()
+            .map_or(0, |capture| {
+                capture_layout(capture.planned_samples, capture.maximum_depth)
+                    .expect("an admitted capture has a valid layout")
+                    .size()
+                    + read::BuildVerification::layout().size()
+                    + capture
+                        .source
+                        .as_ref()
+                        .map_or(0, |source| source._invoice.bytes())
+            })
+    }
+}
+/// The complete capture block and its bounded sample and depth windows.
+fn capture_layout(planned_samples: usize, maximum_depth: u32) -> Result<Layout> {
+    let mut layout = Owner::layout();
+    for part in [
+        array::<Sample>(planned_samples)?,
+        array::<u64>(planned_samples)?,
+        array::<u32>(maximum_depth as usize)?,
+        array::<u32>(maximum_depth as usize)?,
+    ] {
+        layout = extend(layout, part)?;
+    }
+    Ok(layout.pad_to_align())
+}
 fn array<T>(count: usize) -> Result<Layout> {
     Layout::array::<T>(count).map_err(|_| corrupt())
 }
@@ -271,18 +305,9 @@ impl Capture {
         if maximum_depth == 0 {
             return Err(corrupt());
         }
-        let mut layout = Owner::layout();
-        for part in [
-            array::<Sample>(planned_samples)?,
-            array::<u64>(planned_samples)?,
-            array::<u32>(maximum_depth as usize)?,
-            array::<u32>(maximum_depth as usize)?,
-        ] {
-            layout = extend(layout, part)?;
-        }
         let invoice = memory::Invoice::reserve(
             &owner,
-            layout.pad_to_align().size(),
+            capture_layout(planned_samples, maximum_depth)?.size(),
             "clustered_calibration_capture",
         )?;
         let scope = source.scope_key;

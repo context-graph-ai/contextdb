@@ -66,6 +66,10 @@ impl Invoice {
     }
 }
 impl Invoice {
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
     #[cfg(feature = "test-seams")]
     pub fn observe_object(
         &mut self,

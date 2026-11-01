@@ -1932,6 +1932,9 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub pending_commit_metadata: usize,
     pub pending_lineage_generation_charge: usize,
     pub pending_schema_stages: usize,
+    /// An open schema stage: its hold, and what its private working image
+    /// charges to this writer beyond the fixed controls they share.
+    pub pending_schema_stage_charge: usize,
     pub named_owner_total: usize,
     pub reconciliation_gap: i64,
     pub writer_schema_charge: usize,
@@ -1941,6 +1944,8 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub storage_maintenance_control_charge: usize,
     /// Writer charge for the resident windows of durable sink queues.
     pub sink_window_charge: usize,
+    /// The active candidate capture held between calibration cycles.
+    pub calibration_capture_charge: usize,
     /// Process open-residue capacity; observed here, outside named writer liabilities.
     pub snapshot_pin_capacity_charge: usize,
 }

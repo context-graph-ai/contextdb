@@ -4729,6 +4729,18 @@ impl Database {
                 }
             }
             drop(pending_metadata);
+            receipt.pending_schema_stage_charge = self
+                .pending_local_schema_stages
+                .lock()
+                .stages()
+                .map(|stage| {
+                    let image = stage.working.writer_memory_ownership_receipt_for_test();
+                    stage.temporary_memory.bytes + image.named_owner_total
+                        - image.writer_registration
+                        - image.engine_accountant_backing
+                        - image.writer_adapter_controls
+                })
+                .sum();
             receipt.pending_schema_stages = self.pending_local_schema_stages.lock().len()
                 + self.local_schema_stages.lock().len()
                 + self.received_schema_stages.lock().len();
@@ -4746,6 +4758,9 @@ impl Database {
             receipt.captured_root_charge =
                 root_charge.saturating_sub(receipt.published_root_charge);
             receipt.sink_window_charge = self.event_bus.sink_window_charge();
+            receipt.calibration_capture_charge = self.persistence.as_ref().map_or(0, |persistence| {
+                persistence.calibration_capture_charge_for_test()
+            });
             receipt.storage_maintenance_control_charge =
                 self.persistence.as_ref().map_or(0, |persistence| {
                     persistence.storage_compaction_control_charge()
@@ -4785,6 +4800,8 @@ impl Database {
                 + receipt.current_membership_charge
                 + receipt.captured_membership_charge
                 + receipt.sink_window_charge
+                + receipt.calibration_capture_charge
+                + receipt.pending_schema_stage_charge
                 + receipt.schema_history_retained_bytes;
             receipt.reconciliation_gap =
                 receipt.vector.accountant_total as i64 - receipt.named_owner_total as i64;
