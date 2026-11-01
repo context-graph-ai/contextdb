@@ -11139,6 +11139,22 @@ impl VectorState {
                             partitions += 1;
                             Ok::<(), Error>(())
                         })?;
+                        // Admit the trace's bytes before any of it is allocated.
+                        let trace_bytes =
+                            size_of::<contextdb_vector::mem::VectorSearchDebugTrace>()
+                                .checked_add(self.index.table.len())
+                                .and_then(|bytes| bytes.checked_add(self.index.column.len()))
+                                .and_then(|bytes| {
+                                    partitions
+                                        .checked_mul(size_of::<
+                                            contextdb_vector::mem::VectorPartitionSearchTrace,
+                                        >())
+                                        .and_then(|routes| bytes.checked_add(routes))
+                                })
+                                .ok_or_else(|| {
+                                    Error::Other("vector disclosure trace size overflow".into())
+                                })?;
+                        context.reserve(BoundedWorkSource::VectorCandidates, trace_bytes)?;
                         let debug_trace = contextdb_vector::mem::VectorSearchDebugTrace {
                             index: self.index.clone(),
                             final_row_ids: Vec::new(),
@@ -11154,14 +11170,6 @@ impl VectorState {
                             ],
                             budget_receipt: None,
                         };
-                        let trace_bytes =
-                            size_of::<contextdb_vector::mem::VectorSearchDebugTrace>()
-                                + self.index.table.len()
-                                + self.index.column.len()
-                                + partitions
-                                    * size_of::<contextdb_vector::mem::VectorPartitionSearchTrace>(
-                                    );
-                        context.reserve(BoundedWorkSource::VectorCandidates, trace_bytes)?;
                         let trace = contextdb_vector::mem::BoundedVectorSearchTrace::from_prepaid(
                             debug_trace,
                             trace_bytes,
