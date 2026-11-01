@@ -58,7 +58,7 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
             let db = Database::open(&path).unwrap();
             db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
             db.execute("CREATE TABLE retained (id UUID PRIMARY KEY, expires_at TIMESTAMP EXPIRES, embedding VECTOR(2)) RETAIN 1 HOURS", &params()).unwrap();
-            db.execute("CREATE TABLE retained_scalar (id INT PRIMARY KEY, expires_at TIMESTAMP EXPIRES) RETAIN 1 HOURS", &params()).unwrap();
+            db.execute("CREATE TABLE retained_scalar (id INT PRIMARY KEY, expires_at TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF", &params()).unwrap();
             db.execute("CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)", &params()).unwrap();
             if case != "deferred" {
                 db.execute("INSERT INTO retained_scalar VALUES (1, -1)", &params())

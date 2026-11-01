@@ -11132,18 +11132,35 @@ impl VectorState {
                     // when the scan ends if the cursor must report early
                     // terminal observations itself, otherwise now.
                     if !self.row_checked {
+                        // One exact choice per partition the candidate groups
+                        // name, in the order the disclosure streams them.
+                        let mut partitions = 0usize;
+                        groups.get().visit_nonempty_partitions(|_, _| {
+                            partitions += 1;
+                            Ok::<(), Error>(())
+                        })?;
                         let debug_trace = contextdb_vector::mem::VectorSearchDebugTrace {
                             index: self.index.clone(),
                             final_row_ids: Vec::new(),
                             supplemented_row_count: 0,
                             fallback_reason: None,
-                            partition_routes: Vec::new(),
+                            partition_routes: vec![
+                                contextdb_vector::mem::VectorPartitionSearchTrace {
+                                    route: contextdb_vector::mem::VectorPartitionSearchRoute::Exact,
+                                    reason: "maintained_index_unavailable",
+                                    traversal_complete: true,
+                                };
+                                partitions
+                            ],
                             budget_receipt: None,
                         };
                         let trace_bytes =
                             size_of::<contextdb_vector::mem::VectorSearchDebugTrace>()
                                 + self.index.table.len()
-                                + self.index.column.len();
+                                + self.index.column.len()
+                                + partitions
+                                    * size_of::<contextdb_vector::mem::VectorPartitionSearchTrace>(
+                                    );
                         context.reserve(BoundedWorkSource::VectorCandidates, trace_bytes)?;
                         let trace = contextdb_vector::mem::BoundedVectorSearchTrace::from_prepaid(
                             debug_trace,
