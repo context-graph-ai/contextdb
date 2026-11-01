@@ -409,7 +409,6 @@ fn representation_query(db: &Database, column: &str, mode: &str) -> ChargedQuery
     let native = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let grouping = Arc::new(GroupingCounter::default());
     let result = with_bounded_candidate_grouping_observer_for_test(grouping.clone(), || {
-        
             with_native_ivf_seal_observer_for_test(graph.clone(), || {
                 with_native_vector_score_observer_for_test(native.clone(), || {
                     bounded::execute(
@@ -429,7 +428,6 @@ fn representation_query(db: &Database, column: &str, mode: &str) -> ChargedQuery
                     )
                 })
             })
-        
     })
     .unwrap_or_else(|error| panic!("bounded {column} {mode} score query: {error:?}"));
     ChargedQuery {
