@@ -458,11 +458,12 @@ fn a_partition_emptied_by_deletes_keeps_serving_after_reopen_and_accepts_new_row
     );
 }
 
-/// A PURGE refused on a declared disk or memory limit changes nothing: the
-/// rows and every index page stay as they were, and once the limit is lifted
-/// the same PURGE succeeds.
+/// A PURGE refused on the declared memory limit changes nothing: the rows and
+/// every index page stay as they were and its workspace is released, and once
+/// the limit is lifted the same PURGE succeeds. (A native PURGE reuses existing
+/// pages and never grows the file, so no disk ceiling can refuse it.)
 #[test]
-fn a_purge_refused_on_a_declared_limit_changes_nothing_and_succeeds_once_lifted() {
+fn a_purge_refused_on_the_declared_memory_limit_changes_nothing_and_succeeds_once_lifted() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("purge-limits.db"));
     db.execute(
@@ -490,25 +491,6 @@ fn a_purge_refused_on_a_declared_limit_changes_nothing_and_succeeds_once_lifted(
             .collect::<Vec<_>>()
     };
     let pages_before = pages(&db);
-
-    let size = db.disk_file_size().expect("a file-backed store has a size");
-    db.set_disk_limit(Some(size))
-        .expect("install a disk limit with no room for the purge's growth");
-    let refused = db.execute("PURGE FROM limit_items WHERE id = 7", &empty());
-    assert!(
-        matches!(
-            refused,
-            Err(contextdb_core::Error::DiskBudgetExceeded { .. })
-        ),
-        "a purge past the declared disk limit is refused with the typed disk error: {refused:?}"
-    );
-    assert_eq!(count(&db, "limit_items"), rows_before);
-    assert_eq!(
-        pages(&db),
-        pages_before,
-        "the disk refusal changed no index page"
-    );
-    db.set_disk_limit(None).expect("lift the disk limit");
 
     let used = db.accountant().usage().used;
     db.set_memory_limit(Some(used + 4_096))

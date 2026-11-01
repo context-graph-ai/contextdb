@@ -432,3 +432,52 @@ fn an_unpublished_run_write_past_the_ceiling_is_refused_before_it_executes() {
 fn a_prepared_replacement_write_past_the_ceiling_is_refused_before_it_executes() {
     refused_at(BuildWriteClass::PreparedReplacement);
 }
+
+/// A replacement refused at its disk admission is reported as a disk-limit
+/// failure that tells the operator how to raise the limit, and the previous
+/// generation keeps serving until the limit is lifted.
+#[test]
+fn a_disk_refused_replacement_reports_disk_limit_and_names_the_operator_action() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let path = root.path().join("reported.db");
+    let (db, first) = store_with_due_replacement(&path);
+    let class = BuildWriteClass::PreparedReplacement;
+    drive_until_next_write(&db, class);
+
+    let boundary = Arc::new(Mutex::new(None::<u64>));
+    let report = {
+        let _withheld = withhold_reusable_space_from(&db, class);
+        let seen = Arc::clone(&boundary);
+        let _ceiling = declare_ceiling_at_next_admission(
+            &db,
+            class,
+            Box::new(move |at: &AdmissionBoundary| {
+                let ceiling = (at.current_store_bytes + at.minimum_growth_bytes).saturating_sub(1);
+                *seen.lock().unwrap() = Some(ceiling);
+                ceiling
+            }),
+        );
+        observe_build_writes(Arc::new(|_: &BuildWriteEvent| {}), || {
+            db.run_maintenance_cycle()
+        })
+    };
+    let ceiling = boundary
+        .lock()
+        .unwrap()
+        .expect("the cycle reached a prepared replacement admission");
+    let report = report.expect("the cycle reports a local build refusal and still closes");
+    assert_eq!(
+        report.vector.first_failure,
+        Some(contextdb_vector::VectorMaintenanceFailure::DiskLimit)
+    );
+    let details = report
+        .vector
+        .first_failure_details
+        .expect("the disk refusal keeps its typed maintenance detail");
+    assert_eq!(details.budget_limit_bytes, Some(ceiling));
+    assert!(details.current_bytes.is_some());
+    assert!(details.recovery_instruction.contains("SET DISK_LIMIT"));
+    assert_still_serving(&db, first, "reported disk refusal");
+    assert_finishes_once_lifted(db, &path, first, "reported disk refusal");
+}

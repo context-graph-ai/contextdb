@@ -302,7 +302,7 @@ fn switching_to_caller_driven_during_a_native_build_reports_pending_before_retry
         Value::Text("run_maintenance_cycle".into()),
         "the stopped partition reports that a caller cycle continues it"
     );
-    for _ in 0..64 {
+    for _ in 0..512 {
         if db
             .run_maintenance_cycle()
             .unwrap()
