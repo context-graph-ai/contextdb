@@ -22,8 +22,8 @@ class InventoryControls(unittest.TestCase):
         jobs = i.pr_jobs(i.ROOT)
         self.assertEqual(len(jobs), 26)
         rows = [row for _, items in jobs for row in items]
-        self.assertEqual(len(rows), 33)
-        self.assertEqual(len({row[0] for row in rows}), 33)
+        self.assertEqual(len(rows), 32)
+        self.assertEqual(len({row[0] for row in rows}), 32)
         path = i.ROOT / 'scripts/ci-integration-targets.json'
         original = json.loads(path.read_text()); read = Path.read_text
         bundle = next(row for row in original['pr_jobs'] if row['shard'] == 'bundle-transactions-relational')
