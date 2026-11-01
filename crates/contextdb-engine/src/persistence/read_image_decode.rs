@@ -698,6 +698,44 @@ pub(super) fn read_storage_error(error: redb::StorageError) -> LoadReadImageErro
         redb::StorageError::DatabaseClosed => {
             invalid_read_image_state("read-only Redb database closed during hydration")
         }
+        // A refusal with no owner carries no figures to report, and it says
+        // nothing about the bytes in the store.
+        redb::StorageError::Native(error @ redb::NativeColdReadError::AdmissionRefused) => {
+            read_image_io("reading Redb storage", error)
+        }
+        redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefusedAt(owner)) => {
+            let refusal = owner.inspect_failure(|cause| {
+                match cause.and_then(|cause| {
+                    cause.downcast_ref::<native_storage_admission::NativeStorageFailure>()
+                }) {
+                    Some(native_storage_admission::NativeStorageFailure::Refused(refusal)) => {
+                        Some(*refusal)
+                    }
+                    _ => None,
+                }
+            });
+            match refusal {
+                Some(refusal) => {
+                    LoadReadImageError::Memory(native_storage_admission::original_storage_error(
+                        native_storage_admission::NativeStorageFailure::Refused(refusal),
+                    ))
+                }
+                // Preserve the existing foreign/legacy diagnosis. This fallback
+                // keeps its inherited allocating rendering, without claiming
+                // that an opaque foreign cause has the closed source protocol.
+                None => read_image_corruption(
+                    ReadImageCorruptionCause::MalformedRecord,
+                    redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefusedAt(
+                        owner,
+                    )),
+                ),
+            }
+        }
+        redb::StorageError::Native(redb::NativeColdReadError::AllocatorFailed { site, layout }) => {
+            LoadReadImageError::Memory(Error::NativeEngineOther(
+                contextdb_core::read_memory::NativeRefusal::AllocatorFailed { site, layout },
+            ))
+        }
         other => read_image_corruption(ReadImageCorruptionCause::MalformedRecord, other),
     }
 }
@@ -780,41 +818,9 @@ pub(super) fn read_database_open_error(error: redb::DatabaseError) -> LoadReadIm
         // What the caller must do next depends entirely on which of these it
         // is: a store that is not there is a dead end, a store somebody else
         // holds means asking that holder instead.
-        redb::DatabaseError::Storage(redb::StorageError::Native(
-            redb::NativeColdReadError::AdmissionRefusedAt(owner),
-        )) => {
-            let refusal = owner.inspect_failure(|cause| {
-                match cause.and_then(|cause| {
-                    cause.downcast_ref::<native_storage_admission::NativeStorageFailure>()
-                }) {
-                    Some(native_storage_admission::NativeStorageFailure::Refused(refusal)) => {
-                        Some(*refusal)
-                    }
-                    _ => None,
-                }
-            });
-            match refusal {
-                Some(refusal) => {
-                    LoadReadImageError::Memory(native_storage_admission::original_storage_error(
-                        native_storage_admission::NativeStorageFailure::Refused(refusal),
-                    ))
-                }
-                // Preserve the existing foreign/legacy diagnosis. This fallback
-                // keeps its inherited allocating rendering, without claiming
-                // that an opaque foreign cause has the closed source protocol.
-                None => read_image_corruption(
-                    ReadImageCorruptionCause::MalformedRecord,
-                    redb::DatabaseError::Storage(redb::StorageError::Native(
-                        redb::NativeColdReadError::AdmissionRefusedAt(owner),
-                    )),
-                ),
-            }
+        redb::DatabaseError::Storage(error @ redb::StorageError::Native(_)) => {
+            read_storage_error(error)
         }
-        redb::DatabaseError::Storage(redb::StorageError::Native(
-            redb::NativeColdReadError::AllocatorFailed { site, layout },
-        )) => LoadReadImageError::Memory(Error::NativeEngineOther(
-            contextdb_core::read_memory::NativeRefusal::AllocatorFailed { site, layout },
-        )),
         redb::DatabaseError::Storage(redb::StorageError::Io(error)) => match error.kind() {
             std::io::ErrorKind::NotFound => LoadReadImageError::StoreMissing {
                 reason: error.to_string(),
@@ -4925,5 +4931,25 @@ impl CompanionGuard {
         state.companion.pending_matches_store = Some(true);
         Self::finish_pending_replacement(&mut state)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bare_admission_refusal_tests {
+    use super::*;
+
+    /// A refusal that names no owner says nothing about the store's bytes,
+    /// so neither read door may give it the corruption answer and its advice.
+    #[test]
+    fn a_bare_admission_refusal_is_not_reported_as_corruption() {
+        let bare = || redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefused);
+        assert!(matches!(
+            read_storage_error(bare()),
+            LoadReadImageError::Io { .. }
+        ));
+        assert!(matches!(
+            read_database_open_error(redb::DatabaseError::Storage(bare())),
+            LoadReadImageError::Io { .. }
+        ));
     }
 }
