@@ -1405,7 +1405,7 @@ impl Database {
         // Recovery uses durable end keys and maintained identity floors. It
         // must not depend on the resident projections or enumerate retained
         // versions to decide which identities a new writer may allocate.
-        let open_bounds = persistence.writer_open_bounds(all_meta.keys().map(String::as_str))?;
+        let open_bounds = persistence.writer_open_bounds()?;
         let max_tx = open_bounds.max_tx;
         // Every durable mutation door maintains the recovery identity floors.
         let max_row_id = open_bounds.max_row_id;

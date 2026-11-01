@@ -1117,20 +1117,18 @@ impl RedbPersistence {
         Ok(())
     }
 
-    /// Schema-sized open work: one end-key probe per relation and two commit
-    /// end probes. Callers must not reconstruct a directory by walking rows,
-    /// graphs, vectors or change history after obtaining these bounds.
+    /// Fixed open work: the authenticated floors plus commit, schema and change
+    /// log end probes. No row table is read, so a large row body stays shed.
+    /// Callers must not reconstruct a directory by walking rows, graphs,
+    /// vectors or change history after obtaining these bounds.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn writer_open_bounds<'a>(
-        &self,
-        tables: impl IntoIterator<Item = &'a str>,
-    ) -> Result<WriterOpenBounds> {
+    pub(crate) fn writer_open_bounds(&self) -> Result<WriterOpenBounds> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
-            Self::writer_open_bounds_in_read(&read, tables)
+            Self::writer_open_bounds_in_read(&read)
         })
     }
 
@@ -1229,9 +1227,8 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn writer_open_bounds_in_read<'a>(
+    pub(super) fn writer_open_bounds_in_read(
         read: &redb::ReadTransaction,
-        tables: impl IntoIterator<Item = &'a str>,
     ) -> Result<WriterOpenBounds> {
         Self::validate_ddl_selectors_in_read(read)?;
         Self::read_authenticated_bounds_in_read(read)?;
@@ -1288,27 +1285,6 @@ impl RedbPersistence {
             }
             Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(Self::storage_error(error)),
-        }
-        for table in tables {
-            let name = Self::rel_table_name(table);
-            let relation = match read.open_table(TableDefinition::<&[u8], &[u8]>::new(&name)) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => continue,
-                Err(e) => return Err(Self::storage_error(e)),
-            };
-            if let Some((key, _)) = relation.last().map_err(Self::storage_error)? {
-                let key = key.value();
-                if key.len() != 24 {
-                    return Err(crate::funded_error::corruption_text(
-                        crate::read_image_memory::active_owner()
-                            .and_then(|owner| owner.diagnostic_budget()),
-                        &name,
-                        "relation end key is not a 24-byte version key".into(),
-                    ));
-                }
-                let row_id = u64::from_be_bytes(key[..8].try_into().expect("validated key width"));
-                bounds.max_row_id = bounds.max_row_id.max(RowId(row_id));
-            }
         }
         Ok(bounds)
     }

@@ -414,7 +414,7 @@ async fn a_unit_refused_under_transient_hub_pressure_stays_pending_and_lands_on_
     const HUB_LIMIT: usize = 1024 * 1024 * 1024;
     // Leaves less free than the unit's assembly peak, while the limit itself
     // could fit it.
-    const HELD: usize = HUB_LIMIT - 100 * 1024 * 1024;
+    const HEADROOM: usize = 100 * 1024 * 1024;
     let root = tempfile::tempdir().expect("tempdir");
     let hub = start_hub_with_writer_limit(root.path(), Some(HUB_LIMIT)).await;
     let edge_path = root.path().join("edge.db");
@@ -430,7 +430,9 @@ async fn a_unit_refused_under_transient_hub_pressure_stays_pending_and_lands_on_
     let watermark = client.push_watermark();
     let pressure = hub
         .db
-        .hold_writer_memory_for_test(HELD)
+        .hold_writer_memory_for_test(
+            HUB_LIMIT - hub.db.__writer_charged_bytes_for_test() - HEADROOM,
+        )
         .expect("hold most of the hub's writer budget");
     let refused = client.push().await;
     assert!(

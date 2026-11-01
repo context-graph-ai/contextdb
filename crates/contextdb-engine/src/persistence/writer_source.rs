@@ -4193,7 +4193,7 @@ mod tests {
         assert!(!store.contains(Lsn(1)).unwrap());
         assert_eq!(pinned.next_entry().unwrap(), Some((Lsn(1), TxId(1))));
         assert_eq!(pinned.next_entry().unwrap(), None);
-        let bounds = store.writer_open_bounds(["items"]).unwrap();
+        let bounds = store.writer_open_bounds().unwrap();
         assert_eq!(
             (bounds.max_tx, bounds.max_lsn, bounds.commit_count),
             (TxId(1), Lsn(1), 0)
@@ -4226,7 +4226,7 @@ mod tests {
             );
         }
         assert_eq!(store.replace(BTreeMap::new()).unwrap(), 1);
-        let bounds = store.writer_open_bounds(["items"]).unwrap();
+        let bounds = store.writer_open_bounds().unwrap();
         assert_eq!(
             (bounds.max_tx, bounds.max_lsn, bounds.commit_count),
             (TxId(4), Lsn(3), 0)
@@ -4264,7 +4264,7 @@ mod tests {
             .unwrap();
         let store = RedbPersistence::open(&path).unwrap();
         store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_2311).into());
-        let bounds = store.writer_open_bounds(["items"]).unwrap();
+        let bounds = store.writer_open_bounds().unwrap();
         let root = store
             .initialize_writer_snapshot(SnapshotId(bounds.max_tx.0), bounds.max_lsn)
             .unwrap();
