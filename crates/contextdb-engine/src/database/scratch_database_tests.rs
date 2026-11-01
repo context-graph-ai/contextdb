@@ -139,3 +139,21 @@ fn a_failed_scratch_open_leaves_no_directory_behind() {
     let file = seen.expect("the open closure ran");
     assert!(!file.parent().unwrap().exists());
 }
+
+#[test]
+fn a_ddl_stage_creates_no_blob_repository_of_its_own() {
+    let db = Database::open_memory();
+    let before = crate::read_probe::observed().blob_repository_opens;
+    for ddl in [
+        "CREATE TABLE stage_probe (id INT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE stage_probe ADD COLUMN extra TEXT",
+        "ALTER TABLE stage_probe DROP COLUMN extra",
+    ] {
+        db.execute(ddl, &std::collections::HashMap::new()).unwrap();
+    }
+    assert_eq!(
+        crate::read_probe::observed().blob_repository_opens,
+        before,
+        "a private schema image holds no media repository, so a DDL stage makes no scratch store"
+    );
+}

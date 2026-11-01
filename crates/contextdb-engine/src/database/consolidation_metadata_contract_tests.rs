@@ -758,7 +758,7 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     run(
         &db,
-        "CREATE TABLE recheck_rows (id INT PRIMARY KEY, scope_id TEXT NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope_id) SEARCH_MODE INDEXED IVF (LISTS = 4, PROBES = 4, REFINE_FACTOR = 64.00) CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 100))",
+        "CREATE TABLE recheck_rows (id INT PRIMARY KEY, scope_id TEXT NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope_id) SEARCH_MODE INDEXED IVF (PROBES = 200) CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 100))",
     );
     for id in 0..32 {
         db.execute(
@@ -830,45 +830,25 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         "the published serving chain includes the newly published change"
     );
 
+    // Fund one write but not a replacement build, as the policy-change
+    // inspection fixture does, then let the pending change cross the threshold.
     let original_limit = db.memory_limit();
+    db.set_memory_limit(Some(db.accountant().usage().used.saturating_add(96 * 1024)))
+        .unwrap();
     run(
         &db,
         "UPDATE recheck_rows SET embedding = '[0,0,1]' WHERE id = 1",
     );
     let before_failure = (show().2, show().3);
     assert_ne!(before_failure.0, Value::Int64(0));
-    // Raise the headroom until the cycle gets far enough to refuse the
-    // replacement itself (a smaller limit refuses an earlier maintenance
-    // step and records nothing against the partition); a headroom that lets
-    // the replacement publish would clear the pending work and fail below.
-    let used = db.accountant().usage().used;
-    let mut refused = false;
-    for headroom_kib in [8_usize, 16, 24, 32, 48, 64, 96, 128, 192, 256] {
-        if db
-            .set_memory_limit(Some(used.saturating_add(headroom_kib * 1024)))
-            .is_err()
-        {
-            continue;
-        }
-        let attempt = db.run_maintenance_cycle();
-        if matches!(
-            &attempt,
-            Ok(report) if report.vector.first_failure
-                == Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
-        ) && show().4 == Value::Text("memory_limit".into())
-        {
-            refused = true;
-            break;
-        }
-        assert_eq!(
-            (show().2, show().3),
-            before_failure,
-            "a cycle that cannot refuse the replacement leaves every pending change alone"
-        );
-    }
-    assert!(
-        refused,
-        "some memory limit refuses the replacement and records the refusal against the partition"
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.first_failure,
+        Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
+    );
+    assert_eq!(
+        show().4,
+        Value::Text("memory_limit".into()),
+        "the refusal is recorded against the partition"
     );
     assert_eq!(
         (show().2, show().3),

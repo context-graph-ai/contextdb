@@ -2101,7 +2101,7 @@ impl Database {
         if let Some(catalog) = &working_vectors {
             catalog.bind(tx_mgr.identity())?;
         }
-        let blob_repository = BlobRepository::ephemeral()?;
+        let blob_repository = BlobRepository::absent();
 
         let db = Self::build_db(
             tx_mgr,

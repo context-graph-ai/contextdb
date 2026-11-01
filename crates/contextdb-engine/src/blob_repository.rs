@@ -957,7 +957,6 @@ pub struct BlobRepository {
     /// that outlives its file carries none, and every media operation says so
     /// rather than inventing a store to hold it.
     persistence: Option<Arc<RedbPersistence>>,
-    ephemeral_dir: Option<Arc<crate::scratch::ScratchDirectory>>,
     fences: Arc<BlobHashFenceRegistry>,
     operation_gate: Arc<BlobRepositoryOperationGate>,
     bounded_blob_bytes_read: AtomicU64,
@@ -968,7 +967,6 @@ impl BlobRepository {
     pub fn absent() -> Arc<Self> {
         Arc::new(Self {
             persistence: None,
-            ephemeral_dir: None,
             fences: Arc::new(BlobHashFenceRegistry::default()),
             operation_gate: Arc::new(BlobRepositoryOperationGate::default()),
             bounded_blob_bytes_read: AtomicU64::new(0),
@@ -995,38 +993,10 @@ impl BlobRepository {
         crate::read_probe::note_blob_repository_open();
         Arc::new(Self {
             persistence: Some(persistence),
-            ephemeral_dir: None,
             fences: Arc::new(BlobHashFenceRegistry::default()),
             operation_gate: Arc::new(BlobRepositoryOperationGate::default()),
             bounded_blob_bytes_read: AtomicU64::new(0),
         })
-    }
-
-    /// Create a repository in a scratch directory of its own, for a database
-    /// that has no store file to hold media.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn ephemeral() -> Result<Arc<Self>> {
-        #[cfg(any(test, feature = "test-seams"))]
-        crate::read_probe::note_blob_repository_open();
-        let scratch_error = |err: std::io::Error| {
-            Error::Other((format!("create ephemeral blob repository: {err}")).into())
-        };
-        let root = crate::scratch::user_scratch_root().map_err(scratch_error)?;
-        let dir =
-            Arc::new(crate::scratch::ScratchDirectory::create_in(&root).map_err(scratch_error)?);
-        let persistence = Arc::new(RedbPersistence::create(
-            &dir.path().join("contextdb-blobs.redb"),
-        )?);
-        Ok(Arc::new(Self {
-            persistence: Some(persistence),
-            ephemeral_dir: Some(dir),
-            fences: Arc::new(BlobHashFenceRegistry::default()),
-            operation_gate: Arc::new(BlobRepositoryOperationGate::default()),
-            bounded_blob_bytes_read: AtomicU64::new(0),
-        }))
     }
 
     #[expect(
@@ -3630,18 +3600,13 @@ impl BlobRepository {
         })
     }
 
-    /// Mark this shared repository closed. Only the ephemeral form owns and
-    /// closes its persistence; file-backed persistence remains Database-owned.
+    /// Mark this shared repository closed. File-backed persistence remains
+    /// Database-owned.
     pub fn close(&self) {
         if !self.operation_gate.begin_close() {
             return;
         }
         self.fences.close();
-        if self.ephemeral_dir.is_some()
-            && let Some(persistence) = self.persistence.as_ref()
-        {
-            persistence.close();
-        }
         self.operation_gate.finish_close();
     }
 
