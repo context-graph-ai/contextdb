@@ -8961,14 +8961,9 @@ fn prv_assert_result_has_no_vector_payload(
 }
 
 #[cfg(feature = "test-seams")]
-fn prv_memory_usage_tuple(db: &Database) -> (Option<usize>, usize, Option<usize>, Option<usize>) {
+fn prv_memory_usage_tuple(db: &Database) -> (Option<usize>, usize, Option<usize>) {
     let usage = db.accountant().usage();
-    (
-        usage.limit,
-        usage.used,
-        usage.available,
-        usage.startup_ceiling,
-    )
+    (usage.limit, usage.used, usage.startup_ceiling)
 }
 
 fn prv_seed_rank_policy_docs(db: &Database, rows: usize) -> PrvFixture {
