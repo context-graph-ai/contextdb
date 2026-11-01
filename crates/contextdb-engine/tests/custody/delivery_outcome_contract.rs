@@ -8,6 +8,7 @@ use contextdb_core::{Lsn, TenantId, Value, Wallclock};
 use contextdb_engine::database::DeliveryManifest;
 use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;
 use contextdb_engine::sync_types::NaturalKey;
+use contextdb_engine::vector_read_memory::admission;
 use contextdb_engine::{Database, DeliveryOutcome, DeliveryOutcomeKind};
 use contextdb_server::protocol::{
     MessageType, PushRequest, PushResponse, WireDeliveryOutcome, decode, encode,
@@ -691,13 +692,16 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
     // Finish binding, status-independent request preparation and source commits
     // before arming the storage fault. Send only this prepared unit to the real public handler;
     // SyncClient::push's earlier bind/status/preparation writes cannot consume the fault.
+    let memory = edge_db
+        .declared_reader_memory()
+        .expect("admit the fixture client reader");
+    let mut vector_copies = admission(memory.clone());
     let request = edge
         .__delivery_push_request_for_test(
             ROOT_TABLE,
             &root_key(root_id),
-            edge_db
-                .declared_reader_memory()
-                .expect("admit the fixture client reader"),
+            &mut vector_copies,
+            memory,
         )
         .unwrap();
     let source_digest = request.changeset.manifests[0]
@@ -946,13 +950,16 @@ async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_th
     )
     .await
     .expect("genuine incumbent terminal before equivalence probe");
+    let memory = first_db
+        .declared_reader_memory()
+        .expect("admit the fixture client reader");
+    let mut vector_copies = admission(memory.clone());
     let first_digest = first_edge
         .__delivery_push_request_for_test(
             ROOT_TABLE,
             &root_key(root_id),
-            first_db
-                .declared_reader_memory()
-                .expect("admit the fixture client reader"),
+            &mut vector_copies,
+            memory,
         )
         .unwrap()
         .changeset
@@ -1771,13 +1778,16 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
         .commit(tx)
         .expect("commit rows and delivery metadata atomically");
 
+    let memory = edge_db
+        .declared_reader_memory()
+        .expect("admit the fixture client reader");
+    let mut vector_copies = admission(memory.clone());
     let mut pending_request = edge
         .__delivery_push_request_for_test(
             ROOT_TABLE,
             &root_key(unanswered_root),
-            edge_db
-                .declared_reader_memory()
-                .expect("admit the fixture client reader"),
+            &mut vector_copies,
+            memory,
         )
         .unwrap();
     let ordinary = edge

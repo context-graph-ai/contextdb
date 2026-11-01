@@ -2143,8 +2143,11 @@ pub(super) fn validate_and_collect_current_vectors(
         if let Some(row) = comparison_row {
             let row_value = row.values.get(&entry.index.column);
             let row_matches_vector = match column.quantization {
+                // An inline value must be the stored one. An empty nullable slot
+                // keeps no copy; a required NULL stays damage.
                 VectorQuantization::F32 => {
                     matches!(row_value, Some(Value::Vector(row_vector)) if row_vector == &entry.vector)
+                        || (column.nullable && matches!(row_value, None | Some(Value::Null)))
                 }
                 // A quantized column keeps no copy in the row: the store's
                 // entry -- the one being checked here -- IS the value. So an

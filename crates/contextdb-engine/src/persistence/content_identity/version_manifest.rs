@@ -1717,7 +1717,13 @@ impl ContentIdentityReadVerifier {
                     );
                     Some(*hash.finalize().as_bytes())
                 }
-                None | Some(Value::Null) if column.nullable => None,
+                // An empty nullable slot keeps no copy of the vector, so there is
+                // nothing here to compare with the family, which commits the value
+                // on its own. The vector is authenticated when it is loaded.
+                None | Some(Value::Null) if column.nullable => {
+                    credit.try_shrink(key_bytes)?;
+                    continue;
+                }
                 _ => {
                     return Err(self.corrupt(
                         "current vector representation disagrees with its declared column",

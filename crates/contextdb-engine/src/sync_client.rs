@@ -1303,6 +1303,7 @@ impl SyncClient {
         &self,
         table: &str,
         key: &crate::sync_types::NaturalKey,
+        vector_copies: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<crate::protocol::PushRequest> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
@@ -1317,8 +1318,34 @@ impl SyncClient {
             table,
             key,
             signer,
+            vector_copies,
             read_memory.clone(),
         )
+    }
+
+    /// The rows the custody fixtures send for a committed unit. The caller keeps
+    /// `vector_copies` alive until the rows are gone.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __manifest_rows_for_test(
+        &self,
+        root_table: &str,
+        root_key: &crate::sync_types::NaturalKey,
+        vector_copies: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<Vec<crate::sync_types::RowChange>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let manifest = crate::custody::preparation::current_manifest(
+            &self.db,
+            root_table,
+            root_key,
+            read_memory.clone(),
+        )?
+        .ok_or_else(|| Error::ManifestRequired {
+            table: root_table.into(),
+        })?;
+        crate::custody::fixtures::manifest_rows(&self.db, &manifest, vector_copies, read_memory)
     }
 
     #[cfg(feature = "test-seams")]
@@ -1394,7 +1421,13 @@ impl SyncClient {
         .ok_or_else(|| Error::ManifestRequired {
             table: root_table.into(),
         })?;
-        let rows = crate::custody::fixtures::manifest_rows(&self.db, &manifest)?;
+        let mut vector_copies = crate::vector_read_memory::admission(read_memory.clone());
+        let rows = crate::custody::fixtures::manifest_rows(
+            &self.db,
+            &manifest,
+            &mut vector_copies,
+            read_memory.clone(),
+        )?;
         let batch = ChangeSet {
             rows,
             ..Default::default()
@@ -1464,7 +1497,13 @@ impl SyncClient {
         .ok_or_else(|| Error::ManifestRequired {
             table: root_table.into(),
         })?;
-        let rows = crate::custody::fixtures::manifest_rows(&self.db, &manifest)?;
+        let mut vector_copies = crate::vector_read_memory::admission(read_memory.clone());
+        let rows = crate::custody::fixtures::manifest_rows(
+            &self.db,
+            &manifest,
+            &mut vector_copies,
+            read_memory.clone(),
+        )?;
         let request = crate::custody::fixtures::FixtureOutcomeRequest {
             tenant_id: self.tenant_id.clone(),
             edge_incarnation: self
@@ -1542,6 +1581,7 @@ impl SyncClient {
 
         use crate::custody::{preparation::TerminalInput, records::Record};
         let records = custody_hold.retain(self.db.custody_records(read_memory.clone())?)?;
+        let mut vector_copies = crate::vector_read_memory::admission(read_memory.clone());
         let mut requests = Vec::new();
         for record in &records {
             let Record::Manifest(manifest) = record else {
@@ -1554,7 +1594,12 @@ impl SyncClient {
             requests.push(TerminalInput {
                 tenant_id: self.tenant_id.clone(),
                 edge_incarnation: manifest.edge_incarnation,
-                rows: crate::custody::fixtures::manifest_rows(&self.db, manifest)?,
+                rows: crate::custody::fixtures::manifest_rows(
+                    &self.db,
+                    manifest,
+                    &mut vector_copies,
+                    read_memory.clone(),
+                )?,
                 manifest: manifest.as_ref().clone(),
                 kind: 0,
                 cause: None,
@@ -2125,6 +2170,7 @@ impl SyncClient {
                     read_memory.clone(),
                 )?,
             },
+            vector_copy_owner,
             read_memory.clone(),
         )
     }
@@ -3509,8 +3555,12 @@ impl SyncClient {
             changeset
         };
 
-        let changeset =
-            crate::custody::delivery::pending_changes(&self.db, changeset, unit_memory.clone())?;
+        let changeset = crate::custody::delivery::pending_changes(
+            &self.db,
+            changeset,
+            vector_copy_owner,
+            unit_memory.clone(),
+        )?;
 
         // The greatest LSN this push actually TRANSMITS, taken PRE-send from the
         // changeset computed under the directions read above. A lost-ack

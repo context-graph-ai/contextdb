@@ -2444,14 +2444,131 @@ impl Database {
     ) -> Result<()> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
-        self.insert_vector_with_read_memory(
-            tx,
-            index,
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = self
+            .stage_inline_vector_for_edit(
+                tx,
+                &index,
+                row_id,
+                Some(&vector),
+                &mut vector_copy_owner,
+                read_memory.clone(),
+            )
+            .and_then(|()| {
+                self.insert_vector_with_read_memory(
+                    tx,
+                    index,
+                    row_id,
+                    vector,
+                    &mut vector_copy_owner,
+                    read_memory,
+                )
+            });
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else {
+            checkpoint.settle();
+        }
+        result
+    }
+
+    /// A public vector edit on a row whose F32 column holds a different inline
+    /// value stages the row with the new value, or NULL, in the same
+    /// transaction, so a row never answers one vector while search finds
+    /// another. An empty slot keeps no copy and needs no row write, and an equal
+    /// value needs none: equal means the same bits, which is what the F32
+    /// identity commits, so +0 and -0 differ. Sync and SQL do not come through
+    /// here: they already write the row and its vector together.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn stage_inline_vector_for_edit(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        value: Option<&[f32]>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+        let _operation = self.open_operation_after_write_control_wait(tx, "vector_row_body")?;
+        let Some(meta) = self.table_meta(&index.table) else {
+            return Ok(());
+        };
+        if !meta.columns.iter().any(|column| {
+            column.name == index.column && matches!(column.quantization, VectorQuantization::F32)
+        }) {
+            return Ok(());
+        }
+        let snapshot = self.snapshot_for_read();
+        let row = match self.find_row_by_id_in_tx(
+            Some(tx),
+            &index.table,
             row_id,
-            vector,
-            &mut vector_copy_owner,
-            read_memory,
-        )
+            snapshot,
+            read_memory.clone(),
+        ) {
+            Ok(row) => row,
+            // The edit itself answers a missing row with its own refusal.
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let Some(Value::Vector(inline)) = row.values.get(&index.column) else {
+            return Ok(());
+        };
+        if value.is_some_and(|value| {
+            inline.len() == value.len()
+                && inline
+                    .iter()
+                    .zip(value)
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+        }) {
+            return Ok(());
+        }
+        let replacement = match value {
+            Some(value) => {
+                vector_copy_owner.reserve(std::mem::size_of_val(value))?;
+                Value::Vector(value.to_vec())
+            }
+            None => Value::Null,
+        };
+        let mut values = row.values;
+        values.insert(index.column.clone(), replacement);
+        let admission = self.admit_retained_row_owned(
+            &index.table,
+            &values,
+            &meta,
+            "update",
+            "vector_row_replace",
+            "Reduce row growth or raise MEMORY_LIMIT before changing this row's vector.",
+        )?;
+        let replaced = self.replace_row_after_update_validation_owned(
+            tx,
+            &index.table,
+            row_id,
+            values,
+            snapshot,
+            admission,
+            read_memory.clone(),
+        )?;
+        // The row's other vectors stay with it, as a SQL UPDATE keeps them. The
+        // edited column's own vector operation follows in the caller.
+        for column in self.quantized_vector_columns(&index.table) {
+            if column != index.column {
+                self.move_vector(
+                    tx,
+                    VectorIndexRef::new(&index.table, column),
+                    row_id,
+                    replaced,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[expect(
@@ -2540,7 +2657,31 @@ impl Database {
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
-        self.delete_vector_with_read_memory(tx, index, row_id, &mut vector_copy_owner, read_memory)
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = self
+            .stage_inline_vector_for_edit(
+                tx,
+                &index,
+                row_id,
+                None,
+                &mut vector_copy_owner,
+                read_memory.clone(),
+            )
+            .and_then(|()| {
+                self.delete_vector_with_read_memory(
+                    tx,
+                    index,
+                    row_id,
+                    &mut vector_copy_owner,
+                    read_memory,
+                )
+            });
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else {
+            checkpoint.settle();
+        }
+        result
     }
 
     #[expect(

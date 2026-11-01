@@ -1370,17 +1370,18 @@ impl Database {
     pub(crate) fn custody_row(
         &self,
         reference: &crate::custody::records::RowRef,
-
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<VersionedRow>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         // Custody digests cover every committed column, so a file-backed
         // writer's paged-out bodies are read back for the row it hands on.
+        let snapshot = self.snapshot();
         let Some(mut row) = self.visible_row_by_natural_key(
             &reference.table,
             &reference.key,
-            self.snapshot(),
+            snapshot,
             &HashSet::new(),
             read_memory.clone(),
         )?
@@ -1394,6 +1395,35 @@ impl Database {
             read_memory.clone(),
         )?;
         row.values.extend(shed);
+        // A vector kept only in the vector store is committed content too, and
+        // the staged path (`final_row`) digests it the same way. Its lookup reads
+        // the row's partition-key columns, so the row stays whole until every
+        // column is loaded.
+        let decode = crate::read_image_memory::ImageMemory::operation_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        )?;
+        let _decode = decode.enter();
+        let mut loaded = Vec::new();
+        for column in self.quantized_vector_columns(&reference.table) {
+            if !matches!(row.values.get(&column), Some(Value::Null) | None) {
+                continue;
+            }
+            if let Some(vector) = self.load_row_vector_for_column(
+                None,
+                &reference.table,
+                &column,
+                &row,
+                snapshot,
+                vector_copy_owner,
+                read_memory.clone(),
+            )? {
+                loaded.push((column, Value::Vector(vector)));
+            }
+        }
+        // These copies leave with the row, so the caller keeps `vector_copy_owner`
+        // alive until the row is gone.
+        row.values.extend(loaded);
         Ok(Some(row))
     }
 

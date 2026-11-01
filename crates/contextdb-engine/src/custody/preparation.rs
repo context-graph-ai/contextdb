@@ -254,6 +254,7 @@ pub(crate) fn copy_row_owned(
 pub(crate) struct FinalRow {
     row: contextdb_core::VersionedRow,
     _original: Option<crate::memory_accounting::OwnedMemoryReservation>,
+    _vector_copies: Option<contextdb_vector::VectorCopyAdmission>,
 }
 impl std::ops::Deref for FinalRow {
     type Target = contextdb_core::VersionedRow;
@@ -414,6 +415,7 @@ pub(crate) fn final_row(
             return Ok(FinalRow {
                 row: owned.value,
                 _original: Some(owned._debit),
+                _vector_copies: None,
             });
         }
         if require_write {
@@ -421,9 +423,11 @@ pub(crate) fn final_row(
                 table: reference.table.clone(),
             });
         }
-        return actual_row(db, reference, read_memory).map(|row| FinalRow {
+        let mut vector_copies = crate::vector_read_memory::admission(read_memory.clone());
+        return actual_row(db, reference, &mut vector_copies, read_memory).map(|row| FinalRow {
             row,
             _original: None,
+            _vector_copies: Some(vector_copies),
         });
     }
     let meta = db.table_meta(&reference.table).ok_or_else(invalid)?;
@@ -468,6 +472,7 @@ pub(crate) fn final_row(
         return Ok(FinalRow {
             row,
             _original: None,
+            _vector_copies: None,
         });
     }
     if require_write {
@@ -475,9 +480,11 @@ pub(crate) fn final_row(
             table: reference.table.clone(),
         });
     }
-    actual_row(db, reference, read_memory.clone()).map(|row| FinalRow {
+    let mut vector_copies = crate::vector_read_memory::admission(read_memory.clone());
+    actual_row(db, reference, &mut vector_copies, read_memory.clone()).map(|row| FinalRow {
         row,
         _original: None,
+        _vector_copies: Some(vector_copies),
     })
 }
 
@@ -669,14 +676,16 @@ pub(crate) fn binding(
 pub(crate) fn actual_row(
     db: &Database,
     r: &RowRef,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<contextdb_core::VersionedRow> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     // Indexed natural-key lookup, never a table scan per member.
-    db.custody_row(r, read_memory.clone())?.ok_or_else(|| {
-        Error::SyncError((format!("delivery prerequisite row is absent in {}", r.table)).into())
-    })
+    db.custody_row(r, vector_copy_owner, read_memory.clone())?
+        .ok_or_else(|| {
+            Error::SyncError((format!("delivery prerequisite row is absent in {}", r.table)).into())
+        })
 }
 
 #[expect(
@@ -1849,7 +1858,9 @@ pub(crate) fn current_manifest(
     };
     m.verify()?;
     for e in &m.rows {
-        let Some(row) = db.custody_row(&e.reference, read_memory.clone())? else {
+        let mut vector_copies = crate::vector_read_memory::admission(read_memory.clone());
+        let Some(row) = db.custody_row(&e.reference, &mut vector_copies, read_memory.clone())?
+        else {
             return Ok(None);
         };
         if full_row_digest(&row.values) != e.row_digest {
@@ -2347,5 +2358,168 @@ impl OwnedPreparationValue<Vec<String>> {
         self.value.dedup();
         crate::memory_accounting::release_preparation_original(&mut self._debit, released);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod separately_stored_vector_digest_tests {
+    use super::*;
+    use crate::sync_types::NaturalKey;
+    use contextdb_core::{Value, VectorIndexRef};
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_committed_row_digest_covers_its_separately_stored_f32_vector() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let index = VectorIndexRef::new("evidence", "embedding");
+        for (id, vector) in [(1, vec![1.0_f32, 0.0, 0.0]), (2, vec![0.0_f32, 1.0, 0.0])] {
+            let tx = db.begin().unwrap();
+            let row_id = db
+                .insert_row(
+                    tx,
+                    "evidence",
+                    HashMap::from([("id".to_string(), Value::Int64(id))]),
+                )
+                .unwrap();
+            db.insert_vector(tx, index.clone(), row_id, vector).unwrap();
+            db.commit(tx).unwrap();
+        }
+        let memory = db.declared_reader_memory().unwrap();
+        let mut vector_copies = crate::vector_read_memory::admission(memory.clone());
+        let mut row = |id| {
+            let reference = RowRef {
+                table: "evidence".to_string(),
+                key: NaturalKey::single("id".to_string(), Value::Int64(id)),
+            };
+            actual_row(&db, &reference, &mut vector_copies, memory.clone()).unwrap()
+        };
+        let (first, second) = (row(1), row(2));
+        assert_eq!(
+            first.values.get("embedding"),
+            Some(&Value::Vector(vec![1.0, 0.0, 0.0])),
+            "the digested row carries its stored vector"
+        );
+        let exclude = vec!["id".to_string()];
+        assert_ne!(
+            crate::custody::canonical::content_row_digest(&first.values, &exclude),
+            crate::custody::canonical::content_row_digest(&second.values, &exclude),
+            "rows differing only in their stored vector digest differently"
+        );
+    }
+
+    /// The lookup for a vector that is not there reads the row's partition key,
+    /// so an empty slot on a partitioned table must still resolve.
+    #[test]
+    fn a_partitioned_row_with_no_vector_still_answers() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, scope INTEGER NOT NULL, \
+             embedding VECTOR(3) PARTITION_KEY (scope))",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let tx = db.begin().unwrap();
+        db.insert_row(
+            tx,
+            "evidence",
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("scope".to_string(), Value::Int64(7)),
+            ]),
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+        let reference = RowRef {
+            table: "evidence".to_string(),
+            key: NaturalKey::single("id".to_string(), Value::Int64(1)),
+        };
+        let memory = db.declared_reader_memory().unwrap();
+        let mut vector_copies = crate::vector_read_memory::admission(memory.clone());
+        let row = actual_row(&db, &reference, &mut vector_copies, memory.clone()).unwrap();
+        assert_eq!(row.values.get("scope"), Some(&Value::Int64(7)));
+        assert!(!matches!(
+            row.values.get("embedding"),
+            Some(Value::Vector(_))
+        ));
+    }
+
+    /// The vector a committed row carries stays charged while that row is alive
+    /// and comes back once its read memory ends.
+    #[test]
+    fn a_committed_row_keeps_its_loaded_vector_charged_until_its_read_memory_ends() {
+        const DIMENSION: usize = 1024;
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let db = Database::open_memory();
+        db.execute(
+            &format!(
+                "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSION}))"
+            ),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let tx = db.begin().unwrap();
+        let row_id = db
+            .insert_row(
+                tx,
+                "evidence",
+                HashMap::from([("id".to_string(), Value::Int64(1))]),
+            )
+            .unwrap();
+        db.insert_vector(
+            tx,
+            VectorIndexRef::new("evidence", "embedding"),
+            row_id,
+            vec![0.5; DIMENSION],
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+        let root =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(LIMIT as u64).unwrap();
+        // The most this reader can still take, found without keeping any of it.
+        let free = |memory: &contextdb_core::read_memory::ReadMemoryOwner| {
+            let (mut low, mut high) = (0, LIMIT);
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                let fits = contextdb_core::read_memory::ReadCredit::try_new(
+                    memory.clone(),
+                    middle,
+                    "test",
+                    "free_probe",
+                    "fixture",
+                )
+                .is_ok();
+                if fits {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            low
+        };
+        let reference = RowRef {
+            table: "evidence".to_string(),
+            key: NaturalKey::single("id".to_string(), Value::Int64(1)),
+        };
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = root.child().unwrap().into();
+        let before = free(&memory);
+        let mut vector_copies = crate::vector_read_memory::admission(memory.clone());
+        let row = actual_row(&db, &reference, &mut vector_copies, memory.clone()).unwrap();
+        assert!(matches!(
+            row.values.get("embedding"),
+            Some(Value::Vector(vector)) if vector.len() == DIMENSION
+        ));
+        let held = free(&memory);
+        assert!(
+            before - held >= DIMENSION * std::mem::size_of::<f32>(),
+            "the row's vector stays charged while the row is alive: {before} then {held}"
+        );
+        drop(row);
+        drop(vector_copies);
+        assert_eq!(free(&memory), before, "ending the owner returns the charge");
     }
 }

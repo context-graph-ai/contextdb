@@ -324,12 +324,18 @@ pub(crate) use super::delivery::manifested_request;
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )
 )]
-pub(crate) fn manifest_rows(db: &Database, m: &ManifestRecord) -> Result<Vec<RowChange>> {
-    let read_memory = db.declared_reader_memory()?;
+pub(crate) fn manifest_rows(
+    db: &Database,
+    m: &ManifestRecord,
+    vector_copies: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<Vec<RowChange>> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     m.rows
         .iter()
         .map(|e| {
-            let row = actual_row(db, &e.reference, read_memory.clone())?;
+            let row = actual_row(db, &e.reference, vector_copies, read_memory.clone())?;
             if full_row_digest(&row.values) != e.row_digest {
                 return Err(invalid());
             }

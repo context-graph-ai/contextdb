@@ -3998,18 +3998,9 @@ impl RetainedReadSource {
                         )
                         .map_err(|error| self.content_identity_error(error))?;
                 }
-                Some(Value::Null) | None if column.nullable => {
-                    self.content_identity
-                        .verify_with_nodes(
-                            proof,
-                            &content_identity::remove_vector_mutation(
-                                &index,
-                                row.row_id,
-                                column.quantization,
-                            ),
-                        )
-                        .map_err(|error| self.content_identity_error(error))?;
-                }
+                // An empty nullable slot keeps no copy of the vector: the family
+                // may hold one or not, and it commits that value on its own.
+                Some(Value::Null) | None if column.nullable => {}
                 Some(Value::Null) | None => {
                     return Err(self.content_identity_corruption(format!(
                         "{table}.{} row {} is NULL although the vector column is required",

@@ -5082,3 +5082,311 @@ fn a_required_quantized_column_without_its_durable_vector_is_corrupt() {
         );
     }
 }
+
+#[test]
+fn a_vector_written_after_its_row_answers_its_own_value_after_reopen_and_through_the_reader() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("independent-vectors.db");
+    let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+    let database = Database::open(&path).expect("open the store");
+    database
+        .execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+            &HashMap::new(),
+        )
+        .expect("declare the table");
+    let values = [
+        vec![1.0_f32, 0.0, 0.0],
+        vec![0.0_f32, 1.0, 0.0],
+        vec![0.0_f32, 0.0, 1.0],
+    ];
+    let tx = database.begin().expect("begin the owner row");
+    let row_id = database
+        .insert_row(
+            tx,
+            "evidence",
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("embedding".to_string(), Value::Vector(values[0].clone())),
+            ]),
+        )
+        .expect("insert the owner row");
+    database.commit(tx).expect("commit the owner row");
+    let mut expected = vec![(values[0].clone(), database.current_lsn())];
+    for value in &values[1..] {
+        let tx = database.begin().expect("begin the vector");
+        database
+            .insert_vector(tx, index.clone(), row_id, value.clone())
+            .expect("write the vector");
+        database.commit(tx).expect("commit the vector");
+        expected.push((value.clone(), database.current_lsn()));
+    }
+    let written = |vectors: &[contextdb_engine::sync_types::VectorChange]| {
+        vectors
+            .iter()
+            .filter(|vector| !vector.vector.is_empty())
+            .map(|vector| (vector.vector.clone(), vector.lsn))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        written(
+            &database
+                .changes_since(Lsn(0))
+                .expect("writer history")
+                .vectors
+        ),
+        expected
+    );
+    database.close().expect("close the writer");
+
+    let database = Database::open(&path).expect("reopen the writer");
+    assert_eq!(
+        written(
+            &database
+                .changes_since(Lsn(0))
+                .expect("reopened history")
+                .vectors
+        ),
+        expected,
+        "a superseded vector still answers its own value after a writable reopen"
+    );
+    database.close().expect("close the reopened writer");
+
+    let reader = open_for_test(
+        &path,
+        default_reader_config(Arc::new(ManualClock::default())),
+    )
+    .expect("open the reader");
+    match reader
+        .metadata(DirectMetadataRequest::ImageState {
+            kind: DirectImageMetadataKind::ChangeLog,
+        })
+        .expect("the change history answers on request")
+        .body
+        .clone()
+    {
+        DirectMetadataBody::ImageState {
+            state: DirectImageState::ChangeLog(changes),
+        } => assert_eq!(
+            written(&changes.vectors),
+            expected,
+            "the reader route selects the same vectors"
+        ),
+        other => panic!("change history answers as change-log state: {other:?}"),
+    }
+}
+
+/// What the closed store answers on the file route.
+fn vector_cells_on_the_file_route(path: &std::path::Path, sql: &str) -> Vec<Vec<Value>> {
+    let session = contextdb_engine::ReadSession::open_with_clock_for_test(
+        path,
+        contextdb_engine::ReadSessionOptions::default(),
+        Arc::new(ManualClock::default()),
+    )
+    .expect("the file route opens a healthy store");
+    session
+        .execute(sql, &HashMap::new())
+        .expect("a healthy store reads")
+        .rows()
+        .to_vec()
+}
+
+#[test]
+fn an_empty_slot_beside_a_stored_vector_reads_on_every_route() {
+    for same_transaction in [true, false] {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("empty-slot.db");
+        let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+        let vector = vec![0.0_f32, 1.0, 0.0];
+        let expected = vec![vec![Value::Vector(vector.clone())]];
+        let database = Database::open(&path).expect("open the store");
+        database
+            .execute(
+                "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+                &HashMap::new(),
+            )
+            .expect("declare the table");
+        let tx = database.begin().expect("begin the row");
+        let row_id = database
+            .insert_row(
+                tx,
+                "evidence",
+                HashMap::from([("id".to_string(), Value::Int64(1))]),
+            )
+            .expect("insert the row without its vector");
+        let tx = if same_transaction {
+            tx
+        } else {
+            database.commit(tx).expect("commit the row");
+            database.begin().expect("begin the vector")
+        };
+        database
+            .insert_vector(tx, index.clone(), row_id, vector.clone())
+            .expect("write the vector");
+        database.commit(tx).expect("commit the vector");
+        const SELECT: &str = "SELECT embedding FROM evidence";
+        assert_eq!(
+            database
+                .execute(SELECT, &HashMap::new())
+                .expect("writer read")
+                .rows(),
+            expected
+        );
+        database.close().expect("close the writer");
+        assert_eq!(vector_cells_on_the_file_route(&path, SELECT), expected);
+        let database = Database::open(&path).expect("reopen the writer");
+        assert_eq!(
+            database
+                .execute(SELECT, &HashMap::new())
+                .expect("reopened read")
+                .rows(),
+            expected
+        );
+        database.close().expect("close the reopened writer");
+    }
+}
+
+#[test]
+fn an_inline_vector_replaced_or_deleted_keeps_one_answer_on_every_route() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("inline-vector.db");
+    let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+    let kept_index = contextdb_core::VectorIndexRef::new("evidence", "kept");
+    let (first, second, third) = (
+        vec![1.0_f32, 0.0, 0.0],
+        vec![0.0_f32, 1.0, 0.0],
+        vec![0.0_f32, 0.0, 1.0],
+    );
+    const SELECT: &str = "SELECT embedding, kept FROM evidence";
+    let answer = |embedding: Value| vec![vec![embedding, Value::Vector(third.clone())]];
+    let database = Database::open(&path).expect("open the store");
+    database
+        .execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3), kept VECTOR(3))",
+            &HashMap::new(),
+        )
+        .expect("declare the table");
+    let tx = database.begin().expect("begin the row");
+    let row_id = database
+        .insert_row(
+            tx,
+            "evidence",
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("embedding".to_string(), Value::Vector(first.clone())),
+                ("kept".to_string(), Value::Vector(third.clone())),
+            ]),
+        )
+        .expect("insert the row");
+    database.commit(tx).expect("commit the row");
+
+    let tx = database.begin().expect("begin the edit");
+    database
+        .insert_vector(tx, index.clone(), row_id, second.clone())
+        .expect("replace the vector");
+    database.commit(tx).expect("commit the edit");
+    assert_eq!(
+        database
+            .execute(SELECT, &HashMap::new())
+            .expect("writer read")
+            .rows(),
+        answer(Value::Vector(second.clone())),
+        "SELECT answers the vector search finds, and the row keeps its other vector"
+    );
+    let hits = database
+        .query_vector(index.clone(), &second, 1, None, database.snapshot())
+        .expect("search the edited column");
+    assert!(hits[0].1 > 0.99, "search finds the new vector: {hits:?}");
+    let kept_hits = database
+        .query_vector(kept_index.clone(), &third, 1, None, database.snapshot())
+        .expect("search the other column");
+    assert!(
+        kept_hits[0].1 > 0.99,
+        "the other vector is still found: {kept_hits:?}"
+    );
+    database.close().expect("close the writer");
+    assert_eq!(
+        vector_cells_on_the_file_route(&path, SELECT),
+        answer(Value::Vector(second.clone()))
+    );
+
+    // The caller's row id still names the row after commit and reopen.
+    let database = Database::open(&path).expect("reopen the writer");
+    let tx = database.begin().expect("begin the later edit");
+    database
+        .insert_vector(tx, index.clone(), row_id, first.clone())
+        .expect("edit through the original row id");
+    database.commit(tx).expect("commit the later edit");
+    database.close().expect("close the writer");
+    assert_eq!(
+        vector_cells_on_the_file_route(&path, SELECT),
+        answer(Value::Vector(first.clone()))
+    );
+
+    let database = Database::open(&path).expect("reopen the writer");
+    let tx = database.begin().expect("begin the delete");
+    database
+        .delete_vector(tx, index.clone(), row_id)
+        .expect("delete the vector");
+    database.commit(tx).expect("commit the delete");
+    assert_eq!(
+        database
+            .execute(SELECT, &HashMap::new())
+            .expect("writer read")
+            .rows(),
+        answer(Value::Null),
+        "the row no longer answers a vector search cannot find"
+    );
+    assert!(
+        database
+            .query_vector(index, &first, 1, None, database.snapshot())
+            .expect("search after the delete")
+            .is_empty()
+    );
+    database.close().expect("close the writer");
+    assert_eq!(
+        vector_cells_on_the_file_route(&path, SELECT),
+        answer(Value::Null)
+    );
+}
+
+#[test]
+fn replacing_an_inline_vector_with_one_equal_but_for_a_zero_sign_keeps_the_new_bits() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("zero-sign.db");
+    let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+    let database = Database::open(&path).expect("open the store");
+    database
+        .execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+            &HashMap::new(),
+        )
+        .expect("declare the table");
+    let tx = database.begin().expect("begin the row");
+    let row_id = database
+        .insert_row(
+            tx,
+            "evidence",
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("embedding".to_string(), Value::Vector(vec![0.0, 1.0, 0.0])),
+            ]),
+        )
+        .expect("insert the row");
+    database.commit(tx).expect("commit the row");
+    let tx = database.begin().expect("begin the edit");
+    database
+        .insert_vector(tx, index, row_id, vec![-0.0, 1.0, 0.0])
+        .expect("replace the vector");
+    database.commit(tx).expect("commit the edit");
+    database.close().expect("close the writer");
+    let rows = vector_cells_on_the_file_route(&path, "SELECT embedding FROM evidence");
+    let [Value::Vector(vector)] = rows[0].as_slice() else {
+        panic!("the file route answers the vector: {rows:?}");
+    };
+    assert_eq!(
+        vector[0].to_bits(),
+        (-0.0_f32).to_bits(),
+        "the inserted bits are what every route answers"
+    );
+}

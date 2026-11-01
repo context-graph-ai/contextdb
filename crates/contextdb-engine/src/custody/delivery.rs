@@ -17,6 +17,7 @@ pub(crate) fn manifested_request(
     table: &str,
     key: &NaturalKey,
     signer: &LineageSigner,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<crate::protocol::PushRequest> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
@@ -33,7 +34,12 @@ pub(crate) fn manifested_request(
     let mut changes = ChangeSet::default();
     let mut lineage = std::collections::HashMap::new();
     for evidence in &m.rows {
-        let row = actual_row(db, &evidence.reference, read_memory.clone())?;
+        let row = actual_row(
+            db,
+            &evidence.reference,
+            vector_copy_owner,
+            read_memory.clone(),
+        )?;
         lineage.insert(
             (
                 evidence.reference.table.clone(),
@@ -203,6 +209,9 @@ pub(crate) fn attach(
                 .is_some_and(|m| m.delivery_manifest_tables.is_some())
             && current_manifest(db, &row.table, &row.natural_key, read_memory.clone())?.is_some()
         {
+            // Only the manifest leaves this call; the rows and their vector
+            // copies end here.
+            let mut vector_copies = crate::vector_read_memory::admission(read_memory.clone());
             out.extend(
                 manifested_request(
                     db,
@@ -210,6 +219,7 @@ pub(crate) fn attach(
                     &row.table,
                     &row.natural_key,
                     signer,
+                    &mut vector_copies,
                     read_memory.clone(),
                 )?
                 .changeset
@@ -754,6 +764,7 @@ pub(crate) fn fetch(
 pub(crate) fn pending_changes(
     db: &Database,
     mut changes: ChangeSet,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ChangeSet> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
@@ -834,7 +845,7 @@ pub(crate) fn pending_changes(
             {
                 continue;
             }
-            let row = actual_row(db, &e.reference, read_memory.clone())?;
+            let row = actual_row(db, &e.reference, vector_copy_owner, read_memory.clone())?;
             changes.rows.push(RowChange {
                 table: e.reference.table.clone(),
                 natural_key: e.reference.key.clone(),
