@@ -7702,6 +7702,96 @@ fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
 
 #[test]
 #[cfg(feature = "test-seams")]
+fn sync_vector_delta_sends_the_independent_vector_not_the_row_body() {
+    let sender = Database::open_memory();
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(4702);
+    let index = VectorIndexRef::new("evidence", "embedding");
+    let independent = per_index_axis3(1);
+
+    for db in [&sender, &receiver] {
+        db.execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    }
+
+    let tx = sender.begin().unwrap();
+    let row_id = sender
+        .insert_row(
+            tx,
+            "evidence",
+            params(vec![
+                ("id", Value::Uuid(id)),
+                ("note", Value::Text("vector owner".to_string())),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+    sender.commit(tx).unwrap();
+    let row_lsn = sender.current_lsn();
+
+    let tx = sender.begin().unwrap();
+    sender
+        .insert_vector(tx, index.clone(), row_id, independent.clone())
+        .unwrap();
+    sender.commit(tx).unwrap();
+    let vector_lsn = sender.current_lsn();
+
+    let written = |changes: &sync::ChangeSet| {
+        changes
+            .vectors
+            .iter()
+            .filter(|vector| !vector.vector.is_empty())
+            .map(|vector| (vector.row_id, vector.vector.clone(), vector.lsn))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![(row_id, independent.clone(), vector_lsn)];
+
+    let changes = sender
+        .changes_since(row_lsn)
+        .expect("read the declared changes");
+    assert_eq!(
+        written(&changes),
+        expected,
+        "the change carries the vector it selected, not the row body's inline value"
+    );
+    assert!(
+        changes
+            .rows
+            .iter()
+            .any(|row| !row.deleted && row.lsn == vector_lsn),
+        "the owner row travels in the vector's LSN group"
+    );
+
+    let (bounded, _) = sender
+        .changes_since_with_arrivals(row_lsn)
+        .expect("read the bounded changes");
+    assert_eq!(
+        written(&bounded),
+        expected,
+        "bounded extraction selects the same vector"
+    );
+
+    receiver
+        .apply_changes(
+            changes,
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::InsertIfNotExists),
+        )
+        .unwrap();
+    let hits = receiver
+        .query_vector(index, &independent, 1, None, receiver.snapshot())
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].1 > 0.99,
+        "the receiver's index holds the independent vector: {hits:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-seams")]
 fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(47);

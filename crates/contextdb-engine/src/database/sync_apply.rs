@@ -8759,6 +8759,23 @@ impl Database {
 
         checkpoint()?;
         let lsn = self.connected_history_end(lsn, read_memory.clone())?;
+        self.history_snapshot_at_commit(lsn, read_memory, checkpoint)
+    }
+
+    /// The snapshot of the commit at `lsn` itself, not widened to the end of a
+    /// connected group.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn history_snapshot_at_commit(
+        &self,
+        lsn: Lsn,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<SnapshotId> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let snapshot = match self.image_history.as_ref() {
             Some(_) => self.tx_mgr.try_snapshot_at_lsn_with_context(
                 lsn,

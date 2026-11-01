@@ -8525,50 +8525,88 @@ impl Database {
                         edges.push(change);
                     }
                     ChangeLogEntry::VectorInsert { index, row_id, lsn } => {
-                        let snapshot = self.history_change_snapshot_at(
+                        // A vector can be written in a later commit than its
+                        // row. Its owner and its value are both read at the
+                        // vector's own commit: the row version visible there,
+                        // never a newer one, and the stored vector, whose own
+                        // LSN must be this change's. A row body's inline value
+                        // or a connected group's later vector is not the one
+                        // this change selected.
+                        let snapshot = self.history_snapshot_at_commit(
                             lsn,
                             read_memory.clone(),
                             projection.checkpoint,
                         )?;
-                        if let Some(row) = self.row_for_change_projected(
+                        if self.table_meta(&index.table).is_none() {
+                            continue;
+                        }
+                        let Some(row) = self.committed_row_at(
                             &index.table,
                             row_id,
-                            lsn,
-                            projection,
+                            snapshot,
                             read_memory.clone(),
-                        )? && self.row_read_allowed_for_change(
+                        )?
+                        else {
+                            continue;
+                        };
+                        if projection.bounded {
+                            (projection.admit)(
+                                std::mem::size_of::<VersionedRow>()
+                                    .saturating_add(held::values(&row.values)),
+                            )?;
+                        }
+                        if !self.row_read_allowed_for_change(
                             &index.table,
                             &row,
                             snapshot,
                             read_memory.clone(),
-                        )? && let Some((_, values)) = self.row_change_values_projected_at(
-                            &index.table,
-                            &row,
-                            projection,
+                        )? {
+                            continue;
+                        }
+                        let _historical_intent = if snapshot.0 < self.snapshot().0 {
+                            self.vector_historical_read_intent(snapshot, read_memory.clone())
+                        } else {
+                            None
+                        };
+                        let Some(entry) = self.vector_entry_for_row_in_tx(
+                            None,
+                            &index,
+                            row_id,
                             snapshot,
                             vector_copy_owner,
                             read_memory.clone(),
-                        )? && let Some(Value::Vector(vector)) = values.get(&index.column)
-                        {
-                            let change = VectorChange {
-                                index,
-                                row_id,
-                                vector: Vec::new(),
-                                lsn,
-                            };
-                            if projection.bounded {
-                                (projection.admit)(answer_list_entry_bytes::<VectorChange>(
-                                    change
-                                        .held_bytes()
-                                        .saturating_add(std::mem::size_of_val(vector.as_slice()))
-                                        .saturating_add(held::ALLOCATION_BYTES),
-                                ))?;
-                            }
-                            vectors.push(VectorChange {
-                                vector: vector.clone(),
-                                ..change
-                            });
+                        )?
+                        else {
+                            continue;
+                        };
+                        if entry.lsn != lsn {
+                            return Err(crate::funded_error::corruption_display(
+                                Ok(read_memory.clone()),
+                                &index.table,
+                                format_args!(
+                                    "selected vector change at LSN {} resolves to vector LSN {}",
+                                    lsn.0, entry.lsn.0
+                                ),
+                            ));
                         }
+                        let change = VectorChange {
+                            index,
+                            row_id,
+                            vector: Vec::new(),
+                            lsn,
+                        };
+                        if projection.bounded {
+                            (projection.admit)(answer_list_entry_bytes::<VectorChange>(
+                                change
+                                    .held_bytes()
+                                    .saturating_add(std::mem::size_of_val(entry.vector.as_slice()))
+                                    .saturating_add(held::ALLOCATION_BYTES),
+                            ))?;
+                        }
+                        vectors.push(VectorChange {
+                            vector: entry.vector,
+                            ..change
+                        });
                     }
                     ChangeLogEntry::VectorDelete { index, row_id, lsn } => {
                         if self.row_id_read_allowed_for_change(
