@@ -5467,7 +5467,6 @@ impl Database {
             .vector_moves
             .iter()
             .any(|(move_index, old_row_id, _, _)| *move_index == index && *old_row_id == row_id);
-        let canceled_move_to_row = !moved_sources.is_empty();
         for old_row_id in moved_sources {
             if !ws
                 .vector_deletes
@@ -5486,10 +5485,7 @@ impl Database {
             .any(|(pending_index, pending_row_id, _)| {
                 *pending_index == index && *pending_row_id == row_id
             });
-        if !pending_move_from_row
-            && ((canceled_inserts.is_empty() && !canceled_move_to_row) || existing_live)
-            && !already_deleted
-        {
+        if !pending_move_from_row && existing_live && !already_deleted {
             ws.vector_deletes.push((index.clone(), row_id, tx));
         }
         for entry in canceled_inserts {

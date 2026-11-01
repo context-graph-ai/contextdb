@@ -1401,11 +1401,6 @@ impl Database {
             self.vector_store
                 .has_live_entry_for_row(index, row, snapshot, vector_copy_owner)?;
         held.with_tx_checkpoint(|held| {
-            let canceled = held
-                .read()
-                .vector_inserts
-                .iter()
-                .any(|entry| entry.index == *index && entry.row_id == row);
             self.remove_vector_positions_in_restricted_source(held, |entry| {
                 entry.index == *index && entry.row_id == row
             })?;
@@ -1457,7 +1452,7 @@ impl Database {
                 for (_, source) in moves {
                     self.append_commit_vector_delete(held, index, *source, tx)?;
                 }
-                if !pending_move_from && ((!canceled && moves.is_empty()) || live) {
+                if !pending_move_from && live {
                     self.append_commit_vector_delete(held, index, row, tx)?;
                 }
                 Ok(())
