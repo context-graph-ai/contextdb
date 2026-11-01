@@ -826,7 +826,7 @@ pub(super) fn read_database_open_error(error: redb::DatabaseError) -> LoadReadIm
             // is reported as what it is -- a store that cannot be read --
             // rather than as an unbuilt capability, which is what an operator
             // used to be told and could do nothing with.
-            std::io::ErrorKind::InvalidData => {
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
                 read_image_corruption(ReadImageCorruptionCause::MalformedRecord, error)
             }
             _ => read_image_io("opening the read-only Redb database", error),
