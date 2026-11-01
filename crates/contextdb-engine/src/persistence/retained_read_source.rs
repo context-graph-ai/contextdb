@@ -380,15 +380,23 @@ pub(super) fn capture_reader_snapshot_registry(
     capture_reader_snapshot_registry_scanned(identity, runtime_dir, None)
 }
 
-/// Keep the root alive during inventory. A physical reader hold freezes
-/// this store's publications, but never permits inspection without a root
-/// lifetime hold: another store could otherwise remove the empty shared root.
+/// Keep the root alive during inventory. Joins and leaves hold the root
+/// shared, so the only conflicting holder is a store removing an empty root it
+/// created. Under this store's exclusive reader hold no reader of this store
+/// can join, and its last reader cannot remove its registry, so that removal
+/// cannot take anything of this store: the inventory proceeds without a
+/// lifetime hold (`Ok(None)`). Without the hold, contention comes back as
+/// `WouldBlock`.
 #[cfg(target_os = "linux")]
 pub(super) fn serialize_runtime_root_for_inventory(
     root: &Path,
-    _hold: Option<&writer_file::ReaderAdmissionHold>,
+    hold: Option<&writer_file::ReaderAdmissionHold>,
 ) -> std::io::Result<Option<RuntimeRootSerializer>> {
-    hold_runtime_root(root, true).map(Some)
+    match hold_runtime_root(root, true) {
+        Ok(serializer) => Ok(Some(serializer)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && hold.is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "linux")]

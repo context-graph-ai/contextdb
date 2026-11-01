@@ -1,15 +1,18 @@
-//! An authoritative purge on one store is not refused because a reader of
-//! another store, owned by the same user, is joining or leaving the shared
-//! runtime directory at that moment. That reader holds the runtime
-//! directory's lock briefly and says nothing about this store's readers; the
+//! An authoritative purge on one store is not refused because another store
+//! holds the shared runtime directory's lock exclusively. Ordinary joins and
+//! leaves hold that lock shared and never conflict; the exclusive holder in
+//! production is another store's last reader removing the empty default
+//! directory it created. That says nothing about this store's readers; the
 //! purge proves its own readers through its own store's admission, as the
 //! reader audit already does under the same contention.
 //!
 //! The lock is held by a planted holder on its own descriptor for the whole
-//! purge, exactly as that other reader would hold it; the purge neither waits
-//! for it nor refuses. A reader of the purged store itself is different: while
-//! it is inside its own join, holding this store's reader admission, the purge
-//! still refuses, so only another store's contention is set aside.
+//! purge, on a supplied directory. That is stricter than production, whose
+//! exclusive hold is momentary and never on a supplied directory; the purge
+//! neither waits for it nor refuses. A reader of the purged store itself is
+//! different: while it is inside its own join, holding this store's reader
+//! admission, the purge still refuses, so only another store's contention is
+//! set aside.
 
 use contextdb_core::read_contract::{OwnerReadCancellation, ReadRoute};
 use contextdb_core::{Error, Value};
@@ -70,11 +73,11 @@ fn an_authoritative_purge_succeeds_while_another_stores_reader_holds_the_shared_
             .expect("commit a row");
     }
 
-    // A reader of another store joins or leaves the shared runtime directory:
-    // it holds the directory's lock on its own descriptor.
+    // The planted holder takes the directory's lock exclusively on its own
+    // descriptor, as another store's last reader does to remove the directory.
     let other_store_reader = std::fs::File::open(&runtime).expect("open the runtime directory");
     fs2::FileExt::try_lock_exclusive(&other_store_reader)
-        .expect("the other store's reader holds the runtime directory's lock");
+        .expect("the planted holder takes the runtime directory's lock");
 
     let purged = database.execute("PURGE FROM erasable WHERE id = 1", &HashMap::new());
     let remaining = database
