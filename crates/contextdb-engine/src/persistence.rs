@@ -4994,10 +4994,31 @@ pub mod read_persistence_test_scaffold {
         ];
     }
 
-    fn open_damage_fixture(path: &Path) -> std::result::Result<redb::Database, String> {
-        super::redb_builder()
+    /// Opens the raw fixture and the operation scope its decodes run under. The
+    /// planting functions decode stored records with no database operation around
+    /// them, so, as the raw constructors do, this enters the caller's operation
+    /// when one is installed and otherwise declares the default open budget. The
+    /// caller binds the scope for as long as it decodes.
+    fn open_damage_fixture(
+        path: &Path,
+    ) -> std::result::Result<(redb::Database, crate::read_image_memory::ImageMemoryScope), String>
+    {
+        let scope = match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.enter(),
+            Err(_) => {
+                let accountant = crate::memory_accounting::AccountantHandle::standalone(
+                    crate::read_session::DatabaseOpenOptions::default().memory_limit,
+                    true,
+                )
+                .map_err(|error| error.to_string())?;
+                crate::read_image_memory::ImageMemory::enter_writer_operation(accountant)
+                    .map_err(|error| error.to_string())?
+            }
+        };
+        let database = super::redb_builder()
             .open(path)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok((database, scope))
     }
 
     fn damage_table_metadata(
@@ -5280,7 +5301,7 @@ pub mod read_persistence_test_scaffold {
         path: &std::path::Path,
         damage: ExactVectorBodyDamage,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         if matches!(damage, ExactVectorBodyDamage::MismatchedLeaf) {
             return damage_vector_divergence(&database, super::VectorQuantization::F32);
         }
@@ -5775,7 +5796,7 @@ pub mod read_persistence_test_scaffold {
     pub fn busiest_relational_index_for_test(
         path: &Path,
     ) -> std::result::Result<(String, String), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let Some(busiest) = busiest_live_relational_index(&database)? else {
             return Err("fixture has no live relational index posting".to_owned());
         };
@@ -5798,7 +5819,7 @@ pub mod read_persistence_test_scaffold {
         column: &str,
         value: super::Value,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let metadata = damage_table_metadata(&database)?;
         let meta = metadata
             .get(table)
@@ -5849,7 +5870,7 @@ pub mod read_persistence_test_scaffold {
         row_id: super::RowId,
         under_the_key_of_row_id: super::RowId,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let metadata = damage_table_metadata(&database)?;
         let meta = metadata
             .get(table)
@@ -5954,7 +5975,7 @@ pub mod read_persistence_test_scaffold {
         table: &str,
         index: &str,
     ) -> std::result::Result<(bool, bool, bool), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let read = database.begin_read().map_err(|error| error.to_string())?;
         let holds = |name: String| -> std::result::Result<bool, String> {
             let definition: TableDefinition<super::DurableRelationalIndexKey, &[u8]> =
@@ -5985,7 +6006,7 @@ pub mod read_persistence_test_scaffold {
         table: &str,
         index: &str,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let write = database.begin_write().map_err(|error| error.to_string())?;
         super::historical_index_commitment::damage_postings_state_for_test(&write, table, index)
             .map_err(|error| error.to_string())?;
@@ -6000,7 +6021,7 @@ pub mod read_persistence_test_scaffold {
         row_id: super::RowId,
         damage: IndexPostingDamage,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let redb_name = super::RedbPersistence::relational_index_table_name(table, index);
         let definition: TableDefinition<super::DurableRelationalIndexKey, &[u8]> =
             TableDefinition::new(redb_name.as_str());
@@ -6065,7 +6086,7 @@ pub mod read_persistence_test_scaffold {
         path: &Path,
         table: &str,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let name = super::RedbPersistence::rel_table_name(table);
         let write = database.begin_write().map_err(|error| error.to_string())?;
         {
@@ -6177,7 +6198,7 @@ pub mod read_persistence_test_scaffold {
         path: &Path,
         damage: DurableStoreDamage,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let result = match damage {
             DurableStoreDamage::MalformedRecord => {
                 damage_format_marker(&database, &[0xff, 0x00, 0xfe])
@@ -6269,7 +6290,7 @@ pub mod read_persistence_test_scaffold {
         path: &Path,
         damage: HistoryDamage,
     ) -> std::result::Result<(), String> {
-        let database = open_damage_fixture(path)?;
+        let (database, _decode_scope) = open_damage_fixture(path)?;
         let result = damage_history(&database, damage);
         drop(database);
         result
