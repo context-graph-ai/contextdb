@@ -80,8 +80,6 @@ ALTER TABLE t SET MAINTAIN COUNT (col [ASC|DESC], ...), (...) | ALL PREFIXES | N
 ALTER TABLE t ALTER COLUMN vector_col SET MAX_PARTITIONS positive_integer
 ALTER TABLE t ALTER COLUMN vector_col SET SEARCH_MODE AUTO | EXACT | INDEXED
 ALTER TABLE t ALTER COLUMN vector_col SET AUTO_INDEX_AT positive_integer | DEFAULT
-ALTER TABLE t ALTER COLUMN vector_col SET AUTO_EXPANSION_CEILING percent_1_to_100 | DEFAULT
-ALTER TABLE t ALTER COLUMN vector_col SET FLAT_BELOW non_negative_integer | DEFAULT
 ALTER TABLE t ALTER COLUMN vector_col SET SEARCH DEFAULT | (TARGET_ACCURACY = decimal_percent | DEFAULT, EXPECTED_VECTORS = positive_integer | DEFAULT)
 ALTER TABLE t ALTER COLUMN vector_col SET IVF DEFAULT | (LISTS = positive_integer | DEFAULT, PROBES = positive_integer | DEFAULT, REFINE_FACTOR = decimal_at_least_1 | DEFAULT)
 ```
@@ -1685,7 +1683,7 @@ partition's size; a declared member is used exactly as written.
 Change the policy online with the `ALTER` forms above. `DEFAULT` on `AUTO_INDEX_AT` clears that
 declaration; `SET SEARCH DEFAULT` and `SET IVF DEFAULT` clear the whole group, while `DEFAULT` for a
 named member clears only that member and omitted members retain their declarations. Each statement
-changes its named members atomically. `AUTO_INDEX_AT`, `AUTO_EXPANSION_CEILING`, `FLAT_BELOW` and
+changes its named members atomically. `AUTO_INDEX_AT` and
 `PROBES` affect newly opened queries without rebuilding an index. These policies are not versioned
 by snapshot: a statement run against a held older snapshot reads the column's current declaration,
 and both routes it may take return that snapshot's correct answer. The row count a route is chosen
@@ -1724,21 +1722,17 @@ column creates the corresponding local vector index.
   against the column's effective `AUTO_INDEX_AT`. Below that count, the answer is exact when the
   active limits can pay for it and a typed refusal when they cannot; memory never silently picks
   the indexed route on `AUTO`'s behalf. At or above that count, `AUTO` admits indexed planning for
-  the whole answer, then chooses work per Context: a Context whose live vector count is at or below
-  its resolved `EF_SEARCH` is compared exactly, while a larger Context traverses its maintained
-  graph. ContextDB merges both kinds of candidates into the same global answer. For F32 the
+  the whole answer, then chooses work per Context: a Context small enough to be compared exactly is
+  compared exactly, while a larger Context is served from its maintained index. ContextDB merges
+  both kinds of candidates into the same global answer. For F32 the
   automatic switch is at 1,000 allowed vectors; for SQ8/SQ4 it is at 5,001. These counts apply to
   the whole requested answer, not separately to each partition.
 - `EXACT` compares every allowed stored vector, or returns a typed budget refusal. It never quietly
   substitutes an indexed answer. Exact means exact over the stored column values; SQ8 and SQ4 stay
   quantized by design.
 - `INDEXED` requires a maintained bounded route, including for a small non-empty layout. If that
-  route is not ready, it returns a typed unavailable-route refusal instead of a full scan. It
-  traverses the graph even when `AUTO` would exact-compare that same small Context, unless the
-  Context is below the column's declared `FLAT_BELOW`: then its maintained route is its flat
-  representation, compared exactly and disclosed as such (behavior change "INDEXED maintained flat
-  route"). A scope whose graph partition is unavailable is refused as a whole, even beside flat
-  partitions.
+  route is not ready, it returns a typed unavailable-route refusal instead of a full scan. A scope
+  whose index partition is unavailable is refused as a whole.
   <!-- enforced by: vector_search_mode_bounded_contract::auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_policy_resolver_contract::default_crossovers_execute_both_sides_without_a_normal_write_availability_gap -->
 
 Override the declaration for one vector-nearest-neighbour query after vector ordering and before
