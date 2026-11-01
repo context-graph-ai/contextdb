@@ -413,6 +413,7 @@
         "vector_an_exhaustive_find_streams_bodies_it_cannot_hold",
         "vector_multi_partition_union_recovers_nearest_rows",
         "vector_partition",
+        "clustered_vector_index",
         "a_row_pays_for_its_partition_key_once",
         "cdb120_partition_insert_cost"
       ]

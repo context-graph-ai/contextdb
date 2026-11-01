@@ -3354,6 +3354,21 @@
     {
       "crate": "contextdb-engine",
       "kind": "test",
+      "name": "clustered_vector_index",
+      "path": "crates/contextdb-engine/tests/clustered_vector_index.rs",
+      "required_features": [
+        "test-seams"
+      ],
+      "jobs": [
+        "contextdb-engine-test-seams",
+        "nightly/full-test"
+      ],
+      "tier": "normal",
+      "execution": "not executed by this audit; existing ignore attributes still apply"
+    },
+    {
+      "crate": "contextdb-engine",
+      "kind": "test",
       "name": "vector_policy",
       "path": "crates/contextdb-engine/tests/vector_policy.rs",
       "required_features": [
