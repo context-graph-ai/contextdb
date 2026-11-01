@@ -934,13 +934,18 @@ fn default_policy_resolution_matches_producer_checked_layout_and_constructor_deb
         assert_eq!(record, dimensions * 4 + 40);
         assert_eq!(resolved.inputs.buffer_bytes % record, 0);
         assert!(producer_workspace.charged_bytes <= resolved.workspace_budget_bytes);
-        let mut one_more = resolved.inputs;
-        one_more.buffer_bytes = one_more.buffer_bytes.checked_add(record).unwrap();
-        assert!(
-            workspace_allocation_layout(one_more).map_or(true, |layout| layout.charged_bytes
-                > resolved.workspace_budget_bytes),
-            "DEFAULT is the producer-checked complete-record capacity of the actual remaining workspace"
-        );
+        let population_cap = resolved.population.max(expected_vectors).max(1) as usize;
+        let records = resolved.inputs.buffer_bytes / record;
+        assert!(records <= population_cap);
+        if records < population_cap {
+            let mut one_more = resolved.inputs;
+            one_more.buffer_bytes = one_more.buffer_bytes.checked_add(record).unwrap();
+            assert!(
+                workspace_allocation_layout(one_more).map_or(true, |layout| layout.charged_bytes
+                    > resolved.workspace_budget_bytes),
+                "DEFAULT is the smaller of the population cap and the producer-checked complete-record capacity of the actual remaining workspace"
+            );
+        }
         for training_counts in [false, true] {
             let layout =
                 codebook_allocation_layout(dimensions, resolved.active_lists, training_counts)
