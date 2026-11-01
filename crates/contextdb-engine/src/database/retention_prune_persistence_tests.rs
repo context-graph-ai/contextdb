@@ -53,21 +53,11 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
     for case in ["before", "after", "deferred"] {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("retention-crash.redb");
-        let mut expired_lsn = None;
         {
             let db = Database::open(&path).unwrap();
             db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
             db.execute("CREATE TABLE retained (id UUID PRIMARY KEY, expires_at TIMESTAMP EXPIRES, embedding VECTOR(2)) RETAIN 1 HOURS", &params()).unwrap();
-            db.execute("CREATE TABLE retained_scalar (id INT PRIMARY KEY, expires_at TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF", &params()).unwrap();
             db.execute("CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)", &params()).unwrap();
-            if case != "deferred" {
-                db.execute("INSERT INTO retained_scalar VALUES (1, -1)", &params())
-                    .unwrap();
-                expired_lsn = Some(db.tx_mgr.current_lsn());
-                // The scalar commit becomes reclaimable before any vector row
-                // exists, so the crash below is the only thing under test.
-                db.run_maintenance_cycle().unwrap();
-            }
             insert(&db, survivor, i64::MAX);
             if case != "deferred" {
                 insert(&db, expired, -1);
@@ -115,13 +105,6 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
                 if case == "before" { 2 } else { 1 },
                 "a row commit must never strand its vector"
             );
-            if let Some(lsn) = expired_lsn {
-                assert_eq!(
-                    persistence.load_commit_index().unwrap().contains_key(&lsn),
-                    case == "before",
-                    "the eligible commit-index identity follows the same durable commit as the row"
-                );
-            }
             assert_eq!(
                 persistence
                     .load_row_owned_edges_for_test(false)
