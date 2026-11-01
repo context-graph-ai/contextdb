@@ -27,8 +27,6 @@ unsafe impl Sync for NativeStorageCredit {}
 pub(crate) struct NativePageCharge {
     receipt: NonNull<()>,
     finish: unsafe fn(NonNull<()>),
-    #[cfg(feature = "test-seams")]
-    observation: Option<crate::native_page_observations::PaymentObservation>,
 }
 #[cfg(feature = "contextdb-internal")]
 unsafe impl Send for NativePageCharge {}
@@ -40,7 +38,7 @@ impl NativePageCharge {
         self.receipt.as_ptr() as usize
     }
     pub(crate) fn original_funder_for_test(&self) -> Option<usize> {
-        self.observation.as_ref().and_then(|o| o.original_funder)
+        crate::native_page_observations::PaymentObservation::charge_funder(self.identity_for_test())
     }
     pub(crate) fn bind_page_for_test(
         &mut self,
@@ -49,22 +47,30 @@ impl NativePageCharge {
         bytes: usize,
         original_funder: Option<usize>,
     ) {
-        assert!(self.observation.is_none());
-        self.observation = Some(crate::native_page_observations::PaymentObservation::new(
+        if !observer.is_live() {
+            return;
+        }
+        crate::native_page_observations::PaymentObservation::new(
             observer,
             allocation,
             self.identity_for_test(),
             original_funder,
             bytes,
-        ));
+        )
+        .bind_charge(self.identity_for_test());
     }
 }
 #[cfg(feature = "contextdb-internal")]
 impl Drop for NativePageCharge {
     fn drop(&mut self) {
+        // Taken first: finish can free this receipt and let its address be reused.
+        #[cfg(feature = "test-seams")]
+        let observation = crate::native_page_observations::PaymentObservation::take_charge(
+            self.receipt.as_ptr() as usize,
+        );
         unsafe { (self.finish)(self.receipt) };
         #[cfg(feature = "test-seams")]
-        if let Some(observation) = self.observation.take() {
+        if let Some(observation) = observation {
             observation.released();
         }
     }
@@ -76,8 +82,6 @@ impl NativeStorageCredit {
         NativePageCharge {
             receipt: credit.receipt,
             finish: credit.finish,
-            #[cfg(feature = "test-seams")]
-            observation: None,
         }
     }
 

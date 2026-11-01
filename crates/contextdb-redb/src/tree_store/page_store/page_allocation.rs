@@ -209,8 +209,9 @@ pub(super) struct CachePayment {
     counter: CacheCounter,
     bytes: usize,
     fixed: bool,
+    // Fits the padding after `fixed`; the payment stays its production size.
     #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-    observation: Option<PaymentObservation>,
+    occupancy_id: u32,
 }
 impl CachePayment {
     #[cfg(feature = "test-seams")]
@@ -270,7 +271,7 @@ impl CachePayment {
             bytes,
             fixed: true,
             #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-            observation: None,
+            occupancy_id: 0,
         };
         #[cfg(feature = "test-seams")]
         payment.observe(crate::page_payer_observation::Phase::Reserved, 0, 0);
@@ -312,7 +313,7 @@ impl Drop for CachePayment {
         #[cfg(feature = "test-seams")]
         self.observe(crate::page_payer_observation::Phase::AfterRefund, 0, 0);
         #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-        if let Some(observation) = self.observation.take() {
+        if let Some(observation) = PaymentObservation::take_occupancy(self.occupancy_id) {
             observation.occupancy_released(released.0, released.1, released.2);
         }
     }
@@ -390,8 +391,6 @@ struct PageBlock {
     len_and_origin: usize,
     checksum: Mutex<Option<u128>>,
     payer: Mutex<Option<PagePayer>>,
-    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-    observation: PageObservation,
 }
 
 impl PageBlock {
@@ -466,7 +465,7 @@ impl PageAllocation {
             observation.backing_opened();
             let allocation = page.block.as_ptr() as usize;
             let block = unsafe { page.block.as_mut() };
-            block.observation = observation.clone();
+            observation.bind_backing(allocation);
             if let Some(PagePayer::Source(ReadMemoryCharge::Native(charge))) = block
                 .payer
                 .get_mut()
@@ -514,8 +513,6 @@ impl PageAllocation {
                 len_and_origin: len,
                 checksum: Mutex::new(None),
                 payer: Mutex::new(Some(payer)),
-                #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-                observation: PageObservation::default(),
             });
             std::ptr::write_bytes(block.as_ptr().cast::<u8>().add(offset), 0, len);
         }
@@ -647,7 +644,7 @@ impl PageAllocation {
         #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
         {
             payment.bind_page_for_test(
-                unsafe { self.block.as_ref() }.observation.clone(),
+                PageObservation::of_backing(self.block.as_ptr() as usize),
                 self.block.as_ptr() as usize,
             );
         }
@@ -691,7 +688,7 @@ impl PageAllocation {
         );
         drop(slot);
         #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-        unsafe { self.block.as_ref() }.observation.emit(
+        PageObservation::of_backing(self.block.as_ptr() as usize).emit(
             NativePageCustodyEventForTest::PaymentTransferred {
                 backing: self.backing_for_test(),
                 old,
@@ -851,7 +848,7 @@ impl Drop for PageAllocation {
         let block = unsafe { self.block.as_mut() };
         let (layout, _) = Self::layout(block.len()).expect("live page has a valid Layout");
         #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-        let observation = block.observation.clone();
+        let observation = PageObservation::take_backing(self.block.as_ptr() as usize);
         let payer = block
             .payer
             .get_mut()
@@ -1124,6 +1121,18 @@ mod physical_lifetime_observer_tests {
 
     #[test]
     fn cloned_page_counts_one_construction_and_one_physical_free() {
+        // A test page costs what a production page costs: these are the production
+        // sizes, so a test-only field can never re-enter the header unnoticed.
+        #[cfg(all(feature = "contextdb-internal", target_os = "linux"))]
+        {
+            assert_eq!(std::mem::size_of::<super::PageBlock>(), 128);
+            assert_eq!(std::mem::size_of::<super::CachePayment>(), 24);
+            assert_eq!(
+                std::mem::size_of::<crate::native_storage_admission::NativePageCharge>(),
+                16
+            );
+            assert_eq!(PageAllocation::quote(4096), 4224);
+        }
         let bytes = PageAllocation::layout(128).unwrap().0.size();
         let (_, receipt) = observe_page_lifetimes_for_test(|| {
             let page = PageAllocation::zeroed(128, None).unwrap();
@@ -1175,15 +1184,14 @@ impl CachePayment {
             .map(|r| r.identity_for_test())
     }
     fn bind_page_for_test(&mut self, observation: PageObservation, allocation: usize) {
-        assert!(self.observation.is_none());
+        assert_eq!(self.occupancy_id, 0);
+        if !observation.is_live() {
+            return;
+        }
         let receipt = self.fixed_receipt_for_test().unwrap_or(0);
-        self.observation = Some(PaymentObservation::new(
-            observation,
-            allocation,
-            receipt,
-            None,
-            self.bytes,
-        ));
+        self.occupancy_id =
+            PaymentObservation::new(observation, allocation, receipt, None, self.bytes)
+                .bind_occupancy();
     }
 }
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
@@ -1246,7 +1254,7 @@ impl PageAllocation {
         payment
     }
     pub(crate) fn observation_for_test(&self) -> PageObservation {
-        unsafe { self.block.as_ref() }.observation.clone()
+        PageObservation::of_backing(self.block.as_ptr() as usize)
     }
 }
 

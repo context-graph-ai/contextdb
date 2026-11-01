@@ -5,9 +5,9 @@ use crate::NativeColdReadError;
 use std::{
     alloc::Layout,
     cell::RefCell,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -198,6 +198,55 @@ impl PageObservation {
             c.payments.fetch_sub(1, Ordering::AcqRel);
         }
     }
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.is_some()
+    }
+    /// A binding that could not be kept is incomplete evidence, never a pass.
+    fn mark_lost(&self) {
+        if let Some(c) = &self.0 {
+            c.ring.lock().unwrap_or_else(|e| e.into_inner()).overflow = true;
+        }
+    }
+    /// Keeps this capture with one live observed backing until physical free,
+    /// across the installed thread scope and database close.
+    pub(crate) fn bind_backing(&self, allocation: usize) {
+        if !self.is_live() {
+            return;
+        }
+        let displaced = {
+            let mut bound = bound_custody();
+            let displaced = bound.backings.insert(allocation, self.clone());
+            if displaced.is_none() {
+                BOUND_ENTRIES.fetch_add(1, Ordering::AcqRel);
+            }
+            displaced
+        };
+        if let Some(displaced) = displaced {
+            self.mark_lost();
+            displaced.mark_lost();
+        }
+    }
+    pub(crate) fn of_backing(allocation: usize) -> Self {
+        if BOUND_ENTRIES.load(Ordering::Acquire) == 0 {
+            return Self::default();
+        }
+        bound_custody()
+            .backings
+            .get(&allocation)
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// The caller takes this before the backing's address can be reused.
+    pub(crate) fn take_backing(allocation: usize) -> Self {
+        if BOUND_ENTRIES.load(Ordering::Acquire) == 0 {
+            return Self::default();
+        }
+        let taken = bound_custody().backings.remove(&allocation);
+        if taken.is_some() {
+            BOUND_ENTRIES.fetch_sub(1, Ordering::AcqRel);
+        }
+        taken.unwrap_or_default()
+    }
     pub(crate) fn page_returned(&self, retain: &dyn Fn() -> crate::CachePageForTest) {
         if let Some(c) = &self.0 {
             c.observer.page_returned(retain);
@@ -326,6 +375,28 @@ pub fn observe_native_pages_for_test<R>(
     (run(), NativePageObservationForTest(capture))
 }
 
+/// Test-only custody bindings kept outside the physical page, so a test page
+/// costs what a production page costs. Entries hold observation data and capture
+/// identity only, never a page alias, receipt or payer. Each lock is released
+/// before any real destructor runs or any event is emitted.
+struct BoundCustody {
+    backings: BTreeMap<usize, PageObservation>,
+    charges: BTreeMap<usize, PaymentObservation>,
+    occupancy: BTreeMap<u32, PaymentObservation>,
+    last_occupancy: u32,
+}
+static BOUND_CUSTODY: Mutex<BoundCustody> = Mutex::new(BoundCustody {
+    backings: BTreeMap::new(),
+    charges: BTreeMap::new(),
+    occupancy: BTreeMap::new(),
+    last_occupancy: 0,
+});
+/// Lets a test page with no capture skip the shared lock.
+static BOUND_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+fn bound_custody() -> MutexGuard<'static, BoundCustody> {
+    BOUND_CUSTODY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) struct PaymentObservation {
     observation: PageObservation,
     allocation: usize,
@@ -351,6 +422,67 @@ impl PaymentObservation {
             process_only: false,
             bytes,
         }
+    }
+    /// Keyed by the live receipt; the caller takes it before that receipt is freed.
+    pub(crate) fn bind_charge(self, receipt: usize) {
+        let lost = self.observation.clone();
+        let displaced = {
+            let mut bound = bound_custody();
+            let displaced = bound.charges.insert(receipt, self);
+            if displaced.is_none() {
+                BOUND_ENTRIES.fetch_add(1, Ordering::AcqRel);
+            }
+            displaced
+        };
+        if let Some(displaced) = displaced {
+            lost.mark_lost();
+            displaced.observation.mark_lost();
+        }
+    }
+    pub(crate) fn charge_funder(receipt: usize) -> Option<usize> {
+        if BOUND_ENTRIES.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        bound_custody()
+            .charges
+            .get(&receipt)
+            .and_then(|payment| payment.original_funder)
+    }
+    pub(crate) fn take_charge(receipt: usize) -> Option<Self> {
+        if BOUND_ENTRIES.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let taken = bound_custody().charges.remove(&receipt);
+        if taken.is_some() {
+            BOUND_ENTRIES.fetch_sub(1, Ordering::AcqRel);
+        }
+        taken
+    }
+    /// A cache counter or fixed reserve can cover many payments at once, so one
+    /// occupancy payment needs its own id. Zero means unbound; a live id is never reissued.
+    pub(crate) fn bind_occupancy(self) -> u32 {
+        let mut bound = bound_custody();
+        let mut id = bound.last_occupancy;
+        loop {
+            id = id.wrapping_add(1);
+            if id != 0 && !bound.occupancy.contains_key(&id) {
+                break;
+            }
+        }
+        bound.last_occupancy = id;
+        bound.occupancy.insert(id, self);
+        BOUND_ENTRIES.fetch_add(1, Ordering::AcqRel);
+        id
+    }
+    pub(crate) fn take_occupancy(id: u32) -> Option<Self> {
+        if id == 0 {
+            return None;
+        }
+        let taken = bound_custody().occupancy.remove(&id);
+        if taken.is_some() {
+            BOUND_ENTRIES.fetch_sub(1, Ordering::AcqRel);
+        }
+        taken
     }
     /// Called only after the existing genuine release operation has returned.
     pub(crate) fn released(self) {
