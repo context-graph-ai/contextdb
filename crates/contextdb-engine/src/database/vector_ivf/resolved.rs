@@ -375,7 +375,11 @@ mod tests {
         let mut column = declared_column();
         column.ivf_probes = Some(512);
         let roomy = resolve(&index, &column, 10, 1 << 30, 1 << 30, [0; 32]).unwrap();
-        assert_eq!(roomy.policy.probes(), 512, "an explicit PROBES is never clamped");
+        assert_eq!(
+            roomy.policy.probes(),
+            512,
+            "an explicit PROBES is never clamped"
+        );
         assert!(
             roomy.policy.lists() >= 512,
             "an omitted LISTS resolves compatibly with an explicit PROBES: {}",
