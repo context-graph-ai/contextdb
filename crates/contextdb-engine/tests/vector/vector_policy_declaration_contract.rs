@@ -11,28 +11,34 @@ fn empty() -> HashMap<String, Value> {
 }
 
 #[test]
-fn zero_dimension_vector_remains_an_accepted_schema_and_row_value() {
+fn zero_dimension_vector_is_refused_at_declaration() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE zero_vectors (id INTEGER PRIMARY KEY, embedding VECTOR(0))",
-        &empty(),
-    )
-    .expect("the existing VECTOR(0) schema contract remains accepted");
-    db.execute(
-        "INSERT INTO zero_vectors (id, embedding) VALUES (1, $embedding)",
-        &HashMap::from([("embedding".to_owned(), Value::Vector(Vec::new()))]),
-    )
-    .expect("the zero-dimensional row value remains reachable");
-    let meta = db
-        .table_meta("zero_vectors")
-        .expect("read zero-vector schema");
-    assert!(matches!(
-        meta.columns
-            .iter()
-            .find(|column| column.name == "embedding")
-            .map(|column| &column.column_type),
-        Some(contextdb_core::ColumnType::Vector(0))
-    ));
+    let error = db
+        .execute(
+            "CREATE TABLE zero_vectors (id INTEGER PRIMARY KEY, embedding VECTOR(0))",
+            &empty(),
+        )
+        .expect_err("a vector column with no dimensions is refused when it is declared");
+    assert!(
+        matches!(
+            error,
+            contextdb_core::Error::InvalidVectorPolicyDeclaration {
+                issue: contextdb_core::VectorPolicyDeclarationIssue::DimensionsNotPositive,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("vector dimensions must be at least 1"),
+        "{error}"
+    );
+    assert!(
+        db.table_meta("zero_vectors").is_none(),
+        "the refused declaration leaves no table behind"
+    );
 }
 
 fn schema(db: &Database, table: &str) -> String {
