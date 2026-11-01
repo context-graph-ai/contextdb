@@ -74,7 +74,7 @@ fn fixture_in_commits(
     let db = Database::open_with_options(path, options).unwrap();
     db.execute(
         &format!(
- "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)"
+ "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)"
         ),
         &HashMap::new(),
     )
@@ -433,7 +433,7 @@ fn a_completed_replacement_catches_up_its_import_cohort_under_the_writer() {
         ..DatabaseOpenOptions::default()
     };
     let db = Database::open_with_options(&path, options).unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1)", &HashMap::new()).unwrap();
     let small = |db: &Database, id: i64, vector: Vec<f32>| {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $vector)",
@@ -516,7 +516,7 @@ fn absorb_quantized(quantization: &str) {
     .unwrap();
     db.execute(
         &format!(
- "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({QUANTIZED_DIMENSION}) WITH (quantization = '{quantization}') PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)"
+ "CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({QUANTIZED_DIMENSION}) WITH (quantization = '{quantization}') PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)"
         ),
         &HashMap::new(),
     )

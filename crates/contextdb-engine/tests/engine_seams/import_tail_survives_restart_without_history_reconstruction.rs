@@ -31,7 +31,7 @@ fn run(history: usize) -> usize {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("native-tail.db");
     let db = Database::open_with_options(&path, options()).unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)", &HashMap::new()).unwrap();
     for id in 0..16 {
         append(&db, id, vec![0.0, 1.0, id as f32 + 1.0]);
     }
@@ -109,7 +109,7 @@ fn completed_native_import_stays_searchable_while_replacement_is_queued() {
         },
     )
     .unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512))", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1)", &HashMap::new()).unwrap();
     for id in 0..16 {
         append(&db, id, vec![0.0, 1.0, id as f32 + 1.0]);
     }
@@ -238,7 +238,7 @@ fn native_tail_publication_answers_exactly_before_the_serving_cache_installs() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("native-publication-gap.db");
     let db = Arc::new(Database::open_with_options(&path, options()).unwrap());
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)", &HashMap::new()).unwrap();
     for id in 0..16 {
         append(&db, id, vec![0.0, 1.0, id as f32 + 1.0]);
     }
@@ -295,7 +295,7 @@ fn native_tail_publication_answers_exactly_before_the_serving_cache_installs() {
 
 fn native_fixture(path: &std::path::Path) -> Database {
     let db = Database::open_with_options(path, options()).unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 512) CONSOLIDATION NONE)", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)", &HashMap::new()).unwrap();
     for id in 0..16 {
         append(&db, id, vec![0.0, 1.0, id as f32 + 1.0]);
     }

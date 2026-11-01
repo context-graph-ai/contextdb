@@ -242,7 +242,9 @@ fn partial_alters_member_defaults_and_group_defaults_change_only_the_declared_po
     .expect("a member DEFAULT clears only that member");
     let member_default = schema(&db, "policy_items");
     assert!(
-        member_default.contains("LISTS = 32") && !member_default.contains("PROBES"),
+        member_default.contains("LISTS = 32")
+            && member_default.contains("REFINE_FACTOR = 2.5")
+            && !member_default.contains("PROBES"),
         "member DEFAULT leaves the other declared members intact: {member_default}"
     );
 

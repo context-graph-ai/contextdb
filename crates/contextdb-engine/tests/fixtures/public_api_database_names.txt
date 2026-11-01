@@ -22,7 +22,6 @@ declared_reader_memory
 delete_edge
 delete_row
 delete_vector
-detach_writer_vector_session
 disk_file_size
 disk_limit
 disk_limit_startup_ceiling
@@ -62,7 +61,6 @@ open_with_contexts
 open_with_options
 open_with_plugin
 open_with_scope_labels
-open_with_writer_vector_session
 owner_read_config
 owner_read_status
 persist_import_vector_tails
@@ -83,7 +81,6 @@ query_bfs
 query_vector
 read_session
 read_session_with_progress
-reattach_writer_vector_session
 register_cron_callback
 register_sink
 register_transactional_trigger_callback

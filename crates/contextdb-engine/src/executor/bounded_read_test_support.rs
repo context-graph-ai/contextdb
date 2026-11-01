@@ -244,6 +244,14 @@ pub enum TestError {
     Unimplemented,
     Refused(ReadFailure),
     Cancelled,
+    /// The engine's typed memory refusal, kept with its figures.
+    MemoryBudgetExceeded {
+        subsystem: String,
+        operation: String,
+        requested_bytes: usize,
+        available_bytes: usize,
+        budget_limit_bytes: usize,
+    },
     Engine(String),
 }
 
@@ -252,6 +260,20 @@ fn test_error(error: BoundedExecutionError) -> TestError {
         BoundedExecutionError::Unimplemented => TestError::Unimplemented,
         BoundedExecutionError::Refused(refusal) => TestError::Refused(refusal),
         BoundedExecutionError::Cancelled => TestError::Cancelled,
+        BoundedExecutionError::Engine(contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        }) => TestError::MemoryBudgetExceeded {
+            subsystem: subsystem.to_string(),
+            operation: operation.to_string(),
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+        },
         BoundedExecutionError::Engine(error) => TestError::Engine(error.to_string()),
     }
 }
