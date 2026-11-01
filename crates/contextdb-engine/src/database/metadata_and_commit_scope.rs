@@ -3534,18 +3534,6 @@ pub(super) fn closed_database_error() -> Error {
     Error::Other(("database handle is closed".to_string()).into())
 }
 
-pub(super) fn bounded_snapshot_publication_timeout() -> Error {
-    Error::ReadFailure(
-        ReadFailure::new(
-            ReadFailureKind::OwnerTimeout,
-            ReadFailureDetail::Reason {
-                reason: "the writer has not published a complete read snapshot".to_string(),
-            },
-        )
-        .expect("owner timeout accepts a reason"),
-    )
-}
-
 impl ReadRegistrationBudget {
     pub(crate) fn new(clock: Arc<dyn DeadlineClock>, started_ms: u64, active_ms: u64) -> Self {
         Self {
@@ -3583,12 +3571,6 @@ impl ReadRegistrationBudget {
         Ok(Duration::from_millis(
             (self.active_ms - elapsed).saturating_add(1),
         ))
-    }
-
-    pub(super) fn elapsed_timeout(&self) -> Error {
-        self.remaining()
-            .err()
-            .unwrap_or_else(bounded_snapshot_publication_timeout)
     }
 }
 

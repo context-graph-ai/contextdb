@@ -516,12 +516,19 @@ fn healthy_registry_scan_contention_never_refuses_concurrent_cursors() {
     db.execute("INSERT INTO facts VALUES (1)", &HashMap::new())
         .unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(10));
+    // Never advanced: the default active-time limit stays in force and cannot
+    // expire because the host is busy.
+    let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
+        Arc::new(ManualDeadlineClock::at(0));
     let threads: Vec<_> = (0..10)
         .map(|worker| {
             let db = Arc::clone(&db);
             let barrier = Arc::clone(&barrier);
+            let clock = Arc::clone(&clock);
             std::thread::spawn(move || {
-                let session = db.read_session(ReadLimits::default()).unwrap();
+                let session = db
+                    .read_session_with_clock_for_test(ReadLimits::default(), clock)
+                    .unwrap();
                 barrier.wait();
                 let mut failures = Vec::new();
                 for round in 0..100 {

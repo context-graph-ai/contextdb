@@ -3028,8 +3028,6 @@ impl Database {
             .persistence
             .as_ref()
             .ok_or_else(closed_database_error)?;
-        let started = Instant::now();
-        let allowance = budget.remaining()?;
         let wake = Arc::new((Mutex::new(()), Condvar::new()));
         let cancelled = wake.clone();
         let _listener = withdrawn.try_tell_on_cancel(move || {
@@ -3041,10 +3039,7 @@ impl Database {
             if withdrawn.is_cancelled() {
                 return Ok(None);
             }
-            budget.remaining()?;
-            let Some(remaining) = allowance.checked_sub(started.elapsed()) else {
-                return Err(budget.elapsed_timeout());
-            };
+            let remaining = budget.remaining()?;
             let root = &selected.as_ref().expect("selected cursor root").1;
             match persistence.owner_cursor_pin_for_root(root) {
                 Ok(pin) => {
