@@ -321,9 +321,6 @@ pub(crate) fn native_receipt_reserve(
     native_backing_bytes: usize,
     coalesce_pages: usize,
 ) -> Result<usize> {
-    if rows == 0 {
-        return Ok(0);
-    }
     let pages = |bytes: usize| bytes.div_ceil(PAGE_BYTES);
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
     let mut entries = 0usize;

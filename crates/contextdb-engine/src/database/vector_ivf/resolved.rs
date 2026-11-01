@@ -183,13 +183,9 @@ pub(crate) fn resolve(
         to_usize(bytes, "WRITE_BUFFER_BYTES")?
     } else {
         let mut low = 0usize;
-        let mut high = if build_budget_bytes == u64::MAX {
-            usize::try_from(population.max(expected_vectors).max(1))
-                .unwrap_or(usize::MAX / stride)
-                .min(workspace_budget_bytes / stride)
-        } else {
-            workspace_budget_bytes / stride
-        };
+        let mut high = usize::try_from(population.max(expected_vectors).max(1))
+            .unwrap_or(usize::MAX / stride)
+            .min(workspace_budget_bytes / stride);
         while low < high {
             let mid = low + (high - low).div_ceil(2);
             if policy_for(mid * stride)

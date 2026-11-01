@@ -333,3 +333,29 @@ fn retention_during_an_unfinished_build_keeps_its_change_count() {
     assert_eq!(rows.rows()[0][0], Value::Int64(3));
     assert!(db.persist_import_vector_tails().expect("coverage ask"));
 }
+
+/// An empty declared index still prices its fixed roots and controls. Without
+/// them its build workspace takes the whole remaining budget and those required
+/// roots are refused, which stopped the consumer's import at its first file.
+#[test]
+fn maintaining_an_empty_declared_index_is_not_refused_under_a_memory_limit() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = Database::open_with_options(
+        &root.path().join("empty.db"),
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            memory_limit: Some(256 * 1024 * 1024),
+            ..DatabaseOpenOptions::default()
+        },
+    )
+    .expect("open the limited store");
+    db.execute(
+        &format!(
+            "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE INDEXED {})",
+            ivf(4, 4, 64)
+        ),
+        &empty(),
+    )
+    .expect("declare the clustered index");
+    maintain_to_completion(&db);
+}
