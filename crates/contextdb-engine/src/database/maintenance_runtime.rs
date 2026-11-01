@@ -47,6 +47,11 @@ pub(super) fn vector_partition_routes(
             }
             Ok(())
         };
+        #[cfg(all(test, feature = "test-seams"))]
+        super::vector_public_cycle_admission_tests::with_route_output_for_test(
+            _output.0, _output.1, _output.2, append,
+        )?;
+        #[cfg(not(all(test, feature = "test-seams")))]
         append()?;
     }
     Ok(routes)

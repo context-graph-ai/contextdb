@@ -10631,6 +10631,9 @@ mod storage_compaction_overlap_tests;
 #[cfg(test)]
 mod maintenance_resource_tests;
 
+#[cfg(all(test, feature = "test-seams"))]
+mod vector_public_cycle_admission_tests;
+
 /// Deterministic observation points inside a memory-limit transition, so a
 /// concurrency contract can be stated as a measurement instead of an argument.
 /// The hook fires on the transitioning thread while another thread inspects the

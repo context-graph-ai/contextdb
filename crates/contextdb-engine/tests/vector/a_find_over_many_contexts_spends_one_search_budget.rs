@@ -226,6 +226,7 @@ fn statement(selected: usize) -> (String, HashMap<String, Value>) {
 }
 
 struct Observed {
+    rows: Vec<Vec<Value>>,
     evaluations: u64,
     backend_bytes: u64,
     decoded_rows: u64,
@@ -305,6 +306,7 @@ fn measure_within(
         answer.trace().rows_examined,
     );
     Observed {
+        rows: answer.rows().to_vec(),
         evaluations: counts.evaluations.load(Ordering::Relaxed),
         backend_bytes: backend_bytes.load(Ordering::Relaxed),
         decoded_rows: counters.decoded_rows,
@@ -401,6 +403,12 @@ fn a_warm_find_over_many_contexts_reads_no_index_page_twice() {
         "warm_reload contexts={PARTITIONS} budget={TIGHT_MEMORY_BUDGET_BYTES} evaluations={} \
          backend_bytes={}",
         observed.evaluations, observed.backend_bytes,
+    );
+    // Memory pressure changes what is resident, never the rows in the answer.
+    let roomy = measure(&path, &runtime, PARTITIONS);
+    assert_eq!(
+        observed.rows, roomy.rows,
+        "a reader limited to {TIGHT_MEMORY_BUDGET_BYTES} bytes answers the same rows as a roomy reader"
     );
     assert!(
         observed.backend_bytes == 0,

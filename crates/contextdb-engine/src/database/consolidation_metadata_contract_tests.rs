@@ -746,3 +746,136 @@ fn graphs(db: &Database) -> Vec<(Option<u64>, bool)> {
         })
         .collect()
 }
+
+/// Lowering a consolidation threshold makes pending work due without touching
+/// rows, a refused replacement keeps every pending insert and tombstone, and a
+/// successful NONE declaration clears the now-obsolete failure mark while the
+/// retained work stays for the next enabled threshold.
+#[test]
+fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::open(directory.path().join("recheck.db")).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    run(
+        &db,
+        "CREATE TABLE recheck_rows (id INT PRIMARY KEY, scope_id TEXT NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope_id) SEARCH_MODE INDEXED CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 100))",
+    );
+    for id in 0..32 {
+        db.execute(
+            "INSERT INTO recheck_rows VALUES ($id, 'scope', '[1,0,0]')",
+            &HashMap::from([("id".into(), Value::Int64(id))]),
+        )
+        .unwrap();
+    }
+    let show = || {
+        let shown = db
+            .execute(
+                "SHOW VECTOR_PARTITIONS FOR recheck_rows.embedding",
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(shown.rows().len(), 1);
+        let cell = |name: &str| {
+            let position = shown
+                .columns()
+                .iter()
+                .position(|column| column == name)
+                .unwrap();
+            shown.rows()[0][position].clone()
+        };
+        (
+            cell("query_state"),
+            cell("base_generation"),
+            cell("pending_inserts"),
+            cell("tombstones"),
+            cell("maintenance_reason"),
+        )
+    };
+    let drive = |until: &dyn Fn() -> bool| {
+        for _ in 0..128 {
+            if until() {
+                return;
+            }
+            db.run_maintenance_cycle().unwrap();
+        }
+        panic!("finite maintenance did not reach the expected state");
+    };
+    let ready = Value::Text("ready".into());
+    drive(&|| show().0 == ready);
+    let initial = show().1;
+    run(
+        &db,
+        "UPDATE recheck_rows SET embedding = '[0,1,0]' WHERE id = 0",
+    );
+    let pending = (show().2, show().3);
+    assert_ne!(pending.0, Value::Int64(0));
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.built_partitions,
+        0,
+        "the old high threshold must leave the same changes ineligible"
+    );
+    assert_eq!((show().2, show().3), pending);
+    run(
+        &db,
+        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
+    );
+    assert_eq!(show().1, initial, "a declaration change publishes no index");
+    assert_eq!((show().2, show().3), pending);
+    drive(&|| show().1 != initial && show().2 == Value::Int64(0));
+    let replacement = show().1;
+    assert_eq!(
+        db.execute("SELECT id FROM recheck_rows WHERE scope_id = $scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            &HashMap::from([("q".into(), Value::Vector(vec![0.0, 1.0, 0.0])), ("scope".into(), Value::Text("scope".into()))])).unwrap().rows(),
+        vec![vec![Value::Int64(0)]],
+        "the published serving chain includes the newly published change"
+    );
+
+    let original_limit = db.memory_limit();
+    db.set_memory_limit(Some(db.accountant().usage().used.saturating_add(96 * 1024)))
+        .unwrap();
+    run(
+        &db,
+        "UPDATE recheck_rows SET embedding = '[0,0,1]' WHERE id = 1",
+    );
+    let before_failure = (show().2, show().3);
+    assert_ne!(before_failure.0, Value::Int64(0));
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.first_failure,
+        Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
+    );
+    assert_eq!(
+        show().4,
+        Value::Text("memory_limit".into()),
+        "the refusal is recorded against the partition"
+    );
+    assert_eq!(
+        (show().2, show().3),
+        before_failure,
+        "a refused replacement must preserve every pending insert and tombstone"
+    );
+
+    db.set_memory_limit(original_limit).unwrap();
+    run(
+        &db,
+        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
+    );
+    assert_eq!(show().1, replacement);
+    assert_eq!((show().2, show().3), before_failure);
+    assert_eq!(
+        show().4,
+        Value::Text("none".into()),
+        "a successful NONE publication must clear its obsolete failure mark"
+    );
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.built_partitions,
+        0
+    );
+    assert_eq!(show().1, replacement);
+    assert_eq!((show().2, show().3), before_failure);
+
+    run(
+        &db,
+        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
+    );
+    drive(&|| show().1 != replacement && show().2 == Value::Int64(0));
+}

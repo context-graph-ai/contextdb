@@ -127,3 +127,53 @@ fn retained_oversized_body_is_refused_before_persisted_decode() {
     );
     assert_eq!(memory.held(), 0);
 }
+
+#[test]
+fn raw_vector_encoded_width_accepts_all_quantizations_and_extreme_scalar_framing() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("raw-width.db");
+    let database = crate::Database::open(&path).unwrap();
+    database.close().unwrap();
+    let persistence = RedbPersistence::open(&path).unwrap();
+    for dimension in [1, 2, 251, 768, 65_536] {
+        for quantization in [
+            VectorQuantization::F32,
+            VectorQuantization::SQ8,
+            VectorQuantization::SQ4,
+        ] {
+            let mut entry = PersistedVectorEntry {
+                // UTF-8 lengths are bytes, as in the serialized route strings.
+                index: VectorIndexRef::new("資料".repeat(43), "embedding".repeat(31)),
+                row_id: RowId(u64::MAX),
+                vector: PersistedVector::from_f32(&vec![0.0; dimension], quantization),
+                created_tx: TxId(u64::MAX),
+                deleted_tx: Some(TxId(u64::MAX)),
+                lsn: Lsn(u64::MAX),
+            };
+            if let PersistedVector::SQ8 { min, max, .. } | PersistedVector::SQ4 { min, max, .. } =
+                &mut entry.vector
+            {
+                *min = f32::MIN;
+                *max = f32::MAX;
+            }
+            let encoded = RedbPersistence::encode(&entry).unwrap();
+            persistence
+                .validate_raw_vector_entry_encoded_width(&encoded, &entry.index, dimension)
+                .unwrap();
+            let decoded = RedbPersistence::decode_vector_entry(&encoded).unwrap();
+            assert_eq!(decoded.vector.len(), dimension);
+            assert_eq!(decoded.index, entry.index);
+            assert_eq!(decoded.row_id, entry.row_id);
+            assert_eq!(decoded.created_tx, entry.created_tx);
+            assert_eq!(decoded.deleted_tx, entry.deleted_tx);
+            assert_eq!(decoded.lsn, entry.lsn);
+        }
+    }
+}

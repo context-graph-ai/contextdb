@@ -232,3 +232,95 @@ fn native_durable_generation_build_and_seal_workspaces_keep_separate_original_in
     );
     db.close().unwrap();
 }
+
+/// Switching to caller-driven maintenance while the engine-owned worker has a
+/// build in flight stops the worker, returns its reservation, reports the
+/// partition as pending a caller cycle, and the next cycles publish the route.
+#[cfg(feature = "test-seams")]
+#[test]
+fn switching_to_caller_driven_during_a_native_build_reports_pending_before_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("stop.db")).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.native_ivf_set_test_options(crate::vector_ivf_observations::NativeIvfIndexTestOptions {
+        write_buffer_cap_bytes: None,
+        build_batch_rows: Some(2),
+    })
+    .unwrap();
+    db.execute(
+        "CREATE TABLE items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    for id in 0..16 {
+        db.execute(
+            "INSERT INTO items VALUES ($id, '[1,0,0]')",
+            &HashMap::from([("id".into(), Value::Int64(id))]),
+        )
+        .unwrap();
+    }
+    let before = db.accountant.usage().used;
+    db.set_maintenance_policy(MaintenancePolicy::EngineOwned);
+    let clock = db
+        .__hold_engine_owned_vector_maintenance_clock_for_test()
+        .unwrap();
+    clock.wait_until_held_asleep();
+    let caller = std::thread::current().id();
+    let completed = clock.wake_once().unwrap();
+    assert_ne!(
+        completed.worker_thread_id, caller,
+        "the build cycle ran on the engine-owned worker"
+    );
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    assert!(clock.worker_exited());
+    assert_eq!(db.maintenance_policy(), MaintenancePolicy::CallerDriven);
+    assert!(!db.maintenance_status().running);
+    assert_eq!(
+        db.accountant.usage().used,
+        before,
+        "stopping the worker returns its reservation"
+    );
+    let shown = db
+        .execute("SHOW VECTOR_PARTITIONS FOR items.v", &HashMap::new())
+        .unwrap();
+    assert_eq!(shown.rows().len(), 1);
+    let cell = |name: &str| {
+        let position = shown
+            .columns()
+            .iter()
+            .position(|column| column == name)
+            .unwrap();
+        shown.rows()[0][position].clone()
+    };
+    assert_ne!(
+        cell("query_state"),
+        Value::Text("ready".into()),
+        "the stopped build published nothing"
+    );
+    assert_eq!(
+        cell("recovery_action"),
+        Value::Text("run_maintenance_cycle".into()),
+        "the stopped partition reports that a caller cycle continues it"
+    );
+    for _ in 0..64 {
+        if db
+            .run_maintenance_cycle()
+            .unwrap()
+            .vector
+            .remaining_partitions
+            == 0
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM items ORDER BY v <=> [1,0,0] USE VECTOR INDEXED LIMIT 3",
+            &HashMap::new()
+        )
+        .unwrap()
+        .rows()
+        .len(),
+        3
+    );
+}

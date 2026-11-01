@@ -118,6 +118,222 @@ fn durable_state(db: &Database) -> serde_json::Value {
     })
 }
 
+fn obsolete_scalar_lsns(db: &Database) -> Vec<Lsn> {
+    let rows = db
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_relational_table("currency_scalar")
+        .unwrap();
+    let newest = rows.iter().map(|row| row.lsn).max().unwrap();
+    rows.iter()
+        .filter_map(|row| (row.lsn != newest).then_some(row.lsn))
+        .collect()
+}
+
+fn journal_for_table(db: &Database, table: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut prefix = (table.len() as u64).to_be_bytes().to_vec();
+    prefix.extend_from_slice(table.as_bytes());
+    raw_vector_records(db, "vector_partition_journal")
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .collect()
+}
+
+fn untouched_state(db: &Database) -> serde_json::Value {
+    let persistence = db.persistence.as_ref().unwrap();
+    serde_json::json!({
+        "rows": persistence.load_relational_table("untouched").unwrap(),
+        "journal": journal_for_table(db, "untouched"),
+        "vectors": persistence.load_vectors().unwrap().into_iter()
+            .filter(|entry| entry.index.table == "untouched").collect::<Vec<_>>(),
+        "memberships": persistence.load_vector_partition_memberships().unwrap().into_iter()
+            .filter(|entry| entry.index.table == "untouched").collect::<Vec<_>>(),
+    })
+}
+
+fn assert_clean(db: &Database, obsolete_lsns: &[Lsn], untouched: &serde_json::Value) {
+    let persistence = db.persistence.as_ref().unwrap();
+    for table in ["currency_vectors", "currency_scalar"] {
+        assert_eq!(persistence.load_relational_table(table).unwrap().len(), 1);
+        assert_eq!(durable_observation::version_count(db, table), 1);
+    }
+    let vectors = persistence.load_vectors().unwrap();
+    let memberships = persistence.load_vector_partition_memberships().unwrap();
+    let selected = vectors
+        .iter()
+        .filter(|entry| entry.index.table == "currency_vectors")
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].deleted_tx.is_none());
+    let selected_memberships = memberships
+        .iter()
+        .filter(|entry| entry.index.table == "currency_vectors")
+        .collect::<Vec<_>>();
+    assert_eq!(selected_memberships.len(), 1);
+    assert_eq!(
+        selected_memberships[0].vector_created_tx,
+        selected[0].created_tx
+    );
+    assert_eq!(selected_memberships[0].vector_lsn, selected[0].lsn);
+    assert!(selected_memberships[0].deleted_tx.is_none());
+
+    assert_eq!(untouched_state(db), *untouched);
+    assert_eq!(
+        raw_vector_records(db, "vector_partition_tombstones").len(),
+        (VERSIONS - 1) as usize,
+        "only the unrelated table's tombstones remain"
+    );
+    assert_eq!(
+        vectors
+            .iter()
+            .filter(|entry| entry.index.table == "untouched")
+            .count(),
+        VERSIONS as usize
+    );
+    assert_eq!(
+        memberships
+            .iter()
+            .filter(|entry| entry.index.table == "untouched")
+            .count(),
+        VERSIONS as usize
+    );
+    let commits = persistence.load_commit_index().unwrap();
+    assert!(
+        !obsolete_lsns.is_empty(),
+        "the fixture must have removable commit-index identities"
+    );
+    for lsn in obsolete_lsns {
+        assert!(
+            !commits.contains_key(lsn),
+            "obsolete commit {lsn:?} must be reclaimed"
+        );
+    }
+    assert!(
+        !commits.is_empty(),
+        "cleanup retains the commit-index anchor and live references"
+    );
+    assert_eq!(
+        db.execute("SELECT value FROM currency_scalar", &HashMap::new())
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Int64((VERSIONS - 1) as i64)]]
+    );
+}
+
+#[test]
+fn currency_cleanup_crashes_keep_both_removal_gaps_atomic_and_retryable() {
+    const CHILD_PATH: &str = "CONTEXTDB_CURRENCY_CLEANUP_TEST_PATH";
+    const CHILD_BOUNDARY: &str = "CONTEXTDB_CURRENCY_CLEANUP_TEST_BOUNDARY";
+    if let Ok(path) = std::env::var(CHILD_PATH) {
+        let boundary = std::env::var(CHILD_BOUNDARY)
+            .unwrap()
+            .parse::<u8>()
+            .unwrap();
+        let db = open(std::path::Path::new(&path));
+        crate::persistence::arm_currency_reclaim_fault_for_test(boundary, true);
+        db.compact_currency_versions().unwrap();
+        panic!("cleanup did not reach its durable crash checkpoint");
+    }
+    // The first two stop after relational removal and after vector removal,
+    // still inside the same write transaction. The third stops after commit,
+    // before memory publication, proving recovery of the complete new state.
+    for boundary in [1, 2, 3] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("currency-crash.redb");
+        let db = open(&path);
+        seed(&db);
+        let before = durable_state(&db);
+        let obsolete_lsns = obsolete_scalar_lsns(&db);
+        assert_eq!(obsolete_lsns.len(), (VERSIONS - 1) as usize);
+        let untouched = untouched_state(&db);
+        assert_eq!(
+            raw_vector_records(&db, "vector_partition_tombstones").len(),
+            2 * (VERSIONS - 1) as usize,
+            "both tables start with old memberships to reclaim"
+        );
+        db.close().unwrap();
+        drop(db);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "database::currency_cleanup_atomicity_tests::currency_cleanup_crashes_keep_both_removal_gaps_atomic_and_retryable", "--nocapture"])
+            .env(CHILD_PATH, &path)
+            .env(CHILD_BOUNDARY, boundary.to_string())
+            .output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("CURRENCY_RECLAIM_CRASH={boundary}")),
+            "child must reach the real transaction boundary: {output:?}"
+        );
+
+        let db = open(&path);
+        if boundary < 3 {
+            assert_eq!(
+                durable_state(&db),
+                before,
+                "no selected removal can commit on its own"
+            );
+        } else {
+            assert_clean(&db, &obsolete_lsns, &untouched);
+        }
+        let report = db.compact_currency_versions().unwrap();
+        assert_eq!(
+            report.pruned_versions,
+            if boundary < 3 { 2 * (VERSIONS - 1) } else { 0 }
+        );
+        assert_eq!(
+            report.vector_keys_rewritten,
+            if boundary < 3 { VERSIONS - 1 } else { 0 }
+        );
+        assert_eq!(
+            report.commit_index_keys_removed,
+            if boundary < 3 { VERSIONS - 1 } else { 0 }
+        );
+        assert_eq!(
+            report.tables_in_memory_snapshot, 2,
+            "unrelated histories stay outside cleanup selection"
+        );
+        assert_eq!(report.keys_rewritten, 0);
+        assert_eq!(report.edge_keys_rewritten, 0);
+        assert_clean(&db, &obsolete_lsns, &untouched);
+        let clean = durable_state(&db);
+        let prior_journal = before["journal"].as_array().unwrap();
+        let live_journal = clean["journal"].as_array().unwrap();
+        assert_eq!(
+            prior_journal.len() - live_journal.len(),
+            2 * (VERSIONS - 1) as usize,
+            "only reclaimed versions' upsert/tombstone references are removed"
+        );
+        for record in live_journal {
+            assert!(
+                prior_journal.contains(record),
+                "surviving journal bytes are unchanged"
+            );
+        }
+        let charged = db.accountant().usage().used;
+        let again = db.compact_currency_versions().unwrap();
+        assert_eq!(again.pruned_versions, 0);
+        assert_eq!(again.vector_keys_rewritten, 0);
+        assert_eq!(again.commit_index_keys_removed, 0);
+        assert_eq!(
+            db.accountant().usage().used,
+            charged,
+            "a retry cannot release bytes twice"
+        );
+        assert_eq!(durable_state(&db), clean);
+        db.close().unwrap();
+        drop(db);
+        let reopened = open(&path);
+        assert_eq!(
+            durable_state(&reopened),
+            clean,
+            "repeated restart cannot resurrect a removed identity"
+        );
+        assert_clean(&reopened, &obsolete_lsns, &untouched);
+        reopened.close().unwrap();
+    }
+}
+
 #[test]
 fn currency_cleanup_storage_errors_keep_memory_and_disk_available_for_retry() {
     // This raw codec fixture declares its own writer operation; it has no

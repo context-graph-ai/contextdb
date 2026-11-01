@@ -373,3 +373,170 @@ fn purge_during_a_multi_cycle_build_abandons_it_and_leaves_no_sampled_vector() {
         "the erased vector is never an answer"
     );
 }
+
+/// A partition emptied by deletes keeps serving (an empty answer) after
+/// reopen, maintenance of it is not a failure, and rows written into it
+/// afterwards are served and survive another reopen.
+#[test]
+fn a_partition_emptied_by_deletes_keeps_serving_after_reopen_and_accepts_new_rows() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let path = root.path().join("emptied.db");
+    let search = |db: &Database, mode: &str| {
+        int_ids(
+            &db.execute(
+                &format!(
+                    "SELECT id FROM emptied_items ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 5"
+                ),
+                &params([("query", Value::Vector(unit_vector(0, DIMENSIONS)))]),
+            )
+            .expect("search the emptied partition"),
+        )
+    };
+    let db = open_caller_driven(&path);
+    db.execute(
+        &format!(
+            "CREATE TABLE emptied_items (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE INDEXED {})",
+            ivf(4, 4, 64)
+        ),
+        &empty(),
+    )
+    .expect("declare the clustered index");
+    for id in 0..ROWS {
+        insert(&db, "emptied_items", id, unit_vector(id as u64, DIMENSIONS));
+    }
+    drive_until_serving(&db, ROWS as usize, 1, 10);
+    for id in 0..ROWS {
+        db.execute(
+            "DELETE FROM emptied_items WHERE id = $id",
+            &params([("id", Value::Int64(id))]),
+        )
+        .expect("delete one row");
+    }
+    drive_until_serving(&db, ROWS as usize, 1, 10);
+    db.close().expect("close the emptied partition");
+
+    let reopened = open_caller_driven(&path);
+    for _ in 0..16 {
+        let report = reopened
+            .run_maintenance_cycle()
+            .expect("maintenance of the reopened emptied partition returns");
+        assert!(
+            report.vector.first_failure.is_none(),
+            "maintaining an emptied partition is not a failure: {:?}",
+            report.vector.first_failure
+        );
+    }
+    for mode in ["EXACT", "INDEXED"] {
+        assert_eq!(
+            search(&reopened, mode),
+            Vec::<i64>::new(),
+            "{mode} serves no rows from the emptied partition after reopen"
+        );
+    }
+
+    let fresh = ROWS + 1;
+    insert(
+        &reopened,
+        "emptied_items",
+        fresh,
+        unit_vector(0, DIMENSIONS),
+    );
+    drive_until_serving(&reopened, 1, 1, 10);
+    for mode in ["EXACT", "INDEXED"] {
+        assert_eq!(
+            search(&reopened, mode),
+            vec![fresh],
+            "{mode} serves a row written into the emptied partition"
+        );
+    }
+    reopened.close().expect("close the refilled partition");
+    let again = open_caller_driven(&path);
+    assert_eq!(
+        search(&again, "INDEXED"),
+        vec![fresh],
+        "the refilled partition survives reopen"
+    );
+}
+
+/// A PURGE refused on a declared disk or memory limit changes nothing: the
+/// rows and every index page stay as they were, and once the limit is lifted
+/// the same PURGE succeeds.
+#[test]
+fn a_purge_refused_on_a_declared_limit_changes_nothing_and_succeeds_once_lifted() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_caller_driven(&root.path().join("purge-limits.db"));
+    db.execute(
+        &format!(
+            "CREATE TABLE limit_items (id INTEGER PRIMARY KEY, embedding VECTOR({PURGE_DIMENSIONS}) SEARCH_MODE INDEXED {})",
+            ivf(4, 4, 64)
+        ),
+        &empty(),
+    )
+    .expect("declare the clustered index");
+    for id in 0..ROWS {
+        insert(
+            &db,
+            "limit_items",
+            id,
+            unit_vector(id as u64, PURGE_DIMENSIONS),
+        );
+    }
+    drive_until_serving(&db, ROWS as usize, 1, 10);
+    let rows_before = count(&db, "limit_items");
+    let pages = |db: &Database| {
+        physical_pages(db, "limit_items", "embedding")
+            .into_iter()
+            .map(|page| page.bytes)
+            .collect::<Vec<_>>()
+    };
+    let pages_before = pages(&db);
+
+    let size = db.disk_file_size().expect("a file-backed store has a size");
+    db.set_disk_limit(Some(size))
+        .expect("install a disk limit with no room for the purge's growth");
+    let refused = db.execute("PURGE FROM limit_items WHERE id = 7", &empty());
+    assert!(
+        matches!(
+            refused,
+            Err(contextdb_core::Error::DiskBudgetExceeded { .. })
+        ),
+        "a purge past the declared disk limit is refused with the typed disk error: {refused:?}"
+    );
+    assert_eq!(count(&db, "limit_items"), rows_before);
+    assert_eq!(
+        pages(&db),
+        pages_before,
+        "the disk refusal changed no index page"
+    );
+    db.set_disk_limit(None).expect("lift the disk limit");
+
+    let used = db.accountant().usage().used;
+    db.set_memory_limit(Some(used + 4_096))
+        .expect("install a memory limit with no room for the purge's workspace");
+    let refused = db.execute("PURGE FROM limit_items WHERE id = 7", &empty());
+    assert!(
+        matches!(
+            refused,
+            Err(contextdb_core::Error::MemoryBudgetExceeded { .. })
+        ),
+        "a purge past the declared memory limit is refused with the typed memory error: {refused:?}"
+    );
+    assert_eq!(count(&db, "limit_items"), rows_before);
+    assert_eq!(
+        pages(&db),
+        pages_before,
+        "the memory refusal changed no index page"
+    );
+    assert_eq!(
+        db.accountant().usage().used,
+        used,
+        "the refused purge released its workspace"
+    );
+    db.set_memory_limit(None).expect("lift the memory limit");
+
+    let erased = db
+        .execute("PURGE FROM limit_items WHERE id = 7", &empty())
+        .expect("the same purge succeeds once the limits are lifted");
+    assert_eq!(erased.rows_affected(), 1);
+    assert_eq!(count(&db, "limit_items"), rows_before - 1);
+}

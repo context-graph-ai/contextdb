@@ -15,7 +15,7 @@ use super::support::{
     unit_vector,
 };
 use contextdb_core::Value;
-use contextdb_engine::Database;
+use contextdb_engine::{Database, MaintenancePolicy};
 
 const DIMENSIONS: usize = 16;
 const OPTIONS: IndexTestOptions = IndexTestOptions {
@@ -171,4 +171,80 @@ fn damaged_index_pages_refuse_indexed_and_never_stop_writes() {
             "{damage:?}: no recovery action once the replacement serves"
         );
     }
+}
+
+/// A damaged serving index under the default engine-owned maintenance is
+/// repaired by the worker itself: the caller never runs a maintenance cycle,
+/// each wake runs on the worker thread, and INDEXED serves again afterwards.
+#[test]
+fn an_engine_owned_worker_repairs_a_damaged_index_without_a_caller_cycle() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_with_index_test_options(&root.path().join("owned.db"), OPTIONS);
+    db.execute(
+        &format!(
+            "CREATE TABLE damaged_items (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE AUTO {})",
+            ivf(4, 4, 64)
+        ),
+        &empty(),
+    )
+    .expect("declare the clustered index");
+    for id in BUILT {
+        insert(&db, id);
+    }
+    drive_until_serving(&db, 200, 1, 10);
+    let damaged_generation = serving(&db, "damaged_items", "embedding", &[])
+        .expect("a generation serves")
+        .generation;
+    damage_serving_index(
+        &db,
+        "damaged_items",
+        "embedding",
+        &[],
+        IndexDamage::CodebookDigest,
+    );
+    query(&db, 7, "INDEXED").expect_err("INDEXED is refused while the index is damaged");
+    assert_eq!(
+        recovery_action(&db, "damaged_items", "embedding", &[]),
+        Some(RecoveryAction::Rebuild)
+    );
+
+    db.set_maintenance_policy(MaintenancePolicy::EngineOwned);
+    let worker_clock = db
+        .__hold_engine_owned_vector_maintenance_clock_for_test()
+        .expect("hold the real worker at a deterministic externally-clocked barrier");
+    let caller = std::thread::current().id();
+    let mut serial = 0;
+    let mut repaired = false;
+    for _ in 0..256 {
+        let completed = worker_clock
+            .wake_once()
+            .expect("one deterministic worker wake completes one finite maintenance cycle");
+        assert!(
+            completed.cycle_serial > serial,
+            "each wake completes a newly numbered worker cycle"
+        );
+        assert_ne!(
+            completed.worker_thread_id, caller,
+            "the repair runs on the engine-owned worker, never as a caller-driven cycle"
+        );
+        serial = completed.cycle_serial;
+        if recovery_action(&db, "damaged_items", "embedding", &[]).is_none()
+            && query(&db, 7, "INDEXED").is_ok()
+        {
+            repaired = true;
+            break;
+        }
+    }
+    assert!(
+        repaired,
+        "the worker repaired the index within 256 finite wakes"
+    );
+    assert_eq!(query(&db, 7, "INDEXED").unwrap().first(), Some(&7));
+    assert_ne!(
+        serving(&db, "damaged_items", "embedding", &[])
+            .expect("a repaired generation serves")
+            .generation,
+        damaged_generation,
+        "repair publishes a new complete generation"
+    );
 }

@@ -1,5 +1,8 @@
 use super::retained_query_rows::RetainedRows;
 
+use super::maintained_search;
+use uuid::Uuid;
+
 use contextdb_core::read_contract::{
     DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureLimit, ReadLimits,
 };
@@ -215,6 +218,16 @@ fn grouped_query_with_fault(
     mode: &str,
     fault: Option<BoundedCandidateGroupingFaultForTest>,
 ) -> ChargedQuery {
+    grouped_query_outcome(db, partitions, mode, fault)
+        .expect("the fixed candidate scope remains affordable")
+}
+
+fn grouped_query_outcome(
+    db: &Database,
+    partitions: usize,
+    mode: &str,
+    fault: Option<BoundedCandidateGroupingFaultForTest>,
+) -> Result<ChargedQuery, bounded::TestError> {
     let graph = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let native = Arc::new(DistanceCounter(AtomicU64::new(0)));
     let grouping = Arc::new(GroupingCounter::default());
@@ -263,16 +276,15 @@ fn grouped_query_with_fault(
     let result = match fault {
         Some(fault) => with_bounded_candidate_grouping_fault_for_test(fault, execute),
         None => execute(),
-    }
-    .expect("the fixed candidate scope remains affordable");
-    ChargedQuery {
+    }?;
+    Ok(ChargedQuery {
         used_indexed_route: db.__debug_last_query_vector_used_indexed_route_for_test(),
         result,
         distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
         row_directory_lookups: grouping.row_directory_lookups.load(Ordering::SeqCst),
         snapshot_visibility_probes: grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
         placements: grouping.placements.load(Ordering::SeqCst),
-    }
+    })
 }
 
 const SCORE_PARTITIONS: usize = 8;
@@ -548,7 +560,32 @@ fn grouping_charge_bounds_reject_uncharged_and_repeated_candidate_work() {
             BoundedCandidateGroupingFaultForTest::RepeatGlobalCandidatePassPerPartition,
             BoundedCandidateGroupingFaultForTest::SuppressPlacementCharge,
         ] {
-            let faulty = grouped_query_with_fault(&db, partitions, "INDEXED", Some(fault));
+            let faulty = match (
+                fault,
+                grouped_query_outcome(&db, partitions, "INDEXED", Some(fault)),
+            ) {
+                // The injected repeated pass is itself rejected when the engine's
+                // typed memory refusal stops it; any other error is a failure.
+                (
+                    BoundedCandidateGroupingFaultForTest::RepeatGlobalCandidatePassPerPartition,
+                    Err(bounded::TestError::MemoryBudgetExceeded {
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        ..
+                    }),
+                ) => {
+                    assert!(
+                        requested_bytes > available_bytes && available_bytes <= budget_limit_bytes,
+                        "{partitions}-partition {fault:?} control must be refused for lack of memory: \
+                         requested {requested_bytes}, available {available_bytes}, budget {budget_limit_bytes}"
+                    );
+                    continue;
+                }
+                (_, outcome) => {
+                    outcome.expect("the fault control completes or is refused by memory")
+                }
+            };
             assert_eq!(
                 faulty.result.result.rows(),
                 control.result.result.rows(),
@@ -1086,5 +1123,209 @@ fn exhaustive_exact_scan_charges_retained_dead_and_future_versions_before_visibi
                 )
         ),
         "retained dead/future growth must hit the declared work ceiling before visibility can skip it: {refused:?}"
+    );
+}
+
+const CURRENT_ROWS_PER_CONTEXT: usize = 125;
+
+fn context_id(partition: usize) -> Uuid {
+    Uuid::from_u128(0xC045_1000_0000_0000_0000_0000_0000_0000 + partition as u128)
+}
+
+fn generation_id(partition: usize) -> Uuid {
+    Uuid::from_u128(0xC045_2000_0000_0000_0000_0000_0000_0000 + partition as u128)
+}
+
+fn insert(db: &Database, ordinal: usize, partition: usize, current: bool) {
+    db.execute(
+        "INSERT INTO scoped_vectors VALUES ($id, $context, $generation, $current, $embedding)",
+        &HashMap::from([
+            (
+                "id".into(),
+                Value::Int64(maintained_search::corpus_id(ordinal)),
+            ),
+            ("context".into(), Value::Uuid(context_id(partition))),
+            ("generation".into(), Value::Uuid(generation_id(partition))),
+            ("current".into(), Value::Bool(current)),
+            (
+                "embedding".into(),
+                Value::Vector(maintained_search::corpus_vector(ordinal)),
+            ),
+        ]),
+    )
+    .unwrap();
+}
+
+fn seed(include_unrelated_contexts: bool) -> Database {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE scoped_vectors (id INT PRIMARY KEY, context_id UUID NOT NULL, \
+         generation_id UUID NOT NULL, is_current BOOL NOT NULL, \
+         embedding VECTOR(768) PARTITION_KEY (context_id, generation_id) \
+         MAX_PARTITIONS 8 SEARCH_MODE AUTO)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE INDEX scoped_vectors_current_idx ON scoped_vectors \
+         (context_id, generation_id, is_current)",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    // Both fixtures contain byte-for-byte the same selected Context: the
+    // accepted 1,000 frozen vectors with exactly 125 current rows.
+    for ordinal in 0..SELECTED_ROWS {
+        insert(&db, ordinal, 0, ordinal < CURRENT_ROWS_PER_CONTEXT);
+    }
+    if include_unrelated_contexts {
+        // Grow only the other seven Contexts to the frozen 10,000-row total.
+        // Each has exactly 125 current rows; corpus ids and vector bytes stay
+        // in their frozen order.
+        for ordinal in SELECTED_ROWS..maintained_search::CORPUS_ROWS {
+            let offset = ordinal - SELECTED_ROWS;
+            let context = 1 + offset % 7;
+            let local_ordinal = offset / 7;
+            insert(
+                &db,
+                ordinal,
+                context,
+                local_ordinal < CURRENT_ROWS_PER_CONTEXT,
+            );
+        }
+    }
+    db
+}
+
+fn selected_context_snapshot(db: &Database) -> RetainedRows {
+    db.execute(
+        "SELECT id, context_id, generation_id, is_current, embedding FROM scoped_vectors \
+         WHERE context_id = $context AND generation_id = $generation ORDER BY id ASC",
+        &HashMap::from([
+            ("context".into(), Value::Uuid(context_id(0))),
+            ("generation".into(), Value::Uuid(generation_id(0))),
+        ]),
+    )
+    .expect("read every selected-Context field that can affect search")
+    .into()
+}
+
+fn scoped_query(db: &Database, partitions: usize) -> ChargedQuery {
+    let graph = Arc::new(DistanceCounter(AtomicU64::new(0)));
+    let native = Arc::new(DistanceCounter(AtomicU64::new(0)));
+    let grouping = Arc::new(GroupingCounter::default());
+    let mut params = HashMap::from([
+        (
+            "query".into(),
+            Value::Vector(maintained_search::held_out_vector(0)),
+        ),
+        ("is_current".into(), Value::Bool(true)),
+    ]);
+    let mut contexts = Vec::with_capacity(partitions);
+    let mut generations = Vec::with_capacity(partitions);
+    for partition in 0..partitions {
+        let context = format!("context_{partition}");
+        let generation = format!("generation_{partition}");
+        params.insert(context.clone(), Value::Uuid(context_id(partition)));
+        params.insert(generation.clone(), Value::Uuid(generation_id(partition)));
+        contexts.push(format!("${context}"));
+        generations.push(format!("${generation}"));
+    }
+    let result = with_bounded_candidate_grouping_observer_for_test(grouping.clone(), || {
+        with_native_ivf_seal_observer_for_test(graph.clone(), || {
+            with_native_vector_score_observer_for_test(native.clone(), || {
+                bounded::execute(
+                    db,
+                    &bounded::BoundedReadRequest::new(
+                        format!(
+                            "SELECT id FROM scoped_vectors WHERE context_id IN ({}) AND \
+                             generation_id IN ({}) AND is_current = $is_current \
+                             ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 10",
+                            contexts.join(", "),
+                            generations.join(", ")
+                        ),
+                        params,
+                        limits(),
+                        Arc::new(FrozenClock),
+                    ),
+                )
+            })
+        })
+    })
+    .unwrap_or_else(|error| panic!("bounded scoped query: {error:?}"));
+    ChargedQuery {
+        used_indexed_route: db.__debug_last_query_vector_used_indexed_route_for_test(),
+        result,
+        distance_evaluations: graph.0.load(Ordering::SeqCst) + native.0.load(Ordering::SeqCst),
+        row_directory_lookups: grouping.row_directory_lookups.load(Ordering::SeqCst),
+        snapshot_visibility_probes: grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
+        placements: grouping.placements.load(Ordering::SeqCst),
+    }
+}
+
+#[test]
+fn a_filtered_scope_is_charged_for_its_candidates() {
+    let small_db = seed(false);
+    let grown_db = seed(true);
+    let small_selected = selected_context_snapshot(&small_db);
+    let grown_selected = selected_context_snapshot(&grown_db);
+    assert_eq!(small_selected.len(), SELECTED_ROWS);
+    assert_eq!(
+        small_selected
+            .iter()
+            .filter(|row| row.get(3) == Some(&Value::Bool(true)))
+            .count(),
+        CURRENT_ROWS_PER_CONTEXT
+    );
+    assert_eq!(
+        small_selected, grown_selected,
+        "all selected rows, vectors, and current-state values stay byte-identical while only unrelated Contexts grow"
+    );
+    assert_eq!(
+        grown_db
+            .execute("SELECT id FROM scoped_vectors", &HashMap::new())
+            .unwrap()
+            .rows()
+            .len(),
+        maintained_search::CORPUS_ROWS,
+        "the grown arm retains the frozen 10,000-vector corpus"
+    );
+
+    let small = scoped_query(&small_db, 1);
+    let grown = scoped_query(&grown_db, 1);
+    assert_eq!(
+        small.result.result.rows(),
+        grown.result.result.rows(),
+        "unrelated partitions cannot alter the selected answer"
+    );
+    assert_eq!(
+        small.result.telemetry.work_units, grown.result.telemetry.work_units,
+        "the same 125-current-row scope keeps the same charged work as only unrelated partitions grow"
+    );
+    assert_independent_charge_bound("small selected Context", &small, CURRENT_ROWS_PER_CONTEXT);
+    assert_independent_charge_bound("grown selected Context", &grown, CURRENT_ROWS_PER_CONTEXT);
+
+    let all_contexts = scoped_query(&grown_db, 8);
+    assert_eq!(all_contexts.result.result.rows().len(), 10);
+    assert_eq!(
+        all_contexts
+            .result
+            .result
+            .trace()
+            .vector_search
+            .as_ref()
+            .and_then(|detail| detail.aggregate_allowed_vectors),
+        Some(8 * CURRENT_ROWS_PER_CONTEXT),
+        "the eight-Context arm admits exactly 125 current vectors per Context"
+    );
+    assert!(
+        all_contexts.result.telemetry.work_units <= limits().work,
+        "the eight-Context current scope retains cg's unchanged 50,000-work budget: {:?}",
+        all_contexts.result.telemetry
+    );
+    assert_independent_charge_bound(
+        "eight-Context scope",
+        &all_contexts,
+        8 * CURRENT_ROWS_PER_CONTEXT,
     );
 }
