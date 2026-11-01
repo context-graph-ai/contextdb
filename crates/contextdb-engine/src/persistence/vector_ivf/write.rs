@@ -24,7 +24,7 @@ use std::cell::{Cell, Ref, RefCell};
 /// Missing summaries are legitimate only for an actually empty route. A
 /// bounded first-key seek proves that case; existing source rows never become
 /// an invented empty baseline for native coverage.
-pub(super) fn source_summary(
+pub(in super::super) fn source_summary(
     write: &redb::WriteTransaction,
     route: &[u8],
 ) -> Result<super::super::vector_membership_pages::MembershipSummary> {
@@ -167,6 +167,47 @@ impl<'a> WriteSession<'a> {
             self.failed.set(true);
         }
         result
+    }
+    /// Retention removed dead memberships from this partition's source in the
+    /// caller's write; the scope's coverage and any unfinished build's change
+    /// count follow in that same write. This is no row commit: the native delete
+    /// ran when each row was tombstoned, and the covered LSN does not move.
+    /// Returns whether a scope changed; an exact-only column has no scope.
+    pub(in super::super) fn reduce_source(
+        &mut self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        before: &super::super::vector_membership_pages::MembershipSummary,
+        after: &super::super::vector_membership_pages::MembershipSummary,
+    ) -> Result<bool> {
+        debug_assert_eq!(
+            before.live_entries, after.live_entries,
+            "retention removed a live vector"
+        );
+        self.usable()?;
+        let write = self.write;
+        let through = self.admission.run_original_unqualified(|| {
+            let schema = RedbPersistence::vector_schema_binding_in_write(write, index)?;
+            let digest = control::tuple_digest(tuple);
+            let key = control::scope_key(control::index_digest(index, schema), digest);
+            NativeIo::Borrowed(write).with_value(SCOPES.name(), &key, |value| {
+                value
+                    .map(|v| {
+                        ScopeRecord::decode(index, &key, v, schema, digest)
+                            .map(|record| record.committed_through_lsn)
+                    })
+                    .transpose()
+            })
+        })?;
+        let Some(through) = through else {
+            return Ok(false);
+        };
+        self.row_commit_lsn = Lsn(through);
+        self.with_scope(index, tuple, &|| Ok(()), &|_| Ok(()), |scope| {
+            scope.prepare_source_changes(before, after)?;
+            scope.begin_operation()?.commit()
+        })?;
+        Ok(true)
     }
     /// Called after every row/scope/schema write, immediately before the real
     /// outer commit. The mutable borrow excludes any still-live scope holder.

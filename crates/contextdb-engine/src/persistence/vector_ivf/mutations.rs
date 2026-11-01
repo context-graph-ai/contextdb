@@ -108,7 +108,7 @@ impl write::WriteSession<'_> {
     pub(crate) fn apply_rows(
         &mut self,
         persistence: &RedbPersistence,
-        previous: &super::super::vector_paged::CapturedPagedRoot,
+        previous: &redb::ReadTransaction,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         ws: &contextdb_tx::WriteSet,
         batch: &PreparedVectorPartitionMutationBatch,
@@ -148,7 +148,7 @@ impl write::WriteSession<'_> {
                 let tuple = &binding.partition_key;
                 self.with_scope(index, tuple, &|| Ok(()), &|_| Ok(()), |scope| {
                     let route = RedbPersistence::vector_partition_prefix(index, tuple);
-                    let before = previous_summary(&previous.read, &route)?;
+                    let before = previous_summary(previous, &route)?;
                     let after = write::source_summary(write, &route)?;
                     let declared = column(binding)?;
                     #[cfg(feature = "test-seams")]

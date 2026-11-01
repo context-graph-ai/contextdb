@@ -305,6 +305,9 @@ impl RedbPersistence {
         };
         self.with_db(|db| {
             let write_txn = Self::begin_history_write(db)?;
+            // A statement's scoped root may predate commits it waited behind.
+            // With the write held, a new read is this write's exact predecessor.
+            let native_predecessor = native_basis.as_ref().map(|_| db.begin_read().map_err(Self::storage_error)).transpose()?;
             #[cfg(feature="test-seams")]
             let mut native_observation=native_basis.as_ref().map(|_|crate::vector_ivf_observations::NativeIvfOuterWriteObservation::begin());
             let mut native_session=if let (Some(basis),Some(admission))=(&native_basis,&native_admission) {
@@ -1355,8 +1358,8 @@ let mut graph_publication_attempt = crate::read_work_probe::GraphPublicationAtte
                 Ok::<_, Error>((pending_manifests, identity_mutations_commitment_credits,
                     identity_mutations))
             })()?;
-            if let (Some(session),Some(basis),Some(original),Some(batch))=(&mut native_session,&native_basis,&native_original,partition_mutations) {
-                session.apply_rows(self,basis,original,ws,batch,&write_txn)?;
+            if let (Some(session),Some(predecessor),Some(original),Some(batch))=(&mut native_session,&native_predecessor,&native_original,partition_mutations) {
+                session.apply_rows(self,predecessor,original,ws,batch,&write_txn)?;
             }
             if let (Some(session),Some(original),Some(erasure))=(&mut native_session,&native_original,options.local_erasure.as_ref()) {
                 session.erase_rows(self,original,&erasure.projection.vector_partition_identities)?;

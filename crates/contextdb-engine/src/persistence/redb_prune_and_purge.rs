@@ -3059,6 +3059,33 @@ impl RedbPersistence {
         if selected.is_empty() {
             return Ok(());
         }
+        // Each partition's scope follows its source in this write. Borrow before
+        // the membership tables open: the borrow validates their roots.
+        let native_projection = write_txn
+            .table_root_fingerprint(vector_ivf::SCOPES)
+            .map_err(Self::storage_error)?
+            .map(|_| self.require_decode_original())
+            .transpose()?;
+        let native_original = native_projection
+            .as_ref()
+            .map(|projection| projection.preparation_original())
+            .transpose()?;
+        let native_admission = native_original
+            .as_ref()
+            .map(native_storage_admission::StorageAdmissionScope::writer_original)
+            .transpose()?;
+        let mut native_session = match (&native_projection, &native_admission) {
+            (Some(projection), Some(admission)) => Some(vector_ivf::write::WriteSession::borrow(
+                write_txn,
+                admission,
+                projection.vector_budget()?,
+                contextdb_core::SnapshotId(0),
+                Lsn(0),
+                Lsn(0),
+            )?),
+            _ => None,
+        };
+        let mut scope_reduced = false;
         let mut memberships = write_txn
             .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
             .map_err(Self::storage_error)?;
@@ -3123,11 +3150,21 @@ impl RedbPersistence {
                     }
                 }
             }
-            for selected in removed {
+            // Removed records are in key order, and the key starts with the
+            // partition, so each partition's removals are consecutive.
+            let mut partition_before = None;
+            let mut removed = removed.into_iter().peekable();
+            while let Some(selected) = removed.next() {
                 // Keep the tuple intact across every fallible deletion so
                 // error unwinding also drops the record before its owner.
                 let (record, copy_bytes, _) = &selected;
                 let copy_bytes = *copy_bytes;
+                if native_session.is_some() && partition_before.is_none() {
+                    partition_before = Some(vector_ivf::write::source_summary(
+                        write_txn,
+                        &Self::vector_partition_prefix(index, &record.partition_key),
+                    )?);
+                }
                 let mut key = Self::vector_partition_membership_key(record);
                 memberships
                     .remove(key.as_slice())
@@ -3141,6 +3178,19 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
                 drop(key);
+                if let Some(session) = native_session.as_mut()
+                    && removed.peek().is_none_or(|(next, _, _)| {
+                        next.partition_key != record.partition_key
+                    })
+                    && let Some(before) = partition_before.take()
+                {
+                    let after = vector_ivf::write::source_summary(
+                        write_txn,
+                        &Self::vector_partition_prefix(index, &record.partition_key),
+                    )?;
+                    scope_reduced |=
+                        session.reduce_source(index, &record.partition_key, &before, &after)?;
+                }
                 drop(selected);
                 if let Some(workspace) = workspace.as_mut() {
                     workspace.try_shrink(copy_bytes)?;
@@ -3210,7 +3260,11 @@ impl RedbPersistence {
                 }
             }
         }
+        drop((memberships, tombstones, journal));
         vector_membership_pages::settle_dirty_occupancy(write_txn, self.proof_accountant())?;
+        if let Some(session) = native_session.as_mut().filter(|_| scope_reduced) {
+            session.bind_final()?;
+        }
         Ok(())
     }
 

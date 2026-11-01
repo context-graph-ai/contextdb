@@ -46,6 +46,49 @@ fn open(path: &std::path::Path) -> Database {
     db
 }
 
+/// `open` for a table whose cleanup reclaims a replaced vector, as the
+/// context-graph consumer declares its passages.
+fn open_current_only(path: &std::path::Path) -> Database {
+    let db = Database::open_with_options(
+        path,
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..DatabaseOpenOptions::default()
+        },
+    )
+    .expect("open the file-backed import store");
+    db.execute(
+        &format!(
+            "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE INDEXED {}) HISTORY CURRENT ONLY SYNC OFF",
+            ivf(4, 4, 64)
+        ),
+        &empty(),
+    )
+    .expect("declare the clustered index");
+    db
+}
+
+/// Give `ids` new vectors, leaving their previous vectors dead. Row `id` is
+/// then nearest to `unit_vector(id + salt)`.
+fn replace(db: &Database, ids: std::ops::Range<i64>, salt: u64) {
+    let tx = db.begin_or_panic();
+    for id in ids {
+        db.execute_in_tx(
+            tx,
+            "UPDATE passages SET embedding = $embedding WHERE id = $id",
+            &params([
+                ("id", Value::Int64(id)),
+                (
+                    "embedding",
+                    Value::Vector(unit_vector(id as u64 + salt, DIMENSIONS)),
+                ),
+            ]),
+        )
+        .expect("replace one passage vector");
+    }
+    db.commit(tx).expect("commit the replaced vectors");
+}
+
 fn commit(db: &Database, ids: std::ops::Range<i64>) {
     let tx = db.begin_or_panic();
     for id in ids {
@@ -183,5 +226,110 @@ fn the_consumer_loop_finishes_in_finitely_many_cycles_and_is_idle_once_covered()
     commit(&db, IMPORTED..IMPORTED + 8);
     let again = maintain_passage_vectors(&db);
     assert!(again <= MAX_CYCLES);
+    assert!(db.persist_import_vector_tails().expect("coverage ask"));
+}
+
+/// Cleanup that reclaims a replaced vector must leave a healthy store: the
+/// consumer's import stopped here with a corrupt-store refusal at its first
+/// sealed file.
+#[test]
+fn retention_of_a_replaced_passage_keeps_maintenance_search_and_the_next_commit() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let path = root.path().join("replaced.db");
+    let db = open_current_only(&path);
+    commit(&db, 0..IMPORTED);
+    maintain_to_completion(&db);
+    replace(&db, 0..10, 100);
+    assert_eq!(
+        db.compact_currency_versions()
+            .expect("cleanup reclaims the replaced vectors")
+            .pruned_versions,
+        10
+    );
+    maintain_to_completion(&db);
+    let nearest = |db: &Database| {
+        db.execute(
+            "SELECT id FROM passages ORDER BY embedding <=> $query LIMIT 1",
+            &params([(
+                "query",
+                Value::Vector(unit_vector(3 + 100, DIMENSIONS)),
+            )]),
+        )
+        .expect("search after cleanup")
+        .rows()[0][0]
+            .clone()
+    };
+    assert_eq!(nearest(&db), Value::Int64(3));
+    commit(&db, IMPORTED..IMPORTED + 1);
+    db.close().expect("close the store");
+    let db = Database::open_with_options(
+        &path,
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..DatabaseOpenOptions::default()
+        },
+    )
+    .expect("reopen after cleanup");
+    assert_eq!(nearest(&db), Value::Int64(3));
+}
+
+#[test]
+fn the_consumer_loop_covers_a_replaced_passage_after_retention() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_current_only(&root.path().join("consumer-replaced.db"));
+    commit(&db, 0..IMPORTED);
+    maintain_to_completion(&db);
+    replace(&db, 0..10, 100);
+    assert_eq!(
+        db.compact_currency_versions()
+            .expect("cleanup reclaims the replaced vectors")
+            .pruned_versions,
+        10
+    );
+    maintain_passage_vectors(&db);
+    assert!(db.persist_import_vector_tails().expect("coverage ask"));
+}
+
+/// A version born and superseded after a build began can be reclaimed while
+/// that build is unfinished. Publication then checks the build's change count
+/// against the source, so it fails if cleanup left the count behind.
+#[test]
+fn retention_during_an_unfinished_build_keeps_its_change_count() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_current_only(&root.path().join("unfinished.db"));
+    commit(&db, 0..IMPORTED);
+    let index = contextdb_core::VectorIndexRef::new("passages", "embedding");
+    let tuple = contextdb_core::VectorPartitionKey::from_values(&[]).unwrap();
+    let unfinished = |db: &Database| {
+        db.native_ivf_maintenance_state_for_test(&index, &tuple)
+            .expect("read the persisted build")
+            .build
+            .is_some_and(|build| build.phase != contextdb_vector::ivf::storage::BuildPhase::Ready)
+    };
+    assert!(cycle(&db) > 0, "one cycle does not finish this build");
+    assert!(unfinished(&db), "the first cycle leaves a build unfinished");
+    replace(&db, 0..10, 100);
+    replace(&db, 0..10, 200);
+    // One finite pass may only advance its cursor; a few passes visit the row.
+    let pruned: u64 = (0..8)
+        .map(|_| {
+            db.compact_currency_versions()
+                .expect("cleanup during the build")
+                .pruned_versions
+        })
+        .sum();
+    assert_eq!(pruned, 10, "cleanup reclaims the versions the build never saw");
+    assert!(unfinished(&db), "cleanup ran while the build was unfinished");
+    maintain_to_completion(&db);
+    let rows = db
+        .execute(
+            "SELECT id FROM passages ORDER BY embedding <=> $query LIMIT 1",
+            &params([(
+                "query",
+                Value::Vector(unit_vector(3 + 200, DIMENSIONS)),
+            )]),
+        )
+        .expect("search after the build");
+    assert_eq!(rows.rows()[0][0], Value::Int64(3));
     assert!(db.persist_import_vector_tails().expect("coverage ask"));
 }
