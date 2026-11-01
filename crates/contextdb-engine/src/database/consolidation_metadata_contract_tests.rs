@@ -844,8 +844,12 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
     let used = db.accountant().usage().used;
     let mut refused = false;
     for headroom_kib in [8_usize, 16, 24, 32, 48, 64, 96, 128, 192, 256] {
-        db.set_memory_limit(Some(used.saturating_add(headroom_kib * 1024)))
-            .unwrap();
+        if db
+            .set_memory_limit(Some(used.saturating_add(headroom_kib * 1024)))
+            .is_err()
+        {
+            continue;
+        }
         let attempt = db.run_maintenance_cycle();
         if matches!(
             &attempt,

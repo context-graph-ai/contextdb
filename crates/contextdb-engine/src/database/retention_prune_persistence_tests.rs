@@ -143,6 +143,12 @@ fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity()
                 );
             }
             db.run_pruning_cycle_checked().unwrap();
+            if let Some(lsn) = expired_lsn {
+                assert!(
+                    !persistence.load_commit_index().unwrap().contains_key(&lsn),
+                    "a retry reclaims the eligible commit-index identity"
+                );
+            }
             assert_eq!(persistence.load_vectors().unwrap().len(), 1);
             let edges = persistence.load_row_owned_edges_for_test(false).unwrap();
             assert_eq!(edges.len(), 1);

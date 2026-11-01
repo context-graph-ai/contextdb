@@ -6838,14 +6838,6 @@ impl Database {
             .is_ok()
     }
 
-    /// Journal records the vector journal cleanup (T2) read on this thread
-    /// since the last call.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn __take_vector_journal_cleanup_records_read_for_test() -> u64 {
-        crate::persistence::take_vector_journal_cleanup_records_read_for_test()
-    }
-
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
     #[cfg_attr(

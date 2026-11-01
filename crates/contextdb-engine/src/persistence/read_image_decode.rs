@@ -1727,12 +1727,6 @@ pub(super) fn vector_partition_expected_metadata_payload<'a>(
     Ok(payload)
 }
 
-/// Journal records T2 has read on this thread since the last call.
-#[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn take_vector_journal_cleanup_records_read_for_test() -> u64 {
-    VECTOR_JOURNAL_CLEANUP_RECORDS_READ.with(|read| read.replace(0))
-}
-
 /// Stale catalog attribution needs only an exact route and an authenticated,
 /// completely decodable fixed suffix. Descriptors and publication IDs contain
 /// no strings or sequences, so unrelated catalogs never allocate route owners.

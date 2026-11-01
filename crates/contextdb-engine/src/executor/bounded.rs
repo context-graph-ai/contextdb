@@ -11126,6 +11126,56 @@ impl VectorState {
                     }
                     self.scores = Vec::new();
                     self.score_bytes = 0;
+                    // No maintained route serves this scope, so the answer is
+                    // exact. Its result disclosure is recorded like every other
+                    // route's, with the allowed count the candidate groups hold:
+                    // when the scan ends if the cursor must report early
+                    // terminal observations itself, otherwise now.
+                    if !self.row_checked {
+                        let debug_trace = contextdb_vector::mem::VectorSearchDebugTrace {
+                            index: self.index.clone(),
+                            final_row_ids: Vec::new(),
+                            supplemented_row_count: 0,
+                            fallback_reason: None,
+                            partition_routes: Vec::new(),
+                            budget_receipt: None,
+                        };
+                        let trace_bytes =
+                            size_of::<contextdb_vector::mem::VectorSearchDebugTrace>()
+                                + self.index.table.len()
+                                + self.index.column.len();
+                        context.reserve(BoundedWorkSource::VectorCandidates, trace_bytes)?;
+                        let trace = contextdb_vector::mem::BoundedVectorSearchTrace::from_prepaid(
+                            debug_trace,
+                            trace_bytes,
+                        );
+                        if self.force_exact_for_relational_fallback
+                            && context.state().final_observation.is_none()
+                        {
+                            deferred_exact = Some(DeferredExactTrace {
+                                trace: Some(trace),
+                                aggregate: aggregate_allowed_count,
+                                groups: Some(groups.get().disclosure_metadata()),
+                                context: context.clone(),
+                            });
+                        } else {
+                            if let Err(error) = self.record_disclosure(
+                                db,
+                                context,
+                                published_trace,
+                                Some(aggregate_allowed_count),
+                                groups.get(),
+                                &trace,
+                            ) {
+                                let trace_bytes = trace.retained_bytes();
+                                drop(trace);
+                                context.release(trace_bytes)?;
+                                return Err(error);
+                            }
+                            let trace = context.own_vector_trace(trace)?;
+                            db.publish_vector_search_trace(trace);
+                        }
+                    }
                     // The exact route is resolved here -- asked for outright,
                     // forced by a relational fallback, chosen below the
                     // automatic crossover, or reached because the graph could

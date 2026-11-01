@@ -1396,12 +1396,6 @@ enum InspectedPersistedVector {
     },
 }
 
-#[cfg(any(test, feature = "test-seams"))]
-thread_local! {
-    static VECTOR_JOURNAL_CLEANUP_RECORDS_READ: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-}
-
 struct ReadRawVectorDirectory {
     ready: bool,
 }

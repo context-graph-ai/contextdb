@@ -503,18 +503,18 @@ fn a_purge_refused_on_the_declared_memory_limit_changes_nothing_and_succeeds_onc
         ),
         "a purge past the declared memory limit is refused with the typed memory error: {refused:?}"
     );
-    assert_eq!(count(&db, "limit_items"), rows_before);
-    assert_eq!(
-        pages(&db),
-        pages_before,
-        "the memory refusal changed no index page"
-    );
     assert_eq!(
         db.accountant().usage().used,
         used,
         "the refused purge released its workspace"
     );
     db.set_memory_limit(None).expect("lift the memory limit");
+    assert_eq!(count(&db, "limit_items"), rows_before);
+    assert_eq!(
+        pages(&db),
+        pages_before,
+        "the memory refusal changed no index page"
+    );
 
     let erased = db
         .execute("PURGE FROM limit_items WHERE id = 7", &empty())
