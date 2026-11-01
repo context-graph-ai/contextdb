@@ -511,8 +511,15 @@ impl RedbPersistence {
             .get(state_key(at).as_slice())
             .map_err(Self::storage_error)?
             .ok_or_else(|| damage("selector occurrence state is absent"))?;
-        let state: State = Self::decode_config_value_exact(state.value())
-            .map_err(|_| damage("invalid selector occurrence state"))?;
+        let state: State = Self::decode_config_value_exact(state.value()).map_err(|error| {
+            if crate::read_image_memory::is_memory_refusal(&error)
+                || crate::read_image_memory::is_missing_decode_owner(&error)
+            {
+                error
+            } else {
+                damage("invalid selector occurrence state")
+            }
+        })?;
         if !state.eligible
             || !state.unmarked
             || state.selector != key.value()
@@ -533,8 +540,15 @@ impl RedbPersistence {
                 crate::read_image_memory::reserve(
                     bytes.len().saturating_mul(64).saturating_add(4096),
                 )?;
-                Self::decode_config_value_exact::<DdlChange>(bytes)
-                    .map_err(|_| damage("invalid exact declaration primary encoding"))
+                Self::decode_config_value_exact::<DdlChange>(bytes).map_err(|error| {
+                    if crate::read_image_memory::is_memory_refusal(&error)
+                        || crate::read_image_memory::is_missing_decode_owner(&error)
+                    {
+                        error
+                    } else {
+                        damage("invalid exact declaration primary encoding")
+                    }
+                })
             })?
             .ok_or_else(|| damage("selector primary is absent"))?;
         if &local.value != change {

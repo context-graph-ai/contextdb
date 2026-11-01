@@ -148,3 +148,53 @@ fn identical_alters_authored_separately_stay_two_signed_occurrences_and_redelive
     hub.db.close().unwrap();
     author.db.close().unwrap();
 }
+
+/// A selector row that cannot be decoded for want of an operation owner is not
+/// a damaged store: the caller is told about the owner, and the same valid row
+/// decodes once the owner is active.
+#[test]
+fn selector_decode_without_an_owner_reports_the_owner_not_corruption() {
+    let root = tempfile::TempDir::new().expect("scratch peer directory");
+    let peer = JourneyPeer::open(root.path(), "selector-owner");
+    peer.db
+        .execute(
+            "CREATE SINK selector_owner_sink TYPE callback",
+            &HashMap::new(),
+        )
+        .expect("declare the sink");
+    let delta = peer.db.changes_since(Lsn(0)).unwrap();
+    let position = delta
+        .ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::CreateSink { .. }))
+        .expect("the declaration is in the log");
+    let change = &delta.ddl[position];
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner =
+        peer.db.declared_reader_memory().unwrap().into();
+    let read_selector = || {
+        RedbPersistence::first_eligible_ddl_occurrence(
+            &peer.db.writer_read_root().unwrap().unwrap(),
+            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+            change,
+            None,
+        )
+    };
+
+    let unowned = read_selector().expect_err("no operation owner is active");
+    assert!(
+        crate::read_image_memory::is_missing_decode_owner(&unowned),
+        "the missing owner must reach the caller as itself, not as corruption: {unowned:?}"
+    );
+
+    let decode = crate::read_image_memory::ImageMemory::operation_reader(
+        crate::memory_accounting::AccountantHandle::clone(&peer.db.finalization.accountant),
+        read_memory.clone(),
+    )
+    .unwrap();
+    let _decode = decode.enter();
+    let (lsn, ordinal) = read_selector()
+        .expect("the same row decodes under its owner")
+        .expect("the local declaration is an eligible occurrence");
+    assert_eq!(lsn, delta.ddl_lsn[position]);
+    assert_eq!(ordinal, 0);
+}

@@ -1554,6 +1554,15 @@ impl Database {
                 true
             } else {
                 let matches = if self.persistence.is_some() {
+                    // Selector and declaration decodes need the admitting
+                    // declared reader active on this thread.
+                    let decode = crate::read_image_memory::ImageMemory::operation_reader(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                        read_memory.clone(),
+                    )?;
+                    let _decode = decode.enter();
                     self.durable_superseded_local_ddl_occurrences(
                         &changes.ddl,
                         read_memory.clone(),
