@@ -65,9 +65,7 @@ Earlier versions: see git tags.
   requires its standalone format, lint and test checks plus an actual unpacked-engine build against
   the unpacked fork.
   `crates/contextdb-redb/MAINTENANCE.md` records upstream identity, the reproducible source delta,
-  upgrades, and the upstream-proposal path. The HNSW engine is the maintained `contextdb-hnsw`
-  package (library name `hnsw_rs`), published before `contextdb-vector`;
-  `crates/contextdb-hnsw/MAINTENANCE.md` records its upstream identity and source delta.
+  upgrades, and the upstream-proposal path.
 - **Behavior change.** Automatic file compaction runs as resumable sweeps that relocate at most 64
   pages per batch, started once dead space reaches 50% by a retention pass that pruned rows or by a
   maintenance cycle at least an hour after the last completed sweep, instead of one synchronous whole-file compaction inside the
@@ -116,13 +114,10 @@ Earlier versions: see git tags.
   accepts. `AUTO`, `EXACT`, and `INDEXED` are available as a declared default or a per-query
   `USE VECTOR` override. `SHOW VECTOR_INDEXES` gains lifecycle/accounting summaries and
   `SHOW VECTOR_PARTITIONS` exposes per-layout state and recovery.
-- **Added.** A vector column may now declare `AUTO_INDEX_AT` and grouped HNSW `M`,
-  `EF_CONSTRUCTION`, and `EF_SEARCH` workload policy. Default silence keeps the compatibility
-  profile; `AUTO_INDEX_AT` and `EF_SEARCH` affect newly opened queries without a graph rebuild,
-  while `M` or `EF_CONSTRUCTION` schedule a replacement graph and the current complete graph
-  remains available. Inspection separates desired topology from the serving build revision;
-  `EF_SEARCH` follows current query policy immediately. Restricted explanations omit per-partition
-  adaptive settings. The query-language reference is the canonical syntax and defaults.
+- **Added.** A vector column may now declare `AUTO_INDEX_AT` workload policy. Default silence
+  keeps the compatibility profile; `AUTO_INDEX_AT` affects newly opened queries without an index
+  rebuild. Restricted explanations omit per-partition adaptive settings. The query-language
+  reference is the canonical syntax and defaults.
 - **Behavior change.** Filtered `AUTO` vector search may now use a bounded approximate indexed
   route for a broad allowed set. `EXACT` intentionally retains its exhaustive answer over the
   stored column values; when a broad filter has no bounded candidate route, indexed search refuses
