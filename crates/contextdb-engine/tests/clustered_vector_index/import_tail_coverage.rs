@@ -359,3 +359,77 @@ fn maintaining_an_empty_declared_index_is_not_refused_under_a_memory_limit() {
     .expect("declare the clustered index");
     maintain_to_completion(&db);
 }
+
+/// Rows that arrive while an empty partition's first build is unpublished stay
+/// searchable as old runs of a zero-list generation. Those runs must drain in
+/// bounded remap batches so the next build can start, including across a reopen.
+#[test]
+fn rows_arriving_during_an_empty_first_build_reach_a_published_index_in_finite_cycles() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let path = root.path().join("late-arrivals.db");
+    let options = || DatabaseOpenOptions {
+        maintenance_policy: MaintenancePolicy::CallerDriven,
+        ..DatabaseOpenOptions::default()
+    };
+    let db = Database::open_with_options(&path, options()).expect("open the store");
+    db.execute(
+        &format!(
+            "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE INDEXED {} WITH (remap_batch_entries = 2))",
+            ivf(4, 4, 64)
+        ),
+        &empty(),
+    )
+    .expect("declare the clustered index");
+    let index = contextdb_core::VectorIndexRef::new("passages", "embedding");
+    let tuple = contextdb_core::VectorPartitionKey::from_values(&[]).unwrap();
+    assert!(cycle(&db) > 0, "the empty build is not published in one cycle");
+    let state = db
+        .native_ivf_maintenance_state_for_test(&index, &tuple)
+        .expect("read the persisted build");
+    assert!(
+        state
+            .build
+            .is_some_and(|build| build.phase != contextdb_vector::ivf::storage::BuildPhase::Ready),
+        "the empty build is unfinished when the rows arrive"
+    );
+    commit(&db, 0..IMPORTED);
+    // The empty build publishes a zero-list generation holding the rows as old
+    // runs, more entries than one remap batch.
+    let remapping = (0..MAX_CYCLES).any(|_| {
+        cycle(&db);
+        db.native_ivf_maintenance_state_for_test(&index, &tuple)
+            .expect("read the serving generation")
+            .manifest
+            .is_some_and(|manifest| manifest.active_lists == 0)
+            && db
+                .native_ivf_catalog_for_test(&index, &tuple)
+                .expect("read the catalog")
+                .is_some_and(|catalog| catalog.legacy_runs > 0)
+    });
+    assert!(remapping, "the rows are held as old runs of a zero-list generation");
+    db.close().expect("close while remapping");
+    let db = Database::open_with_options(&path, options()).expect("reopen while remapping");
+    maintain_to_completion(&db);
+    let manifest = db
+        .native_ivf_maintenance_state_for_test(&index, &tuple)
+        .expect("read the published generation")
+        .manifest
+        .expect("a published generation");
+    assert!(manifest.active_lists > 0, "the published index has lists");
+    assert_eq!(
+        db.native_ivf_catalog_for_test(&index, &tuple)
+            .expect("read the catalog")
+            .expect("a catalog")
+            .legacy_runs,
+        0,
+        "every old run was remapped"
+    );
+    let rows = db
+        .execute(
+            &format!("SELECT id FROM passages ORDER BY embedding <=> $query LIMIT {IMPORTED}"),
+            &params([("query", Value::Vector(unit_vector(3, DIMENSIONS)))]),
+        )
+        .expect("indexed search answers");
+    assert_eq!(rows.rows().len(), IMPORTED as usize);
+    assert_eq!(rows.rows()[0][0], Value::Int64(3));
+}

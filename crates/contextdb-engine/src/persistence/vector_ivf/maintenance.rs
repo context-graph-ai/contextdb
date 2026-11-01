@@ -544,7 +544,7 @@ impl RedbPersistence {
                                 }
                             }
                             state = Some(build);
-                        } else if ready {
+                        } else if ready || remapping {
                             scope.with_clustered_writer(
                                 resolved.policy,
                                 resolved.training,
@@ -597,9 +597,12 @@ impl RedbPersistence {
                         }
                         Ok(Progress {
                             source_snapshot: family_snapshot,
+                            // Retiring the last old run of a generation with no
+                            // lists leaves the first real build for the next cycle.
                             in_flight: state.is_some_and(|b| b.phase != BuildPhase::Ready)
                                 || remaining
-                                || reclaiming,
+                                || reclaiming
+                                || (remapping && !ready),
                             published,
                             ready,
                             calibration,

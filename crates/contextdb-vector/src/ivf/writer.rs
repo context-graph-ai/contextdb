@@ -1149,6 +1149,7 @@ impl<S: PageStore> ClusteredIndex<S> {
                 }
                 prepared.append(&mut tx, m, target_slot)?;
                 m.slots = m.slots.checked_add(1).ok_or_else(corrupt)?;
+                view.slots = m.slots;
                 progress.entries_remapped = progress
                     .entries_remapped
                     .checked_add(1)
