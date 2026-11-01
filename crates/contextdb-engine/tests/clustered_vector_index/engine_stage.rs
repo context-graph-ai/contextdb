@@ -1014,6 +1014,34 @@ fn default_policy_resolution_matches_producer_checked_layout_and_constructor_deb
                 .lists,
             resolved.inputs.lists
         );
+        let contradictory = db
+            .execute(
+                "ALTER TABLE items ALTER COLUMN v SET IVF (LISTS = 4, PROBES = 8)",
+                &empty(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                contradictory,
+                contextdb_core::Error::InvalidVectorPolicyDeclaration { .. }
+            ),
+            "explicit LISTS below explicit PROBES is refused at the declaration: {contradictory:?}"
+        );
+        db.execute(
+            "ALTER TABLE items ALTER COLUMN v SET IVF (PROBES = 512)",
+            &empty(),
+        )
+        .unwrap();
+        let partial = native_ivf_resolved_policy_for_test(&db, &index(), &tuple()).unwrap();
+        assert_eq!(
+            partial.inputs.probes, 512,
+            "an explicit PROBES is never clamped"
+        );
+        assert!(
+            partial.inputs.lists >= 512,
+            "an omitted LISTS resolves compatibly with an explicit PROBES: {}",
+            partial.inputs.lists
+        );
     }
     assert!(matches!(
         codebook_allocation_layout(usize::MAX, u32::MAX, true),

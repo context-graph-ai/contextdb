@@ -64,6 +64,13 @@ pub(crate) fn resolve(
             .max(expected_vectors)
             .div_ceil(p.vectors_per_list.unwrap_or(1000)),
     );
+    // An omitted LISTS is engine-resolved compatibly with an explicit PROBES:
+    // the derived layout has at least as many lists as probes. Explicit
+    // members are never clamped.
+    let desired = match (column.ivf_lists, column.ivf_probes) {
+        (None, Some(probes)) => desired.max(u64::from(probes)),
+        _ => desired,
+    };
     let active = |lists: u32| {
         u64::from(lists)
             .min(population)
@@ -146,6 +153,9 @@ pub(crate) fn resolve(
         )?,
     };
     let probes = column.ivf_probes.unwrap_or(lists);
+    if probes > lists {
+        return Err(invalid(index, "PROBES"));
+    }
     let max_depth = to_usize(p.calibration_max_k.unwrap_or(100), "CALIBRATION_MAX_K")?;
     let factor = column.ivf_refine_factor_hundredths.unwrap_or(100);
     let rerank = max_depth
@@ -336,4 +346,56 @@ pub(crate) fn resolve_with_native_receipts(
         available,
         source_identity,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+    use std::collections::HashMap;
+
+    fn declared_column() -> ColumnDef {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.table_meta("t")
+            .unwrap()
+            .columns
+            .into_iter()
+            .find(|column| column.name == "v")
+            .unwrap()
+    }
+
+    #[test]
+    fn an_explicit_probes_resolves_a_compatible_lists_or_is_refused_naming_probes() {
+        let index = VectorIndexRef::new("t", "v");
+        let mut column = declared_column();
+        column.ivf_probes = Some(512);
+        let roomy = resolve(&index, &column, 10, 1 << 30, 1 << 30, [0; 32]).unwrap();
+        assert_eq!(roomy.policy.probes(), 512, "an explicit PROBES is never clamped");
+        assert!(
+            roomy.policy.lists() >= 512,
+            "an omitted LISTS resolves compatibly with an explicit PROBES: {}",
+            roomy.policy.lists()
+        );
+        // A population large enough to make every list count real, under a
+        // codebook budget that cannot hold 512 of them: the pair is refused
+        // naming PROBES, and PROBES is not lowered.
+        let error = resolve(&index, &column, 1_000_000, 4096, 1 << 30, [0; 32]).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidVectorPolicyDeclaration {
+                    issue: contextdb_core::VectorPolicyDeclarationIssue::InvalidMember {
+                        member: "PROBES"
+                    },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
 }
