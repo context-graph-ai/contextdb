@@ -1,20 +1,11 @@
-use contextdb_core::{
-    Error, Incarnation, Lsn, TenantId, Value, VectorIndexRef, VectorPartitionKey,
-};
+use contextdb_core::{Error, Incarnation, Lsn, TenantId, Value};
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncAdoption};
 use contextdb_engine::{Database, MaintenancePolicy, database::SyncApplyReceipt};
-use contextdb_vector::VectorPartitionRef;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
-const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 17))";
+const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE AUTO AUTO_INDEX_AT 1 IVF (PROBES = 17))";
 
-fn index() -> VectorIndexRef {
-    VectorIndexRef::new("items", "embedding")
-}
-fn partition() -> VectorPartitionRef {
-    VectorPartitionRef::new(index(), VectorPartitionKey::unpartitioned())
-}
 fn params(id: i64) -> HashMap<String, Value> {
     HashMap::from([
         ("id".to_owned(), Value::Int64(id)),
@@ -35,21 +26,12 @@ fn seed(db: &Database) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(DDL, &HashMap::new()).unwrap();
     insert(db, 1).unwrap();
-    for _ in 0..32 {
-        db.run_maintenance_cycle().unwrap();
-        if db.__debug_vector_partition_indexed_for_test(
-            partition().index.clone(),
-            partition().partition_key.clone(),
-        ) {
-            break;
-        }
-    }
     assert_eq!(indexed_ids(db), vec![1]);
 }
 fn indexed_ids(db: &Database) -> Vec<i64> {
     let result = db
         .execute(
-            "SELECT id FROM items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 8",
+            "SELECT id FROM items ORDER BY embedding <=> $q USE VECTOR AUTO LIMIT 8",
             &HashMap::from([("q".to_owned(), Value::Vector(vec![1.0, 0.0]))]),
         )
         .unwrap();
@@ -79,7 +61,7 @@ fn assert_refusal(db: &Database, error: Error) {
     assert_eq!(
         indexed_ids(db),
         vec![1],
-        "the previously complete indexed route survives"
+        "the previously committed answer survives"
     );
 }
 
@@ -89,12 +71,6 @@ fn local_current_identity_admission_refuses_the_complete_transaction_before_dura
     let path = root.path().join("local.db");
     let db = Database::open(&path).unwrap();
     seed(&db);
-    let generation = db
-        .__debug_vector_partition_generation_for_test(
-            partition().index.clone(),
-            partition().partition_key.clone(),
-        )
-        .unwrap();
     db.arm_vector_current_identity_admission_failure_for_test();
     let tx = db.begin_or_panic();
     db.insert_row(
@@ -116,13 +92,6 @@ fn local_current_identity_admission_refuses_the_complete_transaction_before_dura
     )
     .unwrap();
     assert_refusal(&db, db.commit(tx).unwrap_err());
-    assert_eq!(
-        db.__debug_vector_partition_generation_for_test(
-            partition().index.clone(),
-            partition().partition_key.clone(),
-        ),
-        Some(generation)
-    );
     db.arm_vector_current_identity_admission_failure_for_test();
     let error = db
         .execute("UPDATE items SET embedding = $v WHERE id = 1", &params(90))

@@ -95,16 +95,6 @@ fn fixture(db: &Database, rows_per_partition: &[usize]) {
             .expect("insert one deterministic row");
         }
     }
-    for _ in 0..64 {
-        let report = db
-            .run_maintenance_cycle()
-            .expect("one caller-driven maintenance cycle")
-            .vector;
-        if report.ready_partitions == rows_per_partition.len() && report.remaining_partitions == 0 {
-            return;
-        }
-    }
-    panic!("maintenance did not publish every partition index");
 }
 
 struct Observed {
@@ -610,7 +600,7 @@ fn a_held_reader_answers_exactly_at_its_own_snapshot_after_the_declaration_chang
     let held = db.snapshot();
     let _pin = db.pin_snapshot(held).expect("pin the held snapshot");
     let exact_before = answer_at(&db, "EXACT", held);
-    assert_eq!(answer_at(&db, "INDEXED", held), exact_before);
+    assert_eq!(answer_at(&db, "AUTO", held), exact_before);
     db.execute(
         "ALTER TABLE flat_docs ALTER COLUMN embedding SET IVF (PROBES = 8)",
         &empty(),

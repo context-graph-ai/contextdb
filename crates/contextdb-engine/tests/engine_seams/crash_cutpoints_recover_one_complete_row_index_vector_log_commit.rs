@@ -77,7 +77,7 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
             },
         )
         .unwrap();
-        database.execute("CREATE TABLE atomic_items (id INTEGER PRIMARY KEY, scope INTEGER NOT NULL, embedding VECTOR(3) SEARCH_MODE INDEXED) HISTORY ALL", &params).unwrap();
+        database.execute("CREATE TABLE atomic_items (id INTEGER PRIMARY KEY, scope INTEGER NOT NULL, embedding VECTOR(3) SEARCH_MODE AUTO) HISTORY ALL", &params).unwrap();
         database
             .execute(
                 "CREATE INDEX atomic_scope ON atomic_items (scope, id)",
@@ -90,15 +90,6 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
                 &HashMap::from([("vector".to_owned(), Value::Vector(vec![0.0, 1.0, 0.0]))]),
             )
             .unwrap();
-        let mut ready = false;
-        for _ in 0..128 {
-            let report = database.run_maintenance_cycle().unwrap();
-            if report.vector.ready_partitions == 1 && report.vector.remaining_partitions == 0 {
-                ready = true;
-                break;
-            }
-        }
-        assert!(ready);
         let old_lsn = database.current_lsn();
         let old_snapshot = database.snapshot();
         database.close().unwrap();
@@ -219,7 +210,7 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
         } else {
             old.clone()
         };
-        assert_eq!(recovered.execute("SELECT id FROM atomic_items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 2", &vector_params).unwrap().rows(), expected_vectors, "{selected} searchable vectors agree with recovered rows");
+        assert_eq!(recovered.execute("SELECT id FROM atomic_items ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 2", &vector_params).unwrap().rows(), expected_vectors, "{selected} searchable vectors agree with recovered rows");
         recovered.close().unwrap();
         drop(recovered);
         let persistence = RedbPersistence::open(&path).unwrap();

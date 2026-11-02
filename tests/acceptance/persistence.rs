@@ -1036,9 +1036,8 @@ fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
 #[test]
 #[cfg(feature = "test-seams")]
 fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
-    // Engine-owned maintenance races the one-row-per-commit inserts, so two
-    // stores are only comparable at quiescence: both fixtures drive their own
-    // maintenance until every row is in the graph before they close.
+    // Both fixtures are caller-driven, so no engine-owned maintenance races the
+    // one-row-per-commit inserts, and with no index there is nothing to settle.
     fn caller_driven(path: &Path) -> Database {
         Database::open_with_options(
             path,
@@ -1060,17 +1059,6 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
             .find(|r| matches!(&r[at("table")], Value::Text(t) if t == "recall"))
             .expect("recall.vec is listed");
         row[at(column)].clone()
-    }
-    fn drive_to_quiescence(db: &Database) {
-        for _ in 0..256 {
-            let report = db.run_maintenance_cycle().expect("maintenance cycle");
-            if report.vector.remaining_partitions == 0
-                && recall_index_row(db, "pending_inserts") == Value::Int64(0)
-            {
-                return;
-            }
-        }
-        panic!("maintenance must reach quiescence in finite cycles");
     }
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("q.db");
@@ -1117,7 +1105,6 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
             .expect("insert");
             inserted.push((id, v));
         }
-        drive_to_quiescence(&db);
         // redb commits each transaction synchronously; drop flushes the final state.
         drop(db);
     }
@@ -1209,7 +1196,6 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
             )
             .expect("insert F32 footprint row");
         }
-        drive_to_quiescence(&f32);
         f32_durable_vector_bytes = recall_index_row(&f32, "durable_vector_bytes");
         drop(f32);
     }

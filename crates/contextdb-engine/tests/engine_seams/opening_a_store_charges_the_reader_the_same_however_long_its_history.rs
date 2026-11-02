@@ -52,18 +52,19 @@ fn vector(id: i64) -> Vec<f32> {
 
 fn nearest(db: &Database, target: i64) -> Vec<Vec<Value>> {
     db.execute(
-        "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+        "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR AUTO LIMIT 1",
         &HashMap::from([("q".into(), Value::Vector(vector(target)))]),
     )
     .unwrap()
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 
 /// A built route over 16 rows, then `suffix` rows committed after the build
 /// and never absorbed into the saved index.
 fn suffix_store(path: &std::path::Path, suffix: i64) {
     let db = open(path);
-    db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 IVF (PROBES = 256) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
+    db.execute(&format!("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR({DIMENSION}) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE AUTO AUTO_INDEX_AT 1 IVF (PROBES = 256) CONSOLIDATION NONE)"), &HashMap::new()).unwrap();
     for id in 0..16i64 {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $v)",
@@ -74,13 +75,6 @@ fn suffix_store(path: &std::path::Path, suffix: i64) {
         )
         .unwrap();
     }
-    while db
-        .run_maintenance_cycle()
-        .unwrap()
-        .vector
-        .remaining_partitions
-        != 0
-    {}
     for batch in 0..suffix / 512 {
         let first = 1_000_000 + batch * 512;
         let mut sql = String::from("INSERT INTO points VALUES ");

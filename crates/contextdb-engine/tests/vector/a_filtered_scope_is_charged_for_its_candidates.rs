@@ -179,33 +179,7 @@ fn grouping_fixture(partitions: usize) -> Database {
         )
         .expect("seed one grouping candidate");
     }
-    for _ in 0..256 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic grouping-fixture maintenance");
-        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory()
-                .expect("admit the partition observation reader"),
-        );
-
-        let ready = db
-            .vector_store_for_test()
-            .partition_infos(
-                &contextdb_core::VectorIndexRef::new("grouping_vectors", "embedding"),
-                &mut partition_observation_owner_1,
-            )
-            .expect("inspect grouping partition readiness");
-        if ready.len() == partitions
-            && ready.iter().all(|partition| {
-                db.__debug_vector_partition_indexed_for_test(
-                    partition.partition.index.clone(),
-                    partition.partition.partition_key.clone(),
-                )
-            })
-        {
-            return db;
-        }
-    }
-    panic!("all {partitions} grouping partitions must publish maintained routes");
+    db
 }
 
 fn grouped_query(db: &Database, partitions: usize, mode: &str) -> ChargedQuery {
@@ -338,56 +312,6 @@ fn score_fixture() -> (tempfile::TempDir, Database) {
         .expect("seed one base-graph score row");
     }
 
-    let columns = ["f32_embedding", "sq8_embedding", "sq4_embedding"];
-    for _ in 0..256 {
-        db.run_maintenance_cycle()
-            .expect("advance score-fixture graph maintenance");
-        if columns.iter().all(|column| {
-            let index = VectorIndexRef::new("score_vectors", *column);
-            let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
-                db.declared_reader_memory()
-                    .expect("admit the partition observation reader"),
-            );
-
-            db.vector_store_for_test()
-                .partition_infos(&index, &mut partition_observation_owner_2)
-                .is_ok_and(|partitions| {
-                    partitions.len() == SCORE_PARTITIONS
-                        && partitions.iter().all(|partition| {
-                            db.__debug_vector_partition_indexed_for_test(
-                                partition.partition.index.clone(),
-                                partition.partition.partition_key.clone(),
-                            )
-                        })
-                })
-        }) {
-            break;
-        }
-    }
-
-    for column in columns {
-        let index = VectorIndexRef::new("score_vectors", column);
-        let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory()
-                .expect("admit the partition observation reader"),
-        );
-
-        let partitions = db
-            .vector_store_for_test()
-            .partition_infos(&index, &mut partition_observation_owner_3)
-            .expect("inspect score graph partitions");
-        assert_eq!(partitions.len(), SCORE_PARTITIONS);
-        assert!(
-            partitions
-                .iter()
-                .all(|partition| db.__debug_vector_partition_indexed_for_test(
-                    partition.partition.index.clone(),
-                    partition.partition.partition_key.clone()
-                )),
-            "every {column} base partition must be graph-ready before adding a fresh tail"
-        );
-    }
-
     for partition in 0..SCORE_PARTITIONS {
         let id = SCORE_BASE_ROWS + partition;
         db.execute(
@@ -402,17 +326,6 @@ fn score_fixture() -> (tempfile::TempDir, Database) {
         .expect("append one duplicate vector to every fresh graph tail");
     }
 
-    for column in columns {
-        let index = VectorIndexRef::new("score_vectors", column);
-        for partition in 0..SCORE_PARTITIONS {
-            let key = VectorPartitionKey::from_values(&[Value::Int64(partition as i64)])
-                .expect("integer partition key");
-            assert!(
-                db.__debug_vector_partition_indexed_for_test(index.clone(), key),
-                "the score query spans a published index"
-            );
-        }
-    }
     (directory, db)
 }
 
@@ -456,7 +369,7 @@ fn representation_query(db: &Database, column: &str, mode: &str) -> ChargedQuery
 fn one_thousand_candidates_are_grouped_once_across_eight_or_sixty_four_partitions() {
     let eight = grouping_fixture(8);
     let sixty_four = grouping_fixture(64);
-    for mode in ["EXACT", "INDEXED"] {
+    for mode in ["EXACT", "AUTO"] {
         let eight_query = grouped_query(&eight, 8, mode);
         let sixty_four_query = grouped_query(&sixty_four, 64, mode);
         assert_eq!(
@@ -464,15 +377,13 @@ fn one_thousand_candidates_are_grouped_once_across_eight_or_sixty_four_partition
             sixty_four_query.result.result.rows(),
             "partition fanout cannot alter the fixed 1,000-candidate answer in {mode} mode"
         );
-        assert_eq!(
-            eight_query.used_indexed_route,
-            mode == "INDEXED",
-            "the eight-partition {mode} arm must exercise its declared route"
+        assert!(
+            !eight_query.used_indexed_route,
+            "the eight-partition {mode} arm runs on the exact route"
         );
-        assert_eq!(
-            sixty_four_query.used_indexed_route,
-            mode == "INDEXED",
-            "the sixty-four-partition {mode} arm must exercise its declared route"
+        assert!(
+            !sixty_four_query.used_indexed_route,
+            "the sixty-four-partition {mode} arm runs on the exact route"
         );
         assert_independent_charge_bound(
             &format!("eight-partition {mode} grouping"),
@@ -519,14 +430,14 @@ fn indexed_duplicates_keep_complete_recall_and_canonical_order_per_representatio
         ("sq4_embedding", VectorQuantization::SQ4),
     ] {
         let exact = representation_query(&db, column, "EXACT");
-        let indexed = representation_query(&db, column, "INDEXED");
+        let indexed = representation_query(&db, column, "AUTO");
         assert!(
             !exact.used_indexed_route,
             "{column} EXACT must stay on the exact route"
         );
         assert!(
-            indexed.used_indexed_route,
-            "{column} INDEXED must search the clustered index"
+            !indexed.used_indexed_route,
+            "{column} AUTO runs on the exact route in this release"
         );
         assert_eq!(
             exact.result.result.rows(),
@@ -536,7 +447,7 @@ fn indexed_duplicates_keep_complete_recall_and_canonical_order_per_representatio
         assert_eq!(
             indexed.result.result.rows(),
             exact.result.result.rows(),
-            "{quantization:?} indexed duplicate handling must preserve complete recall and canonical order"
+            "{quantization:?} AUTO duplicate handling must preserve complete recall and canonical order"
         );
         assert_independent_charge_bound(
             &format!("{quantization:?} exact score route"),
@@ -544,7 +455,7 @@ fn indexed_duplicates_keep_complete_recall_and_canonical_order_per_representatio
             SCORE_BASE_ROWS + SCORE_PARTITIONS,
         );
         assert_independent_charge_bound(
-            &format!("{quantization:?} indexed score route"),
+            &format!("{quantization:?} AUTO score route"),
             &indexed,
             SCORE_BASE_ROWS + SCORE_PARTITIONS,
         );
@@ -555,14 +466,14 @@ fn indexed_duplicates_keep_complete_recall_and_canonical_order_per_representatio
 fn grouping_charge_bounds_reject_uncharged_and_repeated_candidate_work() {
     for partitions in [8, 64] {
         let db = grouping_fixture(partitions);
-        let control = grouped_query(&db, partitions, "INDEXED");
+        let control = grouped_query(&db, partitions, "AUTO");
         for fault in [
             BoundedCandidateGroupingFaultForTest::RepeatGlobalCandidatePassPerPartition,
             BoundedCandidateGroupingFaultForTest::SuppressPlacementCharge,
         ] {
             let faulty = match (
                 fault,
-                grouped_query_outcome(&db, partitions, "INDEXED", Some(fault)),
+                grouped_query_outcome(&db, partitions, "AUTO", Some(fault)),
             ) {
                 // The injected repeated pass is itself rejected when the engine's
                 // typed memory refusal stops it; any other error is a failure.

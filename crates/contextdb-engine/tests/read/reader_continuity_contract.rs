@@ -3,7 +3,7 @@
 //! Pipes and existing kernel/publication pauses order the overlap. The timeout
 //! below detects a stuck process; it never decides a latency/product verdict.
 use super::reader_proof_support as fixture;
-use contextdb_core::{Incarnation, Lsn, TenantId, Value, VectorIndexRef, VectorSearchMode};
+use contextdb_core::{Incarnation, Lsn, TenantId, Value, VectorSearchMode};
 use contextdb_engine::database::ReceivedSchemaApplyObserverForTest;
 use contextdb_engine::local_transport::ManualDeadlineClock;
 use contextdb_engine::protocol::WireDdlProvenance;
@@ -79,7 +79,7 @@ fn seed(path: &Path) {
 fn seed_rows(path: &Path, rows: i64) {
     seed_rows_with_observer(path, rows, Arc::new(BuildObservation::default()));
 }
-fn seed_rows_with_observer(path: &Path, rows: i64, builds: Arc<BuildObservation>) {
+fn seed_rows_with_observer(path: &Path, rows: i64, _builds: Arc<BuildObservation>) {
     let db = Database::open(path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute("CREATE TABLE continuity_vectors (id INTEGER PRIMARY KEY, payload TEXT, embedding VECTOR(3)) HISTORY ALL", &HashMap::new()).unwrap();
@@ -97,13 +97,6 @@ fn seed_rows_with_observer(path: &Path, rows: i64, builds: Arc<BuildObservation>
         .unwrap();
     }
     db.commit(tx).unwrap();
-    contextdb_vector::with_vector_build_observer(builds.clone(), || {
-        fixture::finish_maintenance(&db, 1)
-    });
-    assert!(
-        builds.builds.load(Ordering::SeqCst) > 0,
-        "the observer witnesses actual fixture construction"
-    );
     db.close().unwrap();
 }
 fn writer(path: &Path, runtime: &Path) -> Database {
@@ -204,13 +197,6 @@ fn expected_replay_tables() -> BTreeSet<String> {
         .collect()
 }
 fn replace_generation(db: &Database) {
-    let index = VectorIndexRef::new("continuity_vectors", "embedding");
-    let generation = || db.__debug_vector_index_generation_for_test(index.clone());
-    let before = generation();
-    assert!(
-        before.is_some(),
-        "the fixture has a healthy saved generation"
-    );
     let count = db
         .execute("SELECT COUNT(*) FROM continuity_vectors", &HashMap::new())
         .unwrap();
@@ -228,17 +214,6 @@ fn replace_generation(db: &Database) {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    for _ in 0..64 {
-        db.run_maintenance_cycle().unwrap();
-        if generation() != before {
-            break;
-        }
-    }
-    assert_ne!(
-        generation(),
-        before,
-        "the writer really publishes a replacement generation"
-    );
     db.run_pruning_cycle_checked().unwrap();
     db.run_maintenance_cycle().unwrap(); // actual old-generation reclamation attempt
     assert_eq!(

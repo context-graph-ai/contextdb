@@ -762,16 +762,6 @@ fn secure_fixture_in_database(
             )
             .expect("insert a hidden-row fixture row");
     }
-    // Finite, caller-driven maintenance so an `INDEXED` declaration has a
-    // ready graph; this is not a timing wait (`MaintenancePolicy::CallerDriven`
-    // above disables the background maintenance thread `Database::open_memory`
-    // otherwise defaults to).
-    for _ in 0..32 {
-        admin
-            .run_maintenance_cycle()
-            .expect("one caller-driven maintenance batch succeeds");
-    }
-
     HiddenRowFixture {
         admin,
         allowed_context,
@@ -1755,7 +1745,7 @@ mod bounded_door {
                 "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
                 "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE EXACT",
                 "VECTOR(2) PARTITION_KEY (bucket) MAX_PARTITIONS 8 SEARCH_MODE EXACT",
-                "VECTOR(2) PARTITION_KEY (context_id, bucket, scope) MAX_PARTITIONS 8 SEARCH_MODE INDEXED",
+                "VECTOR(2) PARTITION_KEY (context_id, bucket, scope) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
             ] {
                 let fixture = secure_fixture_hidden_by(declaration, hidden_by);
                 if declaration.contains("INDEXED") {
@@ -1871,7 +1861,7 @@ mod bounded_door {
     #[test]
     fn restricted_indexed_reads_admit_their_own_staged_vectors_and_rollback_removes_them() {
         let fixture = super::secure_context_fixture(
-            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE INDEXED",
+            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
         );
         let scoped = fixture.scoped();
         let staged = super::id(0x912);
@@ -1887,15 +1877,8 @@ mod bounded_door {
         ).expect("stage an authorized nearest vector");
         let answer = scoped
             .execute_in_tx(tx, fixture.sql(), &fixture.query_params())
-            .expect("INDEXED merges the authorized staged delta with the maintained source");
+            .expect("AUTO merges the authorized staged delta with the committed rows");
         assert_eq!(result_ids(&answer), vec![staged]);
-        assert!(matches!(
-            answer.trace().vector_search.as_ref().unwrap().route,
-            Some(
-                contextdb_engine::VectorSearchRoute::Indexed
-                    | contextdb_engine::VectorSearchRoute::FilteredIndexed
-            )
-        ));
         scoped.rollback(tx).expect("rollback scoped transaction");
         assert_eq!(
             result_ids(
@@ -1910,29 +1893,29 @@ mod bounded_door {
     #[test]
     fn a_key_aligned_restricted_indexed_query_answers_with_no_relational_index() {
         let fixture = super::secure_context_fixture(
-            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE INDEXED",
+            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
         );
         let scoped = fixture.scoped();
 
         let ordinary = scoped
             .execute(fixture.sql(), &fixture.query_params())
             .unwrap_or_else(|error| {
-                panic!("a key-aligned restricted INDEXED query must answer, not refuse: {error}")
+                panic!("a key-aligned restricted AUTO query must answer, not refuse: {error}")
             });
         assert_eq!(
             result_ids(&ordinary),
             fixture.authorized_ids,
-            "ordinary door: key-aligned restricted INDEXED must answer the nearest VISIBLE row"
+            "ordinary door: key-aligned restricted AUTO must answer the nearest VISIBLE row"
         );
 
         let request = hidden_row_bounded_request(fixture.sql(), fixture.query_params());
         let bounded_result = bounded::execute(&scoped, &request).unwrap_or_else(|error| {
-            panic!("a key-aligned restricted INDEXED query must answer, not error: {error:?}")
+            panic!("a key-aligned restricted AUTO query must answer, not error: {error:?}")
         });
         assert_eq!(
             result_ids(&bounded_result.result),
             fixture.authorized_ids,
-            "bounded door: key-aligned restricted INDEXED must answer the nearest VISIBLE row"
+            "bounded door: key-aligned restricted AUTO must answer the nearest VISIBLE row"
         );
 
         // The restriction equivalence: an unrestricted admin handle asking
@@ -2450,15 +2433,15 @@ fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
             limits: ReadLimits::default(),
             ..ReadSessionOptions::default()
         };
-        let check = |reader: &ReadSession, indexed: bool| {
+        let check = |reader: &ReadSession, _indexed: bool| {
             for mode in ["AUTO", "EXACT", "INDEXED"] {
                 let sql = fixture
                     .sql()
                     .replace("LIMIT 1", &format!("USE VECTOR {mode} LIMIT 1"));
                 let answer = reader.execute(&sql, &fixture.query_params());
-                if mode == "INDEXED" && !indexed {
+                if mode == "INDEXED" {
                     assert!(
-                        matches!(answer, Err(Error::VectorFilteredRouteUnavailable { .. })),
+                        matches!(answer, Err(Error::VectorIndexedRouteUnavailable { .. })),
                         "{hidden_by:?} {:?}: {answer:?}",
                         reader.route()
                     );

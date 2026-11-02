@@ -4,13 +4,12 @@
 //! scope. Each surface also retains its bound or parameter-free control.
 
 use contextdb_core::{Value, VectorSearchMode};
-use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
+use contextdb_engine::{Database, MaintenancePolicy, SemanticQuery};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 const SCOPE_ALPHA: &str = "alpha-scope";
 const SCOPE_BRAVO: &str = "bravo-scope";
-const MAX_FINITE_CYCLES: usize = 32;
 
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
@@ -21,21 +20,6 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
         .into_iter()
         .map(|(name, value)| (name.to_owned(), value))
         .collect()
-}
-
-fn column(result: &QueryResult, name: &str) -> usize {
-    result
-        .columns()
-        .iter()
-        .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("inspection contains {name}: {:?}", result.columns()))
-}
-
-fn text<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a str {
-    match result.rows()[row].get(column(result, name)) {
-        Some(Value::Text(value)) => value,
-        other => panic!("inspection {name} is text, got {other:?}"),
-    }
 }
 
 /// Seeds one AUTO-mode partitioned vector column with two authorized partitions
@@ -84,31 +68,12 @@ fn fixture() -> Database {
     db
 }
 
-fn show_partitions(db: &Database) -> QueryResult {
-    db.execute("SHOW VECTOR_PARTITIONS FOR docs.embedding", &empty())
-        .expect("SHOW VECTOR_PARTITIONS is an admin inspection surface")
-}
-
-fn drive_to_ready(db: &Database) {
-    for _ in 0..MAX_FINITE_CYCLES {
-        let partitions = show_partitions(db);
-        if (0..partitions.rows().len()).all(|row| text(&partitions, row, "query_state") == "ready")
-        {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one caller-driven maintenance batch returns");
-    }
-    panic!("finite caller-driven maintenance did not publish every partition route");
-}
-
 /// Surface 1 -- SQL execution: every executing reader binds every placeholder in the
 /// query expression and candidate predicate before any partition scope or route
 /// availability is judged (`bind_vector_search_parameters`, executor.rs).
 #[test]
 fn sql_execution_of_an_unbound_partition_key_is_the_ordinary_missing_parameter_refusal() {
     let db = fixture();
-    drive_to_ready(&db);
 
     let sql = "SELECT id FROM docs WHERE scope_id = $scope \
                ORDER BY embedding <=> [1.0,0.0,0.0] LIMIT 2";
@@ -131,11 +96,10 @@ fn sql_execution_of_an_unbound_partition_key_is_the_ordinary_missing_parameter_r
 #[test]
 fn semantic_search_where_door_unbound_placeholder_is_the_ordinary_missing_parameter_refusal() {
     let db = fixture();
-    drive_to_ready(&db);
 
     let query = SemanticQuery {
         where_clause: Some("scope_id = $scope".to_owned()),
-        search_mode: Some(VectorSearchMode::Indexed),
+        search_mode: Some(VectorSearchMode::Auto),
         ..SemanticQuery::new("docs", "embedding", vec![1.0, 0.0, 0.0], 2)
     };
     let error = db.semantic_search(query).expect_err(
@@ -159,7 +123,6 @@ fn semantic_search_where_door_unbound_placeholder_is_the_ordinary_missing_parame
 #[test]
 fn explain_reports_no_count_or_route_for_an_unbound_key() {
     let db = fixture();
-    drive_to_ready(&db);
 
     let no_predicate_sql =
         "SELECT id FROM docs ORDER BY embedding <=> [1.0,0.0,0.0] USE VECTOR AUTO LIMIT 2";

@@ -10,7 +10,7 @@
 //! with the answer.
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
-use contextdb_core::{Value, VectorIndexRef};
+use contextdb_core::Value;
 use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
@@ -155,33 +155,7 @@ fn fixture_in(db: Database, plant_a_non_current_row: bool) -> Database {
         )
         .expect("plant the nearest row before the graphs are built");
     }
-    for _ in 0..512 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory()
-                .expect("admit the partition observation reader"),
-        );
-
-        let ready = db
-            .vector_store_for_test()
-            .partition_infos(
-                &VectorIndexRef::new("scoped_rows", "embedding"),
-                &mut partition_observation_owner_1,
-            )
-            .expect("inspect partition readiness");
-        if ready.len() == PARTITIONS
-            && ready.iter().all(|partition| {
-                db.__debug_vector_partition_indexed_for_test(
-                    partition.partition.index.clone(),
-                    partition.partition.partition_key.clone(),
-                )
-            })
-        {
-            return db;
-        }
-    }
-    panic!("every partition must publish a maintained route before the read is measured");
+    db
 }
 
 struct Measured {

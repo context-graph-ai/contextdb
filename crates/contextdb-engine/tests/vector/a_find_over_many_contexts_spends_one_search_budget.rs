@@ -169,34 +169,7 @@ fn seed_shape(
                 .expect("seed one partitioned row");
         }
     }
-    let index = VectorIndexRef::new("scoped_rows", "embedding");
-    for _ in 0..4096 {
-        admin
-            .run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-            admin
-                .declared_reader_memory()
-                .expect("admit the partition observation reader"),
-        );
-
-        let ready = admin
-            .vector_store_for_test()
-            .partition_infos(&index, &mut partition_observation_owner_1)
-            .expect("inspect partition readiness");
-        if ready.len() == partitions
-            && ready.iter().all(|partition| {
-                admin.__debug_vector_partition_indexed_for_test(
-                    partition.partition.index.clone(),
-                    partition.partition.partition_key.clone(),
-                )
-            })
-        {
-            admin.close().expect("seal the fixture store");
-            return;
-        }
-    }
-    panic!("every partition must publish a maintained route before the read is measured");
+    admin.close().expect("seal the fixture store");
 }
 
 fn statement(selected: usize) -> (String, HashMap<String, Value>) {
@@ -446,8 +419,8 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
     seed(&path, &runtime);
 
     let (sql, params) = statement(PARTITIONS);
-    let indexed = sql.replace(" LIMIT ", " USE VECTOR INDEXED LIMIT ");
-    let mut saw_indexed_refusal = false;
+    let exact = sql.replace(" LIMIT ", " USE VECTOR EXACT LIMIT ");
+    let mut saw_exact_refusal = false;
     let mut saw_full_page = false;
     // The statement's candidate windows cost nothing here: its filter admits
     // every live vector of the Contexts it names, which the committed index
@@ -455,7 +428,7 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
     // search's own. This band runs from below its admission floor to a
     // complete answer.
     for work in (200_u64..=1_500).step_by(50).chain([5_000_000]) {
-        for (mode, statement) in [("auto", &sql), ("indexed", &indexed)] {
+        for (mode, statement) in [("auto", &sql), ("exact", &exact)] {
             let limits = ReadLimits { work, ..limits() };
             let reader = ReadSession::with_runtime_directory_for_test(&runtime, || {
                 ReadSession::open_with_options(
@@ -490,13 +463,13 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
                     );
                     saw_full_page = true;
                 }
-                Err(_) if mode == "indexed" => saw_indexed_refusal = true,
+                Err(_) if mode == "exact" => saw_exact_refusal = true,
                 Err(_) => {}
             }
         }
     }
     assert!(saw_full_page, "a large enough budget answers");
-    assert!(saw_indexed_refusal, "a small enough budget refuses INDEXED");
+    assert!(saw_exact_refusal, "a small enough budget refuses EXACT");
 }
 
 /// When fewer than k rows pass the indexed residual, the search must prove

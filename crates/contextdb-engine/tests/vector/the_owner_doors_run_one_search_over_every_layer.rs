@@ -105,18 +105,9 @@ fn insert(db: &Database, context: usize, locals: std::ops::Range<usize>) {
     }
 }
 
-fn drive_maintenance(db: &Database, until: impl Fn(&Database) -> bool, what: &str) {
-    let reached = (0..4096).any(|_| {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        until(db)
-    });
-    assert!(reached, "{what}");
-}
-
 /// Every Context saved as a base, a sealed change on top of it, and a live
-/// tail committed after the change. The column declares INDEXED, so the door
-/// that cannot name a mode asks for the graph as well.
+/// tail committed after the change. The column declares AUTO, so the door
+/// that cannot name a mode runs the same exact search.
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -128,7 +119,7 @@ fn seed(db: &Database) {
             "CREATE TABLE door_rows (id INT PRIMARY KEY, context_id UUID NOT NULL, \
              is_current BOOL NOT NULL, \
              embedding VECTOR({DIMENSIONS}) PARTITION_KEY (context_id) \
-             MAX_PARTITIONS 8 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 \
+             MAX_PARTITIONS 8 SEARCH_MODE AUTO AUTO_INDEX_AT 1 \
              CONSOLIDATION (CHANGE_PERCENT = 10))"
         ),
         &HashMap::new(),
@@ -142,36 +133,9 @@ fn seed(db: &Database) {
     for context in 0..CONTEXTS {
         insert(db, context, 0..BASE_ROWS);
     }
-    drive_maintenance(
-        db,
-        |db| {
-            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-                db.declared_reader_memory()
-                    .expect("admit the partition observation reader"),
-            );
-
-            let ready = db
-                .vector_store_for_test()
-                .partition_infos(&index(), &mut partition_observation_owner_1)
-                .expect("inspect partition readiness");
-            ready.len() == CONTEXTS
-                && ready.iter().all(|info| {
-                    db.__debug_vector_partition_indexed_for_test(
-                        info.partition.index.clone(),
-                        info.partition.partition_key.clone(),
-                    )
-                })
-        },
-        "every Context saves its base graph",
-    );
     for context in 0..CONTEXTS {
         insert(db, context, BASE_ROWS..BASE_ROWS + CHANGE_ROWS);
     }
-    drive_maintenance(
-        db,
-        |db| db.__debug_vector_indexed_available_for_test(index()),
-        "every Context maintains its later rows into its index",
-    );
     let tail = BASE_ROWS + CHANGE_ROWS;
     for context in 0..CONTEXTS {
         insert(db, context, tail..tail + TAIL_ROWS);
@@ -214,7 +178,7 @@ fn the_owner_doors_answer_what_sql_answers_over_a_base_a_maintained_change_and_a
         };
         let sql = format!(
             "SELECT id FROM door_rows {predicate}ORDER BY embedding <=> $query \
-             USE VECTOR INDEXED LIMIT {LIMIT}"
+             USE VECTOR AUTO LIMIT {LIMIT}"
         );
         let params = HashMap::from([("query".to_string(), Value::Vector(query.clone()))]);
         let sql_answer = db.execute(&sql, &params);
@@ -240,7 +204,7 @@ fn the_owner_doors_answer_what_sql_answers_over_a_base_a_maintained_change_and_a
 
         if !filtered {
             // The door that takes no filter and no mode: every partition, the
-            // column's declared INDEXED route.
+            // column's declared AUTO route.
             let vector_rows = db
                 .query_vector(index(), &query, LIMIT, None, db.snapshot())
                 .expect("query_vector answers");

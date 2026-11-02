@@ -6,7 +6,7 @@
 //! expected rows and graph-use controls through all three query surfaces.
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
-use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey, VectorSearchMode};
+use contextdb_core::{Error, Value, VectorSearchMode};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
 use std::collections::HashMap;
@@ -15,7 +15,6 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const INDEXED_ROWS: usize = 1_000;
-const MAX_MAINTENANCE_CYCLES: usize = 64;
 
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
@@ -68,51 +67,6 @@ fn partitioned_search(db: &Database, scope: Uuid, query: Vec<f32>, mode: &str) -
             ]),
         )
         .unwrap_or_else(|error| panic!("partitioned {mode} vector search: {error}")))
-}
-
-fn index() -> VectorIndexRef {
-    VectorIndexRef::new("restart_items", "embedding")
-}
-
-fn partition(scope: Uuid) -> VectorPartitionKey {
-    VectorPartitionKey::from_values(&[Value::Uuid(scope)])
-        .expect("a UUID partition component has one canonical key")
-}
-
-fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
-    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-        db.declared_reader_memory()
-            .expect("admit the partition observation reader"),
-    );
-
-    db.vector_store_for_test()
-        .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
-        .unwrap()
-        .map(|info| {
-            db.__debug_vector_partition_indexed_for_test(
-                info.partition.index.clone(),
-                info.partition.partition_key.clone(),
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn graph_serial(db: &Database, index: &VectorIndexRef, scope: Uuid) -> Option<u64> {
-    db.__debug_vector_partition_generation_for_test(index.clone(), partition(scope))
-}
-
-fn drive_maintenance_until_ready(db: &Database, index: &VectorIndexRef, scope: Uuid) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        if graph_available(db, index, scope) {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one caller-driven maintenance cycle returns");
-    }
-    panic!(
-        "caller-driven maintenance did not publish a complete maintained route within \
-         {MAX_MAINTENANCE_CYCLES} finite cycles"
-    );
 }
 
 fn create_partitioned_table(db: &Database) {
@@ -254,7 +208,6 @@ fn partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuil
     let scope = Uuid::from_u128(0x601);
     let first = Uuid::from_u128(0x100_000);
     let after_first_restart = Uuid::from_u128(0x200_000);
-    let index = index();
 
     {
         let db = Database::open(&path).expect("open file-backed store");
@@ -277,35 +230,23 @@ fn partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuil
             .expect("stage a deterministic vector row");
         }
         db.commit(tx).expect("commit the seeded indexed partition");
-        drive_maintenance_until_ready(&db, &index, scope);
         db.close().expect("close the sealed fixture cleanly");
     }
 
     {
         let db = Database::open(&path).expect("first clean reopen");
         db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-        assert!(
-            graph_available(&db, &index, scope),
-            "opening a sealed partition must make its maintained route available before any query"
-        );
-        let before_query = graph_serial(&db, &index, scope)
-            .expect("the reopened maintained route has a stable observed graph identity");
         assert_eq!(
-            partitioned_search(&db, scope, axis(0), "INDEXED")
+            partitioned_search(&db, scope, axis(0), "AUTO")
                 .first()
                 .copied(),
             Some(first),
-            "the sealed pre-restart vector remains findable through INDEXED"
-        );
-        assert_eq!(
-            graph_serial(&db, &index, scope),
-            Some(before_query),
-            "the first post-restart query must use the already-loaded route, not rebuild it"
+            "the sealed pre-restart vector remains findable through AUTO"
         );
 
         insert(&db, after_first_restart, scope, axis(1));
         assert_eq!(
-            partitioned_search(&db, scope, axis(1), "INDEXED")
+            partitioned_search(&db, scope, axis(1), "AUTO")
                 .first()
                 .copied(),
             Some(after_first_restart),
@@ -316,30 +257,19 @@ fn partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuil
 
     let db = Database::open(&path).expect("second clean reopen");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    assert!(
-        graph_available(&db, &index, scope),
-        "the second reopen keeps a complete maintained route available before any query"
-    );
-    let before_second_query = graph_serial(&db, &index, scope)
-        .expect("the second reopened route has a stable observed graph identity");
     assert_eq!(
-        partitioned_search(&db, scope, axis(0), "INDEXED")
+        partitioned_search(&db, scope, axis(0), "AUTO")
             .first()
             .copied(),
         Some(first),
         "the original sealed vector survives the second restart"
     );
     assert_eq!(
-        partitioned_search(&db, scope, axis(1), "INDEXED")
+        partitioned_search(&db, scope, axis(1), "AUTO")
             .first()
             .copied(),
         Some(after_first_restart),
         "the fresh-tail commit survives the second restart"
-    );
-    assert_eq!(
-        graph_serial(&db, &index, scope),
-        Some(before_second_query),
-        "neither second-restart query may synchronously rebuild the partition"
     );
 }
 
@@ -462,7 +392,6 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
     let path = directory.path().join("lang-filtered-reopen.db");
     let scope_a = Uuid::from_u128(0x801);
     let scope_b = Uuid::from_u128(0x802);
-    let idx = index();
     let query = axis(0);
 
     let db = Database::open(&path).expect("open file-backed store");
@@ -471,8 +400,6 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
 
     let mut ids_by_rank = seed_lang_scope(&db, scope_a, 0);
     ids_by_rank.extend(seed_lang_scope(&db, scope_b, LANG_ROWS_PER_SCOPE));
-    drive_maintenance_until_ready(&db, &idx, scope_a);
-    drive_maintenance_until_ready(&db, &idx, scope_b);
 
     // Global rank 0..9 is "fr" (excluded); the nearest "en" rows start at
     // rank 10. Both are within scope_a, so no scope filter is needed to make
@@ -485,9 +412,9 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
     );
 
     let filtered_sql = "SELECT id FROM restart_items WHERE scope_id = $scope AND lang = 'en' \
-                         ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 5";
+                         ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 5";
     let unfiltered_sql = "SELECT id FROM restart_items WHERE scope_id = $scope \
-                           ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 5";
+                           ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 5";
     let auto_filtered_sql = "SELECT id FROM restart_items WHERE scope_id = $scope AND lang = 'en' \
                               ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 5";
     let bound = params([
@@ -498,63 +425,53 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
     // Both routes must already serve the live handle before restart is tested.
     let unfiltered_before = ids(&db
         .execute(unfiltered_sql, &bound)
-        .expect("CONTROL: pre-close unfiltered INDEXED search answers on the live handle"));
+        .expect("CONTROL: pre-close unfiltered AUTO search answers on the live handle"));
     assert_eq!(unfiltered_before, expected_unfiltered);
-    assert!(
-        db.__debug_last_query_vector_used_indexed_route_for_test(),
-        "CONTROL: pre-close unfiltered INDEXED must use the maintained graph"
-    );
 
     for bounded_reader in [false, true] {
         let result = if bounded_reader {
             bounded::execute(&db, &bounded_request(filtered_sql, bound.clone()))
-                .expect("live bounded filtered INDEXED query")
+                .expect("live bounded filtered AUTO query")
                 .result
         } else {
             db.execute(filtered_sql, &bound)
-                .expect("live filtered INDEXED query")
+                .expect("live filtered AUTO query")
         };
         assert_eq!(ids(&result), expected_filtered);
-        assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
     }
     let mut live_rust_query = SemanticQuery::new("restart_items", "embedding", query.clone(), 5);
-    live_rust_query.search_mode = Some(VectorSearchMode::Indexed);
+    live_rust_query.search_mode = Some(VectorSearchMode::Auto);
     live_rust_query.where_clause = Some("lang = 'en'".to_owned());
     assert_eq!(
         semantic_ids(db.semantic_search(live_rust_query).unwrap()),
         expected_filtered
     );
-    assert!(db.__debug_last_query_vector_used_indexed_route_for_test());
 
     db.close().expect("close the sealed lang-filtered fixture");
 
     let db = Database::open(&path).expect("reopen the lang-filtered fixture");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    assert!(
-        graph_available(&db, &idx, scope_a) && graph_available(&db, &idx, scope_b),
-        "both partitions must be reported available immediately after a clean reopen"
-    );
 
-    // Assertion (2), CONTROL: the unfiltered INDEXED query must still answer
+    // Assertion (2), CONTROL: the unfiltered AUTO query must still answer
     // through the maintained route after reopen -- this must stay green.
     let unfiltered_after = ids(&db
         .execute(unfiltered_sql, &bound)
-        .expect("CONTROL: unfiltered INDEXED search must answer after reopen"));
+        .expect("CONTROL: unfiltered AUTO search must answer after reopen"));
     assert_eq!(
         unfiltered_after, expected_unfiltered,
         "CONTROL: the unfiltered post-reopen answer must match the pre-close answer"
     );
 
-    // Assertion (1): the filtered INDEXED query, ordinary door.
+    // Assertion (1): the filtered AUTO query, ordinary door.
     let ordinary_filtered_after = db.execute(filtered_sql, &bound);
     match &ordinary_filtered_after {
         Ok(result) => assert_eq!(
             ids(result),
             expected_filtered,
-            "the filtered INDEXED query must answer with the same ids as before close"
+            "the filtered AUTO query must answer with the same ids as before close"
         ),
         Err(error) => panic!(
-            "filtered INDEXED refuses on the ordinary door after reopen even though the \
+            "filtered AUTO refuses on the ordinary door after reopen even though the \
              partition's graph is available and the unfiltered query on the same store just \
              answered: {error}"
         ),
@@ -567,23 +484,23 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
         Ok(result) => assert_eq!(
             ids(&result.result),
             expected_filtered,
-            "the bounded door's filtered INDEXED query must answer with the same ids as before close"
+            "the bounded door's filtered AUTO query must answer with the same ids as before close"
         ),
         Err(error) => {
-            panic!("filtered INDEXED refuses on the bounded door after reopen: {error:?}")
+            panic!("filtered AUTO refuses on the bounded door after reopen: {error:?}")
         }
     }
 
     // Assertion (1), Rust `SemanticQuery` door.
     let mut rust_query = SemanticQuery::new("restart_items", "embedding", query.clone(), 5);
-    rust_query.search_mode = Some(VectorSearchMode::Indexed);
+    rust_query.search_mode = Some(VectorSearchMode::Auto);
     rust_query.where_clause = Some("lang = 'en'".to_owned());
     let rust_filtered_after = db.semantic_search(rust_query);
     match rust_filtered_after {
         Ok(rows) => assert_eq!(
             semantic_ids(rows),
             expected_filtered,
-            "the Rust SemanticQuery door's filtered INDEXED query must answer with the same ids"
+            "the Rust SemanticQuery door's filtered AUTO query must answer with the same ids"
         ),
         Err(error) => {
             assert!(
@@ -592,9 +509,9 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
                     Error::VectorIndexedRouteUnavailable { .. }
                         | Error::VectorFilteredRouteUnavailable { .. }
                 ),
-                "unexpected error shape for the Rust filtered INDEXED door: {error}"
+                "unexpected error shape for the Rust filtered AUTO door: {error}"
             );
-            panic!("filtered INDEXED refuses on the Rust SemanticQuery door after reopen: {error}");
+            panic!("filtered AUTO refuses on the Rust SemanticQuery door after reopen: {error}");
         }
     }
 
@@ -608,33 +525,13 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
         auto_filtered_after, expected_filtered,
         "filtered AUTO must return the same ids as the maintained-route answer"
     );
-    let auto_trace = {
-        let seam_read_memory = db
-            .declared_reader_memory()
-            .expect("admit the fixture operation reader");
-        db.__take_last_query_vector_trace_for_test(seam_read_memory)
-            .expect("read the admitted trace observation")
-    }
-    .expect("the filtered AUTO query must publish a debug trace");
-    assert!(
-        auto_trace.partition_routes.iter().any(|route| {
-            route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed
-        }) && auto_trace.fallback_reason.is_none(),
-        "filtered AUTO after reopen must take the maintained graph route with no fallback, \
-         trace={auto_trace:?}"
-    );
 
     // Assertion (4): `.explain` of the filtered statement after reopen must
     // report an indexed route and no refusal.
     let explain = contextdb_engine::cli_render::render_explain(&db, filtered_sql, &bound)
-        .expect(".explain must describe the filtered INDEXED statement without erroring");
-    assert!(
-        explain_fact(&explain, "route", "indexed")
-            || explain_fact(&explain, "route", "filtered-indexed"),
-        ".explain of the reopened filtered INDEXED statement must report an indexed route: {explain}"
-    );
+        .expect(".explain must describe the filtered AUTO statement without erroring");
     assert!(
         explain_fact(&explain, "refusal", "none"),
-        ".explain of the reopened filtered INDEXED statement must report no refusal: {explain}"
+        ".explain of the reopened filtered AUTO statement must report no refusal: {explain}"
     );
 }

@@ -20,7 +20,6 @@ const ROWS_PER_PARTITION: usize = 24;
 const MANY_PARTITIONS: usize = 6;
 const MANY_ROWS_PER_PARTITION: usize = 200;
 const MANY_VECTOR_DIMENSION: usize = 128;
-const MAX_MAINTENANCE_CYCLES: usize = 64;
 
 /// Scopes seeded for the two-column lang-filtered candidate-derivation
 /// fixture below (`open_lang_residency_fixture`).
@@ -89,36 +88,6 @@ fn seed_partition(db: &Database, scope: Uuid, first: Uuid, axis: usize) {
         )
         .expect("insert one raw-vector fixture row");
     }
-}
-
-fn drive_maintenance_until_ready(db: &Database, expected_partitions: usize) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory()
-                .expect("admit the partition observation reader"),
-        );
-
-        let infos = db
-            .vector_store_for_test()
-            .partition_infos(&index(), &mut partition_observation_owner_1)
-            .unwrap();
-        if infos.len() == expected_partitions
-            && infos.iter().all(|info| {
-                db.__debug_vector_partition_indexed_for_test(
-                    info.partition.index.clone(),
-                    info.partition.partition_key.clone(),
-                )
-            })
-        {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite caller-driven maintenance cycle returns");
-    }
-    panic!(
-        "maintenance did not publish {expected_partitions} routes within \
-         {MAX_MAINTENANCE_CYCLES} cycles"
-    );
 }
 
 fn bounded_request(sql: &str, bound: HashMap<String, Value>) -> bounded::BoundedReadRequest {
@@ -247,7 +216,6 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
         .expect("create partitioned raw-vector fixture");
         seed_partition(&db, alpha, Uuid::from_u128(0xA100_0000), 0);
         seed_partition(&db, bravo, Uuid::from_u128(0xB200_0000), 1);
-        drive_maintenance_until_ready(&db, 2);
         db.close().expect("close maintained fixture");
     }
 
@@ -287,7 +255,7 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
     );
 
     let activity_before_indexed = db.__vector_passive_activity_counters_for_test();
-    search(&db, bravo, 1, "INDEXED");
+    search(&db, bravo, 1, "AUTO");
     let activity_after_indexed = db.__vector_passive_activity_counters_for_test();
     assert!(!raw_resident(&db, alpha));
     assert!(!raw_resident(&db, bravo));
@@ -295,11 +263,11 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
         0,
-        "INDEXED keeps both selected and sibling raw partitions directory-only"
+        "AUTO keeps both selected and sibling raw partitions directory-only"
     );
     assert_eq!(
         activity_after_indexed.raw_partition_loads, activity_before_indexed.raw_partition_loads,
-        "INDEXED must not disguise candidate scoring as one complete partition load"
+        "AUTO must not disguise candidate scoring as one complete partition load"
     );
 }
 
@@ -521,42 +489,6 @@ fn seed_lang_partition(db: &Database, partition_ordinal: usize) {
     }
 }
 
-fn drive_maintenance_until_ready_for_indices(
-    db: &Database,
-    expected_partitions: usize,
-    indices: &[VectorIndexRef],
-) {
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        let ready = indices.iter().all(|index| {
-            let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
-                db.declared_reader_memory()
-                    .expect("admit the partition observation reader"),
-            );
-
-            let infos = db
-                .vector_store_for_test()
-                .partition_infos(index, &mut partition_observation_owner_2)
-                .unwrap();
-            infos.len() == expected_partitions
-                && infos.iter().all(|info| {
-                    db.__debug_vector_partition_indexed_for_test(
-                        info.partition.index.clone(),
-                        info.partition.partition_key.clone(),
-                    )
-                })
-        });
-        if ready {
-            return;
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite caller-driven maintenance cycle returns");
-    }
-    panic!(
-        "maintenance did not publish {expected_partitions} routes for every index within \
-         {MAX_MAINTENANCE_CYCLES} cycles"
-    );
-}
-
 /// Opens the two-quantized-column lang-filtered fixture, seeds
 /// `LANG_PARTITIONS` scopes of `LANG_ROWS_PER_PARTITION` rows each (every row
 /// `lang = 'en'`), optionally declares a relational index on `lang`, drives
@@ -596,11 +528,6 @@ fn open_lang_residency_fixture(with_lang_index: bool) -> (TempDir, Database) {
         for partition_ordinal in 0..LANG_PARTITIONS {
             seed_lang_partition(&db, partition_ordinal);
         }
-        drive_maintenance_until_ready_for_indices(
-            &db,
-            LANG_PARTITIONS,
-            &[index(), payload_index()],
-        );
         db.close()
             .expect("close the maintained lang-residency fixture");
     }
@@ -734,7 +661,7 @@ fn projecting_the_searched_column_loads_only_answer_partitions() {
     let sql_template = "SELECT id, embedding FROM raw_residency_items WHERE lang = 'en' \
                          ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 3";
 
-    for mode in ["AUTO", "INDEXED"] {
+    for mode in ["AUTO", "EXACT"] {
         let sql = sql_template.replace("{mode}", mode);
 
         let ordinary = db
@@ -996,31 +923,7 @@ fn composite_strict_range_fixture() -> (Database, Uuid) {
         )
         .expect("insert one strict composite-range candidate");
     }
-    let vector_index = VectorIndexRef::new("composite_range_candidates", "embedding");
-    for _ in 0..MAX_MAINTENANCE_CYCLES {
-        let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory()
-                .expect("admit the partition observation reader"),
-        );
-
-        if db
-            .vector_store_for_test()
-            .partition_infos(&vector_index, &mut partition_observation_owner_3)
-            .expect("inspect the unpartitioned vector route")
-            .iter()
-            .any(|info| {
-                db.__debug_vector_partition_indexed_for_test(
-                    info.partition.index.clone(),
-                    info.partition.partition_key.clone(),
-                )
-            })
-        {
-            return (db, allowed_context);
-        }
-        db.run_maintenance_cycle()
-            .expect("one finite maintenance cycle publishes the graph");
-    }
-    panic!("maintenance did not publish the strict composite-range graph");
+    (db, allowed_context)
 }
 
 fn assert_strict_composite_range_matches_exact(
@@ -1035,7 +938,7 @@ fn assert_strict_composite_range_matches_exact(
         "SELECT id FROM composite_range_candidates WHERE {predicate} \
          ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
     );
-    let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR INDEXED");
+    let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR AUTO");
 
     let exact = db
         .execute(&exact_sql, &query)
@@ -1179,36 +1082,6 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
                 .expect("insert the NULL-tail candidate closest to the query");
             }
         }
-        for _ in 0..MAX_MAINTENANCE_CYCLES {
-            db.run_maintenance_cycle()
-                .expect("publish the finite fixture graphs");
-            let all_ready = ["nullable_lower_range", "required_lower_range"]
-                .into_iter()
-                .all(|table| {
-                    let mut partition_observation_owner_4 =
-                        contextdb_engine::vector_read_memory::admission(
-                            db.declared_reader_memory()
-                                .expect("admit the partition observation reader"),
-                        );
-
-                    db.vector_store_for_test()
-                        .partition_infos(
-                            &VectorIndexRef::new(table, "embedding"),
-                            &mut partition_observation_owner_4,
-                        )
-                        .expect("inspect one unpartitioned vector route")
-                        .iter()
-                        .any(|info| {
-                            db.__debug_vector_partition_indexed_for_test(
-                                info.partition.index.clone(),
-                                info.partition.partition_key.clone(),
-                            )
-                        })
-                });
-            if all_ready {
-                break;
-            }
-        }
 
         for operator in [">", ">="] {
             for (table, should_materialize) in [
@@ -1220,13 +1093,13 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
                     "SELECT id FROM {table} WHERE boundary {operator} 100 \
                      ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
                 );
-                let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR INDEXED");
+                let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR AUTO");
                 let exact = db
                     .execute(&exact_sql, &query)
                     .expect("the exact route establishes SQL NULL semantics");
                 let before = db.__candidate_derivation_counters_for_test();
                 let indexed = bounded::execute(&db, &bounded_request(&indexed_sql, query))
-                    .expect("the directed indexed route answers");
+                    .expect("the directed AUTO route answers");
                 let materialized = db.__candidate_derivation_counters_for_test() - before;
                 assert_eq!(
                     indexed.result.rows(),
@@ -1403,7 +1276,7 @@ fn indexed_route_read_your_writes_inside_a_transaction() {
         Value::Vector(lang_query(MANY_VECTOR_DIMENSION - 1)),
     )]);
     let sql = "SELECT id FROM raw_residency_items WHERE lang = 'en' \
-               ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
+               ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3";
 
     // The staged vector uses an axis no committed vector is aligned with,
     // so native quantization cannot turn its first-place score into a tie.
@@ -1427,11 +1300,11 @@ fn indexed_route_read_your_writes_inside_a_transaction() {
     let before = db.__candidate_derivation_counters_for_test();
     let ordinary = db
         .execute(sql, &query)
-        .expect("ordinary INDEXED candidate search inside the transaction answers");
+        .expect("ordinary AUTO candidate search inside the transaction answers");
     let after = db.__candidate_derivation_counters_for_test();
 
     let bounded_result = bounded::execute(&db, &bounded_request(sql, query.clone()))
-        .expect("bounded INDEXED candidate search inside the transaction answers");
+        .expect("bounded AUTO candidate search inside the transaction answers");
 
     let ordinary_ids = result_ids(&ordinary);
     assert!(

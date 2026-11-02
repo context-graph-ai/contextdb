@@ -73,39 +73,6 @@ fn equal_distance_rows_keep_canonical_order_across_contexts() {
             .expect("seed one equal-distance row");
         }
     }
-    let mut ready = false;
-    for _ in 0..512 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic graph maintenance");
-        if ["ties_reverse", "ties_forward"].into_iter().all(|table| {
-            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-                db.declared_reader_memory()
-                    .expect("admit the partition observation reader"),
-            );
-
-            let ready = db
-                .vector_store_for_test()
-                .partition_infos(
-                    &VectorIndexRef::new(table, "embedding"),
-                    &mut partition_observation_owner_1,
-                )
-                .expect("inspect graph readiness");
-            ready.len() == PARTITIONS
-                && ready.iter().all(|partition| {
-                    db.__debug_vector_partition_indexed_for_test(
-                        partition.partition.index.clone(),
-                        partition.partition.partition_key.clone(),
-                    )
-                })
-        }) {
-            ready = true;
-            break;
-        }
-    }
-    assert!(
-        ready,
-        "all Contexts publish a graph before the routes are compared"
-    );
 
     let mut params = HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
     let mut contexts = Vec::new();
@@ -121,29 +88,21 @@ fn equal_distance_rows_keep_canonical_order_across_contexts() {
     for table in ["ties_reverse", "ties_forward"] {
         let sql = format!(
             "SELECT id FROM {table} WHERE context_id IN ({}) AND generation_id IN ({}) \
-             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT {LIMIT}",
+             ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT {LIMIT}",
             contexts.join(", "),
             generations.join(", "),
         );
         let indexed = db
             .execute(&sql, &params)
-            .expect("the indexed route answers the complete scope");
+            .expect("the AUTO route answers the complete scope");
         let exact = db
-            .execute(&sql.replace("INDEXED", "EXACT"), &params)
+            .execute(&sql.replace("AUTO", "EXACT"), &params)
             .expect("the exact route supplies the canonical tie oracle");
         assert_eq!(ids(&exact), vec![1, 2, 3]);
-        assert!(matches!(
-            indexed
-                .trace()
-                .vector_search
-                .as_ref()
-                .and_then(|search| search.route),
-            Some(VectorSearchRoute::Indexed | VectorSearchRoute::FilteredIndexed)
-        ));
         assert_eq!(
             ids(&indexed),
             ids(&exact),
-            "the {table} graph must retain the three smallest row ids among ties"
+            "the {table} AUTO answer must retain the three smallest row ids among ties"
         );
     }
 }

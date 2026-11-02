@@ -55,9 +55,6 @@ fn fixture(mode: &str, vectors: &[Vec<f32>]) -> Database {
         )
         .unwrap();
     }
-    for _ in 0..32 {
-        db.run_maintenance_cycle().unwrap();
-    }
     db
 }
 
@@ -183,8 +180,7 @@ fn updated_base_and_tail_publish_one_visible_row_per_identity() {
         &parameters(&[0.8, 0.2, -0.3]),
     )
     .unwrap();
-    let sql =
-        "SELECT id, score FROM items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
+    let sql = "SELECT id, score FROM items ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 10";
     for result in [
         db.execute(sql, &parameters(&[0.7, 0.3, -0.2])).unwrap(),
         bounded_query(&db, sql, &[0.7, 0.3, -0.2]),
@@ -196,7 +192,7 @@ fn updated_base_and_tail_publish_one_visible_row_per_identity() {
 #[test]
 fn filtered_completeness_belongs_to_the_merged_serving_layers() {
     let db = fixture("F32", &[vec![1., 0., 0.], vec![-1., 0., 0.]]);
-    let sql = "SELECT id FROM items WHERE bucket < 5 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
+    let sql = "SELECT id FROM items WHERE bucket < 5 ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 10";
     for updated in [false, true] {
         if updated {
             db.execute(
@@ -331,14 +327,11 @@ fn partition_key_only_update_is_visible_in_the_writing_transaction() {
         &HashMap::new(),
     )
     .unwrap();
-    for _ in 0..32 {
-        db.run_maintenance_cycle().unwrap();
-    }
     for commit in [false, true] {
         db.execute("BEGIN", &HashMap::new()).unwrap();
         db.execute("UPDATE items SET bucket = 2 WHERE id = 1", &HashMap::new())
             .unwrap();
-        for mode in ["AUTO", "EXACT", "INDEXED"] {
+        for mode in ["AUTO", "EXACT"] {
             for bucket in [1, 2] {
                 let sql = format!(
                     "SELECT id FROM items WHERE bucket = {bucket} ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 10"
@@ -496,11 +489,10 @@ fn a_long_update_history_does_not_fill_indexed_result_slots_with_one_identity() 
         )
         .unwrap();
     }
-    let sql =
-        "SELECT id, score FROM items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
+    let sql = "SELECT id, score FROM items ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 10";
     let exact = db
         .execute(
-            &sql.replace("INDEXED", "EXACT"),
+            &sql.replace("AUTO", "EXACT"),
             &parameters(&[0.7, 0.3, -0.2]),
         )
         .unwrap();

@@ -65,7 +65,7 @@ fn store(path: &std::path::Path, writer: usize, reader: u64) -> Database {
     .unwrap();
     db.register_trigger_callback("fire_guard", |_, _| Ok(()))
         .unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(32) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(32) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE AUTO AUTO_INDEX_AT 1 CONSOLIDATION NONE)", &HashMap::new()).unwrap();
     db.complete_initialization().unwrap();
     for id in 0..32i64 {
         db.execute(
@@ -77,13 +77,6 @@ fn store(path: &std::path::Path, writer: usize, reader: u64) -> Database {
     for id in 0..64 {
         insert_point(&db, id);
     }
-    while db
-        .run_maintenance_cycle()
-        .unwrap()
-        .vector
-        .remaining_partitions
-        != 0
-    {}
     insert_point(&db, 1000);
     db
 }
@@ -113,7 +106,7 @@ fn reads_decode_only_under_the_declared_reader_never_the_writer() {
     let nearest = {
         let fixture_answer_47 = db
         .execute(
-            "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR AUTO LIMIT 1",
             &HashMap::from([("q".into(), Value::Vector(vector(1000)))]),
         )
         .unwrap();

@@ -20,7 +20,7 @@ fn an_indexed_vector_search_decodes_nothing_without_its_request_owner() {
         },
     )
     .unwrap();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION NONE)", &HashMap::new()).unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE AUTO AUTO_INDEX_AT 1 CONSOLIDATION NONE)", &HashMap::new()).unwrap();
     for id in 0..64i64 {
         db.execute(
             "INSERT INTO points VALUES ($id, 1, $vector)",
@@ -34,13 +34,6 @@ fn an_indexed_vector_search_decodes_nothing_without_its_request_owner() {
         )
         .unwrap();
     }
-    while db
-        .run_maintenance_cycle()
-        .unwrap()
-        .vector
-        .remaining_partitions
-        != 0
-    {}
     // One more row stays in the uncovered suffix, so both the graph and the
     // pending tail are read.
     db.execute(
@@ -52,7 +45,7 @@ fn an_indexed_vector_search_decodes_nothing_without_its_request_owner() {
     let rows = {
         let fixture_answer_37 = db
         .execute(
-            "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR AUTO LIMIT 1",
             &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
