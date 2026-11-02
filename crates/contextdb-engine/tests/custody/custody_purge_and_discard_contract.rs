@@ -2220,7 +2220,7 @@ fn ids(db: &Database, table: &str) -> Vec<Uuid> {
         .execute(&format!("SELECT id FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} must answer: {err}"))
         .rows()
-        .into_iter()
+        .iter()
         .map(|row| match &row[0] {
             Value::Uuid(id) => *id,
             other => panic!("{table}.id is a UUID, got {other:?}"),
@@ -2471,99 +2471,215 @@ fn cg_shaped_followers_erase_only_their_own_arm() {
 /// An archived life is found from the parent it referenced, never from the
 /// child table's current declaration: the table may since point elsewhere,
 /// no longer follow, or be gone.
+/// A source store that pushes to `hub` over real authenticated sync
+/// transport, so the hub receives schema, rows and drops as delivered.
+struct PushingSource {
+    db: Arc<Database>,
+    client: SyncClient,
+    server: Arc<SyncServer>,
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+    _broker: contextdb_server::InProcessBroker,
+}
+
+impl PushingSource {
+    fn start(runtime: &tokio::runtime::Runtime, root: &Path, hub: Arc<Database>) -> Self {
+        let tenant = TenantId::from("archived-followers");
+        let hub_identity = Arc::new(contextdb_server::FabricIdentity::generate());
+        let source_identity = Arc::new(contextdb_server::FabricIdentity::generate());
+        let broker = contextdb_server::InProcessBroker::new();
+        let node = hub_identity.node_id();
+        let server = Arc::new(
+            SyncServer::with_authenticated_transport_and_identity_for_test(
+                hub,
+                broker.server_as(&node),
+                tenant.clone(),
+                node,
+                hub_identity,
+            )
+            .expect("construct the hub's authenticated sync endpoint"),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = runtime.spawn({
+            let server = server.clone();
+            let stop = stop.clone();
+            async move { server.run_until(stop).await }
+        });
+        runtime.block_on(broker.wait_for_registered_route_for_test(
+            &contextdb_server::subjects::push_subject(tenant.as_str()),
+        ));
+        let db = Arc::new(Database::open(root.join("source.db")).expect("open the source store"));
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.client_as(&source_identity.node_id()),
+            tenant,
+            source_identity,
+        )
+        .expect("construct the source's authenticated sync endpoint");
+        Self {
+            db,
+            client,
+            server,
+            stop,
+            task,
+            _broker: broker,
+        }
+    }
+
+    fn push(&self, runtime: &tokio::runtime::Runtime) {
+        runtime
+            .block_on(self.client.push())
+            .expect("the hub receives the source's schema and rows");
+    }
+
+    fn stop(self, runtime: &tokio::runtime::Runtime) {
+        self.stop.store(true, Ordering::SeqCst);
+        runtime.block_on(self.task).expect("hub stops cleanly");
+        drop(self.client);
+        drop(self.server);
+    }
+}
+
 #[test]
 fn a_purge_erases_child_lives_archived_by_an_earlier_drop() {
-    for recreated_as in [
-        Some("parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE"),
-        Some("parent_id UUID REFERENCES other_parents(id) FOLLOWS PARENT PURGE"),
-        Some("parent_id UUID REFERENCES parents(id)"),
-        None,
-    ] {
-        let root = tempfile::tempdir().expect("temporary test directory");
-        let path = root.path().join("archived-followers.db");
-        let db = Database::open(&path).expect("open the store");
-        for ddl in [
-            "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT) SYNC OFF",
-            "CREATE TABLE other_parents (id UUID PRIMARY KEY, batch TEXT) SYNC OFF",
-            "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF",
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("sync runtime");
+    for received in [false, true] {
+        for recreated_as in [
+            Some("parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE"),
+            Some("parent_id UUID REFERENCES other_parents(id) FOLLOWS PARENT PURGE"),
+            Some("parent_id UUID REFERENCES parents(id)"),
+            None,
         ] {
-            exec(&db, ddl, &p());
-        }
-        let (purged, kept) = (Uuid::new_v4(), Uuid::new_v4());
-        for id in [purged, kept] {
-            exec(
-                &db,
-                "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
-                &id_params(id),
+            let case = format!(
+                "{} drop, recreated as {recreated_as:?}",
+                if received { "received" } else { "local" }
             );
-            exec(
-                &db,
-                "INSERT INTO other_parents (id, batch) VALUES ($id, 'b')",
-                &id_params(id),
-            );
-        }
-        let (archived_purged, archived_kept) = (Uuid::new_v4(), Uuid::new_v4());
-        insert_child(&db, "children", archived_purged, "parent_id", purged);
-        insert_child(&db, "children", archived_kept, "parent_id", kept);
-        exec(&db, "DROP TABLE children", &p());
-        let mut fresh = Vec::new();
-        if let Some(column) = recreated_as {
-            exec(
-                &db,
-                &format!(
-                    "CREATE TABLE children (id UUID PRIMARY KEY, {column}, body TEXT) SYNC OFF"
-                ),
-                &p(),
-            );
-            for parent in [purged, kept] {
-                let id = Uuid::new_v4();
-                insert_child(&db, "children", id, "parent_id", parent);
-                fresh.push(id);
+            let root = tempfile::tempdir().expect("temporary test directory");
+            let path = root.path().join("archived-followers.db");
+            let db = Arc::new(Database::open(&path).expect("open the store"));
+            // A received drop is authored on a source and pushed to this store
+            // through real sync transport; a local one is authored here.
+            let source =
+                received.then(|| PushingSource::start(&runtime, root.path(), db.clone()));
+            let author: &Database = source.as_ref().map_or(&db, |source| &source.db);
+            let sync = if received { " SYNC TWO WAY" } else { " SYNC OFF" };
+            for ddl in [
+                "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT)",
+                "CREATE TABLE other_parents (id UUID PRIMARY KEY, batch TEXT)",
+                "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, body TEXT)",
+            ] {
+                exec(author, &format!("{ddl}{sync}"), &p());
             }
-        }
-        db.close().expect("close the store");
-        let db = Database::open(&path).expect("reopen the store");
-        assert!(
-            follower_lives(&db, "parents", purged)
-                .iter()
-                .any(|(table, retained)| table == "children" && *retained),
-            "{recreated_as:?}: the archived life is found from its parent"
-        );
-
-        exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(purged));
-
-        let check = |db: &Database| {
-            assert!(
-                !follower_lives(db, "parents", purged)
-                    .iter()
-                    .any(|(_, retained)| *retained),
-                "{recreated_as:?}: no archived life of the purged parent survives"
-            );
-            assert!(
-                follower_lives(db, "parents", kept)
-                    .iter()
-                    .any(|(table, retained)| table == "children" && *retained),
-                "{recreated_as:?}: the other parent's archived life survives"
-            );
-            if recreated_as.is_some() {
-                let following_this_parent = recreated_as.is_some_and(|column| {
-                    column.contains("parents(id) FOLLOWS") && !column.contains("other_")
-                });
-                let mut expected = fresh.clone();
-                if following_this_parent {
-                    expected.retain(|id| *id != fresh[0]);
-                }
-                expected.sort();
-                assert_eq!(
-                    ids(db, "children"),
-                    expected,
-                    "{recreated_as:?}: a fresh row follows only through the current declaration"
+            // Two parent tables share each key, so a key alone never says
+            // which parent an archived life followed.
+            let (purged, kept) = (Uuid::new_v4(), Uuid::new_v4());
+            for id in [purged, kept] {
+                exec(
+                    author,
+                    "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+                    &id_params(id),
+                );
+                exec(
+                    author,
+                    "INSERT INTO other_parents (id, batch) VALUES ($id, 'b')",
+                    &id_params(id),
                 );
             }
-        };
-        check(&db);
-        db.close().expect("close the store");
-        check(&Database::open(&path).expect("reopen the store"));
+            let (archived_purged, archived_kept) = (Uuid::new_v4(), Uuid::new_v4());
+            insert_child(author, "children", archived_purged, "parent_id", purged);
+            insert_child(author, "children", archived_kept, "parent_id", kept);
+            if let Some(source) = &source {
+                source.push(&runtime);
+            }
+            exec(author, "DROP TABLE children", &p());
+            let mut fresh = Vec::new();
+            if let Some(column) = recreated_as {
+                exec(
+                    author,
+                    &format!(
+                        "CREATE TABLE children (id UUID PRIMARY KEY, {column}, body TEXT){sync}"
+                    ),
+                    &p(),
+                );
+                for parent in [purged, kept] {
+                    let id = Uuid::new_v4();
+                    insert_child(author, "children", id, "parent_id", parent);
+                    fresh.push(id);
+                }
+            } else if received {
+                // A data commit after the drop carries the drop to the hub.
+                exec(
+                    author,
+                    "INSERT INTO parents (id, batch) VALUES ($id, 'later')",
+                    &id_params(Uuid::new_v4()),
+                );
+            }
+            if let Some(source) = source {
+                source.push(&runtime);
+                source.stop(&runtime);
+            }
+            db.close().expect("close the store");
+            drop(db);
+            let db = Database::open(&path).expect("reopen the store");
+            assert!(
+                follower_lives(&db, "parents", purged)
+                    .iter()
+                    .any(|(table, retained)| table == "children" && *retained),
+                "{case}: the archived life is found from its parent"
+            );
+
+            // The other parent table shares the key; purging it never reaches
+            // a life that followed `parents`, whatever `children` follows now.
+            exec(
+                &db,
+                "PURGE FROM other_parents WHERE id = $id",
+                &id_params(purged),
+            );
+            assert!(
+                follower_lives(&db, "parents", purged)
+                    .iter()
+                    .any(|(table, retained)| table == "children" && *retained),
+                "{case}: purging the other parent leaves this parent's archived life"
+            );
+
+            exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(purged));
+
+            let check = |db: &Database| {
+                assert!(
+                    !follower_lives(db, "parents", purged)
+                        .iter()
+                        .any(|(_, retained)| *retained),
+                    "{case}: no archived life of the purged parent survives"
+                );
+                assert!(
+                    follower_lives(db, "parents", kept)
+                        .iter()
+                        .any(|(table, retained)| table == "children" && *retained),
+                    "{case}: the other parent's archived life survives"
+                );
+                if recreated_as.is_some() {
+                    // The fresh row of the purged key follows through the
+                    // current declaration, to whichever parent it names.
+                    let mut expected = fresh.clone();
+                    if recreated_as.is_some_and(|column| column.contains("FOLLOWS")) {
+                        expected.retain(|id| *id != fresh[0]);
+                    }
+                    expected.sort();
+                    assert_eq!(
+                        ids(db, "children"),
+                        expected,
+                        "{case}: a fresh row follows only through the current declaration"
+                    );
+                }
+            };
+            check(&db);
+            db.close().expect("close the store");
+            check(&Database::open(&path).expect("reopen the store"));
+        }
     }
 }
 
@@ -2603,3 +2719,4 @@ fn follows_parent_purge_is_validated_on_the_projected_catalog() {
         "EXPLAIN names what follows: {explained}"
     );
 }
+

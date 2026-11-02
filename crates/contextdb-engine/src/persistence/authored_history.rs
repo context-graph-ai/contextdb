@@ -236,7 +236,9 @@ impl RedbPersistence {
                 .get(addressed.as_str())
                 .map_err(Self::storage_error)?
                 .is_some();
-            if !present && let Some((forward, by_row)) = postings.as_mut() {
+            // A received row's body was archived when it arrived, so `present`
+            // says nothing about its postings: every outgoing life gets them.
+            if let Some((forward, by_row)) = postings.as_mut() {
                 admission.admit(value.value().len().saturating_mul(8).saturating_add(256))?;
                 let row = Self::decode_versioned_row(value.value(), None)?;
                 // The archived life's own key, recorded now: after a drop or a
@@ -583,7 +585,7 @@ impl RedbPersistence {
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len())

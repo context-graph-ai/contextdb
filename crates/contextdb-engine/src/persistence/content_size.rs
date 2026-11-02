@@ -778,10 +778,14 @@ fn reconcile_row_heads_holding<'name, 'txn, A: writer_row_heads::RowHeadAdmissio
         } else {
             0
         };
-        update(write, table, |value| {
-            value.live_row_bytes = changed(value.live_row_bytes, old, new)?;
-            Ok(())
-        })?;
+        // An erased archived life of a dropped table moves nothing: the drop
+        // already retired that table's totals, and there are none to change.
+        if old != new {
+            update(write, table, |value| {
+                value.live_row_bytes = changed(value.live_row_bytes, old, new)?;
+                Ok(())
+            })?;
+        }
         if let Some(head) = head {
             let mut descriptor = [0; 32];
             descriptor[..24].copy_from_slice(&head);

@@ -449,10 +449,12 @@ impl Database {
     ) -> Result<Option<R>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let meta = self
+        // A dropped table's archived row is judged by its own typed values
+        // below: no current declaration describes it.
+        if self
             .table_meta(table)
-            .ok_or_else(|| Error::TableNotFound(table.into()))?;
-        if !crate::executor::has_edge_columns(&meta) {
+            .is_some_and(|meta| !crate::executor::has_edge_columns(&meta))
+        {
             return Ok(None);
         }
         let (Some(Value::Uuid(source)), Some(Value::Uuid(target)), Some(Value::Text(kind))) = (

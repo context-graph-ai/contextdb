@@ -2022,6 +2022,29 @@ impl Database {
                 report_shape = crate::custody::erasure::PurgeReportShape::PerTable;
             }
             working.extend(followers);
+            // Every table that follows a selected table, transitively, is
+            // gated from the first attempt, so a child committed meanwhile
+            // is published under the same gate as its parent's erasure.
+            let catalog = self
+                .table_names()
+                .into_iter()
+                .filter_map(|name| self.table_meta(&name).map(|meta| (name, meta)))
+                .collect::<Vec<_>>();
+            let mut follower_tables = BTreeSet::<String>::new();
+            let mut pending = working
+                .iter()
+                .map(|selection| selection.table.clone())
+                .collect::<Vec<_>>();
+            while let Some(parent) = pending.pop() {
+                for follower in super::purge_followers::purge_followers_of(
+                    catalog.iter().map(|(name, meta)| (name.as_str(), meta)),
+                    &parent,
+                ) {
+                    if follower_tables.insert(follower.child_table.clone()) {
+                        pending.push(follower.child_table);
+                    }
+                }
+            }
             let selections: &[AuthoritativePurgeSelection] = &working;
             // Candidate discovery and the callback drain both happen before the
             // transaction commit mutex. The complete sorted hash set is then
@@ -2035,6 +2058,7 @@ impl Database {
                 let publication_tables = selections
                     .iter()
                     .map(|selection| selection.table.clone())
+                    .chain(follower_tables.iter().cloned())
                     .chain(instructions.outgoing.iter().map(|(table, _)| table.clone()))
                     .chain(
                         frontier_adoptions
