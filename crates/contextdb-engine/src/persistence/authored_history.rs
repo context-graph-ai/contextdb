@@ -5,6 +5,64 @@ use super::*;
 pub(super) const BODIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("__authored_row_bodies");
 
+/// Archived lives of a table that follows its parent's purge, keyed from the
+/// parent: `(parent table, parent key values, child table, child generation,
+/// row key)`. A purge of the parent finds them from the parent alone, never
+/// from the child's current declaration, which may since have changed or gone.
+pub(crate) const FOLLOWER_POSTINGS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__authored_follower_postings");
+/// The same postings keyed `(child table, row key, forward key)`, so erasing
+/// an archived life removes its postings without reading any declaration.
+pub(crate) const FOLLOWER_POSTINGS_BY_ROW: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__authored_follower_postings_by_row");
+
+fn segment(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// The prefix every archived follower of one parent row shares.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn follower_parent_prefix(
+    parent_table: &str,
+    parent_values: &[Value],
+) -> Result<Vec<u8>> {
+    let encoded = RedbPersistence::encode_config_value(&parent_values)?;
+    let mut prefix = Vec::with_capacity(parent_table.len() + encoded.len() + 8);
+    segment(&mut prefix, parent_table.as_bytes());
+    segment(&mut prefix, &encoded);
+    Ok(prefix)
+}
+
+fn follower_row_prefix(child_table: &str, row_key: &[u8]) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(child_table.len() + row_key.len() + 4);
+    segment(&mut prefix, child_table.as_bytes());
+    prefix.extend_from_slice(row_key);
+    prefix
+}
+
+/// What one posting under a parent prefix names: the archived child table,
+/// that table's generation when it was archived, and the row's key.
+pub(crate) fn decode_follower_posting(
+    key: &[u8],
+    prefix_len: usize,
+) -> Option<(String, u64, [u8; 24])> {
+    let rest = key.get(prefix_len..)?;
+    let length = usize::try_from(u32::from_be_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+    let table = std::str::from_utf8(rest.get(4..4 + length)?)
+        .ok()?
+        .to_string();
+    let tail = rest.get(4 + length..)?;
+    if tail.len() != 8 + 24 {
+        return None;
+    }
+    let generation = u64::from_be_bytes(tail[..8].try_into().ok()?);
+    Some((table, generation, tail[8..].try_into().ok()?))
+}
+
 pub(super) fn body_key(table: &str, key: &[u8]) -> String {
     use std::fmt::Write;
     let mut result = String::with_capacity(table.len() * 2 + 1 + 48);
@@ -126,6 +184,37 @@ impl RedbPersistence {
                 })
                 .transpose()
         })?;
+        // A table that follows its parent's purge leaves, for each archived
+        // row, a posting under the parent it referenced, keyed by the parent.
+        let followers = meta
+            .as_ref()
+            .map(|meta| crate::database::purge_followers::declared_purge_followers(logical, meta))
+            .unwrap_or_default();
+        let archived_generation = if followers.is_empty() {
+            0
+        } else {
+            let key = crate::database::Database::durable_lineage_table_generation_key(logical);
+            write
+                .open_table(CONFIG_TABLE)
+                .map_err(Self::storage_error)?
+                .get(key.as_str())
+                .map_err(Self::storage_error)?
+                .map(|value| Self::decode_config_value::<u64>(value.value()))
+                .transpose()?
+                .unwrap_or(0)
+        };
+        let mut postings = if followers.is_empty() {
+            None
+        } else {
+            Some((
+                write
+                    .open_table(FOLLOWER_POSTINGS)
+                    .map_err(Self::storage_error)?,
+                write
+                    .open_table(FOLLOWER_POSTINGS_BY_ROW)
+                    .map_err(Self::storage_error)?,
+            ))
+        };
         // Stored rows are self-describing. Borrow one encoded value at a time;
         // neither decoded history nor a table-sized key list is materialized.
         for entry in source.iter().map_err(Self::storage_error)? {
@@ -147,6 +236,47 @@ impl RedbPersistence {
                 .get(addressed.as_str())
                 .map_err(Self::storage_error)?
                 .is_some();
+            if !present && let Some((forward, by_row)) = postings.as_mut() {
+                admission.admit(value.value().len().saturating_mul(8).saturating_add(256))?;
+                let row = Self::decode_versioned_row(value.value(), None)?;
+                // The archived life's own key, recorded now: after a drop or a
+                // redeclaration the current schema cannot be asked for it.
+                let Some(child_key) = meta.as_ref().and_then(|meta| {
+                    crate::sync_types::natural_key_from_row_values(meta, &row.values)
+                }) else {
+                    continue;
+                };
+                let child_key = Self::encode_config_value(&child_key)?;
+                for follower in &followers {
+                    let Some(values) = follower
+                        .child_columns
+                        .iter()
+                        .map(|column| {
+                            row.values
+                                .get(column)
+                                .filter(|value| **value != Value::Null)
+                                .cloned()
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        // A NULL reference names no parent and follows none.
+                        continue;
+                    };
+                    let mut key = follower_parent_prefix(&follower.parent_table, &values)?;
+                    segment(&mut key, logical.as_bytes());
+                    key.extend_from_slice(&archived_generation.to_be_bytes());
+                    key.extend_from_slice(&raw);
+                    admission.admit(key.len().saturating_mul(3).saturating_add(64))?;
+                    let mut reverse = follower_row_prefix(logical, &raw);
+                    reverse.extend_from_slice(&key);
+                    forward
+                        .insert(key.as_slice(), child_key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    by_row
+                        .insert(reverse.as_slice(), &[][..])
+                        .map_err(Self::storage_error)?;
+                }
+            }
             if !present {
                 // Quantized relational columns are placeholders. Retire their
                 // exact canonical placement now, while that column lifetime
@@ -312,6 +442,7 @@ impl RedbPersistence {
         }
         let mut admission = self.proof_admission();
         admission.admit(logical.len().saturating_mul(2).saturating_add(128))?;
+        let row_key = key;
         let key = body_key(logical, key);
         let removed = write
             .open_table(BODIES)
@@ -319,6 +450,9 @@ impl RedbPersistence {
             .remove(key.as_str())
             .map_err(Self::storage_error)?
             .is_some();
+        if removed {
+            self.erase_follower_postings_in_write(write, logical, row_key)?;
+        }
         Ok(removed)
     }
 }
@@ -385,5 +519,198 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?;
         }
         Ok(())
+    }
+}
+
+impl RedbPersistence {
+    /// Remove every follower posting an erased archived row left, found from
+    /// the row itself. A row of a table that never followed has none.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn erase_follower_postings_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        logical: &str,
+        row_key: &[u8],
+    ) -> Result<()> {
+        if write
+            .normal_table_root(FOLLOWER_POSTINGS_BY_ROW.name())
+            .map_err(Self::storage_error)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let prefix = follower_row_prefix(logical, row_key);
+        let mut by_row = write
+            .open_table(FOLLOWER_POSTINGS_BY_ROW)
+            .map_err(Self::storage_error)?;
+        let mut forward = write
+            .open_table(FOLLOWER_POSTINGS)
+            .map_err(Self::storage_error)?;
+        loop {
+            let mut admission = self.proof_admission();
+            let next = {
+                let mut range = by_row
+                    .range(prefix.as_slice()..)
+                    .map_err(Self::storage_error)?;
+                match range.next() {
+                    Some(entry) => {
+                        let (key, _) = entry.map_err(Self::storage_error)?;
+                        let key = key.value();
+                        if !key.starts_with(&prefix) {
+                            None
+                        } else {
+                            admission.admit(key.len().saturating_mul(2).saturating_add(64))?;
+                            Some(key.to_vec())
+                        }
+                    }
+                    None => None,
+                }
+            };
+            let Some(reverse) = next else {
+                return Ok(());
+            };
+            forward
+                .remove(&reverse[prefix.len()..])
+                .map_err(Self::storage_error)?;
+            by_row
+                .remove(reverse.as_slice())
+                .map_err(Self::storage_error)?;
+        }
+    }
+}
+
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(text.get(at..at + 2)?, 16).ok())
+        .collect()
+}
+
+/// The `(forward, reverse, archived child key)` follower postings an archived
+/// body left, read by its body key in one captured root. Empty for a table
+/// that never followed.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn follower_postings_of_body(
+    read: &redb::ReadTransaction,
+    body_key: &str,
+) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
+    let corrupt = || Error::StoreCorrupted {
+        path: "authored history".into(),
+        reason: "invalid occurrence key".into(),
+    };
+    let (table, row) = body_key.split_once(':').ok_or_else(corrupt)?;
+    let table = String::from_utf8(decode_hex(table).ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    let row = decode_hex(row).ok_or_else(corrupt)?;
+    let by_row = match read.open_table(FOLLOWER_POSTINGS_BY_ROW) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(RedbPersistence::storage_error(error)),
+    };
+    let forward = read
+        .open_table(FOLLOWER_POSTINGS)
+        .map_err(RedbPersistence::storage_error)?;
+    let prefix = follower_row_prefix(&table, &row);
+    let mut postings = Vec::new();
+    for entry in by_row
+        .range(prefix.as_slice()..)
+        .map_err(RedbPersistence::storage_error)?
+    {
+        let (key, _) = entry.map_err(RedbPersistence::storage_error)?;
+        let key = key.value();
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let child_key = forward
+            .get(&key[prefix.len()..])
+            .map_err(RedbPersistence::storage_error)?
+            .ok_or_else(corrupt)?;
+        crate::read_image_memory::reserve(
+            key.len()
+                .saturating_mul(2)
+                .saturating_add(child_key.value().len()),
+        )?;
+        postings.push((
+            key[prefix.len()..].to_vec(),
+            key.to_vec(),
+            child_key.value().to_vec(),
+        ));
+    }
+    Ok(postings)
+}
+
+/// One archived life of a following table, found from its parent.
+pub(crate) struct ArchivedFollower {
+    pub(crate) child_table: String,
+    pub(crate) table_generation: u64,
+    pub(crate) row_id: RowId,
+    pub(crate) natural_key: crate::sync_types::NaturalKey,
+}
+
+impl WriterSnapshotHandle {
+    /// Every archived life whose following foreign key named this parent row,
+    /// whatever the child table's current declaration is. Read in the
+    /// handle's captured root, one posting window charged at a time.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn archived_purge_followers(
+        &self,
+        parent_table: &str,
+        parent_values: &[Value],
+        credit: &mut contextdb_core::read_memory::ReadCredit,
+    ) -> Result<Vec<ArchivedFollower>> {
+        let read = self.owner_read()?;
+        let forward = match read.open_table(FOLLOWER_POSTINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(RedbPersistence::storage_error(error)),
+        };
+        let prefix = follower_parent_prefix(parent_table, parent_values)?;
+        let corrupt = || Error::StoreCorrupted {
+            path: "authored follower postings".into(),
+            reason: "invalid follower posting".into(),
+        };
+        let mut found = Vec::new();
+        for entry in forward
+            .range(prefix.as_slice()..)
+            .map_err(RedbPersistence::storage_error)?
+        {
+            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+            let key = key.value();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            credit.try_grow_for(
+                key.len()
+                    .saturating_add(value.value().len().saturating_mul(4))
+                    .saturating_add(std::mem::size_of::<ArchivedFollower>()),
+                "writer_source",
+                "purge_follower_discovery",
+                "Raise MEMORY_LIMIT to find what follows this purge.",
+            )?;
+            let (child_table, table_generation, row_key) =
+                decode_follower_posting(key, prefix.len()).ok_or_else(corrupt)?;
+            let row_id = RowId(u64::from_be_bytes(
+                row_key[..8].try_into().map_err(|_| corrupt())?,
+            ));
+            let natural_key = RedbPersistence::decode_config_value(value.value())?;
+            found.push(ArchivedFollower {
+                child_table,
+                table_generation,
+                row_id,
+                natural_key,
+            });
+        }
+        Ok(found)
     }
 }

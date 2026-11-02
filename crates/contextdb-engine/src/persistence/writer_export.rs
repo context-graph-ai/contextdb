@@ -148,6 +148,12 @@ impl WriterSnapshotHandle {
                         reason: "invalid occurrence key".into(),
                     })?;
                 artifact.append_encoded_authored_occurrence(key, bytes)?;
+                // The parent-keyed postings of a following table travel with
+                // its archived row, or a restored store could not find it.
+                let postings = super::authored_history::follower_postings_of_body(&read, key)?;
+                if !postings.is_empty() {
+                    artifact.append_follower_postings(&postings)?;
+                }
             }
         }
         Ok(())
@@ -234,6 +240,43 @@ impl RedbPersistence {
         let key = super::authored_history::body_key(table, &Self::rel_row_key(row));
         let encoded = Self::encode_versioned_row(row, Some(meta))?;
         self.append_encoded_authored_occurrence(&key, &encoded)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn append_follower_postings(&self, postings: &[(Vec<u8>, Vec<u8>, Vec<u8>)]) -> Result<()> {
+        self.prepare_proof_owner()?;
+        let mut paid = self.proof_admission();
+        paid.admit(
+            postings
+                .iter()
+                .map(|(forward, reverse, value)| forward.len() + reverse.len() + value.len())
+                .sum::<usize>()
+                .saturating_mul(2)
+                .saturating_add(256),
+        )?;
+        self.with_db(|db| {
+            let write = Self::begin_history_write(db)?;
+            {
+                let mut forward = write
+                    .open_table(super::authored_history::FOLLOWER_POSTINGS)
+                    .map_err(Self::storage_error)?;
+                let mut by_row = write
+                    .open_table(super::authored_history::FOLLOWER_POSTINGS_BY_ROW)
+                    .map_err(Self::storage_error)?;
+                for (key, reverse, value) in postings {
+                    forward
+                        .insert(key.as_slice(), value.as_slice())
+                        .map_err(Self::storage_error)?;
+                    by_row
+                        .insert(reverse.as_slice(), &[][..])
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write.commit().map_err(Self::storage_error)
+        })
     }
 
     #[expect(
