@@ -74,11 +74,13 @@ fn structured_table_ddl_with_including_sync_trigger() -> Vec<DdlChange> {
         child_column: "owner_id".to_string(),
         parent_table: "retry_owners".to_string(),
         parent_column: "id".to_string(),
+        follows_parent_purge: false,
     }];
     let note_composite_foreign_keys = vec![contextdb_core::CompositeForeignKey {
         child_columns: vec!["tenant".to_string(), "owner_id".to_string()],
         parent_table: "retry_owners".to_string(),
         parent_columns: vec!["tenant".to_string(), "id".to_string()],
+        follows_parent_purge: false,
     }];
     let note_composite_unique = vec![vec!["tenant".to_string(), "slug".to_string()]];
     let mut altered_note_columns = note_columns.clone();
@@ -622,6 +624,7 @@ fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
         child_column: "parent_id".to_string(),
         parent_table: parent.to_string(),
         parent_column: "id".to_string(),
+        follows_parent_purge: false,
     }];
     let initial_columns = vec![
         ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
@@ -1100,6 +1103,7 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
         child_column: "parent_id".to_string(),
         parent_table: parent.to_string(),
         parent_column: "id".to_string(),
+        follows_parent_purge: false,
     }];
     let initial_columns = vec![
         ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),

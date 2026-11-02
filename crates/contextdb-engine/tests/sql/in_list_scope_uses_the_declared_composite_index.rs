@@ -220,6 +220,7 @@ fn assert_pinned_schema_competition(db: &Database) {
             child_columns: columns(&["context_id", "generation_id"]),
             parent_table: "event_search_generations".into(),
             parent_columns: columns(&["context_id", "id"]),
+            follows_parent_purge: false,
         }],
         "the fixture keeps the cg Context/generation ownership foreign key"
     );

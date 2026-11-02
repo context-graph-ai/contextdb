@@ -4955,6 +4955,7 @@ fn execute_create_table_plan(
             child_columns: fk.child_columns.clone(),
             parent_table: fk.parent_table.clone(),
             parent_columns: fk.parent_columns.clone(),
+            follows_parent_purge: fk.follows_parent_purge,
         })
         .collect::<Vec<_>>();
 
@@ -5055,6 +5056,19 @@ fn execute_create_table_plan(
     })?;
     meta.indexes = auto_indexes_for_table_meta(&meta);
     auto_indexes = meta.indexes.clone();
+    if crate::database::purge_followers::declared_purge_followers(&p.name, &meta)
+        .first()
+        .is_some()
+    {
+        // Judged on the catalog as it will be with this table in it.
+        let mut projected = db
+            .table_names()
+            .into_iter()
+            .filter_map(|name| db.table_meta(&name).map(|meta| (name, meta)))
+            .collect::<HashMap<_, _>>();
+        projected.insert(p.name.clone(), meta.clone());
+        crate::database::purge_followers::validate_purge_followers(&projected)?;
+    }
     // Judged once the index set this table will actually carry is
     // final, because a declared list must be one some index leads
     // with.
@@ -21545,6 +21559,7 @@ pub(crate) fn core_column_from_ast(
             .map(|reference| contextdb_core::ForeignKeyReference {
                 table: reference.table.clone(),
                 column: reference.column.clone(),
+                follows_parent_purge: reference.follows_parent_purge,
             }),
         expires: col.expires,
         immutable: col.immutable,

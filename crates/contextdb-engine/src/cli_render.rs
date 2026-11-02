@@ -219,6 +219,9 @@ impl std::fmt::Display for MetadataColumn<'_> {
         };
         if let Some(reference) = &col.references {
             write!(out, " REFERENCES {}({})", reference.table, reference.column)?;
+            if reference.follows_parent_purge {
+                out.write_str(" FOLLOWS PARENT PURGE")?;
+            }
         } else if let Some(PropagationRule::ForeignKey {
             referenced_table,
             referenced_column,

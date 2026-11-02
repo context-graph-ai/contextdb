@@ -3007,7 +3007,7 @@ impl Database {
                 projected.get(parent).cloned()
             })?;
         }
-        Ok(())
+        super::purge_followers::validate_purge_followers(projected)
     }
 
     #[expect(

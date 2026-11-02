@@ -8,6 +8,9 @@ pub struct CompositeForeignKey {
     pub child_columns: Vec<String>,
     pub parent_table: String,
     pub parent_columns: Vec<String>,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    #[serde(default)]
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -15,6 +18,9 @@ pub struct SingleColumnForeignKey {
     pub child_column: String,
     pub parent_table: String,
     pub parent_column: String,
+    /// `FOLLOWS PARENT PURGE` on this column's `REFERENCES`.
+    #[serde(default)]
+    pub follows_parent_purge: bool,
 }
 
 /// The time unit a `RETAIN` window was DECLARED in. The engine stores the
@@ -1229,6 +1235,9 @@ pub struct RankPolicy {
 pub struct ForeignKeyReference {
     pub table: String,
     pub column: String,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    #[serde(default)]
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -474,6 +474,8 @@ pub struct CompositeForeignKey {
     pub child_columns: Vec<String>,
     pub parent_table: String,
     pub parent_columns: Vec<String>,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -661,6 +663,8 @@ pub struct ForeignKey {
     pub table: String,
     pub column: String,
     pub propagation_rules: Vec<AstPropagationRule>,
+    /// `FOLLOWS PARENT PURGE`: a PURGE of the parent row erases this row too.
+    pub follows_parent_purge: bool,
 }
 
 #[derive(Debug, Clone)]

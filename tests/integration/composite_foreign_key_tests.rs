@@ -133,6 +133,7 @@ fn cfk(child: &[&str], parent_table: &str, parent: &[&str]) -> CompositeForeignK
         child_columns: child.iter().map(|s| s.to_string()).collect(),
         parent_table: parent_table.to_string(),
         parent_columns: parent.iter().map(|s| s.to_string()).collect(),
+        follows_parent_purge: false,
     }
 }
 
@@ -351,6 +352,7 @@ fn ddl_estimated_bytes_grows_with_each_descriptor_kind() {
         references: Some(ForeignKeyReference {
             table: "p".into(),
             column: "a".into(),
+            follows_parent_purge: false,
         }),
         expires: false,
         immutable: false,
@@ -960,6 +962,7 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
                     child_column: "p_id".into(),
                     parent_table: "p".into(),
                     parent_column: "id".into(),
+                    follows_parent_purge: false,
                 }],
                 "single-column FK must be structured exactly"
             )
@@ -986,6 +989,7 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
         Some(ForeignKeyReference {
             table: "p".into(),
             column: "id".into(),
+            follows_parent_purge: false,
         }),
         "follower metadata must reconstruct the single-column FK"
     );
@@ -1745,6 +1749,7 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
             child_column: "p_id".into(),
             parent_table: "p".into(),
             parent_column: "id".into(),
+            follows_parent_purge: false,
         }],
         composite_foreign_keys: vec![cfk(&["c1", "c2"], "p", &["a", "b"])],
         composite_unique: vec![vec!["c1".into(), "c2".into()]],
@@ -1766,6 +1771,7 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
             child_column: "p_id".into(),
             parent_table: "p".into(),
             parent_column: "id".into(),
+            follows_parent_purge: false,
         }],
         composite_foreign_keys: vec![cfk(&["c1", "c2"], "p", &["a", "b"])],
         composite_unique: vec![vec!["c1".into(), "c2".into()]],

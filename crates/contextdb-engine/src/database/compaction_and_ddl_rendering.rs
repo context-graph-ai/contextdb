@@ -1275,6 +1275,7 @@ pub(super) fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {
                 child_columns: fk.child_columns.clone(),
                 parent_table: fk.parent_table.clone(),
                 parent_columns: fk.parent_columns.clone(),
+                follows_parent_purge: fk.follows_parent_purge,
             })
             .collect(),
         composite_unique: ct.unique_constraints.clone(),
@@ -1339,6 +1340,7 @@ pub(super) fn single_column_foreign_keys_from_ast(ct: &CreateTable) -> Vec<Singl
                     child_column: column.name.clone(),
                     parent_table: reference.table.clone(),
                     parent_column: reference.column.clone(),
+                    follows_parent_purge: reference.follows_parent_purge,
                 })
         })
         .collect()
@@ -1359,6 +1361,7 @@ pub(super) fn single_column_foreign_keys_from_meta(
                     child_column: column.name.clone(),
                     parent_table: reference.table.clone(),
                     parent_column: reference.column.clone(),
+                    follows_parent_purge: reference.follows_parent_purge,
                 })
         })
         .collect()
@@ -1537,6 +1540,9 @@ pub(super) fn sql_type_for_ast_column(
             " REFERENCES {}({})",
             reference.table, reference.column
         ));
+        if reference.follows_parent_purge {
+            ty.push_str(" FOLLOWS PARENT PURGE");
+        }
         for rule in &reference.propagation_rules {
             if let contextdb_parser::ast::AstPropagationRule::FkState {
                 trigger_state,
@@ -1735,10 +1741,11 @@ pub(crate) fn sync_create_table_sql(
     }
     for fk in composite_foreign_keys {
         let element = format!(
-            "FOREIGN KEY ({}) REFERENCES {}({})",
+            "FOREIGN KEY ({}) REFERENCES {}({}){}",
             fk.child_columns.join(", "),
             fk.parent_table,
-            fk.parent_columns.join(", ")
+            fk.parent_columns.join(", "),
+            follows_parent_purge_suffix(fk.follows_parent_purge)
         );
         if seen_table_elements.insert(schema_clause_key(&element)) {
             table_elements.push(element);
@@ -1794,6 +1801,11 @@ pub(super) fn alter_table_ddl_change(
     }
 }
 
+/// The DDL spelling of a foreign key's purge-following declaration.
+pub(super) fn follows_parent_purge_suffix(follows: bool) -> &'static str {
+    if follows { " FOLLOWS PARENT PURGE" } else { "" }
+}
+
 pub(super) fn sync_column_type_with_foreign_key(
     column: &str,
     ty: &str,
@@ -1809,8 +1821,15 @@ pub(super) fn sync_column_type_with_foreign_key(
         return ty.to_string();
     };
     format!(
-        "{} REFERENCES {}({})",
-        ty, fk.parent_table, fk.parent_column
+        "{} REFERENCES {}({}){}",
+        ty,
+        fk.parent_table,
+        fk.parent_column,
+        if fk.follows_parent_purge {
+            " FOLLOWS PARENT PURGE"
+        } else {
+            ""
+        }
     )
 }
 
@@ -2657,6 +2676,7 @@ pub(crate) fn rough_sync_table_meta(
             column.references = Some(ForeignKeyReference {
                 table: fk.parent_table.clone(),
                 column: fk.parent_column.clone(),
+                follows_parent_purge: fk.follows_parent_purge,
             });
         }
     }
@@ -2960,10 +2980,11 @@ pub(super) fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String>
 
     for fk in &ct.composite_foreign_keys {
         constraints.push(format!(
-            "FOREIGN KEY ({}) REFERENCES {}({})",
+            "FOREIGN KEY ({}) REFERENCES {}({}){}",
             fk.child_columns.join(", "),
             fk.parent_table,
-            fk.parent_columns.join(", ")
+            fk.parent_columns.join(", "),
+            follows_parent_purge_suffix(fk.follows_parent_purge)
         ));
     }
 
@@ -3110,10 +3131,11 @@ pub(super) fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String
 
     for fk in &meta.composite_foreign_keys {
         constraints.push(format!(
-            "FOREIGN KEY ({}) REFERENCES {}({})",
+            "FOREIGN KEY ({}) REFERENCES {}({}){}",
             fk.child_columns.join(", "),
             fk.parent_table,
-            fk.parent_columns.join(", ")
+            fk.parent_columns.join(", "),
+            follows_parent_purge_suffix(fk.follows_parent_purge)
         ));
     }
 

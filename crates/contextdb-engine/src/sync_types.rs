@@ -1747,11 +1747,13 @@ mod table_ddl_binary_roundtrip_tests {
             child_column: "owner_id".to_string(),
             parent_table: "owners".to_string(),
             parent_column: "id".to_string(),
+            follows_parent_purge: false,
         }];
         let composite_foreign_keys = vec![CompositeForeignKey {
             child_columns: vec!["tenant".to_string(), "owner_id".to_string()],
             parent_table: "owners".to_string(),
             parent_columns: vec!["tenant".to_string(), "id".to_string()],
+            follows_parent_purge: false,
         }];
         let composite_unique = vec![vec!["tenant".to_string(), "slug".to_string()]];
         if alter {

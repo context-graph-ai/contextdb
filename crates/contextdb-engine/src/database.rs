@@ -44,6 +44,8 @@ mod custody_incumbent;
 pub(crate) mod discard;
 // Self-contained selections for node-local purge delivery.
 pub(crate) mod purge_predicate;
+// Declared purge-following foreign keys.
+pub(crate) mod purge_followers;
 use crate::blob_repository::BlobRepository;
 use crate::composite_store::{
     ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,

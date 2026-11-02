@@ -177,11 +177,14 @@ impl HistoryJson for SingleColumnForeignKey {
         #[derive(Serialize)]
         struct Key<'a> {
             child_column: &'a str,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            follows_parent_purge: bool,
             parent_column: &'a str,
             parent_table: &'a str,
         }
         Key {
             child_column: &self.child_column,
+            follows_parent_purge: self.follows_parent_purge,
             parent_column: &self.parent_column,
             parent_table: &self.parent_table,
         }
@@ -193,11 +196,14 @@ impl HistoryJson for CompositeForeignKey {
         #[derive(Serialize)]
         struct Key<'a> {
             child_columns: &'a [String],
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            follows_parent_purge: bool,
             parent_columns: &'a [String],
             parent_table: &'a str,
         }
         Key {
             child_columns: &self.child_columns,
+            follows_parent_purge: self.follows_parent_purge,
             parent_columns: &self.parent_columns,
             parent_table: &self.parent_table,
         }

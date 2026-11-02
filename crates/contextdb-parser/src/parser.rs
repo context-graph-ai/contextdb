@@ -2844,6 +2844,10 @@ fn build_primary_key_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
+    let follows_parent_purge = pair
+        .clone()
+        .into_inner()
+        .any(|p| p.as_rule() == Rule::follows_parent_purge);
     let mut identifiers = pair
         .into_inner()
         .filter(|p| p.as_rule() == Rule::identifier)
@@ -2872,6 +2876,7 @@ fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignK
         child_columns,
         parent_table,
         parent_columns,
+        follows_parent_purge,
     })
 }
 
@@ -3113,6 +3118,10 @@ fn build_acl_constraint(pair: Pair<'_, Rule>) -> Result<AclConstraint> {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
+    let follows_parent_purge = pair
+        .clone()
+        .into_inner()
+        .any(|p| p.as_rule() == Rule::follows_parent_purge);
     let ids: Vec<String> = pair
         .into_inner()
         .filter(|p| p.as_rule() == Rule::identifier)
@@ -3129,6 +3138,7 @@ fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
         table: ids[0].clone(),
         column: ids[1].clone(),
         propagation_rules: Vec::new(),
+        follows_parent_purge,
     })
 }
 

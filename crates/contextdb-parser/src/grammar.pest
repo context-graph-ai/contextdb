@@ -243,6 +243,7 @@ foreign_key_table_constraint = {
     ~ identifier
     ~ ("," ~ identifier)*
     ~ ")"
+    ~ follows_parent_purge?
 }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
@@ -369,7 +370,9 @@ nullable_marker = { ^"NULL" }
 primary_key = { ^"PRIMARY" ~ ^"KEY" }
 unique = { ^"UNIQUE" }
 default_clause = { ^"DEFAULT" ~ expr }
-references_clause = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
+references_clause = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" ~ follows_parent_purge? }
+/// A child row is erased with the parent row it references, by PURGE only.
+follows_parent_purge = { ^"FOLLOWS" ~ ^"PARENT" ~ ^"PURGE" }
 rank_policy_clause = {
     ^"RANK_POLICY"
     ~ "("

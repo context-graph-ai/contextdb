@@ -3031,6 +3031,7 @@ fn source_order_uses_table_and_foreign_key_validation_for_each_ddl_item() {
             child_column: "parent_id".to_string(),
             parent_table: "parent".to_string(),
             parent_column: "id".to_string(),
+            follows_parent_purge: false,
         }],
         composite_foreign_keys: Vec::new(),
         composite_unique: Vec::new(),

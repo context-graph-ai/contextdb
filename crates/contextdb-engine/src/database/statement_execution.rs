@@ -1799,6 +1799,24 @@ impl Database {
             .as_ref()
             .map(|route| route.physical_plan.clone())
             .unwrap_or_else(|| plan.explain());
+        if let contextdb_planner::PhysicalPlan::Purge(purge) = &plan {
+            // Read from the catalog only: no row is read to explain a purge.
+            let catalog = self
+                .table_names()
+                .into_iter()
+                .filter_map(|name| self.table_meta(&name).map(|meta| (name, meta)))
+                .collect::<HashMap<_, _>>();
+            for line in purge_followers::explain_purge_followers(
+                &catalog,
+                purge
+                    .selections
+                    .iter()
+                    .map(|selection| selection.table.as_str()),
+            ) {
+                physical_plan.push('\n');
+                physical_plan.push_str(&line);
+            }
+        }
         let vector_inspection = vector_shape
             .as_ref()
             .map(|shape| {
