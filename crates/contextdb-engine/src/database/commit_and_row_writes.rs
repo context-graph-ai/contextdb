@@ -825,7 +825,9 @@ impl Database {
                     detached_row_unwind_refund.bytes.set(0);
                     // An ordinary failure: nothing was published, and the
                     // durable apply either did not happen or reported its own
-                    // error. The handle keeps serving.
+                    // error. A refusal before the storage commit keeps serving.
+                    // A storage commit that failed cannot abort, so the storage
+                    // layer refuses later writers until a reopen recovers.
                     if let Some(watch) = publication_watch.borrow_mut().take() {
                         watch.completed();
                     }

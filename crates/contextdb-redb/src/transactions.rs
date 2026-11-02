@@ -1240,8 +1240,12 @@ impl<P> PreparedWrite<P> {
             .close_sealed()?;
         write.completed = true;
         let mut write = self.write.take().unwrap();
+        // Declared after the moved transaction, so an unwind sets the latch
+        // before that transaction releases the writer slot.
+        let latch = CommitFailureLatch::arm(&write.mem);
         let result =
             write.commit_finalized_publishing(self.user_root, allocated, freed, &self.marker);
+        latch.settle(&result);
         self.preserve_failure = result.is_err();
         result
     }
@@ -1259,6 +1263,38 @@ impl<P> PreparedWrite<P> {
         match (self.read.take(), self.prepared.take()) {
             (Some(read), Some(prepared)) => Some((read, prepared)),
             _ => None,
+        }
+    }
+}
+
+/// A commit disables abort before its fallible work, and returns freed pages to
+/// the allocator while the durable freed list still names them. So an Err or an
+/// unwind past that point refuses everything later that would write. This must
+/// drop before the transaction releases the writer slot: a consuming entry owns
+/// the transaction as a parameter, which drops after this local, and the
+/// prepared entry declares this after its moved transaction.
+struct CommitFailureLatch {
+    mem: Arc<TransactionalMemory>,
+    armed: bool,
+}
+
+impl CommitFailureLatch {
+    fn arm(mem: &Arc<TransactionalMemory>) -> Self {
+        Self {
+            mem: Arc::clone(mem),
+            armed: true,
+        }
+    }
+
+    fn settle(mut self, result: &Result<(), CommitError>) {
+        self.armed = result.is_err();
+    }
+}
+
+impl Drop for CommitFailureLatch {
+    fn drop(&mut self) {
+        if self.armed {
+            self.mem.latch_failed_commit();
         }
     }
 }
@@ -2506,7 +2542,10 @@ impl WriteTransaction {
         }
         // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
         self.completed = true;
-        self.commit_inner()
+        let latch = CommitFailureLatch::arm(&self.mem);
+        let result = self.commit_inner();
+        latch.settle(&result);
+        result
     }
 
     /// Bind a stack marker to this database instance and actual write id.
@@ -2653,7 +2692,10 @@ impl WriteTransaction {
         }
         // Match consuming commit: no abort of possibly published pages on drop.
         self.completed = true;
-        self.commit_inner_publishing(marker)
+        let latch = CommitFailureLatch::arm(&self.mem);
+        let result = self.commit_inner_publishing(marker);
+        latch.settle(&result);
+        result
     }
 
     fn commit_inner(&mut self) -> Result<(), CommitError> {
@@ -3961,6 +4003,9 @@ impl WriteTransaction {
 
 impl Drop for WriteTransaction {
     fn drop(&mut self) {
+        // The writer slot is given up when the guard field drops, after this body.
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::note_writer_release_for_test(self.mem.commit_failure_latched());
         if !self.completed && !thread::panicking() && !self.mem.storage_failure() {
             if let Err(error) = self.abort_inner() {
                 #[cfg(feature = "logging")]

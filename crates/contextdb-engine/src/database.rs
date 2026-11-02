@@ -10706,6 +10706,9 @@ mod dormant_raw_vector_loader_tests;
 #[path = "database/bounded_retention_preparation_tests.rs"]
 mod bounded_retention_preparation_tests;
 #[cfg(test)]
+#[path = "database/commit_failure_journey_tests.rs"]
+mod commit_failure_journey_tests;
+#[cfg(test)]
 #[cfg(test)]
 #[path = "database/snapshot_pin_pool_tests.rs"]
 mod snapshot_pin_pool_tests;

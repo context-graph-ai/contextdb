@@ -66,6 +66,12 @@ impl WriterQueueWatchForTest {
     pub fn wait_for_test(&self, liveness_bound: std::time::Duration) -> bool {
         self.receiver.recv_timeout(liveness_bound).is_ok()
     }
+
+    /// Waits for the queue entry with no deadline; the run's own timeout bounds a hang.
+    #[doc(hidden)]
+    pub fn wait_untimed_for_test(&self) -> bool {
+        self.receiver.recv().is_ok()
+    }
 }
 
 impl Drop for WriterQueueWatchForTest {
@@ -82,6 +88,22 @@ impl Drop for WriterQueueWatchForTest {
         WRITER_QUEUE_WATCH_ACTIVE_FOR_TEST
             .store(!watches.is_empty(), std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+thread_local! {
+    static WRITER_RELEASE_SAW_LATCH_FOR_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Records whether the commit-failure latch was set when this thread's write
+/// transaction began to drop, which is before it gives up the writer slot.
+pub(crate) fn note_writer_release_for_test(latched: bool) {
+    WRITER_RELEASE_SAW_LATCH_FOR_TEST.with(|seen| seen.set(Some(latched)));
+}
+
+#[cfg(all(test, feature = "contextdb-internal"))]
+pub(crate) fn take_writer_release_for_test() -> Option<bool> {
+    WRITER_RELEASE_SAW_LATCH_FOR_TEST.with(std::cell::Cell::take)
 }
 
 pub(crate) fn note_writer_queued_for_test() {

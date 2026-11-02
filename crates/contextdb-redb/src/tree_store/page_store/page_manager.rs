@@ -926,7 +926,16 @@ impl TransactionalMemory {
         self.storage.cache_stats()
     }
 
+    /// Refuses writers and everything that would write. The latch comes first,
+    /// before any lock a caught commit unwind may have poisoned.
     pub(crate) fn check_io_errors(&self) -> Result {
+        self.storage.check_commit_latch()?;
+        self.check_read_errors()
+    }
+
+    /// A held page is not read again, so this reports what a read would have.
+    /// A failed commit does not stop committed readers; an I/O failure does.
+    pub(crate) fn check_read_errors(&self) -> Result {
         if let Some(error) = self
             .state
             .lock()
@@ -937,7 +946,16 @@ impl TransactionalMemory {
         {
             return Err(error);
         }
-        self.storage.check_io_errors()
+        self.storage.check_read_errors()
+    }
+
+    pub(crate) fn latch_failed_commit(&self) {
+        self.storage.latch_failed_commit();
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn commit_failure_latched(&self) -> bool {
+        self.storage.commit_failure_latched()
     }
 
     #[cfg(debug_assertions)]

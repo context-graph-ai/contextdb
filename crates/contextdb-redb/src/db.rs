@@ -1724,6 +1724,8 @@ impl Database {
     /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
     /// alive when this method is called.
     pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
+        // This repairs, so it refuses on a failed handle. Reopening repairs.
+        self.mem.check_io_errors()?;
         if Arc::strong_count(&self.mem) != 1 {
             return Err(DatabaseError::TransactionInProgress);
         }
@@ -2555,6 +2557,8 @@ impl Database {
         // after taking exclusive ownership and before touching the live header.
         #[cfg(feature = "contextdb-internal")]
         self.mem.check_publication_recovery()?;
+        // The commit this writer queued behind may have failed during the wait.
+        self.mem.check_io_errors()?;
         self.transaction_tracker
             .refresh_external_snapshots(&self.mem)?;
         WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
@@ -2735,6 +2739,12 @@ impl Database {
     ) -> Result<crate::allocation_observation::AllocationPlanForTest, StorageError> {
         self.mem
             .allocation_plan_for_test(allocation_size, withhold_reusable_space)
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __commit_failure_latched_for_test(&self) -> bool {
+        self.mem.commit_failure_latched()
     }
 
     /// Finish writable housekeeping while the caller still owns its writer

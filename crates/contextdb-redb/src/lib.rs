@@ -156,6 +156,9 @@ mod tree_store;
 mod tuple_types;
 mod types;
 
+#[cfg(all(test, feature = "contextdb-internal"))]
+mod commit_failure_rows;
+
 #[cfg(test)]
 fn create_tempfile() -> tempfile::NamedTempFile {
     if cfg!(target_os = "wasi") {

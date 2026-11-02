@@ -1436,3 +1436,43 @@ capacity retains the existing behavior. The engine applies this before legacy,
 native and prepared-exact writer descriptors escape. The source patch is fully
 regenerated from the checksum-verified 4.1.0 archive. Independent runtime and
 isolated producer-site proofs remain required.
+
+## A failed commit refuses later writers
+
+A consuming commit marks itself completed before its fallible work, so a later
+drop does not abort it, and it returns freed pages to the allocator while the
+durable freed list still names them. A later writer on the same handle could
+then allocate over a page that a committed root still names. Measured on the
+unpatched fork: one transient read fault at or after process_freed_pages_bounded,
+then later writers, left wrong live values and a Corrupted repair on reopen.
+
+`WriteTransaction::commit`, `commit_publishing` and `PreparedWrite::commit` now
+arm a scoped guard around that work. An Err or an unwind leaves it armed, and its
+drop stores a write-only latch in `CheckedBackend` (`commit_failed`) using atomics
+only. The prepared entry declares the guard after its moved transaction, so the
+latch is stored before that transaction gives up the writer slot. The latch is
+checked before any lock an unwind may have poisoned. It refuses backend write,
+sync_data and set_len with PreviousIo, `begin_write` both before and after
+waiting for the writer slot, `check_integrity` on that handle (it repairs, and
+reopen repairs), and the read-only handoff. Committed reads keep serving: backend
+reads, `len` and the held-page iterator check use the read-only check, and a
+cold read outside a commit stays retryable. Shutdown leaves recovery required,
+and reopen recovers. A genuine write or sync fault keeps its existing sticky
+refusal for reads.
+
+Test seams only: `Database::__commit_failure_latched_for_test`, and a note in
+`WriteTransaction::drop` recording whether the latch was set before the writer
+slot is given up.
+
+| Changed source | Reason |
+|---|---|
+| `src/transactions.rs` | Scoped commit-failure guard on the three consuming commit entries; test-seams release note |
+| `src/tree_store/page_store/cached_file.rs` | Write-only `commit_failed` latch; read-only check for readers |
+| `src/tree_store/page_store/page_manager.rs` | Lock-free latch check first; read-only check |
+| `src/tree_store/btree_iters.rs` | Held-page check uses the read-only check |
+| `src/db.rs` | Writer check after waiting for the slot; `check_integrity` refuses on a failed handle; test accessor |
+| `src/commit_work.rs` | Test-seams release note |
+| `src/commit_failure_rows.rs`, `src/lib.rs` | Position-swept rows over read, write, sync, memory refusal, unwind, queued writer, drop and shutdown |
+| `src/tree_store/page_store/cache_owner_contract_rows.rs` | A failed direct read outside a commit retries on the backend, as since ed7361b2 |
+
+These sources are not yet in upstream-4.1.0.patch; step 59 of the closeout regenerates it once, after the last fork edit.

@@ -236,6 +236,9 @@ impl LRUWriteCache {
 struct CheckedBackend {
     file: crate::db::Backend,
     io_failed: AtomicBool,
+    // Set once by a commit that cannot abort, never cleared on this handle. It
+    // stops database-file mutation only: committed readers keep serving.
+    commit_failed: AtomicBool,
     closed: AtomicBool,
 }
 
@@ -244,6 +247,7 @@ impl CheckedBackend {
         Self {
             file: file.into(),
             io_failed: AtomicBool::new(false),
+            commit_failed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
     }
@@ -258,6 +262,14 @@ impl CheckedBackend {
         } else {
             Ok(())
         }
+    }
+
+    fn check_write_failure(&self) -> Result<()> {
+        self.check_failure()?;
+        if self.commit_failed.load(Ordering::Acquire) {
+            return Err(StorageError::PreviousIo);
+        }
+        Ok(())
     }
 
     fn close(&self) -> Result {
@@ -337,7 +349,7 @@ impl CheckedBackend {
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
-        self.check_failure()?;
+        self.check_write_failure()?;
         let result = self.file.set_len(len);
         // A caller-enforced quota is an admission refusal, not failed I/O.
         // The allocator has not published the projected layout yet, so the
@@ -352,7 +364,7 @@ impl CheckedBackend {
     }
 
     fn sync_data(&self) -> Result<()> {
-        self.check_failure()?;
+        self.check_write_failure()?;
         let result = self.file.sync_data();
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
@@ -361,7 +373,7 @@ impl CheckedBackend {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-        self.check_failure()?;
+        self.check_write_failure()?;
         let result = self.file.write(offset, data);
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
@@ -906,8 +918,25 @@ impl PagedCachedFile {
         self.file.close()
     }
 
-    pub(crate) fn check_io_errors(&self) -> Result {
+    pub(crate) fn check_read_errors(&self) -> Result {
         self.file.check_failure()
+    }
+
+    /// Lock free: an unwind past this latch may have poisoned the storage locks.
+    pub(crate) fn check_commit_latch(&self) -> Result {
+        if self.file.commit_failed.load(Ordering::Acquire) {
+            return self.file.check_write_failure();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn latch_failed_commit(&self) {
+        self.file.commit_failed.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn commit_failure_latched(&self) -> bool {
+        self.file.commit_failed.load(Ordering::Acquire)
     }
 
     pub(crate) fn raw_file_len(&self) -> Result<u64> {

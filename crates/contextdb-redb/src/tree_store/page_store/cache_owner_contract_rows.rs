@@ -302,12 +302,19 @@ fn refusal_and_backend_failure_rows() {
         } else {
             let error = result.unwrap().unwrap_err();
             assert!(matches!(error, StorageError::Io(ref io) if io.raw_os_error() == Some(5)));
-            assert!(matches!(
-                file.read(0, 128, PageHint::Clean),
-                Err(StorageError::PreviousIo)
-            ));
+            // The first failure released everything it paid for.
+            assert_eq!(paid.load(Ordering::SeqCst), 0);
+            assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), 0);
+            assert_eq!(file.write_buffer_bytes.load(Ordering::SeqCst), 0);
+            // A failed read stays retryable: the funded retry reaches the
+            // backend and reports the backend's own error again.
+            let retry = crate::with_read_page_charge(admission(&paid), || {
+                file.read(0, 128, PageHint::Clean)
+            })
+            .unwrap_err();
+            assert!(matches!(retry, StorageError::Io(ref io) if io.raw_os_error() == Some(5)));
         }
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), if panic { 1 } else { 2 });
         assert_eq!(paid.load(Ordering::SeqCst), 0);
         assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), 0);
         assert_eq!(file.write_buffer_bytes.load(Ordering::SeqCst), 0);
