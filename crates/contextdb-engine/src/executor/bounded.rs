@@ -11140,20 +11140,23 @@ impl VectorState {
                             Ok::<(), Error>(())
                         })?;
                         // Admit the trace's bytes before any of it is allocated.
-                        let trace_bytes =
-                            size_of::<contextdb_vector::mem::VectorSearchDebugTrace>()
-                                .checked_add(self.index.table.len())
-                                .and_then(|bytes| bytes.checked_add(self.index.column.len()))
-                                .and_then(|bytes| {
-                                    partitions
-                                        .checked_mul(size_of::<
-                                            contextdb_vector::mem::VectorPartitionSearchTrace,
-                                        >())
-                                        .and_then(|routes| bytes.checked_add(routes))
-                                })
-                                .ok_or_else(|| {
-                                    Error::Other("vector disclosure trace size overflow".into())
-                                })?;
+                        // The trace struct itself moves inline into its owner;
+                        // only its name and route buffers are allocations.
+                        let trace_bytes = self
+                            .index
+                            .table
+                            .len()
+                            .checked_add(self.index.column.len())
+                            .and_then(|bytes| {
+                                partitions
+                                    .checked_mul(size_of::<
+                                        contextdb_vector::mem::VectorPartitionSearchTrace,
+                                    >())
+                                    .and_then(|routes| bytes.checked_add(routes))
+                            })
+                            .ok_or_else(|| {
+                                Error::Other("vector disclosure trace size overflow".into())
+                            })?;
                         context.reserve(BoundedWorkSource::VectorCandidates, trace_bytes)?;
                         let debug_trace = contextdb_vector::mem::VectorSearchDebugTrace {
                             index: self.index.clone(),
