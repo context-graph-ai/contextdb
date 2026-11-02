@@ -1774,6 +1774,9 @@ pub(super) fn executed_auto_fallback(
     fallback_reason: Option<&'static str>,
     filtered_exact: bool,
 ) -> Option<&'static str> {
+    if !super::vector_ivf::CLUSTERED_INDEX_SHIPS {
+        return Some(super::vector_ivf::AUTO_WITHOUT_INDEX);
+    }
     if filtered_exact {
         return Some("filtered_route_exact");
     }

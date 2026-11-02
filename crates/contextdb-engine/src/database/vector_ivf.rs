@@ -10,6 +10,32 @@ pub(crate) mod resolved;
 mod observations;
 
 use super::*;
+
+/// This release ships exact vector search only. The clustered index stays in
+/// the tree, switched off: nothing builds it, writes it, reads it or inspects
+/// it. A store made while this is false is recreated when the index ships.
+pub(crate) const CLUSTERED_INDEX_SHIPS: bool = false;
+/// What an INDEXED explain recommends; the same words as the execution refusal.
+pub(crate) const NO_INDEX_RECOVERY: &str =
+    "no vector index ships in this release; use EXACT or AUTO";
+/// What an AUTO search discloses in its fallback field.
+pub(crate) const AUTO_WITHOUT_INDEX: &str =
+    "no vector index ships in this release; AUTO_INDEX_AT and CALIBRATION_SAMPLES have no effect";
+
+/// Refuse INDEXED before any scope, filter or empty-table answer is judged.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn refuse_indexed(index: &VectorIndexRef, mode: VectorSearchMode) -> Result<()> {
+    if !CLUSTERED_INDEX_SHIPS && mode == VectorSearchMode::Indexed {
+        return Err(Error::VectorIndexedRouteUnavailable {
+            index: index.clone(),
+        });
+    }
+    Ok(())
+}
+
 impl Database {
     #[cfg(feature = "test-seams")]
     pub(crate) fn resolve_native_ivf_policy(

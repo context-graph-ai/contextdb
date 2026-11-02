@@ -63,6 +63,9 @@ impl MaintenanceContext {
         &self,
         memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<VectorMaintenanceReport> {
+        if !super::CLUSTERED_INDEX_SHIPS {
+            return Ok(VectorMaintenanceReport::default());
+        }
         #[cfg(feature = "test-seams")]
         let _native_activity = self.vector.native_index_activity_scope_for_test();
         let persistence = &self.persistence;

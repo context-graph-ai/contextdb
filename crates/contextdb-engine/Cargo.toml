@@ -596,6 +596,11 @@ path = "tests/vector_an_exact_search_authenticates_pages_not_every_vector.rs"
 required-features = ["test-seams"]
 
 [[test]]
+name = "vector_a_search_is_exact_with_no_index_built"
+path = "tests/vector_a_search_is_exact_with_no_index_built.rs"
+required-features = ["test-seams"]
+
+[[test]]
 name = "vector_an_exhaustive_find_streams_bodies_it_cannot_hold"
 path = "tests/vector_an_exhaustive_find_streams_bodies_it_cannot_hold.rs"
 required-features = ["test-seams"]

@@ -38,7 +38,7 @@ impl Database {
         memory: ReadMemoryOwner,
         copies: &mut contextdb_vector::VectorCopyAdmission,
     ) -> Result<Option<(SearchScores, RetainedVectorSearchTrace)>> {
-        if !self.has_native_ivf_source() {
+        if !super::CLUSTERED_INDEX_SHIPS || !self.has_native_ivf_source() {
             return Ok(None);
         }
         let credit = RefCell::new(ReadCredit::new(memory.clone()));

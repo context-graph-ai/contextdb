@@ -4273,6 +4273,13 @@ fn vector_missing_publication_lifecycle(
     query_state: &str,
     maintenance_policy: MaintenancePolicy,
 ) -> VectorInspectionLifecycle {
+    if !crate::database::vector_ivf::CLUSTERED_INDEX_SHIPS {
+        if query_state == "unavailable" && lifecycle.availability_reason == "none" {
+            lifecycle.availability_reason = "no_index_in_this_release";
+            lifecycle.recovery_action = "use_exact_or_auto";
+        }
+        return lifecycle;
+    }
     if query_state == "unavailable" && lifecycle.availability_reason == "none" {
         lifecycle.availability_reason = "initial_build";
         if lifecycle.maintenance_reason == "none" {
@@ -6899,6 +6906,7 @@ fn execute_plan_with_working_state(
             let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
             let mut resolved_search_mode =
                 db.resolved_vector_search_mode(&index, (*search_mode).map(map_vector_search_mode))?;
+            crate::database::vector_ivf::refuse_indexed(&index, resolved_search_mode)?;
             bind_vector_search_parameters(query_expr, candidates.as_deref(), params)?;
             let route = vector_candidate_route(db, &index, candidates.as_deref(), params)?;
             let partition_scope = route.scope;

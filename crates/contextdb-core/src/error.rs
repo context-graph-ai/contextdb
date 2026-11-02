@@ -1073,9 +1073,7 @@ pub enum Error {
         required_bytes: u64,
         available_bytes: u64,
     },
-    #[error(
-        "INDEXED vector search on {index} has no complete maintained route; wait for or repair index maintenance"
-    )]
+    #[error("no vector index ships in this release; use EXACT or AUTO")]
     VectorIndexedRouteUnavailable { index: VectorIndexRef },
     #[error(
         "INDEXED vector search on {index} refused: partition {partition} (in scope order) holds live rows its maintained graph does not connect (graph_frontier_disconnected); repair index maintenance, or use AUTO or EXACT"

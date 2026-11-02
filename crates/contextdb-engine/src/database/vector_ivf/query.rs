@@ -69,6 +69,9 @@ impl Database {
         memory: contextdb_core::read_memory::ReadMemoryOwner,
         mut row_check: Option<contextdb_vector::mem::RowCheck<'_, E>>,
     ) -> std::result::Result<Option<crate::executor::BoundedVectorSearchOutcome>, E> {
+        if !super::CLUSTERED_INDEX_SHIPS {
+            return Ok(None);
+        }
         #[cfg(feature = "test-seams")]
         let _native_activity = self.vector_store.native_index_activity_scope_for_test();
         let Some(root) = self.native_ivf_root().map_err(E::from)? else {

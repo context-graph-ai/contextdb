@@ -10,6 +10,9 @@ impl WriteSession<'_> {
         original: &crate::memory_accounting::OwnedMemoryReservation,
         identities: &[super::super::super::VectorPartitionVersionIdentity],
     ) -> Result<()> {
+        if !crate::database::vector_ivf::CLUSTERED_INDEX_SHIPS {
+            return Ok(());
+        }
         for (at, identity) in identities.iter().enumerate() {
             if identities[..at].iter().any(|old| {
                 old.index == identity.index && old.partition_key == identity.partition_key

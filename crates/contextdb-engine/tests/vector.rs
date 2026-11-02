@@ -141,5 +141,7 @@ mod writer_residency_attribution;
 mod a_ranked_file_route_read_holds_bounded_memory;
 #[path = "vector/a_ranked_search_answers_the_same_on_every_read_route.rs"]
 mod a_ranked_search_answers_the_same_on_every_read_route;
+#[path = "vector/a_search_is_exact_with_no_index_built.rs"]
+mod a_search_is_exact_with_no_index_built;
 #[path = "vector/a_write_transactions_vector_copies_are_funded_by_the_writer.rs"]
 mod a_write_transactions_vector_copies_are_funded_by_the_writer;

@@ -42,6 +42,9 @@ impl Database {
         pure: bool,
         live: Option<u64>,
     ) -> Result<Option<Inspection>> {
+        if !super::CLUSTERED_INDEX_SHIPS {
+            return Ok(None);
+        }
         let Some(root) = self.native_ivf_root()? else {
             return Ok(None);
         };

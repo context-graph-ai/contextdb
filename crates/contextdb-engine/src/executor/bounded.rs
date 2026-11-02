@@ -16584,6 +16584,7 @@ fn build_vector_kernel<'plan>(
     let search_mode = requested_search_mode
         .map(super::map_vector_search_mode)
         .unwrap_or(vector_column.search_mode);
+    crate::database::vector_ivf::refuse_indexed(&index, search_mode)?;
     super::bind_vector_search_parameters(query_expr, candidates, &params)?;
     let route = super::vector_candidate_route(db, &index, candidates, &params)?;
     let partition_scope = route.scope;

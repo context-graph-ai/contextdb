@@ -114,6 +114,9 @@ impl write::WriteSession<'_> {
         batch: &PreparedVectorPartitionMutationBatch,
         write: &redb::WriteTransaction,
     ) -> Result<()> {
+        if !crate::database::vector_ivf::CLUSTERED_INDEX_SHIPS {
+            return Ok(());
+        }
         // The immutable prepared write set already owns these bindings. Keep
         // only one tuple window; no resident population directory is introduced.
         for (at, mutation) in batch.mutations.iter().enumerate() {

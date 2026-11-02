@@ -39,6 +39,16 @@ impl MaintenanceContext {
         let mut copy_owner = contextdb_vector::VectorCopyAdmission::new(
             self.finalization.accountant.vector_budget()?,
         );
+        if !super::vector_ivf::CLUSTERED_INDEX_SHIPS {
+            // No index covers a populated partition.
+            for index in self.vector.index_layout_infos(&mut copy_owner)? {
+                let partitions = self.vector.partition_infos(&index.index, &mut copy_owner)?;
+                if partitions.iter().any(|partition| partition.live_rows != 0) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         let root = (self.persistence.paged_root_capture()?)()?;
         let checkpoint = || self.build_checkpoint();
         for partition in vector_partition_routes(&self.vector, &mut copy_owner)? {

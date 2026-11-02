@@ -2048,6 +2048,11 @@ impl Database {
             (contextdb_core::VectorSearchMode::Auto, None) => {
                 contextdb_core::VectorSearchMode::Auto
             }
+            (contextdb_core::VectorSearchMode::Auto, Some(_))
+                if !super::vector_ivf::CLUSTERED_INDEX_SHIPS =>
+            {
+                contextdb_core::VectorSearchMode::Exact
+            }
             (contextdb_core::VectorSearchMode::Auto, Some(count))
                 if count < policy.auto_index_at =>
             {
@@ -2103,7 +2108,8 @@ impl Database {
         let candidate_route =
             crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
         let partition_scope = &candidate_route.scope;
-        let native_routes = if self.has_native_ivf_source()
+        let native_routes = if super::vector_ivf::CLUSTERED_INDEX_SHIPS
+            && self.has_native_ivf_source()
             && facts.aggregate_allowed_vectors.is_some()
         {
             if let Some(trace) = actual_trace {
@@ -2252,7 +2258,14 @@ impl Database {
         } else {
             Some(VectorSearchRoute::Indexed)
         };
-        let (refusal, recovery) = if !exact_route
+        let (refusal, recovery) = if !super::vector_ivf::CLUSTERED_INDEX_SHIPS
+            && facts.resolved_mode == contextdb_core::VectorSearchMode::Indexed
+        {
+            (
+                Some("indexed_route_unavailable".to_string()),
+                Some(super::vector_ivf::NO_INDEX_RECOVERY.to_string()),
+            )
+        } else if !exact_route
             && facts.resolved_mode == contextdb_core::VectorSearchMode::Indexed
             && relational_route == VectorSearchResidual::Unsupported
         {
@@ -2280,6 +2293,10 @@ impl Database {
         };
         let fallback = if unresolved_until_bind {
             Some("partition_scope_unresolved_until_bind".to_string())
+        } else if !super::vector_ivf::CLUSTERED_INDEX_SHIPS
+            && facts.requested_mode == contextdb_core::VectorSearchMode::Auto
+        {
+            Some(super::vector_ivf::AUTO_WITHOUT_INDEX.to_string())
         } else if let Some(trace) = actual_trace
             && facts.requested_mode == contextdb_core::VectorSearchMode::Auto
         {
@@ -2784,7 +2801,8 @@ impl Database {
             && partition_routes
                 .iter()
                 .any(|route| route.route == VectorPartitionSearchRoute::Indexed);
-        let resolved_mode = if self.has_native_ivf_source()
+        let resolved_mode = if (!super::vector_ivf::CLUSTERED_INDEX_SHIPS
+            || self.has_native_ivf_source())
             && requested_mode == VectorSearchMode::Auto
         {
             if native_indexed {

@@ -4001,6 +4001,7 @@ impl Database {
         };
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
             let search_mode = self.resolved_vector_search_mode(&index, None)?;
+            super::vector_ivf::refuse_indexed(&index, search_mode)?;
             let effective_candidates = self.effective_vector_read_candidates(
                 &index,
                 snapshot,
@@ -4225,6 +4226,7 @@ impl Database {
                     index: index.clone(),
                 })?;
             let mut search_mode = query.search_mode.unwrap_or(vector_column.search_mode);
+            super::vector_ivf::refuse_indexed(&index, search_mode)?;
 
             let mut candidate_bitmap = candidates;
             if query.where_clause.is_some()
@@ -4566,6 +4568,7 @@ impl Database {
 
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        super::vector_ivf::refuse_indexed(&index, search_mode)?;
         self.vector_store.validate_vector(&index, query.len())?;
         let _scope = self.writer_read_scope(read_memory.clone())?;
         let _vector_capture = if k == 0 {
