@@ -217,6 +217,11 @@ impl NativeIvfReadForTest<'_> {
 }
 
 impl NativeIvfReadForTest<'_> {
+    pub fn family_roots(
+        &self,
+    ) -> Result<Vec<crate::vector_ivf_observations::NativeIvfFamilyRootsForTest>> {
+        self.0.inspect_family_roots()
+    }
     pub fn scope_roots(
         &self,
     ) -> Result<crate::vector_ivf_observations::NativeIvfScopeRootsForTest> {

@@ -323,6 +323,10 @@ impl ScopeRecord {
         {
             return Err(corrupt());
         }
+        self.validate_controls()
+    }
+    /// The record's own constraints, for a caller that holds no schema binding.
+    pub fn validate_controls(&self) -> Result<()> {
         if self.current_membership_live_entries > self.current_membership_entries {
             return Err(corrupt());
         }
@@ -408,6 +412,13 @@ impl ScopeRecord {
         schema: VectorSchemaBinding,
         tuple: [u8; 32],
     ) -> Result<Self> {
+        let record = Self::decode_envelope(key, input)?;
+        record.validate(index, schema, tuple)?;
+        Ok(record)
+    }
+    /// Size, magic, padding, exact length and the checksum bound to this key.
+    /// Readers still go through decode, which adds the schema binding.
+    pub fn decode_envelope(key: &[u8; 64], input: &[u8]) -> Result<Self> {
         if input.len() != PAGE_BYTES || &input[..8] != b"CDBIVFS1" {
             return Err(corrupt());
         }
@@ -438,7 +449,6 @@ impl ScopeRecord {
         if consumed != n {
             return Err(corrupt());
         }
-        record.validate(index, schema, tuple)?;
         Ok(record)
     }
 }

@@ -172,6 +172,22 @@ impl RedbPersistence {
         event: redb::TableRootEvent,
     ) -> std::result::Result<(), redb::StorageError> {
         content_identity::payloads::relocation_event(write, name, event)?;
+        if matches!(event, redb::TableRootEvent::RelocationRefused) {
+            // Only an index table has a rebuild route; its stale proof keeps the
+            // damage visible. Anything else refuses, and the bytes stay unproven.
+            if vector_ivf::relocation::is_native_table(name) {
+                return Ok(());
+            }
+            return Err(redb::StorageError::AdmissionRefused(Box::new(
+                crate::funded_error::corruption_display(
+                    crate::read_image_memory::active_owner()
+                        .and_then(|owner| owner.diagnostic_budget()),
+                    name.strip_prefix("rel_").unwrap_or(name),
+                    "a source page failed its checksum, so compaction refuses to move it",
+                ),
+            )));
+        }
+        vector_ivf::relocation::event(write, name, event)?;
         if !protected(name) {
             return Ok(());
         }
@@ -207,6 +223,7 @@ impl RedbPersistence {
                 AfterClose => "after_close",
                 AfterRelocate => "after_relocate",
                 AfterDelete => "after_delete",
+                RelocationRefused => "relocation_refused",
             },
             physical,
             previous.as_ref().map(|value| value.value()),
@@ -260,6 +277,8 @@ impl RedbPersistence {
                 drop(previous);
                 witnesses.remove(name).map_err(Self::storage_error)?;
             }
+            // Answered by historical_root_event before a witness is touched.
+            RelocationRefused => {}
         }
         Ok(())
     }

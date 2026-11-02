@@ -15,8 +15,11 @@ mod table_tree;
 mod table_tree_base;
 
 pub(crate) use btree::{
-    Btree, BtreeMut, BtreeStats, PagePath, RawBtree, UntypedBtree, UntypedBtreeMut, btree_stats,
+    Btree, BtreeMut, BtreeStats, PagePath, RawBtree, SelectedPages, UntypedBtree, UntypedBtreeMut,
+    btree_stats,
 };
+#[cfg(any(test, all(feature = "test-seams", feature = "contextdb-internal")))]
+pub(crate) use btree_base::last_checksummed_byte;
 pub use btree_base::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace};
 pub(crate) use btree_base::{
     BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF, LeafAccessor,
@@ -29,7 +32,7 @@ pub(crate) use page_store::{
     PageTrackerPolicy, SerializedSavepoint, ShrinkPolicy, TransactionalMemory,
 };
 pub use page_store::{InMemoryBackend, Savepoint, file_backend};
-pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut};
+pub(crate) use table_tree::{CompactionPageBatch, PageListMut, TableTree, TableTreeMut};
 pub(crate) use table_tree_base::{ALIGNMENT, InternalTableDefinition, TableType};
 
 #[cfg(feature = "test-seams")]

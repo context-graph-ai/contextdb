@@ -72,7 +72,7 @@ pub use db::{ADMISSION_PAGE_BUDGET, AdmissionReadReceipt, last_admission_read_re
 #[doc(hidden)]
 pub use db::{
     AdmissionBudgetOverride, StoreDamage, allocator_state_lookups_for_test, damage_store_for_test,
-    override_admission_page_budget_for_test,
+    damage_table_root_for_test, override_admission_page_budget_for_test,
 };
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
@@ -187,9 +187,9 @@ pub use read_admission::ReadCacheRequest;
 pub use read_admission::{BackendReadObservation, observe_backend_reads};
 #[doc(hidden)]
 pub use read_admission::{
-    ReadPageCharge, ScanAllowance, ScanReads, scan_reads, with_read_memory_admission,
-    with_read_memory_admission_storage, with_read_page_charge, with_read_page_charge_storage,
-    with_scan_reads,
+    ReadPageCharge, ScanAllowance, ScanReads, admit_active_read_memory, scan_reads,
+    with_read_memory_admission, with_read_memory_admission_storage, with_read_page_charge,
+    with_read_page_charge_storage, with_scan_reads,
 };
 
 #[cfg(feature = "test-seams")]

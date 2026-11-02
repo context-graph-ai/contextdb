@@ -1028,6 +1028,61 @@ impl PageSource<'_> {
             present: family.kinds.present,
         })
     }
+    /// Every family of this scope, active and retired, stored root beside actual.
+    pub(super) fn inspect_family_roots(
+        &self,
+    ) -> Result<Vec<crate::vector_ivf_observations::NativeIvfFamilyRootsForTest>> {
+        use redb::ReadableTable;
+        let roots = |family: &control::Family, retired: bool| {
+            let mut actual_roots = [[0; 32]; 16];
+            for tag in 1..=16 {
+                let name = KindTableName::new(family.storage, header::kind_from_tag(tag)?)?;
+                actual_roots[usize::from(tag - 1)] = self
+                    .native()
+                    .fingerprint(name.as_str()?)?
+                    .unwrap_or([0; 32]);
+            }
+            let qualification = qualification::TableName::new(family.storage)?;
+            Ok::<_, Error>(
+                crate::vector_ivf_observations::NativeIvfFamilyRootsForTest {
+                    generation: family.generation,
+                    storage: family.storage,
+                    retired,
+                    present: family.kinds.present,
+                    expected_roots: family.kinds.roots,
+                    actual_roots,
+                    expected_qualification: family.qualification_root,
+                    actual_qualification: self.native().fingerprint(qualification.as_str()?)?,
+                },
+            )
+        };
+        let record = self.record.borrow();
+        let mut families = Vec::new();
+        for family in record.families.iter().flatten() {
+            families.push(roots(family, false)?);
+        }
+        let mut prefix = [0; 65];
+        prefix[..64].copy_from_slice(&self.scope_key);
+        prefix[64] = b'R';
+        let table = self
+            .authority
+            .root
+            .read
+            .open_table(SCOPES)
+            .map_err(RedbPersistence::storage_error)?;
+        for entry in table
+            .range(prefix.as_slice()..)
+            .map_err(RedbPersistence::storage_error)?
+        {
+            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            let family = control::decode_retired_family(key.value(), value.value())?;
+            families.push(roots(&family, true)?);
+        }
+        Ok(families)
+    }
     pub(super) fn visit_authoritative_source(
         &self,
         visit: &mut dyn FnMut(crate::vector_ivf_observations::NativeIvfSourceRecordForTest<'_>),

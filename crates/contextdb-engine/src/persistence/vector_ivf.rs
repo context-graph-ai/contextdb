@@ -16,6 +16,7 @@ mod maintenance;
 mod mutations;
 pub(crate) mod qualification;
 pub(crate) mod query;
+pub(crate) mod relocation;
 pub(crate) mod retained;
 pub(crate) use cache::NativeIvfCache;
 mod frontier;

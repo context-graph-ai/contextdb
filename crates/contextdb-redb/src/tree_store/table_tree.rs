@@ -340,6 +340,18 @@ impl TableTree {
     }
 }
 
+/// One selected relocation batch, resolved in the current write transaction.
+#[derive(Default)]
+pub(crate) struct CompactionPageBatch {
+    pub(crate) target: Option<String>,
+    pub(crate) pages: Vec<PagePath>,
+    pub(crate) examined: usize,
+    /// A visited page failed its checksum: nothing was selected.
+    pub(crate) source_refused: bool,
+    /// The target's root fingerprint before this batch moved anything.
+    pub(crate) source_root: Option<[u8; 32]>,
+}
+
 pub(crate) struct TableTreeMut<'txn> {
     #[cfg(feature = "test-seams")]
     pub(crate) table_write_observer: crate::table_write_observer::ObserverSlot,
@@ -1053,7 +1065,7 @@ impl<'txn> TableTreeMut<'txn> {
         cursor: &mut crate::transactions::CompactionCursor,
         maximum: usize,
         protected_table: Option<&str>,
-    ) -> Result<(Option<String>, Vec<PagePath>, usize)> {
+    ) -> Result<CompactionPageBatch> {
         use std::ops::Bound;
         let target = if cursor.phase.is_multiple_of(2) {
             None
@@ -1072,7 +1084,7 @@ impl<'txn> TableTreeMut<'txn> {
                 cursor.table = None;
                 cursor.advance_table = false;
                 cursor.position.clear();
-                return Ok((None, Vec::new(), 0));
+                return Ok(CompactionPageBatch::default());
             };
             let entry = entry?;
             let name = entry.key().to_owned();
@@ -1082,7 +1094,7 @@ impl<'txn> TableTreeMut<'txn> {
                 cursor.table = Some(name);
                 cursor.advance_table = true;
                 cursor.position.clear();
-                return Ok((None, Vec::new(), 0));
+                return Ok(CompactionPageBatch::default());
             }
             if cursor.table.as_ref() != Some(&name) {
                 cursor.position.clear();
@@ -1095,7 +1107,12 @@ impl<'txn> TableTreeMut<'txn> {
             }
             Some((name, definition))
         };
-        let (pages, next, examined) = if let Some((_, definition)) = &target {
+        let crate::tree_store::SelectedPages {
+            pages,
+            next,
+            examined,
+            source_refused,
+        } = if let Some((_, definition)) = &target {
             definition.page_batch(self.mem.clone(), &cursor.position, maximum)?
         } else {
             let tree = crate::tree_store::UntypedBtree::new(
@@ -1107,6 +1124,22 @@ impl<'txn> TableTreeMut<'txn> {
             );
             tree.page_batch(&cursor.position, maximum, false)?
         };
+        let source_root = target
+            .as_ref()
+            .and_then(|(_, definition)| definition.root_bytes());
+        if source_refused {
+            // Nothing selected here has moved yet, so the whole batch is
+            // dropped and the sweep passes this table.
+            cursor.position.clear();
+            cursor.advance_table = target.is_some();
+            return Ok(CompactionPageBatch {
+                target: target.map(|(name, _)| name),
+                pages: Vec::new(),
+                examined,
+                source_refused: true,
+                source_root: None,
+            });
+        }
         if let Some(next) = next {
             cursor.position = next;
         } else {
@@ -1117,7 +1150,13 @@ impl<'txn> TableTreeMut<'txn> {
                 cursor.phase += 1;
             }
         }
-        Ok((target.map(|(name, _)| name), pages, examined))
+        Ok(CompactionPageBatch {
+            target: target.map(|(name, _)| name),
+            pages,
+            examined,
+            source_refused: false,
+            source_root,
+        })
     }
 
     pub(crate) fn relocate_compaction_batch(

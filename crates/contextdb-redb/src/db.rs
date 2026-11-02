@@ -1264,6 +1264,30 @@ pub fn damage_store_for_test(path: &Path, damage: StoreDamage) -> std::io::Resul
     write_at_for_test(path, edit.0, &edit.1)
 }
 
+/// Flips the last checksummed byte of a named table's root page in a closed
+/// store. The directory's header and checksum for that table stay as they were.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub fn damage_table_root_for_test(path: &Path, name: &str) -> std::io::Result<()> {
+    let db = open_for_test(path)?;
+    let mem = db.mem.clone();
+    let read = db
+        .begin_read()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let (page, at) = read
+        .table_root_damage_site_for_test(name)
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .ok_or_else(|| std::io::Error::other("the table has no root page"))?;
+    let offset = mem.page_address_for_test(page).start + at as u64;
+    let byte = crate::tree_store::Page::memory(
+        &mem.get_page(page, PageHint::None)
+            .map_err(|error| std::io::Error::other(error.to_string()))?,
+    )[at];
+    drop(read);
+    drop(db);
+    write_at_for_test(path, offset, &[byte ^ 0xFF])
+}
+
 /// The windowed and the full-page answers, in that order.
 #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
 #[doc(hidden)]

@@ -300,28 +300,84 @@ impl UntypedBtree {
         resume: &[usize],
         maximum: usize,
         multimap: bool,
-    ) -> Result<(Vec<PagePath>, Option<Vec<usize>>, usize)> {
+    ) -> Result<SelectedPages> {
         let mut batch = PageBatch {
             resume,
             maximum,
             pages: Vec::new(),
             next: None,
             examined: 0,
+            source_refused: false,
         };
         if let Some(root) = self.root {
             self.page_batch_helper(
                 PagePath::new_root(root.root),
+                root.checksum,
                 &mut Vec::new(),
                 multimap,
                 &mut batch,
             )?;
         }
-        Ok((batch.pages, batch.next, batch.examined))
+        Ok(SelectedPages {
+            pages: batch.pages,
+            next: batch.next,
+            examined: batch.examined,
+            source_refused: batch.source_refused,
+        })
+    }
+
+    /// A page's bytes against the checksum its parent or header holds, before
+    /// its offsets or children are used. Relocation recomputes checksums over
+    /// what it copies, so a page moved unchecked would come out looking valid.
+    /// DEFERRED is only a number: it excuses the comparison solely for a page
+    /// this transaction still owns, and that page's layout must still read.
+    fn source_page_intact(&self, page: &PageImpl, expected: Checksum, multimap: bool) -> bool {
+        let value_width = if multimap {
+            crate::multimap_table::multimap_leaf_value_width(self.value_width)
+        } else {
+            self.value_width
+        };
+        let computed = match page.memory().first().copied() {
+            Some(LEAF) => leaf_checksum(page, self.key_width, value_width),
+            Some(BRANCH) => branch_checksum(page, self.key_width),
+            _ => return false,
+        };
+        if expected == DEFERRED && self.mem.uncommitted(page.get_page_number()) {
+            return computed.is_ok();
+        }
+        computed.is_ok_and(|computed| computed == expected)
+    }
+
+    /// Every page from the root to the leaf that holds `query`, each against
+    /// the checksum its parent or header holds: the pages an ordinary update
+    /// of that key copies. Bounded by the tree's height.
+    pub(crate) fn source_path_intact<K: Key>(&self, query: &[u8]) -> Result<bool> {
+        let Some(root) = self.root else {
+            return Ok(true);
+        };
+        let (mut number, mut expected) = (root.root, root.checksum);
+        loop {
+            let page = self.mem.get_page(number, self.hint)?;
+            if !self.source_page_intact(&page, expected, false) {
+                return Ok(false);
+            }
+            match page.memory()[0] {
+                LEAF => return Ok(true),
+                BRANCH => {
+                    let accessor = BranchAccessor::new(&page, self.key_width);
+                    let (child, page_number) = accessor.child_for_key::<K>(query);
+                    expected = accessor.child_checksum(child).unwrap();
+                    number = page_number;
+                }
+                _ => return Ok(false),
+            }
+        }
     }
 
     fn page_batch_helper(
         &self,
         path: PagePath,
+        expected: Checksum,
         position: &mut Vec<usize>,
         multimap: bool,
         batch: &mut PageBatch<'_>,
@@ -338,6 +394,10 @@ impl UntypedBtree {
         }
         batch.examined += 1;
         let page = self.mem.get_page(path.page_number(), self.hint)?;
+        if !self.source_page_intact(&page, expected, multimap) {
+            batch.source_refused = true;
+            return Ok(false);
+        }
         match page.memory()[0] {
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.key_width);
@@ -345,6 +405,7 @@ impl UntypedBtree {
                     position.push(i);
                     let complete = self.page_batch_helper(
                         path.with_child(accessor.child_page(i).unwrap()),
+                        accessor.child_checksum(i).unwrap(),
                         position,
                         multimap,
                         batch,
@@ -374,6 +435,7 @@ impl UntypedBtree {
                     position.push(i);
                     let complete = subtree.page_batch_helper(
                         path.with_child(header.root),
+                        header.checksum,
                         position,
                         false,
                         batch,
@@ -416,12 +478,21 @@ impl UntypedBtree {
     }
 }
 
+/// One finite page selection: where to resume, and whether a page failed its checksum.
+pub(crate) struct SelectedPages {
+    pub(crate) pages: Vec<PagePath>,
+    pub(crate) next: Option<Vec<usize>>,
+    pub(crate) examined: usize,
+    pub(crate) source_refused: bool,
+}
+
 struct PageBatch<'a> {
     resume: &'a [usize],
     maximum: usize,
     pages: Vec<PagePath>,
     next: Option<Vec<usize>>,
     examined: usize,
+    source_refused: bool,
 }
 
 pub(crate) struct UntypedBtreeMut {

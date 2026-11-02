@@ -857,3 +857,51 @@ pub use crate::persistence::vector_ivf::qualification::{
     Depth as NativeIvfDepthQualificationForTest, Header as NativeIvfQualificationHeaderForTest,
     Prefix as NativeIvfPrefixQualificationForTest, Record as NativeIvfQualificationRecordForTest,
 };
+
+/// One family of a scope: what the store proves beside what the tables hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeIvfFamilyRootsForTest {
+    pub generation: u64,
+    pub storage: u64,
+    pub retired: bool,
+    pub present: u16,
+    pub expected_roots: [[u8; 32]; 16],
+    pub actual_roots: [[u8; 32]; 16],
+    pub expected_qualification: Option<[u8; 32]>,
+    pub actual_qualification: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeIvfRootRoleForTest {
+    Kind(u8),
+    Qualification,
+}
+
+/// On this thread: what compaction did to the proofs of tables it moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeIvfRootRelocationsForTest {
+    pub refreshed_kinds: [u64; 16],
+    pub refreshed_qualification: u64,
+    pub refreshed_retired: u64,
+    pub left_stale: u64,
+    pub owner_entries_read: u64,
+    pub scopes_read: u64,
+    pub retired_records_read: u64,
+}
+
+thread_local! {
+    pub(crate) static NATIVE_ROOT_RELOCATIONS: std::cell::Cell<NativeIvfRootRelocationsForTest> =
+        const { std::cell::Cell::new(NativeIvfRootRelocationsForTest {
+            refreshed_kinds: [0; 16],
+            refreshed_qualification: 0,
+            refreshed_retired: 0,
+            left_stale: 0,
+            owner_entries_read: 0,
+            scopes_read: 0,
+            retired_records_read: 0,
+        }) };
+}
+
+pub fn native_ivf_root_relocations_for_test() -> NativeIvfRootRelocationsForTest {
+    NATIVE_ROOT_RELOCATIONS.with(std::cell::Cell::get)
+}

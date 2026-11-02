@@ -466,7 +466,7 @@ impl TransactionalMemory {
 
     /// The file byte range a page number occupies, for proofs that damage a
     /// closed store in place.
-    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    #[cfg(any(test, all(feature = "test-seams", feature = "contextdb-internal")))]
     pub(crate) fn page_address_for_test(&self, page: PageNumber) -> std::ops::Range<u64> {
         page.address_range(
             self.page_size.into(),

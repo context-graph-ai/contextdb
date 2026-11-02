@@ -202,6 +202,67 @@ impl Database {
 }
 
 impl Database {
+    pub fn native_ivf_family_roots_at_snapshot_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<NativeIvfFamilyRootsForTest>> {
+        let memory = self.declared_reader_memory()?;
+        let _intent = self.vector_historical_read_intent(snapshot, memory);
+        self.with_snapshot_override(snapshot, || {
+            self.with_native_ivf_read_for_test(index, tuple, |scope| scope.family_roots())
+        })
+    }
+    pub fn native_ivf_family_roots_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+    ) -> Result<Vec<NativeIvfFamilyRootsForTest>> {
+        self.with_native_ivf_read_for_test(index, tuple, |scope| scope.family_roots())
+    }
+    /// On this thread, the next compaction step that carries a native proof
+    /// fails at its checkpoint, after the proof was written, before it commits.
+    pub fn arm_compaction_failure_after_next_native_carry_for_test(&self) {
+        crate::persistence::vector_ivf::relocation::arm_checkpoint_failure_after_next_carry_for_test();
+    }
+    /// Writes the scope directory without rebinding Configuration to it.
+    pub fn plant_native_ivf_unbound_scope_entry_for_test(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| Error::Other("the scope directory lives in a native store".into()))?
+            .plant_native_ivf_unbound_scope_entry_for_test()
+    }
+    /// The storage identities the store records an owner for, whole-store.
+    pub fn native_ivf_owned_storage_for_test(&self) -> Result<Vec<u64>> {
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| Error::Other("owner entries live in a native store".into()))?
+            .native_ivf_owned_storage_for_test()
+    }
+    /// Damages a stored root below the engine: its table no longer matches.
+    pub fn plant_native_ivf_stale_root_for_test(
+        &self,
+        index: &VectorIndexRef,
+        tuple: &VectorPartitionKey,
+        storage: u64,
+        role: NativeIvfRootRoleForTest,
+    ) -> Result<()> {
+        let snapshot = self.snapshot();
+        let roots = self.native_ivf_scope_roots_at_snapshot_for_test(index, tuple, snapshot)?;
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| Error::Other("stale roots live in a native store".into()))?;
+        self.publish_direct_metadata(|| {
+            persistence.plant_native_ivf_stale_root_for_test(
+                roots.index_digest,
+                roots.tuple_digest,
+                storage,
+                role,
+            )
+        })
+    }
     pub fn native_ivf_scope_roots_at_snapshot_for_test(
         &self,
         index: &VectorIndexRef,

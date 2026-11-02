@@ -19,6 +19,27 @@ pub(crate) type Checksum = u128;
 // Dummy value. Final value will be computed during commit
 pub(crate) const DEFERRED: Checksum = 999;
 
+/// The last byte a page's checksum covers, for planting damage in a closed store.
+#[cfg(any(test, all(feature = "test-seams", feature = "contextdb-internal")))]
+pub(crate) fn last_checksummed_byte<T: Page>(
+    page: &T,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+) -> Option<usize> {
+    let end = match page.memory()[0] {
+        LEAF => {
+            let leaf = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
+            leaf.value_end(leaf.num_pairs().checked_sub(1)?)
+        }
+        BRANCH => {
+            let branch = BranchAccessor::new(page, fixed_key_size);
+            branch.key_end(branch.num_keys().checked_sub(1)?)
+        }
+        _ => None,
+    }?;
+    end.checked_sub(1)
+}
+
 pub(super) fn leaf_checksum<T: Page>(
     page: &T,
     fixed_key_size: Option<usize>,

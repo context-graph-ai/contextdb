@@ -184,6 +184,12 @@ pub fn with_owned_read_page_charge_storage<R>(
     operation()
 }
 
+/// Charge an engine hook's working bytes to the operation it runs under.
+#[doc(hidden)]
+pub fn admit_active_read_memory(bytes: usize) -> Result<(), StorageError> {
+    admit_read_memory(bytes).map(drop)
+}
+
 pub(crate) fn has_read_memory_admission() -> bool {
     ACTIVE.with(|active| !active.borrow().is_empty())
 }

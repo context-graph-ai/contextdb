@@ -154,6 +154,11 @@ fn multimap_stats_helper(
 }
 
 // Verify all the checksums in the tree, including any Dynamic collection subtrees
+/// The value width a multimap leaf is checksummed with.
+pub(crate) fn multimap_leaf_value_width(value_width: Option<usize>) -> Option<usize> {
+    DynamicCollection::<()>::fixed_width_with(value_width)
+}
+
 pub(crate) fn verify_tree_and_subtree_checksums(
     root: Option<BtreeHeader>,
     key_size: Option<usize>,

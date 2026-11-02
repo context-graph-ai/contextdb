@@ -3833,6 +3833,9 @@ impl RedbPersistence {
         // bounded writer transaction during relocation, not the handle or
         // companion mutexes needed by foreground reads and writes.
         let txn = self.with_db(Self::begin_history_write)?;
+        // Every step's checkpoint rebinds Configuration to the scope directory;
+        // a directory that already disagrees must refuse here, not be blessed.
+        content_identity::validate_clustered_scope_root_in_write(&txn)?;
         #[cfg(any(test, feature = "test-seams"))]
         let mut graph_compaction_attempt =
             crate::read_work_probe::GraphPublicationAttempt::begin_in_write(&txn);

@@ -24,6 +24,8 @@ mod calibration_source;
 mod cancellation;
 #[path = "clustered_vector_index/codebook_lifecycle.rs"]
 mod codebook_lifecycle;
+#[path = "clustered_vector_index/compaction_keeps_native_roots.rs"]
+mod compaction_keeps_native_roots;
 #[path = "clustered_vector_index/crash_cut_points.rs"]
 mod crash_cut_points;
 #[path = "clustered_vector_index/declared_breadth.rs"]

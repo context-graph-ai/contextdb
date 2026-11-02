@@ -702,6 +702,7 @@ impl<'a, 'tx> WriteScope<'a, 'tx> {
         };
         let summary = source_summary(self.session.write, &self.route)?;
         let storage = io::allocate_storage(self.session.write, &mut work.native_value)?;
+        relocation::publish_owner(self.session.write, storage, &self.key)?;
         let mut record = self.record.borrow_mut();
         record.families[slot] = Some(Family {
             generation,
@@ -1895,6 +1896,9 @@ impl WriteScope<'_, '_> {
             }
         }
         self.reclaim_qualification(&mut family, &mut remaining)?;
+        if family.kinds.present == 0 && family.qualification_root.is_none() {
+            relocation::remove_owner(self.session.write, family.storage)?;
+        }
         if let Some(slot) = slot {
             self.record.borrow_mut().families[slot] =
                 if family.kinds.present == 0 && family.qualification_root.is_none() {

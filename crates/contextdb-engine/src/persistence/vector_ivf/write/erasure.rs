@@ -191,7 +191,7 @@ impl WriteScope<'_, '_> {
                 .delete_table(redb::TableDefinition::<&[u8], &[u8]>::new(name.as_str()?))
                 .map_err(RedbPersistence::storage_error)?;
         }
-        Ok(())
+        super::super::relocation::remove_owner(self.session.write, family.storage)
     }
     fn erase_unserved_families(&mut self) -> Result<()> {
         for at in 0..control::ROOTS {

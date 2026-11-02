@@ -1008,7 +1008,7 @@ impl SavepointTransactionState {
 /// Transaction-local normal-table root lifecycle. Policy and witness storage belong to callers.
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum TableRootEvent {
     BeforeOpen,
     AfterClose,
@@ -1016,6 +1016,10 @@ pub enum TableRootEvent {
     AfterDelete,
     BeforeRelocate,
     AfterRelocate,
+    /// A source page of this table failed its checksum, so this batch moved
+    /// nothing. Returning Ok lets the sweep pass the table; only an installed
+    /// handler can say so, and with none the relocation refuses.
+    RelocationRefused,
 }
 
 #[cfg(feature = "contextdb-internal")]
@@ -1049,6 +1053,11 @@ pub struct WriteTransaction {
     table_root_hook_error: Mutex<Option<StorageError>>,
     #[cfg(feature = "contextdb-internal")]
     active_relocations: Mutex<Option<HashMap<PageNumber, PageNumber>>>,
+    /// The fingerprint of the table the current batch relocates, as it stood
+    /// before moving anything. Set per batch and cleared when the batch ends;
+    /// it lives and dies with this transaction, so rollback leaves nothing.
+    #[cfg(feature = "contextdb-internal")]
+    relocation_source_root: Mutex<Option<[u8; 32]>>,
 }
 
 /// Caller-owned observation of one actual write's publication interval.
@@ -1332,6 +1341,8 @@ impl WriteTransaction {
             table_root_hook_error: Mutex::new(None),
             #[cfg(feature = "contextdb-internal")]
             active_relocations: Mutex::new(None),
+            #[cfg(feature = "contextdb-internal")]
+            relocation_source_root: Mutex::new(None),
         })
     }
 
@@ -1345,6 +1356,58 @@ impl WriteTransaction {
     ) -> Self {
         self.table_root_hook = Some(hook);
         self
+    }
+
+    /// Before a hook rewrites one record of a table it did not relocate: are
+    /// the pages that update copies intact? False names damage on the path.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn table_path_checksums_hold<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+        key: &K::SelfType<'_>,
+    ) -> Result<bool, StorageError> {
+        let table = {
+            let tables = self.tables.lock().unwrap();
+            tables
+                .table_tree
+                .get_table::<K, V>(definition.name(), TableType::Normal)
+                .map_err(|error| error.into_storage_error_or_corrupted("the table directory"))?
+        };
+        let Some(table) = table else {
+            return Ok(true);
+        };
+        let tree = crate::tree_store::UntypedBtree::new(
+            table.root_bytes().map(BtreeHeader::from_le_bytes),
+            self.mem.clone(),
+            PageHint::None,
+            K::fixed_width(),
+            V::fixed_width(),
+        );
+        tree.source_path_intact::<K>(K::as_bytes(key).as_ref())
+    }
+
+    /// During AfterRelocate: the moved table's fingerprint before this batch.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn relocation_source_root(&self) -> Option<[u8; 32]> {
+        *self.relocation_source_root.lock().unwrap()
+    }
+
+    /// Bad source bytes refuse unless an installed hook accepts skipping the table.
+    fn refuse_relocation(&self, name: Option<&str>, user_table: bool) -> Result<(), StorageError> {
+        #[cfg(feature = "contextdb-internal")]
+        if user_table
+            && let Some(name) = name
+            && let Some(hook) = self.table_root_hook
+        {
+            return hook(self, name, TableRootEvent::RelocationRefused);
+        }
+        let _ = user_table;
+        Err(StorageError::Corrupted(format!(
+            "a source page of {} failed its checksum, so compaction refuses to move it",
+            name.unwrap_or("the table directory")
+        )))
     }
 
     #[cfg(feature = "contextdb-internal")]
@@ -3380,10 +3443,30 @@ impl WriteTransaction {
             &mut system_tables.table_tree
         };
         let user_table = cursor.phase < 2;
-        let (target, pages, examined) =
-            tree.compaction_page_batch(cursor, maximum, protected_table)?;
+        let batch = tree.compaction_page_batch(cursor, maximum, protected_table)?;
         drop(system_tables);
         drop(tables);
+        let crate::tree_store::CompactionPageBatch {
+            target,
+            pages,
+            examined,
+            source_refused,
+            source_root,
+        } = batch;
+        #[cfg(feature = "contextdb-internal")]
+        {
+            *self.relocation_source_root.lock().unwrap() = source_root;
+        }
+        #[cfg(not(feature = "contextdb-internal"))]
+        let _ = source_root;
+        if source_refused {
+            self.refuse_relocation(target.as_deref(), user_table)?;
+            return Ok(CompactionProgress {
+                pages_examined: examined,
+                pages_relocated: 0,
+                complete: false,
+            });
+        }
         #[cfg(feature = "contextdb-internal")]
         if user_table && let Some(name) = target.as_deref() {
             self.call_table_root_hook(name, TableRootEvent::BeforeRelocate)?;
@@ -3461,6 +3544,10 @@ impl WriteTransaction {
                 .borrow_mut()
                 .extend(relocation_map.iter().map(|(from, to)| (*from, *to)));
         });
+        #[cfg(feature = "contextdb-internal")]
+        {
+            *self.relocation_source_root.lock().unwrap() = None;
+        }
         let complete = cursor.phase == 4;
         if complete {
             // One automatic sweep is finite even while writers create new
@@ -4129,6 +4216,17 @@ impl ReadTransaction {
 
     /// Return the committed root header without reading the table's payload pages.
     #[doc(hidden)]
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    pub(crate) fn table_root_damage_site_for_test(
+        &self,
+        name: &str,
+    ) -> Result<Option<(PageNumber, usize)>, TableError> {
+        let Some(table) = self.tree.get_table_untyped(name, TableType::Normal)? else {
+            return Ok(None);
+        };
+        Ok(table.last_root_byte(&self.mem)?)
+    }
+
     pub fn table_root_fingerprint<K: Key + 'static, V: Value + 'static>(
         &self,
         definition: TableDefinition<K, V>,
@@ -5448,5 +5546,375 @@ impl ReadTransaction {
     {
         self.tree
             .next_native_u64_bytes_range(name, lower, exclusive, before)
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod relocation_source_validation_tests {
+    use super::*;
+    use crate::tree_store::{
+        BRANCH, BranchAccessor, BtreeHeader, DEFERRED, Page, RawBtree, UntypedBtree,
+        last_checksummed_byte,
+    };
+    use crate::{Database, TableDefinition};
+    use std::cell::RefCell;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    const FILLER: TableDefinition<u64, &[u8]> = TableDefinition::new("a_filler");
+    const DAMAGED: TableDefinition<u64, &[u8]> = TableDefinition::new("damaged");
+    const OTHER: TableDefinition<u64, &[u8]> = TableDefinition::new("zz_other");
+
+    thread_local! {
+        static EVENTS: RefCell<Vec<(String, String, Option<[u8; 32]>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// A table big enough for a branch root behind holes that relocation can use.
+    fn store(path: &Path) -> Database {
+        let db = Database::create(path).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut filler = write.open_table(FILLER).unwrap();
+            for key in 0..400u64 {
+                filler.insert(key, vec![1u8; 4096].as_slice()).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        let write = db.begin_write().unwrap();
+        for definition in [DAMAGED, OTHER] {
+            let mut table = write.open_table(definition).unwrap();
+            for key in 0..200u64 {
+                table
+                    .insert(key, vec![(key % 251) as u8; 1024].as_slice())
+                    .unwrap();
+            }
+        }
+        write.commit().unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut filler = write.open_table(FILLER).unwrap();
+            for key in 0..399u64 {
+                filler.remove(key).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        for _ in 0..3 {
+            db.begin_write().unwrap().commit_compaction_frees().unwrap();
+        }
+        db
+    }
+    fn root(db: &Database, definition: TableDefinition<u64, &[u8]>) -> [u8; 32] {
+        db.begin_write()
+            .unwrap()
+            .table_root_fingerprint(definition)
+            .unwrap()
+            .unwrap()
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Site {
+        RootBranch,
+        FirstLeaf,
+    }
+    /// Flips one checksummed byte in the closed file, leaving the directory header.
+    fn damage(db: Database, path: &Path, site: Site) -> [u8; 32] {
+        let header = BtreeHeader::from_le_bytes(root(&db, DAMAGED));
+        let write = db.begin_write().unwrap();
+        let mem = write.mem.clone();
+        let page = mem.get_page(header.root, PageHint::None).unwrap();
+        assert_eq!(page.memory()[0], BRANCH, "the fixture needs a branch root");
+        let branch = BranchAccessor::new(&page, Some(8));
+        let at = match site {
+            Site::RootBranch => {
+                mem.page_address_for_test(header.root).start
+                    + last_checksummed_byte(&page, Some(8), None).unwrap() as u64
+            }
+            Site::FirstLeaf => {
+                let child = branch.child_page(0).unwrap();
+                let leaf = mem.get_page(child, PageHint::None).unwrap();
+                mem.page_address_for_test(child).start
+                    + last_checksummed_byte(&leaf, Some(8), None).unwrap() as u64
+            }
+        };
+        drop(page);
+        drop(write);
+        drop(mem);
+        drop(db);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(at)).unwrap();
+        let mut byte = [0];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(at)).unwrap();
+        file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+        file.sync_all().unwrap();
+        header.to_le_bytes()
+    }
+    fn checksums_hold(db: &Database) -> bool {
+        let header = BtreeHeader::from_le_bytes(root(db, DAMAGED));
+        let write = db.begin_write().unwrap();
+        RawBtree::new(
+            Some(header),
+            Some(8),
+            None,
+            write.mem.clone(),
+            PageHint::None,
+        )
+        .verify_checksum()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_damaged_page_refuses_with_no_hook_and_moves_nothing() {
+        for site in [Site::RootBranch, Site::FirstLeaf] {
+            let file = crate::create_tempfile();
+            let before = damage(store(file.path()), file.path(), site);
+            let db = Database::open(file.path()).unwrap();
+            let mut cursor = CompactionCursor::default();
+            let mut refused = None;
+            for _ in 0..4096 {
+                match db
+                    .begin_write()
+                    .unwrap()
+                    .compact_step(&mut cursor, 16, |_| Ok(()))
+                {
+                    Ok(progress) if progress.complete => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        refused = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            let refused = refused.unwrap_or_else(|| panic!("{site:?}: the sweep laundered it"));
+            assert!(refused.contains("damaged"), "{site:?}: {refused}");
+            assert_eq!(root(&db, DAMAGED), before, "{site:?}: nothing moved");
+            assert!(
+                !checksums_hold(&db),
+                "{site:?}: no fresh checksum over the damage"
+            );
+        }
+    }
+
+    #[test]
+    fn an_intact_page_with_a_committed_sentinel_checksum_is_still_compared() {
+        let file = crate::create_tempfile();
+        let db = store(file.path());
+        let header = BtreeHeader::from_le_bytes(root(&db, DAMAGED));
+        let write = db.begin_write().unwrap();
+        let tree = |checksum| {
+            UntypedBtree::new(
+                Some(BtreeHeader::new(header.root, checksum, header.length)),
+                write.mem.clone(),
+                PageHint::None,
+                Some(8),
+                None,
+            )
+        };
+        let intact = tree(header.checksum).page_batch(&[], 4, false).unwrap();
+        assert!(!intact.source_refused);
+        assert_eq!(intact.pages.len(), 4);
+        let forged = tree(DEFERRED).page_batch(&[], 4, false).unwrap();
+        assert!(
+            forged.source_refused,
+            "999 on a committed page is an ordinary wrong checksum"
+        );
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    mod with_a_hook {
+        use super::*;
+
+        fn record(
+            write: &WriteTransaction,
+            name: &str,
+            event: TableRootEvent,
+        ) -> Result<(), StorageError> {
+            EVENTS.with(|events| {
+                events.borrow_mut().push((
+                    name.to_owned(),
+                    format!("{event:?}"),
+                    write.relocation_source_root(),
+                ));
+            });
+            Ok(())
+        }
+        fn fail_after_relocate(
+            write: &WriteTransaction,
+            name: &str,
+            event: TableRootEvent,
+        ) -> Result<(), StorageError> {
+            record(write, name, event)?;
+            if name == "zz_other" && matches!(event, TableRootEvent::AfterRelocate) {
+                return Err(StorageError::Corrupted("injected".into()));
+            }
+            Ok(())
+        }
+        fn saw(table: &str, event: &str) -> bool {
+            EVENTS.with(|events| {
+                events
+                    .borrow()
+                    .iter()
+                    .any(|(name, seen, _)| name == table && seen == event)
+            })
+        }
+        fn sweep(db: &Database) {
+            let mut cursor = CompactionCursor::default();
+            for _ in 0..4096 {
+                let progress = db
+                    .begin_write()
+                    .unwrap()
+                    .with_table_root_hook(record)
+                    .compact_step(&mut cursor, 16, |_| Ok(()))
+                    .unwrap();
+                if progress.complete {
+                    return;
+                }
+            }
+            panic!("the sweep did not finish");
+        }
+
+        #[test]
+        fn a_handler_may_skip_a_damaged_table_and_the_sweep_moves_the_others() {
+            for site in [Site::RootBranch, Site::FirstLeaf] {
+                EVENTS.with(|events| events.borrow_mut().clear());
+                let file = crate::create_tempfile();
+                let before = damage(store(file.path()), file.path(), site);
+                let db = Database::open(file.path()).unwrap();
+                let other_before = root(&db, OTHER);
+                sweep(&db);
+                assert!(saw("damaged", "RelocationRefused"), "{site:?}");
+                assert!(!saw("damaged", "AfterRelocate"), "{site:?}");
+                assert_eq!(root(&db, DAMAGED), before, "{site:?}: nothing moved");
+                assert_ne!(
+                    root(&db, OTHER),
+                    other_before,
+                    "{site:?}: the sweep went on"
+                );
+                assert!(
+                    !checksums_hold(&db),
+                    "{site:?}: no fresh checksum over the damage"
+                );
+                sweep(&db);
+                assert!(!checksums_hold(&db), "{site:?}: nor on a later sweep");
+            }
+        }
+
+        #[test]
+        fn a_dirty_ancestor_excuses_itself_and_not_its_committed_children() {
+            EVENTS.with(|events| events.borrow_mut().clear());
+            let file = crate::create_tempfile();
+            damage(store(file.path()), file.path(), Site::FirstLeaf);
+            let db = Database::open(file.path()).unwrap();
+            let write = db.begin_write().unwrap().with_table_root_hook(record);
+            {
+                // Dirties the root and the rightmost leaf, not the damaged first leaf.
+                write
+                    .open_table(DAMAGED)
+                    .unwrap()
+                    .insert(u64::MAX, b"new".as_slice())
+                    .unwrap();
+            }
+            let mut cursor = CompactionCursor {
+                phase: 1,
+                table: Some("damaged".into()),
+                advance_table: false,
+                position: Vec::new(),
+                active: true,
+            };
+            let progress = write.compact_step(&mut cursor, 16, |_| Ok(())).unwrap();
+            assert_eq!(progress.pages_relocated, 0);
+            assert!(saw("damaged", "RelocationRefused"));
+        }
+
+        #[test]
+        fn dirty_pages_over_an_intact_table_still_move() {
+            EVENTS.with(|events| events.borrow_mut().clear());
+            let file = crate::create_tempfile();
+            let db = store(file.path());
+            let write = db.begin_write().unwrap().with_table_root_hook(record);
+            {
+                write
+                    .open_table(DAMAGED)
+                    .unwrap()
+                    .insert(u64::MAX, b"new".as_slice())
+                    .unwrap();
+            }
+            let mut cursor = CompactionCursor {
+                phase: 1,
+                table: Some("damaged".into()),
+                advance_table: false,
+                position: Vec::new(),
+                active: true,
+            };
+            write.compact_step(&mut cursor, 16, |_| Ok(())).unwrap();
+            assert!(!saw("damaged", "RelocationRefused"));
+        }
+
+        #[test]
+        fn the_source_root_names_this_batch_and_nothing_survives_it() {
+            EVENTS.with(|events| events.borrow_mut().clear());
+            let file = crate::create_tempfile();
+            let db = store(file.path());
+            let before = root(&db, OTHER);
+            sweep(&db);
+            EVENTS.with(|events| {
+                let events = events.borrow();
+                let first = events
+                    .iter()
+                    .find(|(name, seen, _)| name == "zz_other" && seen == "BeforeRelocate")
+                    .expect("the sweep reached the table");
+                assert_eq!(
+                    first.2,
+                    Some(before),
+                    "before the move, the table's own root"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .filter(|(_, seen, _)| seen == "AfterRelocate")
+                        .all(|(_, _, source)| source.is_some()),
+                    "every move knows what it moved from"
+                );
+            });
+            let write = db.begin_write().unwrap();
+            assert_eq!(
+                write.relocation_source_root(),
+                None,
+                "a new transaction starts clean"
+            );
+        }
+
+        #[test]
+        fn a_failed_step_rolls_the_table_back_and_leaves_no_proof_behind() {
+            EVENTS.with(|events| events.borrow_mut().clear());
+            let file = crate::create_tempfile();
+            let db = store(file.path());
+            let before = root(&db, OTHER);
+            let mut cursor = CompactionCursor::default();
+            let mut failed = false;
+            for _ in 0..4096 {
+                let step = db
+                    .begin_write()
+                    .unwrap()
+                    .with_table_root_hook(fail_after_relocate)
+                    .compact_step(&mut cursor, 16, |_| Ok(()));
+                match step {
+                    Ok(progress) if progress.complete => break,
+                    Ok(_) => {}
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(failed, "the injected failure fired");
+            assert_eq!(root(&db, OTHER), before, "the failed batch rolled back");
+            sweep(&db);
+            assert_ne!(root(&db, OTHER), before, "the next attempt moves it afresh");
+        }
     }
 }

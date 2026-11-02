@@ -267,12 +267,34 @@ impl InternalTableDefinition {
         }
     }
 
+    /// The root page and the last byte its checksum covers, for damage plants.
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    pub(crate) fn last_root_byte(
+        &self,
+        mem: &TransactionalMemory,
+    ) -> Result<Option<(crate::tree_store::PageNumber, usize)>> {
+        let Some(root) = self.private_get_root() else {
+            return Ok(None);
+        };
+        let page = mem.get_page(root.root, crate::tree_store::PageHint::None)?;
+        Ok(crate::tree_store::last_checksummed_byte(
+            &page,
+            self.private_get_fixed_key_size(),
+            self.private_get_fixed_value_size(),
+        )
+        .map(|at| (root.root, at)))
+    }
+
+    pub(crate) fn root_bytes(&self) -> Option<[u8; 32]> {
+        self.private_get_root().map(BtreeHeader::to_le_bytes)
+    }
+
     pub(crate) fn page_batch(
         &self,
         mem: Arc<TransactionalMemory>,
         resume: &[usize],
         maximum: usize,
-    ) -> Result<(Vec<PagePath>, Option<Vec<usize>>, usize)> {
+    ) -> Result<crate::tree_store::SelectedPages> {
         let multimap = matches!(self, Self::Multimap { .. });
         let tree = UntypedBtree::new(
             self.private_get_root(),
