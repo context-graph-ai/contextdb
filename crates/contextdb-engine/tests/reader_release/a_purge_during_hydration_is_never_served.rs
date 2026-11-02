@@ -25,7 +25,7 @@ use crate::writer_acquisition_support::{
 use contextdb_core::Error;
 use contextdb_core::read_contract::ReadFailureKind;
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
-    WriterAdmissionEvent, force_complete_hydration_for_test, leave_next_purge_pending_for_test,
+    WriterAdmissionEvent, leave_next_purge_pending_for_test,
 };
 use contextdb_engine::{DatabaseOpenOptions, ReadSession, ReadSessionOptions};
 use std::collections::HashMap;
@@ -46,15 +46,12 @@ fn is_purge_coordination_refusal(error: &Error) -> bool {
 
 /// The reader is stopped before it decodes its image; a writer opens and
 /// attempts a PURGE; the reader is let go. It must never serve an erased row.
-fn assert_a_purge_during_decode_is_never_served(strip_companion: bool, fallback: bool) {
+fn assert_a_purge_during_decode_is_never_served(strip_companion: bool) {
     let directory = tempfile::TempDir::new().expect("task-scoped directory");
     let path = seeded_store(directory.path(), "purged.db");
     if strip_companion {
         let _ = std::fs::remove_file(contextdb_core::store_companion_path(&path));
     }
-    // While held, direct readers of this store decode the complete image (the
-    // established fallback) instead of loading rows lazily.
-    let _complete = fallback.then(|| force_complete_hydration_for_test(&path));
     let mut readers = park_readers(&path, Phase::BeforeDecode, 1);
     let reader = readers.remove(0);
     let watch = watch(&path);
@@ -109,19 +106,13 @@ fn assert_a_purge_during_decode_is_never_served(strip_companion: bool, fallback:
 /// that becomes reachable once the decode leaves the protected section.
 #[test]
 fn a_purge_during_the_reader_s_decode_is_never_served() {
-    assert_a_purge_during_decode_is_never_served(false, false);
+    assert_a_purge_during_decode_is_never_served(false);
 }
 
 /// Test-estate reason (2026-10-15): the same on a store whose companion file does not exist.
 #[test]
 fn a_purge_during_the_decode_of_a_companionless_reader_is_never_served() {
-    assert_a_purge_during_decode_is_never_served(true, false);
-}
-
-/// Test-estate reason (2026-10-15): the same on the complete-image fallback.
-#[test]
-fn a_purge_during_the_fallback_decode_is_never_served() {
-    assert_a_purge_during_decode_is_never_served(false, true);
+    assert_a_purge_during_decode_is_never_served(true);
 }
 
 /// Test-estate reason (2026-10-15): a reader registered in both the default root and a supplied

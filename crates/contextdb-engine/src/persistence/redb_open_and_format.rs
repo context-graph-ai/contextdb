@@ -2676,6 +2676,16 @@ impl RedbPersistence {
         write_txn
             .open_table(writer_history::WRITER_CHANGE_LOG_TABLE)
             .map_err(Self::storage_error)?;
+        // A database with no table still declares its relational readiness: a
+        // reader opens every store this build wrote without loading its tables,
+        // so the two control tables exist from the first commit. They hold no
+        // marker because no table exists to mark.
+        write_txn
+            .open_table(RELATIONAL_INDEX_READY_TABLE)
+            .map_err(Self::storage_error)?;
+        write_txn
+            .open_table(RELATIONAL_INDEX_COUNT_TABLE)
+            .map_err(Self::storage_error)?;
         Self::write_vector_body_root_fingerprint(&write_txn)?;
         Self::apply_content_identity_mutations_in_write(&write_txn, &[], admission)?;
         Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;

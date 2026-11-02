@@ -905,34 +905,15 @@ pub(super) fn validate_read_version_bounds(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_read_source.rs"
-    )
 )]
 pub(super) fn decode_read_relational_table(
     read_txn: &redb::ReadTransaction,
     name: &str,
     meta: &TableMeta,
-) -> std::result::Result<Vec<VersionedRow>, LoadReadImageError> {
-    decode_read_relational_table_with_bounds(read_txn, name, meta, None)
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn decode_read_relational_table_with_bounds(
-    read_txn: &redb::ReadTransaction,
-    name: &str,
-    meta: &TableMeta,
-    authenticated: Option<&writer_recovery::AuthenticatedReadBounds<'_>>,
 ) -> std::result::Result<Vec<VersionedRow>, LoadReadImageError> {
     let _decode_scope =
         crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
@@ -948,11 +929,8 @@ pub(super) fn decode_read_relational_table_with_bounds(
         }
         Err(error) => return Err(read_table_error(error)),
     };
-    let bounds = match authenticated {
-        Some(proof) if std::ptr::eq(proof.read(), read_txn) => *proof.bounds(),
-        _ => RedbPersistence::read_authenticated_bounds_in_read(read_txn)
-            .map_err(read_image_error)?,
-    };
+    let bounds =
+        RedbPersistence::read_authenticated_bounds_in_read(read_txn).map_err(read_image_error)?;
     let mut rows = Vec::new();
     for entry in table.iter().map_err(read_storage_error)? {
         let (_, value) = entry.map_err(read_storage_error)?;
@@ -1064,6 +1042,7 @@ pub(super) fn validate_read_row(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 pub(super) fn remove_quantized_placeholders(row: &mut VersionedRow, meta: &TableMeta) {
     for column in &meta.columns {
         if !matches!(column.column_type, ColumnType::Vector(_)) {
@@ -1077,30 +1056,13 @@ pub(super) fn remove_quantized_placeholders(row: &mut VersionedRow, meta: &Table
     }
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_read_source.rs"
-    )
 )]
 pub(super) fn decode_read_vectors(
     read_txn: &redb::ReadTransaction,
-) -> std::result::Result<Vec<VectorEntry>, LoadReadImageError> {
-    decode_read_vectors_with_bounds(read_txn, None)
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn decode_read_vectors_with_bounds(
-    read_txn: &redb::ReadTransaction,
-    authenticated: Option<&writer_recovery::AuthenticatedReadBounds<'_>>,
 ) -> std::result::Result<Vec<VectorEntry>, LoadReadImageError> {
     let _decode_scope =
         crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
@@ -1109,11 +1071,8 @@ pub(super) fn decode_read_vectors_with_bounds(
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(error) => return Err(read_table_error(error)),
     };
-    let bounds = match authenticated {
-        Some(proof) if std::ptr::eq(proof.read(), read_txn) => *proof.bounds(),
-        _ => RedbPersistence::read_authenticated_bounds_in_read(read_txn)
-            .map_err(read_image_error)?,
-    };
+    let bounds =
+        RedbPersistence::read_authenticated_bounds_in_read(read_txn).map_err(read_image_error)?;
     let mut vectors = Vec::new();
     for entry in table.iter().map_err(read_storage_error)? {
         let (_, value) = entry.map_err(read_storage_error)?;
@@ -1885,8 +1844,8 @@ pub(super) fn decode_read_raw_vector_directory(
             Err(redb::TableError::TableDoesNotExist(_)) => 0,
             Err(error) => return Err(read_table_error(error)),
         };
-        // An empty vector store needs no directory. A nonempty store without
-        // memberships takes the full-image reconstruction route.
+        // An empty vector store needs no directory. A store with an indexed
+        // vector or a body but no memberships is refused by the open.
         raw_ready = indexed_count == 0 && body_count == 0;
     }
     if memberships_present && let Some(root) = directory_root {
@@ -2017,6 +1976,7 @@ pub(super) fn decode_read_raw_vector_directory(
     Ok(ReadRawVectorDirectory { ready: raw_ready })
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2238,6 +2198,7 @@ pub(super) fn validate_and_collect_current_vectors(
     Ok(current)
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 pub(super) fn read_vector_specs_from_meta(
     table_meta: &HashMap<String, TableMeta>,
 ) -> HashMap<VectorIndexRef, usize> {
@@ -2279,6 +2240,7 @@ pub(super) fn read_vector_rename_constraint(constraints: &[String]) -> Option<(S
     None
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 pub(super) fn read_vector_renames_from_ddl_log(
     ddl_log: &[(Lsn, DdlChange)],
 ) -> Vec<ReadVectorRename> {
@@ -2309,6 +2271,7 @@ pub(super) fn read_vector_renames_from_ddl_log(
     renames
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 pub(super) fn resolve_read_vector_index(
     index: &VectorIndexRef,
     entry_lsn: Lsn,
@@ -2334,6 +2297,7 @@ pub(super) fn resolve_read_vector_index(
     None
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2393,6 +2357,7 @@ pub(super) fn ensure_no_vector_supplement_needed(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 /// A quantized vector column keeps its embedding outside the relational row:
 /// the cell holds an empty placeholder and the reader serves the value from
 /// the separately durable vector entry the row owns. Where such a column is
@@ -2524,41 +2489,6 @@ pub(super) fn note_open_history(class: OpenHistoryClass, bytes: usize) {
     read_persistence_test_scaffold::note_open_history(class, bytes);
     #[cfg(not(any(test, feature = "test-seams")))]
     let _ = (class, bytes);
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-pub(super) fn decode_read_ddl_log(
-    read_txn: &redb::ReadTransaction,
-) -> std::result::Result<Vec<(Lsn, DdlChange)>, LoadReadImageError> {
-    let _decode_scope =
-        crate::read_image_memory::ImageMemory::enter_decode_call().map_err(read_image_error)?;
-    let table = match read_txn.open_table(DDL_LOG_TABLE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(read_table_error(error)),
-    };
-    let mut entries = Vec::new();
-    for entry in table.iter().map_err(read_storage_error)? {
-        let (key, value) = entry.map_err(read_storage_error)?;
-        let raw_lsn = key
-            .value()
-            .split_once(':')
-            .map(|(lsn, _)| lsn)
-            .unwrap_or(key.value());
-        let lsn = raw_lsn
-            .parse::<u64>()
-            .map(Lsn)
-            .map_err(|error| read_image_error(Error::Other((error.to_string()).into())))?;
-        note_open_history(OpenHistoryClass::DdlLog, value.value().len());
-        entries.push((
-            lsn,
-            RedbPersistence::decode(value.value()).map_err(read_image_error)?,
-        ));
-    }
-    Ok(entries)
 }
 
 #[expect(
@@ -3007,58 +2937,6 @@ pub(super) fn decode_read_sink_queues(
     Ok(queues)
 }
 
-#[allow(clippy::type_complexity)]
-pub(super) fn logical_read_sync_provenance(
-    relational_tables: &HashMap<String, Vec<VersionedRow>>,
-    persisted_lsns: HashMap<(String, RowId), Lsn>,
-    persisted_kinds: HashMap<(String, RowId), u8>,
-) -> (
-    HashMap<(String, RowId), Lsn>,
-    HashMap<(String, RowId), SyncSourceKind>,
-) {
-    let live_rows = relational_tables
-        .iter()
-        .map(|(table, rows)| {
-            (
-                table.clone(),
-                rows.iter()
-                    .filter(|row| row.deleted_tx.is_none())
-                    .map(|row| row.row_id)
-                    .collect::<HashSet<_>>(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let source_lsns = persisted_lsns
-        .into_iter()
-        .filter(|((table, row_id), _)| {
-            live_rows
-                .get(table)
-                .is_some_and(|rows| rows.contains(row_id))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut source_kinds = persisted_kinds
-        .into_iter()
-        .filter_map(|((table, row_id), kind)| {
-            source_lsns
-                .contains_key(&(table.clone(), row_id))
-                .then_some((
-                    (table, row_id),
-                    match kind {
-                        1 => SyncSourceKind::AcceptedLocal,
-                        2 => SyncSourceKind::AcceptedLocalPending,
-                        _ => SyncSourceKind::Pulled,
-                    },
-                ))
-        })
-        .collect::<HashMap<_, _>>();
-    for key in source_lsns.keys() {
-        source_kinds
-            .entry(key.clone())
-            .or_insert(SyncSourceKind::Pulled);
-    }
-    (source_lsns, source_kinds)
-}
-
 /// The integer key a caller names a row by: the value in its declared
 /// single-column integer primary key. The internal `RowId` is an allocator
 /// counter, so projecting it would answer a lookup for row `42` with whatever
@@ -3143,7 +3021,6 @@ pub(super) fn compatibility_read_vector_projection(
 )]
 pub(super) fn decode_complete_read_image(
     read_txn: &redb::ReadTransaction,
-    _path: &Path,
     memory: crate::read_image_memory::ImageMemoryHandle,
     open_context: crate::executor::bounded::ReadOpenContext,
 ) -> std::result::Result<ReadPersistenceImage, LoadReadImageError> {
@@ -3244,105 +3121,40 @@ pub(super) fn decode_complete_read_image(
     note_open("table_meta");
     let raw_vector_directory = decode_read_raw_vector_directory(read_txn, &memory)?;
     note_open("vector_catalog_and_raw_vector_directory");
-    // Durable relational postings and the raw-vector membership directory
-    // must both cover their complete body tables before the direct reader can
-    // skip full hydration. Marker absence or any directory mismatch retains
-    // the established complete-image fallback.
-    let relational_indexes_ready =
-        RedbPersistence::relational_indexes_ready_in_read(read_txn, &table_meta)?;
-    let lazy_relational = raw_vector_directory.ready && relational_indexes_ready;
-    #[cfg(any(test, feature = "test-seams"))]
-    let lazy_relational = lazy_relational
-        && !read_persistence_test_scaffold::complete_hydration_forced_for_test(_path);
-    let mut relational_tables = HashMap::new();
-    if !lazy_relational {
-        let mut names = table_meta.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        for name in names {
-            let meta = table_meta.get(&name).ok_or_else(|| {
-                invalid_read_image_state(format!("collected table metadata disappeared for {name}"))
-            })?;
-            relational_tables.insert(
-                name.clone(),
-                decode_read_relational_table_with_bounds(
-                    read_txn,
-                    &name,
-                    meta,
-                    Some(&authenticated_bounds),
-                )?,
-            );
-        }
+    // Every store this build wrote declares relational readiness and, unless
+    // its vector store is empty, a membership directory. Malformed readiness
+    // is corruption and wins over absence; absence is refused here, before
+    // any row or vector is decoded.
+    RedbPersistence::relational_indexes_ready_in_read(read_txn, &table_meta)?;
+    if !raw_vector_directory.ready {
+        return Err(direct_read_requires_writer_for(
+            ReadImageRequiresWriterCause::ReadinessAbsent,
+            "the vector store holds an indexed vector or a vector body but has no membership directory",
+        ));
     }
-    note_open("relational_tables");
-    // Graph bodies, projection checks and creation proofs belong to the
-    // querying operation on this root, including the hydration fallback.
-    let vector_entries = if lazy_relational {
-        Vec::new()
-    } else {
-        decode_read_vectors_with_bounds(read_txn, Some(&authenticated_bounds))?
-    };
-    // A page-on-demand open leaves history in the store; the complete
-    // fallback decodes it, as it decodes everything else.
-    let (change_log, ddl_log) = if lazy_relational {
-        (Vec::new(), Vec::new())
-    } else {
-        (Vec::new(), decode_read_ddl_log(read_txn)?)
-    };
-    note_open("change_log");
-    note_open("ddl_log");
-    let projection_bytes = vector_entries
-        .iter()
-        .map(|entry| {
-            entry
-                .vector
-                .len()
-                .saturating_mul(std::mem::size_of::<f32>())
-                .saturating_add(entry.index.table.len())
-                .saturating_add(entry.index.column.len())
-                .saturating_add(std::mem::size_of::<VectorEntry>().saturating_mul(4))
-        })
-        .fold(0usize, usize::saturating_add)
-        .saturating_mul(2);
-    crate::read_image_memory::reserve(projection_bytes).map_err(read_image_error)?;
-    note_open("vector_projection");
-    let current_vectors = if lazy_relational {
-        HashMap::new()
-    } else {
-        validate_and_collect_current_vectors(
-            &table_meta,
-            &mut relational_tables,
-            &vector_entries,
-            &ddl_log,
-        )?
-    };
+    note_open("readiness");
     let persisted_sync_lsns = decode_read_sync_source_lsns(read_txn)?;
     let persisted_sync_kinds = decode_read_sync_source_kinds(read_txn)?;
     note_open("sync_sources");
-    let (sync_source_lsns, sync_source_kinds) = if lazy_relational {
-        let mut kinds = persisted_sync_kinds
-            .into_iter()
-            .filter(|(key, _)| persisted_sync_lsns.contains_key(key))
-            .map(|(key, kind)| {
-                let kind = match kind {
-                    1 => SyncSourceKind::AcceptedLocal,
-                    2 => SyncSourceKind::AcceptedLocalPending,
-                    _ => SyncSourceKind::Pulled,
-                };
-                (key, kind)
-            })
-            .collect::<HashMap<_, _>>();
-        for key in persisted_sync_lsns.keys() {
-            kinds.entry(key.clone()).or_insert(SyncSourceKind::Pulled);
-        }
-        (persisted_sync_lsns, kinds)
-    } else {
-        logical_read_sync_provenance(
-            &relational_tables,
-            persisted_sync_lsns,
-            persisted_sync_kinds,
-        )
-    };
-    // Both hydration paths capture the same scalar directory descriptor.
+    let mut sync_source_kinds = persisted_sync_kinds
+        .into_iter()
+        .filter(|(key, _)| persisted_sync_lsns.contains_key(key))
+        .map(|(key, kind)| {
+            let kind = match kind {
+                1 => SyncSourceKind::AcceptedLocal,
+                2 => SyncSourceKind::AcceptedLocalPending,
+                _ => SyncSourceKind::Pulled,
+            };
+            (key, kind)
+        })
+        .collect::<HashMap<_, _>>();
+    for key in persisted_sync_lsns.keys() {
+        sync_source_kinds
+            .entry(key.clone())
+            .or_insert(SyncSourceKind::Pulled);
+    }
+    let sync_source_lsns = persisted_sync_lsns;
+    // The history frontiers capture the scalar directory descriptor.
     // A detected repair suffix is diagnosed before root/count disagreement.
     let open_checkpoint = || open_context.checkpoint();
     let directory_context =
@@ -3416,16 +3228,16 @@ pub(super) fn decode_complete_read_image(
         content_identity,
         memory,
         table_meta,
-        relational_tables,
-        lazy_relational,
+        #[cfg(any(test, feature = "test-seams"))]
+        relational_tables: HashMap::new(),
         read_bounds: authenticated_bounds.into_bounds(),
-        vector_entries,
+        vector_entries: Vec::new(),
         raw_vector_memberships: Vec::new(),
-        current_vectors,
+        current_vectors: HashMap::new(),
         sync_source_lsns,
         sync_source_kinds,
-        change_log,
-        ddl_log,
+        change_log: Vec::new(),
+        ddl_log: Vec::new(),
         commit_index,
         history_on_request,
         config_values,

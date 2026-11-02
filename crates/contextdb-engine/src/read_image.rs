@@ -112,13 +112,6 @@ fn build_committed_image(
     if let Some(limit) = memory_limit {
         accountant.set_budget(Some(limit))?;
     }
-    // The committed database consumes the decoded rows below, so it needs one
-    // additional image-sized reservation during construction. The typed image
-    // projection still exists until its incremental identity replacement is
-    // ready, but it does not justify reserving a second Database image.
-    if !parts.lazy_relational {
-        memory.reserve(memory.held())?;
-    }
     // Keep durable configuration separate from this process's startup ceiling,
     // so the same committed image keeps the same identity for every reader.
     let declared_memory_limit = parts

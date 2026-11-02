@@ -100,6 +100,23 @@ fn every_refusal() -> Vec<ReadFailure> {
                     }),
                 ));
             }
+            // The one detail that renders without the kind's writable-open
+            // sentence, because a reopen does not republish what it reports.
+            ReadFailureKind::DirectReadRequiresWriter => {
+                refusals.push(refusal(kind, ReadFailureDetail::None));
+                refusals.push(refusal(
+                    kind,
+                    ReadFailureDetail::Reason {
+                        reason: "the owner closed the store".to_owned(),
+                    },
+                ));
+                refusals.push(refusal(
+                    kind,
+                    ReadFailureDetail::ReadinessAbsent {
+                        reason: "the relational index readiness table is absent".to_owned(),
+                    },
+                ));
+            }
             other => {
                 refusals.push(refusal(other, ReadFailureDetail::None));
                 refusals.push(refusal(

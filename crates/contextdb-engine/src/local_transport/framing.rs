@@ -3646,6 +3646,8 @@ impl<'a> WirePreflight<'a> {
                 self.string()?;
             }
             6 => self.string()?,
+            // Absent read-readiness: one reason string, like the plain reason.
+            7 => self.string()?,
             _ => unreachable!("bounded failure-detail discriminant"),
         }
         Ok(())
@@ -3972,7 +3974,7 @@ const READ_FAILURE_KIND_MAXIMUM_DISCRIMINANT: u32 =
 /// vocabulary has no list to read a length from, so appending a detail means
 /// raising this number and walking the new shape in `failure` above --
 /// otherwise the preflight refuses a refusal the owner legitimately sends.
-const READ_FAILURE_DETAIL_MAXIMUM_DISCRIMINANT: u32 = 6;
+const READ_FAILURE_DETAIL_MAXIMUM_DISCRIMINANT: u32 = 7;
 
 /// `continued` says earlier frames of this exchange already carried the
 /// leading bytes of the answer, so this frame's payload is a tail: it is not a

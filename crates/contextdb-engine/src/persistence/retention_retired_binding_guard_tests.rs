@@ -189,14 +189,11 @@ fn physical(path: &Path, count: usize, deferred: bool) {
                 );
             }
             let meta = RedbPersistence::load_table_meta_in_read_txn(&read, "edges")?.unwrap();
-            assert!(
-                RedbPersistence::relational_indexes_ready_in_read(
-                    &read,
-                    &HashMap::from([("edges".into(), meta)])
-                )
-                .unwrap(),
-                "retirement preserves authenticated index readiness"
-            );
+            RedbPersistence::relational_indexes_ready_in_read(
+                &read,
+                &HashMap::from([("edges".into(), meta)]),
+            )
+            .expect("retirement preserves authenticated index readiness");
             Ok(())
         })
         .unwrap();

@@ -1827,12 +1827,23 @@ pub enum ReadFailureDetail {
     None,
     HeldByReaders(HeldByReadersDetail),
     OwnerLimitExceeded(OwnerLimitExceededDetail),
-    CursorExpired { expiry: CursorExpiryKind },
-    Reason { reason: String },
+    CursorExpired {
+        expiry: CursorExpiryKind,
+    },
+    Reason {
+        reason: String,
+    },
     // Wire discriminants are positional: new details append here so every
     // detail that was already encoded keeps its checked-in bytes.
     HeldByWriter(HeldByWriterDetail),
     OwnerRouteUnsupported(OwnerRouteUnsupportedDetail),
+    /// The committed file lacks the read-readiness facts every store this
+    /// build wrote carries from its first commit. It belongs to
+    /// `DirectReadRequiresWriter` and renders without that kind's writable-open
+    /// sentence, because a writable reopen does not republish the facts.
+    ReadinessAbsent {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1941,6 +1952,12 @@ impl ReadFailure {
         // refusal already on the wire changes shape.
         if matches!(&detail, ReadFailureDetail::HeldByWriter(_))
             && kind != ReadFailureKind::HeldByWriter
+        {
+            return Err(ReadFailureConstructionError::KindDetailMismatch);
+        }
+
+        if matches!(&detail, ReadFailureDetail::ReadinessAbsent { .. })
+            && kind != ReadFailureKind::DirectReadRequiresWriter
         {
             return Err(ReadFailureConstructionError::KindDetailMismatch);
         }
@@ -2294,6 +2311,10 @@ impl std::fmt::Display for ReadFailure {
                     .write_str("; a direct file session answers it once no writer holds the store")
             }
             ReadFailureDetail::CursorExpired { expiry } => formatter.write_str(expiry.stated()),
+            ReadFailureDetail::ReadinessAbsent { reason } => write!(
+                formatter,
+                "read-readiness markers are absent: {reason}; this store was not written by this build"
+            ),
             ReadFailureDetail::None => formatter.write_str(self.kind.stated()),
             ReadFailureDetail::Reason { reason } => {
                 write!(formatter, "{}: {reason}", self.kind.stated())

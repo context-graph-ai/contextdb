@@ -1866,13 +1866,11 @@ impl ReadPersistenceImage {
                 lower = std::ops::Bound::Excluded(lsn);
             }
         }
-        if self.lazy_relational {
-            let (tables, vector_entries, current_vectors) = retained_source
-                .compatibility_vector_projection_for_test(&self.table_meta, &self.ddl_log)?;
-            self.relational_tables = tables;
-            self.vector_entries = vector_entries;
-            self.current_vectors = current_vectors;
-        }
+        let (tables, vector_entries, current_vectors) = retained_source
+            .compatibility_vector_projection_for_test(&self.table_meta, &self.ddl_log)?;
+        self.relational_tables = tables;
+        self.vector_entries = vector_entries;
+        self.current_vectors = current_vectors;
         // Audit records and queued payloads an open leaves in the store.
         let history = |error: LoadReadImageError| Error::Other((error.to_string()).into());
         let (config_values, sink_audit, trigger_audit, trigger_audit_stamps, sink_queues) =
@@ -1904,8 +1902,6 @@ impl ReadPersistenceImage {
             content_identity: self.content_identity,
             memory: self.memory,
             table_meta: self.table_meta,
-            relational_tables: self.relational_tables,
-            lazy_relational: self.lazy_relational,
             read_bounds: self.read_bounds,
             vector_entries: self.vector_entries,
             raw_vector_memberships: self.raw_vector_memberships,
@@ -2055,6 +2051,15 @@ impl LoadReadImageError {
                 error.to_string().into(),
             ),
             error @ Self::RequiresWriter { cause, .. } => {
+                // The absence refusal states the observation itself: its
+                // detail carries the bare reason, with no writable-open advice.
+                let readiness_absent = match &error {
+                    Self::RequiresWriter {
+                        cause: ReadImageRequiresWriterCause::ReadinessAbsent,
+                        reason,
+                    } => Some(reason.clone()),
+                    _ => None,
+                };
                 let reason = error.to_string();
                 let cause = match cause {
                     ReadImageRequiresWriterCause::NonMonotonicCommitIndex => {
@@ -2063,6 +2068,7 @@ impl LoadReadImageError {
                     ReadImageRequiresWriterCause::InvalidVectorReference => {
                         DirectRepairRequiredCause::InvalidVectorReference
                     }
+                    #[cfg(any(test, feature = "test-seams"))]
                     ReadImageRequiresWriterCause::RowVectorDivergence => {
                         DirectRepairRequiredCause::RowVectorDivergence
                     }
@@ -2072,12 +2078,16 @@ impl LoadReadImageError {
                     ReadImageRequiresWriterCause::MissingCommitIndex => {
                         DirectRepairRequiredCause::MissingCommitIndex
                     }
+                    ReadImageRequiresWriterCause::ReadinessAbsent => {
+                        DirectRepairRequiredCause::ReadinessAbsent
+                    }
                 };
-                let failure = ReadFailure::new(
-                    ReadFailureKind::DirectReadRequiresWriter,
-                    ReadFailureDetail::Reason { reason },
-                )
-                .expect("direct-read refusal carries a plain reason");
+                let detail = match readiness_absent {
+                    Some(reason) => ReadFailureDetail::ReadinessAbsent { reason },
+                    None => ReadFailureDetail::Reason { reason },
+                };
+                let failure = ReadFailure::new(ReadFailureKind::DirectReadRequiresWriter, detail)
+                    .expect("direct-read refusal carries a plain reason");
                 DirectFileReaderError::DirectReadRequiresWriter { failure, cause }
             }
             error @ Self::StoreMissing { .. } => DirectFileReaderError::StoreNotFound {
@@ -2247,7 +2257,7 @@ pub(crate) fn load_read_image_at_registration_with_cache_share(
             read_memory.clone(),
             || {
                 source.with_read_transaction(|tx| {
-                    decode_complete_read_image(tx, path, memory.clone(), open_context.clone())
+                    decode_complete_read_image(tx, memory.clone(), open_context.clone())
                 })
             },
             LoadReadImageError::Memory,

@@ -515,9 +515,14 @@ fn read_failure_message(
         ReadFailureKind::CursorInvalidStatement => {
             Some("`.cursor open` takes exactly one read-only SELECT or SHOW VECTOR_PARTITIONS")
         }
-        ReadFailureKind::DirectReadRequiresWriter => {
-            Some("close every holder and rerun with --write")
-        }
+        // A store missing its read-readiness markers is not repaired by a
+        // writable reopen, so that detail points at recreating or restoring it.
+        ReadFailureKind::DirectReadRequiresWriter => Some(match failure.detail() {
+            ReadFailureDetail::ReadinessAbsent { .. } => {
+                "recreate the store or restore it from a backup"
+            }
+            _ => "close every holder and rerun with --write",
+        }),
         ReadFailureKind::InvalidContinuation => Some("start the listing again without --continue"),
         ReadFailureKind::OperationAlreadyCompleted | ReadFailureKind::OwnerLimitExceeded => None,
         // The refusal already names the inspection it could not answer and the

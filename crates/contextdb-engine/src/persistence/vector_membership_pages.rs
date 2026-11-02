@@ -1762,9 +1762,9 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
                 ));
             }
             Some(expected) if expected.value() == actual.unwrap_or([0; 32]) => {}
-            // A store without its membership directory takes the full-image
-            // reconstruction route, which trusts nothing from the absent
-            // tables; only a PRESENT table must match its fingerprint.
+            // A store without its membership directory reaches the readiness
+            // check, which refuses it unless its vector store is empty; only
+            // a PRESENT table must match its fingerprint.
             Some(_)
                 if actual.is_none() && (key == MEMBERSHIP_ROOT || key == OPEN_DIRECTORY_ROOT) => {}
             Some(_) => {

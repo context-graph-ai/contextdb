@@ -989,8 +989,10 @@ pub enum DirectRepairRequiredCause {
     NonMonotonicCommitIndex,
     MissingCommitIndex,
     InvalidVectorReference,
+    #[cfg(any(test, feature = "test-seams"))]
     RowVectorDivergence,
     WritableSanitizerWouldChange,
+    ReadinessAbsent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1137,6 +1139,14 @@ impl fmt::Display for DirectFileReaderError {
                     "corrupt direct-read store: {diagnostic:?}: {reason}"
                 )
             }
+            // A store the current build wrote carries its read-readiness
+            // markers from the first commit, and a writable reopen does not
+            // republish them, so this refusal says what was observed and
+            // recommends no reopen.
+            Self::DirectReadRequiresWriter {
+                failure,
+                cause: DirectRepairRequiredCause::ReadinessAbsent,
+            } => write!(formatter, "{failure}"),
             Self::DirectReadRequiresWriter { .. } => formatter.write_str(
                 "direct read requires a writable reopen; close any holder and reopen with --write",
             ),

@@ -511,7 +511,9 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
 // No tests or clock/sleep allowances are removed or changed.
 const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // Inventory includes three native custody source-selection proofs.
-    ("contextdb-core", 88, RSN_TEST_COUNT),
+    // Step 52c (challenge 104), +1: an absent-readiness failure detail belongs to the
+    // direct-read-requires-writer refusal alone and survives the wire.
+    ("contextdb-core", 89, RSN_TEST_COUNT),
     ("contextdb-tx", 19, RSN_TEST_COUNT),
     ("contextdb-relational", 10, RSN_TEST_COUNT),
     ("contextdb-graph", 10, RSN_TEST_COUNT),
@@ -745,7 +747,11 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // Committed sink drive, publication drive and final release add ten guards;
     // ordinary transactions and persisted vector answers add two public-layout guards.
     // Overflowing allocation diagnostics preserve the first unwind and reject incomplete evidence.
-    ("contextdb-engine", 4980, RSN_TEST_COUNT),
+    // Step 52c (challenge 104, validity v5-lane-a-52c.tsv), +9 -1: a store the current build
+    // wrote opens at both doors without decoding a row or a vector (eight healthy-producer
+    // journeys), a store without a membership directory opens only when both vector counts
+    // are zero, and the fallback purge journey goes with the fallback it forced.
+    ("contextdb-engine", 4988, RSN_TEST_COUNT),
     //  - Inventory (+6): an oversized pending unit pushes from a reopened source whose read
     //    limit is smaller than the unit, the hub refuses a unit its writer can never fit before
     //    it transfers, a transiently refused unit stays pending and lands on retry, and a second

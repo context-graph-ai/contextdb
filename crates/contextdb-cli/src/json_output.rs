@@ -178,7 +178,7 @@ pub(crate) fn read_failure_detail_document(failure: &ReadFailure) -> Value {
     );
     match failure.detail() {
         ReadFailureDetail::None => {}
-        ReadFailureDetail::Reason { reason } => {
+        ReadFailureDetail::Reason { reason } | ReadFailureDetail::ReadinessAbsent { reason } => {
             detail.insert("reason".to_string(), json!(reason));
         }
         ReadFailureDetail::CursorExpired { expiry } => {

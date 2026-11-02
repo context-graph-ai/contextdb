@@ -650,12 +650,12 @@ pub(crate) struct ReadPersistenceImage {
     open_context: crate::executor::bounded::ReadOpenContext,
     content_identity: DirectTypedImageDigest,
     table_meta: HashMap<String, TableMeta>,
+    #[cfg(any(test, feature = "test-seams"))]
     relational_tables: HashMap<String, Vec<VersionedRow>>,
-    lazy_relational: bool,
     read_bounds: WriterRecoveryBounds,
     vector_entries: Vec<VectorEntry>,
     /// Checksummed placement and visibility identities for lazy raw-vector
-    /// point loads. Empty on the complete-hydration fallback.
+    /// point loads.
     raw_vector_memberships: Vec<VectorPartitionMembershipRecord>,
     current_vectors: HashMap<(VectorIndexRef, RowId), Vec<f32>>,
     sync_source_lsns: HashMap<(String, RowId), Lsn>,
@@ -699,8 +699,6 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) open_context: crate::executor::bounded::ReadOpenContext,
     pub(crate) content_identity: DirectTypedImageDigest,
     pub(crate) table_meta: HashMap<String, TableMeta>,
-    pub(crate) relational_tables: HashMap<String, Vec<VersionedRow>>,
-    pub(crate) lazy_relational: bool,
     pub(crate) read_bounds: WriterRecoveryBounds,
     #[cfg_attr(
         not(feature = "test-seams"),
@@ -780,12 +778,15 @@ pub(crate) enum ReadImageRequiresWriterCause {
     NonMonotonicCommitIndex,
     #[error("invalid vector reference")]
     InvalidVectorReference,
+    #[cfg(any(test, feature = "test-seams"))]
     #[error("relational and vector values diverge")]
     RowVectorDivergence,
     #[error("writable hydration would sanitize or supplement state")]
     WritableSanitizerWouldChange,
     #[error("commit index is incomplete")]
     MissingCommitIndex,
+    #[error("read-readiness markers are absent")]
+    ReadinessAbsent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -1400,6 +1401,7 @@ struct ReadRawVectorDirectory {
     ready: bool,
 }
 
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Clone)]
 struct ReadVectorRename {
     lsn: Lsn,
@@ -2919,44 +2921,6 @@ pub mod read_persistence_test_scaffold {
         pause_reader_at(store_path, point);
     }
 
-    static COMPLETE_HYDRATION_FORCED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
-        OnceLock::new();
-
-    /// While held, direct readers of THIS store decode the complete image
-    /// (the established fallback) instead of loading rows on demand.
-    pub struct CompleteHydrationGuard {
-        store: PathBuf,
-    }
-
-    pub fn force_complete_hydration_for_test(store_path: &Path) -> CompleteHydrationGuard {
-        COMPLETE_HYDRATION_FORCED
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(store_path.to_path_buf());
-        CompleteHydrationGuard {
-            store: store_path.to_path_buf(),
-        }
-    }
-
-    impl Drop for CompleteHydrationGuard {
-        fn drop(&mut self) {
-            COMPLETE_HYDRATION_FORCED
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&self.store);
-        }
-    }
-
-    pub(crate) fn complete_hydration_forced_for_test(store_path: &Path) -> bool {
-        COMPLETE_HYDRATION_FORCED
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(store_path)
-    }
-
     thread_local! {
         static LEAVE_PURGE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -4064,14 +4028,12 @@ pub mod read_persistence_test_scaffold {
                     }
                     other => LoadReadImageAdapterError::Release(other.to_string()),
                 })?;
-                if image.lazy_relational {
-                    let (tables, vector_entries, current_vectors) = source
-                        .compatibility_vector_projection_for_test(&image.table_meta, &image.ddl_log)
-                        .map_err(|error| LoadReadImageAdapterError::Source(error.to_string()))?;
-                    image.relational_tables = tables;
-                    image.vector_entries = vector_entries;
-                    image.current_vectors = current_vectors;
-                }
+                let (tables, vector_entries, current_vectors) = source
+                    .compatibility_vector_projection_for_test(&image.table_meta, &image.ddl_log)
+                    .map_err(|error| LoadReadImageAdapterError::Source(error.to_string()))?;
+                image.relational_tables = tables;
+                image.vector_entries = vector_entries;
+                image.current_vectors = current_vectors;
                 let vectors = super::compatibility_read_vector_projection(
                     &image.current_vectors,
                     &image.table_meta,

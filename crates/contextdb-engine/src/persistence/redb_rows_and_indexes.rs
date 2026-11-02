@@ -2516,15 +2516,23 @@ impl RedbPersistence {
     pub(super) fn relational_indexes_ready_in_read(
         read_txn: &redb::ReadTransaction,
         table_meta: &HashMap<String, TableMeta>,
-    ) -> std::result::Result<bool, LoadReadImageError> {
+    ) -> std::result::Result<(), LoadReadImageError> {
         let ready = match read_txn.open_table(RELATIONAL_INDEX_READY_TABLE) {
             Ok(ready) => ready,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(direct_read_requires_writer_for(
+                    ReadImageRequiresWriterCause::ReadinessAbsent,
+                    "the relational index readiness table is absent",
+                ));
+            }
             Err(error) => return Err(read_table_error(error)),
         };
         for (table, meta) in table_meta {
             let Some(stored) = ready.get(table.as_str()).map_err(read_storage_error)? else {
-                return Ok(false);
+                return Err(direct_read_requires_writer_for(
+                    ReadImageRequiresWriterCause::ReadinessAbsent,
+                    format!("the relational index readiness marker for table {table} is absent"),
+                ));
             };
             if stored.value() != RELATIONAL_INDEX_READY_VERSION {
                 return Err(read_image_corruption(
@@ -2585,7 +2593,7 @@ impl RedbPersistence {
             }
             Err(error) => return Err(read_table_error(error)),
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Bare persistence flushes have no prepared predecessor snapshot. Their

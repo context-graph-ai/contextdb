@@ -1,9 +1,13 @@
 use super::*;
+use crate::direct_file_reader::DirectRepairRequiredCause;
 use crate::direct_file_reader::test_seams::{
     ReadWorkCounters, ReadWorkObservationScope, ReadWorkPhase,
 };
 use crate::{Database, ReadSession, ReadSessionOptions};
-use contextdb_core::{Value, read_contract::ReadRoute};
+use contextdb_core::{
+    Value,
+    read_contract::{ReadFailureDetail, ReadFailureKind, ReadRoute},
+};
 use std::collections::HashMap;
 
 /// Open authenticates fixed history root controls and the ordered startup
@@ -4886,7 +4890,13 @@ fn ordered_iterator_is_untouched_until_boundary_and_charge_accept() {
 fn relational_and_vector_readiness_cross_matrix_refuses_malformed_before_rows() {
     let root = tempfile::tempdir().expect("task-scoped readiness-state directory");
     for directory_ready in [true, false] {
-        for readiness in ["valid", "malformed", "unsupported", "absent"] {
+        for readiness in [
+            "valid",
+            "malformed",
+            "unsupported",
+            "absent",
+            "marker-absent",
+        ] {
             let case = format!(
                 "{readiness}-{}",
                 if directory_ready { "ready" } else { "unready" }
@@ -4925,6 +4935,13 @@ fn relational_and_vector_readiness_cross_matrix_refuses_malformed_before_rows() 
                         write
                             .delete_table(RELATIONAL_INDEX_READY_TABLE)
                             .expect("remove only the readiness table");
+                    }
+                    "marker-absent" => {
+                        write
+                            .open_table(RELATIONAL_INDEX_READY_TABLE)
+                            .unwrap()
+                            .remove(table.as_str())
+                            .expect("remove only this table's readiness marker");
                     }
                     _ => unreachable!(),
                 }
@@ -4971,64 +4988,143 @@ fn relational_and_vector_readiness_cross_matrix_refuses_malformed_before_rows() 
                     "the public {case} refusal must precede row hydration"
                 );
                 drop(public_work);
+            } else if readiness == "absent" || readiness == "marker-absent" || !directory_ready {
+                // Absent readiness is refused with what was observed, before
+                // any row or vector is decoded, at both doors, and with no
+                // advice to reopen a writer: a writable open does not
+                // republish the facts, so the way out is recreate or restore.
+                let observed = match readiness {
+                    "absent" => "relational index readiness table is absent".to_owned(),
+                    "marker-absent" => {
+                        format!("relational index readiness marker for table {table} is absent")
+                    }
+                    _ => "has no membership directory".to_owned(),
+                };
+                let states_the_observation = |text: String, door: &str| {
+                    assert!(
+                        text.contains(&observed),
+                        "{case}: the {door} states {observed:?}: {text}"
+                    );
+                    assert!(
+                        text.contains("not written by this build"),
+                        "{case}: the {door} says the store is not this build's: {text}"
+                    );
+                    assert!(
+                        !text.contains("--write") && !text.contains("writable"),
+                        "{case}: the {door} gives no writer advice a reopen cannot honor: {text}"
+                    );
+                };
+                let error = match load_read_image_with_memory(&path, Some(2 * 1024 * 1024)) {
+                    Ok(_) => panic!("absent readiness must refuse in {case}"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.kind(),
+                    LoadReadImageErrorKind::RequiresWriter(
+                        ReadImageRequiresWriterCause::ReadinessAbsent
+                    ),
+                    "{case}"
+                );
+                assert_eq!(
+                    work.counters(),
+                    ReadWorkCounters::default(),
+                    "{case} must refuse before any row or vector is decoded"
+                );
+                let direct = error.into_direct_reader_error();
+                let crate::direct_file_reader::DirectFileReaderError::DirectReadRequiresWriter {
+                    failure,
+                    cause,
+                } = &direct
+                else {
+                    panic!(
+                        "{case}: the direct reader keeps its writer-required refusal: {direct:?}"
+                    );
+                };
+                assert_eq!(*cause, DirectRepairRequiredCause::ReadinessAbsent, "{case}");
+                assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
+                assert!(
+                    matches!(failure.detail(), ReadFailureDetail::ReadinessAbsent { .. }),
+                    "{case}: {:?}",
+                    failure.detail()
+                );
+                states_the_observation(failure.to_string(), "read failure");
+                states_the_observation(direct.to_string(), "direct error");
+                drop(work);
+
+                let public_work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+                let public_error = match ReadSession::open(&path) {
+                    Ok(_) => panic!("the public read door must refuse {case}"),
+                    Err(error) => error,
+                };
+                let Error::ReadFailure(public_failure) = &public_error else {
+                    panic!("the public read door keeps its typed refusal: {public_error:?}");
+                };
+                assert_eq!(
+                    public_failure.kind(),
+                    ReadFailureKind::DirectReadRequiresWriter,
+                    "{case}"
+                );
+                assert!(
+                    matches!(
+                        public_failure.detail(),
+                        ReadFailureDetail::ReadinessAbsent { .. }
+                    ),
+                    "{case}: {:?}",
+                    public_failure.detail()
+                );
+                states_the_observation(public_error.to_string(), "public read door");
+                assert_eq!(
+                    public_work.counters(),
+                    ReadWorkCounters::default(),
+                    "the public {case} refusal must precede any row or vector decode"
+                );
+                drop(public_work);
             } else {
                 let image = load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
                     .unwrap_or_else(|error| panic!("{case} remains readable: {error}"));
-                let expected_lazy = directory_ready && readiness == "valid";
-                assert_eq!(image.image.lazy_relational, expected_lazy, "{case}");
-                if expected_lazy {
-                    assert_open_proves_bounded_history_and_startup_digest(
-                        work.counters(),
-                        &format!("{case} skips complete-image hydration"),
-                        331,
-                    );
-                } else {
-                    assert!(
-                        work.counters().decoded_rows > 0,
-                        "{case} retains complete-image hydration"
-                    );
-                }
+                assert_open_proves_bounded_history_and_startup_digest(
+                    work.counters(),
+                    &format!("{case} opens without loading its tables"),
+                    331,
+                );
                 let first_open = work.counters();
                 drop(image);
                 drop(work);
-                if expected_lazy {
-                    // Keep the startup projection fixed while doubling retained
-                    // row/vector bodies and adding a committed history entry.
-                    let database =
-                        Database::open(&path).expect("reopen the readiness matrix growth fixture");
-                    database
-                        .execute(
-                            &format!("INSERT INTO {table} VALUES (2, 'ready', $body, $embedding)"),
-                            &HashMap::from([
-                                (
-                                    "body".to_owned(),
-                                    Value::Text("bounded-readiness-body-".repeat(4096)),
-                                ),
-                                ("embedding".to_owned(), Value::Vector(vec![0.0, 1.0])),
-                            ]),
-                        )
-                        .expect("double retained readiness bodies and append history");
-                    database
-                        .close()
-                        .expect("publish the larger readiness fixture");
+                // Keep the startup projection fixed while doubling retained
+                // row/vector bodies and adding a committed history entry.
+                let database =
+                    Database::open(&path).expect("reopen the readiness matrix growth fixture");
+                database
+                    .execute(
+                        &format!("INSERT INTO {table} VALUES (2, 'ready', $body, $embedding)"),
+                        &HashMap::from([
+                            (
+                                "body".to_owned(),
+                                Value::Text("bounded-readiness-body-".repeat(4096)),
+                            ),
+                            ("embedding".to_owned(), Value::Vector(vec![0.0, 1.0])),
+                        ]),
+                    )
+                    .expect("double retained readiness bodies and append history");
+                database
+                    .close()
+                    .expect("publish the larger readiness fixture");
 
-                    let larger_work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
-                    let larger_image = load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
-                        .expect("the larger readiness fixture remains readable");
-                    assert!(larger_image.image.lazy_relational, "{case}");
-                    assert_open_proves_bounded_history_and_startup_digest(
-                        larger_work.counters(),
-                        &format!("{case} doubled retained bodies skip complete-image hydration"),
-                        331,
-                    );
-                    assert_eq!(
-                        larger_work.counters(),
-                        first_open,
-                        "{case}: fixed 331 hash bytes and zero proof/row/vector work are identical at both store sizes"
-                    );
-                    drop(larger_image);
-                    drop(larger_work);
-                }
+                let larger_work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+                let larger_image = load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
+                    .expect("the larger readiness fixture remains readable");
+                assert_open_proves_bounded_history_and_startup_digest(
+                    larger_work.counters(),
+                    &format!("{case} doubled retained bodies open without loading their tables"),
+                    331,
+                );
+                assert_eq!(
+                    larger_work.counters(),
+                    first_open,
+                    "{case}: fixed 331 hash bytes and zero proof/row/vector work are identical at both store sizes"
+                );
+                drop(larger_image);
+                drop(larger_work);
             }
         }
     }
@@ -5061,7 +5157,7 @@ fn assert_graph_admission_rows(directory: &Path) {
         // Same non-cache source reservation as the production load door.
         // Zero is the existing fixture cache option, not a reader limit.
         let source_bytes =
-            (64 * 1024) + content_identity::READ_VERIFIER_MEMORY_BYTES + std::mem::size_of::<Lsn>();
+            super::companion_and_vector_source::read_source_fixed_reservation_bytes();
         let source_memory =
             SourceMemoryReservation::new(image_memory.clone(), source_bytes).unwrap();
         let limits = crate::read_session::ReadSessionOptions::default().limits;
@@ -5077,15 +5173,23 @@ fn assert_graph_admission_rows(directory: &Path) {
         .unwrap();
         let load = image_memory
             .scope(|| {
-                let mut source =
-                    ReadImageSource::start(&path, 0, 0, source_memory, None, None, None)?;
+                // Zero cache is the fixture option; the page-index capacity is
+                // the production door's own, the declared budget less the fixed
+                // source reservation, so a store with more system tables still
+                // opens.
+                let mut source = ReadImageSource::start(
+                    &path,
+                    0,
+                    usize::try_from(limits.memory)
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(source_bytes),
+                    source_memory,
+                    None,
+                    None,
+                    None,
+                )?;
                 let image = source.with_read_transaction(|read| {
-                    decode_complete_read_image(
-                        read,
-                        &path,
-                        image_memory.clone(),
-                        open_context.clone(),
-                    )
+                    decode_complete_read_image(read, image_memory.clone(), open_context.clone())
                 })?;
                 source.finish(image)
             })
@@ -6693,14 +6797,11 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
         read.open_table(physical).is_ok(),
         "the ready marker and the empty index posting table are committed together"
     );
-    assert!(
-        RedbPersistence::relational_indexes_ready_in_read(
-            &read,
-            &HashMap::from([(table.to_owned(), meta)]),
-        )
-        .expect("inspect marker and every declared backing table in this same read transaction"),
-        "the committed marker names a complete relational-index image"
-    );
+    RedbPersistence::relational_indexes_ready_in_read(
+        &read,
+        &HashMap::from([(table.to_owned(), meta)]),
+    )
+    .expect("the committed marker names a complete relational-index image");
     drop(read);
     drop(raw);
 
@@ -6788,4 +6889,461 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
         large_config_open, small_config_open,
         "fixed-control hash bytes and zero proof-node work are identical with longer history and doubled retained bodies"
     );
+}
+
+// A store the current build wrote carries every fact a reader needs, and opens
+// at both doors without decoding one row or one vector -- as the writer left
+// it, and after a writer reopened and closed it again. The facts are read
+// straight out of the committed file: a fresh store holds no row at all, so a
+// zero row count alone cannot tell the hydration path from the lazy one.
+fn assert_writer_store_opens_without_loading_tables(path: &Path, case: &str) {
+    for state in ["as the writer left it", "after a writer reopen"] {
+        if state == "after a writer reopen" {
+            Database::open(path)
+                .unwrap_or_else(|error| panic!("{case}: reopen the writer: {error:?}"))
+                .close()
+                .unwrap_or_else(|error| panic!("{case}: close the reopened writer: {error:?}"));
+        }
+        let label = format!("{case} {state}");
+        {
+            let raw = redb::Database::open(path)
+                .unwrap_or_else(|error| panic!("{label}: open the committed file: {error}"));
+            let read = raw
+                .begin_read()
+                .unwrap_or_else(|error| panic!("{label}: begin the fact read: {error}"));
+            let tables = match read.open_table(META_TABLE) {
+                Ok(meta) => meta
+                    .iter()
+                    .unwrap_or_else(|error| panic!("{label}: walk the table metadata: {error}"))
+                    .filter_map(|entry| {
+                        let (key, _) = entry.unwrap_or_else(|error| {
+                            panic!("{label}: read a metadata key: {error}")
+                        });
+                        key.value().strip_prefix("table:").map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>(),
+                Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+                Err(error) => panic!("{label}: open the table metadata: {error:?}"),
+            };
+            let ready = read
+                .open_table(RELATIONAL_INDEX_READY_TABLE)
+                .unwrap_or_else(|error| {
+                    panic!("{label}: the writer published no relational readiness table: {error:?}")
+                });
+            for table in &tables {
+                let marker = ready
+                    .get(table.as_str())
+                    .unwrap_or_else(|error| panic!("{label}: read the marker for {table}: {error}"))
+                    .unwrap_or_else(|| {
+                        panic!("{label}: the writer left no readiness marker for {table}")
+                    });
+                assert_eq!(
+                    marker.value(),
+                    RELATIONAL_INDEX_READY_VERSION,
+                    "{label}: the readiness marker for {table} is the current version"
+                );
+            }
+            read.open_table(RELATIONAL_INDEX_COUNT_TABLE)
+                .unwrap_or_else(|error| {
+                    panic!("{label}: the writer published no relational count table: {error:?}")
+                });
+            if read.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE).is_err() {
+                // No membership directory: the store is ready only because its
+                // indexed count and its body count are both zero.
+                let directory =
+                    read.open_table(VECTOR_OPEN_DIRECTORY_TABLE)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{label}: the writer published no vector open directory: {error:?}"
+                            )
+                        });
+                let root = directory
+                    .get(VECTOR_OPEN_DIRECTORY_ROOT_KEY)
+                    .unwrap_or_else(|error| panic!("{label}: read the directory root: {error}"))
+                    .unwrap_or_else(|| panic!("{label}: the directory root is absent"));
+                let indexed = u64::from_be_bytes(root.value()[..8].try_into().unwrap());
+                let bodies = match read.open_table(VECTORS_TABLE) {
+                    Ok(table) => table.len().unwrap(),
+                    Err(redb::TableError::TableDoesNotExist(_)) => 0,
+                    Err(error) => panic!("{label}: read the vector bodies: {error:?}"),
+                };
+                assert_eq!(
+                    (indexed, bodies),
+                    (0, 0),
+                    "{label}: a store without a membership directory holds no indexed vector and no body"
+                );
+            }
+        }
+        let no_decode = |counters: ReadWorkCounters, door: &str| {
+            assert_eq!(
+                ReadWorkCounters {
+                    hashed_bytes: 0,
+                    ..counters
+                },
+                ReadWorkCounters::default(),
+                "{label}: the {door} decodes no row, no vector and no history proof at open"
+            );
+        };
+        let work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+        let image = load_read_image_with_memory(path, Some(8 * 1024 * 1024))
+            .unwrap_or_else(|error| panic!("{label}: the image door opens: {error}"));
+        no_decode(work.counters(), "image door");
+        drop(image);
+        drop(work);
+        let work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+        let session = ReadSession::open(path)
+            .unwrap_or_else(|error| panic!("{label}: the public read door opens: {error:?}"));
+        no_decode(work.counters(), "public read door");
+        drop(session);
+        drop(work);
+    }
+}
+
+#[test]
+fn a_freshly_created_database_opens_for_reading_without_loading_any_table() {
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("fresh.db");
+    Database::open(&path)
+        .expect("create a database with no table and no commit")
+        .close()
+        .expect("close the fresh database");
+    assert_writer_store_opens_without_loading_tables(&path, "a fresh database with no table");
+}
+
+#[test]
+fn a_table_with_no_rows_opens_for_reading_without_loading_any_table() {
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("empty-table.db");
+    let database = Database::open(&path).expect("create the writer");
+    database
+        .execute(
+            "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+            &HashMap::new(),
+        )
+        .expect("declare a table and insert nothing");
+    database.close().expect("close the writer");
+    assert_writer_store_opens_without_loading_tables(&path, "a table with no rows");
+}
+
+#[test]
+fn an_empty_declared_index_opens_for_reading_without_loading_any_table() {
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("empty-index.db");
+    let database = Database::open(&path).expect("create the writer");
+    database
+        .execute(
+            "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+            &HashMap::new(),
+        )
+        .expect("declare a table");
+    database
+        .execute("CREATE INDEX plain_body ON plain (body)", &HashMap::new())
+        .expect("declare an index over a table with no rows");
+    database.close().expect("close the writer");
+    assert_writer_store_opens_without_loading_tables(&path, "an empty declared index");
+}
+
+#[test]
+fn a_vector_column_with_zero_vectors_opens_for_reading_without_loading_any_table() {
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("empty-vector-column.db");
+    let database = Database::open(&path).expect("create the writer");
+    database
+        .execute(
+            "CREATE TABLE vecs (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR(2) SEARCH_MODE INDEXED)",
+            &HashMap::new(),
+        )
+        .expect("declare a vector column and store no vector");
+    database.close().expect("close the writer");
+    assert_writer_store_opens_without_loading_tables(&path, "a vector column with zero vectors");
+}
+
+/// Two tables, one plain and one with an indexed vector column, populated
+/// while maintenance is the caller's. Returns the writer so a case can run
+/// maintenance before closing it.
+fn populated_producer_store(path: &Path) -> Database {
+    let database = Database::open(path).expect("create the populated writer");
+    database.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
+    database
+        .execute(
+            "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+            &HashMap::new(),
+        )
+        .expect("declare the plain table");
+    database
+        .execute(
+            "CREATE TABLE vecs (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR(2) SEARCH_MODE INDEXED)",
+            &HashMap::new(),
+        )
+        .expect("declare the vector table");
+    for id in 0..40 {
+        database
+            .execute(
+                &format!("INSERT INTO plain VALUES ({id}, 'plain-{id}')"),
+                &HashMap::new(),
+            )
+            .expect("insert a plain row");
+        database
+            .execute(
+                &format!("INSERT INTO vecs VALUES ({id}, 'vec-{id}', '[1,{id}]')"),
+                &HashMap::new(),
+            )
+            .expect("insert a row with a vector");
+    }
+    database
+}
+
+#[test]
+fn a_populated_store_before_maintenance_opens_for_reading_without_loading_any_table() {
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("populated-before.db");
+    populated_producer_store(&path)
+        .close()
+        .expect("close before any maintenance cycle");
+    assert_writer_store_opens_without_loading_tables(&path, "a populated store before maintenance");
+}
+
+#[test]
+fn a_populated_store_after_maintenance_opens_for_reading_without_loading_any_table() {
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("populated-after.db");
+    let database = populated_producer_store(&path);
+    for _ in 0..256 {
+        if database
+            .run_maintenance_cycle()
+            .expect("run a maintenance cycle")
+            .vector
+            .remaining_partitions
+            == 0
+        {
+            break;
+        }
+    }
+    database.close().expect("close after maintenance");
+    assert_writer_store_opens_without_loading_tables(&path, "a populated store after maintenance");
+}
+
+#[test]
+fn each_schema_change_on_a_populated_store_keeps_it_openable_without_loading_any_table() {
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("schema-changes.db");
+    populated_producer_store(&path)
+        .close()
+        .expect("close the populated writer");
+    for statement in [
+        "CREATE TABLE extra (id INTEGER PRIMARY KEY, note TEXT)",
+        "CREATE INDEX vecs_body ON vecs (body)",
+        "DROP INDEX vecs_body ON vecs",
+        "ALTER TABLE plain ADD COLUMN extra TEXT",
+        "DROP TABLE extra",
+    ] {
+        let database = Database::open(&path).expect("reopen the writer for a schema change");
+        database.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
+        database
+            .execute(statement, &HashMap::new())
+            .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
+        database.close().expect("close after the schema change");
+        assert_writer_store_opens_without_loading_tables(&path, statement);
+    }
+}
+
+#[test]
+fn a_received_schema_publication_keeps_a_populated_receiver_openable_without_loading_any_table() {
+    use crate::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
+    let root = tempfile::tempdir().expect("task-scoped producer directory");
+    let path = root.path().join("receiver.db");
+    populated_producer_store(&path)
+        .close()
+        .expect("close the populated receiver");
+    let received = [
+        (
+            "a received CreateTable",
+            DdlChange::CreateTable {
+                name: "recv_new".to_owned(),
+                columns: vec![
+                    ("id".to_owned(), "INTEGER PRIMARY KEY".to_owned()),
+                    ("note".to_owned(), "TEXT".to_owned()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            },
+        ),
+        (
+            "a received CreateIndex",
+            DdlChange::CreateIndex {
+                table: "recv_new".to_owned(),
+                name: "recv_new_note".to_owned(),
+                columns: vec![("note".to_owned(), contextdb_core::SortDirection::Asc)],
+            },
+        ),
+        (
+            "a received AlterTable",
+            DdlChange::AlterTable {
+                name: "plain".to_owned(),
+                columns: vec![
+                    ("id".to_owned(), "INTEGER PRIMARY KEY".to_owned()),
+                    ("body".to_owned(), "TEXT".to_owned()),
+                    ("extra".to_owned(), "TEXT".to_owned()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            },
+        ),
+        (
+            "a received DropIndex",
+            DdlChange::DropIndex {
+                table: "recv_new".to_owned(),
+                name: "recv_new_note".to_owned(),
+            },
+        ),
+        (
+            "a received DropTable",
+            DdlChange::DropTable {
+                name: "recv_new".to_owned(),
+            },
+        ),
+    ];
+    for (label, ddl) in received {
+        let database = Database::open(&path).expect("reopen the receiver");
+        database.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
+        let changes = ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![ddl],
+            ddl_lsn: vec![contextdb_core::Lsn(database.current_lsn().0 + 1)],
+        };
+        database
+            .apply_changes(
+                changes,
+                &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+            )
+            .unwrap_or_else(|error| panic!("{label}: the receiver applies it: {error:?}"));
+        database.close().expect("close the receiver");
+        assert_writer_store_opens_without_loading_tables(&path, label);
+    }
+}
+
+/// With no membership directory a store is ready only when its indexed count
+/// and its body count are both zero. Each count is made nonzero on its own, so
+/// dropping either half of the condition changes an outcome here. The planted
+/// directory root is recommitted and its table roots re-authenticated, so the
+/// open reaches the readiness predicate and no earlier corruption check.
+#[test]
+fn a_store_without_a_membership_directory_opens_only_when_both_vector_counts_are_zero() {
+    let root = tempfile::tempdir().expect("task-scoped vector count directory");
+    for (indexed, bodies) in [(0_u64, false), (0, true), (1, false), (1, true)] {
+        let case = format!(
+            "indexed count {indexed}, body {}",
+            if bodies { "present" } else { "absent" }
+        );
+        let path = root.path().join(format!("counts-{indexed}-{bodies}.db"));
+        let database = Database::open(&path).expect("create the vector count fixture");
+        database
+            .execute(
+                "CREATE TABLE counted (id INTEGER PRIMARY KEY, embedding VECTOR(2))",
+                &HashMap::new(),
+            )
+            .expect("declare the vector column");
+        if bodies {
+            database
+                .execute(
+                    "INSERT INTO counted VALUES (1, $embedding)",
+                    &HashMap::from([("embedding".to_owned(), Value::Vector(vec![1.0, 0.0]))]),
+                )
+                .expect("store one vector body");
+        }
+        database.close().expect("close the vector count fixture");
+        {
+            let raw = redb::Database::open(&path).expect("open the vector count fixture");
+            let write = raw.begin_write().expect("begin the count mutation");
+            write
+                .delete_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                .expect("remove the membership directory");
+            let mut planted = [0_u8; 40];
+            {
+                let mut directory = write
+                    .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
+                    .expect("open the vector open directory");
+                planted.copy_from_slice(
+                    directory
+                        .get(VECTOR_OPEN_DIRECTORY_ROOT_KEY)
+                        .expect("read the directory root")
+                        .expect("the directory root exists")
+                        .value(),
+                );
+                planted[..8].copy_from_slice(&indexed.to_be_bytes());
+                directory
+                    .insert(VECTOR_OPEN_DIRECTORY_ROOT_KEY, planted.as_slice())
+                    .expect("plant the indexed count");
+            }
+            RedbPersistence::write_open_index_commitment(
+                &write,
+                VECTOR_OPEN_DIRECTORY_COMMITMENT_KEY,
+                &planted,
+            )
+            .expect("recommit the planted directory root");
+            super::vector_membership_pages::write_fingerprints(&write)
+                .expect("re-authenticate the table roots");
+            write.commit().expect("commit the planted counts");
+        }
+
+        let work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
+        let loaded = load_read_image_with_memory(&path, Some(2 * 1024 * 1024));
+        if indexed == 0 && !bodies {
+            let image = loaded.unwrap_or_else(|error| {
+                panic!("{case}: an empty vector store needs no directory: {error}")
+            });
+            assert_eq!(
+                ReadWorkCounters {
+                    hashed_bytes: 0,
+                    ..work.counters()
+                },
+                ReadWorkCounters::default(),
+                "{case}: the open decodes no row and no vector"
+            );
+            drop(image);
+            drop(work);
+            ReadSession::open(&path).unwrap_or_else(|error| {
+                panic!("{case}: the public read door opens an empty vector store: {error:?}")
+            });
+        } else {
+            let error = match loaded {
+                Ok(_) => panic!("{case}: a nonzero count with no directory must refuse"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                LoadReadImageErrorKind::RequiresWriter(
+                    ReadImageRequiresWriterCause::ReadinessAbsent
+                ),
+                "{case}"
+            );
+            assert!(
+                error.to_string().contains("has no membership directory"),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                work.counters(),
+                ReadWorkCounters::default(),
+                "{case}: the refusal precedes any row or vector decode"
+            );
+            drop(work);
+            let refusal = ReadSession::open(&path)
+                .err()
+                .unwrap_or_else(|| panic!("{case}: the public read door must refuse"));
+            let Error::ReadFailure(failure) = &refusal else {
+                panic!("{case}: the public read door keeps its typed refusal: {refusal:?}");
+            };
+            assert!(
+                matches!(failure.detail(), ReadFailureDetail::ReadinessAbsent { .. }),
+                "{case}: {:?}",
+                failure.detail()
+            );
+        }
+    }
 }

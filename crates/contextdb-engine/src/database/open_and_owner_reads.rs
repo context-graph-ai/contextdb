@@ -1649,8 +1649,6 @@ impl Database {
             content_identity: _,
             memory: _image_memory,
             table_meta: all_meta,
-            mut relational_tables,
-            lazy_relational,
             read_bounds,
             vector_entries: _,
             raw_vector_memberships: _,
@@ -1743,9 +1741,6 @@ impl Database {
                         accountant.read_budget()?,
                     );
                 }
-            }
-            for row in relational_tables.remove(name).unwrap_or_default() {
-                relational.insert_loaded_row(name, row)?;
             }
         }
         relational.replace_sync_source_lsns(sync_source_lsns);
@@ -1960,7 +1955,7 @@ impl Database {
             _image_memory: _image_memory.clone(),
         });
         db.retained_graph_source = Some(retained_source.clone());
-        db.retained_relational_source = lazy_relational.then_some(retained_source);
+        db.retained_relational_source = Some(retained_source);
         db.read_image_memory = Some(_image_memory);
         // This handle has no persistence to stat, so the length the reader
         // measured of the file it read this image out of travels with the

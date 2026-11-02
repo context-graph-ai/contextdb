@@ -1730,3 +1730,23 @@ fn metadata_page_validation_handles_empty_pages_for_every_vocabulary() {
         assert_eq!(exhausted.validate(), Ok(()));
     }
 }
+
+#[test]
+fn a_readiness_absent_detail_belongs_to_direct_read_requires_writer_alone() {
+    let detail = ReadFailureDetail::ReadinessAbsent {
+        reason: "the relational index readiness table is absent".to_owned(),
+    };
+    let failure = ReadFailure::new(ReadFailureKind::DirectReadRequiresWriter, detail.clone())
+        .expect("the refusal that reports absent readiness accepts its detail");
+    assert_read_failure_round_trip(failure, ReadFailureKind::DirectReadRequiresWriter.class());
+    for kind in ReadFailureKind::ALL {
+        if kind == ReadFailureKind::DirectReadRequiresWriter {
+            continue;
+        }
+        assert_eq!(
+            ReadFailure::new(kind, detail.clone()),
+            Err(ReadFailureConstructionError::KindDetailMismatch),
+            "{kind:?} does not report absent readiness"
+        );
+    }
+}

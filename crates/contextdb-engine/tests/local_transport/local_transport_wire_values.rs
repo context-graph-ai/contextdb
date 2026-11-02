@@ -61,6 +61,9 @@ const HELD_BY_WRITER_UNPUBLISHED_FAILURE: &[u8] = &[9, 1, 5, 0, 1, b'w'];
 // The unsupported-inspection detail is newer still, so it takes the position
 // after the writer-contention detail and nothing already encoded moves.
 const OWNER_ROUTE_UNSUPPORTED_FAILURE: &[u8] = &[9, 22, 6, 1, b'i'];
+// The absent-readiness detail is newest of all: it takes the position after
+// the unsupported-inspection detail and nothing already encoded moves.
+const READINESS_ABSENT_FAILURE: &[u8] = &[9, 15, 7, 1, b'r'];
 const REASON_FAILURE: &[u8] = &[9, 4, 4, 3, b'w', b'h', b'y'];
 const RESULT_ROWS_LIMIT_FAILURE: &[u8] = &[9, 8, 2, 0, 10, 0, 0];
 const RESULT_BYTES_LIMIT_FAILURE: &[u8] = &[9, 8, 2, 1, 11, 1, 12, 1, b'r', 0];
@@ -611,6 +614,17 @@ fn every_failure_kind_and_specialized_detail_has_literal_bytes() {
         OWNER_ROUTE_UNSUPPORTED_FAILURE,
     );
     assert_wire_damage_is_rejected::<LocalResponse>(OWNER_ROUTE_UNSUPPORTED_FAILURE);
+    assert_response_codec(
+        failure(
+            ReadFailureKind::DirectReadRequiresWriter,
+            ReadFailureDetail::ReadinessAbsent {
+                reason: "r".to_owned(),
+            },
+        ),
+        LocalResponseExpectation::Custom,
+        READINESS_ABSENT_FAILURE,
+    );
+    assert_wire_damage_is_rejected::<LocalResponse>(READINESS_ABSENT_FAILURE);
     assert_response_codec(
         LocalResponse::Failure {
             failure: ReadFailure::cursor_expired(CursorExpiryKind::Idle),
