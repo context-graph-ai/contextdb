@@ -44,7 +44,7 @@ The same command works whether the store is idle or already owned by a live proc
 | `--sync-endpoint <TICKET>` | *(none)* | Writer-only: server's enrollment ticket to sync with (dial-by-key). |
 | `--tenant-id <ID>` | *(none)* | Writer-only: sync namespace. Omit for local-only mode. |
 | `--sync-debounce-ms <MS>` | 500 | Writer-only: auto-sync batching window. |
-| `--memory-limit <SIZE>` | *(unlimited)* | Whole-session memory ceiling, read or write mode. Suffixes: `K`, `M`, `G`. |
+| `--memory-limit <SIZE>` | *(unlimited)* | Whole-session memory ceiling, read or write mode. Suffixes: `K`, `M`, `G`. A read-only open first reserves about 200 KB (197,048 bytes) of fixed source memory plus its cache share, so a limit below that is refused; the floor is necessary, not sufficient, because the schema, controls and cache need more. |
 | `--disk-limit <SIZE>` | *(unlimited)* | Session disk ceiling. Never authorizes writes. |
 | `--maintenance <MODE>` | `engine-owned` | Maintenance schedule for this process: `engine-owned` starts the database worker when work is declared; `caller-driven` starts no worker and leaves scheduling to `.maintenance run` or the embedding host. Writer-only for file-backed stores. |
 | `--maintenance-poll-ms <MS>` | persisted value, else `60000` | Positive engine-owned poll interval in milliseconds. A supplied value is persisted for a file-backed database; omitting the flag uses that persisted value on later opens rather than overwriting it. Writer-only for file-backed stores. |
@@ -729,6 +729,8 @@ still leave work for a later cycle.
 When `first_failure` is present, the text receipt and JSON `first_failure_details` retain a safe
 operation, message, recovery instruction, and the requested, available, current, and limit byte
 fields that apply. A memory refusal points to `SET MEMORY_LIMIT <SIZE>` or `--memory-limit <SIZE>`;
+a reader refused at open names its fixed source reserve (about 200 KB, plus its cache share), not the
+committed image;
 a disk refusal points to `SET DISK_LIMIT <SIZE>`, `--disk-limit <SIZE>`, or freeing disk space.
 
 Inspection only reads lifecycle metadata: it never loads an evicted graph, replays a tail, builds a

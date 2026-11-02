@@ -5215,9 +5215,18 @@ impl Database {
             self.relational_store
                 .table_meta
                 .read()
-                .values()
-                .fold(0usize, |acc, meta| {
+                .iter()
+                .fold(0usize, |acc, (table, meta)| {
+                    // A committed-image reader is also charged for the exact-probe
+                    // filters it physically holds, none while its postings stay in
+                    // the captured source.
+                    let held_filters = if self.relational_store.prices_exact_filters_by_presence() {
+                        self.relational_store.exact_filter_bytes_held(table)
+                    } else {
+                        0
+                    };
                     acc.saturating_add(retained_table_metadata_bytes(&self.relational_store, meta))
+                        .saturating_add(held_filters)
                 });
         // Charges taken so far are returned if a later one is refused: until
         // the whole set is charged, the retained-state owner refunds nothing.

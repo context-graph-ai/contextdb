@@ -208,6 +208,11 @@ impl From<ImageMemoryHandle> for contextdb_core::read_memory::ReadMemoryOwner {
     }
 }
 
+/// What a refusal says when a reader cannot admit the fixed memory every open
+/// needs before it holds any data. The floor is necessary, not sufficient: the
+/// cache share, the opening controls and the declared schema need more.
+pub(crate) const READER_FLOOR_HINT: &str = "Raise MEMORY_LIMIT: every reader first reserves about 200 KB of fixed source memory (a 64 KiB source window and a 128 KiB verifier ledger), plus its cache share, before it holds any data; the schema it opens needs more.";
+
 impl ImageMemoryHandle {
     #[cfg(test)]
     pub(crate) fn strong_count_for_test(&self) -> usize {
@@ -526,7 +531,7 @@ impl ImageMemory {
             accountant,
             subsystem: "direct_read",
             operation: "hydrate_owned_image",
-            hint: "Raise MEMORY_LIMIT to admit the complete committed read image.",
+            hint: READER_FLOOR_HINT,
             reader_budget: None,
             held: AtomicUsize::new(0),
             control_bytes: 0,
@@ -543,7 +548,7 @@ impl ImageMemory {
             bytes,
             "direct_read",
             "hydrate_owned_image",
-            "Raise MEMORY_LIMIT to admit the complete committed read image.",
+            READER_FLOOR_HINT,
         ) {
             Ok(credit) => credit,
             Err(error) => {
@@ -1116,9 +1121,25 @@ impl ImageMemory {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
+        self.reserve_labeled(bytes, self.operation, self.hint)
+    }
+
+    /// `reserve` under call-specific labels: the same funding branches, held
+    /// bookkeeping and failure rollback, with the refusal naming this
+    /// reservation instead of the handle's general purpose.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn reserve_labeled(
+        &self,
+        bytes: usize,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         let _sample = ImageSample(self);
-        self.reserve_funding(bytes)?;
+        self.reserve_funding_labeled(bytes, operation, hint)?;
         self.held.fetch_add(bytes, Ordering::SeqCst);
         Ok(())
     }
@@ -1191,21 +1212,28 @@ impl ImageMemory {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn reserve_funding(&self, bytes: usize) -> Result<()> {
+        self.reserve_funding_labeled(bytes, self.operation, self.hint)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn reserve_funding_labeled(
+        &self,
+        bytes: usize,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
         match &self.reader_budget {
-            Some(budget) => budget.try_reserve(bytes, self.subsystem, self.operation, self.hint),
+            Some(budget) => budget.try_reserve(bytes, self.subsystem, operation, hint),
             None => match &self._writer_custody {
-                Some(original) => original.try_allocate_for_original(
-                    bytes,
-                    self.subsystem,
-                    self.operation,
-                    self.hint,
-                ),
-                None => self.accountant.try_allocate_for(
-                    bytes,
-                    self.subsystem,
-                    self.operation,
-                    self.hint,
-                ),
+                Some(original) => {
+                    original.try_allocate_for_original(bytes, self.subsystem, operation, hint)
+                }
+                None => self
+                    .accountant
+                    .try_allocate_for(bytes, self.subsystem, operation, hint),
             },
         }
     }

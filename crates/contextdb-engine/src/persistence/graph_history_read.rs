@@ -62,10 +62,15 @@ impl RetainedReadSource {
                     self.history_open_control.check_ddl(read)?;
                     checkpoint()?;
                 }
+                // Each record's hash check runs in a scratch handle built from
+                // the reader's memory.
                 let owner = writer_source::SourceWindowOwner::Read(memory.clone());
-                let _pool = owner.reserve(READ_HISTORY_PROOF_POOL_BYTES, "history_stream_proof")?;
-                let proof =
-                    content_identity::ProofMemory::with_limit(READ_HISTORY_PROOF_POOL_BYTES);
+                // The proof pool is charged to the original reader as the walk
+                // needs it, in steps, up to its ceiling; the owner is declared
+                // before the proof so the proof's buffers are freed before the
+                // last growth credit is returned.
+                let proof_owner = ReadHistoryProofOwner::new(memory.clone())?;
+                let proof = content_identity::ProofMemory::growable(0, proof_owner.clone());
                 #[cfg(any(test, feature = "test-seams"))]
                 {
                     crate::read_work_probe::bind_graph_root(read.storage_snapshot_identity());
@@ -171,7 +176,14 @@ impl RetainedReadSource {
                         })?;
                         Ok(true)
                     },
-                )?;
+                );
+                // The reader's own refusal comes before any reading of an
+                // incomplete proof, so its requested, available and limit
+                // figures survive.
+                if let Some(error) = proof_owner.refusal.lock().take() {
+                    return Err(error);
+                }
+                let complete = complete?;
                 if !complete {
                     return Err(
                         self.unprovable_history(&self._source_memory.memory.accountant, kind)
@@ -341,10 +353,10 @@ impl RetainedReadSource {
         graph_read::with_pages(memory.clone(), || {
             self.with_read(|read| {
                 self.check_history_directory_in_read(read, memory.clone(), checkpoint)?;
-                let owner = writer_source::SourceWindowOwner::Read(memory);
-                let _pool = owner.reserve(READ_HISTORY_PROOF_POOL_BYTES, "commit_floor_proof")?;
-                let proof =
-                    content_identity::ProofMemory::with_limit(READ_HISTORY_PROOF_POOL_BYTES);
+                // As the history stream: the proof pool grows with the seek,
+                // charged to the original reader, owner declared first.
+                let proof_owner = ReadHistoryProofOwner::new(memory)?;
+                let proof = content_identity::ProofMemory::growable(0, proof_owner.clone());
                 checkpoint()?;
                 let table = open_optional_read_table(read, COMMIT_INDEX_TABLE)?;
                 // Both descents use this operation's captured root and the same
@@ -414,7 +426,11 @@ impl RetainedReadSource {
                         found = true;
                         Ok(false)
                     },
-                )?;
+                );
+                if let Some(error) = proof_owner.refusal.lock().take() {
+                    return Err(error);
+                }
+                let complete = complete?;
                 if !complete {
                     return Err(self.unprovable_history(
                         &self._source_memory.memory.accountant,

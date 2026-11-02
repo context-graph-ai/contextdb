@@ -807,6 +807,11 @@ Fan-out to multiple subscribers. Dead channels are cleaned up automatically. Gra
 
 `SET MEMORY_LIMIT`, `SHOW MEMORY_LIMIT`, and the `--memory-limit` startup option all
 feed the same global memory accountant.
+A read-only reader reserves a fixed source floor before it holds any data: a 64 KiB source window, a
+128 KiB verifier ledger and two small controls, 197,048 bytes (about 200 KB) in total, plus its
+cache share. A declared limit below the floor is refused, and the refusal names the floor. The floor
+is necessary, not sufficient: the schema the reader opens, its controls and its cache need more, and
+a reader charges the exact-probe filters it physically holds, not one per declared index.
 Vector operations attribute allocations with tags such as
 `vector_insert@evidence.vector_text` so operators can identify the offending index from errors.
 

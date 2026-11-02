@@ -7347,3 +7347,172 @@ fn a_store_without_a_membership_directory_opens_only_when_both_vector_counts_are
         }
     }
 }
+
+/// The commit-floor seek proves the range it reads with proof memory that grows
+/// with the walk: a reader a fraction of the 4 MiB ceiling still seeks the floor
+/// a roomy reader finds, and a reader that cannot hold the proof is refused
+/// typed, never answered as damage.
+#[test]
+fn a_commit_floor_seek_is_charged_for_the_proof_memory_it_uses() {
+    let root = tempfile::tempdir().expect("task-scoped commit floor directory");
+    let path = root.path().join("floor.db");
+    let database = Database::open(&path).expect("create the commit floor fixture");
+    database
+        .execute(
+            "CREATE TABLE floor_rows (id INTEGER PRIMARY KEY)",
+            &HashMap::new(),
+        )
+        .expect("declare the commit floor table");
+    for id in 0..10 {
+        database
+            .execute(
+                &format!("INSERT INTO floor_rows VALUES ({id})"),
+                &HashMap::new(),
+            )
+            .expect("commit one row");
+    }
+    database.close().expect("close the commit floor fixture");
+
+    let load = load_read_image_with_memory(&path, Some(8 * 1024 * 1024))
+        .expect("open the commit floor fixture");
+    let (_, receipt, source) = load.into_parts();
+    receipt
+        .validate_released()
+        .expect("the open released its source");
+    let limits = crate::read_session::ReadSessionOptions::default().limits;
+    // A reader too small to build even its open context never reaches the seek,
+    // so each limit is first asked whether the open context fits.
+    let try_seek = |memory: u64| {
+        let declared =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(memory).ok()?;
+        let child = declared.child().ok()?;
+        let open_context = crate::executor::bounded::ReadOpenContext::new(
+            child,
+            limits,
+            crate::read_session::read_clock(),
+            OwnerReadCancellation::new(),
+        )
+        .ok()?;
+        Some(source.commit_entry_from(
+            std::ops::Bound::Unbounded,
+            false,
+            open_context.read_memory(),
+            &|| Ok(()),
+        ))
+    };
+
+    let roomy = try_seek(limits.memory)
+        .expect("a roomy reader builds its open context")
+        .expect("a roomy reader seeks the commit floor");
+    assert!(roomy.is_some(), "the fixture has committed history");
+    let small = try_seek(512 * 1024)
+        .expect("a 512 KiB reader builds its open context")
+        .expect("a 512 KiB reader seeks the same floor: the proof grows with the walk");
+    assert_eq!(small, roomy);
+
+    // Climb limits that admit the open context: the seek is either answered
+    // exactly as the roomy reader answered, or refused typed for memory -- never
+    // answered differently and never reported as damage -- and at least one
+    // limit is small enough that the proof cannot be held.
+    let mut judged = 0;
+    let mut refused_for_memory = 0;
+    for memory in [
+        1_400u64, 1_600, 2_048, 3_072, 4_096, 6_144, 8_192, 12_288, 16_384, 32_768,
+    ] {
+        let Some(result) = try_seek(memory) else {
+            continue;
+        };
+        judged += 1;
+        match result {
+            Ok(found) => assert_eq!(
+                found, roomy,
+                "a seek that fits answers as the roomy one did"
+            ),
+            Err(Error::StoreCorrupted { .. }) => {
+                panic!("a reader that cannot hold the proof is refused for memory, not as damage")
+            }
+            Err(Error::MemoryBudgetExceeded { .. }) => refused_for_memory += 1,
+            Err(other) => {
+                panic!("a reader that cannot hold the proof is refused for memory: {other:?}")
+            }
+        }
+    }
+    assert!(
+        judged >= 3,
+        "enough limits admit the open context to judge: {judged}"
+    );
+    assert!(
+        refused_for_memory > 0,
+        "a reader too small to hold the proof is refused typed for memory"
+    );
+}
+
+/// A reader declared below the fixed memory every open reserves is told that
+/// floor: the formula is pinned to the documented "about 200 KB", and the refusal
+/// names it instead of the committed image. An empty store opens at a separately
+/// established fitting limit, so the floor is shown necessary, not sufficient.
+#[test]
+fn a_reader_below_its_fixed_floor_is_told_the_floor() {
+    let floor = super::companion_and_vector_source::read_source_fixed_reservation_bytes();
+    assert_eq!(
+        floor,
+        64 * 1024
+            + content_identity::READ_VERIFIER_MEMORY_BYTES
+            + std::mem::size_of::<Lsn>()
+            + std::mem::size_of::<content_identity::ValidatedHistoryOpenControl>(),
+        "the fixed source reservation is the documented components"
+    );
+    assert!(
+        (196_608..=262_144).contains(&floor),
+        "the documentation says about 200 KB: {floor}"
+    );
+
+    let root = tempfile::tempdir().expect("task-scoped floor directory");
+    let path = root.path().join("floor-empty.db");
+    Database::open(&path)
+        .expect("create an empty store")
+        .close()
+        .expect("close the empty store");
+    let options = |memory: u64| ReadSessionOptions {
+        limits: contextdb_core::read_contract::ReadLimits {
+            memory,
+            ..contextdb_core::read_contract::ReadLimits::default()
+        },
+        ..ReadSessionOptions::default()
+    };
+
+    ReadSession::open_with_options(&path, options(4 * 1024 * 1024))
+        .expect("an empty store opens at a limit well above its floor");
+
+    let limit = floor as u64 - 1;
+    let refusal = ReadSession::open_with_options(&path, options(limit))
+        .err()
+        .expect("a reader declared below its fixed floor is refused");
+    let Error::MemoryBudgetExceeded {
+        hint,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        ..
+    } = &refusal
+    else {
+        panic!("a reader below its floor is refused for memory: {refusal:?}");
+    };
+    assert_eq!(
+        *budget_limit_bytes as u64, limit,
+        "the refusal reports the declared limit"
+    );
+    assert!(
+        requested_bytes > available_bytes,
+        "the refusal reports what could not be admitted: {requested_bytes} against {available_bytes}"
+    );
+    let hint = hint.to_string();
+    assert!(
+        hint.contains("about 200 KB"),
+        "the refusal names the fixed floor: {refusal:?}"
+    );
+    assert!(
+        !hint.contains("complete committed read image"),
+        "the refusal does not blame the committed image: {refusal:?}"
+    );
+}

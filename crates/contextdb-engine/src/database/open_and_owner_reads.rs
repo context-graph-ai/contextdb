@@ -1719,6 +1719,9 @@ impl Database {
             .unwrap_or(0);
 
         let relational = Arc::new(RelationalStore::new());
+        // The reader holds no postings of its own, so it is priced by the
+        // filters it physically holds, not by every declared index.
+        relational.price_exact_filters_by_presence();
         for (name, meta) in &all_meta {
             let mut runtime_meta = meta.clone();
             let user_indexes = runtime_meta

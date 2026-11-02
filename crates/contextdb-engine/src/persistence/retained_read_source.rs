@@ -1049,7 +1049,11 @@ impl SourceMemoryReservation {
                     native_storage_admission::NativeStorageFailure::Refused(refusal),
                 )
             })?;
-        memory.reserve(bytes)?;
+        memory.reserve_labeled(
+            bytes,
+            "reader_source_floor",
+            crate::read_image_memory::READER_FLOOR_HINT,
+        )?;
         SourceShared::try_new_prepaid(
             Self {
                 memory,

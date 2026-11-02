@@ -1433,7 +1433,10 @@ pub(crate) fn retained_row_bytes_for_meta(
 
 /// Price schema declarations and only the filters this backend actually retains.
 pub(crate) fn retained_table_metadata_bytes(store: &RelationalStore, meta: &TableMeta) -> usize {
-    if store.uses_disk_backed_committed_bodies() {
+    // A writer admits the maximum its declarations can allocate and releases
+    // the same figure. A committed-image reader is priced by the schema alone;
+    // the caller that knows the table name adds the filters it physically holds.
+    if store.uses_disk_backed_committed_bodies() || store.prices_exact_filters_by_presence() {
         meta.metadata_bytes()
     } else {
         meta.estimated_bytes()

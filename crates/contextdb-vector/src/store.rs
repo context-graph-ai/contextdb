@@ -6340,9 +6340,10 @@ impl PreparedDirectoryReservation {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn reserve(
+    fn reserve_with_hint(
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         bytes: usize,
+        hint: &'static str,
     ) -> Result<Self> {
         let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
 
@@ -6350,7 +6351,7 @@ impl PreparedDirectoryReservation {
             bytes,
             "vector_index",
             "prepare_vector_directory_growth",
-            "Reduce partition-key or vector-history growth, or raise MEMORY_LIMIT before committing the row.",
+            hint,
         )?;
         Ok(Self {
             charge: Arc::new(Mutex::new(Some(PaidRetainedMemoryCharge::new(
@@ -6370,9 +6371,28 @@ impl PreparedDirectoryReservation {
         accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         bytes: usize,
     ) -> Result<()> {
+        self.reserve_index_with_hint(
+            index,
+            accountant,
+            bytes,
+            "Reduce partition-key or vector-history growth, or raise MEMORY_LIMIT before committing the row.",
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn reserve_index_with_hint(
+        &self,
+        index: VectorIndexRef,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+        bytes: usize,
+        hint: &'static str,
+    ) -> Result<()> {
         let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
 
-        let reservation = Self::reserve(accountant, bytes)?;
+        let reservation = Self::reserve_with_hint(accountant, bytes, hint)?;
         self.index_charges.lock().insert(
             index,
             reservation
@@ -17374,7 +17394,14 @@ impl VectorStore {
                     let charge = column.directory_accounting.lock();
                     let growth = bytes.saturating_sub(charge.bytes);
                     if growth != 0 {
-                        loaded_directories.reserve_index(index.clone(), charge.accountant.clone(), growth)?;
+                        // Opening a store holds every index's partition directory
+                        // in memory; this is not a row being committed.
+                        loaded_directories.reserve_index_with_hint(
+                            index.clone(),
+                            charge.accountant.clone(),
+                            growth,
+                            "Raise the declared MEMORY_LIMIT: every vector index keeps its partition directory in memory while the store is open.",
+                        )?;
                         #[cfg(feature = "test-seams")]
                         if charge.bytes == 0 {
                             let membership = column.directory_ownership(index).total()

@@ -1271,8 +1271,11 @@ impl VectorQuantization {
 }
 
 impl TableMeta {
-    /// The fixed exact-probe bitmap every exact-only index storage on this
-    /// table allocates and keeps for as long as the index exists. Separate
+    /// The largest exact-probe bitmap the exact-only index storages of this
+    /// table can come to hold, one per exact-only index, once each has stored a
+    /// posting. A writer admits this maximum when it declares the indexes; a
+    /// committed-image reader is charged for the filters it holds instead.
+    /// Separate
     /// from [`TableMeta::metadata_bytes`] because it is a durable retention,
     /// not schema text: a staging reservation that copies the declaration
     /// while it builds a projection must not multiply this as well.

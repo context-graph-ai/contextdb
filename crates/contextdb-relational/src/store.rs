@@ -137,10 +137,25 @@ type RowPositionMaps = (
 
 const EXACT_FILTER_WORDS: usize = 8192;
 /// The charge model in `contextdb-core` charges this filter with the table's
-/// schema and cannot see its size from here.
+/// schema for a writer, which admits the maximum at declaration, and cannot see
+/// its size from here. A reader is charged for the filters it holds.
 const _: () = assert!(
     EXACT_FILTER_WORDS * std::mem::size_of::<u64>() == contextdb_core::EXACT_PROBE_FILTER_BYTES
 );
+/// How many exact-probe filters this process has allocated. A store that holds
+/// no posting has no use for one, and a reader that never inserts a posting
+/// should never move this.
+static EXACT_FILTERS_ALLOCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn exact_filters_allocated_for_test() -> u64 {
+    EXACT_FILTERS_ALLOCATED.load(Ordering::Relaxed)
+}
+
+fn allocate_exact_filter() -> Box<[u64; EXACT_FILTER_WORDS]> {
+    EXACT_FILTERS_ALLOCATED.fetch_add(1, Ordering::Relaxed);
+    Box::new([0; EXACT_FILTER_WORDS])
+}
 const EXACT_FILTER_BITS: u64 = (EXACT_FILTER_WORDS as u64) * 64;
 const EXACT_FILTER_MASK: u64 = EXACT_FILTER_BITS - 1;
 
@@ -411,7 +426,7 @@ impl IndexStorage {
             columns,
             tree: BTreeMap::new(),
             exact: ExactMap::default(),
-            exact_filter: exact_only.then(|| Box::new([0; EXACT_FILTER_WORDS])),
+            exact_filter: None,
             exact_only,
             automatic,
             current: MembershipImage::default(),
@@ -693,11 +708,15 @@ impl IndexStorage {
         }
     }
 
+    /// Builds the probe filter on the first posting this storage holds. This
+    /// allocation has no admission hook: a writer has already admitted the
+    /// filter's maximum when the index was declared, and a reader holds no
+    /// postings of its own because its durable postings stay in the captured
+    /// source. A path that builds postings in a reader must admit the whole
+    /// filter before it calls this.
     fn mark_exact_filter(&mut self, hash: u64) {
         let ((word_a, bit_a), (word_b, bit_b)) = exact_filter_slots(hash);
-        let filter = self
-            .exact_filter
-            .get_or_insert_with(|| Box::new([0; EXACT_FILTER_WORDS]));
+        let filter = self.exact_filter.get_or_insert_with(allocate_exact_filter);
         filter[word_a] |= bit_a;
         filter[word_b] |= bit_b;
     }
@@ -813,6 +832,7 @@ pub struct RelationalStore {
     retention_expiries: RwLock<HashMap<RetentionExpiryKey, RetentionExpiryOwner>>,
     next_row_id: AtomicU64,
     disk_backed_committed_bodies: AtomicBool,
+    exact_filters_priced_by_presence: AtomicBool,
 }
 
 /// What an open store is holding, structure by structure, counted from the
@@ -837,8 +857,8 @@ pub struct RetainedStructureBytes {
     pub index_trees: usize,
     /// Every exact-only index's `exact` map, keys and postings.
     pub index_exact: usize,
-    /// The fixed exact-probe filter each index allocates, whether or not the
-    /// index is one that ever reads it.
+    /// The exact-probe filters the index storages physically hold. A storage
+    /// that has stored no posting holds none.
     pub index_exact_filters: usize,
     /// Every index's current membership image.
     pub index_membership: usize,
@@ -912,13 +932,19 @@ fn row_version_heap_bytes(row: &VersionedRow) -> usize {
 }
 
 impl IndexStorage {
+    /// The exact-probe filter this storage physically holds: zero until a
+    /// posting has been stored.
+    fn exact_filter_bytes_held(&self) -> usize {
+        self.exact_filter
+            .as_ref()
+            .map_or(0, |filter| std::mem::size_of_val(filter.as_ref()))
+    }
+
     /// What this index is holding, counted from its own structures.
     fn retained_structure_bytes(&self, into: &mut RetainedStructureBytes) {
-        into.index_exact_filters = into.index_exact_filters.saturating_add(
-            self.exact_filter
-                .as_ref()
-                .map_or(0, |filter| std::mem::size_of_val(filter.as_ref())),
-        );
+        into.index_exact_filters = into
+            .index_exact_filters
+            .saturating_add(self.exact_filter_bytes_held());
         for (key, postings) in &self.tree {
             into.index_trees = into
                 .index_trees
@@ -984,6 +1010,7 @@ impl RelationalStore {
             membership_captures: Arc::new(Mutex::new(MembershipCaptures::default())),
             next_row_id: AtomicU64::new(1),
             disk_backed_committed_bodies: AtomicBool::new(false),
+            exact_filters_priced_by_presence: AtomicBool::new(false),
         }
     }
 
@@ -1004,6 +1031,30 @@ impl RelationalStore {
                 storage.discard_resident_postings();
             }
         }
+    }
+
+    /// The exact-probe filter bytes `table`'s index storages physically hold.
+    /// An observation of present allocations, not a count of declarations.
+    pub fn exact_filter_bytes_held(&self, table: &str) -> usize {
+        self.indexes.read().get(table).map_or(0, |indexes| {
+            indexes
+                .values()
+                .map(IndexStorage::exact_filter_bytes_held)
+                .fold(0usize, usize::saturating_add)
+        })
+    }
+
+    /// A committed-image reader is priced by the schema it holds plus the
+    /// filters it physically holds, not by the maximum its declarations could
+    /// allocate. Set once, before the loaded state is charged.
+    pub fn price_exact_filters_by_presence(&self) {
+        self.exact_filters_priced_by_presence
+            .store(true, Ordering::Release);
+    }
+
+    pub fn prices_exact_filters_by_presence(&self) -> bool {
+        self.exact_filters_priced_by_presence
+            .load(Ordering::Acquire)
     }
 
     pub fn uses_disk_backed_committed_bodies(&self) -> bool {
@@ -3922,6 +3973,29 @@ mod tests {
             lsn: Lsn(created_tx.0),
             created_at: None,
         }
+    }
+
+    #[test]
+    fn a_new_exact_index_storage_holds_no_filter_until_its_first_posting() {
+        let mut storage =
+            IndexStorage::new_automatic(vec![("label".to_string(), SortDirection::Asc)]);
+        assert!(storage.exact_only(), "a single-column index is exact-only");
+        assert_eq!(
+            storage.exact_filter_bytes_held(),
+            0,
+            "a fresh exact-only storage allocates no probe filter"
+        );
+        assert!(
+            !storage.exact_filter_may_contain(7),
+            "with no filter nothing can be found"
+        );
+        storage.mark_exact_filter(7);
+        assert_eq!(
+            storage.exact_filter_bytes_held(),
+            contextdb_core::EXACT_PROBE_FILTER_BYTES,
+            "the first posting builds the filter at its full size"
+        );
+        assert!(storage.exact_filter_may_contain(7));
     }
 
     #[test]

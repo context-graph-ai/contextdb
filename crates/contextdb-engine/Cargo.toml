@@ -284,6 +284,11 @@ name = "history_request_memory"
 path = "tests/history_request_memory.rs"
 required-features = ["test-seams"]
 
+[[test]]
+name = "reader_charges_what_it_holds"
+path = "tests/reader_charges_what_it_holds.rs"
+required-features = ["test-seams"]
+
 
 
 [[bench]]

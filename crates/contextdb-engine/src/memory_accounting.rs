@@ -487,7 +487,7 @@ impl AccountantHandle {
                 bytes,
                 "direct_read",
                 "hydrate_owned_image",
-                "Raise MEMORY_LIMIT to admit the complete committed read image.",
+                crate::read_image_memory::READER_FLOOR_HINT,
             )
             .map_err(contextdb_core::Error::NativeEngineOther)?
         } else {
@@ -3306,7 +3306,7 @@ impl ControlCredit {
             bytes,
             "direct_read",
             "hydrate_owned_image",
-            "Raise MEMORY_LIMIT to admit the complete committed read image.",
+            crate::read_image_memory::READER_FLOOR_HINT,
         )?;
         accountant.change_adapter_control_receipt(bytes, true);
         self.bytes = next;
@@ -4382,7 +4382,7 @@ impl MemoryAccountant {
                     bytes,
                     "direct_read",
                     "hydrate_owned_image",
-                    "Raise MEMORY_LIMIT to admit the complete committed read image.",
+                    crate::read_image_memory::READER_FLOOR_HINT,
                 )
             })
             .transpose()

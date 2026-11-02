@@ -2284,3 +2284,155 @@ fn a_file_route_history_verification_stops_mid_walk_at_cancellation_and_active_t
     }
     assert!(expired_steps < steps, "{expired_steps} of {steps} steps");
 }
+
+/// A reader whose room after open is within a hundredth of `wanted`, and not
+/// below it, or none when no reader can be opened with that much room (the open
+/// itself is refused first). Unlike `reader_with_available_within`, a limit too
+/// small to open is an answer, not a panic.
+fn reader_within(
+    path: &std::path::Path,
+    wanted: usize,
+) -> Option<contextdb_engine::direct_file_reader::test_seams::DirectFileReader> {
+    let mut limit = {
+        let probe = open_for_test(path, config(None)).ok()?;
+        let (usage, _, _) = image_memory_for_test(&probe);
+        usage.used + wanted
+    };
+    for _ in 0..64 {
+        let reader = open_for_test(path, config(Some(limit))).ok()?;
+        let (usage, _, _) = image_memory_for_test(&reader);
+        let available = limit.saturating_sub(usage.used);
+        if available >= wanted && available <= wanted + wanted / 100 {
+            return Some(reader);
+        }
+        if available > wanted {
+            limit -= (available - wanted) / 2 + 1;
+        } else {
+            limit += wanted - available;
+        }
+    }
+    None
+}
+
+/// A small history is answered by a reader whose room is far below the 4 MiB
+/// proof-pool ceiling: the proof memory grows with the walk, it is not paid in
+/// full before the walk starts.
+#[test]
+fn a_small_history_is_answered_by_a_reader_with_less_room_than_the_proof_pool_ceiling() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_small_history_is_answered_by_a_reader_with_less_room_than_the_proof_pool_ceiling",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    seed_rows(&path, 10);
+
+    let (reader, available) = reader_with_available_near(&path, 1024 * 1024);
+    assert!(
+        available < 4 * 1024 * 1024,
+        "the room after open is below the proof-pool ceiling: {available}"
+    );
+    sync_response(&reader).expect("a ten-row history needs a small proof, not the 4 MiB ceiling");
+    change_response(&reader).expect("the change answer of a ten-row history fits the same room");
+}
+
+/// A history walk that outgrows the reader is refused by the reader, with the
+/// reader's own numbers, never turned into an unprovable history, and gives
+/// back everything it took. Rooms the reader's open itself cannot be admitted
+/// into belong to other tests and are skipped.
+#[test]
+fn a_history_walk_that_outgrows_the_reader_is_refused_by_the_reader_and_gives_everything_back() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_history_walk_that_outgrows_the_reader_is_refused_by_the_reader_and_gives_everything_back",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().expect("history memory directory");
+    let path = root.path().join("history.db");
+    seed_rows(&path, ANSWER_ROWS);
+
+    // The rooms span readers that are refused and readers that answer: the
+    // history's body is one request the reader must admit whole, so the small
+    // rooms refuse and the large ones answer.
+    let mut judged = 0;
+    let mut growth_refusals = 0;
+    let mut answered = 0;
+    for extra in [
+        1usize << 20,
+        2 << 20,
+        3 << 20,
+        4 << 20,
+        6 << 20,
+        8 << 20,
+        12 << 20,
+        16 << 20,
+    ] {
+        let Some(reader) = reader_within(&path, extra) else {
+            continue;
+        };
+        judged += 1;
+        let (before, _, _) = image_memory_for_test(&reader);
+        let result = sync_response(&reader);
+        let (after, _, _) = image_memory_for_test(&reader);
+        match &result {
+            Ok(_) => answered += 1,
+            Err(DirectFileReaderError::MemoryBudget {
+                requested_bytes,
+                available_bytes,
+                ..
+            }) => {
+                assert!(
+                    requested_bytes > available_bytes,
+                    "the refusal reports what the reader could not admit: {requested_bytes} \
+                     against {available_bytes}"
+                );
+                assert!(
+                    *requested_bytes < 4 * 1024 * 1024,
+                    "the refusal names the increment the reader could not admit, not the 4 MiB \
+                     ceiling: {requested_bytes} at extra room {extra}"
+                );
+                growth_refusals += 1;
+            }
+            other => panic!(
+                "a reader that cannot hold the proof refuses with its own memory numbers, got \
+                 {other:?} at extra room {extra}"
+            ),
+        }
+        // A walk keeps some state of its own: the history directory it checks first
+        // and the pages it read, which the reader's cache holds and which grows
+        // with the limit (measured at 1% to 3.5% of the room). What a refused walk
+        // must not keep is the proof memory it grew: a walk refused for lack of room
+        // has grown it until the room ran out, so a reader that kept it would hold
+        // nearly the whole room. A reader that holds more than an eighth of the
+        // room beyond what it opened with, after one walk or after three, has kept
+        // proof memory.
+        let second = sync_response(&reader);
+        let third = sync_response(&reader);
+        let (settled, _, _) = image_memory_for_test(&reader);
+        for (walks, used) in [(1, after.used), (3, settled.used)] {
+            assert!(
+                used.saturating_sub(before.used) <= extra / 8,
+                "after {walks} history walk(s) the reader holds {used}, more than an eighth of \
+                 the {extra} bytes of room over the {} it opened with",
+                before.used
+            );
+        }
+        assert_eq!(
+            (result.is_ok(), second.is_ok(), third.is_ok()),
+            (result.is_ok(), result.is_ok(), result.is_ok()),
+            "the same reader answers the same history the same way, at extra room {extra}"
+        );
+    }
+    assert!(
+        judged >= 3,
+        "enough rooms admit the open to judge: {judged}"
+    );
+    assert!(answered > 0, "a roomy reader answers the history");
+    assert!(
+        growth_refusals > 0,
+        "at least one room ends in a typed refusal reported by the reader"
+    );
+}

@@ -515,7 +515,9 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // direct-read-requires-writer refusal alone and survives the wire.
     ("contextdb-core", 89, RSN_TEST_COUNT),
     ("contextdb-tx", 19, RSN_TEST_COUNT),
-    ("contextdb-relational", 10, RSN_TEST_COUNT),
+    // Inventory (+1): a new exact index storage holds no probe filter until its first
+    // posting (a_new_exact_index_storage_holds_no_filter_until_its_first_posting).
+    ("contextdb-relational", 11, RSN_TEST_COUNT),
     ("contextdb-graph", 10, RSN_TEST_COUNT),
     // Inventory additions (+5): the declared index cap funds each selected
     // partition and keeps opening and expansion inside the original cap
@@ -751,7 +753,15 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // wrote opens at both doors without decoding a row or a vector (eight healthy-producer
     // journeys), a store without a membership directory opens only when both vector counts
     // are zero, and the fallback purge journey goes with the fallback it forced.
-    ("contextdb-engine", 4988, RSN_TEST_COUNT),
+    // Inventory (+7), a reader is charged for what it holds: it is charged for the exact
+    // filters it physically holds, not one per declared index, and a populated exact index
+    // answers hits and misses with none (2, reader_charges_what_it_holds); a reader refused
+    // for its vector directories is not told to stop committing rows (1); a small history is
+    // answered with less room than the proof-pool ceiling and a walk that outgrows the
+    // reader is refused with the reader's own numbers (2, history_request_memory); the
+    // commit-floor seek is charged for the proof memory it uses and a reader below its fixed
+    // source floor is told the floor (2, empty_declared_index_readiness_tests).
+    ("contextdb-engine", 4995, RSN_TEST_COUNT),
     //  - Inventory (+6): an oversized pending unit pushes from a reopened source whose read
     //    limit is smaller than the unit, the hub refuses a unit its writer can never fit before
     //    it transfers, a transiently refused unit stays pending and lands on retry, and a second
