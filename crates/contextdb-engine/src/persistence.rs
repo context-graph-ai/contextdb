@@ -102,6 +102,8 @@ mod writer_ddl_occurrences;
 mod writer_ddl_summary;
 mod writer_export;
 mod writer_file;
+#[cfg(test)]
+mod read_error_classification_tests;
 mod writer_history;
 mod writer_recovery;
 mod writer_row_heads;
@@ -1838,6 +1840,36 @@ pub mod read_persistence_test_scaffold {
         }
         let _restore = Restore(WRITER_IO_OBSERVER.with(|slot| slot.replace(Some(observer))));
         operation()
+    }
+
+    thread_local! {
+        static WRITER_READ_FAULT: std::cell::Cell<(u64, u64)> =
+            const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// On this thread, the `nth` writer-file read inside `operation` fails
+    /// once with EIO (os error 5), as a flaky disk would. Returns the result
+    /// and how many writer-file reads `operation` made on this thread.
+    pub fn fail_nth_writer_read_for_test<T>(nth: u64, operation: impl FnOnce() -> T) -> (T, u64) {
+        struct Restore((u64, u64));
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                WRITER_READ_FAULT.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(WRITER_READ_FAULT.with(|slot| slot.replace((0, nth))));
+        let value = operation();
+        let reads = WRITER_READ_FAULT.with(|slot| slot.get().0);
+        (value, reads)
+    }
+
+    pub(super) fn writer_read_fails_for_test() -> bool {
+        WRITER_READ_FAULT.with(|slot| {
+            let (seen, nth) = slot.get();
+            let seen = seen + 1;
+            slot.set((seen, nth));
+            nth != 0 && seen == nth
+        })
     }
 
     pub(super) fn note_writer_io_for_test(
