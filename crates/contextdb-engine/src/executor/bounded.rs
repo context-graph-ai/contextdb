@@ -3888,7 +3888,9 @@ impl Drop for DeferredExactTrace {
 struct RankedVectorRow {
     row_id: RowId,
     rank: f32,
-    vector_score: f32,
+    /// The canonical ranking key the answer is ordered by; the displayed
+    /// score is `vector_key as f32`.
+    vector_key: f64,
     row: PulledRow,
 }
 
@@ -3942,7 +3944,9 @@ struct VectorState {
     /// allowance: the filter is checked on each row the search reaches.
     row_checked: bool,
     source: Option<VectorCandidateSource>,
-    scores: Vec<(RowId, f32)>,
+    /// Candidates keyed by canonical similarity (higher is nearer) until the
+    /// answer order is final.
+    scores: Vec<(RowId, f64)>,
     score_bytes: usize,
     /// The table's column names, in order, so a row read by identity is
     /// projected exactly as the source used to project it.
@@ -10484,7 +10488,7 @@ impl VectorState {
         &mut self,
         context: &ControlArc<RequestContext>,
         row_id: RowId,
-        score: f32,
+        score: f64,
     ) -> std::result::Result<(), BoundedExecutionError> {
         let added = reserve_vector_slot(
             context,
@@ -10654,7 +10658,7 @@ impl VectorState {
                 continue;
             };
             let scored = self.staged_row_admitted(db, context, row_id)?.then(|| {
-                contextdb_vector::cosine_similarity(
+                contextdb_vector::cosine::canonical_cosine_similarity(
                     &vector,
                     parameter_query_vector(&self.query_expr, &self.params).unwrap_or(&self.query),
                 )
@@ -11377,7 +11381,22 @@ impl VectorState {
                     };
                     match step {
                         contextdb_vector::mem::BoundedVectorStep::Pending => continue,
-                        contextdb_vector::mem::BoundedVectorStep::Row(row_id, score) => {
+                        contextdb_vector::mem::BoundedVectorStep::Row(row_id, _displayed) => {
+                            // The canonical key of the row this step returned,
+                            // read before the cursor advances. A displayed f32
+                            // is never widened in its place.
+                            let score = match self.source.as_ref() {
+                                Some(VectorCandidateSource::Brute(cursor)) => {
+                                    cursor.last_row_canonical_score()
+                                }
+                                None => None,
+                            }
+                            .ok_or_else(|| {
+                                Error::Other(
+                                    ("bounded vector row step lost its canonical key".to_string())
+                                        .into(),
+                                )
+                            })?;
                             let Some(row_id) = self.overlay_publishes(row_id) else {
                                 continue;
                             };
@@ -11438,7 +11457,7 @@ impl VectorState {
                     // away, for each row published -- so a store that has been
                     // updated for a while answers the same query more and more
                     // slowly for no reason visible in its data.
-                    let Some((row_id, vector_score)) = self.scores.get(self.materialized).copied()
+                    let Some((row_id, vector_key)) = self.scores.get(self.materialized).copied()
                     else {
                         self.finish_materialization(context)?;
                         self.preparation = VectorPreparation::Output;
@@ -11450,6 +11469,9 @@ impl VectorState {
                     let Some(row) = self.materialize_scored_row(db, context, row_id)? else {
                         continue;
                     };
+                    // The displayed score and the rank formula's input stay f32;
+                    // the answer order keeps the canonical key.
+                    let vector_score = vector_key as f32;
                     // From here the row's retained bytes are held by a guard,
                     // so no exit out of this block leaves them charged.
                     let mut row = RetainedRow::new(context, row);
@@ -11625,7 +11647,7 @@ impl VectorState {
                     self.ranked_rows.push(RankedVectorRow {
                         row_id,
                         rank,
-                        vector_score,
+                        vector_key,
                         row: row.into_row(),
                     });
                     self.drop_rows_out_of_contention(context)?;
@@ -11709,14 +11731,14 @@ impl VectorState {
         if self.sort_key.is_some() {
             self.ranked_rows.sort_by(|left, right| {
                 bounded_rank_float_desc(left.rank, right.rank)
-                    .then_with(|| bounded_rank_float_desc(left.vector_score, right.vector_score))
+                    .then_with(|| bounded_rank_key_desc(left.vector_key, right.vector_key))
                     .then_with(|| left.row_id.cmp(&right.row_id))
             });
         } else if !self.canonical_ordered {
             self.ranked_rows.sort_by(|left, right| {
                 right
-                    .vector_score
-                    .total_cmp(&left.vector_score)
+                    .vector_key
+                    .total_cmp(&left.vector_key)
                     .then_with(|| left.row_id.cmp(&right.row_id))
             });
         }
@@ -11811,6 +11833,16 @@ impl VectorState {
 }
 
 fn bounded_rank_float_desc(left: f32, right: f32) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => right.total_cmp(&left),
+    }
+}
+
+/// [`bounded_rank_float_desc`] for the canonical vector key.
+fn bounded_rank_key_desc(left: f64, right: f64) -> Ordering {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,

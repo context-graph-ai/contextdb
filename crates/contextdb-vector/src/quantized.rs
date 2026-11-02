@@ -623,93 +623,43 @@ impl StoredVector {
         }
     }
 
-    pub fn cosine_similarity(&self, query: &[f32]) -> f32 {
+    /// The exact route's ranking key over the coordinates this body actually
+    /// stores: quantized bodies are decoded one coordinate at a time with the
+    /// stored decoder, then compared through the one canonical arithmetic.
+    /// A length mismatch keeps the existing similarity of 0.0.
+    pub fn canonical_similarity(&self, query: &[f32]) -> f64 {
         if query.len() != self.len() {
             return 0.0;
         }
-        match self {
-            StoredVector::F32(vector) => {
-                cosine_from_iter(query.iter().copied(), vector.iter().copied(), vector.len())
-            }
+        let distance = match self {
+            StoredVector::F32(vector) => crate::cosine::canonical_cosine_distance(query, vector),
             StoredVector::SQ8 {
-                min, max, payload, ..
-            } => cosine_query_sq8(query, payload, *min, *max),
+                min,
+                max,
+                len,
+                payload,
+            } => crate::cosine::canonical_cosine_distance_pairs(
+                query.iter().copied().zip(
+                    payload
+                        .iter()
+                        .take(*len)
+                        .map(|byte| dequantize(*byte, 255.0, *min, *max)),
+                ),
+            ),
             StoredVector::SQ4 {
                 min,
                 max,
                 len,
                 payload,
-            } => cosine_query_sq4(query, payload, *len, *min, *max),
-        }
-    }
-}
-
-fn cosine_query_sq8(query: &[f32], payload: &[u8], min: f32, max: f32) -> f32 {
-    let len = query.len().min(payload.len());
-    let range = max - min;
-    let scale = if range <= f32::EPSILON {
-        0.0
-    } else {
-        range / 255.0
-    };
-    let (mut dot, mut query_norm, mut vector_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for i in 0..len {
-        let a = query[i];
-        let b = if scale == 0.0 {
-            min
-        } else {
-            min + payload[i] as f32 * scale
+            } => crate::cosine::canonical_cosine_distance_pairs(
+                query
+                    .iter()
+                    .copied()
+                    .zip((0..*len).map(|at| dequantize(unpack_sq4(payload, at), 15.0, *min, *max))),
+            ),
         };
-        dot += a * b;
-        query_norm += a * a;
-        vector_norm += b * b;
+        1.0 - distance
     }
-    finish_cosine(dot, query_norm, vector_norm)
-}
-
-fn cosine_query_sq4(query: &[f32], payload: &[u8], len: usize, min: f32, max: f32) -> f32 {
-    let len = query.len().min(len);
-    let range = max - min;
-    let scale = if range <= f32::EPSILON {
-        0.0
-    } else {
-        range / 15.0
-    };
-    let (mut dot, mut query_norm, mut vector_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
-    for (i, a) in query.iter().copied().enumerate().take(len) {
-        let q = unpack_sq4(payload, i);
-        let b = if scale == 0.0 {
-            min
-        } else {
-            min + q as f32 * scale
-        };
-        dot += a * b;
-        query_norm += a * a;
-        vector_norm += b * b;
-    }
-    finish_cosine(dot, query_norm, vector_norm)
-}
-
-fn cosine_from_iter<A, B>(left: A, right: B, expected_len: usize) -> f32
-where
-    A: Iterator<Item = f32>,
-    B: Iterator<Item = f32>,
-{
-    let (dot, left_norm, right_norm) = left.zip(right).take(expected_len).fold(
-        (0.0_f32, 0.0_f32, 0.0_f32),
-        |(dot, left_norm, right_norm), (a, b)| (dot + a * b, left_norm + a * a, right_norm + b * b),
-    );
-    if left_norm == 0.0 || right_norm == 0.0 {
-        return 0.0;
-    }
-    finish_cosine(dot, left_norm, right_norm)
-}
-
-fn finish_cosine(dot: f32, left_norm: f32, right_norm: f32) -> f32 {
-    if left_norm == 0.0 || right_norm == 0.0 {
-        return 0.0;
-    }
-    dot / (left_norm.sqrt() * right_norm.sqrt())
 }
 
 fn dequantize(q: u8, levels: f32, min: f32, max: f32) -> f32 {

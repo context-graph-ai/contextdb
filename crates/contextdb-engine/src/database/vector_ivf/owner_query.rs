@@ -138,7 +138,8 @@ impl Database {
             rows = rows.for_exact();
         }
         rows.reserve(raw.len())?;
-        rows.try_extend(raw.iter().copied())?;
+        // A finished native answer: narrow each canonical key once.
+        rows.try_extend(raw.iter().map(|&(row_id, key)| (row_id, key as f32)))?;
         drop(raw);
         let trace_credit = credit.borrow_mut().try_split_off(trace.retained_bytes())?;
         let owner = crate::vector_read_memory::budget(memory);

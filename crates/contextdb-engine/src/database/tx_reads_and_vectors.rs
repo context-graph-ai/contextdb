@@ -1815,11 +1815,11 @@ impl Database {
         release_retained: &mut dyn FnMut(usize),
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> std::result::Result<Option<f32>, crate::executor::BoundedExecutionError> {
+    ) -> std::result::Result<Option<f64>, crate::executor::BoundedExecutionError> {
         let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
         self.with_vector_read_admission(vector_copy_owner, |vector_copy_owner| {
-            self.vector_store.bounded_score_live_row(
+            self.vector_store.bounded_score_live_row_canonical(
                 index,
                 row_id,
                 snapshot,
@@ -3896,6 +3896,46 @@ impl Database {
         )? {
             return Ok(result);
         }
+        let (rows, trace) = self.owner_vector_search_canonical(
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            mode,
+            executing_owner,
+            read_memory,
+            vector_copy_owner,
+        )?;
+        Ok((rows.narrow()?, trace))
+    }
+
+    /// [`Self::owner_vector_search`] keeping the exact route's canonical keys,
+    /// for the transaction overlays that merge and limit after it. The native
+    /// owner search is not asked: it answers displayed f32 scores, and the
+    /// index is switched off (see `vector_ivf::CLUSTERED_INDEX_SHIPS`).
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn owner_vector_search_canonical(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+        mode: contextdb_core::VectorSearchMode,
+        executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<(
+        contextdb_vector::mem::CanonicalScores,
+        RetainedVectorSearchTrace,
+    )> {
+        let executing_owner: contextdb_vector::MemoryBudgetOwner = executing_owner.into();
+
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let (_load_transfer_funding, load_transfer) =
             self.vector_load_transfer(executing_owner.clone(), read_memory)?;
@@ -3908,7 +3948,7 @@ impl Database {
                     .is_some_and(|owner| owner.historical_operation())
                 {
                     vector_copy_owner.with_historical_durable_reads(|owner| {
-                        self.vector.search_with_mode_admission(
+                        self.vector.search_with_mode_admission_canonical(
                             index,
                             query,
                             k,
@@ -3918,7 +3958,7 @@ impl Database {
                         )
                     })
                 } else {
-                    self.vector.search_with_mode_owned(
+                    self.vector.search_with_mode_owned_canonical(
                         index,
                         query,
                         k,
@@ -4829,7 +4869,7 @@ impl Database {
                     .saturating_add(staged_identities.len());
                 let mut previous_progress = None;
                 let (mut scored, mut trace) = loop {
-                    let (committed, next_trace) = self.owner_vector_search(
+                    let (committed, next_trace) = self.owner_vector_search_canonical(
                         index.clone(),
                         query,
                         committed_k,
@@ -4842,12 +4882,12 @@ impl Database {
             )?;
                     let returned = committed.len();
                     let mut eligible =
-                        contextdb_vector::mem::SearchScores::new(&index, executing_owner.clone())?;
+                        contextdb_vector::mem::CanonicalScores::new(&index, executing_owner.clone())?;
                     if search_mode == contextdb_core::VectorSearchMode::Exact {
                         eligible = eligible.for_exact();
                     }
                     eligible.reserve(returned.saturating_add(staged_entries))?;
-                    for (row_id, score) in committed {
+                    for &(row_id, score) in committed.rows() {
                         if removed.contains(&row_id)
                             || staged_identities.contains(&row_id)
                             || moved.contains_key(&row_id)
@@ -4910,7 +4950,7 @@ impl Database {
                     {
                         continue;
                     }
-                    if let Some(score) = self.vector_store.bounded_score_live_row(
+                    if let Some(score) = self.vector_store.bounded_score_live_row_canonical(
                         &index,
                         *from,
                         snapshot,
@@ -4949,19 +4989,20 @@ impl Database {
                     )? {
                         continue;
                     }
-                    scored.try_push((row_id, cosine_similarity(&entry.vector, query)))?;
+                    scored.try_push((
+                        row_id,
+                        contextdb_vector::cosine::canonical_cosine_similarity(&entry.vector, query),
+                    ))?;
                 }
                 if !self.has_native_ivf_source() || staged_entries!=0 || moved_entries!=0 {
-                    scored.sort_unstable_by(|left, right| {
-                        right.1.total_cmp(&left.1).then_with(||left.0.cmp(&right.0))
-                    });
+                    scored.sort_canonical();
                 }
                 scored.truncate(k);
-                trace.set_final_row_ids(&scored)?;
+                trace.set_final_row_ids(scored.rows())?;
                 trace.trace.supplemented_row_count = trace
                     .supplemented_row_count
                     .saturating_add(staged_entries.min(scored.len()));
-                        Ok((scored, trace))
+                        Ok((scored.narrow()?, trace))
             })();
         self.finalization.accountant.release(overlay_bytes);
         result
@@ -5037,7 +5078,7 @@ impl Database {
                 .saturating_add(staged_identities.len());
             let mut previous_progress = None;
             let (mut scored, mut trace) = loop {
-                let (committed, next_trace) = self.owner_vector_search(
+                let (committed, next_trace) = self.owner_vector_search_canonical(
                     index.clone(),
                     query,
                     committed_k,
@@ -5050,12 +5091,12 @@ impl Database {
             )?;
                 let returned = committed.len();
                 let mut eligible =
-                    contextdb_vector::mem::SearchScores::new(&index, executing_owner.clone())?;
+                    contextdb_vector::mem::CanonicalScores::new(&index, executing_owner.clone())?;
                 if search_mode == contextdb_core::VectorSearchMode::Exact {
                     eligible = eligible.for_exact();
                 }
                 eligible.reserve(returned.saturating_add(staged_entries))?;
-                for (row_id, score) in committed {
+                for &(row_id, score) in committed.rows() {
                     if removed.contains(&row_id)
                         || staged_identities.contains(&row_id)
                         || moved.contains_key(&row_id)
@@ -5111,7 +5152,7 @@ impl Database {
                 {
                     continue;
                 }
-                if let Some(score) = self.vector_store.bounded_score_live_row(
+                if let Some(score) = self.vector_store.bounded_score_live_row_canonical(
                     &index,
                     *from,
                     snapshot,
@@ -5151,17 +5192,20 @@ impl Database {
                 )? {
                     continue;
                 }
-                scored.try_push((row_id, cosine_similarity(entry.vector(), query)))?;
+                scored.try_push((
+                    row_id,
+                    contextdb_vector::cosine::canonical_cosine_similarity(entry.vector(), query),
+                ))?;
             }
             if !self.has_native_ivf_source() || staged_entries!=0 || !moved.is_empty() {
-                scored.sort_unstable_by(|left,right|right.1.total_cmp(&left.1).then_with(||left.0.cmp(&right.0)));
+                scored.sort_canonical();
             }
             scored.truncate(k);
-            trace.set_final_row_ids(&scored)?;
+            trace.set_final_row_ids(scored.rows())?;
             trace.trace.supplemented_row_count = trace
                 .supplemented_row_count
                 .saturating_add(staged_entries.min(scored.len()));
-                Ok((scored, trace))
+                Ok((scored.narrow()?, trace))
         })()
     }
 

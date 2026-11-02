@@ -1884,7 +1884,7 @@ impl RetainedVectorSearchTrace {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn set_final_row_ids(&mut self, rows: &[(RowId, f32)]) -> Result<()> {
+    pub(super) fn set_final_row_ids<S>(&mut self, rows: &[(RowId, S)]) -> Result<()> {
         self.owner
             .reserve(rows.len().saturating_mul(std::mem::size_of::<RowId>()))?;
         let mut ids = Vec::with_capacity(rows.len());

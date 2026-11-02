@@ -4339,7 +4339,7 @@ impl IndexState {
         position: usize,
         snapshot: SnapshotId,
         query: &[f32],
-    ) -> Result<Option<(RowId, f32)>> {
+    ) -> Result<Option<(RowId, f64)>> {
         let carrier = partition.loaded.entries.get(position).ok_or_else(|| {
             Error::Other("historical vector position exceeds its admitted copy".into())
         })?;
@@ -4356,10 +4356,7 @@ impl IndexState {
         let stored = self.stored_entry_ref(&carrier.entry);
         #[cfg(feature = "test-seams")]
         crate::mem::observe_native_vector_score_for_test();
-        Ok(Some((
-            stored.row_id,
-            stored.vector.cosine_similarity(query),
-        )))
+        Ok(Some((stored.row_id, stored.vector.canonical_similarity(query))))
     }
 
     #[expect(
@@ -5154,7 +5151,7 @@ impl IndexState {
         release_retained: &mut impl FnMut(usize),
         owner: &mut VectorCopyAdmission,
         admit: Option<VectorCopyAdmissionCallback<'_>>,
-    ) -> std::result::Result<Option<f32>, E>
+    ) -> std::result::Result<Option<f64>, E>
     where
         E: From<Error>,
     {
@@ -5168,14 +5165,14 @@ impl IndexState {
                     before_distance().map(|()| {
                         #[cfg(feature = "test-seams")]
                         crate::mem::observe_native_vector_score_for_test();
-                        let score = entry.vector.cosine_similarity(query);
+                        let score = entry.vector.canonical_similarity(query);
                         #[cfg(feature = "test-seams")]
                         crate::mem::observe_native_score_identity_for_test(
                             entry.row_id,
                             entry.created_tx,
                             entry.lsn,
                             snapshot,
-                            score,
+                            score as f32,
                             None,
                         );
                         score
@@ -5300,7 +5297,7 @@ impl IndexState {
             return Err(error);
         }
 
-        let scored = (|| -> std::result::Result<(f32, usize), E> {
+        let scored = (|| -> std::result::Result<(f64, usize), E> {
             if caller_charged && loaded.transient_bytes() != caller_reserved {
                 return Err(E::from(Error::Other(
                     ("raw vector candidate charge disagrees with its caller reservation"
@@ -5328,14 +5325,14 @@ impl IndexState {
             before_distance()?;
             #[cfg(feature = "test-seams")]
             crate::mem::observe_native_vector_score_for_test();
-            let score = stored.vector.cosine_similarity(query);
+            let score = stored.vector.canonical_similarity(query);
             #[cfg(feature = "test-seams")]
             crate::mem::observe_native_score_identity_for_test(
                 entry.row_id,
                 entry.created_tx,
                 entry.lsn,
                 snapshot,
-                score,
+                score as f32,
                 Some((
                     entry.vector.as_ptr() as usize,
                     entry.vector.capacity() * std::mem::size_of::<f32>(),
@@ -5378,7 +5375,7 @@ impl IndexState {
         snapshot: SnapshotId,
         query: &[f32],
         owner: &mut VectorCopyAdmission,
-    ) -> Result<Option<f32>> {
+    ) -> Result<Option<f64>> {
         let mut scratch = owner.scratch();
         self.score_visible_candidate_inner(
             index,
@@ -5409,7 +5406,7 @@ impl IndexState {
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize),
         owner: &mut VectorCopyAdmission,
-    ) -> std::result::Result<Option<f32>, E>
+    ) -> std::result::Result<Option<f64>, E>
     where
         E: From<Error>,
     {
@@ -5447,7 +5444,7 @@ impl IndexState {
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize),
         owner: &mut VectorCopyAdmission,
-    ) -> std::result::Result<Option<f32>, E>
+    ) -> std::result::Result<Option<f64>, E>
     where
         E: From<Error>,
     {
@@ -5482,7 +5479,7 @@ impl IndexState {
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize),
         owner: &mut VectorCopyAdmission,
-    ) -> std::result::Result<Option<f32>, E>
+    ) -> std::result::Result<Option<f64>, E>
     where
         E: From<Error>,
     {
@@ -16650,12 +16647,42 @@ impl VectorStore {
         row_id: RowId,
         snapshot: SnapshotId,
         query: &[f32],
+        before_checkpoint: impl FnMut() -> std::result::Result<(), E>,
+        before_distance: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+        owner: &mut VectorCopyAdmission,
+    ) -> std::result::Result<Option<f32>, E> {
+        self.bounded_score_live_row_canonical(
+            index,
+            row_id,
+            snapshot,
+            query,
+            before_checkpoint,
+            before_distance,
+            before_retain,
+            release_retained,
+            owner,
+        )
+        .map(|score| score.map(|key| key as f32))
+    }
+
+    /// [`Self::bounded_score_live_row`] with the exact route's canonical
+    /// ranking key, for callers that still merge or limit after scoring.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_score_live_row_canonical<E: From<Error>>(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        query: &[f32],
         mut before_checkpoint: impl FnMut() -> std::result::Result<(), E>,
         mut before_distance: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
         owner: &mut VectorCopyAdmission,
-    ) -> std::result::Result<Option<f32>, E> {
+    ) -> std::result::Result<Option<f64>, E> {
         self.with_bulk_read(|| {
             let Some(column) = self.try_column(index) else {
                 return Ok(None);
@@ -18042,7 +18069,7 @@ mod tests {
             let entry = entry(&index, 9, TxId(5), [0.13, 0.87]);
             let expected = StoredVectorEntry::from_vector_entry_ref(&entry, quantization)
                 .vector
-                .cosine_similarity(&query);
+                .canonical_similarity(&query);
             let accountant = Arc::new(CountingMemoryBudget::default());
             let loader = Arc::new(CandidateOnlyRawLoader {
                 entry: entry.clone(),

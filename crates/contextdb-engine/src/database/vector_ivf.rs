@@ -15,6 +15,14 @@ use super::*;
 /// the tree, switched off: nothing builds it, writes it, reads it or inspects
 /// it. A store made while this is false is recreated when the index ships.
 pub(crate) const CLUSTERED_INDEX_SHIPS: bool = false;
+// The transaction overlays merge exact-route canonical keys and do not ask the
+// native owner search, whose answer carries only displayed f32 scores
+// (owner_vector_search_canonical). Switching the index on needs that search to
+// return canonical keys first, so the switch cannot flip without it.
+const _: () = assert!(
+    !CLUSTERED_INDEX_SHIPS,
+    "give the native owner search canonical keys before switching the index on"
+);
 /// What an INDEXED explain recommends; the same words as the execution refusal.
 pub(crate) const NO_INDEX_RECOVERY: &str =
     "no vector index ships in this release; use EXACT or AUTO";

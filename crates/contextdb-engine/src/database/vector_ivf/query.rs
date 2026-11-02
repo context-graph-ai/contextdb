@@ -132,7 +132,7 @@ impl Database {
         let mut capacity = k;
         let mut pool_growth = contextdb_core::read_memory::ReadCredit::new(memory.clone());
         let score_bytes = k
-            .checked_mul(std::mem::size_of::<(RowId, f32)>())
+            .checked_mul(std::mem::size_of::<(RowId, f64)>())
             .ok_or_else(|| E::from(Error::Other("native score workspace overflow".into())))?;
         let merge_bytes = k
             .checked_mul(std::mem::size_of::<(RowId, f64)>())
@@ -230,7 +230,7 @@ impl Database {
                 if pool.len() > capacity {
                     let extra = pool.len() - capacity;
                     let score_extra = extra
-                        .checked_mul(std::mem::size_of::<(RowId, f32)>())
+                        .checked_mul(std::mem::size_of::<(RowId, f64)>())
                         .ok_or_else(|| E::from(Error::Other("native pool workspace overflow".into())))?;
                     let merge_extra = extra
                         .checked_mul(std::mem::size_of::<(RowId, f64)>())
@@ -313,11 +313,12 @@ impl Database {
                 rescore_evaluations: usize::try_from(indexed_rescored).unwrap_or(usize::MAX),
             }),
         };
-        // Keep canonical precision through every tuple merge and LIMIT cut.
-        // The public score representation is converted only after ranking.
+        // Keep canonical precision through every tuple merge and LIMIT cut:
+        // the finalists carry the canonical key (1.0 - distance); the public
+        // f32 score is made from it only after ranking.
         let mut scores = Vec::with_capacity(capacity);
         for (row, distance) in &rows {
-            scores.push((*row, (1.0 - distance) as f32));
+            scores.push((*row, 1.0 - distance));
         }
         drop(rows);
         let _ = (&mut retained, total);

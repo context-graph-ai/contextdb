@@ -158,21 +158,7 @@ pub(crate) struct Candidate {
 }
 
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let mut dot = 0.0;
-    let mut aa = 0.0;
-    let mut bb = 0.0;
-    for (&x, &y) in a.iter().zip(b) {
-        let x = f64::from(x);
-        let y = f64::from(y);
-        dot += x * y;
-        aa += x * x;
-        bb += y * y;
-    }
-    if aa == 0.0 || bb == 0.0 {
-        1.0
-    } else {
-        1.0 - dot / (aa.sqrt() * bb.sqrt())
-    }
+    crate::cosine::canonical_cosine_distance(a, b)
 }
 pub(crate) fn order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     a.distance

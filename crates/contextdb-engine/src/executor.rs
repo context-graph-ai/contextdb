@@ -260,7 +260,8 @@ impl ReadPublicationScope {
 pub(crate) type BoundedRowVectorClone = (Vec<f32>, usize);
 
 /// Scored vector candidates, with the bytes their scores retain.
-pub(crate) type BoundedVectorCandidates = (Vec<(RowId, f32)>, usize);
+/// Finished candidates keyed by canonical similarity (higher is nearer).
+pub(crate) type BoundedVectorCandidates = (Vec<(RowId, f64)>, usize);
 
 /// A complete maintained answer, or the explicit reason the caller must not
 /// publish graph rows. The vector layer keeps the detailed maintenance
@@ -483,7 +484,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> std::result::Result<Option<f32>, BoundedExecutionError>;
+    ) -> std::result::Result<Option<f64>, BoundedExecutionError>;
 
     /// Which of a table's vector columns keep their value in the store alone.
     fn quantized_vector_columns(&self, table: &str) -> Vec<String>;
@@ -1930,7 +1931,7 @@ impl ReadExecutionTarget for Database {
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
+    ) -> std::result::Result<Option<f64>, BoundedExecutionError> {
         Database::bounded_score_committed_vector_row(
             self,
             index,
@@ -6953,7 +6954,7 @@ fn execute_plan_with_working_state(
             {
                 let exact_score_bytes = db
                     .vector_entry_count(&index, snapshot, vector_copy_owner)?
-                    .saturating_mul(std::mem::size_of::<(contextdb_core::RowId, f32)>());
+                    .saturating_mul(std::mem::size_of::<(contextdb_core::RowId, f64)>());
                 if contextdb_core::read_memory::ReadCredit::try_new(
                     read_memory.clone(),
                     exact_score_bytes,
@@ -22871,7 +22872,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
+    ) -> std::result::Result<Option<f64>, BoundedExecutionError> {
         self.store.bounded_score_committed_vector_row(
             index,
             row_id,

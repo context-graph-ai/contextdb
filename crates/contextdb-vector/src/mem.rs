@@ -348,30 +348,7 @@ impl SearchScores {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn charge(&mut self, bytes: usize) -> Result<()> {
-        self.credit
-            .budget
-            .try_allocate_for(
-                bytes,
-                "vector_search",
-                if self.exact_budget {
-                    "exact_scores"
-                } else {
-                    "merged_scores"
-                },
-                "Narrow the authorized scope or raise MEMORY_LIMIT.",
-            )
-            .map_err(|error| match error {
-                Error::MemoryBudgetExceeded {
-                    available_bytes, ..
-                } if self.exact_budget => Error::VectorExactSearchBudgetExceeded {
-                    index: self.index.clone(),
-                    required_bytes: bytes as u64,
-                    available_bytes: available_bytes as u64,
-                },
-                other => other,
-            })?;
-        self.credit.bytes += bytes;
-        Ok(())
+        charge_score_credit(&mut self.credit, &self.index, self.exact_budget, bytes)
     }
 
     #[expect(
@@ -448,13 +425,209 @@ impl IntoIterator for SearchScores {
     }
 }
 
-fn sort_vector_scores(rows: &mut [(RowId, f32)]) {
-    rows.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn charge_score_credit(
+    credit: &mut ScoreCredit,
+    index: &VectorIndexRef,
+    exact_budget: bool,
+    bytes: usize,
+) -> Result<()> {
+    credit
+        .budget
+        .try_allocate_for(
+            bytes,
+            "vector_search",
+            if exact_budget {
+                "exact_scores"
+            } else {
+                "merged_scores"
+            },
+            "Narrow the authorized scope or raise MEMORY_LIMIT.",
+        )
+        .map_err(|error| match error {
+            Error::MemoryBudgetExceeded {
+                available_bytes, ..
+            } if exact_budget => Error::VectorExactSearchBudgetExceeded {
+                index: index.clone(),
+                required_bytes: bytes as u64,
+                available_bytes: available_bytes as u64,
+            },
+            other => other,
+        })?;
+    credit.bytes += bytes;
+    Ok(())
 }
 
-fn vector_score_quality(left: &(RowId, f32), right: &(RowId, f32)) -> std::cmp::Ordering {
+/// Exact-route scores keyed by canonical similarity (higher is nearer), kept
+/// until every merge and LIMIT is final, then narrowed once into the public
+/// [`SearchScores`]. Capacity is admitted before allocation exactly as for
+/// [`SearchScores`]. It has no `Deref`, so no caller can reorder a row away
+/// from its key.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CanonicalScores {
+    // Field order is drop order: the rows are freed before their credit refunds.
+    rows: Vec<(RowId, f64)>,
+    index: VectorIndexRef,
+    credit: ScoreCredit,
+    exact_budget: bool,
+}
+
+impl CanonicalScores {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn new(
+        index: &VectorIndexRef,
+        budget: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+    ) -> Result<Self> {
+        let SearchScores {
+            rows: _,
+            index,
+            credit,
+            exact_budget,
+        } = SearchScores::new(index, budget)?;
+        Ok(Self {
+            rows: Vec::new(),
+            index,
+            credit,
+            exact_budget,
+        })
+    }
+
+    pub fn for_exact(mut self) -> Self {
+        self.exact_budget = true;
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The rows with their canonical keys, in their current order.
+    pub fn rows(&self) -> &[(RowId, f64)] {
+        &self.rows
+    }
+
+    /// Grow with the old and the new buffer both funded, as
+    /// [`SearchScores::reserve`] does; the old buffer is freed first.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        let wanted = self
+            .rows
+            .len()
+            .checked_add(additional)
+            .ok_or_else(|| Error::Other("vector score capacity overflow".into()))?;
+        if wanted <= self.rows.capacity() {
+            return Ok(());
+        }
+        let bytes = wanted
+            .checked_mul(std::mem::size_of::<(RowId, f64)>())
+            .ok_or_else(|| Error::Other("vector score capacity overflow".into()))?;
+        let mut replacement = Self::new(&self.index, self.credit.budget.clone())?;
+        replacement.exact_budget = self.exact_budget;
+        charge_score_credit(
+            &mut replacement.credit,
+            &replacement.index,
+            replacement.exact_budget,
+            bytes,
+        )?;
+        replacement
+            .rows
+            .try_reserve_exact(wanted)
+            .map_err(|_| Error::Other("vector score allocation failed".into()))?;
+        let actual = replacement.rows.capacity() * std::mem::size_of::<(RowId, f64)>();
+        if actual > bytes {
+            charge_score_credit(
+                &mut replacement.credit,
+                &replacement.index,
+                replacement.exact_budget,
+                actual - bytes,
+            )?;
+        }
+        replacement.rows.extend_from_slice(&self.rows);
+        let old = std::mem::replace(self, replacement);
+        drop(old);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn try_push(&mut self, row: (RowId, f64)) -> Result<()> {
+        self.reserve(1)?;
+        self.rows.push(row);
+        Ok(())
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.rows.truncate(len);
+    }
+
+    pub fn retain(&mut self, predicate: impl FnMut(&(RowId, f64)) -> bool) {
+        self.rows.retain(predicate);
+    }
+
+    /// Key descending, then row id ascending: the one exact answer order.
+    pub fn sort_canonical(&mut self) {
+        sort_vector_scores(&mut self.rows);
+    }
+
+    /// The public f32 scores in this order, each `key as f32`. The output is
+    /// admitted at its actual capacity while these rows are still alive and
+    /// charged; these rows are then freed before their charge is refunded. On
+    /// a refusal both buffers drop with their credits.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn narrow(self) -> Result<SearchScores> {
+        let mut narrowed = SearchScores::new(&self.index, self.credit.budget.clone())?;
+        narrowed.exact_budget = self.exact_budget;
+        narrowed.reserve(self.rows.len())?;
+        narrowed
+            .rows
+            .extend(self.rows.iter().map(|&(row_id, key)| (row_id, key as f32)));
+        drop(self);
+        Ok(narrowed)
+    }
+}
+
+/// A ranking score: the displayed f32 or the exact route's canonical f64 key.
+/// Higher is nearer; equal scores order by row id.
+trait RankScore: Copy {
+    fn rank_cmp(&self, other: &Self) -> std::cmp::Ordering;
+}
+impl RankScore for f32 {
+    fn rank_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.total_cmp(other)
+    }
+}
+impl RankScore for f64 {
+    fn rank_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.total_cmp(other)
+    }
+}
+
+fn sort_vector_scores<S: RankScore>(rows: &mut [(RowId, S)]) {
+    rows.sort_unstable_by(|a, b| b.1.rank_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
+fn vector_score_quality<S: RankScore>(left: &(RowId, S), right: &(RowId, S)) -> std::cmp::Ordering {
     left.1
-        .total_cmp(&right.1)
+        .rank_cmp(&right.1)
         .then_with(|| right.0.cmp(&left.0))
 }
 
@@ -462,7 +635,10 @@ fn vector_score_quality(left: &(RowId, f32), right: &(RowId, f32)) -> std::cmp::
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn push_bounded_score_heap(scores: &mut Vec<(RowId, f32)>, score: (RowId, f32)) -> Result<()> {
+fn push_bounded_score_heap<S: RankScore>(
+    scores: &mut Vec<(RowId, S)>,
+    score: (RowId, S),
+) -> Result<()> {
     scores.push(score);
     let mut child = scores.len().checked_sub(1).ok_or_else(|| {
         Error::Other(("bounded brute-force heap lost its inserted score".to_string()).into())
@@ -484,7 +660,10 @@ fn push_bounded_score_heap(scores: &mut Vec<(RowId, f32)>, score: (RowId, f32)) 
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn replace_bounded_score_heap_root(scores: &mut [(RowId, f32)], score: (RowId, f32)) -> Result<()> {
+fn replace_bounded_score_heap_root<S: RankScore>(
+    scores: &mut [(RowId, S)],
+    score: (RowId, S),
+) -> Result<()> {
     let Some(root) = scores.first_mut() else {
         return Err(Error::Other(
             ("bounded brute-force heap has no replacement root".to_string()).into(),
@@ -520,10 +699,10 @@ fn replace_bounded_score_heap_root(scores: &mut [(RowId, f32)], score: (RowId, f
 }
 
 #[allow(clippy::too_many_arguments)]
-fn merge_bounded_vector_score<E>(
-    scores: &mut Vec<(RowId, f32)>,
+fn merge_bounded_vector_score<E, S: RankScore>(
+    scores: &mut Vec<(RowId, S)>,
     retained_bytes: &mut usize,
-    candidate: (RowId, f32),
+    candidate: (RowId, S),
     k: usize,
     before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -746,9 +925,9 @@ impl OwnedVectorSearchTrace {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn brute_force(
+    fn brute_force<S>(
         index: &VectorIndexRef,
-        rows: &[(RowId, f32)],
+        rows: &[(RowId, S)],
         reason: &'static str,
         routes: Vec<VectorPartitionSearchTrace>,
         budget: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -768,9 +947,9 @@ impl OwnedVectorSearchTrace {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn brute_force_with_owner(
+    fn brute_force_with_owner<S>(
         index: &VectorIndexRef,
-        rows: &[(RowId, f32)],
+        rows: &[(RowId, S)],
         reason: &'static str,
         routes: Vec<VectorPartitionSearchTrace>,
         admission: crate::VectorCopyAdmission,
@@ -869,8 +1048,10 @@ pub struct BoundedBruteForceCursor {
     source_position: usize,
     position: usize,
     state_end: Option<usize>,
-    pending_score: Option<(RowId, f32)>,
-    scored: Vec<(RowId, f32)>,
+    /// Candidates and the retained heap carry the canonical ranking key; a
+    /// Row step displays `key as f32`.
+    pending_score: Option<(RowId, f64)>,
+    scored: Vec<(RowId, f64)>,
     output_position: usize,
     prepared: bool,
     retained_bytes: usize,
@@ -1248,6 +1429,20 @@ impl BoundedBruteForceCursor {
         self.prepared && self.output_position >= self.scored.len()
     }
 
+    /// The canonical ranking key of the Row step this cursor returned last:
+    /// the prepared element just before the output position. No rescoring and
+    /// no separate copy; `None` before the first Row step.
+    #[doc(hidden)]
+    pub fn last_row_canonical_score(&self) -> Option<f64> {
+        if !self.prepared {
+            return None;
+        }
+        self.output_position
+            .checked_sub(1)
+            .and_then(|at| self.scored.get(at))
+            .map(|&(_, key)| key)
+    }
+
     /// A committed image reads each stored body when the partition does not
     /// fit. A writable store does not: its exact search keeps the load.
     pub fn exact_comparison_streams_when_partition_does_not_fit(&self) -> bool {
@@ -1601,8 +1796,8 @@ where
     Ok(actual)
 }
 
-fn allocate_vector_row_ids<E>(
-    source: &[(RowId, f32)],
+fn allocate_vector_row_ids<E, S>(
+    source: &[(RowId, S)],
     operation: &str,
     before_work: &mut impl FnMut() -> std::result::Result<(), E>,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -2609,7 +2804,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     ("bounded vector output position overflow".to_string()).into(),
                 ))
             })?;
-            return Ok(BoundedVectorStep::Row(row_id, score));
+            return Ok(BoundedVectorStep::Row(row_id, score as f32));
         }
         // Exhaustive membership, authentication and body reads share the
         // same cache-growth allowance across every resumed step and partition.
@@ -3012,7 +3207,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     before_distance()?;
                     #[cfg(feature = "test-seams")]
                     observe_native_vector_score_for_test();
-                    Ok(Some((entry.row_id, entry.vector.cosine_similarity(query))))
+                    Ok(Some((entry.row_id, entry.vector.canonical_similarity(query))))
                 })?
         };
         cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
@@ -3248,14 +3443,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         snapshot: SnapshotId,
         stream_when_refused: bool,
         owner: &mut crate::VectorCopyAdmission,
-    ) -> Result<(SearchScores, usize)> {
-        let mut scored = SearchScores::new(index, owner.accountant().clone())?.for_exact();
+    ) -> Result<(CanonicalScores, usize)> {
+        let mut scored = CanonicalScores::new(index, owner.accountant().clone())?.for_exact();
         // Grow only for rows this pass actually authenticates. A historical
         // snapshot needs no preliminary membership-count pass.
         let capacity = k;
         // Evaluate every eligible vector, retaining only the requested best
         // scores. Ranking callers request their complete candidate set here.
-        let mut consider = |score: (RowId, f32)| -> Result<()> {
+        let mut consider = |score: (RowId, f64)| -> Result<()> {
             if capacity == 0 {
                 return Ok(());
             }
@@ -3271,7 +3466,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     scored.reserve(next_capacity - scored.len())?;
                 }
                 push_bounded_score_heap(&mut scored.rows, score)?;
-            } else if vector_score_quality(&score, &scored[0]) == std::cmp::Ordering::Greater {
+            } else if vector_score_quality(&score, &scored.rows[0]) == std::cmp::Ordering::Greater {
                 replace_bounded_score_heap_root(&mut scored.rows, score)?;
             }
             Ok(())
@@ -3371,13 +3566,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     }
                     #[cfg(feature = "test-seams")]
                     observe_native_vector_score_for_test();
-                    source_consider((entry.row_id, entry.vector.cosine_similarity(query)))?;
+                    source_consider((entry.row_id, entry.vector.canonical_similarity(query)))?;
                 }
                 Ok::<(), Error>(())
             })?;
             partition_count += usize::from(source_has_rows);
         }
-        sort_vector_scores(&mut scored);
+        scored.sort_canonical();
         scored.truncate(k);
         Ok((scored, partition_count))
     }
@@ -3398,7 +3593,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         query: &[f32],
         snapshot: SnapshotId,
         candidates: Option<&RoaringTreemap>,
-        consider: &mut impl FnMut((RowId, f32)) -> Result<()>,
+        consider: &mut impl FnMut((RowId, f64)) -> Result<()>,
         owner: &mut crate::VectorCopyAdmission,
     ) -> Result<()> {
         let accountant = owner.accountant().clone();
@@ -3715,6 +3910,36 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         mode: contextdb_core::VectorSearchMode,
         executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let (scores, trace) = self.search_with_mode_owned_canonical(
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            mode,
+            executing_owner,
+        )?;
+        Ok((scores.narrow()?, trace))
+    }
+
+    /// [`Self::search_with_mode_owned`] keeping the exact route's canonical
+    /// keys, for callers that merge or limit the answer further.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)] // The same input list as search_with_mode_owned.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn search_with_mode_owned_canonical(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+        mode: contextdb_core::VectorSearchMode,
+        executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+    ) -> Result<(CanonicalScores, OwnedVectorSearchTrace)> {
         let executing_owner: crate::memory_budget::MemoryBudgetOwner = executing_owner.into();
 
         let route_owner = crate::VectorCopyAdmission::new(executing_owner.clone());
@@ -3744,6 +3969,27 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         snapshot_mode: (SnapshotId, contextdb_core::VectorSearchMode),
         owner: &mut crate::VectorCopyAdmission,
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+        let (scores, trace) =
+            self.search_with_mode_admission_canonical(index, query, k, candidates, snapshot_mode, owner)?;
+        Ok((scores.narrow()?, trace))
+    }
+
+    /// [`Self::search_with_mode_admission`] keeping the exact route's
+    /// canonical keys, for callers that merge or limit the answer further.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn search_with_mode_admission_canonical(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot_mode: (SnapshotId, contextdb_core::VectorSearchMode),
+        owner: &mut crate::VectorCopyAdmission,
+    ) -> Result<(CanonicalScores, OwnedVectorSearchTrace)> {
         self.search_with_mode_route(
             index,
             query,
@@ -3769,14 +4015,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             crate::memory_budget::MemoryBudgetOwner,
             crate::VectorCopyAdmission,
         ),
-    ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+    ) -> Result<(CanonicalScores, OwnedVectorSearchTrace)> {
         let (snapshot, mode) = snapshot_mode;
         let (executing_owner, mut route_owner) = owners;
         self.store.with_bulk_read(|| {
             if k == 0 {
                 return Ok((
-                    SearchScores::new(&index, executing_owner.clone())?,
-                    OwnedVectorSearchTrace::brute_force(
+                    CanonicalScores::new(&index, executing_owner.clone())?,
+                    OwnedVectorSearchTrace::brute_force::<f64>(
                         &index,
                         &[],
                         "empty_limit",
@@ -3795,8 +4041,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
             if candidates.is_some_and(|candidates| candidates.is_empty()) {
                 return Ok((
-                    SearchScores::new(&index, executing_owner.clone())?,
-                    OwnedVectorSearchTrace::brute_force(
+                    CanonicalScores::new(&index, executing_owner.clone())?,
+                    OwnedVectorSearchTrace::brute_force::<f64>(
                         &index,
                         &[],
                         "empty_candidates",
@@ -3820,8 +4066,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             )?;
             if sources.is_empty() {
                 return Ok((
-                    SearchScores::new(&index, executing_owner.clone())?,
-                    OwnedVectorSearchTrace::brute_force(
+                    CanonicalScores::new(&index, executing_owner.clone())?,
+                    OwnedVectorSearchTrace::brute_force::<f64>(
                         &index,
                         &[],
                         "empty_index",
@@ -3832,7 +4078,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
             let exact = |reason: &'static str,
                          owner: &mut crate::VectorCopyAdmission|
-             -> Result<(SearchScores, OwnedVectorSearchTrace)> {
+             -> Result<(CanonicalScores, OwnedVectorSearchTrace)> {
                 // Durable EXACT and exhaustive AUTO share the authenticated
                 // membership/body stream; resident loader policy is preserved.
                 let (rows, partition_count) = self.brute_force_search_sources(
@@ -3861,7 +4107,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 ];
                 let trace = OwnedVectorSearchTrace::brute_force_with_owner(
                     &index,
-                    &rows,
+                    rows.rows(),
                     reason,
                     partition_routes,
                     trace_owner,

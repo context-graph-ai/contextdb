@@ -200,7 +200,7 @@ use contextdb_vector::{
     MemVectorExecutor, PartitionedVectorEntry, PreparedVectorPublication, VectorIndexLayout,
     VectorMaintenanceFailure, VectorMaintenanceFailureDetails, VectorMaintenanceReport,
     VectorPartitionSearchRoute, VectorPartitionSearchTrace, VectorSearchDebugTrace, VectorStore,
-    VectorVersionIdentity, cosine_similarity,
+    VectorVersionIdentity,
 };
 #[cfg(any(test, feature = "test-seams"))]
 use contextdb_vector::{
