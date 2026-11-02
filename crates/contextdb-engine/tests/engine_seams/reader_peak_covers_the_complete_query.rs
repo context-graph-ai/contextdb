@@ -6,6 +6,7 @@ use contextdb_core::{Value, Wallclock};
 use std::collections::HashMap;
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn first_saved_search_reader_bytes_fit_the_fixed_32_record_window() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();

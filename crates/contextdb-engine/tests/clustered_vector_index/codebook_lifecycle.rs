@@ -151,6 +151,7 @@ fn assert_every_run_on_the_serving_codebook(db: &Database, stage: &str) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn writes_before_the_first_codebook_stay_exactly_searchable_and_the_first_publication_assigns_them()
 {
     let root = tempfile::tempdir().expect("temporary store directory");
@@ -263,6 +264,7 @@ fn seal_runs_while_a_replacement_trains(db: &Database) -> (u64, u64) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn runs_sealed_while_a_replacement_trains_stay_served_and_are_remapped_in_bounded_resumable_batches()
  {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
@@ -414,6 +416,7 @@ fn run_child(path: &Path, selected: &str) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_crash_immediately_before_or_after_the_codebook_switch_leaves_every_row_served() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     if let Some(path) = std::env::var_os(CHILD_PATH) {

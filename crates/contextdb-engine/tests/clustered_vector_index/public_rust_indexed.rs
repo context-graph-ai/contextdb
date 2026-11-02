@@ -11,6 +11,7 @@ use std::sync::{
 };
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn ready_file_index_serves_fresh_public_rust_indexed_search_without_building() {
     const ROWS: usize = 64;
     const DIM: usize = 8;

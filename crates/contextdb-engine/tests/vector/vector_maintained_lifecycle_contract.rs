@@ -205,6 +205,7 @@ fn record_contract(failures: &mut Vec<String>, holds: bool, message: impl Into<S
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader() {
     let root = TempDir::new().expect("durable vector fixture directory");
     let path = root.path().join("maintained-vectors.redb");

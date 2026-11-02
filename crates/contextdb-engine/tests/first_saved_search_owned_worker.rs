@@ -118,6 +118,7 @@ fn child(path: &Path) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn first_saved_search_scores_on_the_owned_worker_in_one_identity_namespace() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     if let Some(path) = std::env::var_os(CHILD_STORE) {

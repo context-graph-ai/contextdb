@@ -256,6 +256,7 @@ impl NativeIvfSealObserver for SearchEvaluations {
 /// answer is a full page or a typed refusal.
 #[cfg(unix)]
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

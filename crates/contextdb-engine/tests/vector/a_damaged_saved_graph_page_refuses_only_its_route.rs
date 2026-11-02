@@ -192,6 +192,7 @@ fn bravo_answers(reader: &ReadSession, what: &str) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn every_kind_of_page_damage_refuses_only_the_damaged_route() {
     for fault in [IndexPageFault::FlipCodebook, IndexPageFault::RemoveListPage] {
         let root = TempDir::new().expect("temporary durable store directory");

@@ -64,6 +64,7 @@ fn alter(db: &Database, sql: &str) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_training_seed_is_declared_persisted_and_inspected() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join("seeded.db");

@@ -545,6 +545,7 @@ fn a_refused_explain_admission_leaves_no_charge_and_no_partial_prediction() {
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn indexed_refuses_a_whole_scope_whose_index_partition_is_unavailable_beside_a_built_one() {
     let db = Database::open_memory();
     fixture(&db, &[120, 400]);

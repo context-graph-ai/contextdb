@@ -277,6 +277,7 @@ fn assert_indexed_answers(edge: &Database, why: &str) {
 }
 
 #[tokio::test]
+#[ignore = "index deferred to the follow-on plan"]
 async fn a_synced_search_mode_change_keeps_indexed_answering_without_maintenance() {
     let synced = Synced::start().await;
     synced
@@ -295,6 +296,7 @@ async fn a_synced_search_mode_change_keeps_indexed_answering_without_maintenance
 }
 
 #[tokio::test]
+#[ignore = "index deferred to the follow-on plan"]
 async fn a_synced_auto_index_at_change_keeps_indexed_answering_without_maintenance() {
     let synced = Synced::start().await;
     synced
@@ -318,6 +320,7 @@ async fn a_synced_auto_index_at_change_keeps_indexed_answering_without_maintenan
 /// serving without maintenance, and a snapshot taken before the update still
 /// sees the old vector.
 #[tokio::test]
+#[ignore = "index deferred to the follow-on plan"]
 async fn a_vector_update_after_a_synced_policy_change_keeps_the_other_partitions_graph() {
     for alter in [
         "ALTER TABLE policy_items ALTER COLUMN embedding SET SEARCH_MODE AUTO",

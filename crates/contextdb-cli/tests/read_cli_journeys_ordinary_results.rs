@@ -575,6 +575,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
     let store = auto_vector_store(1_024);
     let query = "SELECT id FROM vector_budget_docs \
@@ -808,6 +809,7 @@ fn open_counting_page_read_attempts(
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_route() {
     let store = auto_vector_store(1_024);
     let indexed = "SELECT id FROM vector_budget_docs \

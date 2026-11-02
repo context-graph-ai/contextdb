@@ -1266,6 +1266,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "index deferred to the follow-on plan"]
     fn maintenance_json_retains_the_failed_budget_and_real_recovery_command() {
         let directory = tempfile::tempdir().unwrap();
         // A durable store's writer needs headroom of its own to run a cycle at

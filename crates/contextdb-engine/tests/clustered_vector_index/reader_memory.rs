@@ -117,6 +117,7 @@ fn all_contexts_bound() -> HashMap<String, Value> {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn index_metadata_is_charged_whole_and_released_while_the_answer_keeps_its_own_funding() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = store(&root.path().join("charged.db"));
@@ -200,6 +201,7 @@ fn index_metadata_is_charged_whole_and_released_while_the_answer_keeps_its_own_f
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_reader_smaller_than_one_list_page_is_refused_with_the_typed_reader_refusal() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = store(&root.path().join("tight.db"));

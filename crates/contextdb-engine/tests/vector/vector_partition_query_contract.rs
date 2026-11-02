@@ -822,9 +822,23 @@ fn use_vector_exact_parses_between_vector_ordering_and_limit() {
 
 #[test]
 fn use_vector_indexed_parses_between_vector_ordering_and_limit() {
-    assert_empty_mode_query(
-        "SELECT id FROM mode_docs \
-         ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+    // INDEXED still parses; this release refuses it by name, before the empty
+    // table could answer.
+    let database = empty_mode_fixture();
+    let refusal = database
+        .execute(
+            "SELECT id FROM mode_docs \
+             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+            &params([("query", Value::Vector(query_vector()))]),
+        )
+        .expect_err("the query-level vector mode parses and is refused");
+    assert!(matches!(
+        refusal,
+        Error::VectorIndexedRouteUnavailable { .. }
+    ));
+    assert_eq!(
+        refusal.to_string(),
+        "no vector index ships in this release; use EXACT or AUTO"
     );
 }
 
@@ -2104,6 +2118,7 @@ mod restricted_access_scan_accounting {
     }
 
     #[test]
+    #[ignore = "index deferred to the follow-on plan"]
     fn restricted_rust_indexed_without_predicate_refuses_before_sources_and_recovers() {
         let fixture = secure_fixture_hidden_by("VECTOR(2)", HiddenBy::Context);
         let scoped = fixture.scoped();
@@ -2162,6 +2177,7 @@ mod restricted_access_scan_accounting {
     /// proves the aligned-answers arm; this proves the opposite starting
     /// point.
     #[test]
+    #[ignore = "index deferred to the follow-on plan"]
     fn indexed_refuses_naming_the_restriction_column_then_recovers_via_index() {
         let fixture = secure_fixture_hidden_by("VECTOR(2)", HiddenBy::Context);
         let scoped = fixture.scoped();
@@ -2220,7 +2236,7 @@ fn residual_acl_without_an_index_refuses_before_selected_partition_enumeration()
     let sql = fixture.sql();
     assert!(matches!(
         scoped.execute(sql, &fixture.query_params()),
-        Err(Error::VectorFilteredRouteUnavailable { .. })
+        Err(Error::VectorIndexedRouteUnavailable { .. })
     ));
     let mut query = SemanticQuery::new("hidden_row_docs", "embedding", query_vector(), 1);
     query.search_mode = Some(VectorSearchMode::Indexed);
@@ -2230,7 +2246,7 @@ fn residual_acl_without_an_index_refuses_before_selected_partition_enumeration()
     ));
     assert!(matches!(
         scoped.semantic_search(query),
-        Err(Error::VectorFilteredRouteUnavailable { .. })
+        Err(Error::VectorIndexedRouteUnavailable { .. })
     ));
     use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
     use contextdb_engine::executor::bounded_read_test_support as bounded;

@@ -668,6 +668,7 @@ fn semantic_headers_cover_contiguous_padded_sparse_and_retained_record_boundarie
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn two_native_kernel_commits_seal_in_one_atomic_authoritative_sql_commit() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -727,6 +728,7 @@ fn two_native_kernel_commits_seal_in_one_atomic_authoritative_sql_commit() {
     assert_eq!(count(&db, "items"), 66);
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn every_fallible_native_seal_boundary_aborts_rows_roots_and_original_owner_scratch() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for point in [
@@ -792,6 +794,7 @@ fn checked_source(db: &Database, snapshot: contextdb_core::SnapshotId) -> ([u8; 
     (digest, entries, live)
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn captured_native_roots_keep_frozen_basis_separate_from_actual_delta_coverage_and_read_snapshot() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -864,6 +867,7 @@ fn captured_native_roots_keep_frozen_basis_separate_from_actual_delta_coverage_a
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn real_one_list_page_489_search_loads_the_link_used_and_list_boundaries() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -911,6 +915,7 @@ fn real_one_list_page_489_search_loads_the_link_used_and_list_boundaries() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn actual_page_identity_damage_refuses_indexed_before_scoring_and_auto_uses_canonical_source() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for payload in [false, true] {
@@ -970,6 +975,7 @@ fn actual_page_identity_damage_refuses_indexed_before_scoring_and_auto_uses_cano
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn equal_schema_counters_on_different_index_names_never_share_native_authority() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();

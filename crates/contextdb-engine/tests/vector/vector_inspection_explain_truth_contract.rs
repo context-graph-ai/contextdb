@@ -517,6 +517,7 @@ fn assert_ready_layer_facts(explain: &str) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts() {
     let (db, source_id) = fixture();
     // Declared before the first build: one append stays below the 100% change
@@ -865,6 +866,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residency_once() {
     let root = TempDir::new().expect("temporary durable inspection store");
     let path = root.path().join("vector-inspection-durable.redb");
@@ -1208,6 +1210,7 @@ fn active_inspection_reports_one_atomic_progress_snapshot_without_advancing_it()
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_build() {
     let (db, _) = fixture();
     drive_to_ready(&db);
@@ -1267,6 +1270,7 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn the_same_pending_partition_reports_the_owner_of_maintenance_on_both_show_surfaces() {
     let (db, _) = fixture();
     let caller_partitions = show_partitions(&db);

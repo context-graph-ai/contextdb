@@ -448,6 +448,7 @@ impl Drop for RouteOutputHookScopeForTest {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_route_output_refusal_releases_partial_output_preserves_serving_and_closes() {
     if crate::test_process::rerun_alone(
         module_path!(),
@@ -816,6 +817,7 @@ fn native_non_route_values_are_not_read_while_healthy_routes_keep_serving() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn public_cycle_small_unknown_invalid_catalog_does_not_quarantine() {
     public_small_unknown_invalid_native();
 }

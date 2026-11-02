@@ -185,11 +185,13 @@ fn search_cancelled_at(target: IndexCancelPoint) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_search_cancelled_while_paging_lists_returns_the_typed_cancellation() {
     search_cancelled_at(IndexCancelPoint::ListPageRead);
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_search_cancelled_while_scoring_candidates_returns_the_typed_cancellation() {
     search_cancelled_at(IndexCancelPoint::CandidateScoring);
 }
@@ -224,6 +226,7 @@ fn cancel_maintenance_at(db: &Database, target: IndexCancelPoint, batch: usize) 
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_maintenance_cycle_cancelled_inside_a_build_batch_returns_the_typed_cancellation() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join("cancelled-build.db");
@@ -260,6 +263,7 @@ fn a_maintenance_cycle_cancelled_inside_a_build_batch_returns_the_typed_cancella
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_maintenance_cycle_cancelled_inside_a_reclaim_batch_returns_the_typed_cancellation() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join("cancelled-reclaim.db");

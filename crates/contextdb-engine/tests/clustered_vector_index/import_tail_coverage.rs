@@ -166,6 +166,7 @@ fn committed_vectors_are_not_covered_until_the_index_is_published() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn maintenance_to_completion_covers_every_committed_vector() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open(&root.path().join("complete.db"));
@@ -180,6 +181,7 @@ fn maintenance_to_completion_covers_every_committed_vector() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn new_committed_work_is_covered_again_after_one_more_maintenance_run_and_the_call_builds_nothing()
 {
     let root = tempfile::tempdir().expect("temporary store directory");
@@ -208,6 +210,7 @@ fn new_committed_work_is_covered_again_after_one_more_maintenance_run_and_the_ca
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn the_consumer_loop_finishes_in_finitely_many_cycles_and_is_idle_once_covered() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open(&root.path().join("consumer.db"));
@@ -274,6 +277,7 @@ fn retention_of_a_replaced_passage_keeps_maintenance_search_and_the_next_commit(
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn the_consumer_loop_covers_a_replaced_passage_after_retention() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_current_only(&root.path().join("consumer-replaced.db"));
@@ -294,6 +298,7 @@ fn the_consumer_loop_covers_a_replaced_passage_after_retention() {
 /// that build is unfinished. Publication then checks the build's change count
 /// against the source, so it fails if cleanup left the count behind.
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn retention_during_an_unfinished_build_keeps_its_change_count() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_current_only(&root.path().join("unfinished.db"));
@@ -364,6 +369,7 @@ fn maintaining_an_empty_declared_index_is_not_refused_under_a_memory_limit() {
 /// searchable as old runs of a zero-list generation. Those runs must drain in
 /// bounded remap batches so the next build can start, including across a reopen.
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn rows_arriving_during_an_empty_first_build_reach_a_published_index_in_finite_cycles() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join("late-arrivals.db");

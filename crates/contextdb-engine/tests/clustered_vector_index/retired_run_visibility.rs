@@ -123,6 +123,7 @@ fn cycle(db: &Database) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_change_to_a_row_in_a_retired_legacy_run_keeps_old_pages_until_state_c() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join("retired.db");

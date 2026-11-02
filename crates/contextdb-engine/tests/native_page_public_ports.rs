@@ -155,6 +155,7 @@ fn ring_capacity() -> usize {
         .unwrap()
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn owned_page_rejection_and_shared_page_retirement_preserve_physical_custody() {
     let root = tempfile::tempdir().unwrap();
     let observer = Arc::new(Observer::default());
@@ -507,6 +508,7 @@ fn cold_case(route: Route, phase: SetupPhase, fault: Fault) -> (bool, Vec<String
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_failed_page_read_leaves_nothing_resident() {
     let mut failures = Vec::new();
     for route in ROUTES {
@@ -525,6 +527,7 @@ fn a_failed_page_read_leaves_nothing_resident() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn persistent_native_cold_damage_is_typed_on_every_public_query_without_rebuild() {
     let mut failures = Vec::new();
     for route in ROUTES {
@@ -543,6 +546,7 @@ fn persistent_native_cold_damage_is_typed_on_every_public_query_without_rebuild(
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn persistent_native_unexpected_eof_is_typed_on_every_public_query_without_rebuild() {
     let mut failures = Vec::new();
     for route in ROUTES {

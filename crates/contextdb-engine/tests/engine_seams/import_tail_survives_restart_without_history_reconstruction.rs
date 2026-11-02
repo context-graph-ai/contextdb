@@ -85,6 +85,7 @@ fn run(history: usize) -> usize {
     count.load(Ordering::SeqCst)
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn cold_import_tail_reconstruction_does_not_examine_n_or_four_n_history() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let work = [64, 256].map(run);
@@ -357,6 +358,7 @@ fn native_tail_crash_recovers_a_complete_catalog_and_graph_at_both_commit_bounda
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_tail_purge_erases_selected_points_and_preserves_survivor_search_after_restart() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -381,6 +383,7 @@ fn native_tail_purge_erases_selected_points_and_preserves_survivor_search_after_
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_tail_reopens_and_appends_inside_one_fixed_writer_budget() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let ownership = [64, 256].map(|history| {
@@ -410,6 +413,7 @@ fn native_tail_reopens_and_appends_inside_one_fixed_writer_budget() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_tail_publications_preserve_an_existing_transaction_snapshot() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();

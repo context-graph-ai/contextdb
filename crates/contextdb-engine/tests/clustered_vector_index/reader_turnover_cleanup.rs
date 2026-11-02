@@ -26,6 +26,7 @@ fn old_list_entries(db: &Database, generation: u64) -> usize {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn obsolete_current_tree_entries_are_removed_while_finite_readers_overlap() {
     let directory = tempfile::tempdir().unwrap();
     let db = open_caller_driven(&directory.path().join("turnover.db"));

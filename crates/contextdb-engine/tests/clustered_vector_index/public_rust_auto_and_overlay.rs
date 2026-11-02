@@ -132,6 +132,7 @@ fn without_build_writes<T>(operation: impl FnOnce() -> T) -> T {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn ready_file_auto_semantic_search_executes_the_native_route_reported_by_explain() {
     let root = tempfile::tempdir().unwrap();
     let db = ready_file(&root.path().join("automatic.db"), true);
@@ -242,6 +243,7 @@ fn overlay() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn ready_file_indexed_transaction_overlay_preserves_staged_rows_and_native_committed_search() {
     overlay();
 }

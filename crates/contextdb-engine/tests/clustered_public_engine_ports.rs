@@ -99,6 +99,7 @@ fn fixture(db: &Database, d: usize, n: usize) {
     ready(db);
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_page_read_does_not_stop_another_search_over_the_same_generation() {
     let root = tempfile::tempdir().unwrap();
     let db = Arc::new(open(&root.path().join("concurrent.db")));
@@ -128,6 +129,7 @@ fn a_page_read_does_not_stop_another_search_over_the_same_generation() {
     assert_eq!(resumed, alone);
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_parked_walk_and_the_insertions_beside_it_all_finish() {
     let root = tempfile::tempdir().unwrap();
     let db = Arc::new(open(&root.path().join("insertion.db")));
@@ -159,6 +161,7 @@ fn a_parked_walk_and_the_insertions_beside_it_all_finish() {
     assert_eq!(count.rows()[0][0], Value::Int64(152));
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn one_buffer_generation_preserves_canonical_bytes_for_every_encoding() {
     for encoding in ["F32", "SQ8", "SQ4"] {
         let root = tempfile::tempdir().unwrap();
@@ -202,6 +205,7 @@ fn one_buffer_generation_preserves_canonical_bytes_for_every_encoding() {
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn durable_generation_refuses_corruption_and_incompatible_column_definition() {
     let root = tempfile::tempdir().unwrap();
     let db = open(&root.path().join("corruption.db"));
@@ -237,6 +241,7 @@ fn durable_generation_refuses_corruption_and_incompatible_column_definition() {
     assert!(wrong.is_err(), "incompatible dimension must refuse");
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn mutable_quantized_canonical_insertion_without_rebuilding() {
     for quantization in ["SQ8", "SQ4"] {
         let root = tempfile::tempdir().unwrap();

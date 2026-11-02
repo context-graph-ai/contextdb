@@ -107,6 +107,7 @@ fn context(ordinal: u128) -> Uuid {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn exact_rescores_every_allowed_vector_and_indexed_does_strictly_less_work() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("work.db"));

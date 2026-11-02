@@ -45,6 +45,7 @@ fn indexed_and_exact(
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn default_probes_keep_probing_until_k_eligible_candidates_are_found() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("small.db"));
@@ -111,6 +112,7 @@ fn default_probes_keep_probing_until_k_eligible_candidates_are_found() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn explicit_indexed_on_a_150_row_partition_is_served_complete_from_its_generation() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("partition.db"));

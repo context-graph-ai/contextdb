@@ -70,6 +70,7 @@ fn work(db: &Database) -> BuildWork {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn rebuilding_from_the_same_rows_under_one_training_seed_gives_the_same_index_and_answers() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let mut codebooks = Vec::new();
@@ -112,6 +113,7 @@ fn rebuilding_from_the_same_rows_under_one_training_seed_gives_the_same_index_an
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_build_does_deterministic_work_bounded_by_its_declared_numbers() {
     let root = tempfile::tempdir().expect("temporary store directory");
     for rows in [2_000_i64, 4_000] {

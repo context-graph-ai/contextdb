@@ -38,6 +38,7 @@ fn append(db: &Database, id: i64) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn ordinary_import_persistence_advances_durable_coverage_without_an_observer() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();

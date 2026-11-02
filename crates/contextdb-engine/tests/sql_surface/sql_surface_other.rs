@@ -10479,7 +10479,7 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         covering_explain.contains("VectorSearch")
             && covering_explain.contains("strategy=BruteForce")
             && covering_explain.contains("route=exact")
-            && covering_explain.contains("fallback=filtered_route_exact"),
+            && covering_explain.contains("fallback=no vector index ships in this release; AUTO_INDEX_AT and CALIBRATION_SAMPLES have no effect"),
         "filtered EXPLAIN must describe the read-only exact fallback without inventing an index: {covering_explain}"
     );
     assert!(
@@ -10568,8 +10568,9 @@ fn prv_28b_filtered_indexed_explain_names_specific_or_generic_recovery() {
         )
         .unwrap();
     assert!(
-        simple.contains("recovery=CREATE INDEX docs_label_idx ON docs (label)"),
-        "a simple filtered scan must retain its directly executable CREATE INDEX recovery: {simple}"
+        simple.contains("refusal=indexed_route_unavailable")
+            && simple.contains("recovery=no vector index ships in this release; use EXACT or AUTO"),
+        "a filtered INDEXED explain reports the release refusal before any filter recovery: {simple}"
     );
 
     let compound = db
@@ -10581,11 +10582,10 @@ fn prv_28b_filtered_indexed_explain_names_specific_or_generic_recovery() {
         ))
         .unwrap();
     assert!(
-        compound.contains("refusal=filtered_route_unavailable")
-            && compound.contains(
-                "recovery=use EXACT or rewrite the filter with a supporting relational index"
-            ),
-        "a compound filtered plan with no derivable index must name the exact-or-rewrite recovery: {compound}"
+        compound.contains("refusal=indexed_route_unavailable")
+            && compound
+                .contains("recovery=no vector index ships in this release; use EXACT or AUTO"),
+        "a compound filtered INDEXED explain reports the release refusal before any filter recovery: {compound}"
     );
     assert!(
         !compound.contains("recovery=none"),

@@ -104,6 +104,7 @@ fn assert_uncovered(db: &Database, limit: usize, why: &str) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn only_calibrated_depths_are_covered_each_by_its_own_run() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("coverage.db"));
@@ -306,6 +307,7 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn auto_takes_the_index_on_a_qualified_partition() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("qualified.db"));
@@ -460,6 +462,7 @@ fn codes(db: &Database, vector: &[f32]) -> Vec<i32> {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
     let root = tempfile::tempdir().expect("temporary store directory");
 

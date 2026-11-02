@@ -117,6 +117,7 @@ fn count(db: &Database) -> i64 {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -141,6 +142,7 @@ fn one_committed_lsn_larger_than_the_cohort_share_is_absorbed_without_raising_th
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_pinned_reader_keeps_its_answer_while_the_large_commit_is_rebuilt_and_published() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();

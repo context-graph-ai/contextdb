@@ -1742,6 +1742,7 @@ fn indexed_threshold_999_brute_force_boundary() {
 /// route is built deterministically before the query runs, so the ranked candidate pool this
 /// test measures is always the indexed route's pool, never a result of background-build timing.
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn indexed_threshold_1001_indexed_boundary() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);

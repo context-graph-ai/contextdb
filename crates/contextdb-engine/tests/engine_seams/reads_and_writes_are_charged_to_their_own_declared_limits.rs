@@ -139,6 +139,7 @@ fn reads_decode_only_under_the_declared_reader_never_the_writer() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn import_writes_decode_only_under_the_declared_writer_never_the_reader() {
     let root = tempfile::tempdir().unwrap();
     let db = store(&root.path().join("writes.db"), 64 * 1024 * 1024, 1 << 30);

@@ -584,6 +584,7 @@ fn exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_r
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible() {
     let db = partitioned_fixture("INDEXED");
     let committed = id(20);

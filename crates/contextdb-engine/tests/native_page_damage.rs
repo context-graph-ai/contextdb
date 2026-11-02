@@ -7,6 +7,7 @@ const fn build_cycle_bound(rows: usize, batch: usize, training: usize) -> usize 
     rows.div_ceil(batch) * (training + 3) + rows + 3
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn actual_page_header_and_payload_damage_refuse_indexed_and_leave_canonical_exact_usable() {
     for payload in [false, true] {
         let root = tempfile::tempdir().unwrap();
@@ -93,6 +94,7 @@ fn actual_page_header_and_payload_damage_refuse_indexed_and_leave_canonical_exac
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_frozen_source_range_excludes_later_appends_and_preparation_is_counted_once_durably() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("replacement.db");
@@ -223,11 +225,13 @@ fn a_frozen_source_range_excludes_later_appends_and_preparation_is_counted_once_
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_retained_codebook_is_lazy_after_reopen_and_released_by_the_real_retirement_commit() {
     retained_codebook_lifecycle(false);
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn dropping_a_state_b_table_releases_its_actual_retained_codebook_before_close() {
     retained_codebook_lifecycle(true);
 }

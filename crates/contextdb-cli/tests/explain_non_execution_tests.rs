@@ -261,7 +261,7 @@ fn vector_select_and_with_explain_publish_passive_route_facts_even_when_indexed_
         "aggregate_allowed_vectors=1",
         "route=indexed",
         "refusal=indexed_route_unavailable",
-        "recovery=run vector maintenance and retry",
+        "recovery=no vector index ships in this release; use EXACT or AUTO",
         "tail=present",
         "partition=<redacted:1>",
         "policy_revision=",
@@ -299,6 +299,9 @@ fn trace_on_publishes_the_vector_route_that_actually_executed() {
     assert_eq!(vector["resolved_mode"], "EXACT");
     assert_eq!(vector["aggregate_allowed_vectors"], 1);
     assert_eq!(vector["route"], "exact");
-    assert_eq!(vector["fallback"], "clustered_exact");
+    assert_eq!(
+        vector["fallback"],
+        "no vector index ships in this release; AUTO_INDEX_AT and CALIBRATION_SAMPLES have no effect"
+    );
     assert!(trace["rows_examined"].as_u64().is_some());
 }

@@ -29,6 +29,7 @@ fn context(ordinal: u128) -> Uuid {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn explicit_probes_and_refine_factor_bound_list_pages_and_rescores_exactly() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("breadth.db"));

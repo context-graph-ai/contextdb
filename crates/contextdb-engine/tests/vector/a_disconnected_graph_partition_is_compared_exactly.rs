@@ -116,6 +116,7 @@ fn ids(result: &QueryResult) -> Vec<Value> {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn deleted_history_does_not_move_a_connected_partition_off_its_graph() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);

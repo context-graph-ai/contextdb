@@ -60,6 +60,7 @@ fn routes(
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_calibration_source_change_marks_requalification_pending_without_flipping_the_route() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("sourced.db"));
@@ -168,6 +169,7 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn fifty_source_questions_use_stored_vectors_under_the_default_two_hundred_sample_threshold() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("sourced-default.db"));

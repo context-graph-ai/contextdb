@@ -190,6 +190,7 @@ fn assert_partial_answers(ids: Vec<i64>, winner: i64) {
     assert!(distinct.contains(&51) && distinct.contains(&53));
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn mutations_before_initial_maintenance_do_not_resurrect_rows_when_native_build_finishes() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -304,6 +305,7 @@ fn mutations_before_initial_maintenance_do_not_resurrect_rows_when_native_build_
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn initialized_live_and_preingest_tombstone_journals_refuse_stale_row_identity() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -365,6 +367,7 @@ fn initialized_live_and_preingest_tombstone_journals_refuse_stale_row_identity()
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn failure_after_source_and_preingest_journal_staging_rolls_back_both() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -418,6 +421,7 @@ fn failure_after_source_and_preingest_journal_staging_rolls_back_both() {
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_indexed_file_search_survives_restart_replacement_and_erasure() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();
@@ -703,6 +707,7 @@ fn native_indexed_file_search_survives_restart_replacement_and_erasure() {
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn first_saved_search_loads_compact_serving_descriptor_as_real_manifest_source() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().unwrap();

@@ -61,6 +61,7 @@ fn assert_exact_serves(db: &Database, ids: impl IntoIterator<Item = i64>, why: &
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn damaged_index_pages_refuse_indexed_and_never_stop_writes() {
     for damage in [
         IndexDamage::CodebookDigest,
@@ -177,6 +178,7 @@ fn damaged_index_pages_refuse_indexed_and_never_stop_writes() {
 /// repaired by the worker itself: the caller never runs a maintenance cycle,
 /// each wake runs on the worker thread, and INDEXED serves again afterwards.
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn an_engine_owned_worker_repairs_a_damaged_index_without_a_caller_cycle() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_with_index_test_options(&root.path().join("owned.db"), OPTIONS);

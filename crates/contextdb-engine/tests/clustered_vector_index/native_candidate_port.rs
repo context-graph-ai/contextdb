@@ -69,6 +69,7 @@ fn exact(db: &Database, k: usize) -> QueryResult {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_indexed_residual_selects_eligible_nearest_rows_before_limit() {
     let root = tempfile::tempdir().unwrap();
     let db = open_caller_driven(&root.path().join("eligible.db"));
@@ -144,6 +145,7 @@ fn native_exact_formula_uses_transaction_join_overlay_without_publishing_it() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_pinned_residual_uses_captured_rows_after_a_predicate_change() {
     let root = tempfile::tempdir().unwrap();
     let db = open_caller_driven(&root.path().join("predicate-snapshot.db"));

@@ -4,6 +4,7 @@ use super::*;
 /// complete operation holder; neither can reuse the other holder's credit.
 #[cfg(all(feature = "test-seams", target_pointer_width = "64"))]
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn native_durable_generation_build_and_seal_workspaces_keep_separate_original_invoices() {
     use crate::vector_ivf_observations::{
         NativeIvfDriveCallbacks, NativeIvfFaultBoundary, NativeIvfObjectKind,
@@ -238,6 +239,7 @@ fn native_durable_generation_build_and_seal_workspaces_keep_separate_original_in
 /// partition as pending a caller cycle, and the next cycles publish the route.
 #[cfg(feature = "test-seams")]
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn switching_to_caller_driven_during_a_native_build_reports_pending_before_retry() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path().join("stop.db")).unwrap();

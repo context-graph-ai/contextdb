@@ -18,6 +18,7 @@ fn initial_kinds(db: &Database) -> (u64, u64) {
     (payloads, journals)
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn initial_unclustered_payloads_retire_after_remap_without_recreating_old_pages() {
     let root = tempfile::tempdir().unwrap();
     let db = Database::open_with_options(

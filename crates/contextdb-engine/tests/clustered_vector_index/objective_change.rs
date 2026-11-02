@@ -175,6 +175,7 @@ fn a_raised_target_keeps_only_the_settings_that_meet_it_until_requalification() 
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_changed_expected_population_keeps_the_covered_settings_with_requalification_pending() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = qualified(root.path());

@@ -55,6 +55,7 @@ fn uuid_set(work: &SearchWork) -> Vec<Uuid> {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_one_context_search_reads_only_its_own_segments_and_fewer_pages_than_all() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("scoped.db"));
@@ -197,6 +198,7 @@ fn target_searches(db: &Database) -> Vec<(Vec<i64>, SearchWork)> {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn an_unrelated_context_growing_and_republishing_leaves_a_fixed_context_s_work_unchanged() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("grown.db"));

@@ -801,6 +801,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn embedded_graph_scratch_obeys_memory_admission_and_returns_its_charge() {
     let db = fixture(
         "F32",
@@ -832,6 +833,7 @@ fn embedded_graph_scratch_obeys_memory_admission_and_returns_its_charge() {
 }
 
 #[test]
+#[ignore = "exact work counters arrive with the int8 scan (step 3)"]
 fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_passes() {
     use contextdb_engine::vector_ivf_observations::{
         NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,

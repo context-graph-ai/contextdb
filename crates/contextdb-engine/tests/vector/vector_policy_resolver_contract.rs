@@ -344,6 +344,7 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_declared_small_breadth_still_preserves_useful_top_ten_quality() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);

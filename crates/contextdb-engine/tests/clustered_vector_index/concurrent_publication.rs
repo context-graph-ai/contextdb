@@ -50,6 +50,7 @@ fn complete_rows(db: &Database, snapshot: SnapshotId) -> Result<Vec<i64>, String
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers() {
     let root = tempfile::tempdir().unwrap();
     let db = Arc::new(open_caller_driven(&root.path().join("publication.db")));
@@ -204,6 +205,7 @@ fn concurrent_maintenance_publishes_one_complete_generation_for_pinned_readers()
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_paused_native_reader_keeps_its_answer_while_vector_writes_commit() {
     use contextdb_engine::vector_ivf_observations::{
         NativeIvfWorkPoint, with_native_ivf_work_observer_for_test,

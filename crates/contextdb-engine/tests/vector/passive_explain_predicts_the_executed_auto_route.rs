@@ -161,6 +161,7 @@ fn assert_passive_predicts_executed(db: &Database, filter: Option<&str>) -> Vect
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn passive_explain_predicts_an_unfiltered_resident_auto_route() {
     let db = Database::open_memory();
     declare(&db);
@@ -187,6 +188,7 @@ fn passive_explain_predicts_a_filtered_resident_auto_route() {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn passive_explain_predicts_a_mixed_stored_and_resident_auto_route() {
     let root = TempDir::new().expect("create the durable fixture directory");
     let path = root.path().join("routes.redb");

@@ -10,6 +10,7 @@ use std::{
     },
 };
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_private_candidate_retains_its_real_verdict_across_calibration_queries() {
     let root = tempfile::tempdir().unwrap();
     let db = Database::open_with_options(
@@ -91,6 +92,7 @@ impl contextdb_vector::ivf::IvfConstructorObserverForTest for Queries {
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_rejected_point_reuses_its_actual_failing_sample_before_repeating_successes() {
     const SAMPLES: usize = 4;
     // The declared factors are 1,2,4; growth adds8, then reaches population8.
@@ -220,6 +222,7 @@ impl contextdb_engine::vector_ivf_observations::NativeIvfSealObserver for RootCo
     }
 }
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn an_immutable_private_query_root_loads_its_scope_control_once() {
     let controls = Arc::new(RootControls::default());
     contextdb_engine::vector_ivf_observations::with_native_ivf_seal_observer_for_test(

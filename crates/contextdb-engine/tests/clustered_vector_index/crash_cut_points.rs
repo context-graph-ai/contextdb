@@ -124,6 +124,7 @@ fn prepare(path: &Path) -> u64 {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_crash_at_either_publication_boundary_leaves_one_complete_generation() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     if let Some(path) = std::env::var_os(CHILD_PATH) {

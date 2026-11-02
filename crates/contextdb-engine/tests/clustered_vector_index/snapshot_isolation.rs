@@ -46,6 +46,7 @@ fn search_now(db: &Database) -> QueryResult {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn a_pinned_reader_keeps_its_view_through_commit_replacement_and_reclamation() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("isolated.db"));

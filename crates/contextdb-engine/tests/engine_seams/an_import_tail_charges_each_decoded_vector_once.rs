@@ -624,6 +624,7 @@ fn one_commit_of(rows: usize, limit: usize) -> (bool, Result<bool, String>) {
 }
 
 #[test]
+#[ignore = "index deferred to the follow-on plan"]
 fn every_commit_the_writer_accepted_is_absorbed_under_the_same_limit() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     // One committed LSN is the import tail's smallest unit of coverage. A
