@@ -17,7 +17,7 @@ const TENANT: &str = "received-vector-generation-invalidation";
 const SCHEMA: &str = "CREATE TABLE received_vector_items (
     id UUID PRIMARY KEY,
     scope_id UUID NOT NULL,
-    embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 4 SEARCH_MODE INDEXED
+    embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 4 SEARCH_MODE AUTO
 ) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 
 fn empty() -> HashMap<String, Value> {
@@ -83,10 +83,10 @@ fn exact_search_at_snapshot(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn indexed_search(db: &Database, scope: Uuid, query: Vec<f32>) -> Result<Vec<Uuid>, Error> {
+fn auto_search(db: &Database, scope: Uuid, query: Vec<f32>) -> Result<Vec<Uuid>, Error> {
     db.execute(
         "SELECT id FROM received_vector_items WHERE scope_id = $scope \
-         ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+         ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 1",
         &params([
             ("scope", Value::Uuid(scope)),
             ("query", Value::Vector(query)),
@@ -172,12 +172,12 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
     edge.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     drive_maintenance(&edge);
     assert_eq!(
-        indexed_search(&edge, scope, vec![1.0, 0.0, 0.0])
+        auto_search(&edge, scope, vec![1.0, 0.0, 0.0])
             .expect("the receiver has a maintained route before replacement"),
         vec![old_id]
     );
     assert_eq!(
-        indexed_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
+        auto_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
             .expect("the sibling partition also has a maintained route before replacement"),
         vec![sibling_id]
     );
@@ -217,14 +217,14 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
         "the old vector owner is absent from the received replacement image"
     );
     assert_eq!(
-        indexed_search(&edge, scope, vec![0.0, 1.0, 0.0])
+        auto_search(&edge, scope, vec![0.0, 1.0, 0.0])
             .expect("the retained chain is complete for the current replacement image"),
         vec![replacement_id],
         "the route retained for the older reader must merge the replacement tail and never \
          return the superseded owner"
     );
     assert_eq!(
-        indexed_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
+        auto_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
             .expect("the retained chain remains complete for the unchanged sibling"),
         vec![sibling_id],
         "the full affected-table image preserves the unchanged sibling's current result"
@@ -237,12 +237,12 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
 
     drive_maintenance(&edge);
     assert_eq!(
-        indexed_search(&edge, scope, vec![0.0, 1.0, 0.0])
+        auto_search(&edge, scope, vec![0.0, 1.0, 0.0])
             .expect("finite maintenance creates the replacement route"),
         vec![replacement_id]
     );
     assert_eq!(
-        indexed_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
+        auto_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
             .expect("finite maintenance rebuilds the unchanged sibling for the full image"),
         vec![sibling_id]
     );
@@ -268,7 +268,7 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
         "reopen never resurrects the original vector identity"
     );
     assert_eq!(
-        indexed_search(&reopened, scope, vec![0.0, 1.0, 0.0])
+        auto_search(&reopened, scope, vec![0.0, 1.0, 0.0])
             .expect("reopen retains only the route built for the replacement image"),
         vec![replacement_id],
         "the saved route after reopen answers from the replacement image, never the old identity"

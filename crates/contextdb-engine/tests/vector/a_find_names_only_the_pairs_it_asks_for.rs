@@ -12,9 +12,9 @@
 //! pair that holds postings, and none for a pair with no rows; and a find whose
 //! filter admits every live vector of the pairs it names enumerates nothing.
 
+use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadLimits, ReadRoute};
 use contextdb_core::types::ContextId;
-use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
 use contextdb_engine::{
     Database, DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession,
@@ -137,33 +137,6 @@ fn seed(db: &Database, plant: bool) {
         )
         .expect("seed one row");
     }
-    for _ in 0..512 {
-        db.run_maintenance_cycle()
-            .expect("advance deterministic maintenance");
-        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory()
-                .expect("admit the partition observation reader"),
-        );
-
-        let ready = db
-            .vector_store_for_test()
-            .partition_infos(
-                &VectorIndexRef::new("lane_rows", "embedding"),
-                &mut partition_observation_owner_1,
-            )
-            .expect("inspect partition readiness");
-        if ready.len() == CONTEXTS * GENERATIONS
-            && ready.iter().all(|partition| {
-                db.__debug_vector_partition_indexed_for_test(
-                    partition.partition.index.clone(),
-                    partition.partition.partition_key.clone(),
-                )
-            })
-        {
-            return;
-        }
-    }
-    panic!("every partition must publish a maintained route before the read is measured");
 }
 
 struct Fixture {

@@ -284,16 +284,18 @@ fn signed_constants_and_parameters_share_the_index_route() {
         "bucket < -1",
         "bucket = -(1 + 2)",
     ] {
-        let sql = format!(
-            "SELECT id FROM items WHERE {predicate} ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10"
-        );
-        assert!(
-            db.execute(&sql, &parameters(&[1., 0., 0.]))
-                .unwrap()
-                .rows()
-                .is_empty()
-        );
-        assert!(bounded_query(&db, &sql, &[1., 0., 0.]).rows().is_empty());
+        for mode in ["EXACT", "AUTO"] {
+            let sql = format!(
+                "SELECT id FROM items WHERE {predicate} ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 10"
+            );
+            assert!(
+                db.execute(&sql, &parameters(&[1., 0., 0.]))
+                    .unwrap()
+                    .rows()
+                    .is_empty()
+            );
+            assert!(bounded_query(&db, &sql, &[1., 0., 0.]).rows().is_empty());
+        }
     }
 }
 

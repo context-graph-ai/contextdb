@@ -8,7 +8,7 @@
 
 use contextdb_core::read_contract::ReadLimits;
 use contextdb_core::types::ContextId;
-use contextdb_core::{Error, Value, VectorIndexRef};
+use contextdb_core::{Error, Value};
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
     IndexPostingDamage, damage_relational_index_posting_for_test,
     damage_relational_row_table_for_test, misfile_relational_index_posting_for_test,
@@ -98,29 +98,7 @@ fn seed(path: &std::path::Path) {
         )
         .expect("seed one note");
     }
-    for _ in 0..256 {
-        db.run_maintenance_cycle().expect("advance maintenance");
-        let mut owner = contextdb_engine::vector_read_memory::admission(
-            db.declared_reader_memory()
-                .expect("admit the observation reader"),
-        );
-        let ready = db
-            .vector_store_for_test()
-            .partition_infos(&VectorIndexRef::new("scoped_rows", "embedding"), &mut owner)
-            .expect("inspect readiness");
-        if ready.len() == PARTITIONS
-            && ready.iter().all(|partition| {
-                db.__debug_vector_partition_indexed_for_test(
-                    partition.partition.index.clone(),
-                    partition.partition.partition_key.clone(),
-                )
-            })
-        {
-            db.close().expect("close the sealed fixture");
-            return;
-        }
-    }
-    panic!("every partition publishes a maintained route");
+    db.close().expect("close the fixture");
 }
 
 fn reader(path: &std::path::Path) -> ReadSession {

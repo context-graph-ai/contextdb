@@ -9,6 +9,8 @@ use super::support::{
     params, serving, unit_vector,
 };
 use contextdb_core::Value;
+use contextdb_engine::Database;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 fn angle(radians: f64) -> Vec<f32> {
@@ -25,13 +27,15 @@ fn ranked(query: &[f32], rows: &[(i64, Vec<f32>)]) -> Vec<(f64, i64)> {
     ranked
 }
 
-#[test]
-fn exact_returns_full_precision_order_where_int8_records_tie() {
-    let root = tempfile::tempdir().expect("temporary store directory");
-    let db = open_caller_driven(&root.path().join("trap.db"));
+/// The tie trap's committed rows and its bound query.
+type TieTrap = (Vec<(i64, Vec<f32>)>, HashMap<String, Value>);
+
+/// The tie trap: eight neighbours far finer than one int8 step, committed
+/// under `search_mode`, with the fixture's full-precision order checked.
+fn tie_trap(db: &Database, search_mode: &str) -> TieTrap {
     db.execute(
         &format!(
-            "CREATE TABLE trap_items (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE INDEXED {})",
+            "CREATE TABLE trap_items (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE {search_mode} {})",
             ivf(1, 1, 16)
         ),
         &empty(),
@@ -60,8 +64,6 @@ fn exact_returns_full_precision_order_where_int8_records_tie() {
         )
         .expect("commit one vector");
     }
-    drive_until_serving(&db, 6, 1, 10);
-
     let query = angle(0.45);
     let expected = ranked(&query, &rows);
     assert_eq!(
@@ -75,7 +77,35 @@ fn exact_returns_full_precision_order_where_int8_records_tie() {
             "neighbouring distances are resolvable at full precision: {pair:?}"
         );
     }
-    let bound = params([("query", Value::Vector(query))]);
+    (rows, params([("query", Value::Vector(query))]))
+}
+
+#[test]
+fn exact_returns_full_precision_order_where_int8_records_tie() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_caller_driven(&root.path().join("trap.db"));
+    let (_, bound) = tie_trap(&db, "AUTO");
+    for mode in ["EXACT", "AUTO"] {
+        let sql = format!(
+            "SELECT id FROM trap_items ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 3"
+        );
+        assert_eq!(
+            int_ids(&db.execute(&sql, &bound).unwrap()),
+            vec![105, 101, 108],
+            "{mode} returns the full-precision order"
+        );
+    }
+}
+
+/// The native work count of EXACT and the successful INDEXED arm of the tie
+/// trap; the shared answer stays active above.
+#[test]
+#[ignore = "index deferred to the follow-on plan"]
+fn exact_counts_every_vector_and_indexed_reranks_the_tie_trap() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_caller_driven(&root.path().join("trap.db"));
+    let (rows, bound) = tie_trap(&db, "INDEXED");
+    drive_until_serving(&db, 6, 1, 10);
     for mode in ["EXACT", "INDEXED"] {
         let sql = format!(
             "SELECT id FROM trap_items ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 3"

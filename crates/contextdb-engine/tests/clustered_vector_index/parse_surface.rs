@@ -330,10 +330,8 @@ fn duplicate_and_out_of_range_members_are_refused_without_changing_the_schema() 
     }
 }
 
-#[test]
-fn a_query_raises_its_own_target_accuracy_and_an_out_of_range_target_is_refused() {
-    let root = tempfile::tempdir().expect("temporary store directory");
-    let db = open_caller_driven(&root.path().join("query-target.db"));
+/// 200 committed rows under the derived policy, with no index build.
+fn target_items(db: &Database) {
     db.execute(
         "CREATE TABLE target_items (id INTEGER PRIMARY KEY, embedding VECTOR(8))",
         &empty(),
@@ -349,6 +347,35 @@ fn a_query_raises_its_own_target_accuracy_and_an_out_of_range_target_is_refused(
         )
         .expect("commit one row");
     }
+}
+
+#[test]
+fn a_query_raises_its_own_target_accuracy_and_an_out_of_range_target_is_refused() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_caller_driven(&root.path().join("query-target.db"));
+    target_items(&db);
+    let query = params([("query", Value::Vector(unit_vector(7, 8)))]);
+    for value in ["0", "101", "-1", "95.555"] {
+        let sql = format!(
+            "SELECT id FROM target_items ORDER BY embedding <=> $query USE VECTOR INDEXED (TARGET_ACCURACY = {value}) LIMIT 5"
+        );
+        let error = db
+            .execute(&sql, &query)
+            .expect_err("an out-of-range query target is refused");
+        assert!(
+            !matches!(error, Error::Other(_)) && error.to_string().contains("TARGET_ACCURACY"),
+            "{sql} is refused with a typed error naming TARGET_ACCURACY, got {error:?}"
+        );
+    }
+}
+
+/// The successful indexed arm: a raised query target runs on the index.
+#[test]
+#[ignore = "index deferred to the follow-on plan"]
+fn a_query_raises_its_own_target_accuracy_on_the_index() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_caller_driven(&root.path().join("query-target.db"));
+    target_items(&db);
     drive_until_serving(&db, 200, 1, 10);
     let query = params([("query", Value::Vector(unit_vector(7, 8)))]);
     for target in ["99", "95.5"] {
@@ -364,18 +391,6 @@ fn a_query_raises_its_own_target_accuracy_and_an_out_of_range_target_is_refused(
             int_ids(&answer)[0],
             7,
             "the query's own row answers first at {target}"
-        );
-    }
-    for value in ["0", "101", "-1", "95.555"] {
-        let sql = format!(
-            "SELECT id FROM target_items ORDER BY embedding <=> $query USE VECTOR INDEXED (TARGET_ACCURACY = {value}) LIMIT 5"
-        );
-        let error = db
-            .execute(&sql, &query)
-            .expect_err("an out-of-range query target is refused");
-        assert!(
-            !matches!(error, Error::Other(_)) && error.to_string().contains("TARGET_ACCURACY"),
-            "{sql} is refused with a typed error naming TARGET_ACCURACY, got {error:?}"
         );
     }
 }

@@ -97,14 +97,32 @@ fn damage(path: &std::path::Path, scope: Uuid, fault: IndexPageFault) {
 }
 
 fn seed(path: &std::path::Path) {
+    let db = seed_rows(path, "INDEXED");
+    for _ in 0..MAX_CYCLES {
+        if index_ready(&db, alpha()) && index_ready(&db, bravo()) {
+            break;
+        }
+        db.run_maintenance_cycle().expect("one maintenance cycle");
+    }
+    assert!(
+        index_ready(&db, alpha()) && index_ready(&db, bravo()),
+        "both routes publish a clustered index"
+    );
+    db.close().expect("close the sealed store");
+}
+
+/// The two committed routes under `search_mode`, with no index build.
+fn seed_rows(path: &std::path::Path, search_mode: &str) -> Database {
     let db = Database::open(path).expect("open the durable two-route store");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
-        "CREATE TABLE paged_items (\
-         id UUID PRIMARY KEY, \
-         scope_id UUID NOT NULL, \
-         embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE INDEXED\
-         )",
+        &format!(
+            "CREATE TABLE paged_items (\
+             id UUID PRIMARY KEY, \
+             scope_id UUID NOT NULL, \
+             embedding VECTOR(3) PARTITION_KEY (scope_id) MAX_PARTITIONS 8 SEARCH_MODE {search_mode}\
+             )"
+        ),
         &HashMap::new(),
     )
     .expect("declare the partitioned vector table");
@@ -127,17 +145,7 @@ fn seed(path: &std::path::Path) {
         }
         db.commit(tx).expect("commit one route");
     }
-    for _ in 0..MAX_CYCLES {
-        if index_ready(&db, alpha()) && index_ready(&db, bravo()) {
-            break;
-        }
-        db.run_maintenance_cycle().expect("one maintenance cycle");
-    }
-    assert!(
-        index_ready(&db, alpha()) && index_ready(&db, bravo()),
-        "both routes publish a clustered index"
-    );
-    db.close().expect("close the sealed store");
+    db
 }
 
 fn reader(path: &std::path::Path, memory: Option<u64>) -> ReadSession {
@@ -155,15 +163,30 @@ fn reader(path: &std::path::Path, memory: Option<u64>) -> ReadSession {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+fn find(reader: &ReadSession, scope: Uuid, query: Vec<f32>) -> contextdb_core::Result<Vec<Uuid>> {
+    find_as(reader, scope, query, "INDEXED")
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 #[expect(
     clippy::into_iter_on_ref,
     reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
 )]
-fn find(reader: &ReadSession, scope: Uuid, query: Vec<f32>) -> contextdb_core::Result<Vec<Uuid>> {
+fn find_as(
+    reader: &ReadSession,
+    scope: Uuid,
+    query: Vec<f32>,
+    mode: &str,
+) -> contextdb_core::Result<Vec<Uuid>> {
     reader
         .execute(
-            "SELECT id FROM paged_items WHERE scope_id = $scope \
-             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 4",
+            &format!(
+                "SELECT id FROM paged_items WHERE scope_id = $scope \
+                 ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 4"
+            ),
             &HashMap::from([
                 ("scope".to_owned(), Value::Uuid(scope)),
                 ("query".to_owned(), Value::Vector(query)),
@@ -225,7 +248,9 @@ fn every_kind_of_page_damage_refuses_only_the_damaged_route() {
 fn schema_metadata_damage_is_not_treated_as_page_damage() {
     let root = TempDir::new().expect("temporary durable store directory");
     let path = root.path().join("paged-schema-damage.redb");
-    seed(&path);
+    seed_rows(&path, "AUTO")
+        .close()
+        .expect("close the committed store");
     {
         let database = redb::Database::create(&path).expect("open the raw store");
         let write = database.begin_write().expect("raw write");
@@ -237,7 +262,7 @@ fn schema_metadata_damage_is_not_treated_as_page_damage() {
         write.commit().expect("commit the damage");
     }
     let outcome = ReadSession::open_with_options(&path, ReadSessionOptions::default())
-        .and_then(|session| find(&session, bravo(), axis(1)));
+        .and_then(|session| find_as(&session, bravo(), axis(1), "EXACT"));
     assert!(
         matches!(outcome, Err(Error::StoreCorrupted { .. })),
         "schema metadata damage refuses even the undamaged route, got {outcome:?}"

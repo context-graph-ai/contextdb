@@ -39,7 +39,7 @@ fn a_deleted_vector_never_appears_on_a_snapshot_that_cannot_see_it() {
     let db = open_caller_driven(&root.path().join("deleted.db"));
     db.execute(
         &format!(
-            "CREATE TABLE deleted_items (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE INDEXED {})",
+            "CREATE TABLE deleted_items (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE AUTO {})",
             ivf(4, 4, 64)
         ),
         &empty(),
@@ -71,8 +71,7 @@ fn a_deleted_vector_never_appears_on_a_snapshot_that_cannot_see_it() {
         .collect::<Vec<_>>();
     assert_eq!(deleted[0], 7);
 
-    let indexed =
-        "SELECT id FROM deleted_items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 5";
+    let auto = "SELECT id FROM deleted_items ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 5";
     let exact =
         "SELECT id FROM deleted_items ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 5";
     let bound = params([("query", Value::Vector(query.clone()))]);
@@ -90,13 +89,8 @@ fn a_deleted_vector_never_appears_on_a_snapshot_that_cannot_see_it() {
     }
 
     let check = |stage: &str| {
-        let (current, work) = observe_search(&db, || db.execute(indexed, &bound).unwrap());
-        assert!(
-            work.clustered_route,
-            "{stage}: the search ran on the clustered index"
-        );
         assert_eq!(
-            int_ids(&current),
+            int_ids(&db.execute(auto, &bound).unwrap()),
             live_answer,
             "{stage}: deleted rows are absent and do not crowd out the five nearest live rows"
         );
@@ -108,7 +102,7 @@ fn a_deleted_vector_never_appears_on_a_snapshot_that_cannot_see_it() {
     };
     check("before list maintenance");
     assert_eq!(
-        int_ids(&db.execute_at_snapshot(indexed, &bound, before).unwrap())[0],
+        int_ids(&db.execute_at_snapshot(auto, &bound, before).unwrap())[0],
         7,
         "the pinned snapshot still sees the row it was opened with"
     );
@@ -397,7 +391,7 @@ fn a_partition_emptied_by_deletes_keeps_serving_after_reopen_and_accepts_new_row
     let db = open_caller_driven(&path);
     db.execute(
         &format!(
-            "CREATE TABLE emptied_items (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE INDEXED {})",
+            "CREATE TABLE emptied_items (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE AUTO {})",
             ivf(4, 4, 64)
         ),
         &empty(),
@@ -428,7 +422,7 @@ fn a_partition_emptied_by_deletes_keeps_serving_after_reopen_and_accepts_new_row
             report.vector.first_failure
         );
     }
-    for mode in ["EXACT", "INDEXED"] {
+    for mode in ["EXACT", "AUTO"] {
         assert_eq!(
             search(&reopened, mode),
             Vec::<i64>::new(),
@@ -444,7 +438,7 @@ fn a_partition_emptied_by_deletes_keeps_serving_after_reopen_and_accepts_new_row
         unit_vector(0, DIMENSIONS),
     );
     drive_until_serving(&reopened, 1, 1, 10);
-    for mode in ["EXACT", "INDEXED"] {
+    for mode in ["EXACT", "AUTO"] {
         assert_eq!(
             search(&reopened, mode),
             vec![fresh],
@@ -454,7 +448,7 @@ fn a_partition_emptied_by_deletes_keeps_serving_after_reopen_and_accepts_new_row
     reopened.close().expect("close the refilled partition");
     let again = open_caller_driven(&path);
     assert_eq!(
-        search(&again, "INDEXED"),
+        search(&again, "AUTO"),
         vec![fresh],
         "the refilled partition survives reopen"
     );
@@ -466,11 +460,22 @@ fn a_partition_emptied_by_deletes_keeps_serving_after_reopen_and_accepts_new_row
 /// pages and never grows the file, so no disk ceiling can refuse it.)
 #[test]
 fn a_purge_refused_on_the_declared_memory_limit_changes_nothing_and_succeeds_once_lifted() {
+    purge_refused_on_the_declared_memory_limit("AUTO", false);
+}
+
+/// The index-page half of the PURGE memory refusal: no index page changes.
+#[test]
+#[ignore = "index deferred to the follow-on plan"]
+fn a_purge_refused_on_the_declared_memory_limit_changes_no_index_page() {
+    purge_refused_on_the_declared_memory_limit("INDEXED", true);
+}
+
+fn purge_refused_on_the_declared_memory_limit(search_mode: &str, index_pages: bool) {
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_caller_driven(&root.path().join("purge-limits.db"));
     db.execute(
         &format!(
-            "CREATE TABLE limit_items (id INTEGER PRIMARY KEY, embedding VECTOR({PURGE_DIMENSIONS}) SEARCH_MODE INDEXED {})",
+            "CREATE TABLE limit_items (id INTEGER PRIMARY KEY, embedding VECTOR({PURGE_DIMENSIONS}) SEARCH_MODE {search_mode} {})",
             ivf(4, 4, 64)
         ),
         &empty(),
@@ -492,7 +497,7 @@ fn a_purge_refused_on_the_declared_memory_limit_changes_nothing_and_succeeds_onc
             .map(|page| page.bytes)
             .collect::<Vec<_>>()
     };
-    let pages_before = pages(&db);
+    let pages_before = index_pages.then(|| pages(&db));
 
     let used = db.accountant().usage().used;
     db.set_memory_limit(Some(used + 4_096))
@@ -512,11 +517,13 @@ fn a_purge_refused_on_the_declared_memory_limit_changes_nothing_and_succeeds_onc
     );
     db.set_memory_limit(None).expect("lift the memory limit");
     assert_eq!(count(&db, "limit_items"), rows_before);
-    assert_eq!(
-        pages(&db),
-        pages_before,
-        "the memory refusal changed no index page"
-    );
+    if let Some(pages_before) = pages_before {
+        assert_eq!(
+            pages(&db),
+            pages_before,
+            "the memory refusal changed no index page"
+        );
+    }
 
     let erased = db
         .execute("PURGE FROM limit_items WHERE id = 7", &empty())

@@ -49,6 +49,11 @@ fn open(path: &std::path::Path) -> Database {
 /// `open` for a table whose cleanup reclaims a replaced vector, as the
 /// context-graph consumer declares its passages.
 fn open_current_only(path: &std::path::Path) -> Database {
+    open_current_only_as(path, "INDEXED")
+}
+
+/// `open_current_only` with the column's declared search mode.
+fn open_current_only_as(path: &std::path::Path, search_mode: &str) -> Database {
     let db = Database::open_with_options(
         path,
         DatabaseOpenOptions {
@@ -59,7 +64,7 @@ fn open_current_only(path: &std::path::Path) -> Database {
     .expect("open the file-backed import store");
     db.execute(
         &format!(
-            "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE INDEXED {}) HISTORY CURRENT ONLY SYNC OFF",
+            "CREATE TABLE passages (id INTEGER PRIMARY KEY, embedding VECTOR({DIMENSIONS}) SEARCH_MODE {search_mode} {}) HISTORY CURRENT ONLY SYNC OFF",
             ivf(4, 4, 64)
         ),
         &empty(),
@@ -239,16 +244,34 @@ fn the_consumer_loop_finishes_in_finitely_many_cycles_and_is_idle_once_covered()
 fn retention_of_a_replaced_passage_keeps_maintenance_search_and_the_next_commit() {
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join("replaced.db");
-    let db = open_current_only(&path);
+    let db = open_current_only_as(&path, "AUTO");
     commit(&db, 0..IMPORTED);
     maintain_to_completion(&db);
     replace(&db, 0..10, 100);
-    assert_eq!(
-        db.compact_currency_versions()
+    // A cleanup pass prunes only versions at or below the LSN frontier its
+    // cursor recorded when it last wrapped, so versions written after the
+    // maintenance cycle's own pass wait for the next wrap. One wrap visits each
+    // row group (3 work units: the group, its head record and body probe) and
+    // each stored version (1 unit), within the pass budget of 128 units
+    // (compaction_and_ddl_rendering.rs), and a pass that resumes a group pays
+    // its head again. Passes run until a whole wrap prunes nothing more.
+    let wrap_units = 3 * IMPORTED as usize + (IMPORTED as usize + 10);
+    let passes_per_wrap = wrap_units.div_ceil(128 - 2) + 1;
+    let (mut pruned, mut quiet, mut passes) = (0_u64, 0_usize, 0_usize);
+    while pruned == 0 || quiet < passes_per_wrap {
+        assert!(
+            passes < 3 * passes_per_wrap,
+            "cleanup settles within three cursor wraps: {passes} passes, {pruned} pruned"
+        );
+        let now = db
+            .compact_currency_versions()
             .expect("cleanup reclaims the replaced vectors")
-            .pruned_versions,
-        10
-    );
+            .pruned_versions;
+        passes += 1;
+        pruned += now;
+        quiet = if now == 0 { quiet + 1 } else { 0 };
+    }
+    assert_eq!(pruned, 10, "cleanup reclaims the replaced vectors");
     maintain_to_completion(&db);
     let nearest = |db: &Database| {
         db.execute(

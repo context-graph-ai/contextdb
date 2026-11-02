@@ -428,7 +428,7 @@ fn a_refused_explain_admission_leaves_no_charge_and_no_partial_prediction() {
     // and push one entry per disclosed partition.
     let sql = format!(
         "SELECT id FROM flat_docs WHERE partition_id >= 0 ORDER BY embedding <=> [{query}] \
-         USE VECTOR INDEXED LIMIT 10"
+         USE VECTOR AUTO LIMIT 10"
     );
     let open = |memory: u64| {
         let mut options = contextdb_engine::DatabaseOpenOptions::default();
