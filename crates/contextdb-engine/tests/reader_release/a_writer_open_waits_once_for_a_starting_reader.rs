@@ -56,9 +56,11 @@ fn a_writer_completes_only_after_the_last_of_two_readers_leaves() {
     let watch = watch(&path);
 
     let writer = open_writer(&path, DatabaseOpenOptions::default());
-    assert_eq!(
-        next_event(&watch, "with two readers inside their acquisition"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "with two readers inside their acquisition"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "a writer that meets readers inside their acquisition waits for them"
     );
 
@@ -105,10 +107,10 @@ fn cancelling_a_waiting_writer_returns_the_cancellation_and_leaves_nothing_held(
             ..DatabaseOpenOptions::default()
         },
     );
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "while a reader is inside its acquisition"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
 
     stop.cancel();
     match writer.finish() {
@@ -162,10 +164,10 @@ fn cancelling_at_the_linearization_point_returns_the_cancellation_and_releases_e
             ..DatabaseOpenOptions::default()
         },
     );
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "while a reader is inside its acquisition"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     reader.let_go();
     let session = reader.session();
     assert!(
@@ -217,9 +219,11 @@ fn an_expired_caller_deadline_is_the_held_by_readers_refusal_naming_the_readers(
             ..DatabaseOpenOptions::default()
         },
     );
-    assert_eq!(
-        next_event(&watch, "before the deadline"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "before the deadline"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "a deadline in the future is a wait, not a refusal"
     );
 
@@ -365,10 +369,10 @@ fn on_macos_a_default_open_waits_and_a_cancellable_open_is_refused_unsupported()
     }
 
     let plain = open_writer(&path, DatabaseOpenOptions::default());
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "for the default open"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     reader.let_go();
     drop(reader.session());
     assert_eq!(

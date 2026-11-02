@@ -882,10 +882,7 @@ fn wait_for_helper_mode(
         super::read_persistence_test_scaffold::ReaderReleaseBlockForTest::ParkEntered,
     );
     #[cfg(any(test, feature = "test-seams"))]
-    super::read_persistence_test_scaffold::note_writer_admission_for_test(
-        store_path,
-        super::read_persistence_test_scaffold::WriterAdmissionEvent::Waiting,
-    );
+    super::read_persistence_test_scaffold::note_writer_waiting_for_test(store_path);
     let parked = if let Some(memory) = &read_memory {
         park_read(&helper, &pipe, stop, deadline.as_ref(), memory, &owner)
     } else {

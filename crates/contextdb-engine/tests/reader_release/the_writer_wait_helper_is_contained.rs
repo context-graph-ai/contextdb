@@ -101,10 +101,10 @@ fn a_helper_killed_externally_is_a_typed_refusal_and_leaves_nothing_held() {
     let watch = watch(&path);
 
     let writer = open_writer(&path, cancellable());
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "while a reader is inside its acquisition"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     let open_thread = writer.thread_id();
     assert_eq!(
         unreaped_helpers(open_thread),
@@ -147,10 +147,10 @@ fn waiting_writer_child() {
     let path = std::env::var(STORE).expect("child store path");
     let watch = watch(Path::new(&path));
     let writer = open_writer(Path::new(&path), cancellable());
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "in the child"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     let pids = helper_pids(writer.thread_id());
     println!("WAITING {}", pids.last().expect("the wait's helper"));
     std::io::stdout().flush().expect("flush the marker");
@@ -251,9 +251,11 @@ fn a_failed_preflight_refuses_a_cancellable_open_but_a_default_open_still_waits(
     );
 
     let plain = open_writer(&path, DatabaseOpenOptions::default());
-    assert_eq!(
-        next_event(&watch, "for the default open"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "for the default open"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "a default open supplies no stop and no deadline, so it waits regardless"
     );
     reader.let_go();
@@ -293,10 +295,10 @@ fn an_unconfirmed_helper_death_quarantines_the_store_and_starts_no_second_helper
         reader_wait_stop: Some(stop.clone()),
         ..DatabaseOpenOptions::default()
     });
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "while a reader is inside its acquisition"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     stop.cancel();
     match first
         .recv_timeout(WATCHDOG)
@@ -433,10 +435,10 @@ fn a_thread_that_may_not_sigkill_gets_the_unsupported_refusal_and_default_opens_
         Some(error) if is_unsupported_cancellable_wait(&error) => {}
         other => panic!("a thread that cannot SIGKILL gets the unsupported refusal: {other:?}"),
     }
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "for the default open on the filtered thread"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     reader.let_go();
     drop(reader.session());
     filtered.join().expect("the filtered thread finishes");

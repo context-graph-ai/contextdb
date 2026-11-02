@@ -94,10 +94,10 @@ fn a_cleaner_arriving_after_the_writer_claim_makes_no_gate_or_hold_request() {
     let reader = readers.remove(0);
     let watch = watch(&path);
     let writer = open_writer(&path, DatabaseOpenOptions::default());
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "behind the parked reader"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     let before = counts(&path);
 
     drop(earlier);
@@ -138,10 +138,10 @@ fn a_reader_paused_after_its_precheck_is_refused_at_the_gate_and_never_holds() {
 
     let watch = watch(&path);
     let writer = open_writer(&path, DatabaseOpenOptions::default());
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "behind the reader inside the section"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     let before = counts(&path);
 
     precheck_pause.release(ticket);
@@ -197,10 +197,10 @@ fn a_reader_paused_after_the_gate_makes_the_writer_wait_exactly_once_for_the_hol
     let watch = watch(&path);
     let before = counts(&path);
     let writer = open_writer(&path, DatabaseOpenOptions::default());
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "while a reader holds the hold"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
 
     gate_pause.release(ticket);
     let session = heard

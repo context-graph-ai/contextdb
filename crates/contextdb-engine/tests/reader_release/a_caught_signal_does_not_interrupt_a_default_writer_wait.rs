@@ -73,10 +73,10 @@ fn a_caught_signal_neither_fails_nor_repeats_a_default_writer_wait() {
         contextdb_engine::Database::open_with_options(&writer_path, DatabaseOpenOptions::default())
     });
     let writer_thread = thread_id_rx.recv().expect("the writer thread's identifier");
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "while a reader is inside its acquisition"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
 
     // SAFETY: signals a thread of this process that is still running.
     assert_eq!(

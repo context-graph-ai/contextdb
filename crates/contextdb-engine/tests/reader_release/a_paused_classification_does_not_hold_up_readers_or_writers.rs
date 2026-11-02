@@ -47,12 +47,14 @@ fn assert_a_paused_classification_blocks_nobody(checked: &Path, other: &Path) {
     let reader = readers.remove(0);
     let watch = watch(other);
     let writer = open_writer(other, DatabaseOpenOptions::default());
-    assert_eq!(
-        next_event(
-            &watch,
-            "behind a reader while a format check is paused in its scan"
+    assert!(
+        matches!(
+            next_event(
+                &watch,
+                "behind a reader while a format check is paused in its scan"
+            ),
+            WriterAdmissionEvent::Waiting { .. }
         ),
-        WriterAdmissionEvent::Waiting,
         "the writer queues behind the reader"
     );
 

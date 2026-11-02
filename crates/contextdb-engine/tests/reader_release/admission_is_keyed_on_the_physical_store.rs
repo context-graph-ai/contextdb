@@ -66,9 +66,11 @@ fn queue_through(
     let reader = readers.remove(0);
     let watch = watch(path);
     let writer = open_writer(path, DatabaseOpenOptions::default());
-    assert_eq!(
-        next_event(&watch, "behind the reader inside the section"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "behind the reader inside the section"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "the writer must be queued before the second name's arrivals"
     );
     (reader, writer, watch)
@@ -165,9 +167,11 @@ fn a_rename_while_the_writer_waits_does_not_open_admission() {
 
     let watch = watch(&moved);
     let writer = open_writer(&moved, DatabaseOpenOptions::default());
-    assert_eq!(
-        next_event(&watch, "behind the reader whose name moved"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "behind the reader whose name moved"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "the writer queues behind a reader that holds the same physical file"
     );
     let before = counts(&moved);

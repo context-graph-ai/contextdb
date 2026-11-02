@@ -79,9 +79,11 @@ fn a_classifier_through_a_hard_link_makes_no_data_lock_call_past_a_queued_writer
     let reader = readers.remove(0);
     let watch = watch(&p);
     let writer = open_writer(&p, DatabaseOpenOptions::default());
-    assert_eq!(
-        next_event(&watch, "behind the reader inside the section"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "behind the reader inside the section"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "the writer must be queued before the classifier arrives"
     );
     let before = counts(&p);

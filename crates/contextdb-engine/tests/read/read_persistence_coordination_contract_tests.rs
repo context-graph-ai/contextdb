@@ -13,7 +13,7 @@ use contextdb_engine::persistence::read_persistence_test_scaffold::{
     CompanionWriteBoundary, CompanionWriterBootFields, LoadReadImageAdapterError,
     ReadImageObservation, ReadImageSourceEvent, ReplacementIntentObservation,
     StoreReplacementBoundary, StoreReplacementEvent, TwoReadImageHydrationController,
-    arm_companion_crash_for_test, arm_read_image_hydration_pause_for_test,
+    WriterAdmissionEvent, arm_companion_crash_for_test, arm_read_image_hydration_pause_for_test,
     arm_store_replacement_sequence_for_test, arm_two_read_image_hydrations_for_test,
     begin_two_read_image_hydration_attempt_for_test, cancel_store_replacement_sequence_for_test,
     canonical_reader_breadcrumb_directory_for_test,
@@ -27,7 +27,8 @@ use contextdb_engine::persistence::read_persistence_test_scaffold::{
     release_store_replacement_checkpoint_for_test, replace_reader_breadcrumb_for_test,
     reset_companion_effective_user_source_calls_for_test, reset_writer_open_attempts_for_test,
     set_companion_effective_user_identity_for_test, store_fingerprint_for_test,
-    try_store_data_lock_for_test, writer_open_attempts_for_test,
+    try_store_data_lock_for_test, watch_writer_admission_in_runtime_dir_for_test,
+    writer_open_attempts_for_test,
 };
 use contextdb_engine::{Database, ReadSession};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -4929,4 +4930,76 @@ fn production_readers_and_a_writer_meet_below_a_runtime_root_named_contextdb() {
     let runtime_directory = base.path().join("contextdb");
     create_runtime_directory(&runtime_directory);
     assert_production_readers_are_named_where_the_writer_scans(&runtime_directory);
+}
+
+/// A writer that waits for a store's readers says, while it waits, which
+/// store and which readers. Two readers in two processes park inside a
+/// production `ReadSession::open`; the writer is opened in this process with
+/// no deadline, so it waits. The proof blocks on the writer's own admission
+/// record, never on a clock: the waiting event must name the store path and
+/// both readers exactly as they published themselves, and the next event,
+/// once both leave, must be the open itself.
+#[test]
+#[cfg(unix)]
+fn a_waiting_writer_names_the_store_and_every_reader_it_waits_for() {
+    let _serial = serialise_coordination_test();
+    let runtime_root = short_runtime_root();
+    create_runtime_directory(runtime_root.path());
+    let root = tempfile::tempdir().expect("scratch directory");
+    let path = root.path().join("waited-for.db");
+    seed_store(&path);
+
+    let mut first = spawn_production_read_session(&path, runtime_root.path());
+    let mut second = spawn_production_read_session(&path, runtime_root.path());
+    let first_breadcrumb = first
+        .wait_until_held()
+        .expect("the first production read session reaches its read-lock checkpoint")
+        .breadcrumb
+        .expect("a production read session publishes its reader identity");
+    let second_breadcrumb = second
+        .wait_until_held()
+        .expect("the second production read session reaches its read-lock checkpoint")
+        .breadcrumb
+        .expect("a production read session publishes its reader identity");
+    assert_ne!(
+        first_breadcrumb.process_id, second_breadcrumb.process_id,
+        "two reader processes, so two identities"
+    );
+
+    // The readers were given this root as XDG_RUNTIME_DIR, so they publish in
+    // its contextdb child, the directory the platform default selects.
+    let reader_runtime = runtime_root.path().join("contextdb");
+    let watch = watch_writer_admission_in_runtime_dir_for_test(&path, Some(&reader_runtime));
+    let writer = {
+        let path = path.clone();
+        thread::spawn(move || Database::open(&path))
+    };
+    match watch.next_event() {
+        WriterAdmissionEvent::Waiting { store, readers } => {
+            assert_eq!(
+                store, path,
+                "the waiting event names the store the open named"
+            );
+            assert_eq!(
+                sorted_breadcrumbs(readers),
+                sorted_breadcrumbs(vec![first_breadcrumb, second_breadcrumb]),
+                "the waiting event names every reader the writer waits for, completely"
+            );
+        }
+        other => panic!("a writer that meets two hydrating readers waits for them, got {other:?}"),
+    }
+
+    first.release().expect("the first reader finishes");
+    second.release().expect("the second reader finishes");
+    assert_eq!(
+        watch.next_event(),
+        WriterAdmissionEvent::Acquired,
+        "once both readers leave, the writer's next event is the open itself: one wait"
+    );
+    writer
+        .join()
+        .expect("the writer thread returns")
+        .expect("the writer is admitted once its readers leave")
+        .close()
+        .expect("close the admitted writer");
 }

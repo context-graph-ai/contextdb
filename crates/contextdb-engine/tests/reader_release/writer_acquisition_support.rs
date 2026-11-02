@@ -324,9 +324,11 @@ pub fn assert_writer_opens_during(journey: Journey) {
 
     let writer = open_writer(&path, DatabaseOpenOptions::default());
     match expected {
-        Expected::WaitsForTheReader => assert_eq!(
-            next_event(&watch, "while a reader is inside its acquisition"),
-            WriterAdmissionEvent::Waiting,
+        Expected::WaitsForTheReader => assert!(
+            matches!(
+                next_event(&watch, "while a reader is inside its acquisition"),
+                WriterAdmissionEvent::Waiting { .. }
+            ),
             "a writer that meets a reader still acquiring its snapshot waits for it; \
              it is not refused for the caller to retry"
         ),
@@ -458,9 +460,11 @@ pub fn queue_a_writer_behind_a_reader(name: &str) -> QueuedWriter {
     let reader = readers.remove(0);
     let watch = watch(&path);
     let writer = open_writer(&path, DatabaseOpenOptions::default());
-    assert_eq!(
-        next_event(&watch, "while a reader is inside its acquisition"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "while a reader is inside its acquisition"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "the writer must be waiting before the journey's newcomers arrive"
     );
     let before = counts(&path);

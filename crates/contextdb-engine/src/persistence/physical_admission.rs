@@ -735,10 +735,7 @@ pub(crate) fn acquire_for_writer(
         // The gate is held: no reader can enter from here. What is left is
         // waiting out the readers already inside.
         #[cfg(any(test, feature = "test-seams"))]
-        super::read_persistence_test_scaffold::note_writer_admission_for_test(
-            store_path,
-            super::read_persistence_test_scaffold::WriterAdmissionEvent::Waiting,
-        );
+        super::read_persistence_test_scaffold::note_writer_waiting_for_test(store_path);
         if !held.reader_hold {
             writer_takes(file, READER_HOLD_OFFSET)?;
             held.reader_hold = true;

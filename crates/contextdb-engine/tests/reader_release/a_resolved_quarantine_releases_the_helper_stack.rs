@@ -84,10 +84,10 @@ fn quarantine_stack_child() {
             reply,
         ))
         .expect("hand the first open over");
-    assert_eq!(
+    assert!(matches!(
         next_event(&watch, "while a reader is inside its acquisition"),
-        WriterAdmissionEvent::Waiting
-    );
+        WriterAdmissionEvent::Waiting { .. }
+    ),);
     stop.cancel();
     match first
         .recv_timeout(WATCHDOG)

@@ -3084,17 +3084,31 @@ pub mod read_persistence_test_scaffold {
     }
 
     /// What one writable open of an armed store did about the readers it met.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum WriterAdmissionEvent {
-        /// It is waiting for the store to be handed to it.
-        Waiting,
+        /// It is waiting for the store to be handed to it. `store` is the path
+        /// the open named; `readers` are the live direct readers of that store
+        /// whose identity records the writer could verify when its wait began,
+        /// ordered by process id and start, as a `held_by_readers` refusal
+        /// names them.
+        Waiting {
+            store: PathBuf,
+            readers: Vec<ReaderBreadcrumb>,
+        },
         /// It was refused because somebody holds the store.
         Refused,
         /// It owns the store's data lock.
         Acquired,
     }
 
-    type WriterAdmissionEvents = HashMap<PathBuf, std::collections::VecDeque<WriterAdmissionEvent>>;
+    /// One armed store: where its readers publish who they are, and what its
+    /// writable opens have done so far.
+    struct WatchedWriterAdmission {
+        runtime_dir: Option<PathBuf>,
+        events: std::collections::VecDeque<WriterAdmissionEvent>,
+    }
+
+    type WriterAdmissionEvents = HashMap<PathBuf, WatchedWriterAdmission>;
 
     static WRITER_ADMISSION_EVENTS: OnceLock<(Mutex<WriterAdmissionEvents>, Condvar)> =
         OnceLock::new();
@@ -3109,12 +3123,29 @@ pub mod read_persistence_test_scaffold {
     }
 
     /// Start recording writable-open admission events for THIS store.
+    /// Readers are looked for where a reader with no runtime root of its own
+    /// publishes them.
     pub fn watch_writer_admission_for_test(store_path: &Path) -> WriterAdmissionWatch {
+        watch_writer_admission_in_runtime_dir_for_test(store_path, None)
+    }
+
+    /// The same record, with readers also looked for below `runtime_dir`, the
+    /// root the store's readers were given.
+    pub fn watch_writer_admission_in_runtime_dir_for_test(
+        store_path: &Path,
+        runtime_dir: Option<&Path>,
+    ) -> WriterAdmissionWatch {
         let (events, changed) = writer_admission_events();
         events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(store_path.to_path_buf(), std::collections::VecDeque::new());
+            .insert(
+                store_path.to_path_buf(),
+                WatchedWriterAdmission {
+                    runtime_dir: runtime_dir.map(Path::to_path_buf),
+                    events: std::collections::VecDeque::new(),
+                },
+            );
         changed.notify_all();
         WriterAdmissionWatch {
             store: store_path.to_path_buf(),
@@ -3133,7 +3164,7 @@ pub mod read_persistence_test_scaffold {
             loop {
                 if let Some(event) = events
                     .get_mut(&self.store)
-                    .and_then(std::collections::VecDeque::pop_front)
+                    .and_then(|watched| watched.events.pop_front())
                 {
                     return Some(event);
                 }
@@ -3145,6 +3176,27 @@ pub mod read_persistence_test_scaffold {
                     .wait_timeout(events, left)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 events = next;
+            }
+        }
+
+        /// The next event this store's writable opens recorded, waiting for
+        /// as long as that takes. Nothing here reads a clock; a proof that
+        /// must not hang runs under an outer process timeout.
+        pub fn next_event(&self) -> WriterAdmissionEvent {
+            let (events, changed) = writer_admission_events();
+            let mut events = events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if let Some(event) = events
+                    .get_mut(&self.store)
+                    .and_then(|watched| watched.events.pop_front())
+                {
+                    return event;
+                }
+                events = changed
+                    .wait(events)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         }
     }
@@ -3165,10 +3217,34 @@ pub mod read_persistence_test_scaffold {
         let mut events = events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(recorded) = events.get_mut(store_path) {
-            recorded.push_back(event);
+        if let Some(watched) = events.get_mut(store_path) {
+            watched.events.push_back(event);
             changed.notify_all();
         }
+    }
+
+    /// Record that a writable open of an armed store is about to wait, naming
+    /// the readers it is waiting for. The scan runs only for an armed store,
+    /// and outside the record's lock.
+    pub(crate) fn note_writer_waiting_for_test(store_path: &Path) {
+        let (events, _) = writer_admission_events();
+        let runtime_dir = match events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(store_path)
+        {
+            Some(watched) => watched.runtime_dir.clone(),
+            None => return,
+        };
+        let (_, readers) =
+            super::retained_read_source::live_reader_holders(store_path, runtime_dir.as_deref());
+        note_writer_admission_for_test(
+            store_path,
+            WriterAdmissionEvent::Waiting {
+                store: store_path.to_path_buf(),
+                readers,
+            },
+        );
     }
 
     /// How the admission bytes of ONE physical store have been used, by

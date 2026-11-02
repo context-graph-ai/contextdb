@@ -87,9 +87,11 @@ fn an_existing_only_open_refuses_at_once_on_an_expired_deadline_and_otherwise_wa
             ..DatabaseOpenOptions::default()
         },
     );
-    assert_eq!(
-        next_event(&watch, "for the existing-only open with no deadline"),
-        WriterAdmissionEvent::Waiting,
+    assert!(
+        matches!(
+            next_event(&watch, "for the existing-only open with no deadline"),
+            WriterAdmissionEvent::Waiting { .. }
+        ),
         "with no deadline of its own, a change-open waits for the reader like every write open"
     );
 
