@@ -7353,6 +7353,10 @@ fn a_store_without_a_membership_directory_opens_only_when_both_vector_counts_are
 /// a roomy reader finds, and a reader that cannot hold the proof is refused
 /// typed, never answered as damage.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_commit_floor_seek_is_charged_for_the_proof_memory_it_uses() {
     let root = tempfile::tempdir().expect("task-scoped commit floor directory");
     let path = root.path().join("floor.db");
