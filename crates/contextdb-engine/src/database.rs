@@ -46,6 +46,8 @@ pub(crate) mod discard;
 pub(crate) mod purge_predicate;
 // Declared purge-following foreign keys.
 pub(crate) mod purge_followers;
+// What a purge of a parent also erases.
+mod purge_follower_expansion;
 use crate::blob_repository::BlobRepository;
 use crate::composite_store::{
     ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,
@@ -2286,6 +2288,9 @@ struct AuthoritativePurgeSelection {
     natural_key: NaturalKey,
     lineage_root: String,
     local_row_id: RowId,
+    /// A life that is no longer the visible row at its key: deleted, replaced
+    /// at the same key, or archived. Only a declared purge follower selects one.
+    retained: bool,
 }
 
 #[cfg(any(test, feature = "test-seams"))]

@@ -91,6 +91,7 @@ impl Database {
             natural_key: natural_key.clone(),
             lineage_root,
             local_row_id,
+            retained: false,
         })
     }
 
@@ -121,6 +122,7 @@ impl Database {
             || self.durable_lineage_table_generation(&selection.table, read_memory.clone())?
                 != selection.table_generation;
         if !retired_generation
+            && !selection.retained
             && self
                 .visible_row_by_natural_key(
                     &selection.table,
@@ -155,7 +157,13 @@ impl Database {
             selection.table_generation,
         );
         let state = self.lineage_state_lock.lock();
-        let sidecar = self.load_row_lineage_sidecar(&state, &row_sidecar_key)?;
+        let sidecar = self
+            .load_row_lineage_sidecar(&state, &row_sidecar_key)?
+            // A retained life shares its key with a later life; that life's
+            // sidecar is not evidence about this one.
+            .filter(|sidecar| {
+                !selection.retained || sidecar.local_row_id == Some(selection.local_row_id)
+            });
         let creation = self.load_unbound_creation_lineage(&state, &creation_lineage_key)?;
         let lifecycle = self
             .load_lineage_record(&state, &lifecycle_record_key)?
@@ -1471,6 +1479,7 @@ impl Database {
                         natural_key: item.natural_key.clone(),
                         lineage_root: lineage_root.clone(),
                         local_row_id: *row_id,
+                        retained: false,
                     }));
                 }
             }
@@ -1521,6 +1530,7 @@ impl Database {
                     natural_key: item.natural_key.clone(),
                     lineage_root,
                     local_row_id: record.local_row_id,
+                    retained: false,
                 }));
             }
         }
@@ -1672,6 +1682,7 @@ impl Database {
                         natural_key: item.natural_key.clone(),
                         lineage_root,
                         local_row_id,
+                        retained: false,
                     }),
                     None => self.retained_unbound_purge_selection(item, read_memory.clone())?,
                 };
@@ -1972,10 +1983,10 @@ impl Database {
     )]
     pub(super) fn commit_authoritative_purge_kernel_batch(
         &self,
-        selections: &[AuthoritativePurgeSelection],
+        named_selections: &[AuthoritativePurgeSelection],
         frontier_adoptions: &[IncomingPurgeFrontierAdoption],
         journal_outbound_delivery: bool,
-        report_shape: crate::custody::erasure::PurgeReportShape,
+        mut report_shape: crate::custody::erasure::PurgeReportShape,
         instructions: purge_predicate::Instructions<'_>,
         _vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1993,6 +2004,25 @@ impl Database {
                 ));
             };
 
+            // Declared followers of the named rows join the same erasure. They
+            // are found here, and again under the commit mutex below, so a
+            // child committed meanwhile cannot outlive its parent.
+            let mut follower_credit =
+                contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let mut working = named_selections.to_vec();
+            let followers = self.authoritative_purge_followers(
+                &working,
+                &mut follower_credit,
+                read_memory.clone(),
+            )?;
+            if !followers.is_empty()
+                && report_shape == crate::custody::erasure::PurgeReportShape::Single
+            {
+                // A purge that erased more than its named table says so per table.
+                report_shape = crate::custody::erasure::PurgeReportShape::PerTable;
+            }
+            working.extend(followers);
+            let selections: &[AuthoritativePurgeSelection] = &working;
             // Candidate discovery and the callback drain both happen before the
             // transaction commit mutex. The complete sorted hash set is then
             // quiesced and acquired atomically; a commit-locked discovery retry
@@ -2000,17 +2030,18 @@ impl Database {
             let mut held_hashes =
                 self.authoritative_purge_selected_blob_hashes(selections, read_memory.clone())?;
             let mut queue_drain = Some(self.event_bus.begin_authoritative_purge_queue_drain()?);
-            let publication_tables = selections
-                .iter()
-                .map(|selection| selection.table.clone())
-                .chain(instructions.outgoing.iter().map(|(table, _)| table.clone()))
-                .chain(
-                    frontier_adoptions
-                        .iter()
-                        .map(|adoption| adoption.table.clone()),
-                )
-                .collect::<BTreeSet<_>>();
             loop {
+                let selections: &[AuthoritativePurgeSelection] = &working;
+                let publication_tables = selections
+                    .iter()
+                    .map(|selection| selection.table.clone())
+                    .chain(instructions.outgoing.iter().map(|(table, _)| table.clone()))
+                    .chain(
+                        frontier_adoptions
+                            .iter()
+                            .map(|adoption| adoption.table.clone()),
+                    )
+                    .collect::<BTreeSet<_>>();
                 let blob_guard = self
                     .blob_repository
                     .acquire_exclusive_sorted(&held_hashes)?;
@@ -2024,6 +2055,7 @@ impl Database {
                     .read_publication_gate
                     .acquire_write(&publication_tables);
                 let mut newly_discovered = BTreeSet::new();
+                let mut newly_followed = Vec::new();
                 let attempt = self.allocate_ddl_lsn_maybe(|frontier| {
                     let (selected_hashes, survivor_hashes) = self
                         .authoritative_purge_current_blob_references(
@@ -2033,6 +2065,16 @@ impl Database {
                         )?;
                     newly_discovered.extend(selected_hashes.difference(&held_hashes).copied());
                     if !newly_discovered.is_empty() {
+                        return Ok(None);
+                    }
+                    // Under the commit mutex no child can commit: any follower
+                    // found now restarts the attempt with the whole union.
+                    newly_followed.extend(self.authoritative_purge_followers(
+                        selections,
+                        &mut follower_credit,
+                        read_memory.clone(),
+                    )?);
+                    if !newly_followed.is_empty() {
                         return Ok(None);
                     }
                     let deletable_hashes = selected_hashes
@@ -2357,6 +2399,16 @@ impl Database {
                     None => {
                         drop(blob_guard);
                         held_hashes.extend(newly_discovered);
+                        if !newly_followed.is_empty() {
+                            if report_shape == crate::custody::erasure::PurgeReportShape::Single {
+                                report_shape = crate::custody::erasure::PurgeReportShape::PerTable;
+                            }
+                            working.extend(newly_followed);
+                            held_hashes.extend(self.authoritative_purge_selected_blob_hashes(
+                                &working,
+                                read_memory.clone(),
+                            )?);
+                        }
                     }
                 }
             }

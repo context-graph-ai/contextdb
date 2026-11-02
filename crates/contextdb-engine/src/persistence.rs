@@ -106,7 +106,6 @@ mod writer_history;
 mod writer_recovery;
 mod writer_row_heads;
 pub(crate) mod writer_source;
-pub(crate) use authored_history::ArchivedFollower;
 use writer_file::{LockedWriterFile, OpenedWriterDatabase};
 pub(crate) use writer_recovery::WriterRecoveryBounds;
 pub(crate) use writer_source::{WriterSnapshot, WriterSnapshotHandle, WriterSnapshotWeak};

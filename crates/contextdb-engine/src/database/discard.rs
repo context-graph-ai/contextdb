@@ -1939,6 +1939,7 @@ fn discard_copy_selection(
         natural_key: discard_copy_key(&selection.natural_key)?,
         lineage_root: crate::memory_accounting::preparation_copy_string(&selection.lineage_root)?,
         local_row_id: selection.local_row_id,
+        retained: false,
     })
 }
 

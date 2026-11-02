@@ -1467,6 +1467,43 @@ fn insert_without_column_list() {
 }
 
 #[test]
+fn ddl_parses_follows_parent_purge_on_column_and_table_foreign_keys() {
+    let Statement::CreateTable(table) = parse(
+        "CREATE TABLE child (id UUID PRIMARY KEY, \
+         parent_id UUID REFERENCES parent(id) FOLLOWS PARENT PURGE, \
+         plain_id UUID REFERENCES parent(id), \
+         context_id UUID, other_id UUID, \
+         FOREIGN KEY (context_id, other_id) REFERENCES other(context_id, id) FOLLOWS PARENT PURGE, \
+         FOREIGN KEY (context_id, plain_id) REFERENCES parent(context_id, id))",
+    )
+    .expect("both foreign key spellings take the clause") else {
+        panic!("a CREATE TABLE statement");
+    };
+    let reference = |name: &str| {
+        table
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .and_then(|column| column.references.as_ref())
+            .unwrap_or_else(|| panic!("{name} references its parent"))
+            .follows_parent_purge
+    };
+    assert!(reference("parent_id"));
+    assert!(
+        !reference("plain_id"),
+        "leaving the clause out means no following"
+    );
+    assert_eq!(
+        table
+            .composite_foreign_keys
+            .iter()
+            .map(|fk| (fk.parent_table.as_str(), fk.follows_parent_purge))
+            .collect::<Vec<_>>(),
+        vec![("other", true), ("parent", false)]
+    );
+}
+
+#[test]
 fn ddl_reject_banned_features_inside_fk_clause() {
     let cases = [
         "CREATE TABLE child (c1 INTEGER, c2 INTEGER, FOREIGN KEY (lower(c1), c2) REFERENCES parent(a, b))",

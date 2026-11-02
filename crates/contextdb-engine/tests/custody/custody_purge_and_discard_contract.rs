@@ -2201,3 +2201,405 @@ fn an_ordinary_delete_of_a_later_life_keeps_the_purged_life_refused() {
         purged_at(third_frontier)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Declared children follow their parent's purge (CDB-206).
+// ---------------------------------------------------------------------------
+
+fn id_params(id: Uuid) -> HashMap<String, Value> {
+    HashMap::from([("id".to_string(), Value::Uuid(id))])
+}
+
+fn exec(db: &Database, sql: &str, params: &HashMap<String, Value>) {
+    db.execute(sql, params)
+        .unwrap_or_else(|err| panic!("{sql}: {err}"));
+}
+
+fn ids(db: &Database, table: &str) -> Vec<Uuid> {
+    let mut ids = db
+        .execute(&format!("SELECT id FROM {table}"), &p())
+        .unwrap_or_else(|err| panic!("{table} must answer: {err}"))
+        .rows()
+        .into_iter()
+        .map(|row| match &row[0] {
+            Value::Uuid(id) => *id,
+            other => panic!("{table}.id is a UUID, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn follower_lives(db: &Database, parent_table: &str, parent: Uuid) -> Vec<(String, bool)> {
+    db.purge_follower_lives_for_test(parent_table, &key_of(parent))
+        .expect("discover what follows the parent")
+        .into_iter()
+        .map(|(table, _, retained)| (table, retained))
+        .collect()
+}
+
+fn insert_child(db: &Database, table: &str, id: Uuid, parent_column: &str, parent: Uuid) {
+    exec(
+        db,
+        &format!("INSERT INTO {table} (id, {parent_column}, body) VALUES ($id, $parent, 'x')"),
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("parent".to_string(), Value::Uuid(parent)),
+        ]),
+    );
+}
+
+#[test]
+fn a_purge_erases_every_retained_life_of_a_declared_child() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("followers.db");
+    let db = Database::open(&path).expect("open the store");
+    for ddl in [
+        "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT) SYNC OFF",
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF",
+        "CREATE TABLE grandchildren (id UUID PRIMARY KEY, child_id UUID REFERENCES children(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF",
+        "CREATE TABLE bystanders (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id), body TEXT) SYNC OFF",
+    ] {
+        exec(&db, ddl, &p());
+    }
+    let (parent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    for id in [parent, other] {
+        exec(
+            &db,
+            "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+            &id_params(id),
+        );
+    }
+    let (live, deleted, twice, other_child) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    insert_child(&db, "children", live, "parent_id", parent);
+    insert_child(&db, "children", deleted, "parent_id", parent);
+    exec(
+        &db,
+        "DELETE FROM children WHERE id = $id",
+        &id_params(deleted),
+    );
+    // One key, two lives: the first deleted, the second current.
+    insert_child(&db, "children", twice, "parent_id", parent);
+    exec(
+        &db,
+        "DELETE FROM children WHERE id = $id",
+        &id_params(twice),
+    );
+    insert_child(&db, "children", twice, "parent_id", parent);
+    insert_child(&db, "children", other_child, "parent_id", other);
+    let grandchild = Uuid::new_v4();
+    insert_child(&db, "grandchildren", grandchild, "child_id", live);
+    let bystander = Uuid::new_v4();
+    insert_child(&db, "bystanders", bystander, "parent_id", parent);
+
+    let before = follower_lives(&db, "parents", parent);
+    assert_eq!(
+        before
+            .iter()
+            .filter(|(table, _)| table == "children")
+            .count(),
+        4,
+        "discovery finds the current, the deleted and both lives at one key: {before:?}"
+    );
+    assert_eq!(
+        before.iter().filter(|(_, retained)| *retained).count(),
+        2,
+        "two of the four are no longer the visible row at their key: {before:?}"
+    );
+    assert!(before.contains(&("grandchildren".to_string(), false)));
+    assert!(
+        !before.iter().any(|(table, _)| table == "bystanders"),
+        "an undeclared reference never follows"
+    );
+
+    let result = db
+        .execute("PURGE FROM parents WHERE id = $id", &id_params(parent))
+        .expect("the purge of the parent commits");
+    let report = normalize_erasure(&result);
+    assert_eq!(report["parents"].affected, 1, "{report:?}");
+    assert_eq!(
+        report["children"].affected, 4,
+        "every life is reported: {report:?}"
+    );
+    assert_eq!(report["grandchildren"].affected, 1, "{report:?}");
+    assert!(!report.contains_key("bystanders"), "{report:?}");
+
+    let check = |db: &Database| {
+        assert_eq!(ids(db, "parents"), vec![other]);
+        assert_eq!(ids(db, "children"), vec![other_child]);
+        assert!(ids(db, "grandchildren").is_empty());
+        assert_eq!(
+            ids(db, "bystanders"),
+            vec![bystander],
+            "an undeclared child survives"
+        );
+        assert!(
+            follower_lives(db, "parents", parent).is_empty(),
+            "no retained life of any follower still references the purged parent"
+        );
+        assert_eq!(
+            follower_lives(db, "parents", other),
+            vec![("children".to_string(), false)],
+            "the other parent's child is untouched"
+        );
+    };
+    check(&db);
+    db.close().expect("close the store");
+    let reopened = Database::open(&path).expect("reopen the store");
+    check(&reopened);
+}
+
+#[test]
+fn cg_shaped_followers_erase_only_their_own_arm() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let db = Database::open(root.path().join("cg-shaped.db")).expect("open the store");
+    for ddl in [
+        "CREATE TABLE digests (id UUID PRIMARY KEY, context_id UUID NOT NULL, summary TEXT, UNIQUE (context_id, id)) SYNC OFF",
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, context_id UUID NOT NULL, kind TEXT, UNIQUE (context_id, id)) SYNC OFF",
+        "CREATE TABLE reproducible_vectors (target_table TEXT NOT NULL, target_id UUID NOT NULL, \
+         embedding_space_id TEXT NOT NULL, model_generation INTEGER NOT NULL, context_id UUID NOT NULL, \
+         digest_id UUID REFERENCES digests(id) FOLLOWS PARENT PURGE, \
+         evidence_id UUID REFERENCES evidence(id) FOLLOWS PARENT PURGE, vector_text VECTOR(4), \
+         PRIMARY KEY (target_table, target_id, embedding_space_id), \
+         FOREIGN KEY (context_id, digest_id) REFERENCES digests(context_id, id), \
+         FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) SYNC OFF",
+        "CREATE TABLE reproducible_vector_handles (id UUID PRIMARY KEY, target_table TEXT NOT NULL, \
+         target_id UUID NOT NULL, context_id UUID NOT NULL, \
+         digest_id UUID REFERENCES digests(id) FOLLOWS PARENT PURGE, \
+         evidence_id UUID REFERENCES evidence(id) FOLLOWS PARENT PURGE, \
+         FOREIGN KEY (context_id, digest_id) REFERENCES digests(context_id, id), \
+         FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) SYNC OFF",
+        "CREATE TABLE rebuild_pending (embedding_space_id TEXT NOT NULL, model_generation INTEGER NOT NULL, \
+         state TEXT NOT NULL, target_table TEXT NOT NULL, target_id UUID NOT NULL, context_id UUID NOT NULL, \
+         digest_id UUID REFERENCES digests(id) FOLLOWS PARENT PURGE, \
+         evidence_id UUID REFERENCES evidence(id) FOLLOWS PARENT PURGE, \
+         PRIMARY KEY (embedding_space_id, model_generation, state, target_table, target_id), \
+         FOREIGN KEY (context_id, digest_id) REFERENCES digests(context_id, id), \
+         FOREIGN KEY (context_id, evidence_id) REFERENCES evidence(context_id, id)) SYNC OFF",
+    ] {
+        exec(&db, ddl, &p());
+    }
+    // One UUID names a digest and an evidence row; they are unrelated.
+    let shared = Uuid::new_v4();
+    let context = Uuid::new_v4();
+    let params = HashMap::from([
+        ("id".to_string(), Value::Uuid(shared)),
+        ("context".to_string(), Value::Uuid(context)),
+    ]);
+    exec(
+        &db,
+        "INSERT INTO digests (id, context_id, summary) VALUES ($id, $context, 's')",
+        &params,
+    );
+    exec(
+        &db,
+        "INSERT INTO evidence (id, context_id, kind) VALUES ($id, $context, 'text')",
+        &params,
+    );
+    for (target, arm) in [("digests", "digest_id"), ("evidence", "evidence_id")] {
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO reproducible_vectors (target_table, target_id, embedding_space_id, \
+                 model_generation, context_id, {arm}, vector_text) \
+                 VALUES ('{target}', $id, 'text', 1, $context, $id, $vector)"
+            ),
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(shared)),
+                ("context".to_string(), Value::Uuid(context)),
+                (
+                    "vector".to_string(),
+                    Value::Vector(vec![0.1, 0.2, 0.3, 0.4]),
+                ),
+            ]),
+        );
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO reproducible_vector_handles (id, target_table, target_id, context_id, {arm}) \
+                 VALUES ($handle, '{target}', $id, $context, $id)"
+            ),
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(shared)),
+                ("context".to_string(), Value::Uuid(context)),
+                ("handle".to_string(), Value::Uuid(Uuid::new_v4())),
+            ]),
+        );
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO rebuild_pending (embedding_space_id, model_generation, state, target_table, \
+                 target_id, context_id, {arm}) VALUES ('text', 1, 'waiting', '{target}', $id, $context, $id)"
+            ),
+            &params,
+        );
+    }
+
+    exec(&db, "PURGE FROM digests WHERE id = $id", &id_params(shared));
+
+    for table in [
+        "reproducible_vectors",
+        "reproducible_vector_handles",
+        "rebuild_pending",
+    ] {
+        let result = db
+            .execute(
+                &format!("SELECT target_table, digest_id, evidence_id FROM {table}"),
+                &p(),
+            )
+            .unwrap_or_else(|err| panic!("{table} must answer: {err}"));
+        let rows = result.rows();
+        assert_eq!(
+            rows,
+            vec![vec![text("evidence"), Value::Null, Value::Uuid(shared)]],
+            "{table}: the digest's row is erased and the evidence row with the same UUID survives"
+        );
+    }
+    assert_eq!(
+        ids(&db, "evidence"),
+        vec![shared],
+        "the unrelated parent survives"
+    );
+    assert!(ids(&db, "digests").is_empty());
+}
+
+/// An archived life is found from the parent it referenced, never from the
+/// child table's current declaration: the table may since point elsewhere,
+/// no longer follow, or be gone.
+#[test]
+fn a_purge_erases_child_lives_archived_by_an_earlier_drop() {
+    for recreated_as in [
+        Some("parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE"),
+        Some("parent_id UUID REFERENCES other_parents(id) FOLLOWS PARENT PURGE"),
+        Some("parent_id UUID REFERENCES parents(id)"),
+        None,
+    ] {
+        let root = tempfile::tempdir().expect("temporary test directory");
+        let path = root.path().join("archived-followers.db");
+        let db = Database::open(&path).expect("open the store");
+        for ddl in [
+            "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT) SYNC OFF",
+            "CREATE TABLE other_parents (id UUID PRIMARY KEY, batch TEXT) SYNC OFF",
+            "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF",
+        ] {
+            exec(&db, ddl, &p());
+        }
+        let (purged, kept) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [purged, kept] {
+            exec(
+                &db,
+                "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+                &id_params(id),
+            );
+            exec(
+                &db,
+                "INSERT INTO other_parents (id, batch) VALUES ($id, 'b')",
+                &id_params(id),
+            );
+        }
+        let (archived_purged, archived_kept) = (Uuid::new_v4(), Uuid::new_v4());
+        insert_child(&db, "children", archived_purged, "parent_id", purged);
+        insert_child(&db, "children", archived_kept, "parent_id", kept);
+        exec(&db, "DROP TABLE children", &p());
+        let mut fresh = Vec::new();
+        if let Some(column) = recreated_as {
+            exec(
+                &db,
+                &format!(
+                    "CREATE TABLE children (id UUID PRIMARY KEY, {column}, body TEXT) SYNC OFF"
+                ),
+                &p(),
+            );
+            for parent in [purged, kept] {
+                let id = Uuid::new_v4();
+                insert_child(&db, "children", id, "parent_id", parent);
+                fresh.push(id);
+            }
+        }
+        db.close().expect("close the store");
+        let db = Database::open(&path).expect("reopen the store");
+        assert!(
+            follower_lives(&db, "parents", purged)
+                .iter()
+                .any(|(table, retained)| table == "children" && *retained),
+            "{recreated_as:?}: the archived life is found from its parent"
+        );
+
+        exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(purged));
+
+        let check = |db: &Database| {
+            assert!(
+                !follower_lives(db, "parents", purged)
+                    .iter()
+                    .any(|(_, retained)| *retained),
+                "{recreated_as:?}: no archived life of the purged parent survives"
+            );
+            assert!(
+                follower_lives(db, "parents", kept)
+                    .iter()
+                    .any(|(table, retained)| table == "children" && *retained),
+                "{recreated_as:?}: the other parent's archived life survives"
+            );
+            if recreated_as.is_some() {
+                let following_this_parent = recreated_as.is_some_and(|column| {
+                    column.contains("parents(id) FOLLOWS") && !column.contains("other_")
+                });
+                let mut expected = fresh.clone();
+                if following_this_parent {
+                    expected.retain(|id| *id != fresh[0]);
+                }
+                expected.sort();
+                assert_eq!(
+                    ids(db, "children"),
+                    expected,
+                    "{recreated_as:?}: a fresh row follows only through the current declaration"
+                );
+            }
+        };
+        check(&db);
+        db.close().expect("close the store");
+        check(&Database::open(&path).expect("reopen the store"));
+    }
+}
+
+#[test]
+fn follows_parent_purge_is_validated_on_the_projected_catalog() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let db = Database::open(root.path().join("validated.db")).expect("open the store");
+    exec(
+        &db,
+        "CREATE TABLE parents (id UUID PRIMARY KEY, code TEXT UNIQUE) SYNC OFF",
+        &p(),
+    );
+    let refused = db
+        .execute(
+            "CREATE TABLE by_code (id UUID PRIMARY KEY, code TEXT REFERENCES parents(code) FOLLOWS PARENT PURGE) SYNC OFF",
+            &p(),
+        )
+        .expect_err("a reference through a key other than the parent's erasure key cannot follow");
+    assert!(
+        matches!(&refused, Error::SchemaInvalid { reason } if reason.contains("erasure key")),
+        "{refused}"
+    );
+    assert!(
+        db.table_meta("by_code").is_none(),
+        "a refused declaration creates nothing"
+    );
+    exec(
+        &db,
+        "CREATE TABLE by_id (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE) SYNC OFF",
+        &p(),
+    );
+    let explained = db
+        .explain("PURGE FROM parents WHERE code = 'x'")
+        .expect("explain the purge");
+    assert!(
+        explained.contains("follows parent purge: by_id(parent_id) -> parents(id)"),
+        "EXPLAIN names what follows: {explained}"
+    );
+}
