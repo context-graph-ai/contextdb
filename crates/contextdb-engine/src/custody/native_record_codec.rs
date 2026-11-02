@@ -1075,26 +1075,29 @@ fn ddl_codec(n: NodeView<'_>) -> Decoded<()> {
             text(0)?;
             pairs(1)?;
             texts(2)?;
-            // Single/composite foreign keys are tuple-encoded real core types.
+            // Single/composite foreign keys are tuple-encoded real core types,
+            // each ending in its FOLLOWS PARENT PURGE flag.
             for f in get(3)?.array()? {
                 let f = f?;
                 let mut a = f.array()?;
-                if a.len() != 3 {
+                if a.len() != 4 {
                     return Err(Invalid::Codec);
                 }
                 for _ in 0..3 {
                     a.next().ok_or(Invalid::Codec)??.string()?;
                 }
+                bool::decode(a.next().ok_or(Invalid::Codec)??)?;
             }
             for f in get(4)?.array()? {
                 let f = f?;
                 let mut a = f.array()?;
-                if a.len() != 3 {
+                if a.len() != 4 {
                     return Err(Invalid::Codec);
                 }
                 Seq::<&str>::decode(a.next().ok_or(Invalid::Codec)??)?;
                 a.next().ok_or(Invalid::Codec)??.string()?;
                 Seq::<&str>::decode(a.next().ok_or(Invalid::Codec)??)?;
+                bool::decode(a.next().ok_or(Invalid::Codec)??)?;
             }
             Seq::<Seq<'_, &str>>::decode(get(5)?)?;
         }
