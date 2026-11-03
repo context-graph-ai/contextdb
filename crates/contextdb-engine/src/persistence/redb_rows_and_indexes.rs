@@ -6075,9 +6075,13 @@ impl RedbPersistence {
         let corruption = match &err {
             redb::Error::Native(redb::NativeColdReadError::Corrupt(fault)) => Some(fault.reason),
             redb::Error::Native(redb::NativeColdReadError::Io(error)) | redb::Error::Io(error)
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                if super::io_kind_is_damage(error.kind()) =>
             {
-                Some("native storage extent is truncated")
+                Some(if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    "native storage extent is truncated"
+                } else {
+                    "native storage extent holds invalid data"
+                })
             }
             _ => None,
         };

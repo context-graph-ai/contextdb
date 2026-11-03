@@ -2,7 +2,7 @@
 
 #[cfg(any(test, feature = "test-seams"))]
 use super::read_persistence_test_scaffold::{
-    WriterFileIoKindForTest as IoKindForTest, note_writer_io_for_test, writer_read_fails_for_test,
+    WriterFileIoKindForTest as IoKindForTest, note_writer_io_for_test, writer_read_fault_for_test,
 };
 use std::fs::File;
 use std::io;
@@ -623,8 +623,8 @@ impl redb::NativeStorageBackend for WriterFileView {
         #[cfg(any(test, feature = "test-seams"))]
         note_writer_io_for_test(IoKindForTest::ReadBegin, offset, out.len(), None);
         #[cfg(any(test, feature = "test-seams"))]
-        if writer_read_fails_for_test() {
-            return Err(io::Error::from_raw_os_error(5).into());
+        if let Some(error) = writer_read_fault_for_test() {
+            return Err(error.into());
         }
         let result = self.native_owner()?.file.read_exact_at(out, offset);
         #[cfg(any(test, feature = "test-seams"))]

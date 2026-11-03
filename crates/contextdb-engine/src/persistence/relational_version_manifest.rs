@@ -184,6 +184,8 @@ impl RedbPersistence {
             | Error::StoreCorrupted { .. }
             | Error::ReadCancelled
             | Error::ReadFailure(_) => error,
+            // A manifest page the device failed to return is I/O, not damage.
+            error if super::is_storage_io(&error) => error,
             other => self.relational_manifest_damage(other),
         }
     }
@@ -2101,8 +2103,13 @@ impl RedbPersistence {
                                     TxId(captured.identity_tx_floor),
                                     Lsn(captured.source_lsn_floor),
                                 )
-                                .map_err(|error| {
-                                    verifier.corrupt(format!("version bounds: {error:?}"))
+                                .map_err(|error| match error {
+                                    // The bounds-table read failed: I/O, not damaged history.
+                                    error @ LoadReadImageError::Io { .. } => {
+                                        RedbPersistence::storage_message_error(error)
+                                    }
+                                    LoadReadImageError::Memory(error) => error,
+                                    error => verifier.corrupt(format!("version bounds: {error:?}")),
                                 })?;
                                 if created == tx || actual_witness.deleted_tx == Some(tx) {
                                     content_identity::visit_history_logical_key_for_test(

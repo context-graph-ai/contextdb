@@ -73,7 +73,7 @@ impl SavedAllocatorValue<'_> {
                 self.range.start + start..self.range.start + end,
                 self.hint,
             )
-            .map_err(io::Error::other)?;
+            .map_err(storage_error_as_io)?;
         out.copy_from_slice(&data);
         Ok(())
     }
@@ -156,6 +156,17 @@ impl SavedAllocatorValue<'_> {
 }
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+
+/// A storage failure carried through the allocator pager's `io::Result` keeps
+/// its I/O kind, so a short read stays damage and EIO stays I/O (CDB-207).
+fn storage_error_as_io(error: StorageError) -> io::Error {
+    match error {
+        StorageError::Io(error) => error,
+        #[cfg(feature = "contextdb-internal")]
+        StorageError::Native(crate::NativeColdReadError::Io(error)) => error,
+        error => io::Error::other(error),
+    }
+}
 
 // The region header is optional in the v3 file format
 // It's an artifact of the v2 file format, so we initialize new databases without headers to save space
@@ -1509,7 +1520,7 @@ impl TransactionalMemory {
                         crate::tree_store::btree::fixed_key_value_location::<AllocatorStateKey>(
                             root, &mem, hint, &key,
                         )
-                        .map_err(io::Error::other)?
+                        .map_err(storage_error_as_io)?
                     else {
                         if region.is_none() {
                             return Err(io::Error::new(

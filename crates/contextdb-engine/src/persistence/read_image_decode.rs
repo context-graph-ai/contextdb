@@ -661,11 +661,15 @@ pub(super) fn preserves_typed_read_refusal(error: &Error) -> bool {
 
 pub(super) fn read_image_error(error: Error) -> LoadReadImageError {
     if let Error::Other(message) = &error
-        && let Some(reason) = message
+        && super::is_storage_io(&error)
+    {
+        return match message
             .as_text()
             .and_then(|message| message.strip_prefix(STORAGE_IO_ERROR_PREFIX))
-    {
-        return read_image_io("reading Redb storage", reason);
+        {
+            Some(reason) => read_image_io("reading Redb storage", reason),
+            None => read_image_io("reading Redb storage", message),
+        };
     }
     if matches!(
         error,
@@ -687,6 +691,10 @@ pub(super) fn read_storage_error(error: redb::StorageError) -> LoadReadImageErro
             Ok(error) => read_image_error(*error),
             Err(error) => read_image_corruption(ReadImageCorruptionCause::MalformedRecord, error),
         },
+        // A short read or rejected bytes are damage; any other kind is I/O.
+        redb::StorageError::Io(error) if super::io_kind_is_damage(error.kind()) => {
+            read_image_corruption(ReadImageCorruptionCause::MalformedRecord, error)
+        }
         redb::StorageError::Io(error) => read_image_io("reading Redb storage", error),
         redb::StorageError::PreviousIo => read_image_io(
             "reading Redb storage",
@@ -3501,16 +3509,25 @@ pub(super) fn parse_companion_selector(bytes: &[u8]) -> Option<(usize, u64)> {
     (*blake3::hash(body).as_bytes() == checksum).then_some((active_slot, generation))
 }
 
-pub(super) fn read_companion_state(file: &mut File) -> std::result::Result<CompanionState, String> {
+/// The companion's state, or why it could not be read. An I/O failure keeps its
+/// kind, so a device that failed to answer is not reported as a lost companion.
+fn read_companion_state_classified(
+    file: &mut File,
+) -> std::result::Result<CompanionState, (Option<std::io::ErrorKind>, String)> {
     file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek companion: {error}"))?;
+        .map_err(|error| (Some(error.kind()), format!("seek companion: {error}")))?;
     let mut bytes = vec![0_u8; COMPANION_FILE_BYTES];
     let mut length = 0;
     while length < COMPANION_FILE_BYTES {
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(error) = super::read_persistence_test_scaffold::companion_read_fault_for_test()
+        {
+            return Err((Some(error.kind()), format!("read companion: {error}")));
+        }
         let read = match file.read(&mut bytes[length..]) {
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("read companion: {error}")),
+            Err(error) => return Err((Some(error.kind()), format!("read companion: {error}"))),
         };
         if read == 0 {
             break;
@@ -3520,13 +3537,16 @@ pub(super) fn read_companion_state(file: &mut File) -> std::result::Result<Compa
     bytes.truncate(length);
     if length == COMPANION_FILE_BYTES {
         let mut oversize = [0_u8; 1];
-        if file
-            .read(&mut oversize)
-            .map_err(|error| format!("probe companion length: {error}"))?
-            != 0
+        if file.read(&mut oversize).map_err(|error| {
+            (
+                Some(error.kind()),
+                format!("probe companion length: {error}"),
+            )
+        })? != 0
         {
-            return Err(format!(
-                "companion inode exceeds its fixed {COMPANION_FILE_BYTES}-byte layout"
+            return Err((
+                None,
+                format!("companion inode exceeds its fixed {COMPANION_FILE_BYTES}-byte layout"),
             ));
         }
     }
@@ -3543,7 +3563,7 @@ pub(super) fn read_companion_state(file: &mut File) -> std::result::Result<Compa
         });
     }
     if bytes.len() != COMPANION_FILE_BYTES || !bytes.starts_with(COMPANION_FILE_MAGIC) {
-        return Err("companion inode has an unsupported layout".to_owned());
+        return Err((None, "companion inode has an unsupported layout".to_owned()));
     }
     let slots: [std::result::Result<ParsedCompanionSlot, String>; 2] =
         std::array::from_fn(|slot| {
@@ -3601,7 +3621,7 @@ pub(super) fn read_companion_state(file: &mut File) -> std::result::Result<Compa
             .cloned()
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(format!("companion has no recoverable slot: {damage}"));
+        return Err((None, format!("companion has no recoverable slot: {damage}")));
     }
     if active.is_none() && pending.is_none() {
         if recoverable_generation_zero_initialization(&bytes) {
@@ -3614,7 +3634,10 @@ pub(super) fn read_companion_state(file: &mut File) -> std::result::Result<Compa
                 pending_matches_store: None,
             });
         }
-        return Err("empty companion has no valid generation-zero selector".to_owned());
+        return Err((
+            None,
+            "empty companion has no valid generation-zero selector".to_owned(),
+        ));
     }
     let (active_slot, active_record) = active
         .map(|(slot, record)| (Some(slot), Some(record)))
@@ -3630,6 +3653,10 @@ pub(super) fn read_companion_state(file: &mut File) -> std::result::Result<Compa
         pending_replacement,
         pending_matches_store: None,
     })
+}
+
+pub(super) fn read_companion_state(file: &mut File) -> std::result::Result<CompanionState, String> {
+    read_companion_state_classified(file).map_err(|(_, reason)| reason)
 }
 
 #[expect(
@@ -4355,7 +4382,7 @@ impl CompanionGuard {
             unlock_file(&file);
             return Err(error);
         }
-        let companion = match read_companion_state(&mut file) {
+        let companion = match read_companion_state_classified(&mut file) {
             Ok(companion) => companion,
             // The store is being created here, so an unreadable companion is
             // residue rather than this store's lost generation.
@@ -4368,7 +4395,13 @@ impl CompanionGuard {
                 pending_replacement: None,
                 pending_matches_store: None,
             },
-            Err(error) => {
+            // A device that failed to answer the companion read is I/O, not a
+            // lost companion: no corruption verdict and no reset advice.
+            Err((Some(kind), error)) if !super::io_kind_is_damage(kind) => {
+                unlock_file(&file);
+                return Err(RedbPersistence::storage_message_error(error));
+            }
+            Err((_, error)) => {
                 unlock_file(&file);
                 return Err(crate::funded_error::corruption_display(
                     writer_open_diagnostic_budget(),

@@ -917,6 +917,13 @@ pub(crate) fn read_totals(
     )?;
     let fingerprint = super::erasure_frontiers::binding_in_read(read)?;
     let expected = content_identity::content_size_root_in_read(read).map_err(|error| {
+        // A failed read of the root table is I/O, a refused one a budget.
+        if super::is_storage_io(&error)
+            || crate::read_image_memory::is_memory_refusal(&error)
+            || matches!(error, Error::ReadCancelled)
+        {
+            return error;
+        }
         crate::funded_error::corruption_display(Ok(memory.clone()), path, error)
     })?;
     control.try_shrink(CONTENT_IDENTITY_ROOTS_TABLE.name().len())?;

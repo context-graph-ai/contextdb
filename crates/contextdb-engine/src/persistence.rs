@@ -90,6 +90,8 @@ pub(crate) mod discard_history;
 pub(crate) mod native_storage_admission;
 #[cfg(test)]
 mod precommit_callback_atomicity_tests;
+#[cfg(all(test, feature = "in-process-test-seams"))]
+mod read_error_classification_tests;
 pub(crate) mod received_working;
 pub(crate) mod received_working_graph;
 pub(crate) mod received_working_source;
@@ -102,8 +104,6 @@ mod writer_ddl_occurrences;
 mod writer_ddl_summary;
 mod writer_export;
 mod writer_file;
-#[cfg(test)]
-mod read_error_classification_tests;
 mod writer_history;
 mod writer_recovery;
 mod writer_row_heads;
@@ -1314,6 +1314,34 @@ pub use read_image_decode::*;
 // Preserve native storage provenance without changing the shared error vocabulary.
 const STORAGE_IO_ERROR_PREFIX: &str = "contextdb-engine-storage-io:";
 
+/// A read that came back short, or bytes the reader rejected as invalid, is
+/// damage to the store. Every other I/O kind is the device failing to answer.
+fn io_kind_is_damage(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+    )
+}
+
+/// The device failed to answer a read or write: a transient I/O failure, never
+/// evidence that the store is damaged, and never a reason to advise a reset.
+fn storage_failure_is_io(error: &redb::StorageError) -> bool {
+    match error {
+        redb::StorageError::Io(error)
+        | redb::StorageError::Native(redb::NativeColdReadError::Io(error)) => {
+            !io_kind_is_damage(error.kind()) && error.kind() != std::io::ErrorKind::QuotaExceeded
+        }
+        redb::StorageError::PreviousIo => true,
+        _ => false,
+    }
+}
+
+/// An engine error already classified as the storage I/O class, including
+/// deferred or shared diagnostic text.
+fn is_storage_io(error: &Error) -> bool {
+    matches!(error, Error::Other(message) if message.starts_with(STORAGE_IO_ERROR_PREFIX))
+}
+
 #[cfg(test)]
 mod cdb130_storage_error_tests;
 
@@ -1842,33 +1870,90 @@ pub mod read_persistence_test_scaffold {
         operation()
     }
 
+    type WriterReadFault = (u64, u64, Option<std::io::ErrorKind>);
     thread_local! {
-        static WRITER_READ_FAULT: std::cell::Cell<(u64, u64)> =
-            const { std::cell::Cell::new((0, 0)) };
+        static WRITER_READ_FAULT: std::cell::Cell<WriterReadFault> =
+            const { std::cell::Cell::new((0, 0, None)) };
     }
 
     /// On this thread, the `nth` writer-file read inside `operation` fails
     /// once with EIO (os error 5), as a flaky disk would. Returns the result
     /// and how many writer-file reads `operation` made on this thread.
     pub fn fail_nth_writer_read_for_test<T>(nth: u64, operation: impl FnOnce() -> T) -> (T, u64) {
-        struct Restore((u64, u64));
+        fail_nth_writer_read_with_for_test(nth, None, operation)
+    }
+
+    /// As [`fail_nth_writer_read_for_test`], failing with `kind` instead of
+    /// EIO when it is given: UnexpectedEof is a short read, InvalidData bytes
+    /// the device rejected.
+    pub fn fail_nth_writer_read_with_for_test<T>(
+        nth: u64,
+        kind: Option<std::io::ErrorKind>,
+        operation: impl FnOnce() -> T,
+    ) -> (T, u64) {
+        struct Restore(WriterReadFault);
         impl Drop for Restore {
             fn drop(&mut self) {
                 WRITER_READ_FAULT.with(|slot| slot.set(self.0));
             }
         }
-        let _restore = Restore(WRITER_READ_FAULT.with(|slot| slot.replace((0, nth))));
+        let _restore = Restore(WRITER_READ_FAULT.with(|slot| slot.replace((0, nth, kind))));
         let value = operation();
         let reads = WRITER_READ_FAULT.with(|slot| slot.get().0);
         (value, reads)
     }
 
-    pub(super) fn writer_read_fails_for_test() -> bool {
-        WRITER_READ_FAULT.with(|slot| {
-            let (seen, nth) = slot.get();
+    thread_local! {
+        static COMPANION_READ_FAULT: std::cell::Cell<WriterReadFault> =
+            const { std::cell::Cell::new((0, 0, None)) };
+    }
+
+    /// On this thread, the `nth` companion-file read inside `operation` fails
+    /// once with `kind` (EIO when None). Returns the result and how many
+    /// companion reads `operation` made on this thread.
+    pub fn fail_nth_companion_read_for_test<T>(
+        nth: u64,
+        kind: Option<std::io::ErrorKind>,
+        operation: impl FnOnce() -> T,
+    ) -> (T, u64) {
+        struct Restore(WriterReadFault);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                COMPANION_READ_FAULT.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(COMPANION_READ_FAULT.with(|slot| slot.replace((0, nth, kind))));
+        let value = operation();
+        let reads = COMPANION_READ_FAULT.with(|slot| slot.get().0);
+        (value, reads)
+    }
+
+    /// Writer-file reads made on this thread so far.
+    pub fn writer_reads_seen_for_test() -> u64 {
+        WRITER_READ_FAULT.with(|slot| slot.get().0)
+    }
+
+    pub(super) fn companion_read_fault_for_test() -> Option<std::io::Error> {
+        COMPANION_READ_FAULT.with(|slot| {
+            let (seen, nth, kind) = slot.get();
             let seen = seen + 1;
-            slot.set((seen, nth));
-            nth != 0 && seen == nth
+            slot.set((seen, nth, kind));
+            (nth != 0 && seen == nth).then(|| match kind {
+                None => std::io::Error::from_raw_os_error(5),
+                Some(kind) => std::io::Error::new(kind, "injected companion read fault"),
+            })
+        })
+    }
+
+    pub(super) fn writer_read_fault_for_test() -> Option<std::io::Error> {
+        WRITER_READ_FAULT.with(|slot| {
+            let (seen, nth, kind) = slot.get();
+            let seen = seen + 1;
+            slot.set((seen, nth, kind));
+            (nth != 0 && seen == nth).then(|| match kind {
+                None => std::io::Error::from_raw_os_error(5),
+                Some(kind) => std::io::Error::new(kind, "injected writer read fault"),
+            })
         })
     }
 

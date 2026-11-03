@@ -820,6 +820,10 @@ impl GraphDiagnosis for GraphProofContext<'_> {
     fn diagnose(&self, error: LoadReadImageError) -> Error {
         match self.image {
             Some(source) => image_diagnosis(source, error),
+            // A graph page the device failed to return is I/O, not damage.
+            None if matches!(error, LoadReadImageError::Io { .. }) => {
+                RedbPersistence::storage_message_error(error)
+            }
             None => self.content_identity_corruption(format!("{error:?}")),
         }
     }

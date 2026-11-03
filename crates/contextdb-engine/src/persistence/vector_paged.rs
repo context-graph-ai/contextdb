@@ -240,8 +240,13 @@ pub(crate) fn validate_schema_meta_root(read: &redb::ReadTransaction) -> Result<
 )]
 pub(crate) fn validate_pages_root(read: &redb::ReadTransaction) -> Result<()> {
     let actual = content_identity::vector_schema_pages_root_in_read(read)?;
-    let expected = content_identity::vector_pages_root_in_read(read)
-        .map_err(|error| corruption(format!("pages root binding is invalid: {error}")))?;
+    let expected = content_identity::vector_pages_root_in_read(read).map_err(|error| {
+        // An unreadable binding is I/O or a budget, not an invalid one.
+        if super::is_storage_io(&error) || crate::read_image_memory::is_memory_refusal(&error) {
+            return error;
+        }
+        corruption(format!("pages root binding is invalid: {error}"))
+    })?;
     if actual != expected && !content_identity::vector_schema_meta_root_matches_in_read(read)? {
         return Err(corruption(
             "pages or schema physical root differs from its published binding",

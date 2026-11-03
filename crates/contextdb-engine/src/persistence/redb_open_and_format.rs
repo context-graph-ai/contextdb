@@ -2256,6 +2256,12 @@ impl RedbPersistence {
             // that the image itself is corrupt.
             return Self::storage_error(err);
         }
+        // A device that failed to answer a read says nothing about the bytes
+        // on disk: report the I/O failure, never corruption with reset advice.
+        if matches!(&err, redb::DatabaseError::Storage(error) if super::storage_failure_is_io(error))
+        {
+            return Self::storage_error(err);
+        }
         Error::StoreCorrupted {
             path: path.display().to_string().into(),
             reason: format!(
@@ -2709,7 +2715,11 @@ impl RedbPersistence {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(super) fn validate_format_marker(db: &redb::Database, path: &Path) -> Result<()> {
+        // A device that failed to answer is I/O, not damage (CDB-207).
         let read_txn = db.begin_read().map_err(|err| {
+            if matches!(&err, redb::TransactionError::Storage(error) if super::storage_failure_is_io(error)) {
+                return Self::storage_error(err);
+            }
             crate::funded_error::corruption_display(
                 writer_open_diagnostic_budget(),
                 path.display(),
@@ -2727,6 +2737,9 @@ impl RedbPersistence {
                     expected_release: CURRENT_FORMAT_VERSION.to_string(),
                 });
             }
+            Err(redb::TableError::Storage(error)) if super::storage_failure_is_io(&error) => {
+                return Err(Self::storage_error(error));
+            }
             Err(err) => {
                 return Err(crate::funded_error::corruption_display(
                     writer_open_diagnostic_budget(),
@@ -2741,6 +2754,9 @@ impl RedbPersistence {
         let value = table
             .get(FORMAT_VERSION_KEY)
             .map_err(|err| {
+                if super::storage_failure_is_io(&err) {
+                    return Self::storage_error(err);
+                }
                 crate::funded_error::corruption_display(
                     writer_open_diagnostic_budget(),
                     path.display(),
@@ -2779,6 +2795,9 @@ impl RedbPersistence {
                 graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE,
             ] {
                 read_txn.open_table(definition).map_err(|error| {
+                    if matches!(&error, redb::TableError::Storage(inner) if super::storage_failure_is_io(inner)) {
+                        return Self::storage_error(error);
+                    }
                     crate::funded_error::corruption_display(
                         writer_open_diagnostic_budget(),
                         path.display(),

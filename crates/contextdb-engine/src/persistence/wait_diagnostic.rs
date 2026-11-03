@@ -115,7 +115,9 @@ impl PreparedOpenDiagnostic {
             redb::DatabaseError::Storage(redb::StorageError::Io(error))
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     && display_contains_registry(error));
-        let corruption = !permission && !registry;
+        let io = matches!(&source,
+            redb::DatabaseError::Storage(error) if super::storage_failure_is_io(error));
+        let corruption = !permission && !registry && !io;
         // The legacy storage receiver also consumes recorded coordination
         // and disk-growth refusals. Keep its exact precedence and classes;
         // their producer-owned text remains a separate admission gap.
@@ -168,7 +170,9 @@ impl PreparedOpenDiagnostic {
         // Preserve the existing registry uncertainty exception, including a
         // custom source whose text arrives in more than one Display fragment.
         let registry = kind == std::io::ErrorKind::WouldBlock && display_contains_registry(&source);
-        let corruption = !permission && !registry;
+        // Only a short read or rejected bytes are damage; any other I/O kind is
+        // the device failing to answer, reported as I/O without reset advice.
+        let corruption = !permission && !registry && super::io_kind_is_damage(kind);
         let reason = DiagnosticText::from_shared(self.source.publish(OpenIoDiagnostic {
             source: OpenDiagnosticSource::Wait(source),
             corruption,

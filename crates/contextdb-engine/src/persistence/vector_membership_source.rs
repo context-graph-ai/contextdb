@@ -673,6 +673,7 @@ fn validate_captured_roots(
             .map_err(|error| {
             if crate::read_image_memory::is_memory_refusal(&error)
                 || matches!(error, Error::ReadCancelled)
+                || super::is_storage_io(&error)
             {
                 return error;
             }

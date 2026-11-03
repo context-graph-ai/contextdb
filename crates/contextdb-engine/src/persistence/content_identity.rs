@@ -6182,6 +6182,9 @@ impl ContentIdentityReadVerifier {
             // operator looking for damage that is not there, when what they
             // have is a budget to raise.
             Error::MemoryBudgetExceeded { .. } => error,
+            // A proof page the device failed to return says nothing about
+            // whether the proof matches: report the I/O failure.
+            error if super::is_storage_io(&error) => error,
             other => self.corrupt(other),
         }
     }

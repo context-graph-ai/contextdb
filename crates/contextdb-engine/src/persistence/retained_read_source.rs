@@ -2000,7 +2000,8 @@ impl CheckpointReadSource {
             Error::StoreCorrupted { .. } | Error::ReadCancelled | Error::ReadFailure(_) => error,
             error
                 if crate::read_image_memory::is_memory_refusal(&error)
-                    || crate::read_image_memory::is_missing_decode_owner(&error) =>
+                    || crate::read_image_memory::is_missing_decode_owner(&error)
+                    || super::is_storage_io(&error) =>
             {
                 error
             }
@@ -3059,7 +3060,8 @@ impl RetainedReadSource {
             Error::StoreCorrupted { .. } | Error::ReadCancelled | Error::ReadFailure(_) => error,
             error
                 if crate::read_image_memory::is_memory_refusal(&error)
-                    || crate::read_image_memory::is_missing_decode_owner(&error) =>
+                    || crate::read_image_memory::is_missing_decode_owner(&error)
+                    || super::is_storage_io(&error) =>
             {
                 error
             }
@@ -5397,6 +5399,10 @@ impl RetainedReadSource {
                     &read,
                 );
                 let index = read.open_table(definition).map_err(|error| {
+                    // A device that failed to return the index root is I/O.
+                    if matches!(&error, redb::TableError::Storage(inner) if super::storage_failure_is_io(inner)) {
+                        return E::from(RedbPersistence::storage_error(error));
+                    }
                     E::from(self.content_identity_corruption(format!(
                         "cannot read physical index {}: {error}",
                         declaration.name
@@ -5415,6 +5421,9 @@ impl RetainedReadSource {
                     let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
                         TableDefinition::new(name.as_str());
                     Some(read.open_table(definition).map_err(|error| {
+                        if matches!(&error, redb::TableError::Storage(inner) if super::storage_failure_is_io(inner)) {
+                            return E::from(RedbPersistence::storage_error(error));
+                        }
                         E::from(self.content_identity_corruption(format!(
                             "cannot read current index {}: {error}",
                             declaration.name

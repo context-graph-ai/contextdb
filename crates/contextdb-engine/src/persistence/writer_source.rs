@@ -4743,6 +4743,8 @@ impl WriterSnapshotHandle {
                     | Error::ReadFailure(_)
                     | Error::MemoryBudgetExceeded { .. }
                     | Error::StoreCorrupted { .. } => error,
+                    // A body read the device failed to answer is I/O, not damage.
+                    error if super::is_storage_io(&error) => error,
                     other => verifier.corrupt(other),
                 };
                 let mut previous = None::<[u8; 24]>;
@@ -4820,6 +4822,10 @@ impl WriterSnapshotHandle {
                                             LoadReadImageError::Memory(error) => {
                                                 typed_body_error(error)
                                             }
+                                            // The bounds-table read failed: I/O, not damaged history.
+                                            error @ LoadReadImageError::Io { .. } => {
+                                                RedbPersistence::storage_message_error(error)
+                                            }
                                             other => verifier.corrupt(other),
                                         }
                                     })
@@ -4865,6 +4871,9 @@ impl WriterSnapshotHandle {
                             )
                             .map_err(|error| match error {
                                 LoadReadImageError::Memory(error) => typed_body_error(error),
+                                error @ LoadReadImageError::Io { .. } => {
+                                    RedbPersistence::storage_message_error(error)
+                                }
                                 other => verifier.corrupt(other),
                             })?;
                         }
@@ -5036,6 +5045,9 @@ impl WriterReadCursor {
                                 )
                                 .map_err(|error| match error {
                                     LoadReadImageError::Memory(error) => error,
+                                    error @ LoadReadImageError::Io { .. } => {
+                                        RedbPersistence::storage_message_error(error)
+                                    }
                                     other => verifier.corrupt(other),
                                 })?;
                                 expected = Some((witness.identity, coordinate.to_vec()));
