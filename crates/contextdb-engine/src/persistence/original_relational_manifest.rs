@@ -450,3 +450,6 @@ impl RedbPersistence {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod refusal_tests;
