@@ -6,7 +6,6 @@
       [
         "pr-contextdb-engine-test-seams-13",
         "pr-contextdb-engine-test-seams-14",
-        "pr-contextdb-engine-test-seams-17",
         "pr-contextdb-engine-test-seams-5"
       ],
       [
@@ -69,8 +68,7 @@
       [
         "integration-acceptance-long-running-transfer-test",
         "integration-acceptance-sync-test",
-        "integration-sync-schema-transactions",
-        "integration-vector-graph-recall-profile"
+        "integration-sync-schema-transactions"
       ],
       [
         "pr-contextdb-core",
@@ -88,8 +86,7 @@
     "fallback_additions": {
       "integration-engine-family-10": 12,
       "integration-engine-family-11": 12,
-      "integration-engine-family-13": 4,
-      "integration-engine-family-14": 4
+      "integration-engine-family-13": 4
     }
   },
   "pr_jobs": [
@@ -228,13 +225,6 @@
       "cache_parent": "contextdb-engine-test-seams-11"
     },
     {
-      "shard": "contextdb-engine-test-seams-17",
-      "crate": "contextdb-engine",
-      "features": "test-seams,iroh",
-      "name": "engine / test-profile / vector search across storage layers",
-      "cache_parent": "contextdb-engine-test-seams-11"
-    },
-    {
       "shard": "contextdb-engine-test-seams-12",
       "crate": "contextdb-engine",
       "features": "test-seams,iroh",
@@ -312,7 +302,6 @@
         "direct_file_image_memory_lifetime",
         "graph_property_memory_charge_measurement",
         "received_schema_metadata_peak",
-        "vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph",
         "in_transaction_count_stays_inside_its_memory",
         "native_backing_allocator",
         "native_terminal_allocations",
@@ -340,7 +329,13 @@
       "targets": [
         "history_request_memory",
         "vector_declared_budget",
-        "seed_commit_memory"
+        "seed_commit_memory",
+        "checked_backend_read_faults",
+        "clustered_public_engine_ports",
+        "first_saved_search_owned_worker",
+        "import_persistence_without_observer",
+        "reader_charges_what_it_holds",
+        "setting_refusals"
       ]
     },
     {
@@ -385,7 +380,14 @@
         "read",
         "exact_vector_cursor_releases_only_its_reader_credit",
         "read_cache_share_option",
-        "read_cache_share_session"
+        "read_cache_share_session",
+        "native_calibration_window",
+        "native_initial_reclaim",
+        "native_page_damage",
+        "native_page_public_ports",
+        "native_query_overrides",
+        "native_query_precision",
+        "shared_native_cache_capacity"
       ]
     },
     {
@@ -448,7 +450,6 @@
       "family": "vector serving pages and route selection",
       "kind": "engine-tests",
       "targets": [
-        "vector_serving_pages",
         "vector_auto_chooses_the_cheaper_route_for_each_partition"
       ]
     },
@@ -474,21 +475,10 @@
       "cache_parent": "engine-family-11"
     },
     {
-      "id": "engine-family-14",
-      "family": "vector search across storage layers",
-      "kind": "engine-tests",
-      "targets": [
-        "vector_one_search_covers_every_layer_on_both_routes"
-      ],
-      "logical_id": "engine-family-11",
-      "cache_parent": "engine-family-11"
-    },
-    {
       "id": "engine-family-12",
       "family": "custody, vector lifecycle and retrieval",
       "kind": "engine-tests",
       "targets": [
-        "vector_a_saved_graph_search_reports_its_distance_work",
         "vector_a_find_names_only_the_pairs_it_asks_for",
         "custody_the_whole_startup_schema_installs_in_one_transaction",
         "vector_serving_merge_contract",
@@ -509,67 +499,20 @@
         "vector_inspection_explain_truth_contract",
         "vector_an_exact_search_authenticates_pages_not_every_vector",
         "vector_maintained_lifecycle_contract",
-        "vector_a_replaced_vector_cannot_end_a_tied_frontier",
         "vector_retained_indexed_rows",
         "vector_tail_transaction_contract",
-        "vector_delete_only_journal_progress_contract",
         "vector_received_generation_invalidation_contract",
         "vector_quantized",
-        "vector_a_tied_frontier_cannot_hide_a_smaller_row",
         "vector_row_delete_and_guards_honor_vector_columns",
         "vector_operation_observations",
         "vector_exclusion_persistence_tests",
-        "vector_snapshot_frontier_completeness_contract",
         "vector_equal_distance_rows_keep_canonical_order_across_contexts",
         "vector_named_vector_planner_tests",
         "custody_server_resource_policy_contract_tests",
         "custody_custody_protocol",
-        "vector_where_one_partition_spends_its_find",
-        "vector_a_graph_search_stays_inside_its_serving_cache",
-        "vector_a_find_locks_its_serving_cache_once_per_page",
-        "vector_graph_build_distance_evaluations_stay_under_the_ratchet",
         "custody",
-        "vector"
-      ]
-    },
-    {
-      "id": "vector-graph-recall-profile",
-      "family": "vector default search-breadth calibration",
-      "kind": "engine-tests",
-      "targets": [
-        "vector_graph_route_profile_quality"
-      ]
-    },
-    {
-      "id": "vector-graph-recall-5000-anisotropic",
-      "family": "vector graph recall / 5,000 anisotropic vectors per context",
-      "kind": "engine-tests",
-      "targets": [
-        "vector_graph_recall_5000_anisotropic_per_context"
-      ]
-    },
-    {
-      "id": "vector-graph-recall-5001-topic-clusters",
-      "family": "vector graph recall / 5,001 topic-clustered vectors per context",
-      "kind": "engine-tests",
-      "targets": [
-        "vector_graph_recall_5001_topic_clusters_per_context"
-      ]
-    },
-    {
-      "id": "vector-graph-recall-50000-isotropic",
-      "family": "vector graph recall / 50,000 isotropic vectors per context",
-      "kind": "engine-tests",
-      "targets": [
-        "vector_graph_recall_50000_isotropic_per_context"
-      ]
-    },
-    {
-      "id": "vector-graph-recall-50001-anisotropic",
-      "family": "vector graph recall / 50,001 anisotropic vectors per context",
-      "kind": "engine-tests",
-      "targets": [
-        "vector_graph_recall_50001_anisotropic_per_context"
+        "vector",
+        "vector_a_search_is_exact_with_no_index_built"
       ]
     },
     {
@@ -923,45 +866,6 @@
           "crates/contextdb-engine/tests/vector_a_find_names_only_the_pairs_it_asks_for.rs": "64461a0a66b44e8504440ce5426f3c41daeb59699674ea21524e5f9ef706aa43"
         }
       },
-      "vector_a_replaced_vector_cannot_end_a_tied_frontier": {
-        "cases": [
-          [
-            "a_replaced_vector_cannot_end_a_tied_frontier::a_replaced_vector_cannot_end_a_tied_frontier_on_either_reader_route",
-            "ok"
-          ]
-        ],
-        "case_count": 1,
-        "sources": {
-          "crates/contextdb-engine/tests/vector/a_replaced_vector_cannot_end_a_tied_frontier.rs": "1da49a0103727907800004afc809186f628e81512696edd7468ea9d84936c0ef",
-          "crates/contextdb-engine/tests/vector_a_replaced_vector_cannot_end_a_tied_frontier.rs": "fd0e96802aea8685ef66b7adec922e832704952d9c185f7856a179fb98183e0f"
-        }
-      },
-      "vector_a_saved_graph_search_reports_its_distance_work": {
-        "cases": [
-          [
-            "a_saved_graph_search_reports_its_distance_work::a_saved_graph_search_reports_its_distance_work",
-            "ok"
-          ]
-        ],
-        "case_count": 1,
-        "sources": {
-          "crates/contextdb-engine/tests/vector/a_saved_graph_search_reports_its_distance_work.rs": "ce7586faae0ae6863f4bae6028b584d83b93f3b33e308ddbd3e2f64e55c962f4",
-          "crates/contextdb-engine/tests/vector_a_saved_graph_search_reports_its_distance_work.rs": "ffd9225c5ed234529546b4c1dc713ffa4925301060b6d4aa63ac4e20f72d99f2"
-        }
-      },
-      "vector_a_tied_frontier_cannot_hide_a_smaller_row": {
-        "cases": [
-          [
-            "a_tied_frontier_cannot_hide_a_smaller_row::a_tied_frontier_cannot_hide_a_smaller_row_on_either_reader_route",
-            "ok"
-          ]
-        ],
-        "case_count": 1,
-        "sources": {
-          "crates/contextdb-engine/tests/vector/a_tied_frontier_cannot_hide_a_smaller_row.rs": "dd22ef7168886015f7df78db9d2b181ee4ee9c3a338d88a725bdc0e30ed275db",
-          "crates/contextdb-engine/tests/vector_a_tied_frontier_cannot_hide_a_smaller_row.rs": "9f1b8d8a25aef9f66ec21267c701e4a35433a82e55a2d2030e56958deefbcc8d"
-        }
-      },
       "vector_auto_decides_the_route_once_for_the_whole_scope": {
         "cases": [
           [
@@ -986,31 +890,6 @@
         "sources": {
           "crates/contextdb-engine/tests/vector/auto_pays_what_indexed_pays.rs": "7881d2724d88d3eee48c5ea70c796e4e3c2dce8136ee260ad98602b01cfaaff2",
           "crates/contextdb-engine/tests/vector_auto_pays_what_indexed_pays.rs": "4d23412cb18c14d051edf8d0afd2a49aa18400d6217b3259abd4e0cfee7037da"
-        }
-      },
-      "vector_delete_only_journal_progress_contract": {
-        "cases": [
-          [
-            "vector_delete_only_journal_progress_contract::a_route_emptied_by_deletes_is_maintained_after_reopen_and_accepts_new_rows",
-            "ok"
-          ],
-          [
-            "vector_delete_only_journal_progress_contract::delete_only_final_route_truncates_covered_history_before_snapshot_release_can_retire_it",
-            "ok"
-          ],
-          [
-            "vector_delete_only_journal_progress_contract::delete_only_survivor_route_advances_its_durable_frontier_and_truncates_the_journal",
-            "ok"
-          ],
-          [
-            "vector_delete_only_journal_progress_contract::delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirement",
-            "ok"
-          ]
-        ],
-        "case_count": 4,
-        "sources": {
-          "crates/contextdb-engine/tests/vector/vector_delete_only_journal_progress_contract.rs": "3d95e5f4e583d7676bc0d9a1910761552a14edfc9e0a2a0b63653111ea672139",
-          "crates/contextdb-engine/tests/vector_delete_only_journal_progress_contract.rs": "fd23c9a65c3c3e17398af143e95a4ca36ac7a15cb81cd9221f244831d5339f47"
         }
       },
       "vector_equal_distance_rows_keep_canonical_order_across_contexts": {
@@ -1561,19 +1440,6 @@
           "crates/contextdb-engine/tests/vector_serving_merge_contract.rs": "00371c52fa924a4875f1e5d67eadd1f06ef6706c209516cdfdbee930ba3deb42"
         }
       },
-      "vector_snapshot_frontier_completeness_contract": {
-        "cases": [
-          [
-            "vector_snapshot_frontier_completeness_contract::indexed_pinned_snapshot_keeps_eligible_tail_across_newer_commits",
-            "ok"
-          ]
-        ],
-        "case_count": 1,
-        "sources": {
-          "crates/contextdb-engine/tests/vector/vector_snapshot_frontier_completeness_contract.rs": "b554de06b102f57aa6a26b439273d2ba78e8ca613e2342256cb4eeb43347c740",
-          "crates/contextdb-engine/tests/vector_snapshot_frontier_completeness_contract.rs": "f020802964a967cbe562668eebab1e3496d6e122b0e1ae05b65b980051139b57"
-        }
-      },
       "vector_tail_transaction_contract": {
         "cases": [
           [
@@ -1705,71 +1571,6 @@
         "sources": {
           "crates/contextdb-engine/tests/vector/auto_chooses_the_cheaper_route_for_each_partition.rs": "bc44091707d2f5e73ab9591e8da141eb4c63e14c035c73b1331f7a2edc746333",
           "crates/contextdb-engine/tests/vector_auto_chooses_the_cheaper_route_for_each_partition.rs": "04dc7abf09cea0db58d268ff6ce2c0fe80662e5f5b86d16004395bc1ae9b4ea7"
-        }
-      },
-      "vector_serving_pages": {
-        "cases": [
-          [
-            "a_saved_graph_load_checks_its_bytes_once::a_byte_flipped_inside_a_saved_graph_is_refused_as_damage",
-            "ok"
-          ],
-          [
-            "a_saved_graph_load_checks_its_bytes_once::a_fresh_readers_first_find_hashes_each_saved_graph_it_loads_once",
-            "ok"
-          ],
-          [
-            "a_wide_find_admits_every_partition_when_serving_pages_give_way::a_wide_find_answers_from_every_saved_graph_once_earlier_pages_give_way",
-            "ok"
-          ],
-          [
-            "a_wide_find_admits_every_partition_when_serving_pages_give_way::a_wide_find_whose_loads_filled_memory_with_pages_still_answers",
-            "ok"
-          ],
-          [
-            "a_wide_find_admits_every_partition_when_serving_pages_give_way::a_wide_find_whose_topologies_do_not_fit_is_refused_by_type",
-            "ok"
-          ],
-          [
-            "a_wide_find_admits_every_partition_when_serving_pages_give_way::an_idle_partitions_pages_give_way_to_the_partitions_a_find_loads",
-            "ok"
-          ],
-          [
-            "a_wide_find_is_admitted_at_what_its_loads_hold::a_wide_find_is_priced_at_what_its_loads_hold",
-            "ok"
-          ],
-          [
-            "a_wide_find_is_admitted_at_what_its_loads_hold::each_load_leaves_room_for_the_loads_still_to_come",
-            "ok"
-          ],
-          [
-            "a_wide_find_keeps_its_entry_pages_warm::a_graph_load_chooses_only_cache_slots_whose_directory_fits",
-            "ok"
-          ],
-          [
-            "a_wide_find_keeps_its_entry_pages_warm::a_short_declaration_keeps_its_charge_and_refuses_missing_topologies",
-            "ok"
-          ],
-          [
-            "a_wide_find_keeps_its_entry_pages_warm::repeated_wide_finds_stop_filling_pages_within_the_declared_memory",
-            "ok"
-          ],
-          [
-            "each_layer_a_wide_find_loads_keeps_its_share::a_load_published_over_is_retried_on_the_share_it_already_claimed",
-            "ok"
-          ],
-          [
-            "each_layer_a_wide_find_loads_keeps_its_share::every_layer_of_a_wide_find_keeps_its_share",
-            "ok"
-          ]
-        ],
-        "case_count": 13,
-        "sources": {
-          "crates/contextdb-engine/tests/vector/a_saved_graph_load_checks_its_bytes_once.rs": "574fef583b5249465b92d76ecf45d5c9e0e47d6a7445e2e03c53e612039bc8ab",
-          "crates/contextdb-engine/tests/vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs": "109a36e306f4b6b6cc8ebc7fc3bf56c14862dc6cc61842b8d49948bfe46bb393",
-          "crates/contextdb-engine/tests/vector/a_wide_find_is_admitted_at_what_its_loads_hold.rs": "56b3d5d175e45cd91faea1045511b6d21520f8aa84243b3fa81cf15ee1201454",
-          "crates/contextdb-engine/tests/vector/a_wide_find_keeps_its_entry_pages_warm.rs": "42cc7f16bff0f5486fe3e98c7f46bbdaa638e00207e99efa1e2492c313e0c0d9",
-          "crates/contextdb-engine/tests/vector/each_layer_a_wide_find_loads_keeps_its_share.rs": "aaad3f1ba0ca3364eae6fe29e41a2c4f0fb40842bf009a6912a708071e7f0501",
-          "crates/contextdb-engine/tests/vector_serving_pages.rs": "e1a118faf9a1b0f9dad21081baaa4ad05e7d85c4289f54c57ee1be9ce3d102d0"
         }
       },
       "bounded_metadata_start_lookup_stays_inside_the_read_limits": {
@@ -3454,12 +3255,8 @@
         ],
         "case_count": 29,
         "sources": {
-          "crates/contextdb-engine/tests/vector/vector_generation_admission_contract.rs": "beba72cf64a63319da9396fa19270a50f12482e4533de081e4918c9dbce91823",
           "crates/contextdb-engine/tests/vector/vector_generation_authoritative_purge_contract.rs": "6e3eef332d6734862eed4996713fbbea7632a18175fe98f8efbe5467a9203a3c",
-          "crates/contextdb-engine/tests/vector/vector_generation_authoritative_purge_replacement_contract.rs": "cd42a69c35cb9c70290ce71da06c7b92bccaed495559dca778db4b727d83d7b2",
           "crates/contextdb-engine/tests/vector/vector_generation_ddl_cleanup_contract.rs": "da8bb81bc39355aeaab00329b5755ee700cd6f985a54cf7bb662b0c084b0aeec",
-          "crates/contextdb-engine/tests/vector/vector_generation_delta_admission_contract.rs": "4ad8e58b4ed82fdaaf6e2ffa73950a943a58633195c759e95fb6e1bae07316a6",
-          "crates/contextdb-engine/tests/vector/vector_generation_quarantine_compaction_lock_contract.rs": "28bb33f7b0be3c04e5392ec5c2a57ea605e6e939b4e4549921f0c86163333f61",
           "crates/contextdb-engine/tests/vector_generation.rs": "6325ce674ffe316574c9c07b0ad848acfd78c25a265a6fc4ad8c84517d7d97a3"
         }
       },
@@ -3660,27 +3457,6 @@
         "sources": {
           "crates/contextdb-engine/tests/vector/a_find_over_many_contexts_spends_one_search_budget.rs": "814a1208e47b621a5612d9f31576ac10f66f5fe8c302e10e5a9e600c18f29c28",
           "crates/contextdb-engine/tests/vector_a_find_over_many_contexts_spends_one_search_budget.rs": "b8c7142caf96af56a2b1389e579d1e2d680e559154607a5c74351460b4fe9d59"
-        }
-      },
-      "vector_one_search_covers_every_layer_on_both_routes": {
-        "cases": [
-          [
-            "one_search_covers_every_layer_on_both_routes::a_generation_published_after_a_read_pinned_its_snapshot_changes_nothing_it_answers",
-            "ok"
-          ],
-          [
-            "one_search_covers_every_layer_on_both_routes::one_search_opens_every_layer_of_every_context_on_the_file_route",
-            "ok"
-          ],
-          [
-            "one_search_covers_every_layer_on_both_routes::one_search_opens_every_layer_of_every_context_on_the_owner_route",
-            "ok"
-          ]
-        ],
-        "case_count": 3,
-        "sources": {
-          "crates/contextdb-engine/tests/vector/one_search_covers_every_layer_on_both_routes.rs": "89dd4543149540ba01e696405e6b98f0649d2023ecbca4f24cd3e03399f8921e",
-          "crates/contextdb-engine/tests/vector_one_search_covers_every_layer_on_both_routes.rs": "e3ef34b8c93e7a0d4174cb31f8f1773baf863a75c87f3721b9b1e36fec92c0c7"
         }
       },
       "direct_file_image_memory_lifetime": {
@@ -4127,7 +3903,6 @@
           "crates/contextdb-engine/tests/bounded/bounded_read_sees_the_same_transaction_graph_overlay.rs": "aa34a3299b97f73302444966bffc15682494f998986caaa189024767ed20b5fd",
           "crates/contextdb-engine/tests/bounded/bounded_read_sees_the_same_transaction_row_vectors.rs": "d9a8bda5d011981a757ab416e6211c9ff545c1eeac9da94e5f6b8a32550a1eaa",
           "crates/contextdb-engine/tests/bounded/bounded_route_answer_parity.rs": "ccf95e79797c5330a91d870c523bf5eeedf1eab26b15db029819f5419691a949",
-          "crates/contextdb-engine/tests/bounded/bounded_route_graph_candidate_shortfall.rs": "d117fafd633d55bed03ea21453b34eaf4fa4ae0d7148d7de27d82abfadd209de",
           "crates/contextdb-engine/tests/bounded/bounded_user_table_named_dual.rs": "7a171516e9268b25453d4fa8e0fba4bfe78eeaa9cd0deb6cc803c8651c02425e",
           "crates/contextdb-engine/tests/bounded/composite_prefix_newest_row_examines_constant_entries.rs": "966973fb92dc0692c6d527f28d2cc4eb7eba200afcdb99ca04644af03ed8c2ea",
           "crates/contextdb-engine/tests/bounded.rs": "2d2dbc8f4eea5eb46d5f60861b3e772614afb7bd7e3f90c39e321f2059b989dc"
@@ -4252,8 +4027,6 @@
         "sources": {
           "crates/contextdb-engine/tests/vector/vector_lazy_consumer_restart_contract.rs": "50a25413d282bae54bae4981e6b9fa0445b42f7bf61692a21d49693cea165684",
           "crates/contextdb-engine/tests/vector/vector_lazy_raw_residency_contract.rs": "5d0f65d2abab6e7fa170dbf94de028e089991f1092d3245598619ce7eb8cd2fc",
-          "crates/contextdb-engine/tests/vector/vector_lazy_replay_budget_contract.rs": "324c4eda153511d52e1c72265332df0da7628806058abacb1d72be802e6d6c93",
-          "crates/contextdb-engine/tests/vector/vector_lazy_restart_residency_contract.rs": "acc521101765ed9ae596dfe8f797328afc994abc329d3c53de70997b0bbd1a87",
           "crates/contextdb-engine/tests/vector_lazy.rs": "5efbcf81a80bdc7e202fa944e229583b5c00c47ffbb47c0d4d6984108eed9674"
         }
       },

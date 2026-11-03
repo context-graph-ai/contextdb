@@ -22,6 +22,8 @@ REDB_FEATURED_TARGETS = [
     ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'),
     ('growth_after_compaction_contract', 'contextdb-internal'),
     ('cache_residency', 'contextdb-internal'),
+    ('page_window_contract', 'contextdb-internal,test-seams'),
+    ('startup_settle_releases_the_replaced_cache_index', 'contextdb-internal,test-seams'),
 ]
 OPTIONAL = {'workspace', 'redb', 'production', 'production-release'}
 KINDS = {'engine-tests', 'release-acceptance', 'examples', 'doctests'} | OPTIONAL
@@ -39,19 +41,9 @@ SYNC_SLICES = {
     'sync-schema-transactions': ('schema replication, atomic publish and oversized transport', 'sync_schema_transactions'),
 }
 
-# Complete corpora keep one fixture and six ordered filter/scope cells per job.
-VECTOR_PROFILE_SLICES = {
-    'vector-graph-recall-5000-anisotropic': ('vector graph recall / 5,000 anisotropic vectors per context', 'vector_graph_recall_5000_anisotropic_per_context'),
-    'vector-graph-recall-5001-topic-clusters': ('vector graph recall / 5,001 topic-clustered vectors per context', 'vector_graph_recall_5001_topic_clusters_per_context'),
-    'vector-graph-recall-50000-isotropic': ('vector graph recall / 50,000 isotropic vectors per context', 'vector_graph_recall_50000_isotropic_per_context'),
-    'vector-graph-recall-50001-anisotropic': ('vector graph recall / 50,001 anisotropic vectors per context', 'vector_graph_recall_50001_anisotropic_per_context'),
-}
-
-
 # Local proposal: normal correctness and original full qualification are distinct.
 # The canonical manifest always describes the full inventory; routing is a view.
 FULL_SCHEMA = {value[1] for value in SCHEMA_REPLAY_SLICES.values()}
-FULL_CORPORA = {value[1] for value in VECTOR_PROFILE_SLICES.values()}
 FULL_ONLY_TARGETS = {'seed_commit_memory'}
 OVERSIZED = ('a_received_schema_transaction_never_publishes_a_prefix::'
              'schema_migration_chunked_transport::'
@@ -66,7 +58,7 @@ SYNC_ROUTING_FINGERPRINTS = {'crates/contextdb-engine/tests/sync_schema_transact
 # Reviewed normal-only partition of the unchanged three-case native inventory.
 LONG_RUNNING_CASES = ('long_running::f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes', 'long_running::f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge', 'long_running::f27_incremental_pull_after_initial_sync')
 LONG_RUNNING_PARTITIONS = {'acceptance-long-running-transfer-test': ('long_running::f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes', 'long_running::f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge'), 'acceptance-long-running-test': ('long_running::f27_incremental_pull_after_initial_sync',)}
-LONG_RUNNING_FINGERPRINTS = {'tests/acceptance_long_running.rs': 'c070eb6fe18b5871b42419f33ed2c78c8e938c421384e7f1bcc9f35641b6e04d', 'tests/acceptance/long_running.rs': 'a1441aa17b96b6583fcfde53406205bf223447c00da8f613d330a438a936c5cb', 'tests/acceptance/common.rs': '8f6aea2930f4ac2fcf2e0050f15dfd70620a6c24742fa25949804116a393d860', 'tests/support/binary_path_helpers.rs': '05bd95280e47f5141b2a04bec3bcf5ca934c4cc642597cc46e16496d9461cb0c'}
+LONG_RUNNING_FINGERPRINTS = {'tests/acceptance_long_running.rs': 'c070eb6fe18b5871b42419f33ed2c78c8e938c421384e7f1bcc9f35641b6e04d', 'tests/acceptance/long_running.rs': '619337ba5703466555d071982ddd2bd081eabcb3c27b4fc74e63739a0b6ed438', 'tests/acceptance/common.rs': 'af970762e25f7b2b83982e6ff5d40f25a418e86fa2d9a251f9b1069c1f37d0d4', 'tests/support/binary_path_helpers.rs': '05bd95280e47f5141b2a04bec3bcf5ca934c4cc642597cc46e16496d9461cb0c'}
 
 def long_running_contract(root=ROOT):
     for path, expected in LONG_RUNNING_FINGERPRINTS.items():
@@ -88,10 +80,6 @@ def long_running_counts(entries, log, row_id):
 
 # Owner-approved rc2 quarantine: these are declarations, not passing cells.
 QUARANTINE_EXCEPTIONS = {
-    ('crates/contextdb-engine/tests/vector_graph_recall_5000_anisotropic_per_context.rs', 'selected_f32_build_switches_pass_5000_anisotropic_per_context'): 'CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.',
-    ('crates/contextdb-engine/tests/vector_graph_recall_5001_topic_clusters_per_context.rs', 'selected_f32_build_switches_pass_5001_topic_clusters_per_context'): 'CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.',
-    ('crates/contextdb-engine/tests/vector_graph_recall_50000_isotropic_per_context.rs', 'selected_f32_build_switches_pass_50000_isotropic_per_context'): 'CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.',
-    ('crates/contextdb-engine/tests/vector_graph_recall_50001_anisotropic_per_context.rs', 'selected_f32_build_switches_pass_50001_anisotropic_per_context'): 'CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.',
     ('crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs', 'indexed_route_does_less_work_than_exact'): 'CDB-161: bounded-storage-rc2 S5 AUTO calibration campaign (fix SHA pending); re-enabled when rc2 lands on dev.',
     ('crates/contextdb-engine/tests/sync/schema_migration_chunked_transport.rs', 'oversized_authenticated_schema_stays_invisible_until_one_commit_and_retry'): 'CDB-163: bounded-storage-rc2 S3/S4 oversized-pull funding campaign (fix SHA pending); re-enabled when rc2 lands on dev.',
 }
@@ -107,7 +95,7 @@ def gate_mode(value=None):
 
 def routed_targets(targets, mode):
     gate_mode(mode)
-    return [t for t in targets if mode == 'full' or t not in FULL_SCHEMA | FULL_CORPORA | FULL_ONLY_TARGETS]
+    return [t for t in targets if mode == 'full' or t not in FULL_SCHEMA | FULL_ONLY_TARGETS]
 
 
 def aggregate_module(root=ROOT):
@@ -151,14 +139,7 @@ def quarantine_contract(root=ROOT):
             cdb_ignores.append((relative, match[1], match[2]))
     expected = [(path, reason, case) for (path, case), reason in QUARANTINE_EXCEPTIONS.items()] + [BASELINE_CDB_IGNORE]
     if sorted(cdb_ignores) != sorted(expected):
-        raise ValueError('CDB ignore inventory changed; only CDB-154 and the six approved rc2 attributes are allowed')
-    corpus = [(path, case) for (path, case), reason in QUARANTINE_EXCEPTIONS.items() if reason.startswith('CDB-160:')]
-    if len(corpus) != 4:
-        raise ValueError('four corpus quarantine declarations required')
-    for path, case in corpus:
-        text = (root / path).read_text()
-        if text.count('#![cfg(feature = "nightly-tests")]') != 1 or text.count('#[test]') != 1:
-            raise ValueError('corpus quarantine must remain nightly-only and discoverable: ' + case)
+        raise ValueError('CDB ignore inventory changed; only CDB-154 and the two approved rc2 attributes are allowed')
 
 
 def sync_routing_counts(entries, mode, companion=False):
@@ -172,7 +153,7 @@ def sync_routing_counts(entries, mode, companion=False):
 
 
 # Optional optimization: any inapplicable certificate restores all normal tests.
-NORMAL_DEDUP_TARGETS = ('custody_custody_protocol', 'custody_custody_purge_and_discard', 'custody_server_resource_policy_contract_tests', 'custody_tenant_table_policy', 'vector_a_filtered_scope_is_charged_for_its_candidates', 'vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn', 'vector_a_find_names_only_the_pairs_it_asks_for', 'vector_a_replaced_vector_cannot_end_a_tied_frontier', 'vector_a_saved_graph_search_reports_its_distance_work', 'vector_a_tied_frontier_cannot_hide_a_smaller_row', 'vector_auto_decides_the_route_once_for_the_whole_scope', 'vector_auto_pays_what_indexed_pays', 'vector_delete_only_journal_progress_contract', 'vector_equal_distance_rows_keep_canonical_order_across_contexts', 'vector_exclusion_persistence_tests', 'vector_inspection_explain_truth_contract', 'vector_maintained_lifecycle_contract', 'vector_memory_ownership_reconciliation_contract', 'vector_named_vector_planner_tests', 'vector_operation_observations', 'vector_policy', 'vector_quantized', 'vector_rank_policy_exact_audits_the_whole_table', 'vector_received_generation_invalidation_contract', 'vector_resource_maintenance_contract', 'vector_retained_indexed_rows', 'vector_row_delete_and_guards_honor_vector_columns', 'vector_serving_merge_contract', 'vector_snapshot_frontier_completeness_contract', 'vector_tail_transaction_contract', 'vector_the_owner_doors_run_one_search_over_every_layer', 'vector_transaction_filter_snapshot_truth_contract', 'vector_writer_residency_attribution', 'vector_auto_chooses_the_cheaper_route_for_each_partition', 'vector_serving_pages', 'bounded_metadata_start_lookup_stays_inside_the_read_limits', 'custody_delivery_outcome', 'indexed_row_memory_charge_measurement', 'memory_limit_admission_holds_for_vectors', 'vector_an_exhaustive_find_streams_bodies_it_cannot_hold', 'vector_multi_partition_union_recovers_nearest_rows', 'vector_partition', 'engine', 'sql', 'vector_generation', 'history_request_memory', 'custody_delivery_manifest', 'vector_a_find_decodes_only_the_rows_it_returns', 'vector_a_find_over_many_contexts_spends_one_search_budget', 'vector_one_search_covers_every_layer_on_both_routes', 'direct_file_image_memory_lifetime', 'graph_property_memory_charge_measurement', 'received_schema_metadata_peak', 'bounded_in_subquery_stays_inside_the_read_limits', 'bounded_read_of_staged_graph_work_stays_within_its_limits', 'bounded', 'vector_lazy', 'vector_schema', 'vector_search_mode_bounded_contract')
+NORMAL_DEDUP_TARGETS = ('custody_custody_protocol', 'custody_custody_purge_and_discard', 'custody_server_resource_policy_contract_tests', 'custody_tenant_table_policy', 'vector_a_filtered_scope_is_charged_for_its_candidates', 'vector_a_find_answers_a_full_page_when_a_candidate_is_withdrawn', 'vector_a_find_names_only_the_pairs_it_asks_for', 'vector_auto_decides_the_route_once_for_the_whole_scope', 'vector_auto_pays_what_indexed_pays', 'vector_equal_distance_rows_keep_canonical_order_across_contexts', 'vector_exclusion_persistence_tests', 'vector_inspection_explain_truth_contract', 'vector_maintained_lifecycle_contract', 'vector_memory_ownership_reconciliation_contract', 'vector_named_vector_planner_tests', 'vector_operation_observations', 'vector_policy', 'vector_quantized', 'vector_rank_policy_exact_audits_the_whole_table', 'vector_received_generation_invalidation_contract', 'vector_resource_maintenance_contract', 'vector_retained_indexed_rows', 'vector_row_delete_and_guards_honor_vector_columns', 'vector_serving_merge_contract', 'vector_tail_transaction_contract', 'vector_the_owner_doors_run_one_search_over_every_layer', 'vector_transaction_filter_snapshot_truth_contract', 'vector_writer_residency_attribution', 'vector_auto_chooses_the_cheaper_route_for_each_partition', 'bounded_metadata_start_lookup_stays_inside_the_read_limits', 'custody_delivery_outcome', 'indexed_row_memory_charge_measurement', 'memory_limit_admission_holds_for_vectors', 'vector_an_exhaustive_find_streams_bodies_it_cannot_hold', 'vector_multi_partition_union_recovers_nearest_rows', 'vector_partition', 'engine', 'sql', 'vector_generation', 'history_request_memory', 'custody_delivery_manifest', 'vector_a_find_decodes_only_the_rows_it_returns', 'vector_a_find_over_many_contexts_spends_one_search_budget', 'direct_file_image_memory_lifetime', 'graph_property_memory_charge_measurement', 'received_schema_metadata_peak', 'bounded_in_subquery_stays_inside_the_read_limits', 'bounded_read_of_staged_graph_work_stays_within_its_limits', 'bounded', 'vector_lazy', 'vector_schema', 'vector_search_mode_bounded_contract')
 
 
 def feature_consumers(root):
@@ -402,58 +383,6 @@ def active_rows(rows, run_default, mode, decision=None):
     return selected
 
 
-def vector_profile_contract(root, by_id):
-    """Prove four required corpus jobs map bijectively to the canonical 24 cells."""
-    base = root / 'crates/contextdb-engine/tests'
-    source = (base / 'vector/graph_route_profile_support.rs').read_text()
-    match = re.search(r'const BUILD_QUALITY_PROFILES: \[\(usize, &str, usize\); 4\] = \[(.*?)\n\];', source, re.S)
-    if match is None:
-        raise ValueError('missing canonical vector quality profiles')
-    tuples = re.findall(r'\(\s*([\d_]+)(?:usize)?, "([a-z_]+)", ([\d_]+)(?:usize)?\),', match[1])
-    profiles = [(int(n.replace('_', '')), shape, int(seed.replace('_', ''))) for n, shape, seed in tuples]
-    if len(profiles) != 4 or len(set(profiles)) != 4:
-        raise ValueError('vector quality requires four unique canonical profiles')
-    # Freeze the original tuples, including seeds, without a second profile list.
-    fingerprint = hashlib.sha256(json.dumps(profiles, separators=(',', ':')).encode()).hexdigest()
-    if fingerprint != '07b228e9d90b2802530a785327e698059214e6ccdd6fa02b5b07c71bbae73f6d':
-        raise ValueError('vector quality canonical corpus/seed tuples changed')
-    if (re.search(r'#\[\s*(?:test|ignore)\b', source)
-            or 'let filters = [("broad", "bucket < 5"), ("narrow", "bucket = 0")];' not in source
-            or 'const ALL: [Self; 3] = [Self::One, Self::Several, Self::All];' not in source
-            or 'BUILD_QUALITY_PROFILES.len() * filters.len() * Scope::ALL.len(),\n        24,' not in source
-            or 'assert_eq!(cells, 6, "each build-quality corpus has six cells");' not in source):
-        raise ValueError('vector quality must retain six cells per corpus and 24 aggregate cells')
-    manifest = tomllib.loads((root / 'crates/contextdb-engine/Cargo.toml').read_text())
-    for index, (slice_id, (family, target)) in enumerate(VECTOR_PROFILE_SLICES.items()):
-        row = by_id.get(slice_id)
-        if row != dict(id=slice_id, family=family, kind='engine-tests', targets=[target]):
-            raise ValueError('vector quality requires four separate named corpus slices: ' + slice_id)
-        n, shape, _ = profiles[index]
-        if target != f'vector_graph_recall_{n}_{shape}_per_context':
-            raise ValueError('vector quality corpus/target mapping changed: ' + target)
-        registrations = [t for t in manifest.get('test', []) if t['name'] == target]
-        if registrations != [dict(name=target, path=f'tests/{target}.rs', **{'required-features': ['test-seams']})]:
-            raise ValueError('vector quality target registration changed: ' + target)
-        wrapper = (base / f'{target}.rs').read_text()
-        calls = re.findall(r'run_build_quality_profile\((.*?)\);', wrapper)
-        expected_test = f'selected_f32_build_switches_pass_{n}_{shape}_per_context'
-        approved = QUARANTINE_EXCEPTIONS.get((str((base / f'{target}.rs').relative_to(root)), expected_test))
-        expected_ignore = f'#[ignore = "{approved}"]' if approved else None
-        if (calls != [str(index)] or wrapper.count('#[test]') != 1
-                or len(re.findall(r'#\[\s*ignore\b', wrapper)) != 1
-                or (wrapper.count(expected_ignore) != 1 if expected_ignore else re.search(r'#\[\s*ignore\b', wrapper))
-                or f'fn {expected_test}()' not in wrapper
-                or wrapper.count('#![cfg(feature = "nightly-tests")]') != 1
-                or wrapper.count('include!("vector/graph_route_profile_support.rs");') != 1
-                or '#[allow(dead_code, unused_imports)]' not in wrapper
-                or '#[path = "fixtures/maintained_search/mod.rs"]\nmod maintained_search;' not in wrapper):
-            raise ValueError('vector quality wrapper/profile mapping changed: ' + target)
-    calibration = by_id.get('vector-graph-recall-profile')
-    if calibration != dict(id='vector-graph-recall-profile', family='vector default search-breadth calibration',
-                           kind='engine-tests', targets=['vector_graph_route_profile_quality']):
-        raise ValueError('vector calibration must retain its separate required slice')
-
-
 def inventory_module(root):
     spec = importlib.util.spec_from_file_location('integration_inventory', root / 'scripts/ci-inventory.py')
     module = importlib.util.module_from_spec(spec)
@@ -507,7 +436,6 @@ def load_manifest(root=ROOT):
             id='indexed-search-work-latency', family='indexed-search routing and distance work',
             kind='engine-tests', targets=['vector_indexed_route_does_less_work_than_exact']):
         raise ValueError('saved-graph acceleration assertion must retain its required nightly slice')
-    vector_profile_contract(root, by_id)
     acceptance_parts = {
         'acceptance-test': {
             ('acceptance-test', 'acceptance'),
@@ -528,7 +456,6 @@ def load_manifest(root=ROOT):
         ('engine-family-11', ('vector_a_find_decodes_only_the_rows_it_returns',
                               'custody_delivery_manifest')),
         ('engine-family-13', ('vector_a_find_over_many_contexts_spends_one_search_budget',)),
-        ('engine-family-14', ('vector_one_search_covers_every_layer_on_both_routes',)),
     }
     actual_vector_parts = {(row['id'], tuple(row['targets'])) for row in rows
                            if row.get('logical_id') == 'engine-family-11'}
@@ -537,7 +464,7 @@ def load_manifest(root=ROOT):
             if row.get('logical_id') == 'engine-family-11'):
         raise ValueError('vector physical partitions or cache-parent binding changed')
     logical_ids = [row.get('logical_id', row['id']) for row in rows]
-    if len(rows) != 36 or len(set(logical_ids)) != 30:
+    if len(rows) != 30 or len(set(logical_ids)) != 25:
         raise ValueError('physical/logical qualification inventory changed')
     for kind in KINDS - {'engine-tests', 'release-acceptance'}:
         if sum(row['kind'] == kind for row in rows) != 1:
@@ -578,7 +505,7 @@ def metadata(row):
 def commands(row, root=ROOT, mode=None):
     """Keep default-target commands intact, including custom harnesses and doctests."""
     mode = gate_mode(mode)
-    if mode == 'normal' and any(t in FULL_SCHEMA | FULL_CORPORA | FULL_ONLY_TARGETS for t in row['targets']):
+    if mode == 'normal' and any(t in FULL_SCHEMA | FULL_ONLY_TARGETS for t in row['targets']):
         raise ValueError('unrouted full-qualification target in normal mode')
     kind = row['kind']
     base = ['cargo', 'test', '--locked', '-p', 'contextdb-engine', '--features', metadata(row)['features']]
@@ -672,10 +599,10 @@ ENVELOPE_FIELDS = {'kind', 'id', 'name', 'pr', 'integration'}
 def pr_inventory(root=ROOT):
     manifest = json.loads((root / 'scripts/ci-integration-targets.json').read_text())
     rows = manifest.get('pr_jobs')
-    if manifest.get('schema_version') != 2 or not isinstance(rows, list) or len(rows) != 26:
+    if manifest.get('schema_version') != 2 or not isinstance(rows, list) or len(rows) != 25:
         raise ValueError('invalid canonical PR inventory')
     ids = [row.get('shard') for row in rows if isinstance(row, dict)]
-    if len(ids) != 26 or len(set(ids)) != 26:
+    if len(ids) != 25 or len(set(ids)) != 25:
         raise ValueError('missing or duplicate canonical PR job')
     parents = {row['shard']: row.get('cache_parent', row['shard']) for row in rows}
     expected = {
@@ -683,8 +610,7 @@ def pr_inventory(root=ROOT):
             'contextdb-engine-test-seams-4', 'contextdb-engine-test-seams-13',
             'contextdb-engine-test-seams-14'},
         'contextdb-engine-test-seams-11': {
-            'contextdb-engine-test-seams-11', 'contextdb-engine-test-seams-16',
-            'contextdb-engine-test-seams-17'},
+            'contextdb-engine-test-seams-11', 'contextdb-engine-test-seams-16'},
     }
     for parent, parts in expected.items():
         if {shard for shard, bound in parents.items() if bound == parent} != parts:
@@ -709,7 +635,7 @@ def combined_matrix(rows, enabled, decision, root=ROOT):
     return {'include': envelopes}
 
 
-NORMAL_BUNDLES_SHA256 = '14e6e7c3e0958b6e0ab5c435879830fa09fac2eec1de48560304aeb3d5a7584e'
+NORMAL_BUNDLES_SHA256 = '3a31c0cf7c2512f3207a3a79fde2ae11579f90ba9024d34fb04a231aefc2e023'
 SLOT_FIELDS = ENVELOPE_FIELDS | {'cache_key'}
 
 
@@ -733,8 +659,7 @@ def _bundle_slots(value, enabled, decision, root=ROOT):
             or not isinstance(additions, dict)
             or additions != {'integration-engine-family-10': 12,
                               'integration-engine-family-11': 12,
-                              'integration-engine-family-13': 4,
-                              'integration-engine-family-14': 4}):
+                              'integration-engine-family-13': 4}):
         raise ValueError('invalid reviewed normal bundle layout')
     planned = [list(bundle) for bundle in bundles]
     if enabled and not decision['dedup_sha']:

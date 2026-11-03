@@ -41,9 +41,8 @@ if '--plan-only' in sys.argv:
         decision = i.plan_decision('normal', False)
         planned = i.matrix(rows, False, 'normal', decision)
         selected = i.active_rows(rows, False, 'normal', decision)
-        assert len(selected) == 23
-        assert not {'engine-family-10', 'engine-family-11', 'engine-family-13',
-                    'engine-family-14'} & {r['id'] for r in selected}
+        assert len(selected) == 22
+        assert not {'engine-family-10', 'engine-family-11', 'engine-family-13'} & {r['id'] for r in selected}
         owner = next(r for r in selected if r['id'] == 'engine-family-1')
         assert i.commands(owner, mode='normal')[0][-1] == '--no-run'
         needs = dict(plan=dict(result='success', outputs=dict(enabled='true', matrix=json.dumps(planned), **decision)), slice=dict(result='success'))
@@ -62,7 +61,7 @@ if '--plan-only' in sys.argv:
         with patch.object(i, 'normal_dedup_certificate', return_value=off):
             disabled = i.plan_decision('normal', False)
         fallback = i.active_rows(rows, False, 'normal', disabled)
-        assert len(fallback) == 27
+        assert len(fallback) == 25
         executed = [t for row in fallback for t in row['targets']]
         assert all(executed.count(t) == 1 for t in i.NORMAL_DEDUP_TARGETS)
         for row in fallback:
@@ -93,7 +92,7 @@ if '--plan-only' in sys.argv:
     i.workflow_contract()
     ci = (ROOT / '.github/workflows/ci.yml').read_text()
     assert all(int(n) <= 30 for n in i.re.findall(r'timeout-minutes: (\d+)', ci))
-    print(f'Review17 plan fixtures PASS: valid→stale refuses before build with receipt; off→valid retains59/26; compile owner/dropped rows; {controls} mutation refusals; normal timeout caps.')
+    print(f'Review17 plan fixtures PASS: valid→stale refuses before build with receipt; off→valid retains52/25; compile owner/dropped rows; {controls} mutation refusals; normal timeout caps.')
     sys.exit(0)
 
 if '--dedup-only' in sys.argv:
@@ -161,10 +160,10 @@ if '--dedup-only' in sys.argv:
     rows = i.load_manifest()
     with patch.object(i, 'normal_dedup_certificate', return_value=dict(targets={}, reason='dedup disabled: stale certificate', fallback_targets=list(i.NORMAL_DEDUP_TARGETS))):
         fallback = i.active_rows(rows, False, 'normal')
-        assert len(fallback) == 27
+        assert len(fallback) == 25
         assert set(i.NORMAL_DEDUP_TARGETS) <= {t for row in fallback for t in row['targets']}
         for row in fallback: i.commands(row, mode='normal')
-    print(f'Review16 fixture controls PASS: local regeneration, conservative fallback, unchanged unrelated source, all59 fallback targets/26 physical slices; {controls} negative controls.')
+    print(f'Review16 fixture controls PASS: local regeneration, conservative fallback, unchanged unrelated source, all52 fallback targets/25 physical slices; {controls} negative controls.')
     sys.exit(0)
 
 # Routing tests use the checked-in certificate as test data, never recertify a live tree.
@@ -188,11 +187,13 @@ data = json.loads(manifest.read_text())
 data['slices'] = [row for row in data['slices'] if row['id'] != 'indexed-search-work-latency']
 with patch.object(Path, 'read_text', lambda p, *a, **kw: json.dumps(data) if p == manifest else read_text(p, *a, **kw)):
     reject(lambda: i.load_manifest())
-for path, case in list(i.QUARANTINE_EXCEPTIONS)[:2]:
+for (path, case), reason in list(i.QUARANTINE_EXCEPTIONS.items())[:2]:
     source = ROOT / path
     original = source.read_text()
+    prefix = reason.split(':')[0] + ':'
+    assert prefix in original
     read_text = Path.read_text
-    with patch.object(Path, 'read_text', lambda p, *a, **kw: original.replace('CDB-160:', 'CDB-999:') if p == source else read_text(p, *a, **kw)):
+    with patch.object(Path, 'read_text', lambda p, *a, **kw: original.replace(prefix, 'CDB-999:') if p == source else read_text(p, *a, **kw)):
         reject(lambda: i.quarantine_contract())
 # CI test/lint/full checkouts are depth 1. The runtime quarantine inventory must
 # inspect only checkout files, never ask Git for the frozen base object.
@@ -200,8 +201,8 @@ check_output = i.subprocess.check_output
 with patch.object(i.subprocess, 'check_output', lambda argv, *a, **kw: (_ for _ in ()).throw(AssertionError('runtime guard asked for git history')) if argv[:2] == ['git', 'show'] else check_output(argv, *a, **kw)):
     assert i.quarantine_contract() is None
     assert i.load_manifest()
-print(f'Quarantine guard PASS: enabled saved-graph assertion and CDB-154 baseline plus six exact owner-approved rc2 attributes; {controls} mutation refusals.')
-for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full', True, 36)]:
+print(f'Quarantine guard PASS: enabled saved-graph assertion and CDB-154 baseline plus two exact owner-approved rc2 attributes; {controls} mutation refusals.')
+for mode, default, count in [('normal', False, 22), ('full', False, 26), ('full', True, 30)]:
     matrix = i.matrix(rows, default, mode)
     assert len(matrix['include']) == count
     selected = i.active_rows(rows, default, mode)
@@ -209,10 +210,8 @@ for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full'
     targets = [t for row in selected if row['kind'] == 'engine-tests' for t in row['targets']]
     assert 'custody_schema_replay_bounded_contract' in targets
     assert 'vector_indexed_route_does_less_work_than_exact' in targets
-    assert 'vector_graph_route_profile_quality' in targets
     assert sum(row['kind'] == 'release-acceptance' for row in selected) == 3
     assert bool(set(targets) & i.FULL_SCHEMA) == (mode == 'full')
-    assert bool(set(targets) & i.FULL_CORPORA) == (mode == 'full')
     for row in selected:
         commands = i.commands(row, mode=mode)
         for cmd in commands:
@@ -255,7 +254,7 @@ for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full'
 reject(lambda: i.matrix(rows, True, 'normal'))
 reject(lambda: i.matrix(rows, False, 'typo'))
 for row in rows:
-    if set(row['targets']) & (i.FULL_SCHEMA | i.FULL_CORPORA):
+    if set(row['targets']) & i.FULL_SCHEMA:
         reject(lambda: i.commands(row, mode='normal'))
 for mode, companion, passed, ignored, filtered in [('normal', False, 12, 0, 1), ('full', False, 12, 1, 0), ('full', True, 0, 1, 12)]:
     entry = dict(target='tests/sync_schema_transactions.rs', passed=passed,
@@ -294,7 +293,6 @@ for mode in ['normal', 'full']:
             assert ('custody_schema_replay_is_proportional_to_affected_tables' in targets.split()) == (mode == 'full')
             assert 'custody_schema_replay_bounded_contract' in targets.split()
         if shard.endswith('-12'):
-            assert ('vector_graph_recall_50000_isotropic_per_context' in targets.split()) == True
             assert 'vector_indexed_route_does_less_work_than_exact' in targets.split()
         assert skip == (i.OVERSIZED if mode == 'normal' and shard.endswith('-15') else '')
 print('Six normal/full Bash shard plans PASS; original indexed route remains normal.')

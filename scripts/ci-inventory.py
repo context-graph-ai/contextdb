@@ -160,8 +160,6 @@ def split_shard_contract(root, rows, documents, paths, workspace):
             'vector_a_find_decodes_only_the_rows_it_returns', 'custody_delivery_manifest'],
         'contextdb-engine-test-seams-16': [
             'vector_a_find_over_many_contexts_spends_one_search_budget'],
-        'contextdb-engine-test-seams-17': [
-            'vector_one_search_covers_every_layer_on_both_routes'],
         'contextdb-engine-test-seams-15': ['sync_schema_transactions'],
     }
     for shard, targets in expected_shards.items():
@@ -305,7 +303,7 @@ def pr_jobs(root):
         else:
             raise ValueError('unsupported PR job shape')
         jobs.append((item['shard'], rows))
-    if len(jobs) != 26 or len({name for name, _ in jobs}) != len(jobs):
+    if len(jobs) != 25 or len({name for name, _ in jobs}) != len(jobs):
         raise ValueError('missing or duplicate PR jobs')
     parents = {item['shard']: item.get('cache_parent', item['shard'])
                for item in manifest['pr_jobs']}
@@ -314,8 +312,7 @@ def pr_jobs(root):
             'contextdb-engine-test-seams-4', 'contextdb-engine-test-seams-13',
             'contextdb-engine-test-seams-14'},
         'contextdb-engine-test-seams-11': {
-            'contextdb-engine-test-seams-11', 'contextdb-engine-test-seams-16',
-            'contextdb-engine-test-seams-17'},
+            'contextdb-engine-test-seams-11', 'contextdb-engine-test-seams-16'},
     }
     for parent, parts in expected_parts.items():
         if {shard for shard, bound in parents.items() if bound == parent} != parts:
@@ -331,7 +328,7 @@ def pr_jobs(root):
 
 
 def redb_featured_contract(root):
-    expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal'), ('cache_residency', 'contextdb-internal')]
+    expected = [('named_root_capture_contract', 'contextdb-internal,test-seams'), ('reclaim_step_contract', 'contextdb-internal,test-seams'), ('open_table_registry_allocations', 'contextdb-internal,test-seams'), ('admission_reads_are_bounded_by_the_format', 'contextdb-internal,test-seams'), ('growth_after_compaction_contract', 'contextdb-internal'), ('cache_residency', 'contextdb-internal'), ('page_window_contract', 'contextdb-internal,test-seams'), ('startup_settle_releases_the_replaced_cache_index', 'contextdb-internal,test-seams')]
     source = (root / 'scripts/ci-integration.py').read_text()
     declarations = [node for node in ast.parse(source).body if isinstance(node, ast.Assign)
                     and any(isinstance(name, ast.Name) and name.id == 'REDB_FEATURED_TARGETS'

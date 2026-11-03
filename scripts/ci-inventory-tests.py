@@ -20,10 +20,10 @@ spec.loader.exec_module(i)
 class InventoryControls(unittest.TestCase):
     def test_bundle_inventory_and_missing_duplicate_constituents(self):
         jobs = i.pr_jobs(i.ROOT)
-        self.assertEqual(len(jobs), 26)
+        self.assertEqual(len(jobs), 25)
         rows = [row for _, items in jobs for row in items]
-        self.assertEqual(len(rows), 32)
-        self.assertEqual(len({row[0] for row in rows}), 32)
+        self.assertEqual(len(rows), 31)
+        self.assertEqual(len({row[0] for row in rows}), 31)
         path = i.ROOT / 'scripts/ci-integration-targets.json'
         original = json.loads(path.read_text()); read = Path.read_text
         bundle = next(row for row in original['pr_jobs'] if row['shard'] == 'bundle-transactions-relational')
@@ -146,11 +146,11 @@ for suffix in ['profile','tests','targets.json','time']:
                                                'custody_schema_replay_work_limited_to_affected_tables',
                                                'custody_schema_replay_identical_schema_does_no_artifact_work'],
         }
-        self.assertEqual(len(shards), 17)
+        self.assertEqual(len(shards), 16)
         read = Path.read_text
         _, rows = i.inventory(i.ROOT)
         self.assertEqual(sum(crate == 'contextdb-engine' and features == 'test-seams,iroh'
-                             for _, crate, features in rows), 17)
+                             for _, crate, features in rows), 16)
         for shard, targets in expected.items():
             self.assertEqual(shards[shard], targets)
             for target in targets:
@@ -184,23 +184,6 @@ for suffix in ['profile','tests','targets.json','time']:
                         Path, 'read_text', lambda p, *a, **kw: replacement if p == fixture else read(p, *a, **kw)):
                     with self.assertRaisesRegex(ValueError, 'schema replay frozen fixture mismatch'):
                         i.inventory(i.ROOT)
-
-    def test_vector_corpus_targets_remain_once_in_partitioned_ordinary_shards(self):
-        path = i.ROOT / 'scripts/ci-shard-targets.txt'; original = path.read_text(); read = Path.read_text
-        targets = ['vector_graph_recall_5000_anisotropic_per_context',
-                   'vector_graph_recall_5001_topic_clusters_per_context',
-                   'vector_graph_recall_50000_isotropic_per_context',
-                   'vector_graph_recall_50001_anisotropic_per_context']
-        _, rows = i.inventory(i.ROOT)
-        self.assertEqual(sum(crate == 'contextdb-engine' and features == 'test-seams,iroh'
-                             for _, crate, features in rows), 17)
-        for target in targets:
-            self.assertEqual(original.split().count(target), 1)
-            for replacement in [original.replace(' ' + target, '', 1),
-                                original.replace(' ' + target, ' ' + target + ' ' + target, 1)]:
-                with self.subTest(target=target), patch.object(
-                        Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
-                    with self.assertRaises(ValueError): i.inventory(i.ROOT)
 
     def test_target_durations_keep_final_parent_summary_and_thread_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

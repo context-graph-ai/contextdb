@@ -9,7 +9,7 @@ import re
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_MODULE_SHA256 = "45c95eed5fdbcaa3f45afa18f646bb83c4780cd2ebc61bf68b13cec449eb51a5"
+BASELINE_MODULE_SHA256 = "25b3fe06a2e913eec60e03cfefd9e73041997f47da43384670bf737f3c6eebc5"
 BASELINE_HELPERS_SHA256 = "9905e54b79db77270853f14542c5d525b5da1b33a37ca9889d0a28e3941eafbf"
 BASELINE_HELPER_TESTS_SHA256 = "9883a4313ce70e8a444b3a7237e587d618fbdc163d2eac86d9acafe40a84d269"
 ACCEPTANCE_TARGETS = {
@@ -58,7 +58,7 @@ assert partitioned["acceptance_sync"] == [
 ]
 source_entries = {entry for entries in partitioned.values() for entry in entries
                   if entry[0] not in {"support/binary_path.rs", "support/binary_path_helpers.rs"}}
-assert len(source_entries) == 48
+assert len(source_entries) == 50
 assert source_digest(source_entries) == BASELINE_MODULE_SHA256
 
 helpers = (ROOT / "tests/support/binary_path_helpers.rs").read_bytes()
@@ -81,17 +81,17 @@ spec.loader.exec_module(integration)
 rows = integration.load_manifest()
 manifest_path = ROOT / "scripts/ci-integration-targets.json"
 manifest = json.loads(manifest_path.read_text())
-assert len(rows) == 36
-assert len({row.get("logical_id", row["id"]) for row in rows}) == 30
-assert len(integration.pr_inventory()) == 26
+assert len(rows) == 30
+assert len({row.get("logical_id", row["id"]) for row in rows}) == 25
+assert len(integration.pr_inventory()) == 25
 logical_pr = {
     (row.get("cache_parent", row["shard"]), row["crate"], row["features"])
     for job in integration.pr_inventory() for row in job.get("constituents", [job])
 }
-assert len(logical_pr) == 29
+assert len(logical_pr) == 28
 
 identity = {"source_sha": "1" * 40, "source_fingerprint": "2" * 64}
-for proved, physical in ((True, 49), (False, 53)):
+for proved, physical in ((True, 47), (False, 50)):
     certificate = ({"targets": {target: {} for target in integration.NORMAL_DEDUP_TARGETS},
                     "sha256": "a" * 64, "reason": "static fixture"}
                    if proved else {"targets": {}, "reason": "static fallback fixture"})
@@ -126,8 +126,8 @@ for mutation in ("missing", "duplicate", "cache-parent", "case-loss"):
         reject(integration.pr_inventory if mutation in {"missing", "cache-parent"}
                else integration.load_manifest)
 
-print("Acceptance partition controls PASS: 48 source modules unchanged; 3 helper tests once; "
-      "29 logical PR groups; 30 logical qualification slices; 49/53 physical normal/fallback rows. No Cargo or native tests.")
+print("Acceptance partition controls PASS: 50 source modules unchanged; 3 helper tests once; "
+      "28 logical PR groups; 25 logical qualification slices; 47/50 physical normal/fallback rows. No Cargo or native tests.")
 
 # Normal-only filters must preserve each of the three functional witnesses once.
 import tempfile

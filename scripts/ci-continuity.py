@@ -141,7 +141,7 @@ def inventory(root=ROOT):
     w = workflows(root)
     shard, command = validate_workflows(w)
     rows = shard['strategy']['matrix']['include']
-    demand(len(rows) == 17 and len({r['shard'] for r in rows}) == 17, 'all 17 shards required')
+    demand(len(rows) == 16 and len({r['shard'] for r in rows}) == 16, 'all 16 shards required')
     targets, features = [], []
     feature_selection = feature_jobs(root, rows)
     for path in sorted((root / 'crates').glob('*/Cargo.toml')):

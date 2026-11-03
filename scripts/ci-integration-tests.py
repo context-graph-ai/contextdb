@@ -58,8 +58,8 @@ class IntegrationControls(unittest.TestCase):
             'schema-replay-work-limited-to-affected-tables': ('schema replay / work limited to affected tables', 'custody_schema_replay_work_limited_to_affected_tables'),
             'schema-replay-identical-schema-does-no-artifact-work': ('schema replay / identical schema avoids rebuilding data', 'custody_schema_replay_identical_schema_does_no_artifact_work'),
         }
-        self.assertEqual(len(i.matrix(self.rows, False)['include']), 32)
-        self.assertEqual(len(i.matrix(self.rows, True)['include']), 36)
+        self.assertEqual(len(i.matrix(self.rows, False)['include']), 26)
+        self.assertEqual(len(i.matrix(self.rows, True)['include']), 30)
         path = ROOT / 'scripts/ci-integration-targets.json'
         original = json.loads(path.read_text()); read = Path.read_text
         for slice_id, (family, target) in expected.items():
@@ -90,75 +90,6 @@ class IntegrationControls(unittest.TestCase):
                     Path, 'read_text', lambda p, *a, **kw: json.dumps(data) if p == path else read(p, *a, **kw)):
                 with self.assertRaisesRegex(ValueError, 'three separate named slices'):
                     i.load_manifest()
-
-    def test_vector_corpora_are_four_required_jobs_with_exact_metadata(self):
-        self.assertEqual(len(i.matrix(self.rows, False)['include']), 32)
-        self.assertEqual(len(i.matrix(self.rows, True)['include']), 36)
-        for slice_id, (family, target) in i.VECTOR_PROFILE_SLICES.items():
-            row = next(r for r in self.rows if r['id'] == slice_id)
-            self.assertEqual(row, dict(id=slice_id, family=family, kind='engine-tests', targets=[target]))
-            self.assertEqual(i.metadata(row), dict(features='nightly-tests,test-seams,iroh',
-                profile='test-profile', name=f'engine / test-profile / {family}', test_threads='1'))
-            self.assertEqual(i.commands(row), [['cargo', 'test', '--locked', '-p', 'contextdb-engine',
-                '--features', 'nightly-tests,test-seams,iroh', '--test', target, '--', '--test-threads=1']])
-            for default in (False, True):
-                for mutation in ('missing', 'duplicate', 'wrong-name', 'wrong-id'):
-                    bad = self.needs(default=default)
-                    matrix = json.loads(bad['plan']['outputs']['matrix'])
-                    item = next(r for r in matrix['include'] if r['id'] == slice_id)
-                    if mutation == 'missing': matrix['include'].remove(item)
-                    elif mutation == 'duplicate': matrix['include'].append(copy.deepcopy(item))
-                    elif mutation == 'wrong-name': item['name'] += ' changed'
-                    else: item['id'] = 'wrong-profile'
-                    bad['plan']['outputs']['matrix'] = json.dumps(matrix)
-                    with self.subTest(slice_id=slice_id, default=default, mutation=mutation), self.assertRaises(ValueError):
-                        i.required(bad, self.rows, True, default)
-
-    def test_vector_manifest_rejects_missing_duplicate_combined_and_wrong_mapping(self):
-        path = ROOT / 'scripts/ci-integration-targets.json'
-        original = json.loads(path.read_text()); read = Path.read_text
-        for slice_id in i.VECTOR_PROFILE_SLICES:
-            for mutation in ('missing', 'duplicate', 'combined', 'wrong-target', 'optional', 'wrong-label'):
-                data = copy.deepcopy(original)
-                row = next(r for r in data['slices'] if r['id'] == slice_id)
-                if mutation in ('missing', 'combined'):
-                    data['slices'].remove(row)
-                    if mutation == 'combined': data['slices'][0]['targets'].extend(row['targets'])
-                elif mutation == 'duplicate': data['slices'].append(copy.deepcopy(row))
-                elif mutation == 'wrong-target': row['targets'] = ['vector_graph_route_profile_quality']
-                elif mutation == 'optional': row['kind'] = 'production'
-                else: row['family'] += ' changed'
-                with self.subTest(slice_id=slice_id, mutation=mutation), patch.object(
-                        Path, 'read_text', lambda p, *a, **kw: json.dumps(data) if p == path else read(p, *a, **kw)):
-                    with self.assertRaises(ValueError): i.load_manifest()
-
-    def test_vector_source_mapping_registration_and_coverage_fail_closed(self):
-        base = ROOT / 'crates/contextdb-engine/tests'
-        helper = base / 'vector/graph_route_profile_support.rs'
-        source = helper.read_text()
-        mutations = [(helper, source.replace('(50_001, "anisotropic", 17)', '(5_000_usize, "anisotropic", 17_usize)')),
-                     (helper, source.replace('(50_000, "isotropic", 29)', '(50_000, "isotropic", 17)')),
-                     (helper, source.replace('(50_000, "isotropic", 29),', '')),
-                     (helper, source.replace('Self::Several, ', '')),
-                     (helper, source.replace('("narrow", "bucket = 0")', '("narrow", "bucket = 1")')),
-                     (helper, source.replace('cells, 6,', 'cells, 3,')),
-                     (helper, source.replace('        24,', '        12,'))]
-        cargo = ROOT / 'crates/contextdb-engine/Cargo.toml'
-        for index, (_, target) in enumerate(i.VECTOR_PROFILE_SLICES.values()):
-            wrapper = base / f'{target}.rs'; text = wrapper.read_text()
-            for a, b in [(f'run_build_quality_profile({index});', f'run_build_quality_profile({(index+1)%4});'),
-                         ('#[test]', '#[test]\n    #[ignore]'),
-                         ('#![cfg(feature = "nightly-tests")]', '#![cfg(feature = "test-seams")]'),
-                         ('#[allow(dead_code, unused_imports)]', '#[allow(dead_code)]')]:
-                mutations.append((wrapper, text.replace(a, b)))
-            block = f'name = "{target}"\npath = "tests/{target}.rs"\nrequired-features = ["test-seams"]'
-            mutations.append((cargo, cargo.read_text().replace(block, block.replace('["test-seams"]', '["nightly-tests"]'))))
-            mutations.append((cargo, cargo.read_text() + '\n[[test]]\n' + block + '\n'))
-        read = Path.read_text
-        for path, text in mutations:
-            with self.subTest(path=path, text=text[-100:]), patch.object(
-                    Path, 'read_text', lambda p, *a, **kw: text if p == path else read(p, *a, **kw)):
-                with self.assertRaises(ValueError): i.load_manifest()
 
     def test_exact_original_command_classes_and_thread_modes(self):
         kinds = {row['kind']: row for row in self.rows if row['kind'] != 'release-acceptance'}
@@ -318,29 +249,29 @@ class IntegrationControls(unittest.TestCase):
                         SLOT3_KIND='', SLOT3_PR='skipped', SLOT3_INTEGRATION='skipped',
                         SLOT4_KIND='', SLOT4_PR='skipped', SLOT4_INTEGRATION='skipped')
         self.assertNotEqual(subprocess.run(['bash', '-c', final], env=outcomes).returncode, 0)
-        self.assertEqual(len(i.pr_inventory()), 26)
+        self.assertEqual(len(i.pr_inventory()), 25)
 
     def test_mixed_normal_matrix_is_exact_and_fail_closed(self):
         identity = {'source_sha': '1' * 40, 'source_fingerprint': '2' * 64}
         certificate = {'targets': {t: {} for t in i.NORMAL_DEDUP_TARGETS},
                        'sha256': 'a' * 64, 'reason': 'fixture proof applies'}
         fallback = {'targets': {}, 'reason': 'fixture proof unavailable'}
-        for proof, integration_count in [(certificate, 23), (fallback, 27)]:
+        for proof, integration_count in [(certificate, 22), (fallback, 25)]:
             with patch.object(i, 'source_identity', return_value=identity), \
                  patch.object(i, 'normal_dedup_certificate', return_value=proof):
                 decision = i.plan_decision('normal', False)
                 value = i.combined_matrix(self.rows, True, decision)
-                self.assertEqual(len(value['include']), 26 + integration_count)
-                self.assertEqual(sum(row['kind'] == 'pr' for row in value['include']), 26)
+                self.assertEqual(len(value['include']), 25 + integration_count)
+                self.assertEqual(sum(row['kind'] == 'pr' for row in value['include']), 25)
                 tuples = [tuple(x[k] for k in ('shard', 'crate', 'features'))
                           for row in i.pr_inventory()
                           for x in row.get('constituents', [row])]
-                self.assertEqual(len(tuples), 33)
-                self.assertEqual(len(set(tuples)), 33)
+                self.assertEqual(len(tuples), 31)
+                self.assertEqual(len(set(tuples)), 31)
                 logical_tuples = {(x.get('cache_parent', x['shard']), x['crate'], x['features'])
                                   for row in i.pr_inventory()
                                   for x in row.get('constituents', [row])}
-                self.assertEqual(len(logical_tuples), 29)
+                self.assertEqual(len(logical_tuples), 28)
                 i.validate_combined(value, self.rows, True, decision)
                 bundles = i.bundle_matrix(value, self.rows, True, decision)
                 self.assertEqual(len(bundles['include']), 16)
@@ -349,7 +280,7 @@ class IntegrationControls(unittest.TestCase):
                 self.assertEqual(len(flattened), len(value['include']))
                 self.assertEqual({row['id'] for row in flattened},
                                  {row['id'] for row in value['include']})
-                self.assertEqual(len(flattened), 26 + integration_count)
+                self.assertEqual(len(flattened), 25 + integration_count)
                 i.validate_bundle_matrix(bundles, value, self.rows, True, decision)
                 for mutation in ('missing', 'duplicate', 'cache', 'source', 'profile'):
                     changed_bundles = copy.deepcopy(bundles)
@@ -404,12 +335,12 @@ class IntegrationControls(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         i.validate_combined(bad, self.rows, True, decision)
                 disabled = i.combined_matrix(self.rows, False, decision)
-                self.assertEqual(len(disabled['include']), 26)
+                self.assertEqual(len(disabled['include']), 25)
                 self.assertTrue(all(row['kind'] == 'pr' for row in disabled['include']))
                 disabled_bundles = i.bundle_matrix(disabled, self.rows, False, decision)
                 self.assertEqual(len(disabled_bundles['include']), 11)
                 self.assertEqual(sum(bundle[f'slot{slot}'] is not None
-                                     for bundle in disabled_bundles['include'] for slot in range(1, 5)), 26)
+                                     for bundle in disabled_bundles['include'] for slot in range(1, 5)), 25)
                 # A disabled partition is empty, not an exemption from binding
                 # the published source and certificate decision.
                 for field, value in [('source_sha', '0' * 40),

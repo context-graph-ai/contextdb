@@ -275,31 +275,6 @@ is absent. Every compiled name was checked against libtest's substring skip
 semantics, with no missing unique case or shared case left in the aggregate.
 These compile/list results do not establish runtime passes.
 
-**Vector default search-breadth calibration** retains the existing
-`vector_graph_route_profile_quality` target and its single calibration test.
-Four full-qualification **vector graph recall** jobs each cover one complete corpus:
-
-| Vectors per context | Corpus | Explicit target / slice ID |
-|---:|---|---|
-| 5,000 | anisotropic | `vector_graph_recall_5000_anisotropic_per_context` / `vector-graph-recall-5000-anisotropic` |
-| 5,001 | topic-clustered | `vector_graph_recall_5001_topic_clusters_per_context` / `vector-graph-recall-5001-topic-clusters` |
-| 50,000 | isotropic | `vector_graph_recall_50000_isotropic_per_context` / `vector-graph-recall-50000-isotropic` |
-| 50,001 | anisotropic | `vector_graph_recall_50001_anisotropic_per_context` / `vector-graph-recall-50001-anisotropic` |
-
-The former `selected_f32_build_switches_pass_the_affected_policy_matrix` case
-maps to four `selected_f32_build_switches_pass_<rows>_<shape>_per_context` cases
-in module `graph_route_profile_quality`, in the targets above. Each builds one
-fixture, then keeps the two filters and three scopes together in their original
-order. Every corpus retains all six cells, 100 probes per cell and the 95% recall
-assertion, for 24 cells across four independently required full-qualification jobs. The canonical
-profile list, explicit target registrations, wrapper indices and named job mapping
-are checked before scheduling; missing, duplicate or combined jobs fail closed.
-The selected build choice remains `(false, false)`. Nightly declaration count is
-expected to increase by three (one matrix case becomes four); ordinary case count
-is unchanged because all five profile sources require `nightly-tests`. All four corpus targets remain in PR shard 12 under `test-seams,iroh`, where
-they compile their ordinary layout and run/list zero cases. Their nightly-feature
-24 cells remain full qualification. No PR shard is added.
-
 **Indexed-search work and latency** and **held-out vector recall and native-score
 reference** retain their separate targets. All required engine slices preserve
 `nightly-tests,test-seams,iroh`, the test profile and one test thread. Native
