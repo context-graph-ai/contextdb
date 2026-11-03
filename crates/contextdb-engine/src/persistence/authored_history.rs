@@ -187,9 +187,16 @@ impl RedbPersistence {
         // A table that follows its parent's purge leaves, for each archived
         // row, a posting under the parent it referenced, keyed by the parent.
         if let Some(meta) = meta.as_ref() {
-            metadata_credit.admit(crate::database::purge_followers::declared_purge_follower_bytes(
-                logical, meta,
-            ))?;
+            // The exact-capacity list and every copy it holds.
+            metadata_credit.admit(
+                crate::database::purge_followers::declared_purge_follower_count(meta)
+                    .saturating_mul(std::mem::size_of::<
+                        crate::database::purge_followers::PurgeFollower,
+                    >())
+                    .saturating_add(crate::database::purge_followers::declared_purge_follower_bytes(
+                        logical, meta,
+                    )),
+            )?;
         }
         let followers = meta
             .as_ref()

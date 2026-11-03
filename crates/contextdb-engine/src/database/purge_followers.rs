@@ -37,22 +37,23 @@ pub(crate) fn declared_purge_follower_count(meta: &TableMeta) -> usize {
             .count()
 }
 
-/// Every byte [`declared_purge_followers`] owns for one table, including the
-/// list it collects into and the copy that moves out of it, counted in place.
+/// The heap bytes the copies of one table's following foreign keys own, beyond
+/// each destination slot: every cloned string's contents and every inner
+/// column list's buffer. A cloned string and a cloned list allocate exactly
+/// their length, so this is exact, counted in place.
 pub(crate) fn declared_purge_follower_bytes(child_table: &str, meta: &TableMeta) -> usize {
-    let string = |text: &str| text.len().saturating_add(std::mem::size_of::<String>());
-    let fixed = string(child_table)
-        .saturating_add(std::mem::size_of::<PurgeFollower>().saturating_mul(2))
-        .saturating_add(std::mem::size_of::<Vec<String>>().saturating_mul(2));
+    let list = |columns: usize| columns.saturating_mul(std::mem::size_of::<String>());
     let single = meta.columns.iter().filter_map(|column| {
         column
             .references
             .as_ref()
             .filter(|reference| reference.follows_parent_purge)
             .map(|reference| {
-                string(&column.name)
-                    .saturating_add(string(&reference.table))
-                    .saturating_add(string(&reference.column))
+                list(1)
+                    .saturating_add(column.name.len())
+                    .saturating_add(reference.table.len())
+                    .saturating_add(list(1))
+                    .saturating_add(reference.column.len())
             })
     });
     let composite = meta
@@ -63,54 +64,66 @@ pub(crate) fn declared_purge_follower_bytes(child_table: &str, meta: &TableMeta)
             fk.child_columns
                 .iter()
                 .chain(&fk.parent_columns)
-                .map(|column| string(column))
-                .fold(string(&fk.parent_table), usize::saturating_add)
+                .map(String::len)
+                .fold(
+                    list(fk.child_columns.len())
+                        .saturating_add(list(fk.parent_columns.len()))
+                        .saturating_add(fk.parent_table.len()),
+                    usize::saturating_add,
+                )
         });
     single
         .chain(composite)
-        .map(|bytes| bytes.saturating_add(fixed))
+        .map(|bytes| bytes.saturating_add(child_table.len()))
         .fold(0, usize::saturating_add)
+}
+
+/// Push one table's following foreign keys, in ordinal order, into `out`.
+/// With `out` reserved for [`declared_purge_follower_count`] more entries and
+/// [`declared_purge_follower_bytes`] admitted, nothing else is allocated.
+pub(crate) fn declared_purge_followers_into(
+    child_table: &str,
+    meta: &TableMeta,
+    out: &mut Vec<PurgeFollower>,
+) {
+    let mut ordinal = 0_u32;
+    for column in &meta.columns {
+        if let Some(reference) = column
+            .references
+            .as_ref()
+            .filter(|reference| reference.follows_parent_purge)
+        {
+            out.push(PurgeFollower {
+                child_table: child_table.to_string(),
+                ordinal,
+                child_columns: vec![column.name.clone()],
+                parent_table: reference.table.clone(),
+                parent_columns: vec![reference.column.clone()],
+            });
+            ordinal = ordinal.saturating_add(1);
+        }
+    }
+    for fk in meta
+        .composite_foreign_keys
+        .iter()
+        .filter(|fk| fk.follows_parent_purge)
+    {
+        out.push(PurgeFollower {
+            child_table: child_table.to_string(),
+            ordinal,
+            child_columns: fk.child_columns.clone(),
+            parent_table: fk.parent_table.clone(),
+            parent_columns: fk.parent_columns.clone(),
+        });
+        ordinal = ordinal.saturating_add(1);
+    }
 }
 
 /// The following foreign keys one table declares, in ordinal order.
 pub(crate) fn declared_purge_followers(child_table: &str, meta: &TableMeta) -> Vec<PurgeFollower> {
-    let single = meta.columns.iter().filter_map(|column| {
-        column
-            .references
-            .as_ref()
-            .filter(|reference| reference.follows_parent_purge)
-            .map(|reference| {
-                (
-                    vec![column.name.clone()],
-                    reference.table.clone(),
-                    vec![reference.column.clone()],
-                )
-            })
-    });
-    let composite = meta
-        .composite_foreign_keys
-        .iter()
-        .filter(|fk| fk.follows_parent_purge)
-        .map(|fk| {
-            (
-                fk.child_columns.clone(),
-                fk.parent_table.clone(),
-                fk.parent_columns.clone(),
-            )
-        });
-    single
-        .chain(composite)
-        .enumerate()
-        .map(
-            |(ordinal, (child_columns, parent_table, parent_columns))| PurgeFollower {
-                child_table: child_table.to_string(),
-                ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
-                child_columns,
-                parent_table,
-                parent_columns,
-            },
-        )
-        .collect()
+    let mut followers = Vec::with_capacity(declared_purge_follower_count(meta));
+    declared_purge_followers_into(child_table, meta, &mut followers);
+    followers
 }
 
 /// Every following foreign key in a catalog that points at `parent`.

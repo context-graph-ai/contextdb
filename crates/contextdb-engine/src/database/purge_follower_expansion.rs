@@ -9,7 +9,7 @@
 //!   child table is declared as now, or whether it still exists.
 use super::purge_followers::{
     PurgeFollower, declared_purge_follower_bytes, declared_purge_follower_count,
-    declared_purge_followers,
+    declared_purge_followers_into,
 };
 use super::writer_read::next_window_with_work;
 use super::*;
@@ -265,11 +265,10 @@ impl Database {
             "purge_follower_declarations",
             HINT,
         )?;
+        // Built straight into the admitted exact-capacity list.
         let mut followers = Vec::with_capacity(count);
         for (table, meta) in catalog.iter() {
-            if declared_purge_follower_count(meta) > 0 {
-                followers.extend(declared_purge_followers(table, meta));
-            }
+            declared_purge_followers_into(table, meta, &mut followers);
         }
         drop(catalog);
         followers.sort_unstable_by(|left, right| {

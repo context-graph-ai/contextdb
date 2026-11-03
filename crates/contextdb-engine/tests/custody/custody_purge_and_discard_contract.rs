@@ -3302,16 +3302,15 @@ fn insert_family(db: &Database, parent: Uuid) {
     }
 }
 
-/// One refused attempt: the typed budget refusal, and a note of whether it
-/// came from admitting followers.
+/// One refused attempt must be the existing typed budget refusal. True when
+/// that refusal came from admitting followers, named by its operation.
 fn budget_refusal(refused: &Error, label: &str, limit: usize, history: &[String]) -> bool {
-    let text = refused.to_string();
-    assert!(
-        matches!(refused, Error::MemoryBudgetExceeded { .. })
-            || text.contains("memory budget exceeded"),
-        "{label}: a refusal at a {limit}-byte reader limit is the typed budget refusal: {refused:?}; before: {history:?}"
-    );
-    text.contains("purge_follower")
+    match refused {
+        Error::MemoryBudgetExceeded { operation, .. } => operation.starts_with("purge_follower"),
+        other => panic!(
+            "{label}: a refusal at a {limit}-byte limit is Error::MemoryBudgetExceeded: {other:?}; before: {history:?}"
+        ),
+    }
 }
 
 #[test]
@@ -3333,39 +3332,36 @@ fn a_purge_whose_followers_exceed_the_memory_limit_is_refused_typed_and_changes_
         insert_family(&db, parent);
         db.close().expect("close the store");
     }
+    // The reader limit grows until a refusal comes from admitting followers;
+    // every refusal up to it is the typed budget refusal and changes nothing.
     let mut history = Vec::new();
-    let mut follower_refusals = 0_usize;
     let mut limit = 256 * 1024;
     loop {
         let db = open_with_reader_limit(&path, Some(limit));
-        match db.execute("PURGE FROM parents WHERE id = $id", &id_params(parent)) {
-            Ok(_) => {
-                for table in ["parents", "children", "grandchildren"] {
-                    assert!(ids(&db, table).is_empty(), "local: the purge that fits erases {table}");
-                }
-                break;
-            }
-            Err(refused) => {
-                if budget_refusal(&refused, "local", limit, &history) {
-                    follower_refusals += 1;
-                }
-                assert!(
-                    ids(&db, "parents") == vec![parent]
-                        && ids(&db, "children").len() == MANY
-                        && ids(&db, "grandchildren").len() == MANY,
-                    "local: a refused purge changes nothing: {refused}"
-                );
-                history.push(format!("{limit} {refused}"));
-            }
-        }
+        let refused = match db.execute("PURGE FROM parents WHERE id = $id", &id_params(parent)) {
+            Ok(_) => panic!("local: the purge fit before any follower refusal: {history:?}"),
+            Err(refused) => refused,
+        };
+        let from_followers = budget_refusal(&refused, "local", limit, &history);
+        assert!(
+            ids(&db, "parents") == vec![parent]
+                && ids(&db, "children").len() == MANY
+                && ids(&db, "grandchildren").len() == MANY,
+            "local: a refused purge changes nothing: {refused}"
+        );
+        history.push(format!("{limit} {refused}"));
         db.close().expect("close the store");
+        if from_followers {
+            break;
+        }
         limit += limit / 4;
-        assert!(limit < 1 << 34, "local: the purge never fit: {history:?}");
+        assert!(limit < 1 << 34, "local: no limit refused while admitting followers: {history:?}");
     }
-    assert!(
-        follower_refusals > 0,
-        "local: some limit refused while admitting followers: {history:?}"
-    );
+    let db = Database::open(&path).expect("reopen the store with room");
+    exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(parent));
+    for table in ["parents", "children", "grandchildren"] {
+        assert!(ids(&db, table).is_empty(), "local: with room the purge erases {table}");
+    }
 
     // Received: the edge's node-local children follow the hub's purge.
     let runtime = sync_runtime();
