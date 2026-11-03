@@ -1600,7 +1600,9 @@ fn cursor_page_validation_requires_only_column_row_coherence() {
                 _payload: payload,
             })
     }
-    let db = contextdb_engine::Database::open_memory();
+    let store_dir = tempfile::tempdir().expect("create the scratch store directory");
+    let db = contextdb_engine::Database::open(store_dir.path().join("reader.db"))
+        .expect("open a scratch store");
     let owner = db
         .declared_reader_memory()
         .expect("use the store's declared reader");

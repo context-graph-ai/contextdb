@@ -2041,10 +2041,37 @@ fn ddl_targets_fixture(change: &DdlChange) -> bool {
     }
 }
 
+/// A scratch directory under the system temporary directory, named for this
+/// process and removed when dropped, so an early return also cleans it up.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create(purpose: &str) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "contextdb-smoke-{purpose}-{}",
+            std::process::id()
+        ));
+        // A directory left by an earlier process with the same id is stale.
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)
+            .map_err(|_| "cannot create the smoke scratch directory".to_string())?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn print_refused_ddl_state(database: &Database) -> Result<(), String> {
     const CONTACT_TABLE: &str = "work_node_contacts";
     let table_names = database.table_names();
-    let canonical = Database::open_memory();
+    // Declared before the database so the directory is removed after it closes.
+    let scratch = ScratchDir::create("canonical-schema")?;
+    let canonical = Database::open(scratch.0.join("canonical.db"))
+        .map_err(|_| "cannot open the canonical transport schema store".to_string())?;
     contextdb_server::work_ledger::install_node_contacts_schema(&canonical)
         .map_err(|_| "cannot construct canonical transport schema".to_string())?;
     let canonical_changes = canonical
