@@ -1360,6 +1360,24 @@ fn load_error_is_io(error: &LoadReadImageError) -> bool {
     }
 }
 
+/// A native page admission refused with no owner figures to report: the
+/// fixed cache reserve was exhausted, or no reader owner was installed. It is
+/// a memory-side refusal, the memory class, never I/O and never damage. The
+/// figures are unknown, so they read zero and the hint says why. Static text:
+/// no allocation on a refusal path.
+fn bare_admission_refusal() -> Error {
+    Error::NativeEngineOther(
+        contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+            subsystem: "storage_pages",
+            operation: "native_admission",
+            requested_bytes: 0,
+            available_bytes: 0,
+            budget_limit_bytes: 0,
+            hint: "a native page admission was refused without budget figures (the fixed cache reserve is exhausted or no reader owner is installed); raise MEMORY_LIMIT",
+        },
+    )
+}
+
 /// An engine error already classified as the storage I/O class, including
 /// deferred or shared diagnostic text.
 fn is_storage_io(error: &Error) -> bool {

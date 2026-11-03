@@ -81,9 +81,37 @@ fn fixture(dir: &Path) -> PathBuf {
         )
         .unwrap();
     }
+    // A small graph, so graph traversals and their proof diagnosis
+    // (graph_read GraphProofContext::diagnose) read real pages.
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &none,
+    )
+    .unwrap();
+    for n in 0..20u128 {
+        db.execute(
+            "INSERT INTO edges VALUES ($id, $source, $target, 'LINKS')",
+            &HashMap::from([
+                (
+                    "id".to_owned(),
+                    Value::Uuid(uuid::Uuid::from_u128(1_000 + n)),
+                ),
+                ("source".to_owned(), Value::Uuid(uuid::Uuid::from_u128(n))),
+                (
+                    "target".to_owned(),
+                    Value::Uuid(uuid::Uuid::from_u128(n + 1)),
+                ),
+            ]),
+        )
+        .unwrap();
+    }
     db.close().unwrap();
     path
 }
+
+/// A traversal over the fixture's graph.
+const GRAPH_TRAVERSAL: &str =
+    "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) COLUMNS (b.id AS t))";
 
 fn store_files(base: &Path) -> Vec<(PathBuf, String)> {
     let stem = base.file_name().unwrap().to_string_lossy().into_owned();
@@ -513,8 +541,9 @@ fn bounded_read_within(db: &Database, sql: &str, memory: u64) -> Result<(), Stri
 }
 
 /// Captured-root reads under a stepped reader memory limit: content size, a
-/// vector scan, a history read and an indexed lookup that opens the retained
-/// physical and current index tables (retained_read_source index opens).
+/// vector scan, a history read, an indexed lookup and a graph traversal. (No
+/// SQL reaches the ordered-run index opens on this train; the ordered-run rows
+/// below cover those.)
 #[test]
 fn a_captured_read_refused_for_memory_is_the_memory_class_never_corruption() {
     let dir = tempfile::tempdir().unwrap();
@@ -533,6 +562,7 @@ fn a_captured_read_refused_for_memory_is_the_memory_class_never_corruption() {
             "captured index lookup",
             "SELECT id FROM h WHERE body = 'second'",
         ),
+        ("captured graph traversal", GRAPH_TRAVERSAL),
     ] {
         let refusals = memory_sweep(label, 4096, |memory| bounded_read_within(&db, sql, memory));
         assert!(refusals > 0, "{label}: some limit refused the read");
@@ -540,8 +570,8 @@ fn a_captured_read_refused_for_memory_is_the_memory_class_never_corruption() {
     db.close().unwrap();
 }
 
-/// Writer reads under a stepped MEMORY_LIMIT: content size, the history scan
-/// and the received vector-pages binding.
+/// Writer reads under a stepped MEMORY_LIMIT: content size, the history scan,
+/// the received vector-pages binding and a graph traversal.
 #[test]
 fn a_writer_read_refused_for_memory_is_the_memory_class_never_corruption() {
     let dir = tempfile::tempdir().unwrap();
@@ -556,7 +586,7 @@ fn a_writer_read_refused_for_memory_is_the_memory_class_never_corruption() {
         )
         .unwrap();
     };
-    let ops: [(&str, &dyn Fn(&Database) -> Result<(), String>); 3] = [
+    let ops: [(&str, &dyn Fn(&Database) -> Result<(), String>); 4] = [
         ("writer content size", &|db| {
             db.execute("SHOW CONTENT_SIZE", &HashMap::new())
                 .map(|_| ())
@@ -564,6 +594,11 @@ fn a_writer_read_refused_for_memory_is_the_memory_class_never_corruption() {
         }),
         ("writer history scan", &|db| {
             db.execute("SELECT id, body FROM h", &HashMap::new())
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        }),
+        ("writer graph traversal", &|db| {
+            db.execute(GRAPH_TRAVERSAL, &HashMap::new())
                 .map(|_| ())
                 .map_err(|e| format!("{e:?}"))
         }),
@@ -722,13 +757,8 @@ fn an_ordered_index_run_refused_for_memory_is_the_memory_class_never_corruption(
         match ordered_pull(&path, Some(limit as usize)) {
             Ok(()) => break,
             Err(text) => {
-                // A bare native admission refusal (no owner figures) is the
-                // existing storage-io answer, pinned by
-                // read_image_decode bare_admission_refusal_tests.
                 assert!(
-                    !text_says_corrupt(&text)
-                        && (says_memory(&text)
-                            || text.contains("native storage admission refused")),
+                    !text_says_corrupt(&text) && says_memory(&text),
                     "ordered index run: a refusal at {limit} bytes is a refusal, never corruption: {text}"
                 );
                 refusals += 1;
@@ -773,4 +803,19 @@ fn an_absent_index_table_at_the_ordered_run_is_still_corruption() {
             if current { "current" } else { "physical" }
         );
     }
+}
+
+/// Graph traversals on the writer and on a captured root, with the graph proof
+/// diagnosis (graph_read GraphProofContext::diagnose): an unreadable graph page
+/// is I/O, never corruption.
+#[test]
+fn one_read_error_in_a_graph_traversal_is_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = fixture(dir.path());
+    assert_io_sweep(&base, "writer-graph-traversal", |db| {
+        db.execute(GRAPH_TRAVERSAL, &HashMap::new()).map(|_| ())
+    });
+    assert_io_sweep(&base, "captured-graph-traversal", |db| {
+        bounded_read(db, GRAPH_TRAVERSAL)
+    });
 }

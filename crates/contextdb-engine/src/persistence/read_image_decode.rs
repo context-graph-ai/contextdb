@@ -708,9 +708,9 @@ pub(super) fn read_storage_error(error: redb::StorageError) -> LoadReadImageErro
             invalid_read_image_state("read-only Redb database closed during hydration")
         }
         // A refusal with no owner carries no figures to report, and it says
-        // nothing about the bytes in the store.
-        redb::StorageError::Native(error @ redb::NativeColdReadError::AdmissionRefused) => {
-            read_image_io("reading Redb storage", error)
+        // nothing about the bytes in the store: it is the memory class.
+        redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefused) => {
+            LoadReadImageError::Memory(super::bare_admission_refusal())
         }
         redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefusedAt(owner)) => {
             let refusal = owner.inspect_failure(|cause| {
@@ -4788,17 +4788,28 @@ mod bare_admission_refusal_tests {
     use super::*;
 
     /// A refusal that names no owner says nothing about the store's bytes,
-    /// so neither read door may give it the corruption answer and its advice.
+    /// and it is a memory-side refusal: every read door gives it the memory
+    /// class, never corruption and never I/O.
     #[test]
-    fn a_bare_admission_refusal_is_not_reported_as_corruption() {
+    fn a_bare_admission_refusal_is_the_memory_class() {
         let bare = || redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefused);
-        assert!(matches!(
+        for answer in [
             read_storage_error(bare()),
-            LoadReadImageError::Io { .. }
-        ));
-        assert!(matches!(
             read_database_open_error(redb::DatabaseError::Storage(bare())),
-            LoadReadImageError::Io { .. }
-        ));
+        ] {
+            let LoadReadImageError::Memory(error) = answer else {
+                panic!("a bare admission refusal is the memory class: {answer:?}");
+            };
+            assert!(
+                crate::read_image_memory::is_memory_refusal(&error),
+                "{error:?}"
+            );
+        }
+        let error = RedbPersistence::storage_error(bare());
+        assert!(
+            crate::read_image_memory::is_memory_refusal(&error),
+            "{error:?}"
+        );
+        assert!(!super::super::is_storage_io(&error), "{error:?}");
     }
 }

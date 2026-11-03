@@ -6099,6 +6099,14 @@ impl RedbPersistence {
                 contextdb_core::read_memory::NativeRefusal::AllocatorFailed { site, layout },
             );
         }
+        // A bare native admission refusal has no figures; it is still the
+        // memory class, never storage I/O.
+        if matches!(
+            err,
+            redb::Error::Native(redb::NativeColdReadError::AdmissionRefused)
+        ) {
+            return super::bare_admission_refusal();
+        }
         // Native markers lend only their prepaid scalar diagnosis here.
         if let Some(refusal) = Self::scalar_storage_refusal(&err) {
             return native_storage_admission::callback_storage_refusal(refusal);
