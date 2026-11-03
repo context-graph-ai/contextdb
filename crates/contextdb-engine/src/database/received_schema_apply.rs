@@ -2867,8 +2867,8 @@ impl Database {
             comparison_bytes,
             "compare_received_bootstrap_catalog",
         )?;
-        Ok(Self::canonical_received_schema_tables(&current)
-            == Self::canonical_received_schema_tables(&incoming))
+        Ok(Self::canonical_declared_schema_tables(&current)
+            == Self::canonical_declared_schema_tables(&incoming))
     }
 
     /// Whether a schema-only unit with no signed provenance would change
@@ -3928,6 +3928,24 @@ impl Database {
                     }
                 }
             }
+            // Proved here, against the receiver's own DDL history: the
+            // private working store replays without one (CDB-216).
+            let _own_history_charge = StagedCopyCharge::admit_for_host(
+                &self.tx_mgr,
+                &self.finalization.accountant,
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+                replay_changes
+                    .ddl
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+                "prove_received_create_own_history",
+            )?;
+            let mut own_history_creates = Vec::with_capacity(replay_changes.ddl.len());
+            for (position, ddl) in replay_changes.ddl.iter().enumerate() {
+                if self.received_create_restates_current_generation(ddl, read_memory.clone())? {
+                    own_history_creates.push(position);
+                }
+            }
             let prepare_attempt = || -> Result<Option<ReceivedSchemaStage>> {
                 working_vectors.activate(&working.vector_store, vector_copy_owner)?;
                 let applied = working.apply_changes_with_private_source_order(
@@ -3958,6 +3976,7 @@ impl Database {
                         authoritative_generations: received.map(|_| source_order.as_slice()),
                         receiver_tx: inputs.receiver_tx,
                         end: local_lsn,
+                        own_history_creates: &own_history_creates,
                     }),
                 );
                 if let Some(access) = &working.received_staging_access {

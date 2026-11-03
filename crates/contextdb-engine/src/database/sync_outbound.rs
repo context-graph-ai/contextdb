@@ -2477,10 +2477,20 @@ impl Database {
                     let incoming_name = incoming_column.name.clone();
                     let incoming_column_type = incoming_column.column_type.clone();
                     let incoming_quantization = incoming_column.quantization;
+                    // Judged while the old type and quantization are both
+                    // still here: quantization is a policy-revision axis.
+                    let quantization_changed = matches!(
+                        (&column.column_type, &incoming_column_type),
+                        (ColumnType::Vector(_), ColumnType::Vector(_))
+                    ) && column.quantization != incoming_quantization;
                     column.name = incoming_name;
                     column.column_type = incoming_column_type;
                     column.quantization = incoming_quantization;
-                    merge_sync_alter_existing_column(&mut column, incoming_column);
+                    merge_sync_alter_existing_column(
+                        &mut column,
+                        incoming_column,
+                        quantization_changed,
+                    );
                     column.references = incoming_references;
                     column
                 } else {
@@ -2614,7 +2624,8 @@ impl Database {
                 .iter_mut()
                 .find(|current| current.name == column.name)
             {
-                merge_sync_alter_existing_column(current, column);
+                // Quantization differs only on the full-shape path above.
+                merge_sync_alter_existing_column(current, column, false);
             }
         }
         if !dropped_columns.is_empty() {
@@ -5534,6 +5545,23 @@ impl Database {
                         })
                 })
             });
+        }
+        canonical
+    }
+
+    /// The declared shape and policy of received tables, for the two
+    /// restatement judgements only (CDB-216). A vector column's
+    /// `vector_policy_revision` counts this store's own policy advances, so two
+    /// histories that reach the same declared policy can count differently;
+    /// it is not part of what an arriving history declares.
+    pub(super) fn canonical_declared_schema_tables(
+        tables: &HashMap<String, TableMeta>,
+    ) -> HashMap<String, TableMeta> {
+        let mut canonical = Self::canonical_received_schema_tables(tables);
+        for meta in canonical.values_mut() {
+            for column in &mut meta.columns {
+                column.vector_policy_revision = contextdb_core::DEFAULT_VECTOR_POLICY_REVISION;
+            }
         }
         canonical
     }

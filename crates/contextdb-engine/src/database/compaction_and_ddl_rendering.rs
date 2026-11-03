@@ -2189,11 +2189,41 @@ where
     values
 }
 
-pub(super) fn merge_sync_alter_existing_column(current: &mut ColumnDef, incoming: ColumnDef) {
+/// `quantization_changed` is the caller's verdict on the one revision axis it
+/// overwrote before calling (the full-shape vector path assigns quantization
+/// first); every other caller passes `false`.
+pub(super) fn merge_sync_alter_existing_column(
+    current: &mut ColumnDef,
+    incoming: ColumnDef,
+    quantization_changed: bool,
+) {
     if matches!(
         (&current.column_type, &incoming.column_type),
         (ColumnType::Vector(_), ColumnType::Vector(_))
     ) {
+        // The receiver advances the policy revision on exactly the local
+        // ALTER door's axes (`next_vector_policy_revision`, executor.rs): the
+        // SEARCH objectives, IVF members, WITH engine-policy members and
+        // quantization. SEARCH_MODE, MAX_PARTITIONS, AUTO_INDEX_AT,
+        // FLAT_BELOW, AUTO_EXPANSION_CEILING, CONSOLIDATION and partition keys
+        // have their own local setters, which do not advance it; they merge
+        // below without advancing. Compared in place, before any copy.
+        let revision_axis_changed = quantization_changed
+            || current.search_target_accuracy_hundredths
+                != incoming.search_target_accuracy_hundredths
+            || current.search_expected_vectors != incoming.search_expected_vectors
+            || current.ivf_lists != incoming.ivf_lists
+            || current.ivf_probes != incoming.ivf_probes
+            || current.ivf_refine_factor_hundredths != incoming.ivf_refine_factor_hundredths
+            || current.vector_engine_policy != incoming.vector_engine_policy;
+        if revision_axis_changed {
+            // Saturates instead of refusing: a receiver cannot refuse an
+            // authenticated ALTER over its own local counter, and u64 policy
+            // advances are unreachable.
+            current.vector_policy_revision =
+                crate::executor::next_vector_policy_revision(current.vector_policy_revision)
+                    .unwrap_or(u64::MAX);
+        }
         // A synced ALTER carries that moment's full column declaration, so an
         // absent policy member means "no longer declared" and clears the
         // receiver's override, exactly as `SET ... DEFAULT` does locally.

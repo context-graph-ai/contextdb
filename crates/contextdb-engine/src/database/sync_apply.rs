@@ -1,5 +1,38 @@
 use super::*;
 
+/// The CREATE occurrences of one arriving unit whose own history reaches the
+/// shape this store already holds (CDB-216). Each entry names one occurrence
+/// by its position in the unit and its table; a later CREATE of the same
+/// table is a different occurrence and is judged on its own.
+pub(super) struct ReceivedCreateCertificate {
+    certified: Vec<(usize, String)>,
+    // Declared after `certified`, so the entries and their names are freed
+    // before the charge that pays for them is refunded.
+    _charge: Option<StagedCopyCharge>,
+}
+
+impl ReceivedCreateCertificate {
+    fn none() -> Self {
+        Self {
+            certified: Vec::new(),
+            _charge: None,
+        }
+    }
+
+    /// Whether `change`, at `position` in the unit it arrived in, is a
+    /// certified historical CREATE.
+    pub(super) fn covers(&self, position: usize, change: &DdlChange) -> bool {
+        matches!(change, DdlChange::CreateTable { name, .. } if self.covers_table(position, name))
+    }
+
+    /// Whether the CREATE of `table` at `position` is certified.
+    pub(super) fn covers_table(&self, position: usize, table: &str) -> bool {
+        self.certified
+            .iter()
+            .any(|(at, certified)| *at == position && certified == table)
+    }
+}
+
 impl Database {
     sync_test_seam! {
     /// Marks this handle as a sync relay hub.
@@ -1216,6 +1249,239 @@ impl Database {
         None
     }
 
+    /// Judge each arriving historical CREATE by the shape its own history
+    /// reaches, not by this store's final shape (CDB-216). A CREATE is
+    /// certified when this store already holds its table in a different shape
+    /// and replaying that CREATE with the unit's later statements for the same
+    /// table -- up to the next CREATE or DROP of it, which begins another
+    /// occurrence -- reaches the held table's declared shape and policy. Every
+    /// CREATE occurrence is judged this way, a later CREATE of the same table
+    /// included, so two authors' histories that both reach the held shape are
+    /// both certified. Whether this node authored that history (an echo) or a
+    /// peer authored it independently does not matter. A CREATE whose history
+    /// reaches another shape, and a re-creation after an earlier DROP TABLE of
+    /// that table in the unit, keep the ordinary judgement.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn received_creates_reaching_held_shape(
+        &self,
+        changes: &ChangeSet,
+    ) -> Result<ReceivedCreateCertificate> {
+        if !changes
+            .ddl
+            .iter()
+            .any(|ddl| matches!(ddl, DdlChange::CreateTable { .. }))
+        {
+            return Ok(ReceivedCreateCertificate::none());
+        }
+        let (_held_charge, held) = self.selected_received_catalog(changes, std::iter::empty())?;
+        let names_table =
+            |ddl: &DdlChange, table: &str| Self::ddl_affected_table(ddl) == Some(table);
+        let candidate = |position: usize| -> Option<&str> {
+            let DdlChange::CreateTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            } = &changes.ddl[position]
+            else {
+                return None;
+            };
+            let local = held.get(name)?;
+            // Every CREATE occurrence is judged on its own history, a later
+            // one of the same table included. Only a re-creation -- the
+            // delivery dropped the table earlier -- keeps the ordinary path.
+            if changes.ddl[..position]
+                .iter()
+                .any(|earlier| matches!(earlier, DdlChange::DropTable { name: dropped } if dropped == name))
+            {
+                return None;
+            }
+            let matches = sync_table_shape_matches(
+                local,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            ) && sync_table_columns_match(local, columns);
+            (!matches).then_some(name.as_str())
+        };
+        let (count, name_bytes) = (0..changes.ddl.len())
+            .filter_map(candidate)
+            .fold((0usize, 0usize), |(count, bytes), name| {
+                (count + 1, bytes.saturating_add(name.len()))
+            });
+        if count == 0 {
+            return Ok(ReceivedCreateCertificate::none());
+        }
+        // Paid for the most entries this unit can certify, before the
+        // vector and its names exist; held for as long as the certificate.
+        let charge = StagedCopyCharge::admit_for_host(
+            &self.tx_mgr,
+            &self.finalization.accountant,
+            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+            count
+                .saturating_mul(std::mem::size_of::<(usize, String)>())
+                .saturating_add(name_bytes),
+            "certify_received_historical_create",
+        )?;
+        let mut certified = Vec::with_capacity(count);
+        // One priced copy of the selected catalog; each candidate rebuilds
+        // only its own table in it, so candidates cannot see each other.
+        let (_projection_charge, mut projected) =
+            self.selected_received_catalog(changes, std::iter::empty())?;
+        for position in 0..changes.ddl.len() {
+            let Some(name) = candidate(position) else {
+                continue;
+            };
+            projected.remove(name);
+            Self::apply_sync_table_ddl_to_projected_meta(&mut projected, &changes.ddl[position]);
+            for later in &changes.ddl[position + 1..] {
+                if !names_table(later, name) {
+                    continue;
+                }
+                if matches!(
+                    later,
+                    DdlChange::CreateTable { .. } | DdlChange::DropTable { .. }
+                ) {
+                    break;
+                }
+                Self::apply_sync_table_ddl_to_projected_meta(&mut projected, later);
+            }
+            let (Some(reached), Some(local)) = (projected.get(name), held.get(name)) else {
+                continue;
+            };
+            let _comparison_charge = StagedCopyCharge::admit_for_host(
+                &self.tx_mgr,
+                &self.finalization.accountant,
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+                (name.len()
+                    + std::mem::size_of::<(String, TableMeta)>()
+                    + reached.metadata_bytes().max(local.metadata_bytes()))
+                .saturating_mul(4),
+                "compare_received_historical_create",
+            )?;
+            let one = |meta: &TableMeta| HashMap::from([(name.to_string(), meta.clone())]);
+            if Self::canonical_declared_schema_tables(&one(reached))
+                == Self::canonical_declared_schema_tables(&one(local))
+            {
+                certified.push((position, name.to_string()));
+            }
+        }
+        Ok(ReceivedCreateCertificate {
+            certified,
+            _charge: Some(charge),
+        })
+    }
+
+    /// Whether an arriving CREATE restates the CREATE occurrence that made
+    /// this table's current generation here (CDB-216, ruling (b)). It is then
+    /// an already-known historical declaration and a literal no-op: it
+    /// installs nothing and adopts none of its policy, and this node's own
+    /// later migration of the table stays its own pending work. Only that one
+    /// occurrence counts -- an older incarnation's CREATE, or any CREATE that
+    /// differs from it in declared shape or policy, keeps the ordinary
+    /// judgement. Compared by declared shape and policy, without the
+    /// store-local vector policy revision.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn received_create_restates_current_generation(
+        &self,
+        change: &DdlChange,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<bool> {
+        let DdlChange::CreateTable { name, .. } = change else {
+            return Ok(false);
+        };
+        // The proof is the occurrence in this node's own history, never the
+        // table's current shape: a later local migration of the table must
+        // not change whether its own current-generation CREATE is restated.
+        if self.table_meta(name).is_none() {
+            return Ok(false);
+        }
+        let generation = self.authoritative_table_generation_counter(name)?;
+        // Entries of one commit are adjacent, so the occurrence ordinal is a
+        // running count within the current LSN. `Some(answer)` once `ddl` is
+        // the current generation's CREATE.
+        let judge = |position: &mut Option<(Lsn, u32)>,
+                     lsn: Lsn,
+                     ddl: &DdlChange|
+         -> Result<Option<bool>> {
+            let ordinal = match *position {
+                Some((at, next)) if at == lsn => next,
+                _ => 0,
+            };
+            *position = Some((lsn, ordinal.saturating_add(1)));
+            if !matches!(ddl, DdlChange::CreateTable { name: created, .. } if created == name) {
+                return Ok(None);
+            }
+            let Some(sidecar) = self.recorded_ddl_generation_sidecar(lsn, ordinal)? else {
+                return Ok(None);
+            };
+            if sidecar.table.as_deref() != Some(name.as_str())
+                || sidecar.table_generation != Some(generation)
+            {
+                return Ok(None);
+            }
+            let _comparison_charge = StagedCopyCharge::admit_for_host(
+                &self.tx_mgr,
+                &self.finalization.accountant,
+                contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+                (ddl.estimated_bytes() + change.estimated_bytes())
+                    .saturating_mul(8)
+                    .saturating_add(std::mem::size_of::<(String, TableMeta)>() * 4),
+                "compare_received_create_with_own_history",
+            )?;
+            let declared = |create: &DdlChange| {
+                let mut projected = HashMap::<String, TableMeta>::new();
+                Self::apply_sync_table_ddl_to_projected_meta(&mut projected, create);
+                Self::canonical_declared_schema_tables(&projected)
+            };
+            // The current generation has exactly one CREATE occurrence.
+            Ok(Some(declared(ddl) == declared(change)))
+        };
+        let mut position: Option<(Lsn, u32)> = None;
+        if self.persistence.is_none() {
+            // The resident fallback keeps its existing lookup.
+            let history = self.durable_ddl_history_for_provenance(read_memory)?;
+            for (lsn, ddl) in history.iter() {
+                if let Some(answer) = judge(&mut position, *lsn, ddl)? {
+                    return Ok(answer);
+                }
+            }
+            return Ok(false);
+        }
+        // Walk the durable history from one captured root, one charged
+        // window at a time, held while its entry is judged, and stop at the
+        // current generation's CREATE: memory never grows with the history.
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let (_, root) = self.capture_writer_statement()?;
+        let root = root.ok_or_else(|| {
+            Error::Other("declaration history requires a captured writer source".into())
+        })?;
+        if root.lsn == Lsn(0) {
+            return Ok(false);
+        }
+        let mut cursor = root.ddl_history_cursor(
+            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+            Lsn(0),
+        )?;
+        while let Some(window) = cursor.next_ddl_history()? {
+            let (lsn, ddl) = &window.value;
+            if let Some(answer) = judge(&mut position, *lsn, ddl)? {
+                return Ok(answer);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether this node's declared or bound policy refuses one arriving
     /// table statement, and with what typed refusal. The caller refuses the
     /// statement's WHOLE authored transaction on a refusal: an authenticated
@@ -1582,6 +1848,7 @@ impl Database {
         } else {
             false
         };
+        let historical_creates = self.received_creates_reaching_held_shape(changes)?;
 
         let unit_key = |index: usize| -> UnitKey {
             match aligned.map(|received| (received, &received.entries[index])) {
@@ -1669,9 +1936,14 @@ impl Database {
                 if refusal.is_some() {
                     break;
                 }
+                let ddl = &changes.ddl[*index];
+                let exempt = complete_restatement
+                    || historical_creates.covers(*index, ddl)
+                    || self
+                        .received_create_restates_current_generation(ddl, read_memory.clone())?;
                 if let Some(error) = self.arriving_statement_refusal(
-                    &changes.ddl[*index],
-                    complete_restatement,
+                    ddl,
+                    exempt,
                     aligned.is_some(),
                     read_memory.clone(),
                 )? {
@@ -4219,6 +4491,8 @@ impl Database {
             let mut accepted_sync_tombstones = Vec::<AcceptedSyncTombstone>::new();
             let mut terminal_marker_clears = Vec::<(String, NaturalKey)>::new();
             let mut semantic_refused_rows = Vec::<RowChange>::new();
+            // Judged on the whole unit, before its phases take it by value.
+            let historical_creates = self.received_creates_reaching_held_shape(&changes)?;
             let phases = connected_replay::PrivateApplyPhases::prepare(
                 changes,
                 source_coordinates,
@@ -4336,6 +4610,18 @@ impl Database {
                             self.drop_private_pending_graph_rows(tx, name)?;
                             self.drop_private_pending_relational_rows(tx, name)?;
                         }
+                        let restates_current_generation = match private_replay {
+                            Some(context) => {
+                                matches!(ddl, DdlChange::CreateTable { .. })
+                                    && context
+                                        .own_history_creates
+                                        .contains(&(private_ddl_cursor - 1))
+                            }
+                            None => self.received_create_restates_current_generation(
+                                &ddl,
+                                read_memory.clone(),
+                            )?,
+                        };
                         match ddl {
                             DdlChange::CreateTable {
                                 name,
@@ -4346,16 +4632,28 @@ impl Database {
                                 composite_unique,
                             } => {
                                 if self.table_meta(&name).is_some() {
+                                    if restates_current_generation {
+                                        // The CREATE that made this table's current
+                                        // generation here: a literal no-op, adopting
+                                        // none of the old declaration's policy.
+                                        continue;
+                                    }
                                     // The planner normally removes refused declarations;
                                     // this boundary also refuses an unplanned mismatch.
-                                    if let Some(refusal) = self.arriving_create_table_shape_refusal(
-                                        &name,
-                                        &columns,
-                                        &constraints,
-                                        &foreign_keys,
-                                        &composite_foreign_keys,
-                                        &composite_unique,
-                                    ) {
+                                    // A certified historical CREATE is not a mismatch: its
+                                    // own later statements replay below, in author order.
+                                    if !historical_creates
+                                        .covers_table(private_ddl_cursor - 1, &name)
+                                        && let Some(refusal) = self
+                                            .arriving_create_table_shape_refusal(
+                                                &name,
+                                                &columns,
+                                                &constraints,
+                                                &foreign_keys,
+                                                &composite_foreign_keys,
+                                                &composite_unique,
+                                            )
+                                    {
                                         return Err(refusal);
                                     }
                                     // Adopt the arriving declaration's policy for a table
@@ -4942,9 +5240,11 @@ impl Database {
                                             .iter_mut()
                                             .find(|column| column.name == incoming_column.name)
                                         {
+                                            // Not a vector shape change, so quantization is unchanged.
                                             merge_sync_alter_existing_column(
                                                 existing_column,
                                                 incoming_column,
+                                                false,
                                             );
                                         }
                                     }

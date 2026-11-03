@@ -1190,6 +1190,10 @@ pub(super) struct PrivateReplayContext<'a> {
     pub(super) authoritative_generations: Option<&'a [ReceivedSchemaOrderEntry]>,
     pub(super) receiver_tx: TxId,
     pub(super) end: Lsn,
+    /// Positions, in the replayed unit, of the CREATEs proved on the receiver
+    /// to restate the CREATE of their table's current generation (CDB-216).
+    /// The working store has no DDL history of its own to prove it with.
+    pub(super) own_history_creates: &'a [usize],
 }
 pub(super) struct PrivateSyntheticTriggerFiring {
     pub(super) trigger_name: String,

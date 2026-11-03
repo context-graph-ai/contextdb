@@ -255,7 +255,13 @@ mod received_closeout_guards {
 
     const EDGE_DDL: &str = "CREATE TABLE links (id INTEGER PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, note TEXT) SYNC CONFLICT KEEP LATEST";
     fn row(db: &Database, id: i64, target: u128) {
-        sql(db, &format!("INSERT INTO links VALUES ({id}, '00000000-0000-0000-0000-000000000001', '{}', 'link', 'row')", uuid::Uuid::from_u128(target)));
+        sql(
+            db,
+            &format!(
+                "INSERT INTO links VALUES ({id}, '00000000-0000-0000-0000-000000000001', '{}', 'link', 'row')",
+                uuid::Uuid::from_u128(target)
+            ),
+        );
     }
     fn edge(db: &Database, target: u128) -> Option<HashMap<String, Value>> {
         db.get_edge_properties(
@@ -268,15 +274,16 @@ mod received_closeout_guards {
     }
     fn standalone(db: &Database) {
         let tx = db.begin().unwrap();
-        assert!(db
-            .insert_edge(
+        assert!(
+            db.insert_edge(
                 tx,
                 uuid::Uuid::from_u128(1),
                 uuid::Uuid::from_u128(2),
                 "link".into(),
                 HashMap::from([("independent".into(), Value::Text("keep me".into()))])
             )
-            .unwrap());
+            .unwrap()
+        );
         db.commit(tx).unwrap();
     }
     fn assert_standalone(db: &Database) {
@@ -317,8 +324,14 @@ mod received_closeout_guards {
         standalone(&author.db);
         sql(&author.db, EDGE_DDL);
         row(&author.db, 1, 3);
-        sql(&author.db, "CREATE TABLE other_links (id INTEGER PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)");
-        sql(&author.db, "INSERT INTO other_links VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000005', 'link')");
+        sql(
+            &author.db,
+            "CREATE TABLE other_links (id INTEGER PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        );
+        sql(
+            &author.db,
+            "INSERT INTO other_links VALUES (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000005', 'link')",
+        );
         received(&hub, &author, Lsn(0));
         assert!(edge(&hub.db, 3).is_some());
         let since = author.db.current_lsn();
@@ -396,6 +409,15 @@ mod received_closeout_guards {
         check(&hub.db);
     }
 
+    /// Corrected expectation (CDB-216, manager ruling (b), challenge 147
+    /// "Option b"). The hub's CREATE equals the CREATE that made the edge's
+    /// current `bootstrap` generation, so it is an already-known historical
+    /// declaration and a literal no-op -- not a claim that the two peers' whole
+    /// schemas are equal. The edge keeps its later column, its data and its
+    /// policy; its own ALTER stays pending onward work under the occurrence
+    /// bookkeeping, and the hub converges when it syncs that migration. Before
+    /// this, the pull was refused, so two peers sharing a CREATE could not
+    /// sync while either had migrated further.
     fn incomplete_restatement(file: bool) {
         let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
         let root = tempfile::tempdir().unwrap();
@@ -405,17 +427,30 @@ mod received_closeout_guards {
             sql(db, "CREATE TABLE bootstrap (id INTEGER PRIMARY KEY)");
         }
         sql(&edge.db, "ALTER TABLE bootstrap ADD COLUMN extra TEXT");
-        let before = edge.db.current_lsn();
-        let before_history = edge.db.changes_since(Lsn(0)).unwrap().ddl;
-        let refused = try_pulled_from(&edge, &hub, served_by(&hub, Lsn(0)));
-        assert!(
-            refused.is_err(),
-            "authenticated old CREATE-only cannot restate richer local final schema"
-        );
-        assert_eq!(edge.db.current_lsn(), before);
-        assert_eq!(edge.db.changes_since(Lsn(0)).unwrap().ddl, before_history);
         sql(&edge.db, "INSERT INTO bootstrap VALUES (1, 'still here')");
+        let declared = edge.db.table_meta("bootstrap").unwrap();
+        try_pulled_from(&edge, &hub, served_by(&hub, Lsn(0))).unwrap_or_else(|e| {
+            panic!("the edge's own historical CREATE arriving from the hub is a no-op: {e}")
+        });
+        assert_eq!(
+            edge.db.table_meta("bootstrap").unwrap(),
+            declared,
+            "the no-op adopts none of the old CREATE's shape or policy"
+        );
+        let pending = ChangeSet::try_from(served_by(&edge, Lsn(0))).unwrap().ddl;
+        assert!(
+            pending.iter().any(
+                |ddl| matches!(ddl, DdlChange::AlterTable { name, .. } if name == "bootstrap")
+            ),
+            "the edge's own ALTER is still pending onward work"
+        );
+        try_pulled_from(&hub, &edge, served_by(&edge, Lsn(0)))
+            .unwrap_or_else(|e| panic!("the hub converges on the edge's migration: {e}"));
         let check = |db: &Database| {
+            assert_eq!(
+                table_columns(db, "bootstrap"),
+                vec!["id".to_string(), "extra".to_string()]
+            );
             assert_eq!(
                 db.execute("SELECT extra FROM bootstrap", &HashMap::new())
                     .unwrap()
@@ -425,9 +460,12 @@ mod received_closeout_guards {
             );
         };
         check(&edge.db);
+        check(&hub.db);
         if file {
             let edge = edge.reopen();
             check(&edge.db);
+            let hub = hub.reopen();
+            check(&hub.db);
         }
     }
 
@@ -477,6 +515,657 @@ mod received_closeout_guards {
     fn argon_shape_loss_regain_file() {
         shape_cycle(false);
     }
+
+    // CDB-216: an arriving historical CREATE is judged by the shape its own
+    // history reaches, not by the receiver's final shape; and the receiver
+    // advances a vector column's policy revision on the local ALTER door's
+    // axes (executor.rs `next_vector_policy_revision`).
+    const T_EDGE: &str =
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+    const T_HUB: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+    const V_EDGE: &str = "CREATE TABLE v (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 11)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+    const V_HUB: &str = "CREATE TABLE v (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED IVF (PROBES = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+
+    fn vector_row(db: &Database, id: i64) {
+        let params = HashMap::from([
+            ("id".to_string(), Value::Int64(id)),
+            (
+                "vector".to_string(),
+                Value::Vector(vec![id as f32, 1.0, 0.5]),
+            ),
+        ]);
+        db.execute(
+            "INSERT INTO v (id, embedding) VALUES ($id, $vector)",
+            &params,
+        )
+        .unwrap_or_else(|e| panic!("author vector row {id}: {e:?}"));
+    }
+
+    fn table_columns(db: &Database, table: &str) -> Vec<String> {
+        db.table_meta(table)
+            .expect("the table is present")
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    }
+
+    fn embedding(db: &Database) -> contextdb_core::ColumnDef {
+        db.table_meta("v")
+            .expect("the vector table is present")
+            .columns
+            .into_iter()
+            .find(|column| column.name == "embedding")
+            .expect("the embedding column")
+    }
+
+    fn ids(db: &Database, table: &str) -> Vec<Option<Value>> {
+        db.execute(
+            &format!("SELECT id FROM {table} ORDER BY id"),
+            &HashMap::new(),
+        )
+        .unwrap()
+        .rows()
+        .iter()
+        .map(|row| row.first().cloned())
+        .collect()
+    }
+
+    /// The revision a fresh replay of `db`'s own schema history reaches.
+    fn projected_embedding_revision(db: &Database) -> u64 {
+        let mut projected = HashMap::<String, contextdb_core::TableMeta>::new();
+        for ddl in db.changes_since(Lsn(0)).unwrap().ddl {
+            Database::apply_sync_table_ddl_to_projected_meta(&mut projected, &ddl);
+        }
+        projected["v"]
+            .columns
+            .iter()
+            .find(|column| column.name == "embedding")
+            .expect("the projected embedding column")
+            .vector_policy_revision
+    }
+
+    fn peer_history_reaching_live_shape(file: bool) {
+        let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let hub = peer(root.path(), "hub", file);
+        let edge = peer(root.path(), "edge", file);
+        sql(&hub.db, T_HUB);
+        sql(
+            &hub.db,
+            "INSERT INTO t (id, a, b) VALUES (1, 'one', 'gone')",
+        );
+        sql(&hub.db, "ALTER TABLE t DROP COLUMN b");
+        sql(&hub.db, "INSERT INTO t (id, a) VALUES (2, 'two')");
+        sql(&edge.db, T_EDGE);
+        try_pulled_from(&edge, &hub, served_by(&hub, Lsn(0))).unwrap_or_else(|e| {
+            panic!("a peer history reaching the edge's own shape delivers its rows: {e}")
+        });
+        let check = |db: &Database| {
+            assert_eq!(
+                table_columns(db, "t"),
+                vec!["id".to_string(), "a".to_string()]
+            );
+            let result = db
+                .execute("SELECT id, a FROM t ORDER BY id", &HashMap::new())
+                .unwrap();
+            let rows: Vec<_> = result
+                .rows()
+                .iter()
+                .map(|row| (row.first().cloned(), row.get(1).cloned()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    (Some(Value::Int64(1)), Some(Value::Text("one".into()))),
+                    (Some(Value::Int64(2)), Some(Value::Text("two".into()))),
+                ]
+            );
+        };
+        check(&edge.db);
+        if file {
+            let edge = edge.reopen();
+            check(&edge.db);
+        }
+    }
+
+    fn peer_vector_history_reaching_live_policy(file: bool) {
+        let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let hub = peer(root.path(), "hub", file);
+        let edge = peer(root.path(), "edge", file);
+        sql(&hub.db, V_HUB);
+        vector_row(&hub.db, 1);
+        sql(
+            &hub.db,
+            "ALTER TABLE v ALTER COLUMN embedding SET IVF (PROBES = 11)",
+        );
+        vector_row(&hub.db, 2);
+        sql(&edge.db, V_EDGE);
+        assert_eq!(embedding(&hub.db).vector_policy_revision, 2);
+        assert_eq!(embedding(&edge.db).vector_policy_revision, 1);
+        try_pulled_from(&edge, &hub, served_by(&hub, Lsn(0))).unwrap_or_else(|e| {
+            panic!("a peer vector history reaching the edge's own policy is accepted: {e}")
+        });
+        let check = |db: &Database| {
+            assert_eq!(
+                ids(db, "v"),
+                vec![Some(Value::Int64(1)), Some(Value::Int64(2))]
+            );
+            let column = embedding(db);
+            assert_eq!(column.ivf_probes, Some(11));
+            assert_eq!(
+                column.vector_policy_revision, 1,
+                "the arriving ALTER changes nothing on the edge's column"
+            );
+        };
+        check(&edge.db);
+        if file {
+            let edge = edge.reopen();
+            check(&edge.db);
+        }
+    }
+
+    fn refused_without_change(edge: JourneyPeer, hub: &JourneyPeer, table: &str, file: bool) {
+        let lsn = edge.db.current_lsn();
+        let ddl = edge.db.changes_since(Lsn(0)).unwrap().ddl;
+        let rows = ids(&edge.db, table);
+        let refused = try_pulled_from(&edge, hub, served_by(hub, Lsn(0)));
+        assert!(
+            refused.is_err(),
+            "a history reaching another shape is a conflict"
+        );
+        let check = |db: &Database| {
+            assert_eq!(db.current_lsn(), lsn);
+            assert_eq!(db.changes_since(Lsn(0)).unwrap().ddl, ddl);
+            assert_eq!(ids(db, table), rows);
+        };
+        check(&edge.db);
+        if file {
+            let edge = edge.reopen();
+            check(&edge.db);
+        }
+    }
+
+    fn peer_history_reaching_another_shape(file: bool) {
+        let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let hub = peer(root.path(), "hub", file);
+        let edge = peer(root.path(), "edge", file);
+        sql(&hub.db, T_HUB);
+        sql(
+            &hub.db,
+            "INSERT INTO t (id, a, b) VALUES (1, 'one', 'gone')",
+        );
+        sql(&hub.db, "ALTER TABLE t DROP COLUMN b");
+        sql(&hub.db, "ALTER TABLE t ADD COLUMN c TEXT");
+        sql(
+            &hub.db,
+            "INSERT INTO t (id, a, c) VALUES (2, 'two', 'kept')",
+        );
+        sql(&edge.db, T_EDGE);
+        refused_without_change(edge, &hub, "t", file);
+
+        let hub = peer(root.path(), "vector-hub", file);
+        let edge = peer(root.path(), "vector-edge", file);
+        sql(&hub.db, V_HUB);
+        vector_row(&hub.db, 1);
+        sql(
+            &hub.db,
+            "ALTER TABLE v ALTER COLUMN embedding SET IVF (PROBES = 9)",
+        );
+        vector_row(&hub.db, 2);
+        sql(&edge.db, V_EDGE);
+        refused_without_change(edge, &hub, "v", file);
+    }
+
+    /// Only the CREATE of the table's current generation counts: an equal
+    /// CREATE from an earlier incarnation here is not proof (ruling (b)).
+    fn older_incarnation_create_is_not_restated(file: bool) {
+        let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let hub = peer(root.path(), "hub", file);
+        let edge = peer(root.path(), "edge", file);
+        sql(&hub.db, T_HUB);
+        sql(
+            &hub.db,
+            "INSERT INTO t (id, a, b) VALUES (1, 'one', 'kept')",
+        );
+        sql(&edge.db, T_HUB);
+        sql(&edge.db, "DROP TABLE t");
+        sql(&edge.db, T_EDGE);
+        refused_without_change(edge, &hub, "t", file);
+    }
+
+    fn same_alter_history_equal_revision(file: bool) {
+        let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let hub = peer(root.path(), "hub", file);
+        let edge = peer(root.path(), "edge", file);
+        // No rows: the local door refuses to re-quantize a nonempty index,
+        // and the revision axes are pure policy.
+        sql(&hub.db, V_HUB);
+        // (statement, the local door's revision after it)
+        let steps: [(&str, u64); 9] = [
+            ("", 1),
+            (
+                "ALTER TABLE v ALTER COLUMN embedding SET IVF (PROBES = 11)",
+                2,
+            ),
+            (
+                "ALTER TABLE v ALTER COLUMN embedding SET IVF (PROBES = 11)",
+                2,
+            ),
+            (
+                "ALTER TABLE v ALTER COLUMN embedding SET WITH (quantization = 'SQ8')",
+                3,
+            ),
+            (
+                "ALTER TABLE v ALTER COLUMN embedding SET WITH (quantization = 'SQ4', training_seed = 7)",
+                4,
+            ),
+            (
+                "ALTER TABLE v ALTER COLUMN embedding RESET WITH (quantization)",
+                5,
+            ),
+            ("ALTER TABLE v ADD COLUMN note TEXT", 5),
+            (
+                "ALTER TABLE v ALTER COLUMN embedding SET SEARCH_MODE AUTO",
+                5,
+            ),
+            (
+                "ALTER TABLE v ALTER COLUMN embedding SET AUTO_INDEX_AT 7",
+                5,
+            ),
+        ];
+        let mut since = Lsn(0);
+        for (statement, expected) in steps {
+            if !statement.is_empty() {
+                sql(&hub.db, statement);
+            }
+            try_pulled_from(&edge, &hub, served_by(&hub, since))
+                .unwrap_or_else(|e| panic!("the edge receives {statement:?}: {e}"));
+            since = hub.db.current_lsn();
+            let local = embedding(&hub.db).vector_policy_revision;
+            assert_eq!(local, expected, "local door after {statement:?}");
+            assert_eq!(
+                embedding(&edge.db).vector_policy_revision,
+                local,
+                "receiver after {statement:?}"
+            );
+            assert_eq!(
+                projected_embedding_revision(&hub.db),
+                local,
+                "projection after {statement:?}"
+            );
+        }
+        if file {
+            let edge = edge.reopen();
+            assert_eq!(embedding(&edge.db).vector_policy_revision, 5);
+        }
+    }
+
+    /// A certificate names one CREATE occurrence, never a table: a later
+    /// independently authored CREATE of the same table is judged on its own
+    /// history. Two genuine authors write the statements; an honest relay
+    /// cannot hold both histories itself (it would refuse the second), so
+    /// this row drives the judgement both refusal sites consult. The
+    /// authenticated door row is
+    /// `cdb216_a_later_create_in_one_delivery_is_refused_whole_file`.
+    #[test]
+    fn cdb216_a_later_create_is_judged_on_its_own_history() {
+        let root = tempfile::tempdir().unwrap();
+        let first = peer(root.path(), "first-author", false);
+        let second = peer(root.path(), "second-author", false);
+        let edge = peer(root.path(), "edge", false);
+        sql(&first.db, T_HUB);
+        sql(&first.db, "ALTER TABLE t DROP COLUMN b");
+        sql(
+            &second.db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, c TEXT) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+        );
+        sql(&edge.db, T_EDGE);
+        let mut ddl = first.db.changes_since(Lsn(0)).unwrap().ddl;
+        assert_eq!(ddl.len(), 2, "CREATE (id, a, b) and its DROP COLUMN b");
+        ddl.extend(second.db.changes_since(Lsn(0)).unwrap().ddl);
+        assert_eq!(ddl.len(), 3, "and the second author's CREATE (id, a, c)");
+        let changes = ChangeSet {
+            ddl,
+            ..Default::default()
+        };
+        let certificate = edge
+            .db
+            .received_creates_reaching_held_shape(&changes)
+            .unwrap();
+        assert!(
+            certificate.covers(0, &changes.ddl[0]),
+            "the first CREATE's own history reaches the held (id, a)"
+        );
+        assert!(
+            !certificate.covers(2, &changes.ddl[2]),
+            "the later CREATE's own history ends at (id, a, c)"
+        );
+        let reader = edge.db.declared_reader_memory().unwrap();
+        assert!(
+            edge.db
+                .arriving_statement_refusal(&changes.ddl[2], false, true, reader.clone())
+                .is_err(),
+            "an authenticated later CREATE reaching another shape is refused"
+        );
+        assert!(
+            edge.db
+                .arriving_statement_refusal(&changes.ddl[0], true, true, reader)
+                .unwrap()
+                .is_none(),
+            "the certified CREATE needs no shape judgement"
+        );
+    }
+
+    /// `relay` forwards `relayed` after its own served log. Each author block
+    /// (who wrote the statement, the author's LSN, ordinal, generation, unit
+    /// length and signature) travels unchanged, as a forwarding peer carries
+    /// it; only the forwarding sender's own positions follow its log.
+    fn relayed_after(
+        mut wire: crate::protocol::WireChangeSet,
+        mut relayed: crate::protocol::WireChangeSet,
+    ) -> crate::protocol::WireChangeSet {
+        assert!(
+            relayed.rows.is_empty()
+                && relayed.edges.is_empty()
+                && relayed.vectors.is_empty()
+                && relayed.purges.is_empty()
+                && relayed.manifests.is_empty(),
+            "the relayed author unit is schema only"
+        );
+        assert_eq!(relayed.ddl.len(), relayed.ddl_provenance.len());
+        let base = wire.ddl_lsn.iter().map(|lsn| lsn.0).max().unwrap_or(0);
+        for ((lsn, provenance), ddl) in relayed
+            .ddl_lsn
+            .iter_mut()
+            .zip(relayed.ddl_provenance.iter_mut())
+            .zip(relayed.ddl.iter())
+        {
+            *lsn = Lsn(base + lsn.0);
+            provenance.source_ddl_lsn = *lsn;
+            // The sender's own record digest binds its position, so the
+            // forwarding sender emits it for its own LSN; the author's
+            // signed digest inside the author block is untouched.
+            provenance.digest = crate::protocol::canonical_ddl_provenance_digest(
+                ddl,
+                provenance.source_ddl_lsn,
+                provenance.ordinal,
+                provenance.table.as_deref(),
+                provenance.table_generation,
+            )
+            .unwrap();
+            assert!(
+                provenance.author.is_some(),
+                "the relayed statement keeps its author's signed block"
+            );
+        }
+        wire.ddl.append(&mut relayed.ddl);
+        wire.ddl_lsn.append(&mut relayed.ddl_lsn);
+        wire.ddl_provenance.append(&mut relayed.ddl_provenance);
+        wire
+    }
+
+    /// The edge's durable state a refused delivery must leave untouched:
+    /// schema and DDL history, acceptance position, received arrivals,
+    /// progress, every durable config value (receipts and outcomes
+    /// included), and the table's shape and rows.
+    fn conflict_image(
+        edge: &JourneyPeer,
+        relay: &JourneyPeer,
+    ) -> (ReceiverImage, Vec<String>, Vec<Option<Value>>) {
+        (
+            receiver_image(edge, relay),
+            table_columns(&edge.db, "t"),
+            ids(&edge.db, "t"),
+        )
+    }
+
+    /// The authenticated door, not a helper: one delivery carries two
+    /// genuine authors' complete signed units -- the first author's CREATE
+    /// (id, a, b) and DROP COLUMN b, whose own history reaches the edge's
+    /// (id, a), then the second author's CREATE (id, a, c), whose own
+    /// history ends at another shape. A certificate for the first CREATE
+    /// must not exempt the second: the later CREATE is refused, and with it
+    /// the whole delivery, at the pull door and the receipted push door,
+    /// with schema, rows, history, acceptance, receipts and progress
+    /// unchanged before and after a restart. The control delivery, spliced
+    /// the same way from a second author whose history does reach (id, a),
+    /// installs: the refusal is the CREATE judgement, not the splice.
+    #[test]
+    fn cdb216_a_later_create_in_one_delivery_is_refused_whole_file() {
+        let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let first = peer(root.path(), "first-author", true);
+        let second = peer(root.path(), "second-author", true);
+        let agreeing = peer(root.path(), "agreeing-author", true);
+        let edge = peer(root.path(), "edge", true);
+        let control = peer(root.path(), "control-edge", true);
+        sql(&first.db, T_HUB);
+        sql(&first.db, "ALTER TABLE t DROP COLUMN b");
+        const T_OTHER: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, c TEXT) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+        sql(&second.db, T_OTHER);
+        sql(&agreeing.db, T_OTHER);
+        sql(&agreeing.db, "ALTER TABLE t DROP COLUMN c");
+        for receiver in [&edge, &control] {
+            sql(&receiver.db, T_EDGE);
+            sql(&receiver.db, "INSERT INTO t (id, a) VALUES (1, 'kept')");
+        }
+
+        let conflicting = relayed_after(served_by(&first, Lsn(0)), served_by(&second, Lsn(0)));
+        assert_eq!(conflicting.ddl.len(), 3, "two complete authored units");
+        // The edge's own sync incarnation (its database life, minted on its
+        // first sync use, accepted or refused) exists before the image, so
+        // the image compares only what a delivery could change.
+        let own_life = edge.incarnation();
+        let before = conflict_image(&edge, &first);
+        let pulled = try_pulled_from(&edge, &first, conflicting.clone());
+        let error = pulled.err().unwrap_or_else(|| {
+            panic!("a later CREATE reaching another shape installed through the pull door")
+        });
+        assert!(
+            error.contains("schema mismatch for table t"),
+            "the pull refusal is the CREATE judgement, not a signature or splice check: {error}"
+        );
+        assert_eq!(
+            conflict_image(&edge, &first),
+            before,
+            "a refused pull changes nothing"
+        );
+        let pushed = try_pushed_to(&edge, &first, conflicting);
+        let error = pushed.err().unwrap_or_else(|| {
+            panic!("a later CREATE reaching another shape installed through the push door")
+        });
+        assert!(
+            error.contains("schema mismatch for table t"),
+            "the push refusal is the CREATE judgement: {error}"
+        );
+        assert_eq!(
+            conflict_image(&edge, &first),
+            before,
+            "a refused push changes nothing"
+        );
+        let edge = edge.reopen();
+        assert_eq!(
+            conflict_image(&edge, &first),
+            before,
+            "after a restart the refused delivery left nothing behind"
+        );
+        assert_eq!(edge.incarnation(), own_life, "the edge keeps its own life");
+
+        let agreed = relayed_after(served_by(&first, Lsn(0)), served_by(&agreeing, Lsn(0)));
+        assert_eq!(agreed.ddl.len(), 4);
+        try_pulled_from(&control, &first, agreed).unwrap_or_else(|e| {
+            panic!("the same splice of two histories reaching (id, a) installs: {e}")
+        });
+        let control = control.reopen();
+        assert_eq!(
+            table_columns(&control.db, "t"),
+            vec!["id".to_string(), "a".to_string()]
+        );
+        assert_eq!(ids(&control.db, "t"), vec![Some(Value::Int64(1))]);
+    }
+
+    /// A durable store whose declaration history is `prefix` unrelated
+    /// tables created and dropped, then `CREATE TABLE t` (its current
+    /// generation), then `suffix` more. Built under ordinary budgets; the
+    /// history is confirmed to hold every declaration. Returns the store and
+    /// its own CREATE of `t`, which a peer restating it would send.
+    fn restating_history(prefix: usize, suffix: usize) -> (Database, DdlChange) {
+        let db = Database::open_memory();
+        assert!(db.persistence.is_some(), "the durable path");
+        let churn = |db: &Database, stem: &str, count: usize| {
+            for i in 0..count {
+                sql(
+                    db,
+                    &format!("CREATE TABLE {stem}{i} (id INTEGER PRIMARY KEY)"),
+                );
+                sql(db, &format!("DROP TABLE {stem}{i}"));
+            }
+        };
+        churn(&db, "p", prefix);
+        sql(&db, T_EDGE);
+        churn(&db, "s", suffix);
+        let ddl = db.changes_since(Lsn(0)).unwrap().ddl;
+        assert_eq!(
+            ddl.len(),
+            2 * prefix + 1 + 2 * suffix,
+            "the durable history holds every declaration"
+        );
+        let create = ddl
+            .into_iter()
+            .find(|ddl| matches!(ddl, DdlChange::CreateTable { name, .. } if name == "t"))
+            .expect("the store's own CREATE of t");
+        (db, create)
+    }
+
+    /// Judge `create` with the store's reader limited to `limit` for this
+    /// one call: the answer (typed error kept whole), the reader parent's
+    /// before/peak/after bytes, and how many declaration-history entries the
+    /// call decoded.
+    fn judge_restatement(
+        db: &mut Database,
+        create: &DdlChange,
+        limit: u64,
+    ) -> (
+        std::result::Result<bool, String>,
+        crate::vector_read_memory::ReaderMemoryHighWaterForTest,
+        u64,
+    ) {
+        db.declared_read_memory =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limit)
+                .expect("the reader root admits itself");
+        let db = &*db;
+        let ((answer, memory), work) = crate::writer_query_test_seams::observe(|| {
+            db.with_reader_memory_high_water_for_test(|| {
+                db.declared_reader_memory().and_then(|reader| {
+                    db.received_create_restates_current_generation(create, reader)
+                })
+            })
+        });
+        (
+            answer.map_err(|error| format!("{error:?}")),
+            memory,
+            work.history.ddl_occurrences,
+        )
+    }
+
+    /// Judging a restated CREATE walks this store's own declaration history
+    /// one charged entry at a time and stops at the current-generation
+    /// CREATE (challenge 151). The same fixed reader limit restates it after
+    /// 17 or 1025 earlier declarations, within a history-independent reader
+    /// bound, releasing every transient credit; a roomy reader is the
+    /// control. A match followed by a long suffix never visits the suffix.
+    /// Calibrated on 0335486f under a roomy reader: the collected history
+    /// peaked at 10176 bytes for 17 entries and 521676 for 1025; at this
+    /// limit the long history was refused once the retained output filled
+    /// the reader (the next cursor window found no room).
+    #[test]
+    fn cdb216_restating_create_reader_memory_does_not_grow_with_history() {
+        const LIMIT: u64 = 64 * 1024;
+        const ROOMY: u64 = 1 << 30;
+        const BOUND: u64 = 16 * 1024;
+        // Declared before the green run: the 17- and 1025-entry walks may
+        // differ by at most one cursor window (576 or 736 bytes observed)
+        // plus the longer table names.
+        const FLAT_TOLERANCE: u64 = 1024;
+        let mut peaks = Vec::new();
+        for prefix in [8, 512] {
+            let (mut db, create) = restating_history(prefix, 0);
+            let (roomy, ..) = judge_restatement(&mut db, &create, ROOMY);
+            assert_eq!(
+                roomy,
+                Ok(true),
+                "control: a roomy reader restates (prefix {prefix})"
+            );
+            let (answer, memory, visited) = judge_restatement(&mut db, &create, LIMIT);
+            eprintln!(
+                "CDB216-HISTORY-WALK prefix={prefix} entries={} answer={answer:?} memory={memory:?} visited={visited}",
+                2 * prefix + 1
+            );
+            assert_eq!(
+                answer,
+                Ok(true),
+                "prefix {prefix}: restated within the fixed {LIMIT}-byte reader limit ({memory:?})"
+            );
+            assert!(
+                memory.peak - memory.before <= BOUND,
+                "prefix {prefix}: reader peak within the history-independent bound ({memory:?})"
+            );
+            assert_eq!(
+                memory.after, memory.before,
+                "prefix {prefix}: transient credits released"
+            );
+            peaks.push(memory.peak - memory.before);
+        }
+        assert!(
+            peaks[0].abs_diff(peaks[1]) <= FLAT_TOLERANCE,
+            "the reader peak is flat from 17 to 1025 entries within {FLAT_TOLERANCE} bytes: {peaks:?}"
+        );
+        let (mut db, create) = restating_history(4, 512);
+        let (answer, memory, visited) = judge_restatement(&mut db, &create, LIMIT);
+        eprintln!(
+            "CDB216-HISTORY-WALK early-stop prefix=4 suffix=512 entries=1033 answer={answer:?} memory={memory:?} visited={visited}"
+        );
+        assert_eq!(answer, Ok(true), "the early match restates");
+        assert!(
+            visited < 1033,
+            "the walk stops at the match; the 1024-entry suffix is not visited ({visited} decoded)"
+        );
+        assert!(
+            visited <= 2 * 4 + 2,
+            "only the 8-entry prefix and the match are decoded ({visited} decoded)"
+        );
+    }
+
+    both!(
+        cdb216_peer_history_reaching_live_shape_memory,
+        cdb216_peer_history_reaching_live_shape_file,
+        peer_history_reaching_live_shape
+    );
+    both!(
+        cdb216_peer_vector_history_reaching_live_policy_memory,
+        cdb216_peer_vector_history_reaching_live_policy_file,
+        peer_vector_history_reaching_live_policy
+    );
+    both!(
+        cdb216_peer_history_reaching_another_shape_memory,
+        cdb216_peer_history_reaching_another_shape_file,
+        peer_history_reaching_another_shape
+    );
+    both!(
+        cdb216_older_incarnation_create_is_not_restated_memory,
+        cdb216_older_incarnation_create_is_not_restated_file,
+        older_incarnation_create_is_not_restated
+    );
+    both!(
+        cdb216_same_alter_history_equal_revision_memory,
+        cdb216_same_alter_history_equal_revision_file,
+        same_alter_history_equal_revision
+    );
 
     macro_rules! retire {
         ($name:ident, $file:expr, $mutation:expr, $ddl:expr) => {
@@ -599,7 +1288,10 @@ mod received_closeout_guards {
                 drop(stage);
             }
             after.push(owner.usage().used);
-            assert_eq!(after[cycle], baseline, "prepare/drop cycle {cycle} must return the identical held total; samples={after:?}");
+            assert_eq!(
+                after[cycle], baseline,
+                "prepare/drop cycle {cycle} must return the identical held total; samples={after:?}"
+            );
             assert_eq!(db.current_lsn(), Lsn(0));
             assert!(db.table_meta("cycle_table").is_none());
         }
@@ -684,7 +1376,11 @@ mod received_closeout_guards {
                 matches!(error, Error::MemoryBudgetExceeded { operation, .. } if operation == "history_occurrences"),
                 "the refusal must come after successful history capacity admission"
             );
-            assert_eq!(owner.usage().used, before, "failed payload preparation cycle {cycle} releases the newly allocated empty backing");
+            assert_eq!(
+                owner.usage().used,
+                before,
+                "failed payload preparation cycle {cycle} releases the newly allocated empty backing"
+            );
             assert!(db.changes_since(Lsn(0)).unwrap().ddl.is_empty());
         }
     }
