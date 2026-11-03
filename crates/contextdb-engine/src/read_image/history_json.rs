@@ -364,3 +364,44 @@ impl HistoryJson for DdlChange {
         }
     }
 }
+
+#[cfg(test)]
+mod follows_parent_purge_tests {
+    use super::*;
+
+    #[test]
+    fn history_json_names_follows_parent_purge_only_when_declared() {
+        let single = |follows| SingleColumnForeignKey {
+            child_column: "parent_id".into(),
+            parent_table: "parents".into(),
+            parent_column: "id".into(),
+            follows_parent_purge: follows,
+        };
+        let composite = |follows| CompositeForeignKey {
+            child_columns: vec!["context_id".into(), "parent_id".into()],
+            parent_table: "parents".into(),
+            parent_columns: vec!["context_id".into(), "id".into()],
+            follows_parent_purge: follows,
+        };
+        let json = |value: serde_json::Result<serde_json::Value>| {
+            value.expect("history JSON renders a foreign key")
+        };
+        assert_eq!(
+            json(serde_json::to_value(Canonical(&single(true))))["follows_parent_purge"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            json(serde_json::to_value(Canonical(&composite(true))))["follows_parent_purge"],
+            serde_json::Value::Bool(true)
+        );
+        for undeclared in [
+            json(serde_json::to_value(Canonical(&single(false)))),
+            json(serde_json::to_value(Canonical(&composite(false)))),
+        ] {
+            assert!(
+                undeclared.get("follows_parent_purge").is_none(),
+                "an undeclared key renders as it always has: {undeclared}"
+            );
+        }
+    }
+}

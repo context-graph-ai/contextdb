@@ -23,10 +23,19 @@ impl Database {
         selections: &[AuthoritativePurgeSelection],
         credit: &mut contextdb_core::read_memory::ReadCredit,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        published_root: bool,
     ) -> Result<Vec<AuthoritativePurgeSelection>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let _scope = self.writer_read_scope(read_memory.clone())?;
+        // Under the commit mutex the statement's captured root predates any
+        // child committed since it was taken; that pass reads the root
+        // published now, so such a child is found.
+        let (_scope, _decode) = if published_root {
+            let (scope, decode) = self.published_root_read_scope(read_memory.clone())?;
+            (scope, Some(decode))
+        } else {
+            (self.writer_read_scope(read_memory.clone())?, None)
+        };
         let Some(root) = self.writer_read_root()? else {
             return Ok(Vec::new());
         };
@@ -97,6 +106,23 @@ impl Database {
                 else {
                     continue;
                 };
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    use std::sync::atomic::Ordering;
+                    let seam = &super::authoritative_purge_kernel::PURGE_FOLLOWERS_BEFORE_REFUSAL;
+                    match seam.load(Ordering::SeqCst) {
+                        0 => {
+                            seam.store(-1, Ordering::SeqCst);
+                            return Err(Error::Other(
+                                "purge follower admission refused by the test seam"
+                                    .to_string()
+                                    .into(),
+                            ));
+                        }
+                        remaining if remaining > 0 => seam.store(remaining - 1, Ordering::SeqCst),
+                        _ => {}
+                    }
+                }
                 credit.try_grow_for(
                     std::mem::size_of::<AuthoritativePurgeSelection>()
                         .saturating_add(selection.table.len().saturating_mul(3))
@@ -112,6 +138,28 @@ impl Database {
             }
         }
         Ok(found)
+    }
+
+    /// Read at the root published now, not the root the statement captured:
+    /// under the commit mutex that is every row committed before this purge.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn published_root_read_scope(
+        &self,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<(
+        super::writer_read::WriterReadScope,
+        crate::read_image_memory::ImageMemoryScope,
+    )> {
+        let image = crate::read_image_memory::ImageMemory::operation_reader(
+            self.accountant.clone(),
+            read_memory.clone(),
+        )?;
+        let published =
+            super::writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?;
+        Ok((self.enter_writer_read(published, read_memory), image.enter()))
     }
 
     /// Every row id a covering index of `table` has ever held for these
@@ -354,7 +402,12 @@ impl Database {
             retained: false,
         };
         let mut lives = self
-            .authoritative_purge_followers(std::slice::from_ref(&probe), &mut credit, read_memory)?
+            .authoritative_purge_followers(
+                std::slice::from_ref(&probe),
+                &mut credit,
+                read_memory,
+                false,
+            )?
             .into_iter()
             .map(|selection| (selection.table, selection.local_row_id, selection.retained))
             .collect::<Vec<_>>();

@@ -2471,22 +2471,24 @@ fn cg_shaped_followers_erase_only_their_own_arm() {
 /// An archived life is found from the parent it referenced, never from the
 /// child table's current declaration: the table may since point elsewhere,
 /// no longer follow, or be gone.
-/// A source store that pushes to `hub` over real authenticated sync
-/// transport, so the hub receives schema, rows and drops as delivered.
+/// An edge store linked to `hub` over real authenticated sync transport: it
+/// pushes its own schema and rows, and pulls the hub's, purges included.
 struct PushingSource {
-    db: Arc<Database>,
-    client: SyncClient,
+    db: Option<Arc<Database>>,
+    path: std::path::PathBuf,
+    client: Option<SyncClient>,
+    identity: Arc<contextdb_server::FabricIdentity>,
+    tenant: TenantId,
     server: Arc<SyncServer>,
     stop: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
-    _broker: contextdb_server::InProcessBroker,
+    broker: contextdb_server::InProcessBroker,
 }
 
 impl PushingSource {
     fn start(runtime: &tokio::runtime::Runtime, root: &Path, hub: Arc<Database>) -> Self {
         let tenant = TenantId::from("archived-followers");
         let hub_identity = Arc::new(contextdb_server::FabricIdentity::generate());
-        let source_identity = Arc::new(contextdb_server::FabricIdentity::generate());
         let broker = contextdb_server::InProcessBroker::new();
         let node = hub_identity.node_id();
         let server = Arc::new(
@@ -2508,45 +2510,94 @@ impl PushingSource {
         runtime.block_on(broker.wait_for_registered_route_for_test(
             &contextdb_server::subjects::push_subject(tenant.as_str()),
         ));
-        let db = Arc::new(Database::open(root.join("source.db")).expect("open the source store"));
-        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
-            db.clone(),
-            broker.client_as(&source_identity.node_id()),
+        let path = root.join("source.db");
+        let db = Arc::new(Database::open(&path).expect("open the edge store"));
+        let mut link = Self {
+            db: None,
+            path,
+            client: None,
+            identity: Arc::new(contextdb_server::FabricIdentity::generate()),
             tenant,
-            source_identity,
-        )
-        .expect("construct the source's authenticated sync endpoint");
-        Self {
-            db,
-            client,
             server,
             stop,
             task,
-            _broker: broker,
-        }
+            broker,
+        };
+        link.connect(db);
+        link
+    }
+
+    fn connect(&mut self, db: Arc<Database>) {
+        self.client = Some(
+            SyncClient::with_authenticated_transport_and_identity_for_test(
+                db.clone(),
+                self.broker.client_as(&self.identity.node_id()),
+                self.tenant.clone(),
+                self.identity.clone(),
+            )
+            .expect("construct the edge's authenticated sync endpoint"),
+        );
+        self.db = Some(db);
+    }
+
+    fn edge(&self) -> &Database {
+        self.db.as_ref().expect("the edge store is open")
+    }
+
+    fn client(&self) -> &SyncClient {
+        self.client.as_ref().expect("the edge is connected")
     }
 
     fn push(&self, runtime: &tokio::runtime::Runtime) {
         runtime
-            .block_on(self.client.push())
-            .expect("the hub receives the source's schema and rows");
+            .block_on(self.client().push())
+            .expect("the hub receives the edge's schema and rows");
     }
 
-    fn stop(self, runtime: &tokio::runtime::Runtime) {
+    fn pull(&self, runtime: &tokio::runtime::Runtime) {
+        runtime
+            .block_on(self.client().pull_default())
+            .expect("the edge receives the hub's schema, rows and purges");
+    }
+
+    /// Close and reopen the edge store. With `replay`, its pull watermark is
+    /// rewound so the hub delivers everything again.
+    fn reopen_edge(&mut self, runtime: &tokio::runtime::Runtime, replay: bool) {
+        if let Some(client) = self.client.take() {
+            runtime.block_on(client.shutdown());
+        }
+        let db = self.db.take().expect("the edge store is open");
+        db.close().expect("close the edge store");
+        drop(db);
+        let db = Database::open(&self.path).expect("reopen the edge store");
+        if replay {
+            db.persist_sync_pull_watermark(&self.tenant, contextdb_core::Lsn(0))
+                .expect("rewind the edge's pull watermark");
+        }
+        self.connect(Arc::new(db));
+    }
+
+    fn stop(mut self, runtime: &tokio::runtime::Runtime) {
+        if let Some(client) = self.client.take() {
+            runtime.block_on(client.shutdown());
+        }
         self.stop.store(true, Ordering::SeqCst);
         runtime.block_on(self.task).expect("hub stops cleanly");
-        drop(self.client);
         drop(self.server);
     }
 }
 
-#[test]
-fn a_purge_erases_child_lives_archived_by_an_earlier_drop() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+fn sync_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("sync runtime");
+        .expect("sync runtime")
+}
+
+#[test]
+fn a_purge_erases_child_lives_archived_by_an_earlier_drop() {
+    let runtime = sync_runtime();
     for received in [false, true] {
         for recreated_as in [
             Some("parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE"),
@@ -2565,7 +2616,7 @@ fn a_purge_erases_child_lives_archived_by_an_earlier_drop() {
             // through real sync transport; a local one is authored here.
             let source =
                 received.then(|| PushingSource::start(&runtime, root.path(), db.clone()));
-            let author: &Database = source.as_ref().map_or(&db, |source| &source.db);
+            let author: &Database = source.as_ref().map_or(&*db, |source| source.edge());
             let sync = if received { " SYNC TWO WAY" } else { " SYNC OFF" };
             for ddl in [
                 "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT)",
@@ -2646,7 +2697,12 @@ fn a_purge_erases_child_lives_archived_by_an_earlier_drop() {
                 "{case}: purging the other parent leaves this parent's archived life"
             );
 
-            exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(purged));
+            // CDB-211: a hub that received a DROP refuses a later purge of a
+            // received row ("change-log witness is missing from its LSN group").
+            // Pre-existing on 1ce16099 with no follower declared; the received
+            // variant stays red here until CDB-211 is fixed.
+            db.execute("PURGE FROM parents WHERE id = $id", &id_params(purged))
+                .unwrap_or_else(|err| panic!("{case}: purge the parent (CDB-211 when received): {err}"));
 
             let check = |db: &Database| {
                 assert!(
@@ -2718,5 +2774,487 @@ fn follows_parent_purge_is_validated_on_the_projected_catalog() {
         explained.contains("follows parent purge: by_id(parent_id) -> parents(id)"),
         "EXPLAIN names what follows: {explained}"
     );
+
+    // Following never forms a cycle, declared at once or by a later ALTER.
+    let cycle = db
+        .execute(
+            "CREATE TABLE self_ring (id UUID PRIMARY KEY, parent_id UUID REFERENCES self_ring(id) FOLLOWS PARENT PURGE) SYNC OFF",
+            &p(),
+        )
+        .expect_err("a table cannot follow its own purge");
+    assert!(
+        matches!(&cycle, Error::SchemaInvalid { reason } if reason.contains("cycle")),
+        "{cycle}"
+    );
+    exec(&db, "CREATE TABLE ring_a (id UUID PRIMARY KEY) SYNC OFF", &p());
+    exec(
+        &db,
+        "CREATE TABLE ring_b (id UUID PRIMARY KEY, a_id UUID REFERENCES ring_a(id) FOLLOWS PARENT PURGE) SYNC OFF",
+        &p(),
+    );
+    let cycle = db
+        .execute(
+            "ALTER TABLE ring_a ADD COLUMN b_id UUID REFERENCES ring_b(id) FOLLOWS PARENT PURGE",
+            &p(),
+        )
+        .expect_err("a later ALTER cannot close a following cycle");
+    assert!(
+        matches!(&cycle, Error::SchemaInvalid { reason } if reason.contains("cycle")),
+        "{cycle}"
+    );
+
+    // The covering index is the automatic foreign-key index; it cannot be
+    // dropped while the follower needs it.
+    let covering = db
+        .table_meta("by_id")
+        .expect("by_id is declared")
+        .indexes
+        .iter()
+        .find(|index| index.columns.first().is_some_and(|(column, _)| column == "parent_id"))
+        .map(|index| index.name.clone())
+        .expect("an index leads with the following column");
+    assert!(
+        db.execute(&format!("DROP INDEX {covering} ON by_id"), &p())
+            .is_err(),
+        "the follower's covering index cannot be dropped"
+    );
+
+    // The parent's erasure key and the parent itself stay while followed.
+    assert!(
+        db.execute("ALTER TABLE parents DROP COLUMN id", &p()).is_err(),
+        "the referenced erasure-key column cannot be removed"
+    );
+    assert!(
+        db.execute("DROP TABLE parents", &p()).is_err(),
+        "a followed parent cannot be dropped from under its follower"
+    );
+    assert!(
+        db.table_meta("by_id").is_some_and(|meta| meta
+            .columns
+            .iter()
+            .any(|column| column.references.as_ref().is_some_and(|r| r.follows_parent_purge))),
+        "the follower keeps its declaration"
+    );
+
+    // The same rules judge a received declaration on the projected catalog.
+    let source = Database::open(root.path().join("validation-source.db")).expect("open the source");
+    exec(
+        &source,
+        "CREATE TABLE parents (id UUID PRIMARY KEY, code UUID UNIQUE) SYNC TWO WAY",
+        &p(),
+    );
+    exec(
+        &source,
+        "CREATE TABLE by_ref (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE) SYNC TWO WAY",
+        &p(),
+    );
+    let mut changes = source
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the source's schema");
+    let mut rewritten = false;
+    for ddl in &mut changes.ddl {
+        if let contextdb_engine::sync_types::DdlChange::CreateTable {
+            name,
+            columns,
+            foreign_keys,
+            ..
+        } = ddl
+            && name == "by_ref"
+        {
+            for (column, ty) in columns.iter_mut() {
+                if column == "parent_id" {
+                    *ty = ty.replace("parents(id)", "parents(code)");
+                }
+            }
+            for key in foreign_keys.iter_mut() {
+                key.parent_column = "code".into();
+            }
+            rewritten = true;
+        }
+    }
+    assert!(rewritten, "the source declares by_ref");
+    let receiver =
+        Database::open(root.path().join("validation-receiver.db")).expect("open the receiver");
+    let refused = receiver
+        .apply_changes(
+            changes,
+            &contextdb_engine::sync_types::ConflictPolicies::uniform(
+                contextdb_engine::sync_types::ConflictPolicy::ServerWins,
+            ),
+        )
+        .expect_err("a received follower through a key other than the erasure key is refused");
+    assert!(refused.to_string().contains("erasure key"), "{refused}");
+    assert!(
+        receiver.table_meta("by_ref").is_none(),
+        "a refused received declaration creates nothing"
+    );
+}
+
+/// `.schema`, EXPLAIN and the canonical schema a peer receives all carry the
+/// declaration, so it survives every schema path.
+#[test]
+fn schema_and_explain_show_follows_parent_purge() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let source = Database::open(root.path().join("schema-source.db")).expect("open the source");
+    exec(
+        &source,
+        "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT) SYNC TWO WAY",
+        &p(),
+    );
+    exec(
+        &source,
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, body TEXT) SYNC TWO WAY",
+        &p(),
+    );
+    let shows = |db: &Database, label: &str| {
+        let meta = db.table_meta("children").expect("children is declared");
+        let rendered = contextdb_engine::cli_render::render_table_meta("children", &meta);
+        assert!(
+            rendered.contains("REFERENCES parents(id) FOLLOWS PARENT PURGE"),
+            "{label}: .schema shows the declaration: {rendered}"
+        );
+        let explained = db
+            .explain("PURGE FROM parents WHERE batch = 'x'")
+            .expect("explain the purge");
+        assert!(
+            explained.contains("follows parent purge: children(parent_id) -> parents(id)"),
+            "{label}: EXPLAIN names what follows: {explained}"
+        );
+    };
+    shows(&source, "source");
+
+    let changes = source
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the canonical schema");
+    assert!(
+        changes.ddl.iter().any(|ddl| matches!(
+            ddl,
+            contextdb_engine::sync_types::DdlChange::CreateTable { name, columns, foreign_keys, .. }
+                if name == "children"
+                    && (foreign_keys.iter().any(|key| key.follows_parent_purge)
+                        || columns.iter().any(|(_, ty)| ty.contains("FOLLOWS PARENT PURGE")))
+        )),
+        "the canonical schema carries the declaration"
+    );
+    let receiver = Database::open(root.path().join("schema-receiver.db")).expect("open the receiver");
+    receiver
+        .apply_changes(
+            changes,
+            &contextdb_engine::sync_types::ConflictPolicies::uniform(
+                contextdb_engine::sync_types::ConflictPolicy::ServerWins,
+            ),
+        )
+        .expect("the receiver applies the canonical schema");
+    shows(&receiver, "receiver");
+    receiver.close().expect("close the receiver");
+    shows(
+        &Database::open(root.path().join("schema-receiver.db")).expect("reopen the receiver"),
+        "reopened receiver",
+    );
+}
+
+fn create_following_tables(db: &Database) {
+    for ddl in [
+        "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT) SYNC OFF",
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF",
+        "CREATE TABLE grandchildren (id UUID PRIMARY KEY, child_id UUID REFERENCES children(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF",
+    ] {
+        exec(db, ddl, &p());
+    }
+}
+
+/// The edge's node-local followers of the hub's `parents`, declared after the
+/// hub's schema arrived by real sync.
+const EDGE_CHILDREN_DDL: &str = "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF";
+const HUB_PARENTS_DDL: &str = "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT) SYNC TWO WAY";
+
+#[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn a_child_committed_during_a_purge_is_erased_with_its_parent() {
+    // Local: the purge pauses after it found its followers and before it takes
+    // any lock; a child committed there is erased with the parent.
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("concurrent.db");
+    let db = Database::open(&path).expect("open the store");
+    create_following_tables(&db);
+    let (parent, early, late) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    exec(
+        &db,
+        "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+        &id_params(parent),
+    );
+    insert_child(&db, "children", early, "parent_id", parent);
+    let pause = db.pause_purge_after_follower_expansion_for_test();
+    std::thread::scope(|scope| {
+        let purge =
+            scope.spawn(|| db.execute("PURGE FROM parents WHERE id = $id", &id_params(parent)));
+        assert!(
+            pause.wait_until_reached_blocking(),
+            "the purge pauses after finding its followers"
+        );
+        insert_child(&db, "children", late, "parent_id", parent);
+        pause.release();
+        purge
+            .join()
+            .expect("the purge thread finishes")
+            .expect("the purge commits");
+    });
+    let erased = |db: &Database, label: &str| {
+        assert!(ids(db, "parents").is_empty(), "{label}: the parent is gone");
+        assert!(
+            ids(db, "children").is_empty(),
+            "{label}: the child committed during the purge is gone with the one before it"
+        );
+        assert!(
+            follower_lives(db, "parents", parent).is_empty(),
+            "{label}: no retained life of either child survives"
+        );
+    };
+    erased(&db, "local");
+    db.close().expect("close the store");
+    erased(&Database::open(&path).expect("reopen the store"), "local reopened");
+
+    // Received: the edge applying the hub's purge pauses inside that apply.
+    let runtime = sync_runtime();
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let hub = Arc::new(Database::open(root.path().join("hub.db")).expect("open the hub"));
+    exec(&hub, HUB_PARENTS_DDL, &p());
+    let link = PushingSource::start(&runtime, root.path(), hub.clone());
+    exec(
+        &hub,
+        "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+        &id_params(parent),
+    );
+    link.pull(&runtime);
+    exec(link.edge(), EDGE_CHILDREN_DDL, &p());
+    insert_child(link.edge(), "children", early, "parent_id", parent);
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(parent));
+    let pause = link.edge().pause_purge_after_follower_expansion_for_test();
+    std::thread::scope(|scope| {
+        let pull = scope.spawn(|| runtime.block_on(link.client().pull_default()));
+        assert!(
+            pause.wait_until_reached_blocking(),
+            "the received purge pauses after finding the edge's followers"
+        );
+        // The received apply holds the edge's writer from its expansion to its
+        // commit, so a local child cannot commit in between: it waits behind
+        // the purge and is then refused by its foreign key, or, had it got in
+        // first, it would be erased with the parent. Either way none survives.
+        let insert = scope.spawn(|| {
+            link.edge().execute(
+                "INSERT INTO children (id, parent_id, body) VALUES ($id, $parent, 'x')",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(late)),
+                    ("parent".to_string(), Value::Uuid(parent)),
+                ]),
+            )
+        });
+        pause.release();
+        let _ = insert.join().expect("the insert thread finishes");
+        pull.join()
+            .expect("the pull thread finishes")
+            .expect("the edge applies the hub's purge");
+    });
+    erased(link.edge(), "received");
+    link.stop(&runtime);
+}
+
+#[test]
+fn a_failure_at_the_erasure_boundary_leaves_parent_and_children_together() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("erasure-failure.db");
+    let db = Database::open(&path).expect("open the store");
+    create_following_tables(&db);
+    let (parent, child, grandchild) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    exec(
+        &db,
+        "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+        &id_params(parent),
+    );
+    insert_child(&db, "children", child, "parent_id", parent);
+    insert_child(&db, "grandchildren", grandchild, "child_id", child);
+    db.arm_authoritative_purge_point_remove_persistence_failure_for_test();
+    db.execute("PURGE FROM parents WHERE id = $id", &id_params(parent))
+        .expect_err("the injected failure at the erasure boundary refuses the purge");
+    let together = |db: &Database, label: &str| {
+        assert_eq!(ids(db, "parents"), vec![parent], "{label}: the parent stays");
+        assert_eq!(ids(db, "children"), vec![child], "{label}: the child stays");
+        assert_eq!(
+            ids(db, "grandchildren"),
+            vec![grandchild],
+            "{label}: the grandchild stays"
+        );
+        assert_eq!(
+            follower_lives(db, "parents", parent).len(),
+            2,
+            "{label}: both followers are still found"
+        );
+    };
+    together(&db, "after the failure");
+    db.close().expect("close the store");
+    let db = Database::open(&path).expect("reopen the store");
+    together(&db, "reopened");
+    exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(parent));
+    for table in ["parents", "children", "grandchildren"] {
+        assert!(ids(&db, table).is_empty(), "a retried purge erases {table}");
+    }
+}
+
+#[test]
+fn a_purge_refused_after_some_followers_were_admitted_changes_nothing() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("refused-followers.db");
+    let db = Database::open(&path).expect("open the store");
+    create_following_tables(&db);
+    let (parent, child, grandchild) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    exec(
+        &db,
+        "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+        &id_params(parent),
+    );
+    insert_child(&db, "children", child, "parent_id", parent);
+    insert_child(&db, "grandchildren", grandchild, "child_id", child);
+    let before = db.accountant().usage().used;
+    // The child is admitted; the grandchild is refused before it is held.
+    Database::__refuse_purge_follower_after_for_test(1);
+    let refused = db
+        .execute("PURGE FROM parents WHERE id = $id", &id_params(parent))
+        .expect_err("the purge is refused after a follower was admitted");
+    assert!(refused.to_string().contains("refused"), "{refused}");
+    assert_eq!(
+        db.accountant().usage().used,
+        before,
+        "a refused purge leaves no credit outstanding"
+    );
+    let unchanged = |db: &Database, label: &str| {
+        assert_eq!(ids(db, "parents"), vec![parent], "{label}: the parent stays");
+        assert_eq!(ids(db, "children"), vec![child], "{label}: the child stays");
+        assert_eq!(
+            ids(db, "grandchildren"),
+            vec![grandchild],
+            "{label}: the grandchild stays"
+        );
+        assert_eq!(
+            follower_lives(db, "parents", parent).len(),
+            2,
+            "{label}: every follower's history is still there"
+        );
+    };
+    unchanged(&db, "after the refusal");
+    db.close().expect("close the store");
+    let db = Database::open(&path).expect("reopen the store");
+    unchanged(&db, "reopened");
+    exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(parent));
+    for table in ["parents", "children", "grandchildren"] {
+        assert!(ids(&db, table).is_empty(), "an unrefused purge erases {table}");
+    }
+}
+
+#[test]
+fn a_redelivered_purge_never_expands() {
+    let runtime = sync_runtime();
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let hub = Arc::new(Database::open(root.path().join("hub.db")).expect("open the hub"));
+    exec(&hub, HUB_PARENTS_DDL, &p());
+    let mut link = PushingSource::start(&runtime, root.path(), hub.clone());
+    let (keyed, predicated) = (Uuid::new_v4(), Uuid::new_v4());
+    exec(
+        &hub,
+        "INSERT INTO parents (id, batch) VALUES ($id, 'keyed')",
+        &id_params(keyed),
+    );
+    exec(
+        &hub,
+        "INSERT INTO parents (id, batch) VALUES ($id, 'predicated')",
+        &id_params(predicated),
+    );
+    link.pull(&runtime);
+    exec(link.edge(), EDGE_CHILDREN_DDL, &p());
+    insert_child(link.edge(), "children", Uuid::new_v4(), "parent_id", keyed);
+    insert_child(link.edge(), "children", Uuid::new_v4(), "parent_id", predicated);
+    // One purge by key, one by predicate.
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(keyed));
+    exec(&hub, "PURGE FROM parents WHERE batch = 'predicated'", &p());
+    link.pull(&runtime);
+    assert!(ids(link.edge(), "children").is_empty(), "the first delivery erases both children");
+
+    // The old parents come back at their keys as new lives, with fresh children.
+    for (id, batch) in [(keyed, "keyed"), (predicated, "predicated")] {
+        exec(
+            &hub,
+            &format!("INSERT INTO parents (id, batch) VALUES ($id, '{batch}')"),
+            &id_params(id),
+        );
+    }
+    link.pull(&runtime);
+    let (fresh_keyed, fresh_predicated) = (Uuid::new_v4(), Uuid::new_v4());
+    insert_child(link.edge(), "children", fresh_keyed, "parent_id", keyed);
+    insert_child(link.edge(), "children", fresh_predicated, "parent_id", predicated);
+
+    // Reopen and rewind: the hub delivers both old purges again.
+    link.reopen_edge(&runtime, true);
+    link.pull(&runtime);
+    let mut fresh = vec![fresh_keyed, fresh_predicated];
+    fresh.sort();
+    let survives = |db: &Database, label: &str| {
+        assert_eq!(
+            ids(db, "children"),
+            fresh,
+            "{label}: a re-delivered purge never reaches a fresh child"
+        );
+        let mut parents = vec![keyed, predicated];
+        parents.sort();
+        assert_eq!(ids(db, "parents"), parents, "{label}: the new parent lives stay");
+    };
+    survives(link.edge(), "re-delivered");
+    link.reopen_edge(&runtime, false);
+    survives(link.edge(), "reopened");
+    link.stop(&runtime);
+}
+
+#[test]
+fn a_received_purge_erases_the_receivers_declared_node_local_children() {
+    let runtime = sync_runtime();
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let hub = Arc::new(Database::open(root.path().join("hub.db")).expect("open the hub"));
+    exec(&hub, HUB_PARENTS_DDL, &p());
+    let mut link = PushingSource::start(&runtime, root.path(), hub.clone());
+    let (purged, kept) = (Uuid::new_v4(), Uuid::new_v4());
+    for id in [purged, kept] {
+        exec(
+            &hub,
+            "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+            &id_params(id),
+        );
+    }
+    // The schema reaches the edge by real delivery; the follower is the edge's own.
+    link.pull(&runtime);
+    exec(link.edge(), EDGE_CHILDREN_DDL, &p());
+    let (purged_child, kept_child) = (Uuid::new_v4(), Uuid::new_v4());
+    insert_child(link.edge(), "children", purged_child, "parent_id", purged);
+    insert_child(link.edge(), "children", kept_child, "parent_id", kept);
+    link.reopen_edge(&runtime, false);
+
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(purged));
+    link.pull(&runtime);
+    let erased = |db: &Database, label: &str| {
+        assert_eq!(ids(db, "parents"), vec![kept], "{label}: the purged parent is gone");
+        assert_eq!(
+            ids(db, "children"),
+            vec![kept_child],
+            "{label}: only the purged parent's node-local child is erased"
+        );
+        assert!(
+            follower_lives(db, "parents", purged).is_empty(),
+            "{label}: no retained life of the erased child survives"
+        );
+    };
+    erased(link.edge(), "received");
+    link.reopen_edge(&runtime, false);
+    erased(link.edge(), "reopened");
+    link.stop(&runtime);
 }
 

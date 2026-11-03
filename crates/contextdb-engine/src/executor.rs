@@ -5500,6 +5500,16 @@ fn execute_alter_table_plan(
                         }
                     },
                 )?;
+                if core_col
+                    .references
+                    .as_ref()
+                    .is_some_and(|reference| reference.follows_parent_purge)
+                {
+                    // Judged on the catalog as it will be with this column in it.
+                    let mut projected = db.relational_store().table_meta.read().clone();
+                    projected.insert(p.table.clone(), candidate_meta.clone());
+                    crate::database::purge_followers::validate_purge_followers(&projected)?;
+                }
             }
             let added_vector = matches!(col.data_type, DataType::Vector(_));
             let _vector_schema = added_vector

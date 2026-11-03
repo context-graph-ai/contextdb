@@ -2014,6 +2014,7 @@ impl Database {
                 &working,
                 &mut follower_credit,
                 read_memory.clone(),
+                false,
             )?;
             if !followers.is_empty()
                 && report_shape == crate::custody::erasure::PurgeReportShape::Single
@@ -2045,6 +2046,8 @@ impl Database {
                     }
                 }
             }
+            #[cfg(any(test, feature = "test-seams"))]
+            purge_after_follower_expansion_pause().maybe_pause();
             let selections: &[AuthoritativePurgeSelection] = &working;
             // Candidate discovery and the callback drain both happen before the
             // transaction commit mutex. The complete sorted hash set is then
@@ -2053,7 +2056,14 @@ impl Database {
             let mut held_hashes =
                 self.authoritative_purge_selected_blob_hashes(selections, read_memory.clone())?;
             let mut queue_drain = Some(self.event_bus.begin_authoritative_purge_queue_drain()?);
+            // Set once the commit-locked pass found a follower committed after
+            // the statement's root: every later attempt reads the root
+            // published under the commit mutex, where that follower exists.
+            let mut read_published_root = false;
             loop {
+                let _published_root = read_published_root
+                    .then(|| self.published_root_read_scope(read_memory.clone()))
+                    .transpose()?;
                 let selections: &[AuthoritativePurgeSelection] = &working;
                 let publication_tables = selections
                     .iter()
@@ -2097,6 +2107,7 @@ impl Database {
                         selections,
                         &mut follower_credit,
                         read_memory.clone(),
+                        true,
                     )?);
                     if !newly_followed.is_empty() {
                         return Ok(None);
@@ -2424,10 +2435,12 @@ impl Database {
                         drop(blob_guard);
                         held_hashes.extend(newly_discovered);
                         if !newly_followed.is_empty() {
+                            read_published_root = true;
                             if report_shape == crate::custody::erasure::PurgeReportShape::Single {
                                 report_shape = crate::custody::erasure::PurgeReportShape::PerTable;
                             }
                             working.extend(newly_followed);
+                            let _published = self.published_root_read_scope(read_memory.clone())?;
                             held_hashes.extend(self.authoritative_purge_selected_blob_hashes(
                                 &working,
                                 read_memory.clone(),
@@ -2850,5 +2863,41 @@ impl Database {
                 .then_some("accepted".to_string()),
             purge_frontier: record.purge_frontier,
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+static PURGE_AFTER_FOLLOWER_EXPANSION_PAUSE: std::sync::OnceLock<Arc<ApplyPhasePause>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-seams"))]
+fn purge_after_follower_expansion_pause() -> Arc<ApplyPhasePause> {
+    PURGE_AFTER_FOLLOWER_EXPANSION_PAUSE
+        .get_or_init(|| Arc::new(ApplyPhasePause::new()))
+        .clone()
+}
+
+/// Follower admissions left before the next one is refused; negative when
+/// the seam is not armed.
+#[cfg(any(test, feature = "test-seams"))]
+pub(super) static PURGE_FOLLOWERS_BEFORE_REFUSAL: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(any(test, feature = "test-seams"))]
+impl Database {
+    /// Production-dead: pause the next purge after it has found what follows
+    /// its named rows and before it takes any lock, so a test can commit a
+    /// child there.
+    #[doc(hidden)]
+    pub fn pause_purge_after_follower_expansion_for_test(&self) -> ApplyPhasePauseGuard {
+        ApplyPhasePauseGuard::arm_for_test(purge_after_follower_expansion_pause())
+    }
+
+    /// Production-dead: the next purge admits `followers` more followers,
+    /// then the next follower is refused before it is held.
+    #[doc(hidden)]
+    pub fn __refuse_purge_follower_after_for_test(followers: u32) {
+        PURGE_FOLLOWERS_BEFORE_REFUSAL
+            .store(i64::from(followers), std::sync::atomic::Ordering::SeqCst);
     }
 }
