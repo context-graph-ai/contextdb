@@ -68,6 +68,10 @@ fn store(members: &[(u64, u64)]) -> (tempfile::TempDir, super::super::ProofFixtu
 /// Seek `start` within `scope` with `pending` overlaid, under a real
 /// accountant. Returns the answer; checks the admission holds only the
 /// answer's copy and gives everything back.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn seek(
     database: &super::super::ProofFixtureDatabase,
     scope: &[u8],

@@ -16896,6 +16896,10 @@ pub(crate) mod original_version_manifest {
             // counters suspended, must give this caller the same answer and
             // authenticate the same in-scope members as the scoped walk.
             overlay_work::begin_authenticated();
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             let unbounded = overlay_work::suspended(|| {
                 overlay_walk(
                     write,
