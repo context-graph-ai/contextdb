@@ -11358,7 +11358,6 @@ pub(crate) mod original_writer {
             before: Option<&[u8]>,
             admission: &mut ProofAdmission,
         ) -> Result<Option<Vec<u8>>> {
-            let _ = scope;
             let window = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
             let prefix_len = ORDERED_HISTORY_MAGIC.len() + 2;
             window.reserve(prefix_len * 2 + start.len())?;
@@ -11386,6 +11385,13 @@ pub(crate) mod original_writer {
                     break;
                 }
                 let coordinate = &key.value()[prefix_len..];
+                // `start` lies in `scope`, and the coordinates starting with
+                // `scope` are one contiguous run of this ordered range, so the
+                // first one outside it ends every candidate the caller can use,
+                // whether or not a stored successor bounds the walk.
+                if !coordinate.starts_with(scope) {
+                    break;
+                }
                 if before.is_some_and(|limit| coordinate >= limit) {
                     break;
                 }
@@ -16785,6 +16791,8 @@ pub(crate) mod original_version_manifest {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    /// [`writer_manifest_next_overlay`] over a publication-ordered slice of
+    /// this transaction's pending manifest deltas, within the caller's `scope`.
     pub(crate) fn writer_manifest_next_pending(
         write: &redb::WriteTransaction,
         scope: &[u8],
@@ -16805,13 +16813,15 @@ pub(crate) mod original_version_manifest {
             admission,
             |key| Ok(latest(key).map(|m| m.logical_value.is_some())),
             |before, scope, admission| {
-                let _ = scope;
+                // The slice is in publication order, not coordinate order, so
+                // a member outside the scope is skipped, never a stop.
                 let mut selected: Option<&[u8]> = None;
                 for mutation in pending {
                     #[cfg(all(test, feature = "test-seams"))]
                     overlay_work::count_slice_visited();
                     let key = coordinate(mutation);
-                    if mutation.logical_value.is_none()
+                    if !key.starts_with(scope)
+                        || mutation.logical_value.is_none()
                         || !std::ptr::eq(latest(key).expect("overlay member"), mutation)
                         || key < start
                         || (exclusive && key == start)
@@ -16832,6 +16842,8 @@ pub(crate) mod original_version_manifest {
         )
     }
 
+    /// [`writer_manifest_next_overlay`] over the paged batch of this
+    /// transaction's pending identity records, within the caller's `scope`.
     pub(crate) fn writer_manifest_next_paged(
         write: &redb::WriteTransaction,
         scope: &[u8],
@@ -16858,8 +16870,14 @@ pub(crate) mod original_version_manifest {
     /// unpublished deltas on the authenticated committed root.
     ///
     /// `scope` is the caller's manifest prefix: the table, the physical
-    /// identity or the row id it asks about. Every caller uses an answer only
-    /// if it starts with `scope`.
+    /// identity or the row id it asks about. `start` must lie within it, or
+    /// the seek is refused before any walk; the answer always lies within it,
+    /// and None means no member at or after `start` does. Both walks stop at
+    /// the scope's end: the stored walk authenticates every member it passes
+    /// inside the scope and the first stored successor past it, and the
+    /// pending walk visits at most the pending entries of the scope at or
+    /// after `start`, plus one that ends it. A seek therefore costs the
+    /// members of its own scope, never the rest of the table.
     fn writer_manifest_next_overlay(
         write: &redb::WriteTransaction,
         scope: &[u8],
@@ -16869,6 +16887,9 @@ pub(crate) mod original_version_manifest {
         mut state: impl FnMut(&[u8]) -> Result<Option<bool>>,
         mut next: impl FnMut(Option<&[u8]>, &[u8], &mut ProofAdmission) -> Result<Option<Vec<u8>>>,
     ) -> Result<Option<Vec<u8>>> {
+        if !start.starts_with(scope) {
+            return Err(bad("seek start lies outside its caller's scope"));
+        }
         #[cfg(all(test, feature = "test-seams"))]
         if overlay_work::shadow_enabled() {
             // The unbounded walk (an empty scope admits every coordinate), its
@@ -16930,6 +16951,14 @@ pub(crate) mod original_version_manifest {
         #[cfg(all(test, feature = "test-seams"))]
         overlay_work::note_authenticated(stored.as_deref());
         while let Some(key) = stored.as_deref() {
+            if !key.starts_with(scope) {
+                // Authenticated, and past every member this caller can use.
+                let key = stored.take().expect("authenticated successor");
+                let bytes = key.capacity();
+                drop(key);
+                admission.release(bytes);
+                break;
+            }
             if state(key)? != Some(false) {
                 break;
             }
@@ -16944,6 +16973,10 @@ pub(crate) mod original_version_manifest {
             admission.release(bytes);
         }
         if let Some(selected) = next(stored.as_deref(), scope, admission)? {
+            debug_assert!(
+                selected.starts_with(scope),
+                "a pending answer within the scope"
+            );
             if let Some(stored) = stored {
                 let bytes = stored.capacity();
                 drop(stored);
