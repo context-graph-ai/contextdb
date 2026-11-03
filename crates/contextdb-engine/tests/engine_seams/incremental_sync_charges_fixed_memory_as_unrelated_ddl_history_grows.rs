@@ -1,5 +1,5 @@
 //! Incremental sync uses bounded declaration summaries and preserves historical policy.
-use contextdb_core::{TenantId, Value};
+use contextdb_core::{Incarnation, TenantId, Value};
 use contextdb_engine::database::resident_history_test_seams::observe as summaries;
 use contextdb_engine::sync_types::SchemaSyncCapability;
 use contextdb_engine::writer_query_test_seams::observe as history;
@@ -19,6 +19,12 @@ fn open(path: &Path) -> Database {
         },
     )
     .unwrap()
+}
+/// A fabric identity from a fixed seed, so every run signs the same bytes.
+fn fixed_identity(directory: &Path, name: &str, byte: u8) -> Arc<FabricIdentity> {
+    let path = directory.join(name);
+    std::fs::write(&path, [byte; 32]).unwrap();
+    Arc::new(FabricIdentity::load_or_generate(&path).unwrap())
 }
 fn sql(db: &Database, statement: &str) {
     db.execute(statement, &HashMap::new()).unwrap();
@@ -83,8 +89,15 @@ async fn stop_server(
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
+    // Rows carry their write time, and the push envelope encodes each payload
+    // byte at or above 0x80 in two bytes, so a live clock moves the measured
+    // peak with the millisecond. One fixed clock on this thread and on every
+    // runtime worker makes both sizes stamp the same bytes.
+    const FIXED_WALLCLOCK_MS: u64 = 1_800_000_000_000;
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| FIXED_WALLCLOCK_MS);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .on_thread_start(|| contextdb_core::Wallclock::set_test_clock(|| FIXED_WALLCLOCK_MS))
         .enable_all()
         .build()
         .unwrap();
@@ -97,6 +110,22 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         let hub_path = directory.path().join("hub.redb");
         let source = Arc::new(open(&source_path));
         let hub = Arc::new(open(&hub_path));
+        // Both sizes sign the same row lineages: a fixed fabric key and a
+        // fixed sync incarnation per store. A minted incarnation is random,
+        // and the signature over it is pushed as a byte array whose encoded
+        // size depends on its byte values, so the peaks would differ by noise.
+        let tenant = TenantId::from("declaration-summary-growth");
+        source
+            .pin_sync_incarnation_for_test(
+                &tenant,
+                Incarnation(0x5eed_0000_0000_0000_0000_0000_0000_0001),
+            )
+            .unwrap();
+        hub.pin_sync_incarnation_for_test(
+            &tenant,
+            Incarnation(0x5eed_0000_0000_0000_0000_0000_0000_0002),
+        )
+        .unwrap();
         sql(
             &source,
             "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY",
@@ -134,9 +163,8 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         sql(&source, "ALTER TABLE held SET MAINTAIN COUNT NONE");
         // A final deliverable data commit confirms every preceding declaration.
         sql(&source, "INSERT INTO notes VALUES (1,'bootstrap')");
-        let tenant = TenantId::from("declaration-summary-growth");
-        let source_identity = Arc::new(FabricIdentity::generate());
-        let hub_identity = Arc::new(FabricIdentity::generate());
+        let source_identity = fixed_identity(directory.path(), "source.identity", 0x11);
+        let hub_identity = fixed_identity(directory.path(), "hub.identity", 0x22);
         let broker = InProcessBroker::new();
         let (stop, task, server) =
             runtime.block_on(serve(hub.clone(), &broker, hub_identity.clone(), &tenant));

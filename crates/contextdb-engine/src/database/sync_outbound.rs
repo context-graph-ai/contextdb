@@ -243,6 +243,58 @@ impl Database {
         self.sync_incarnation_with_read_memory(tenant_id, self.declared_reader_memory()?)
     }
 
+    /// Test-only: set this database life's per-tenant sync incarnation before
+    /// anything has minted one, so a fixture that compares two runs signs the
+    /// same row-lineage attestations in both. It refuses once an incarnation
+    /// exists for the tenant: replacing a live identity is never a test setup.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn pin_sync_incarnation_for_test(
+        &self,
+        tenant_id: &TenantId,
+        incarnation: Incarnation,
+    ) -> Result<()> {
+        let read_memory = self.declared_reader_memory()?;
+        let _operation = self.open_operation()?;
+        let operation = || {
+            let _writer_read = self.writer_read_scope(read_memory.clone())?;
+            let mut cache = self.sync_incarnations.lock();
+            let key = tenant_id.config_key("sync_incarnation");
+            let exists = cache.contains_key(tenant_id.as_str())
+                || match &self.persistence {
+                    Some(_) => self
+                        .read_config_value::<String>(&key, read_memory.clone())?
+                        .is_some(),
+                    None => false,
+                };
+            if exists {
+                return Err(Error::Other(
+                    "a sync incarnation already exists for this tenant; pin it before the first sync"
+                        .into(),
+                ));
+            }
+            if let Some(persistence) = &self.persistence {
+                self.publish_direct_metadata(|| {
+                    persistence.flush_config_value(&key, &incarnation.to_hex())
+                })?;
+            }
+            cache.insert(tenant_id.as_str().to_string(), incarnation);
+            Ok(())
+        };
+        if self.tx_mgr.commit_boundary_held_by_current_thread() {
+            operation()
+        } else {
+            self.tx_mgr.with_maintenance_publication(|_| operation())
+        }
+    }
+
     /// Per-tenant record of the highest edge-LSN this database has applied
     /// from sync pushes. Stored as a config value so `export_snapshot` carries
     /// it with the artifact at the snapshot point, exactly like the tenant sync

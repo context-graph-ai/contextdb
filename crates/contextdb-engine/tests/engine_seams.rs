@@ -77,6 +77,8 @@ mod one_event_append_cost_by_stream_depth;
 mod one_event_append_work_by_family;
 #[path = "engine_seams/one_vector_append_does_not_rescan_the_directory.rs"]
 mod one_vector_append_does_not_rescan_the_directory;
+#[path = "engine_seams/pinning_a_sync_incarnation_holds_across_reopen_and_refuses_a_second_pin.rs"]
+mod pinning_a_sync_incarnation_holds_across_reopen_and_refuses_a_second_pin;
 #[path = "engine_seams/pruning_report_names_reader_deferred_rows.rs"]
 mod pruning_report_names_reader_deferred_rows;
 #[path = "engine_seams/rank_policy_joined_row_sees_staged_access_changes.rs"]
