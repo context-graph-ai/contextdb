@@ -3568,14 +3568,24 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    /// Every retained change-log record, with the envelope its stored
+    /// coordinate files it under. A received unit files records of several
+    /// source commits under one later envelope, so the envelope is read from
+    /// the coordinate, never derived from the record. A store with no durable
+    /// history has no envelope to report.
     pub(super) fn collect_change_log_versions(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<Vec<ChangeLogEntry>> {
+    ) -> Result<Vec<(Option<Lsn>, ChangeLogEntry)>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let Some(root) = self.writer_read_root()? else {
-            return Ok(self.change_log.read().clone());
+            return Ok(self
+                .change_log
+                .read()
+                .iter()
+                .map(|entry| (None, entry.clone()))
+                .collect());
         };
         let mut cursor = root.change_log_cursor(
             crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
@@ -3587,13 +3597,21 @@ impl Database {
         while let Some(window) = cursor.next_change()? {
             memory.try_grow_for(
                 crate::composite_store::change_log_entry_retained_bytes(&window.value)
+                    .saturating_add(std::mem::size_of::<Option<Lsn>>())
                     .saturating_mul(2)
                     .saturating_add(128),
                 "writer_source",
                 "change_history_output",
                 "Raise MEMORY_LIMIT to prepare this history output.",
             )?;
-            entries.push(window.value);
+            let envelope = Lsn(u64::from_be_bytes(
+                window
+                    .position()
+                    .get(..8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| Error::Other("change-log coordinate has no envelope".into()))?,
+            ));
+            entries.push((Some(envelope), window.value));
         }
         self.retain_writer_output(memory);
         Ok(entries)

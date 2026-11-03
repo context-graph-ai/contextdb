@@ -2434,7 +2434,8 @@ struct AuthoritativePurgeKernelOutcome {
 /// remove for one immutable root, plus the projections that must remain.
 struct AuthoritativePurgePreparedSet {
     row_version_keys: Vec<AuthoritativePurgeRowVersionKey>,
-    change_log_entries: Vec<ChangeLogEntry>,
+    /// Each selected record with the envelope it is stored under.
+    change_log_entries: Vec<(Option<Lsn>, ChangeLogEntry)>,
     vector_entries: Vec<VectorEntry>,
     vector_partition_identities: Vec<VectorPartitionVersionIdentity>,
     canonical_graph_entries: Vec<AdjEntry>,

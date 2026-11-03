@@ -897,7 +897,7 @@ impl Database {
         let selected_change_log_positions = change_log
             .iter()
             .enumerate()
-            .filter_map(|(position, entry)| match entry {
+            .filter_map(|(position, (_, entry))| match entry {
                 ChangeLogEntry::RowInsert { table, row_id, .. }
                 | ChangeLogEntry::RowDelete { table, row_id, .. } => {
                     selected(table, row_id).then_some(position)

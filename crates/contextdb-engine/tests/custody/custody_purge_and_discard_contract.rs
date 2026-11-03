@@ -2717,12 +2717,8 @@ fn a_purge_erases_child_lives_archived_by_an_earlier_drop() {
                 "{case}: purging the other parent leaves this parent's archived life"
             );
 
-            // CDB-211: a hub that received a DROP refuses a later purge of a
-            // received row ("change-log witness is missing from its LSN group").
-            // Pre-existing on 1ce16099 with no follower declared; the received
-            // variant stays red here until CDB-211 is fixed.
             db.execute("PURGE FROM parents WHERE id = $id", &id_params(purged))
-                .unwrap_or_else(|err| panic!("{case}: purge the parent (CDB-211 when received): {err}"));
+                .unwrap_or_else(|err| panic!("{case}: purge the parent: {err}"));
 
             let check = |db: &Database| {
                 assert!(
@@ -3509,4 +3505,160 @@ fn a_purge_erases_archived_edge_shaped_children() {
         db.close().expect("close the store");
         check(&Database::open(&path).expect("reopen the store"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// A purge erases received rows wherever their change-log record is filed
+// (CDB-211).
+// ---------------------------------------------------------------------------
+
+/// A row whose two declared foreign keys join two parents written by earlier
+/// commits: delivery carries the three as one dependency-complete unit, filed
+/// under one acceptance envelope later than either parent's own position.
+const LINKS_DDL: &str = "CREATE TABLE links (id UUID PRIMARY KEY, p_ref UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, q_ref UUID REFERENCES parents(id), body TEXT) SYNC TWO WAY";
+
+/// Three commits: parent P, parent Q, then a link that requires both.
+fn write_multi_commit_unit(db: &Database) -> (Uuid, Uuid, Uuid) {
+    let (p_id, q_id, link) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for id in [p_id, q_id] {
+        exec(
+            db,
+            "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+            &id_params(id),
+        );
+    }
+    exec(
+        db,
+        "INSERT INTO links (id, p_ref, q_ref, body) VALUES ($id, $p, $q, 'x')",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(link)),
+            ("p".to_string(), Value::Uuid(p_id)),
+            ("q".to_string(), Value::Uuid(q_id)),
+        ]),
+    );
+    (p_id, q_id, link)
+}
+
+struct FixedClock;
+
+impl contextdb_core::read_contract::DeadlineClock for FixedClock {
+    fn now_ms(&self) -> u64 {
+        1
+    }
+
+    fn wait_until(&self, _deadline_ms: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+        Box::pin(async {})
+    }
+}
+
+/// A strict committed-history read of the closed store at `path`: it walks
+/// every committed coordinate in lockstep with its physical record, so a
+/// mis-filed or orphaned record is typed damage, not an answer.
+fn strict_history_rows(path: &Path) -> usize {
+    use contextdb_engine::direct_file_reader::test_seams::{
+        DirectImageMetadataKind, DirectImageState, DirectMetadataBody, DirectMetadataRequest,
+        DirectReaderConfig, open_for_test,
+    };
+    let config = DirectReaderConfig::new(
+        contextdb_core::read_contract::ReadLimits {
+            result_rows: 1_000,
+            result_bytes: 64 * 1024 * 1024,
+            work: 1_000_000,
+            active_ms: 60_000,
+            memory: 1024 * 1024 * 1024,
+            cursor_page_rows: 100,
+            cursor_page_bytes: 2 * 1024 * 1024,
+            cursor_idle_ms: 10_000,
+            cursor_lifetime_ms: 20_000,
+        },
+        Arc::new(FixedClock),
+    );
+    let reader = open_for_test(path, config).expect("open the store as a strict reader");
+    match reader
+        .metadata(DirectMetadataRequest::ImageState {
+            kind: DirectImageMetadataKind::ChangeLog,
+        })
+        .expect("a strict committed-history read answers")
+        .body
+        .clone()
+    {
+        DirectMetadataBody::ImageState {
+            state: DirectImageState::ChangeLog(changes),
+        } => changes.rows.len(),
+        other => panic!("change history answers as change-log state: {other:?}"),
+    }
+}
+
+/// The hub received the unit by push; its records sit under one envelope.
+fn hub_received_unit(
+    runtime: &tokio::runtime::Runtime,
+    root: &Path,
+) -> (Arc<Database>, Uuid, Uuid, Uuid) {
+    let hub = Arc::new(Database::open(root.join("hub.db")).expect("open the hub"));
+    let link = PushingSource::start(runtime, root, hub.clone());
+    exec(link.edge(), HUB_PARENTS_DDL, &p());
+    exec(link.edge(), LINKS_DDL, &p());
+    let ids = write_multi_commit_unit(link.edge());
+    link.push(runtime);
+    link.stop(runtime);
+    (hub, ids.0, ids.1, ids.2)
+}
+
+/// Hub route: P's record is filed under the link's later envelope, with Q and
+/// the link beside it in the same group.
+#[test]
+fn a_hub_purge_erases_pushed_rows_filed_under_a_later_envelope() {
+    let runtime = sync_runtime();
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("hub.db");
+    let (hub, p_id, q_id, link) = hub_received_unit(&runtime, root.path());
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(p_id));
+    assert_eq!(ids(&hub, "parents"), vec![q_id], "hub: P is gone and Q, filed beside it, stays");
+    assert!(ids(&hub, "links").is_empty(), "hub: the link follows P");
+    hub.close().expect("close the hub");
+    drop(hub);
+    let after_p = strict_history_rows(&path);
+    let hub = Database::open(&path).expect("reopen the hub");
+    assert_eq!(ids(&hub, "parents"), vec![q_id], "hub reopened: Q survives P's erasure");
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(q_id));
+    assert!(ids(&hub, "parents").is_empty(), "hub: the survivor is erased from its re-densified group");
+    assert!(follower_lives(&hub, "parents", p_id).is_empty() && follower_lives(&hub, "parents", q_id).is_empty());
+    hub.close().expect("close the hub");
+    drop(hub);
+    assert!(
+        strict_history_rows(&path) < after_p,
+        "hub: the strict history read answers and has lost Q's record"
+    );
+    let hub = Database::open(&path).expect("reopen the hub");
+    assert!(ids(&hub, "parents").is_empty() && ids(&hub, "links").is_empty());
+    let _ = link;
+}
+
+/// Edge route: the hub authors the same three commits; the edge pulls them as
+/// one dependency unit and applies the hub's purges.
+#[test]
+fn an_edge_applies_a_purge_of_pulled_rows_filed_under_a_later_envelope() {
+    let runtime = sync_runtime();
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let hub = Arc::new(Database::open(root.path().join("hub.db")).expect("open the hub"));
+    exec(&hub, HUB_PARENTS_DDL, &p());
+    exec(&hub, LINKS_DDL, &p());
+    let mut edge = PushingSource::start(&runtime, root.path(), hub.clone());
+    let (p_id, q_id, _) = write_multi_commit_unit(&hub);
+    edge.pull(&runtime);
+    assert_eq!(ids(edge.edge(), "parents").len(), 2, "edge: the unit arrived");
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(p_id));
+    edge.pull(&runtime);
+    assert_eq!(ids(edge.edge(), "parents"), vec![q_id], "edge: P is gone and Q stays");
+    assert!(ids(edge.edge(), "links").is_empty(), "edge: the link follows P");
+    edge.reopen_edge(&runtime, false);
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(q_id));
+    edge.pull(&runtime);
+    assert!(ids(edge.edge(), "parents").is_empty(), "edge: Q is erased from its group");
+    let edge_path = root.path().join("source.db");
+    edge.stop(&runtime);
+    // Panics with typed damage if any record is mis-filed or orphaned.
+    strict_history_rows(&edge_path);
+    let reopened = Database::open(&edge_path).expect("reopen the edge");
+    assert!(ids(&reopened, "parents").is_empty() && ids(&reopened, "links").is_empty());
 }

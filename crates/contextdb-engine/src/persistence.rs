@@ -7098,7 +7098,8 @@ pub(crate) struct AuthoritativePurgePersistenceProjection {
     /// Selected sink entries: sink, id and the BLAKE3 digest of the durable
     /// value the selection saw.
     pub(crate) sink_entries: Vec<(String, u64, [u8; 32])>,
-    pub(crate) change_log_entries: Vec<ChangeLogEntry>,
+    /// Each selected change-log record with the envelope it is stored under.
+    pub(crate) change_log_entries: Vec<(Option<Lsn>, ChangeLogEntry)>,
     pub(crate) config_keys_removed: Vec<String>,
     pub(crate) lifecycle_records: Vec<(String, Vec<u8>)>,
     pub(crate) purge_delivery_items: Vec<(String, Vec<u8>)>,

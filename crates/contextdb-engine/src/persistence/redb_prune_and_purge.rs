@@ -2223,10 +2223,18 @@ impl RedbPersistence {
         // value inside its LSN group.  Read and re-densify only touched
         // groups so earlier scoped maintenance cannot leave an orphaned
         // or mis-indexed survivor.
+        // A record is looked up under the envelope its stored coordinate
+        // names: a received unit files records of several source commits
+        // under one envelope later than their own positions.
         let mut selected_by_lsn = BTreeMap::<Lsn, Vec<ChangeLogEntry>>::new();
-        for entry in &projection.change_log_entries {
+        for (envelope, entry) in &projection.change_log_entries {
+            let envelope = envelope.ok_or_else(|| {
+                Error::SyncError(
+                    "durable erasure lost a change-log record's stored envelope".into(),
+                )
+            })?;
             selected_by_lsn
-                .entry(entry.lsn())
+                .entry(envelope)
                 .or_default()
                 .push(entry.clone());
         }
