@@ -76,6 +76,7 @@ impl RedbPersistence {
             )?;
             let next = manifest::writer_manifest_next_paged(
                 write,
+                &prefix,
                 after
                     .as_ref()
                     .map_or(prefix.as_slice(), |at| at.bytes.as_slice()),
@@ -212,10 +213,18 @@ impl RedbPersistence {
         let mut prefix = manifest::manifest_prefix(table)?;
         prefix.extend_from_slice(physical);
         let expected = if let Some(paged) = paged.as_deref() {
-            manifest::writer_manifest_next_paged(write, &prefix, false, &mut admission, paged)
+            manifest::writer_manifest_next_paged(
+                write,
+                &prefix,
+                &prefix,
+                false,
+                &mut admission,
+                paged,
+            )
         } else {
             manifest::writer_manifest_next_pending(
                 write,
+                &prefix,
                 &prefix,
                 false,
                 &mut admission,
@@ -235,10 +244,18 @@ impl RedbPersistence {
         }
         if let Some(coordinate) = &old_coordinate {
             let next = if let Some(paged) = paged.as_deref() {
-                manifest::writer_manifest_next_paged(write, coordinate, true, &mut admission, paged)
+                manifest::writer_manifest_next_paged(
+                    write,
+                    &prefix,
+                    coordinate,
+                    true,
+                    &mut admission,
+                    paged,
+                )
             } else {
                 manifest::writer_manifest_next_pending(
                     write,
+                    &prefix,
                     coordinate,
                     true,
                     &mut admission,
@@ -369,9 +386,15 @@ impl RedbPersistence {
             self.proof_scratch_owner(),
         )?;
         let Some((key, body)) = latest else {
-            let witnessed =
-                manifest::writer_manifest_next_pending(write, &prefix, false, &mut window, pending)
-                    .map_err(|e| self.relational_manifest_error(e))?;
+            let witnessed = manifest::writer_manifest_next_pending(
+                write,
+                &prefix,
+                &prefix,
+                false,
+                &mut window,
+                pending,
+            )
+            .map_err(|e| self.relational_manifest_error(e))?;
             if witnessed.is_some_and(|coordinate| coordinate.starts_with(&prefix)) {
                 return Err(
                     self.relational_manifest_damage("writer group version is physically missing")
@@ -381,13 +404,17 @@ impl RedbPersistence {
         };
         let mut at = manifest::manifest_prefix(table)?;
         at.extend_from_slice(key.value());
-        let coordinate =
-            manifest::writer_manifest_next_pending(write, &at, false, &mut window, pending)
-                .map_err(|e| self.relational_manifest_error(e))?
-                .filter(|coordinate| coordinate.starts_with(&prefix))
-                .ok_or_else(|| {
-                    self.relational_manifest_damage("unwitnessed writer group suffix")
-                })?;
+        let coordinate = manifest::writer_manifest_next_pending(
+            write,
+            &prefix,
+            &at,
+            false,
+            &mut window,
+            pending,
+        )
+        .map_err(|e| self.relational_manifest_error(e))?
+        .filter(|coordinate| coordinate.starts_with(&prefix))
+        .ok_or_else(|| self.relational_manifest_damage("unwitnessed writer group suffix"))?;
         let witness =
             manifest::parse_manifest(&coordinate).map_err(|e| self.relational_manifest_error(e))?;
         // The seek starts at the newest physical version, so a different
@@ -406,9 +433,15 @@ impl RedbPersistence {
                 self.relational_manifest_damage("writer group body or closure is unauthenticated")
             );
         }
-        let after =
-            manifest::writer_manifest_next_pending(write, &coordinate, true, &mut window, pending)
-                .map_err(|e| self.relational_manifest_error(e))?;
+        let after = manifest::writer_manifest_next_pending(
+            write,
+            &prefix,
+            &coordinate,
+            true,
+            &mut window,
+            pending,
+        )
+        .map_err(|e| self.relational_manifest_error(e))?;
         if after.is_some_and(|coordinate| coordinate.starts_with(&prefix)) {
             return Err(self.relational_manifest_damage(
                 "duplicate or physically missing writer group version",

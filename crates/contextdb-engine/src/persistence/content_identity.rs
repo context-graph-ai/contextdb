@@ -11352,11 +11352,13 @@ pub(crate) mod original_writer {
 
         pub(super) fn manifest_candidate(
             &self,
+            scope: &[u8],
             start: &[u8],
             exclusive: bool,
             before: Option<&[u8]>,
             admission: &mut ProofAdmission,
         ) -> Result<Option<Vec<u8>>> {
+            let _ = scope;
             let window = crate::persistence::OriginalPersistenceFrame::new(self.original)?;
             let prefix_len = ORDERED_HISTORY_MAGIC.len() + 2;
             window.reserve(prefix_len * 2 + start.len())?;
@@ -11378,6 +11380,8 @@ pub(crate) mod original_writer {
                 .map_err(RedbPersistence::storage_error)?
             {
                 let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+                #[cfg(all(test, feature = "test-seams"))]
+                super::original_version_manifest::overlay_work::count_pending_visited();
                 if !key.value().starts_with(&prefix) {
                     break;
                 }
@@ -16187,6 +16191,8 @@ pub(crate) mod original_producers {
 
 pub(crate) mod original_version_manifest {
     //! A private ordered witness for each retained physical relational version.
+    #[cfg(test)]
+    mod seek_tests;
     use super::original_writer::{ProofAdmission, read_node_charged, resolve_key_charged};
     use super::*;
 
@@ -16781,6 +16787,7 @@ pub(crate) mod original_version_manifest {
     )]
     pub(crate) fn writer_manifest_next_pending(
         write: &redb::WriteTransaction,
+        scope: &[u8],
         start: &[u8],
         exclusive: bool,
         admission: &mut ProofAdmission,
@@ -16792,13 +16799,17 @@ pub(crate) mod original_version_manifest {
         let latest = |key: &[u8]| pending.iter().rev().find(|m| coordinate(m) == key);
         writer_manifest_next_overlay(
             write,
+            scope,
             start,
             exclusive,
             admission,
             |key| Ok(latest(key).map(|m| m.logical_value.is_some())),
-            |before, admission| {
+            |before, scope, admission| {
+                let _ = scope;
                 let mut selected: Option<&[u8]> = None;
                 for mutation in pending {
+                    #[cfg(all(test, feature = "test-seams"))]
+                    overlay_work::count_slice_visited();
                     let key = coordinate(mutation);
                     if mutation.logical_value.is_none()
                         || !std::ptr::eq(latest(key).expect("overlay member"), mutation)
@@ -16823,6 +16834,7 @@ pub(crate) mod original_version_manifest {
 
     pub(crate) fn writer_manifest_next_paged(
         write: &redb::WriteTransaction,
+        scope: &[u8],
         start: &[u8],
         exclusive: bool,
         admission: &mut ProofAdmission,
@@ -16830,34 +16842,108 @@ pub(crate) mod original_version_manifest {
     ) -> Result<Option<Vec<u8>>> {
         writer_manifest_next_overlay(
             write,
+            scope,
             start,
             exclusive,
             admission,
             |key| pending.manifest_state(key),
-            |before, admission| pending.manifest_candidate(start, exclusive, before, admission),
+            |before, scope, admission| {
+                pending.manifest_candidate(scope, start, exclusive, before, admission)
+            },
         )
     }
 
+    /// The first present manifest member at or after `start` (after it when
+    /// `exclusive`), stored or pending, overlaying this transaction's
+    /// unpublished deltas on the authenticated committed root.
+    ///
+    /// `scope` is the caller's manifest prefix: the table, the physical
+    /// identity or the row id it asks about. Every caller uses an answer only
+    /// if it starts with `scope`.
     fn writer_manifest_next_overlay(
         write: &redb::WriteTransaction,
+        scope: &[u8],
         start: &[u8],
         exclusive: bool,
         admission: &mut ProofAdmission,
         mut state: impl FnMut(&[u8]) -> Result<Option<bool>>,
-        mut next: impl FnMut(Option<&[u8]>, &mut ProofAdmission) -> Result<Option<Vec<u8>>>,
+        mut next: impl FnMut(Option<&[u8]>, &[u8], &mut ProofAdmission) -> Result<Option<Vec<u8>>>,
     ) -> Result<Option<Vec<u8>>> {
+        #[cfg(all(test, feature = "test-seams"))]
+        if overlay_work::shadow_enabled() {
+            // The unbounded walk (an empty scope admits every coordinate), its
+            // counters suspended, must give this caller the same answer and
+            // authenticate the same in-scope members as the scoped walk.
+            overlay_work::begin_authenticated();
+            let unbounded = overlay_work::suspended(|| {
+                overlay_walk(
+                    write,
+                    &[],
+                    start,
+                    exclusive,
+                    admission,
+                    &mut state,
+                    &mut next,
+                )
+            });
+            let unbounded_seen = overlay_work::end_authenticated();
+            let unbounded = unbounded?;
+            overlay_work::begin_authenticated();
+            let scoped = overlay_walk(
+                write, scope, start, exclusive, admission, &mut state, &mut next,
+            );
+            let scoped_seen = overlay_work::end_authenticated();
+            let scoped = scoped?;
+            let in_scope = |seen: Vec<Vec<u8>>| {
+                seen.into_iter()
+                    .filter(|key| key.starts_with(scope))
+                    .collect::<Vec<_>>()
+            };
+            overlay_work::record_shadow(
+                unbounded.as_deref().filter(|key| key.starts_with(scope)) == scoped.as_deref()
+                    && in_scope(unbounded_seen) == in_scope(scoped_seen),
+            );
+            if let Some(key) = unbounded {
+                let bytes = key.capacity();
+                drop(key);
+                admission.release(bytes);
+            }
+            return Ok(scoped);
+        }
+        overlay_walk(
+            write, scope, start, exclusive, admission, &mut state, &mut next,
+        )
+    }
+
+    fn overlay_walk(
+        write: &redb::WriteTransaction,
+        scope: &[u8],
+        start: &[u8],
+        exclusive: bool,
+        admission: &mut ProofAdmission,
+        state: &mut impl FnMut(&[u8]) -> Result<Option<bool>>,
+        next: &mut impl FnMut(Option<&[u8]>, &[u8], &mut ProofAdmission) -> Result<Option<Vec<u8>>>,
+    ) -> Result<Option<Vec<u8>>> {
+        #[cfg(all(test, feature = "test-seams"))]
+        overlay_work::count_call();
         let mut stored = writer_manifest_next(write, start, exclusive, admission)?;
+        #[cfg(all(test, feature = "test-seams"))]
+        overlay_work::note_authenticated(stored.as_deref());
         while let Some(key) = stored.as_deref() {
             if state(key)? != Some(false) {
                 break;
             }
+            #[cfg(all(test, feature = "test-seams"))]
+            overlay_work::count_stored_skip(!key.starts_with(scope));
             let key = stored.take().expect("selected predecessor");
             stored = writer_manifest_next(write, &key, true, admission)?;
+            #[cfg(all(test, feature = "test-seams"))]
+            overlay_work::note_authenticated(stored.as_deref());
             let bytes = key.capacity();
             drop(key);
             admission.release(bytes);
         }
-        if let Some(selected) = next(stored.as_deref(), admission)? {
+        if let Some(selected) = next(stored.as_deref(), scope, admission)? {
             if let Some(stored) = stored {
                 let bytes = stored.capacity();
                 drop(stored);
@@ -16866,6 +16952,104 @@ pub(crate) mod original_version_manifest {
             Ok(Some(selected))
         } else {
             Ok(stored)
+        }
+    }
+
+    /// Work counters for the two walks of the legacy manifest overlay: the
+    /// stored successors it authenticates and skips, and the pending entries
+    /// it visits. Read by `received_legacy_overlay_work_guards.rs`.
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) mod overlay_work {
+        use std::cell::{Cell, RefCell};
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) struct Work {
+            pub(crate) calls: u64,
+            pub(crate) stored_skips: u64,
+            pub(crate) stored_skips_outside_scope: u64,
+            pub(crate) pending_visited: u64,
+            pub(crate) slice_visited: u64,
+            pub(crate) shadow_compared: u64,
+            pub(crate) shadow_mismatches: u64,
+        }
+        const ZERO: Work = Work {
+            calls: 0,
+            stored_skips: 0,
+            stored_skips_outside_scope: 0,
+            pending_visited: 0,
+            slice_visited: 0,
+            shadow_compared: 0,
+            shadow_mismatches: 0,
+        };
+        thread_local! {
+            static WORK: Cell<Work> = const { Cell::new(ZERO) };
+            static SUSPENDED: Cell<bool> = const { Cell::new(false) };
+            static SHADOW: Cell<bool> = const { Cell::new(false) };
+            static AUTHENTICATED: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) };
+        }
+        fn bump(step: impl FnOnce(&mut Work)) {
+            if !SUSPENDED.with(Cell::get) {
+                WORK.with(|work| {
+                    let mut next = work.get();
+                    step(&mut next);
+                    work.set(next);
+                });
+            }
+        }
+        pub(super) fn count_call() {
+            bump(|work| work.calls += 1);
+        }
+        pub(super) fn count_stored_skip(outside_scope: bool) {
+            bump(|work| {
+                work.stored_skips += 1;
+                work.stored_skips_outside_scope += u64::from(outside_scope);
+            });
+        }
+        pub(in super::super) fn count_pending_visited() {
+            bump(|work| work.pending_visited += 1);
+        }
+        pub(super) fn count_slice_visited() {
+            bump(|work| work.slice_visited += 1);
+        }
+        pub(super) fn note_authenticated(key: Option<&[u8]>) {
+            if let Some(key) = key {
+                AUTHENTICATED.with(|seen| {
+                    if let Some(seen) = seen.borrow_mut().as_mut() {
+                        seen.push(key.to_vec());
+                    }
+                });
+            }
+        }
+        pub(super) fn begin_authenticated() {
+            AUTHENTICATED.with(|seen| *seen.borrow_mut() = Some(Vec::new()));
+        }
+        pub(super) fn end_authenticated() -> Vec<Vec<u8>> {
+            AUTHENTICATED.with(|seen| seen.borrow_mut().take().unwrap_or_default())
+        }
+        pub(super) fn suspended<T>(walk: impl FnOnce() -> T) -> T {
+            let was = SUSPENDED.with(|suspended| suspended.replace(true));
+            let result = walk();
+            SUSPENDED.with(|suspended| suspended.set(was));
+            result
+        }
+        pub(super) fn shadow_enabled() -> bool {
+            SHADOW.with(Cell::get)
+        }
+        pub(super) fn record_shadow(matched: bool) {
+            WORK.with(|work| {
+                let mut next = work.get();
+                next.shadow_compared += 1;
+                next.shadow_mismatches += u64::from(!matched);
+                work.set(next);
+            });
+        }
+        /// Run every overlay seek on this thread twice from now on: scoped,
+        /// and unbounded with its counters suspended.
+        pub(crate) fn set_shadow(enabled: bool) {
+            SHADOW.with(|shadow| shadow.set(enabled));
+        }
+        pub(crate) fn take() -> Work {
+            WORK.with(|work| work.replace(ZERO))
         }
     }
     #[expect(

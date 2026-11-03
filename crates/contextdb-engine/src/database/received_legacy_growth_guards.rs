@@ -424,4 +424,5 @@ mod received_legacy_growth_guards {
         growth(4);
     }
     include!("received_legacy_growth_lifecycle_guards.rs");
+    include!("received_legacy_overlay_work_guards.rs");
 }
