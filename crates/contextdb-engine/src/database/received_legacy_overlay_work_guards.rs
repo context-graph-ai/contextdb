@@ -8,7 +8,8 @@ use crate::persistence::content_identity::original_version_manifest::overlay_wor
 
 /// The overlay work of the first apply of the restating stage over `count`
 /// seeded rows, which the injected durable failure refuses after staging.
-fn first_apply_overlay_work(count: usize, shadow: bool) -> overlay_work::Work {
+/// `check` asserts on the counters before either database closes.
+fn first_apply_overlay_work(count: usize, shadow: bool, check: impl FnOnce(overlay_work::Work)) {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let root = tempfile::tempdir().unwrap();
     let (author, receiver, before, _retained_at) = seeded(root.path(), count);
@@ -26,10 +27,20 @@ fn first_apply_overlay_work(count: usize, shadow: bool) -> overlay_work::Work {
         "the injected durable failure refuses the unit after full staging"
     );
     drop(outcome);
-    receiver.db.close().unwrap();
+    check(work);
+    // CDB-224: closing after the refused stage can be refused at
+    // redb/pending_directory. CDB-226: that memory refusal arrives flattened
+    // to storage I/O, so this text match stands in for a typed match until
+    // CDB-226 is fixed. Remove the acceptance when CDB-224 is fixed.
+    if let Err(error) = receiver.db.close() {
+        let accepted = matches!(&error, Error::Other(message)
+            if message.starts_with("contextdb-engine-storage-io:")
+                && message.contains("memory budget exceeded: redb/pending_directory"));
+        assert!(accepted, "receiver close: {error:?}");
+        eprintln!("CDB-224 receiver close refused after the failed stage: {error:?}");
+    }
     drop(receiver);
     author.db.close().unwrap();
-    work
 }
 
 /// The declared counts (cdb217-bound-sheet-r2.md): V = 2N+1 versions; calls
@@ -62,28 +73,29 @@ fn assert_linear(count: usize, work: overlay_work::Work) {
 #[test]
 #[serial]
 fn legacy_stage_overlay_steps_are_linear_in_rows_replaced_at_512() {
-    assert_linear(512, first_apply_overlay_work(512, false));
+    first_apply_overlay_work(512, false, |work| assert_linear(512, work));
 }
 
 #[test]
 #[serial]
 fn legacy_stage_overlay_steps_are_linear_in_rows_replaced_at_2043() {
     assert_eq!(N, 2043, "the measured size");
-    assert_linear(N, first_apply_overlay_work(N, false));
+    first_apply_overlay_work(N, false, |work| assert_linear(N, work));
 }
 
 #[test]
 #[serial]
 fn legacy_stage_scoped_overlay_answers_as_the_unbounded_walk_at_512() {
-    let work = first_apply_overlay_work(512, true);
-    eprintln!("CDB217 overlay shadow N=512: {work:?}");
-    assert_eq!(
-        work.shadow_compared, work.calls,
-        "every seek of the stage was shadowed"
-    );
-    assert!(work.shadow_compared > 0);
-    assert_eq!(
-        work.shadow_mismatches, 0,
-        "the scoped walk gives each caller the unbounded walk's in-scope answer and authenticates the same in-scope members"
-    );
+    first_apply_overlay_work(512, true, |work| {
+        eprintln!("CDB217 overlay shadow N=512: {work:?}");
+        assert_eq!(
+            work.shadow_compared, work.calls,
+            "every seek of the stage was shadowed"
+        );
+        assert!(work.shadow_compared > 0);
+        assert_eq!(
+            work.shadow_mismatches, 0,
+            "the scoped walk gives each caller the unbounded walk's in-scope answer and authenticates the same in-scope members"
+        );
+    });
 }
