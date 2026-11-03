@@ -2563,13 +2563,23 @@ impl PushingSource {
     /// Close and reopen the edge store. With `replay`, its pull watermark is
     /// rewound so the hub delivers everything again.
     fn reopen_edge(&mut self, runtime: &tokio::runtime::Runtime, replay: bool) {
+        self.reopen_edge_with(runtime, replay, None);
+    }
+
+    /// Reopen the edge, optionally with a declared reader memory limit.
+    fn reopen_edge_with(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        replay: bool,
+        reader_limit: Option<usize>,
+    ) {
         if let Some(client) = self.client.take() {
             runtime.block_on(client.shutdown());
         }
         let db = self.db.take().expect("the edge store is open");
         db.close().expect("close the edge store");
         drop(db);
-        let db = Database::open(&self.path).expect("reopen the edge store");
+        let db = open_with_reader_limit(&self.path, reader_limit);
         if replay {
             db.persist_sync_pull_watermark(&self.tenant, contextdb_core::Lsn(0))
                 .expect("rewind the edge's pull watermark");
@@ -2584,6 +2594,16 @@ impl PushingSource {
         self.stop.store(true, Ordering::SeqCst);
         runtime.block_on(self.task).expect("hub stops cleanly");
         drop(self.server);
+    }
+}
+
+/// Runs its closure when dropped, so a failing test still releases a pause
+/// that would otherwise hold the operation under test.
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
     }
 }
 
@@ -2989,6 +3009,7 @@ fn a_child_committed_during_a_purge_is_erased_with_its_parent() {
     insert_child(&db, "children", early, "parent_id", parent);
     let pause = db.pause_purge_after_follower_expansion_for_test();
     std::thread::scope(|scope| {
+        let _release = OnDrop(|| pause.release());
         let purge =
             scope.spawn(|| db.execute("PURGE FROM parents WHERE id = $id", &id_params(parent)));
         assert!(
@@ -3034,6 +3055,7 @@ fn a_child_committed_during_a_purge_is_erased_with_its_parent() {
     exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(parent));
     let pause = link.edge().pause_purge_after_follower_expansion_for_test();
     std::thread::scope(|scope| {
+        let _release = OnDrop(|| pause.release());
         let pull = scope.spawn(|| runtime.block_on(link.client().pull_default()));
         assert!(
             pause.wait_until_reached_blocking(),
@@ -3258,3 +3280,237 @@ fn a_received_purge_erases_the_receivers_declared_node_local_children() {
     link.stop(&runtime);
 }
 
+/// Open a store whose readers, the purge's follower discovery among them,
+/// may hold at most `reader_limit` bytes.
+fn open_with_reader_limit(path: &Path, reader_limit: Option<usize>) -> Database {
+    let mut options = contextdb_engine::DatabaseOpenOptions::default();
+    if let Some(limit) = reader_limit {
+        options.owner_reads.limits.limits.memory = limit as _;
+    }
+    Database::open_with_options(path, options).expect("open the store")
+}
+
+const MANY: usize = 400;
+
+fn insert_family(db: &Database, parent: Uuid) {
+    for _ in 0..MANY {
+        let child = Uuid::new_v4();
+        insert_child(db, "children", child, "parent_id", parent);
+        if db.table_meta("grandchildren").is_some() {
+            insert_child(db, "grandchildren", Uuid::new_v4(), "child_id", child);
+        }
+    }
+}
+
+/// One refused attempt: the typed budget refusal, and a note of whether it
+/// came from admitting followers.
+fn budget_refusal(refused: &Error, label: &str, limit: usize, history: &[String]) -> bool {
+    let text = refused.to_string();
+    assert!(
+        matches!(refused, Error::MemoryBudgetExceeded { .. })
+            || text.contains("memory budget exceeded"),
+        "{label}: a refusal at a {limit}-byte reader limit is the typed budget refusal: {refused:?}; before: {history:?}"
+    );
+    text.contains("purge_follower")
+}
+
+#[test]
+fn a_purge_whose_followers_exceed_the_memory_limit_is_refused_typed_and_changes_nothing() {
+    // Local: children and grandchildren followed by one parent. The reader
+    // limit grows until the purge fits; every refusal before it is typed and
+    // changes nothing, and some refusal comes from admitting followers.
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("budget.db");
+    let parent = Uuid::new_v4();
+    {
+        let db = Database::open(&path).expect("open the store");
+        create_following_tables(&db);
+        exec(
+            &db,
+            "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+            &id_params(parent),
+        );
+        insert_family(&db, parent);
+        db.close().expect("close the store");
+    }
+    let mut history = Vec::new();
+    let mut follower_refusals = 0_usize;
+    let mut limit = 256 * 1024;
+    loop {
+        let db = open_with_reader_limit(&path, Some(limit));
+        match db.execute("PURGE FROM parents WHERE id = $id", &id_params(parent)) {
+            Ok(_) => {
+                for table in ["parents", "children", "grandchildren"] {
+                    assert!(ids(&db, table).is_empty(), "local: the purge that fits erases {table}");
+                }
+                break;
+            }
+            Err(refused) => {
+                if budget_refusal(&refused, "local", limit, &history) {
+                    follower_refusals += 1;
+                }
+                assert!(
+                    ids(&db, "parents") == vec![parent]
+                        && ids(&db, "children").len() == MANY
+                        && ids(&db, "grandchildren").len() == MANY,
+                    "local: a refused purge changes nothing: {refused}"
+                );
+                history.push(format!("{limit} {refused}"));
+            }
+        }
+        db.close().expect("close the store");
+        limit += limit / 4;
+        assert!(limit < 1 << 34, "local: the purge never fit: {history:?}");
+    }
+    assert!(
+        follower_refusals > 0,
+        "local: some limit refused while admitting followers: {history:?}"
+    );
+
+    // Received: the edge's node-local children follow the hub's purge.
+    let runtime = sync_runtime();
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let hub = Arc::new(Database::open(root.path().join("hub.db")).expect("open the hub"));
+    exec(&hub, HUB_PARENTS_DDL, &p());
+    let link = PushingSource::start(&runtime, root.path(), hub.clone());
+    exec(
+        &hub,
+        "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+        &id_params(parent),
+    );
+    link.pull(&runtime);
+    exec(link.edge(), EDGE_CHILDREN_DDL, &p());
+    exec(
+        link.edge(),
+        "CREATE TABLE grandchildren (id UUID PRIMARY KEY, child_id UUID REFERENCES children(id) FOLLOWS PARENT PURGE, body TEXT) SYNC OFF",
+        &p(),
+    );
+    insert_family(link.edge(), parent);
+    exec(&hub, "PURGE FROM parents WHERE id = $id", &id_params(parent));
+    // A received purge prepares under the edge's engine sync budget, which
+    // MEMORY_LIMIT bounds. Each limit leaves SET MEMORY_LIMIT its own commit
+    // room; the steps stop at the first refusal from admitting followers.
+    let edge = link.edge();
+    let mut history = Vec::new();
+    let mut limit_k = 0_usize;
+    for step in 0.. {
+        assert!(step < 8192, "received: no limit refused while admitting followers: {history:?}");
+        limit_k = (limit_k + 4).max(edge.accountant().usage().used.div_ceil(1024) + 64);
+        exec(edge, &format!("SET MEMORY_LIMIT '{limit_k}K'"), &p());
+        let refused = match runtime.block_on(link.client().pull_default()) {
+            Ok(_) => panic!("received: the purge fit before any follower refusal: {history:?}"),
+            Err(refused) => refused,
+        };
+        let from_followers = budget_refusal(&refused, "received", limit_k * 1024, &history);
+        assert!(
+            ids(edge, "parents") == vec![parent]
+                && ids(edge, "children").len() == MANY
+                && ids(edge, "grandchildren").len() == MANY,
+            "received: a refused purge changes nothing: {refused}"
+        );
+        history.push(format!("{limit_k}K {refused}"));
+        if from_followers {
+            break;
+        }
+    }
+    exec(edge, "SET MEMORY_LIMIT 'none'", &p());
+    link.pull(&runtime);
+    for table in ["parents", "children", "grandchildren"] {
+        assert!(
+            ids(edge, table).is_empty(),
+            "received: with room the purge erases {table}"
+        );
+    }
+    link.stop(&runtime);
+}
+
+/// A following child whose old declaration made graph edges: its DROP
+/// already erased those edges, so purging its parent erases the archived body
+/// without asking for a witness that no longer exists. A recreated child's
+/// fresh row still carries its own witness, and unrelated edges survive.
+#[test]
+fn a_purge_erases_archived_edge_shaped_children() {
+    const EDGE_CHILDREN: &str = "CREATE TABLE edge_children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) FOLLOWS PARENT PURGE, source_id UUID, target_id UUID, edge_type TEXT) SYNC OFF";
+    const TRAVERSE: &str = "SELECT t FROM GRAPH_TABLE(other_edges MATCH (a)-[:REL]->(b) WHERE a.id = $source_id COLUMNS (b.id AS t))";
+    for recreated in [false, true] {
+        let root = tempfile::tempdir().expect("temporary test directory");
+        let path = root.path().join("edge-children.db");
+        let db = Database::open(&path).expect("open the store");
+        for ddl in [
+            "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT) SYNC OFF",
+            EDGE_CHILDREN,
+            "CREATE TABLE other_edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) SYNC OFF",
+        ] {
+            exec(&db, ddl, &p());
+        }
+        let parent = Uuid::new_v4();
+        exec(
+            &db,
+            "INSERT INTO parents (id, batch) VALUES ($id, 'b')",
+            &id_params(parent),
+        );
+        let edge = |db: &Database, table: &str, parent: Option<Uuid>| -> (Uuid, Uuid) {
+            let (source, target) = (Uuid::new_v4(), Uuid::new_v4());
+            let mut params = HashMap::from([
+                ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+                ("source_id".to_string(), Value::Uuid(source)),
+                ("target_id".to_string(), Value::Uuid(target)),
+            ]);
+            let sql = match parent {
+                Some(parent) => {
+                    params.insert("parent".to_string(), Value::Uuid(parent));
+                    format!("INSERT INTO {table} (id, parent_id, source_id, target_id, edge_type) VALUES ($id, $parent, $source_id, $target_id, 'REL')")
+                }
+                None => format!("INSERT INTO {table} (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, 'REL')"),
+            };
+            exec(db, &sql, &params);
+            (source, target)
+        };
+        edge(&db, "edge_children", Some(parent));
+        let (other_source, other_target) = edge(&db, "other_edges", None);
+        exec(&db, "DROP TABLE edge_children", &p());
+        if recreated {
+            exec(&db, EDGE_CHILDREN, &p());
+            edge(&db, "edge_children", Some(parent));
+        }
+        db.close().expect("close the store");
+        let db = Database::open(&path).expect("reopen the store");
+        assert!(
+            follower_lives(&db, "parents", parent)
+                .iter()
+                .any(|(table, retained)| table == "edge_children" && *retained),
+            "recreated={recreated}: the archived edge-shaped life is found"
+        );
+        exec(&db, "PURGE FROM parents WHERE id = $id", &id_params(parent));
+        let check = |db: &Database| {
+            assert!(
+                follower_lives(db, "parents", parent).is_empty(),
+                "recreated={recreated}: no life of the purged parent's children survives"
+            );
+            if recreated {
+                assert!(
+                    ids(db, "edge_children").is_empty(),
+                    "recreated={recreated}: the fresh edge-shaped child goes with its parent"
+                );
+            }
+            let reached = db
+                .execute(
+                    TRAVERSE,
+                    &HashMap::from([("source_id".to_string(), Value::Uuid(other_source))]),
+                )
+                .expect("traverse the unrelated edges")
+                .rows()
+                .iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reached,
+                vec![Value::Uuid(other_target)],
+                "recreated={recreated}: unrelated graph data survives"
+            );
+        };
+        check(&db);
+        db.close().expect("close the store");
+        check(&Database::open(&path).expect("reopen the store"));
+    }
+}

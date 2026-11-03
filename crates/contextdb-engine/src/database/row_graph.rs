@@ -449,12 +449,10 @@ impl Database {
     ) -> Result<Option<R>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        // A dropped table's archived row is judged by its own typed values
-        // below: no current declaration describes it.
-        if self
+        let meta = self
             .table_meta(table)
-            .is_some_and(|meta| !crate::executor::has_edge_columns(&meta))
-        {
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        if !crate::executor::has_edge_columns(&meta) {
             return Ok(None);
         }
         let (Some(Value::Uuid(source)), Some(Value::Uuid(target)), Some(Value::Text(kind))) = (
@@ -725,6 +723,16 @@ impl Database {
         )?;
         let mut selected = Vec::with_capacity(count);
         for candidate in selections {
+            // A retired generation -- its table dropped, or dropped and
+            // recreated -- lost its row-owned edges and their retirement
+            // records to that DROP. No witness remains to carry; a current
+            // generation still needs its exact witness below.
+            if self.table_meta(&candidate.table).is_none()
+                || self.durable_lineage_table_generation(&candidate.table, read_memory.clone())?
+                    != candidate.table_generation
+            {
+                continue;
+            }
             for row in &rows[&candidate.table] {
                 if row.row_id != candidate.local_row_id {
                     continue;

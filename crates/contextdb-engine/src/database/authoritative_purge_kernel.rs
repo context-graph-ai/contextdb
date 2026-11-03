@@ -2009,6 +2009,20 @@ impl Database {
             // child committed meanwhile cannot outlive its parent.
             let mut follower_credit =
                 contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            follower_credit.try_grow_for(
+                named_selections
+                    .iter()
+                    .map(|selection| {
+                        std::mem::size_of::<AuthoritativePurgeSelection>()
+                            .saturating_add(selection.table.len())
+                            .saturating_add(selection.natural_key.held_bytes())
+                            .saturating_add(selection.lineage_root.len())
+                    })
+                    .fold(0, usize::saturating_add),
+                "writer_source",
+                "purge_follower_working_set",
+                "Raise MEMORY_LIMIT to erase what follows this purge.",
+            )?;
             let mut working = named_selections.to_vec();
             let followers = self.authoritative_purge_followers(
                 &working,
@@ -2022,32 +2036,46 @@ impl Database {
                 // A purge that erased more than its named table says so per table.
                 report_shape = crate::custody::erasure::PurgeReportShape::PerTable;
             }
+            Self::admit_working_growth(&mut working, followers.len(), &mut follower_credit)?;
             working.extend(followers);
             // Every table that follows a selected table, transitively, is
             // gated from the first attempt, so a child committed meanwhile
             // is published under the same gate as its parent's erasure.
-            let catalog = self
-                .table_names()
-                .into_iter()
-                .filter_map(|name| self.table_meta(&name).map(|meta| (name, meta)))
-                .collect::<Vec<_>>();
+            let declared = self.admitted_purge_followers(&mut follower_credit)?;
             let mut follower_tables = BTreeSet::<String>::new();
-            let mut pending = working
-                .iter()
-                .map(|selection| selection.table.clone())
-                .collect::<Vec<_>>();
-            while let Some(parent) = pending.pop() {
-                for follower in super::purge_followers::purge_followers_of(
-                    catalog.iter().map(|(name, meta)| (name.as_str(), meta)),
-                    &parent,
-                ) {
-                    if follower_tables.insert(follower.child_table.clone()) {
-                        pending.push(follower.child_table);
+            {
+                let mut pending = Vec::<&str>::new();
+                for selection in &working {
+                    super::purge_follower_expansion::admit_vec_slot(
+                        &mut pending,
+                        &mut follower_credit,
+                        "purge_follower_publication",
+                    )?;
+                    pending.push(selection.table.as_str());
+                }
+                while let Some(parent) = pending.pop() {
+                    for follower in declared.iter().filter(|follower| follower.parent_table == parent) {
+                        if follower_tables.contains(follower.child_table.as_str()) {
+                            continue;
+                        }
+                        follower_credit.try_grow_for(
+                            follower.child_table.len().saturating_add(64),
+                            "writer_source",
+                            "purge_follower_publication",
+                            "Raise MEMORY_LIMIT to erase what follows this purge.",
+                        )?;
+                        follower_tables.insert(follower.child_table.clone());
+                        super::purge_follower_expansion::admit_vec_slot(
+                            &mut pending,
+                            &mut follower_credit,
+                            "purge_follower_publication",
+                        )?;
+                        pending.push(follower.child_table.as_str());
                     }
                 }
             }
             #[cfg(any(test, feature = "test-seams"))]
-            purge_after_follower_expansion_pause().maybe_pause();
+            purge_after_follower_expansion_pause().maybe_pause_until_released();
             let selections: &[AuthoritativePurgeSelection] = &working;
             // Candidate discovery and the callback drain both happen before the
             // transaction commit mutex. The complete sorted hash set is then
@@ -2065,6 +2093,16 @@ impl Database {
                     .then(|| self.published_root_read_scope(read_memory.clone()))
                     .transpose()?;
                 let selections: &[AuthoritativePurgeSelection] = &working;
+                // The follower part of this attempt's publication gate.
+                follower_credit.try_grow_for(
+                    follower_tables
+                        .iter()
+                        .map(|table| table.len().saturating_add(64))
+                        .fold(0, usize::saturating_add),
+                    "writer_source",
+                    "purge_follower_publication",
+                    "Raise MEMORY_LIMIT to erase what follows this purge.",
+                )?;
                 let publication_tables = selections
                     .iter()
                     .map(|selection| selection.table.clone())
@@ -2103,12 +2141,12 @@ impl Database {
                     }
                     // Under the commit mutex no child can commit: any follower
                     // found now restarts the attempt with the whole union.
-                    newly_followed.extend(self.authoritative_purge_followers(
+                    newly_followed = self.authoritative_purge_followers(
                         selections,
                         &mut follower_credit,
                         read_memory.clone(),
                         true,
-                    )?);
+                    )?;
                     if !newly_followed.is_empty() {
                         return Ok(None);
                     }
@@ -2439,6 +2477,11 @@ impl Database {
                             if report_shape == crate::custody::erasure::PurgeReportShape::Single {
                                 report_shape = crate::custody::erasure::PurgeReportShape::PerTable;
                             }
+                            Self::admit_working_growth(
+                                &mut working,
+                                newly_followed.len(),
+                                &mut follower_credit,
+                            )?;
                             working.extend(newly_followed);
                             let _published = self.published_root_read_scope(read_memory.clone())?;
                             held_hashes.extend(self.authoritative_purge_selected_blob_hashes(
@@ -2899,5 +2942,35 @@ impl Database {
     pub fn __refuse_purge_follower_after_for_test(followers: u32) {
         PURGE_FOLLOWERS_BEFORE_REFUSAL
             .store(i64::from(followers), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Database {
+    /// Admit room for `added` more selections before the working set grows;
+    /// the grown buffer exists beside the old one while they move.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn admit_working_growth(
+        working: &mut Vec<AuthoritativePurgeSelection>,
+        added: usize,
+        credit: &mut contextdb_core::read_memory::ReadCredit,
+    ) -> Result<()> {
+        if added == 0 {
+            return Ok(());
+        }
+        credit.try_grow_for(
+            working
+                .capacity()
+                .saturating_add(working.len())
+                .saturating_add(added)
+                .saturating_mul(std::mem::size_of::<AuthoritativePurgeSelection>()),
+            "writer_source",
+            "purge_follower_working_set",
+            "Raise MEMORY_LIMIT to erase what follows this purge.",
+        )?;
+        working.reserve_exact(added);
+        Ok(())
     }
 }

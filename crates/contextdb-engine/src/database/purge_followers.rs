@@ -19,6 +19,59 @@ pub(crate) struct PurgeFollower {
     pub(crate) parent_columns: Vec<String>,
 }
 
+/// How many following foreign keys one table declares, counted in place.
+pub(crate) fn declared_purge_follower_count(meta: &TableMeta) -> usize {
+    meta.columns
+        .iter()
+        .filter(|column| {
+            column
+                .references
+                .as_ref()
+                .is_some_and(|reference| reference.follows_parent_purge)
+        })
+        .count()
+        + meta
+            .composite_foreign_keys
+            .iter()
+            .filter(|fk| fk.follows_parent_purge)
+            .count()
+}
+
+/// Every byte [`declared_purge_followers`] owns for one table, including the
+/// list it collects into and the copy that moves out of it, counted in place.
+pub(crate) fn declared_purge_follower_bytes(child_table: &str, meta: &TableMeta) -> usize {
+    let string = |text: &str| text.len().saturating_add(std::mem::size_of::<String>());
+    let fixed = string(child_table)
+        .saturating_add(std::mem::size_of::<PurgeFollower>().saturating_mul(2))
+        .saturating_add(std::mem::size_of::<Vec<String>>().saturating_mul(2));
+    let single = meta.columns.iter().filter_map(|column| {
+        column
+            .references
+            .as_ref()
+            .filter(|reference| reference.follows_parent_purge)
+            .map(|reference| {
+                string(&column.name)
+                    .saturating_add(string(&reference.table))
+                    .saturating_add(string(&reference.column))
+            })
+    });
+    let composite = meta
+        .composite_foreign_keys
+        .iter()
+        .filter(|fk| fk.follows_parent_purge)
+        .map(|fk| {
+            fk.child_columns
+                .iter()
+                .chain(&fk.parent_columns)
+                .map(|column| string(column))
+                .fold(string(&fk.parent_table), usize::saturating_add)
+        });
+    single
+        .chain(composite)
+        .map(|bytes| bytes.saturating_add(fixed))
+        .fold(0, usize::saturating_add)
+}
+
 /// The following foreign keys one table declares, in ordinal order.
 pub(crate) fn declared_purge_followers(child_table: &str, meta: &TableMeta) -> Vec<PurgeFollower> {
     let single = meta.columns.iter().filter_map(|column| {

@@ -186,6 +186,11 @@ impl RedbPersistence {
         })?;
         // A table that follows its parent's purge leaves, for each archived
         // row, a posting under the parent it referenced, keyed by the parent.
+        if let Some(meta) = meta.as_ref() {
+            metadata_credit.admit(crate::database::purge_followers::declared_purge_follower_bytes(
+                logical, meta,
+            ))?;
+        }
         let followers = meta
             .as_ref()
             .map(|meta| crate::database::purge_followers::declared_purge_followers(logical, meta))
@@ -241,6 +246,15 @@ impl RedbPersistence {
             if let Some((forward, by_row)) = postings.as_mut() {
                 admission.admit(value.value().len().saturating_mul(8).saturating_add(256))?;
                 let row = Self::decode_versioned_row(value.value(), None)?;
+                // The archived life's own key and its encoding.
+                admission.admit(
+                    value
+                        .value()
+                        .len()
+                        .saturating_mul(2)
+                        .saturating_add(logical.len())
+                        .saturating_add(128),
+                )?;
                 // The archived life's own key, recorded now: after a drop or a
                 // redeclaration the current schema cannot be asked for it.
                 let Some(child_key) = meta.as_ref().and_then(|meta| {
@@ -250,25 +264,51 @@ impl RedbPersistence {
                 };
                 let child_key = Self::encode_config_value(&child_key)?;
                 for follower in &followers {
+                    // Count what this posting pair will own before any of it
+                    // exists. A NULL reference names no parent and follows none.
+                    let mut referenced = Some(0_usize);
+                    for column in &follower.child_columns {
+                        referenced = match (referenced, row.values.get(column)) {
+                            (Some(bytes), Some(value)) if *value != Value::Null => {
+                                Some(bytes.saturating_add(value.estimated_bytes()))
+                            }
+                            _ => None,
+                        };
+                    }
+                    let Some(referenced) = referenced else {
+                        continue;
+                    };
+                    let key_bytes = follower
+                        .parent_table
+                        .len()
+                        .saturating_add(logical.len())
+                        .saturating_add(raw.len())
+                        .saturating_add(referenced.saturating_mul(4))
+                        .saturating_add(96);
+                    admission.admit(
+                        key_bytes
+                            .saturating_mul(3)
+                            .saturating_add(
+                                follower
+                                    .child_columns
+                                    .len()
+                                    .saturating_mul(std::mem::size_of::<Value>()),
+                            )
+                            .saturating_add(referenced)
+                            .saturating_add(64),
+                    )?;
                     let Some(values) = follower
                         .child_columns
                         .iter()
-                        .map(|column| {
-                            row.values
-                                .get(column)
-                                .filter(|value| **value != Value::Null)
-                                .cloned()
-                        })
+                        .map(|column| row.values.get(column).cloned())
                         .collect::<Option<Vec<_>>>()
                     else {
-                        // A NULL reference names no parent and follows none.
                         continue;
                     };
                     let mut key = follower_parent_prefix(&follower.parent_table, &values)?;
                     segment(&mut key, logical.as_bytes());
                     key.extend_from_slice(&archived_generation.to_be_bytes());
                     key.extend_from_slice(&raw);
-                    admission.admit(key.len().saturating_mul(3).saturating_add(64))?;
                     let mut reverse = follower_row_prefix(logical, &raw);
                     reverse.extend_from_slice(&key);
                     forward
@@ -677,6 +717,21 @@ impl WriterSnapshotHandle {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(error) => return Err(RedbPersistence::storage_error(error)),
         };
+        credit.try_grow_for(
+            parent_table
+                .len()
+                .saturating_add(
+                    parent_values
+                        .iter()
+                        .map(Value::estimated_bytes)
+                        .fold(0, usize::saturating_add)
+                        .saturating_mul(4),
+                )
+                .saturating_add(64),
+            "writer_source",
+            "purge_follower_keys",
+            "Raise MEMORY_LIMIT to find what follows this purge.",
+        )?;
         let prefix = follower_parent_prefix(parent_table, parent_values)?;
         let corrupt = || Error::StoreCorrupted {
             path: "authored follower postings".into(),
@@ -706,6 +761,19 @@ impl WriterSnapshotHandle {
                 row_key[..8].try_into().map_err(|_| corrupt())?,
             ));
             let natural_key = RedbPersistence::decode_config_value(value.value())?;
+            if found.len() == found.capacity() {
+                let grow = found.capacity().max(4);
+                credit.try_grow_for(
+                    found
+                        .capacity()
+                        .saturating_add(grow)
+                        .saturating_mul(std::mem::size_of::<ArchivedFollower>()),
+                    "writer_source",
+                    "purge_follower_discovery",
+                    "Raise MEMORY_LIMIT to find what follows this purge.",
+                )?;
+                found.reserve_exact(grow);
+            }
             found.push(ArchivedFollower {
                 child_table,
                 table_generation,

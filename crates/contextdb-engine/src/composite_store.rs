@@ -596,6 +596,26 @@ impl ApplyPhasePause {
         }
     }
 
+    /// The same pause with no deadline: the paused operation continues only
+    /// when its test releases it. The test's guard releases on drop, so a
+    /// failing test still lets the operation finish.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn maybe_pause_until_released(&self) {
+        let mut state = self.state.lock();
+        if !state.armed || state.released {
+            return;
+        }
+        state.reached = true;
+        self.waiters.notify_all();
+        while state.armed && !state.released {
+            self.waiters.wait(&mut state);
+        }
+        state.armed = false;
+        state.reached = false;
+        state.released = false;
+        self.waiters.notify_all();
+    }
+
     pub(crate) fn maybe_pause(&self) {
         let mut state = self.state.lock();
         if !state.armed || state.released {

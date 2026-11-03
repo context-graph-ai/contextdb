@@ -5056,10 +5056,7 @@ fn execute_create_table_plan(
     })?;
     meta.indexes = auto_indexes_for_table_meta(&meta);
     auto_indexes = meta.indexes.clone();
-    if crate::database::purge_followers::declared_purge_followers(&p.name, &meta)
-        .first()
-        .is_some()
-    {
+    if crate::database::purge_followers::declared_purge_follower_count(&meta) > 0 {
         // Judged on the catalog as it will be with this table in it.
         let mut projected = db
             .table_names()
