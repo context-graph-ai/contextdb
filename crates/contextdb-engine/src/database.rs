@@ -22,6 +22,8 @@ pub(crate) mod native_custody_selection;
 use contextdb_relational::source::RelationalCursor as _;
 use maintenance_frontier::MaintenanceFrontier;
 pub(crate) mod graph_read_memory;
+#[cfg(test)]
+mod ordinary_write_set_overlay_precision_tests;
 #[doc(hidden)]
 mod received_row_graph;
 #[cfg(any(test, feature = "test-seams"))]
