@@ -33,6 +33,23 @@ impl<T> From<PoisonError<T>> for StorageError {
 
 impl From<io::Error> for StorageError {
     fn from(err: io::Error) -> StorageError {
+        // A storage failure carried through an io::Result (the allocator
+        // pager's loaders) comes back as itself: a memory refusal stays a
+        // refusal, never an I/O failure of kind Other (CDB-212).
+        if err
+            .get_ref()
+            .is_some_and(|inner| inner.is::<StorageError>())
+        {
+            let kind = err.kind();
+            return match err
+                .into_inner()
+                .map(|inner| inner.downcast::<StorageError>())
+            {
+                Some(Ok(storage)) => *storage,
+                Some(Err(inner)) => StorageError::Io(io::Error::new(kind, inner)),
+                None => StorageError::Io(io::Error::from(kind)),
+            };
+        }
         StorageError::Io(err)
     }
 }

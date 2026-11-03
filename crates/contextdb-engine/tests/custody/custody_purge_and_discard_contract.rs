@@ -3662,3 +3662,99 @@ fn an_edge_applies_a_purge_of_pulled_rows_filed_under_a_later_envelope() {
     let reopened = Database::open(&edge_path).expect("reopen the edge");
     assert!(ids(&reopened, "parents").is_empty() && ids(&reopened, "links").is_empty());
 }
+
+/// CDB-212: a purge refused for memory inside its commit is the typed memory
+/// refusal, by category, never a corrupt store, and the store keeps serving.
+/// The memory limit steps up until the purge fits. A refusal past the commit
+/// boundary latches the handle until reopen (PB54a; CDB-204 tracks removing
+/// that): the latched handle's next answer is storage-io, and the sweep
+/// reopens and continues.
+#[test]
+fn a_purge_refused_for_memory_inside_its_commit_is_the_typed_memory_refusal() {
+    use contextdb_core::read_memory::NativeRefusal;
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("budget.db");
+    let mut db = Database::open(&path).expect("open the store");
+    // A purge whose commit writes many table roots: the row, three secondary
+    // indexes and a vector column.
+    for ddl in [
+        "CREATE TABLE parents (id UUID PRIMARY KEY, batch TEXT, tag TEXT, note TEXT, embedding VECTOR(2)) SYNC OFF",
+        "CREATE INDEX parents_batch ON parents (batch)",
+        "CREATE INDEX parents_tag ON parents (tag)",
+        "CREATE INDEX parents_note ON parents (note)",
+    ] {
+        db.execute(ddl, &p()).unwrap();
+    }
+    let rows: Vec<Uuid> = (0..400).map(|_| Uuid::new_v4()).collect();
+    let body = "b".repeat(200);
+    for (n, id) in rows.iter().enumerate() {
+        db.execute(
+            &format!(
+                "INSERT INTO parents (id, batch, tag, note, embedding) VALUES ($id, $batch, 't{n}', 'n{n}', [1, {n}])"
+            ),
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(*id)),
+                ("batch".to_string(), Value::Text(body.clone())),
+            ]),
+        )
+        .unwrap();
+    }
+    let target = HashMap::from([("id".to_string(), Value::Uuid(rows[0]))]);
+    let floor_k = db.accountant().usage().used.div_ceil(1024) + 256;
+    let mut refusals = Vec::new();
+    let mut latched = 0_usize;
+    for step in 1..8192_usize {
+        let limit_k = floor_k + step * 4;
+        db.execute(&format!("SET MEMORY_LIMIT '{limit_k}K'"), &p())
+            .unwrap();
+        match db.execute("PURGE FROM parents WHERE id = $id", &target) {
+            Ok(_) => break,
+            Err(Error::Other(message))
+                if message.to_string().contains("Previous I/O error occurred") =>
+            {
+                latched += 1;
+                drop(db);
+                db = Database::open(&path).expect("a latched store reopens");
+            }
+            Err(error) => {
+                assert!(
+                    matches!(
+                        &error,
+                        Error::MemoryBudgetExceeded { .. }
+                            | Error::NativeEngineOther(
+                                NativeRefusal::MemoryBudgetExceeded { .. }
+                                    | NativeRefusal::ProcessMemoryBudgetExceeded { .. }
+                            )
+                    ),
+                    "a purge refused at {limit_k}K is the typed memory refusal: {error:?}"
+                );
+                refusals.push(limit_k);
+            }
+        }
+        assert!(step < 8191, "the purge never fitted");
+    }
+    eprintln!(
+        "CDB212 memory refusals before the purge fitted: {}, latched reopens: {latched}",
+        refusals.len()
+    );
+    assert!(
+        !refusals.is_empty(),
+        "the sweep met at least one memory refusal"
+    );
+    db.execute("SET MEMORY_LIMIT 'none'", &p()).unwrap();
+    db.execute(
+        "INSERT INTO parents (id, batch) VALUES ($id, 'after')",
+        &HashMap::from([("id".to_string(), Value::Uuid(Uuid::new_v4()))]),
+    )
+    .expect("the store keeps writing after the refusals");
+    db.close().unwrap();
+    drop(db);
+    let db = Database::open(&path).expect("the store reopens");
+    let count = db
+        .execute("SELECT id FROM parents", &p())
+        .unwrap()
+        .rows()
+        .len();
+    assert_eq!(count, 400, "the purged row is gone and the others stay");
+    db.close().unwrap();
+}

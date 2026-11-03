@@ -186,6 +186,8 @@ impl RedbPersistence {
             | Error::ReadFailure(_) => error,
             // A manifest page the device failed to return is I/O, not damage.
             error if super::is_storage_io(&error) => error,
+            // A refused memory admission is a budget to raise (CDB-212).
+            error if crate::read_image_memory::is_memory_refusal(&error) => error,
             other => self.relational_manifest_damage(other),
         }
     }
