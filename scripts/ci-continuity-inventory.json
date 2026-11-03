@@ -2829,21 +2829,6 @@
     {
       "crate": "contextdb-engine",
       "kind": "test",
-      "name": "vector_a_find_locks_its_serving_cache_once_per_page",
-      "path": "crates/contextdb-engine/tests/vector_a_find_locks_its_serving_cache_once_per_page.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
       "name": "vector_a_find_names_only_the_pairs_it_asks_for",
       "path": "crates/contextdb-engine/tests/vector_a_find_names_only_the_pairs_it_asks_for.rs",
       "required_features": [
@@ -2861,66 +2846,6 @@
       "kind": "test",
       "name": "vector_a_find_over_many_contexts_spends_one_search_budget",
       "path": "crates/contextdb-engine/tests/vector_a_find_over_many_contexts_spends_one_search_budget.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_a_graph_search_stays_inside_its_serving_cache",
-      "path": "crates/contextdb-engine/tests/vector_a_graph_search_stays_inside_its_serving_cache.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_a_replaced_vector_cannot_end_a_tied_frontier",
-      "path": "crates/contextdb-engine/tests/vector_a_replaced_vector_cannot_end_a_tied_frontier.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_a_saved_graph_search_reports_its_distance_work",
-      "path": "crates/contextdb-engine/tests/vector_a_saved_graph_search_reports_its_distance_work.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_a_tied_frontier_cannot_hide_a_smaller_row",
-      "path": "crates/contextdb-engine/tests/vector_a_tied_frontier_cannot_hide_a_smaller_row.rs",
       "required_features": [
         "test-seams"
       ],
@@ -3024,21 +2949,6 @@
     {
       "crate": "contextdb-engine",
       "kind": "test",
-      "name": "vector_delete_only_journal_progress_contract",
-      "path": "crates/contextdb-engine/tests/vector_delete_only_journal_progress_contract.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
       "name": "vector_equal_distance_rows_keep_canonical_order_across_contexts",
       "path": "crates/contextdb-engine/tests/vector_equal_distance_rows_keep_canonical_order_across_contexts.rs",
       "required_features": [
@@ -3069,113 +2979,8 @@
     {
       "crate": "contextdb-engine",
       "kind": "test",
-      "name": "vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph",
-      "path": "crates/contextdb-engine/tests/vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
       "name": "vector_generation",
       "path": "crates/contextdb-engine/tests/vector_generation.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_graph_build_distance_evaluations_stay_under_the_ratchet",
-      "path": "crates/contextdb-engine/tests/vector_graph_build_distance_evaluations_stay_under_the_ratchet.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_graph_recall_50000_isotropic_per_context",
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_50000_isotropic_per_context.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_graph_recall_50001_anisotropic_per_context",
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_50001_anisotropic_per_context.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_graph_recall_5000_anisotropic_per_context",
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_5000_anisotropic_per_context.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_graph_recall_5001_topic_clusters_per_context",
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_5001_topic_clusters_per_context.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_graph_route_profile_quality",
-      "path": "crates/contextdb-engine/tests/vector_graph_route_profile_quality.rs",
       "required_features": [
         "test-seams"
       ],
@@ -3296,21 +3101,6 @@
       "kind": "test",
       "name": "vector_named_vector_planner_tests",
       "path": "crates/contextdb-engine/tests/vector_named_vector_planner_tests.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_one_search_covers_every_layer_on_both_routes",
-      "path": "crates/contextdb-engine/tests/vector_one_search_covers_every_layer_on_both_routes.rs",
       "required_features": [
         "test-seams"
       ],
@@ -3519,36 +3309,6 @@
     {
       "crate": "contextdb-engine",
       "kind": "test",
-      "name": "vector_serving_pages",
-      "path": "crates/contextdb-engine/tests/vector_serving_pages.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_snapshot_frontier_completeness_contract",
-      "path": "crates/contextdb-engine/tests/vector_snapshot_frontier_completeness_contract.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
       "name": "vector_tail_transaction_contract",
       "path": "crates/contextdb-engine/tests/vector_tail_transaction_contract.rs",
       "required_features": [
@@ -3581,21 +3341,6 @@
       "kind": "test",
       "name": "vector_transaction_filter_snapshot_truth_contract",
       "path": "crates/contextdb-engine/tests/vector_transaction_filter_snapshot_truth_contract.rs",
-      "required_features": [
-        "test-seams"
-      ],
-      "jobs": [
-        "contextdb-engine-test-seams",
-        "nightly/full-test"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-engine",
-      "kind": "test",
-      "name": "vector_where_one_partition_spends_its_find",
-      "path": "crates/contextdb-engine/tests/vector_where_one_partition_spends_its_find.rs",
       "required_features": [
         "test-seams"
       ],
@@ -5857,99 +5602,8 @@
     {
       "crate": "contextdb-vector",
       "kind": "test",
-      "name": "a_borrowed_serving_page_keeps_its_charge_through_a_give_back",
-      "path": "crates/contextdb-vector/tests/a_borrowed_serving_page_keeps_its_charge_through_a_give_back.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-vector",
-        "contextdb-vector-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-vector",
-      "kind": "test",
-      "name": "a_completed_search_keeps_live_scratch_charged",
-      "path": "crates/contextdb-vector/tests/a_completed_search_keeps_live_scratch_charged.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-vector",
-        "contextdb-vector-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-vector",
-      "kind": "test",
-      "name": "a_saved_graph_serving_cache_keeps_its_lookup_table_charged",
-      "path": "crates/contextdb-vector/tests/a_saved_graph_serving_cache_keeps_its_lookup_table_charged.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-vector",
-        "contextdb-vector-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-vector",
-      "kind": "test",
-      "name": "a_serving_page_a_search_still_reads_stays_charged",
-      "path": "crates/contextdb-vector/tests/a_serving_page_a_search_still_reads_stays_charged.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-vector",
-        "contextdb-vector-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-vector",
-      "kind": "test",
       "name": "borrowed_route_metadata_adapter",
       "path": "crates/contextdb-vector/tests/borrowed_route_metadata_adapter.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-vector",
-        "contextdb-vector-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-vector",
-      "kind": "test",
-      "name": "concurrent_searches_stay_inside_their_serving_cache",
-      "path": "crates/contextdb-vector/tests/concurrent_searches_stay_inside_their_serving_cache.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-vector",
-        "contextdb-vector-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-vector",
-      "kind": "test",
-      "name": "graph_identity_rows_share_one_point",
-      "path": "crates/contextdb-vector/tests/graph_identity_rows_share_one_point.rs",
-      "required_features": [],
-      "jobs": [
-        "contextdb-vector",
-        "contextdb-vector-test-seams"
-      ],
-      "tier": "normal",
-      "execution": "not executed by this audit; existing ignore attributes still apply"
-    },
-    {
-      "crate": "contextdb-vector",
-      "kind": "test",
-      "name": "graph_reachability_diagnostic",
-      "path": "crates/contextdb-vector/tests/graph_reachability_diagnostic.rs",
       "required_features": [],
       "jobs": [
         "contextdb-vector",
@@ -6600,20 +6254,6 @@
       "execution": "not executed by this audit"
     },
     {
-      "path": "crates/contextdb-engine/tests/vector/graph_build_distance_evaluations_stay_under_the_ratchet.rs",
-      "line": 1,
-      "declaration": "#![cfg(feature = \"nightly-tests\")]",
-      "job": "nightly/full-test",
-      "execution": "not executed by this audit"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/graph_route_profile_quality.rs",
-      "line": 1,
-      "declaration": "#![cfg(feature = \"nightly-tests\")]",
-      "job": "nightly/full-test",
-      "execution": "not executed by this audit"
-    },
-    {
       "path": "crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs",
       "line": 359,
       "declaration": "#[cfg(feature = \"nightly-tests\")]",
@@ -6715,34 +6355,6 @@
       "path": "crates/contextdb-engine/tests/vector.rs",
       "line": 70,
       "declaration": "#[cfg(feature = \"nightly-tests\")]",
-      "job": "nightly/full-test",
-      "execution": "not executed by this audit"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_50000_isotropic_per_context.rs",
-      "line": 5,
-      "declaration": "#![cfg(feature = \"nightly-tests\")]",
-      "job": "nightly/full-test",
-      "execution": "not executed by this audit"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_50001_anisotropic_per_context.rs",
-      "line": 5,
-      "declaration": "#![cfg(feature = \"nightly-tests\")]",
-      "job": "nightly/full-test",
-      "execution": "not executed by this audit"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_5000_anisotropic_per_context.rs",
-      "line": 5,
-      "declaration": "#![cfg(feature = \"nightly-tests\")]",
-      "job": "nightly/full-test",
-      "execution": "not executed by this audit"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_5001_topic_clusters_per_context.rs",
-      "line": 5,
-      "declaration": "#![cfg(feature = \"nightly-tests\")]",
       "job": "nightly/full-test",
       "execution": "not executed by this audit"
     },
@@ -6886,99 +6498,9 @@
       "execution": "not selected (--include-ignored absent)"
     },
     {
-      "path": "crates/contextdb-engine/tests/vector/a_find_locks_its_serving_cache_once_per_page.rs",
-      "line": 130,
-      "declaration": "#[ignore = \"requires the seeded 1,250-row, 768-dimension store built by an_exact_search_authenticates_pages_not_every_vector; fixture creation takes minutes and hundreds of megabytes\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_graph_search_stays_inside_its_serving_cache.rs",
-      "line": 61,
-      "declaration": "#[ignore = \"seeds a 1,250 x 768 store, which is minutes and hundreds of megabytes -- too slow \\",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_replaced_vector_tied_frontier_walk_diagnostic.rs",
-      "line": 27,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_tied_frontier_walk_diagnostic.rs",
-      "line": 13,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs",
-      "line": 106,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs",
-      "line": 181,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_admits_every_partition_when_serving_pages_give_way.rs",
-      "line": 219,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_is_admitted_at_what_its_loads_hold.rs",
-      "line": 39,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_is_admitted_at_what_its_loads_hold.rs",
-      "line": 80,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_keeps_its_entry_pages_warm.rs",
-      "line": 51,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_keeps_its_entry_pages_warm.rs",
-      "line": 159,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/a_wide_find_keeps_its_entry_pages_warm.rs",
-      "line": 224,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
       "path": "crates/contextdb-engine/tests/vector/an_exact_search_authenticates_pages_not_every_vector.rs",
       "line": 149,
       "declaration": "#[ignore = \"large exact-search diagnostic; run explicitly when measuring body and proof work\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/each_layer_a_wide_find_loads_keeps_its_share.rs",
-      "line": 282,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/each_layer_a_wide_find_loads_keeps_its_share.rs",
-      "line": 314,
-      "declaration": "#[ignore = \"encodes the all-resident serving-cache pricing model, which contradicts the intent's on-demand paging; superseded by the paged-pricing replacement rows\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/flat_route_crossover_diagnostic.rs",
-      "line": 78,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
       "execution": "not selected (--include-ignored absent)"
     },
     {
@@ -6988,93 +6510,9 @@
       "execution": "not selected (--include-ignored absent)"
     },
     {
-      "path": "crates/contextdb-engine/tests/vector/multi_context_auto_route_diagnostic.rs",
-      "line": 97,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/multi_context_auto_route_diagnostic.rs",
-      "line": 210,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/multi_context_auto_route_diagnostic.rs",
-      "line": 306,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/multi_partition_union_recall_beam_diagnostic.rs",
-      "line": 199,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/single_context_search_radius_work_diagnostic.rs",
-      "line": 118,
-      "declaration": "#[ignore = \"diagnostic: run explicitly with --ignored\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/what_a_declared_search_breadth_buys.rs",
-      "line": 227,
-      "declaration": "#[ignore = \"measurement for the owner, not a bar, and it cannot run in the default suite: it \\",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/what_the_approved_budget_does_to_one_large_context.rs",
-      "line": 227,
-      "declaration": "#[ignore = \"diagnostic measurement: it seeds a 12,500 x 768 store (about \\",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/where_one_partition_spends_its_find.rs",
-      "line": 85,
-      "declaration": "#[ignore = \"attribution, not a bar: it seeds a 10,000 x 768 store (about ten minutes) and \\",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector/where_one_partition_spends_its_find.rs",
-      "line": 118,
-      "declaration": "#[ignore = \"attribution, not a bar: it seeds a 10,000 x 768 store (about ten minutes) and \\",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_50000_isotropic_per_context.rs",
-      "line": 10,
-      "declaration": "#[ignore = \"CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_50001_anisotropic_per_context.rs",
-      "line": 10,
-      "declaration": "#[ignore = \"CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_5000_anisotropic_per_context.rs",
-      "line": 10,
-      "declaration": "#[ignore = \"CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-engine/tests/vector_graph_recall_5001_topic_clusters_per_context.rs",
-      "line": 10,
-      "declaration": "#[ignore = \"CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
       "path": "crates/contextdb-server/tests/durable_deletion_and_purge_tests.rs",
       "line": 1600,
       "declaration": "#[ignore = \"CDB-154: vector-sync defect on dev makes this purge test fail nondeterministically (transport timeout, false frontier corruption, 1000 vs 1001 nodes); re-enable when the storage fix lands\"]",
-      "execution": "not selected (--include-ignored absent)"
-    },
-    {
-      "path": "crates/contextdb-vector/tests/graph_reachability_diagnostic.rs",
-      "line": 109,
-      "declaration": "#[ignore = \"diagnostic\"]",
       "execution": "not selected (--include-ignored absent)"
     },
     {
