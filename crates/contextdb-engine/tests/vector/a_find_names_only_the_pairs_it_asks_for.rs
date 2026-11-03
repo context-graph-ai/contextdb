@@ -220,11 +220,20 @@ fn pair_list(pairs: &[(usize, usize)], params: &mut HashMap<String, Value>) -> S
     format!("(context_id, generation_id) IN ({})", listed.join(", "))
 }
 
-fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
-    let dot: f32 = left.iter().zip(right).map(|(a, b)| a * b).sum();
-    let left_norm: f32 = left.iter().map(|a| a * a).sum::<f32>().sqrt();
-    let right_norm: f32 = right.iter().map(|a| a * a).sum::<f32>().sqrt();
-    1.0 - dot / (left_norm * right_norm)
+/// The canonical cosine distance, written out independently: f64 per
+/// coordinate, a zero norm is distance 1.0.
+fn cosine_distance(left: &[f32], right: &[f32]) -> f64 {
+    let (dot, left_norm, right_norm) = left.iter().zip(right).fold(
+        (0.0_f64, 0.0_f64, 0.0_f64),
+        |(dot, left_norm, right_norm), (&a, &b)| {
+            let (a, b) = (f64::from(a), f64::from(b));
+            (dot + a * b, left_norm + a * a, right_norm + b * b)
+        },
+    );
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return 1.0;
+    }
+    1.0 - dot / (left_norm.sqrt() * right_norm.sqrt())
 }
 
 /// The ten nearest rows among those the statement admits, computed from the
