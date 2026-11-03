@@ -671,10 +671,11 @@ pub(super) fn read_image_error(error: Error) -> LoadReadImageError {
             None => read_image_io("reading Redb storage", message),
         };
     }
-    if matches!(
-        error,
-        Error::MemoryBudgetExceeded { .. } | Error::ReadFailure(_) | Error::ReadCancelled
-    ) {
+    // Every memory refusal is the memory class, the native budget form
+    // included; none of them says anything about the stored bytes.
+    if crate::read_image_memory::is_memory_refusal(&error)
+        || matches!(error, Error::ReadFailure(_) | Error::ReadCancelled)
+    {
         LoadReadImageError::Memory(error)
     } else if crate::read_image_memory::is_missing_decode_owner(&error) {
         // The existing public direct-file vocabulary cannot yet preserve

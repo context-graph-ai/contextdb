@@ -1323,15 +1323,39 @@ fn io_kind_is_damage(kind: std::io::ErrorKind) -> bool {
     )
 }
 
-/// The device failed to answer a read or write: a transient I/O failure, never
-/// evidence that the store is damaged, and never a reason to advise a reset.
-fn storage_failure_is_io(error: &redb::StorageError) -> bool {
+/// Not damage: the device failed to answer (a transient I/O failure) or a
+/// memory admission was refused. Never a reason to call the store corrupt or
+/// to advise a reset; storage_error gives each its own typed class.
+fn storage_failure_is_not_damage(error: &redb::StorageError) -> bool {
     match error {
         redb::StorageError::Io(error)
         | redb::StorageError::Native(redb::NativeColdReadError::Io(error)) => {
             !io_kind_is_damage(error.kind()) && error.kind() != std::io::ErrorKind::QuotaExceeded
         }
-        redb::StorageError::PreviousIo => true,
+        redb::StorageError::PreviousIo
+        | redb::StorageError::AdmissionRefused(_)
+        | redb::StorageError::Native(
+            redb::NativeColdReadError::AdmissionRefused
+            | redb::NativeColdReadError::AdmissionRefusedAt(_),
+        ) => true,
+        _ => false,
+    }
+}
+
+/// An engine error that is not damage: storage I/O, a memory refusal, a
+/// cancellation or a typed read failure. A wrapper passes it through.
+fn error_is_not_damage(error: &Error) -> bool {
+    is_storage_io(error)
+        || crate::read_image_memory::is_memory_refusal(error)
+        || matches!(error, Error::ReadCancelled | Error::ReadFailure(_))
+}
+
+/// A read-image error that is I/O, not damage.
+fn load_error_is_io(error: &LoadReadImageError) -> bool {
+    match error {
+        LoadReadImageError::Io { .. } => true,
+        #[cfg(unix)]
+        LoadReadImageError::WaitIo { .. } => true,
         _ => false,
     }
 }

@@ -116,7 +116,7 @@ impl PreparedOpenDiagnostic {
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     && display_contains_registry(error));
         let io = matches!(&source,
-            redb::DatabaseError::Storage(error) if super::storage_failure_is_io(error));
+            redb::DatabaseError::Storage(error) if super::storage_failure_is_not_damage(error));
         let corruption = !permission && !registry && !io;
         // The legacy storage receiver also consumes recorded coordination
         // and disk-growth refusals. Keep its exact precedence and classes;

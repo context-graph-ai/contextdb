@@ -671,10 +671,7 @@ fn validate_captured_roots(
     if actual_bodies != body_count
         || !content_identity::vector_directory_projection_matches_in_read(read, body_count, count)
             .map_err(|error| {
-            if crate::read_image_memory::is_memory_refusal(&error)
-                || matches!(error, Error::ReadCancelled)
-                || super::is_storage_io(&error)
-            {
+            if super::error_is_not_damage(&error) {
                 return error;
             }
             crate::funded_error::corruption_display(

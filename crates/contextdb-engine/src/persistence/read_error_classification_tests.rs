@@ -462,3 +462,315 @@ fn one_read_error_reading_the_vector_pages_binding_is_io() {
             .map(|_| ())
     });
 }
+
+/// A refusal of the memory class, by category: a typed budget refusal or a
+/// read failure for the memory limit. Never corruption.
+fn says_memory(text: &str) -> bool {
+    text.contains("MemoryBudgetExceeded")
+        || text.contains("ProcessMemoryBudgetExceeded")
+        || (text.contains("ReadFailure") && text.contains("Memory"))
+        || text.contains("the read went past the memory it is allowed")
+}
+
+/// Step a memory budget up from `start` until `operation` fits. Every refusal on
+/// the way is the memory class and never says corrupt. Returns the refusals.
+fn memory_sweep(
+    label: &str,
+    start: u64,
+    mut operation: impl FnMut(u64) -> Result<(), String>,
+) -> usize {
+    let mut limit = start;
+    let mut refusals = 0;
+    for _ in 0..400 {
+        match operation(limit) {
+            Ok(()) => return refusals,
+            Err(text) => {
+                assert!(
+                    !text_says_corrupt(&text) && says_memory(&text),
+                    "{label}: a refusal at {limit} bytes is the memory class, never corruption: {text}"
+                );
+                refusals += 1;
+            }
+        }
+        limit += limit / 4 + 1024;
+    }
+    panic!("{label}: the operation never fitted");
+}
+
+fn bounded_read_within(db: &Database, sql: &str, memory: u64) -> Result<(), String> {
+    let request = bounded::BoundedReadRequest::new(
+        sql,
+        HashMap::new(),
+        contextdb_core::read_contract::ReadLimits {
+            memory,
+            ..contextdb_core::read_contract::ReadLimits::default()
+        },
+        Arc::new(FrozenClock),
+    );
+    bounded::execute(db, &request)
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// Captured-root reads under a stepped reader memory limit: content size, a
+/// vector scan, a history read and an indexed lookup that opens the retained
+/// physical and current index tables (retained_read_source index opens).
+#[test]
+fn a_captured_read_refused_for_memory_is_the_memory_class_never_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = fixture(dir.path());
+    let db = Database::open(&base).unwrap();
+    db.execute("CREATE INDEX h_body ON h (body)", &HashMap::new())
+        .unwrap();
+    for (label, sql) in [
+        ("captured content size", "SHOW CONTENT_SIZE"),
+        (
+            "captured vector scan",
+            "SELECT id FROM vecs ORDER BY embedding <=> [1,0,0] USE VECTOR EXACT LIMIT 5",
+        ),
+        ("captured history read", "SELECT id, body FROM h"),
+        (
+            "captured index lookup",
+            "SELECT id FROM h WHERE body = 'second'",
+        ),
+    ] {
+        let refusals = memory_sweep(label, 4096, |memory| bounded_read_within(&db, sql, memory));
+        assert!(refusals > 0, "{label}: some limit refused the read");
+    }
+    db.close().unwrap();
+}
+
+/// Writer reads under a stepped MEMORY_LIMIT: content size, the history scan
+/// and the received vector-pages binding.
+#[test]
+fn a_writer_read_refused_for_memory_is_the_memory_class_never_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = fixture(dir.path());
+    let db = Database::open(&base).unwrap();
+    let none = HashMap::new();
+    let floor = db.accountant().usage().used as u64 + 64 * 1024;
+    let set = |db: &Database, limit: u64| {
+        db.execute(
+            &format!("SET MEMORY_LIMIT '{}K'", limit.div_ceil(1024)),
+            &HashMap::new(),
+        )
+        .unwrap();
+    };
+    let ops: [(&str, &dyn Fn(&Database) -> Result<(), String>); 3] = [
+        ("writer content size", &|db| {
+            db.execute("SHOW CONTENT_SIZE", &HashMap::new())
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        }),
+        ("writer history scan", &|db| {
+            db.execute("SELECT id, body FROM h", &HashMap::new())
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        }),
+        ("received vector binding", &|db| {
+            let meta = db.table_meta("vecs").expect("the vector table's meta");
+            db.replay_guard_persistence_for_test()
+                .received_changed_vector_incarnations("vecs", &meta, &[])
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        }),
+    ];
+    for (label, op) in ops {
+        memory_sweep(label, floor, |limit| {
+            set(&db, limit);
+            op(&db)
+        });
+    }
+    db.execute("SET MEMORY_LIMIT 'none'", &none).unwrap();
+    db.close().unwrap();
+}
+
+/// Open under a stepped declared memory limit: the open mappers and format
+/// validation report a refusal as the memory class, never corruption.
+#[test]
+fn an_open_refused_for_memory_is_the_memory_class_never_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = fixture(dir.path());
+    let mut refusals = 0;
+    let mut limit = 1u64;
+    loop {
+        let options = crate::DatabaseOpenOptions {
+            memory_limit: Some(limit as usize),
+            ..crate::DatabaseOpenOptions::default()
+        };
+        match Database::open_with_options(&base, options) {
+            Ok(db) => {
+                drop(db);
+                break;
+            }
+            Err(error) => {
+                let text = format!("{error:?}");
+                assert!(
+                    !text_says_corrupt(&text) && says_memory(&text),
+                    "open: a refusal at {limit} bytes is the memory class, never corruption: {text}"
+                );
+                refusals += 1;
+            }
+        }
+        assert!(limit < 1 << 30, "open never fitted");
+        limit += if limit < 1 << 20 { 4096 } else { limit / 16 };
+    }
+    assert!(refusals > 0, "some declared limit refused the open");
+}
+
+/// A captured indexed lookup: an unreadable page is I/O. On this train no SQL
+/// reaches the ordered-run index opens in retained_read_source (they are
+/// covered by the ordered-run rows below), so this row covers the lookup only.
+#[test]
+fn one_read_error_in_a_captured_index_lookup_is_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = fixture(dir.path());
+    let db = Database::open(&base).unwrap();
+    db.execute("CREATE INDEX h_body ON h (body)", &HashMap::new())
+        .unwrap();
+    db.close().unwrap();
+    assert_io_sweep(&base, "captured-index-lookup", |db| {
+        bounded_read(db, "SELECT id FROM h WHERE body = 'second'")
+    });
+}
+
+/// A table with one secondary index, closed, for the ordered-run rows.
+fn ordered_fixture(path: &Path) {
+    let db = Database::open(path).unwrap();
+    let none = HashMap::new();
+    db.execute(
+        "CREATE TABLE postings (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL)",
+        &none,
+    )
+    .unwrap();
+    db.execute("CREATE INDEX by_bucket ON postings(bucket)", &none)
+        .unwrap();
+    for id in 0..40i64 {
+        db.execute(
+            "INSERT INTO postings VALUES ($id, 1)",
+            &HashMap::from([("id".into(), Value::Int64(id))]),
+        )
+        .unwrap();
+    }
+    db.close().unwrap();
+}
+
+/// Load a fresh read image of `path` under `memory` and pull one row of the
+/// verified ordered run over `by_bucket`, which opens the retained physical and
+/// current index tables (retained_read_source index opens).
+fn ordered_pull(path: &Path, memory: Option<usize>) -> Result<(), String> {
+    use contextdb_relational::mem::BoundedOrderedRowCursor;
+    let load =
+        super::load_read_image_with_memory(path, memory).map_err(|e| format!("load: {e:?}"))?;
+    let meta = &load.image.table_meta["postings"];
+    let declaration = super::RedbPersistence::relational_index_declarations(meta)
+        .into_iter()
+        .find(|d| d.name == "by_bucket")
+        .unwrap();
+    let snapshot = contextdb_core::SnapshotId(
+        load.image
+            .newest_committed_tx_for_test()
+            .map(|tx| tx.0)
+            .unwrap(),
+    );
+    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        load.source
+            .verified_ordered_runs
+            .memory
+            .accountant
+            .usage()
+            .limit
+            .map(|bytes| bytes as u64)
+            .unwrap_or(u64::MAX),
+    )
+    .map_err(|e| format!("declare: {e:?}"))?;
+    let child = parent.child().map_err(|e| format!("child: {e:?}"))?;
+    let mut cursor = BoundedOrderedRowCursor::for_index("by_bucket".into(), false);
+    cursor.select_identities_only();
+    cursor.source_configure(1);
+    load.source
+        .bounded_relational_ordered_next(
+            "postings",
+            meta,
+            &declaration,
+            snapshot,
+            &mut cursor,
+            &mut || Ok(()),
+            &mut || Ok(()),
+            &mut |_| Ok(()),
+            child,
+        )
+        .map(|_| ())
+        .map_err(|e: Error| format!("pull: {e:?}"))
+}
+
+/// The ordered run's index opens under a stepped declared memory, each attempt
+/// on a fresh read image so the index roots are cold. On 4e1f5c7b the current
+/// index open answered a page-admission refusal with StoreCorrupted ("cannot
+/// read current index by_bucket: native storage admission refused", at 286208
+/// bytes), and the image load answered a native memory budget refusal with
+/// Corrupt MalformedRecord. Every refusal, at load or at the pull, is now a
+/// refusal and never corruption.
+#[test]
+fn an_ordered_index_run_refused_for_memory_is_the_memory_class_never_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ordered.db");
+    ordered_fixture(&path);
+    let mut refusals = 0;
+    let mut limit = 0u64;
+    loop {
+        match ordered_pull(&path, Some(limit as usize)) {
+            Ok(()) => break,
+            Err(text) => {
+                // A bare native admission refusal (no owner figures) is the
+                // existing storage-io answer, pinned by
+                // read_image_decode bare_admission_refusal_tests.
+                assert!(
+                    !text_says_corrupt(&text)
+                        && (says_memory(&text)
+                            || text.contains("native storage admission refused")),
+                    "ordered index run: a refusal at {limit} bytes is a refusal, never corruption: {text}"
+                );
+                refusals += 1;
+            }
+        }
+        assert!(limit < 1 << 30, "the ordered index run never fitted");
+        limit += if limit < 1 << 20 { 512 } else { limit / 64 };
+    }
+    assert!(refusals > 0, "some declared memory refused the ordered run");
+}
+
+/// Damage control for the same opens: an index table that is absent from the
+/// committed store is still reported as corruption.
+#[test]
+fn an_absent_index_table_at_the_ordered_run_is_still_corruption() {
+    for current in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordered.db");
+        ordered_fixture(&path);
+        let name = if current {
+            super::RedbPersistence::current_relational_index_table_name("postings", "by_bucket")
+        } else {
+            super::RedbPersistence::relational_index_table_name("postings", "by_bucket")
+        };
+        {
+            let _scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+                crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+            )
+            .unwrap();
+            let raw = redb::Database::create(&path).unwrap();
+            let write = raw.begin_write().unwrap();
+            let definition: redb::TableDefinition<super::DurableRelationalIndexKey, &[u8]> =
+                redb::TableDefinition::new(name.as_str());
+            assert!(write.delete_table(definition).unwrap(), "{name} existed");
+            write.commit().unwrap();
+        }
+        let outcome = ordered_pull(&path, Some(256 * 1024 * 1024));
+        let text = outcome.expect_err("an absent index table refuses the run");
+        assert!(
+            text_says_corrupt(&text),
+            "absent {} index: still corruption: {text}",
+            if current { "current" } else { "physical" }
+        );
+    }
+}

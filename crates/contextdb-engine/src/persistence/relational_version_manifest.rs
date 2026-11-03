@@ -185,9 +185,8 @@ impl RedbPersistence {
             | Error::ReadCancelled
             | Error::ReadFailure(_) => error,
             // A manifest page the device failed to return is I/O, not damage.
-            error if super::is_storage_io(&error) => error,
-            // A refused memory admission is a budget to raise (CDB-212).
-            error if crate::read_image_memory::is_memory_refusal(&error) => error,
+            // I/O, a refused memory admission (CDB-212) or a cancellation.
+            error if super::error_is_not_damage(&error) => error,
             other => self.relational_manifest_damage(other),
         }
     }
@@ -2107,7 +2106,7 @@ impl RedbPersistence {
                                 )
                                 .map_err(|error| match error {
                                     // The bounds-table read failed: I/O, not damaged history.
-                                    error @ LoadReadImageError::Io { .. } => {
+                                    error if super::load_error_is_io(&error) => {
                                         RedbPersistence::storage_message_error(error)
                                     }
                                     LoadReadImageError::Memory(error) => error,

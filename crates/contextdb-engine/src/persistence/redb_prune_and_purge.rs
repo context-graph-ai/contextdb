@@ -382,10 +382,15 @@ impl RedbPersistence {
                 let frontier =
                     read_authenticated_history_frontiers(&read, &self.path, &memory, &context)
                         .map_err(|error| {
-                            // A failed frontier read is I/O, not damaged history.
-                            if matches!(error, super::LoadReadImageError::Io { .. }) {
+                            // A failed frontier read is I/O, a refused one a budget
+                            // or a cancellation: not damaged history.
+                            if super::load_error_is_io(&error) {
                                 return Self::storage_message_error(error);
                             }
+                            let error = match error {
+                                super::LoadReadImageError::Memory(error) => return error,
+                                error => error,
+                            };
                             crate::funded_error::corruption_display(
                                 self.require_decode_original()
                                     .and_then(|original| original.read_budget()),
