@@ -160,15 +160,27 @@ for suffix in ['profile','tests','targets.json','time']:
                             Path, 'read_text', lambda p, *a, **kw: replacement if p == path else read(p, *a, **kw)):
                         with self.assertRaises(ValueError):
                             i.inventory(i.ROOT)
+        proportional = 'custody_schema_replay_is_proportional_to_affected_tables'
         for target in [target for targets in expected.values() for target in targets]:
-            fixture = i.ROOT / 'crates/contextdb-engine/tests' / (target + '.rs')
-            source = fixture.read_text()
-            full = target != 'custody_schema_replay_bounded_contract'
-            for rows in ([5_000, 1] if full else [5_000, 10_000]):
-                replacement = source.replace('const UNRELATED_RESIDENT_ROWS: i64 = '
-                                             + ('10_000' if full else '1') + ';',
-                                             f'const UNRELATED_RESIDENT_ROWS: i64 = {rows};')
-                with self.subTest(target=target, rows=rows), patch.object(
+            if target == proportional:
+                # No constant here: the frozen 10,000 rows are literals in the shared module.
+                fixture = i.ROOT / 'crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs'
+                source = fixture.read_text()
+                shrunk = ['for id in 0..10_000 {', 'Vec::with_capacity(10_000)',
+                          'rows.len(),\n        10_000,']
+                replacements = [(literal, source.replace(literal, literal.replace('10_000', '5_000'))) for literal in shrunk]
+            else:
+                fixture = i.ROOT / 'crates/contextdb-engine/tests' / (target + '.rs')
+                source = fixture.read_text()
+                full = target != 'custody_schema_replay_bounded_contract'
+                replacements = [(str(rows), source.replace(
+                    'const UNRELATED_RESIDENT_ROWS: i64 = ' + ('10_000' if full else '1') + ';',
+                    f'const UNRELATED_RESIDENT_ROWS: i64 = {rows};'))
+                    for rows in ([5_000, 1] if full else [5_000, 10_000])]
+            for label, replacement in replacements:
+                # A replacement that changes nothing would pass for the wrong reason.
+                self.assertNotEqual(replacement, source, (target, label))
+                with self.subTest(target=target, change=label), patch.object(
                         Path, 'read_text', lambda p, *a, **kw: replacement if p == fixture else read(p, *a, **kw)):
                     with self.assertRaisesRegex(ValueError, 'schema replay frozen fixture mismatch'):
                         i.inventory(i.ROOT)

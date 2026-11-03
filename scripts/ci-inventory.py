@@ -251,7 +251,6 @@ def schema_replay_fixture_contract(root):
     """Freeze full resident fixtures independently of the bounded root."""
     tests = root / "crates/contextdb-engine/tests"
     for target, rows in {
-            "custody_schema_replay_is_proportional_to_affected_tables": 10_000,
             "custody_schema_replay_work_limited_to_affected_tables": 10_000,
             "custody_schema_replay_identical_schema_does_no_artifact_work": 10_000,
             "custody_schema_replay_bounded_contract": 1}.items():
@@ -260,6 +259,15 @@ def schema_replay_fixture_contract(root):
                                   text, re.MULTILINE)
         if len(declarations) != 1 or int(declarations[0].replace("_", "")) != rows:
             raise ValueError(f"schema replay frozen fixture mismatch: {target}: expected {rows}")
+    # The proportional fixture declares no row-count constant: its shared module holds the
+    # 10,000 resident rows as literals, which is where the frozen size has to be checked.
+    target = "custody_schema_replay_is_proportional_to_affected_tables"
+    text = (tests / "schema/schema_replay_is_proportional_to_affected_tables.rs").read_text()
+    for literal in (r"^    for id in 0\.\.10_000 \{$",
+                    r"^    let mut rows = Vec::with_capacity\(10_000\);$",
+                    r"^        rows\.len\(\),\n        10_000,$"):
+        if len(re.findall(literal, text, re.MULTILINE)) != 1:
+            raise ValueError(f"schema replay frozen fixture mismatch: {target}: expected 10000")
 
 
 
