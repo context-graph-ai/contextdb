@@ -284,6 +284,10 @@ const UNREACHABLE_BY_CONSUMERS: &[(&str, &str)] = &[
         "its module exists only with the `test-seams` feature",
     ),
     (
+        "contextdb_engine::persistence::RedbPersistence::rewrite_change_log",
+        "compiled only with the `test-seams` feature: a fixture tool that cannot keep a received unit's history grouping",
+    ),
+    (
         "contextdb_engine::executor::bounded_read_test_support::execute",
         "test support for the engine's bounded-read suites, not a consumer route",
     ),

@@ -1,17 +1,15 @@
 use super::*;
 
 impl RedbPersistence {
-    /// Rewrite the persisted change log to exactly `entries`, in order. Used by
-    /// currency-table version compaction to drop, in lockstep with the pruned
-    /// superseded row versions, the `RowInsert`/`RowDelete` entries that
-    /// referenced them — so `changes_since`'s change-log replay (which reads the
-    /// row version AT each logged LSN) never encounters an entry whose version
-    /// was removed and silently substitutes the latest one. The table is fully
-    /// cleared and rebuilt from `entries`; keys are re-derived as
-    /// `{lsn:020}:{index}` with `index` restarting per LSN (entries sharing an
-    /// LSN are contiguous, exactly as the commit path wrote them), so the load
-    /// order is preserved byte-for-byte with what a fresh sequence of commits
-    /// would have produced.
+    /// Fixture tool, compiled only for tests: rewrite the persisted change log
+    /// to exactly `entries`, in order. The table is cleared and rebuilt with
+    /// keys `{entry.lsn():020}:{index}`, `index` restarting per LSN. That
+    /// matches only a store whose records were all written by local commits:
+    /// a received unit spanning several source commits files its records under
+    /// one later envelope, which a bare record list cannot carry, so this call
+    /// would re-file them. It is therefore not a consumer operation.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

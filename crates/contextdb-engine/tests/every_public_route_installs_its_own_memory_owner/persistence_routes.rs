@@ -235,13 +235,6 @@ pub fn rows() -> Vec<Row> {
             },
         },
         Row {
-            route: "contextdb_engine::persistence::RedbPersistence::rewrite_change_log",
-            drive: || {
-                let raw = seeded();
-                call(|| raw.store.rewrite_change_log(&[insert_entry(1)]))
-            },
-        },
-        Row {
             route: "contextdb_engine::persistence::RedbPersistence::load_change_log",
             drive: || {
                 let raw = seeded();
