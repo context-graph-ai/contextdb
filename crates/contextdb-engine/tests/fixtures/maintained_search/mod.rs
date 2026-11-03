@@ -25,11 +25,6 @@ pub const CORPUS_ROWS: usize = 10_000;
 pub const HELD_OUT_ROWS: usize = 100;
 #[allow(
     dead_code,
-    reason = "KEEP-SHARED: shared test helper used by vector, vector_graph_recall_50000_isotropic_per_context, vector_graph_recall_500"
-)]
-pub const PROFILE_DIMENSIONS: usize = 64;
-#[allow(
-    dead_code,
     reason = "KEEP-SHARED: shared test helper used by vector, vector_a_filtered_scope_is_charged_for_its_candidates, vector_first_filt"
 )]
 pub const CORPUS_SHA256: &str = "30b962cfabd4727efd55e1569a3e1a028422c244230f9cb1e88121d0167b3d4d";
@@ -121,15 +116,7 @@ pub fn held_out_vector(ordinal: usize) -> Vec<f32> {
 
 #[allow(
     dead_code,
-    reason = "KEEP-SHARED: shared test helper used by vector, vector_graph_recall_50000_isotropic_per_context, vector_graph_recall_500"
-)]
-pub fn profile_vector(shape: &str, seed: usize, role: &str, ordinal: usize) -> Vec<f32> {
-    generator::vector_for(shape, seed, role, ordinal, PROFILE_DIMENSIONS)
-}
-
-#[allow(
-    dead_code,
-    reason = "KEEP-SHARED: shared test helper used by vector, vector_first_filtered_search_in_a_fresh_reader_uses_the_saved_graph, vec"
+    reason = "KEEP-SHARED: shared test helper used by vector, vector_indexed_route_does_less_work_than_exact"
 )]
 pub fn corpus_partition(ordinal: usize) -> i64 {
     i64::try_from(ordinal / 1_250).expect("eight frozen corpus partitions fit i64")
