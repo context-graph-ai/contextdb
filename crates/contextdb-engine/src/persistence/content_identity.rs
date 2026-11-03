@@ -16872,12 +16872,17 @@ pub(crate) mod original_version_manifest {
     /// `scope` is the caller's manifest prefix: the table, the physical
     /// identity or the row id it asks about. `start` must lie within it, or
     /// the seek is refused before any walk; the answer always lies within it,
-    /// and None means no member at or after `start` does. Both walks stop at
-    /// the scope's end: the stored walk authenticates every member it passes
-    /// inside the scope and the first stored successor past it, and the
-    /// pending walk visits at most the pending entries of the scope at or
-    /// after `start`, plus one that ends it. A seek therefore costs the
-    /// members of its own scope, never the rest of the table.
+    /// and None means no member at or after `start` does. The stored walk
+    /// stops at the scope's end: it authenticates every member it passes
+    /// inside the scope and the first stored successor past it. The pending
+    /// walk is bounded only on the paged traversal
+    /// ([`writer_manifest_next_paged`]), which visits at most the pending
+    /// entries of the scope at or after `start`, plus one that ends it; there
+    /// a seek costs the members of its own scope, never the rest of the
+    /// table. The publication-ordered slice ([`writer_manifest_next_pending`])
+    /// is not in coordinate order, so it still visits the whole batch on
+    /// every seek, skipping members outside the scope, and its `latest`
+    /// lookup may rescan the batch for each one.
     fn writer_manifest_next_overlay(
         write: &redb::WriteTransaction,
         scope: &[u8],
