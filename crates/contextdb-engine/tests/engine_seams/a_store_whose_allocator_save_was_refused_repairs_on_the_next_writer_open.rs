@@ -10,11 +10,11 @@
 //!   redb's crash repair run, as it documents for a store left without
 //!   allocator state, and answers "current format, nothing to correct"
 //!   (`Ok(false)`), after which direct reads open;
-//! - a writable open repairs it, keeps every row and keeps its database
-//!   identity.
+//! - a writable open repairs it, keeps every row and keeps the store's
+//!   durable sync incarnation, the identity sync stamps on its requests.
 #![cfg(unix)]
 
-use contextdb_core::{Error, Value, read_contract::ReadFailureKind};
+use contextdb_core::{Error, Incarnation, TenantId, Value, read_contract::ReadFailureKind};
 use contextdb_engine::persistence::RedbPersistence;
 use contextdb_engine::{Database, ReadSession};
 use std::collections::HashMap;
@@ -23,6 +23,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const ROWS: i64 = 300;
+/// The tenant whose durable sync incarnation identifies the store.
+const TENANT: &str = "refused-save";
 
 fn body(id: i64) -> String {
     format!("{id:04}-{}", "x".repeat(2000))
@@ -32,8 +34,9 @@ fn body(id: i64) -> String {
 /// bitmap has a summary level, then closed and reopened as a raw redb store
 /// whose summary gets one planted wrong bit; dropping the raw handle runs
 /// its quick-repair commit, which must refuse to save the allocator.
-/// Returns the store's database identity.
-fn latched_store(path: &Path) -> u64 {
+/// Returns the store's durable sync incarnation, which a healthy reopen
+/// already agrees with.
+fn latched_store(path: &Path) -> Incarnation {
     let database = Database::open(path).expect("create store");
     database
         .execute(
@@ -49,8 +52,19 @@ fn latched_store(path: &Path) -> u64 {
             )
             .expect("commit row");
     }
-    let identity = database.database_identity_for_test();
+    let identity = database
+        .sync_incarnation_for_test(&TenantId::from(TENANT))
+        .expect("persist the store's sync incarnation");
     database.close().expect("close fixture owner");
+    let healthy = Database::open(path).expect("healthy reopen");
+    assert_eq!(
+        healthy
+            .sync_incarnation_for_test(&TenantId::from(TENANT))
+            .expect("read the store's sync incarnation"),
+        identity,
+        "fixture: a healthy reopen changed the store's durable sync incarnation"
+    );
+    healthy.close().expect("close the healthy reopen");
 
     let raw = redb::Database::open(path).expect("open physical store");
     // Drop runs the quick-repair commit that saves the allocator table; the
@@ -189,15 +203,17 @@ fn a_store_whose_allocator_save_was_refused_repairs_on_the_next_writer_open() {
         ReadSession::open(&inspected).expect("direct read after diagnose repaired the store");
     drop(file);
 
-    // A writable open repairs it, keeps every row and its identity.
+    // A writable open repairs it, keeps every row and its durable identity.
     let reopened = root.path().join("reopened.db");
     let identity = latched_store(&reopened);
     assert_direct_read_needs_a_writer(&reopened, "before the writable open");
     let recovered = Database::open(&reopened).expect("writable open repairs the store");
     assert_eq!(
-        recovered.database_identity_for_test(),
+        recovered
+            .sync_incarnation_for_test(&TenantId::from(TENANT))
+            .expect("read the repaired store's sync incarnation"),
         identity,
-        "the repair changed the store's database identity"
+        "the repair changed the store's durable sync incarnation"
     );
     assert_rows(&recovered, "after the writable open");
     recovered.close().expect("close recovered owner");
