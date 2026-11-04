@@ -1410,6 +1410,8 @@ pub enum Error {
     IndexNotFound { table: String, index: String },
     #[error("duplicate index: {table}.{index}")]
     DuplicateIndex { table: String, index: String },
+    #[error("reserved column name: {table}.{column} is owned by the engine")]
+    ReservedColumnName { table: String, column: String },
     #[error("reserved index name: {table}.{name} uses reserved prefix `{prefix}`")]
     ReservedIndexName {
         table: String,
