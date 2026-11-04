@@ -6468,6 +6468,12 @@
       "execution": "not selected (--include-ignored absent)"
     },
     {
+      "path": "crates/contextdb-engine/src/database/received_legacy_growth_lifecycle_guards.rs",
+      "line": 158,
+      "declaration": "#[ignore = \"CDB-223: residual after deep refusal\"]",
+      "execution": "not selected (--include-ignored absent)"
+    },
+    {
       "path": "crates/contextdb-engine/tests/engine_seams/a_declared_count_is_the_only_count_an_append_writes.rs",
       "line": 123,
       "declaration": "#[ignore = \"measurement: builds two 20,010-event streams\"]",
