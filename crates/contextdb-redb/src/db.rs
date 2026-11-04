@@ -4031,8 +4031,11 @@ mod allocator_save_check_contract {
         (height, entry)
     }
 
-    /// Plant, refuse, keep refusing, close, and repair on reopen. `handoff`
-    /// closes through `prepare_read_only_handoff` instead of plain Drop.
+    /// Plant at the entry of the quick-repair commit's allocator save, after
+    /// the commit's last allocation, so nothing the commit allocates can
+    /// clear it; then refuse, keep refusing, close, and repair on reopen.
+    /// `handoff` closes through `prepare_read_only_handoff` instead of plain
+    /// Drop.
     fn refusal_lifecycle(
         level: Level,
         full: bool,
@@ -4044,8 +4047,22 @@ mod allocator_save_check_contract {
         let context = format!("{level:?} full={full} handoff={handoff}");
         {
             let mut db = fixture(&path, removed());
-            let planted = plant(&db.mem, level, full);
+            let at_save = Arc::new(Mutex::new(None));
+            {
+                let at_save = Arc::clone(&at_save);
+                TransactionalMemory::before_next_allocator_save_for_test(Box::new(move |mem| {
+                    let planted = plant(mem, level, full);
+                    *at_save.lock().unwrap() = Some((planted, mem.summary_mismatches_for_test()));
+                }));
+            }
             quick_repair_commit(&db, ROW_COUNT);
+            let (planted, at_entry) = at_save.lock().unwrap().take().unwrap_or_else(|| {
+                panic!("{context}: the quick-repair commit never reached the allocator save")
+            });
+            assert!(
+                at_entry.contains(&(0, 0, planted.0, planted.1)),
+                "{context}: the plant at {planted:?} was not present at the allocator save's entry: {at_entry:?}"
+            );
             assert!(
                 !allocator_table_present(&db.mem),
                 "{context}: the quick-repair commit after the plant at {planted:?} published an allocator table"

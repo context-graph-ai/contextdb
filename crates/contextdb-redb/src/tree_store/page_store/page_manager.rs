@@ -1269,6 +1269,10 @@ impl TransactionalMemory {
     ) -> Result<bool> {
         #[cfg(test)]
         allocator_growth_tests::SAVE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_NEXT_ALLOCATOR_SAVE.with(|slot| slot.borrow_mut().take()) {
+            hook(self);
+        }
         self.check_io_errors()?;
         // Has the number of regions changed since reserve_allocator_state() was called?
         if num_regions != self.state.lock().unwrap().header.layout().num_regions() {
@@ -3317,9 +3321,27 @@ impl TransactionalMemory {
     }
 }
 
+/// A test hook run at the entry of one allocator save.
+#[cfg(test)]
+type AllocatorSaveHook = Box<dyn FnOnce(&TransactionalMemory)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once, on this thread, at the entry of the next
+    /// `try_save_allocator_state`: after the commit's last allocation and
+    /// before anything is checked or encoded.
+    static BEFORE_NEXT_ALLOCATOR_SAVE: std::cell::RefCell<Option<AllocatorSaveHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 // Test-only inspection of the allocator's summary levels.
 #[cfg(test)]
 impl TransactionalMemory {
+    /// Run `hook` at the entry of the next allocator save on this thread.
+    pub(crate) fn before_next_allocator_save_for_test(hook: AllocatorSaveHook) {
+        BEFORE_NEXT_ALLOCATOR_SAVE.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+
     /// Every inexact regional summary bit, as `(region, order, height, entry)`.
     pub(crate) fn summary_mismatches_for_test(&self) -> Vec<(u32, u8, u32, u32)> {
         let mut state = self.state.lock().unwrap();
