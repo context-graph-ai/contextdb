@@ -252,7 +252,7 @@ mod policy_bounded_load_tests;
 mod policy_hold_scoped_load_tests;
 
 #[cfg(all(test, feature = "test-seams"))]
-mod reader_wait_and_reserved_row_id_tests;
+mod reserved_row_id_tests;
 
 #[cfg(test)]
 mod received_schema_stage_tests;
