@@ -2028,6 +2028,22 @@ pub fn wire_changeset_with_arrivals_lineages_and_ddl_provenance(
 ) -> WireChangeSet {
     let mut wire: WireChangeSet = changes.into();
     wire.ddl_provenance = ddl_provenance;
+    #[cfg(feature = "test-seams")]
+    crate::outbound_ddl_test_seams::note_sent(
+        wire.ddl.len(),
+        wire.ddl_provenance
+            .iter()
+            .map(|provenance| crate::outbound_ddl_test_seams::SentDdl {
+                source: (provenance.source_ddl_lsn, provenance.ordinal),
+                author: provenance.author.as_ref().map(|author| {
+                    (
+                        author.node_id.clone(),
+                        author.source_ddl_lsn,
+                        author.ordinal,
+                    )
+                }),
+            }),
+    );
     for row in &mut wire.rows {
         if let Some(arrival) = arrivals.get(&row.lsn) {
             row.arrival = *arrival;

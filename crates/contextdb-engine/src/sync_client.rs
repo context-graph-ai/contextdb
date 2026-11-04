@@ -5585,6 +5585,10 @@ fn checked_drop_rows_that_arrived_by_sync_after(
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ChangeSet, Error> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    #[cfg(feature = "test-seams")]
+    crate::outbound_ddl_test_seams::note_event(
+        crate::outbound_ddl_test_seams::OutboundDdlEvent::ArrivalFrontier(reupload_through),
+    );
 
     let mut changes = changes;
     // A changeset can include the older local insert that preceded a pulled

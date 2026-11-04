@@ -359,6 +359,8 @@ impl Database {
         persisted_ordinal: u32,
         generation: &DurableDdlGenerationSidecar,
     ) -> Result<Vec<u8>> {
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_digest_checked((local_lsn, persisted_ordinal));
         // The receiver-local marker binds the durable DDL-log occurrence, not
         // the authenticated source spelling (whose full-fidelity digest is
         // validated separately before this point). The DDL-log codec is exact,

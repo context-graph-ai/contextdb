@@ -1883,13 +1883,15 @@ impl Database {
         tenant_id: &TenantId,
         hub_node_id: &str,
     ) -> Result<Option<(Lsn, uuid::Uuid)>> {
-        #[cfg(feature = "test-seams")]
-        crate::outbound_ddl_test_seams::note_reupload_epoch_read();
         let _operation = self.open_operation()?;
         let target = if let Some(persistence) = &self.persistence {
             let established =
                 persistence.load_config_value::<String>(RETENTION_SYNC_PEER_CONFIG_KEY)?;
             if established.as_deref() != Some(hub_node_id) {
+                #[cfg(feature = "test-seams")]
+                crate::outbound_ddl_test_seams::note_event(
+                    crate::outbound_ddl_test_seams::OutboundDdlEvent::EpochRead(None),
+                );
                 return Ok(None);
             }
             persistence.load_config_value::<DestinationReuploadEpoch>(
@@ -1901,9 +1903,16 @@ impl Database {
                 .get(&tenant_id.config_key(DESTINATION_REUPLOAD_TARGET_CONFIG_NAME))
                 .cloned()
         };
-        Ok(target
+        let epoch = target
             .filter(|target| target.hub_node_id == hub_node_id)
-            .map(|target| (target.held_through_lsn, target.epoch_id)))
+            .map(|target| (target.held_through_lsn, target.epoch_id));
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_event(
+            crate::outbound_ddl_test_seams::OutboundDdlEvent::EpochRead(
+                epoch.map(|(through, _)| through),
+            ),
+        );
+        Ok(epoch)
     }
 
     sync_test_seam! {

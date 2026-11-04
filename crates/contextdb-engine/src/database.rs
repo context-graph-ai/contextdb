@@ -8305,8 +8305,6 @@ impl Database {
                         })
                         .sum::<usize>();
                     drop(ddl_log);
-                    #[cfg(feature = "test-seams")]
-                    crate::outbound_ddl_test_seams::note_resident_ddl_priced(ddl_bytes);
                     let log = self.change_log.read();
                     let start = log.partition_point(|entry| entry.lsn() <= since_lsn);
                     let change_bytes = log[start..]

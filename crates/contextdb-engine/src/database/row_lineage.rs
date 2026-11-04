@@ -3663,6 +3663,10 @@ impl Database {
         held_through_lsn: Lsn,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,) -> Result<ChangeSet> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_event(
+            crate::outbound_ddl_test_seams::OutboundDdlEvent::DeleteFrontier(held_through_lsn),
+        );
 
         let lineage_state = self.lineage_state_lock.lock();
         let records = self.list_lineage_records(&lineage_state)?;

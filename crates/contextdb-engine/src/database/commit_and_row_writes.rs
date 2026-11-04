@@ -4789,6 +4789,8 @@ impl Database {
     ) -> Result<T> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_arrival_lookup(occurrence);
         RedbPersistence::validate_ddl_occurrence_ordinal(occurrence.1)?;
         let key = Self::durable_received_ddl_arrival_key(occurrence.0, occurrence.1);
         let record = root.config_point::<DurableReceivedDdlArrival>(
@@ -4844,6 +4846,8 @@ impl Database {
     ) -> Result<T> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_superseded_lookup(occurrence);
         RedbPersistence::validate_ddl_occurrence_ordinal(occurrence.1)?;
         let key = Self::durable_superseded_ddl_occurrence_key(occurrence.0, occurrence.1);
         let record = root.config_point::<DurableSupersededDdlOccurrence>(

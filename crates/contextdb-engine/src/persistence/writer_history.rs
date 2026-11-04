@@ -341,8 +341,14 @@ impl super::writer_source::WriterReadCursor {
                 .map_or(key, |(lsn, _)| lsn)
                 .parse::<u64>()
                 .map_err(|_| Error::Other("invalid declaration log frontier".into()))?;
+            #[cfg(feature = "test-seams")]
+            crate::outbound_ddl_test_seams::note_walked_key(Lsn(lsn), key);
             let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
             let owner = crate::read_image_memory::active_owner()?;
+            #[cfg(feature = "test-seams")]
+            crate::outbound_ddl_test_seams::note_walked_held(
+                owner.accountant.used_bytes_for_phase_observation(),
+            );
             let before = owner.held();
             let (change, consumed) = crate::read_image_memory::decode(
                 &crate::read_image_memory::ImageMemory::enter_decode_call()?,

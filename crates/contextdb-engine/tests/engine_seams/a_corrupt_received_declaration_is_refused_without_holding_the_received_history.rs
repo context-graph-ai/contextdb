@@ -1,8 +1,15 @@
 //! A push refuses, with the same typed error as before, when the evidence of a
-//! received group it would otherwise suppress is corrupt or incomplete, and
-//! reaching that refusal costs the same memory however much received history
-//! comes before it. After a move, a declaration authored locally above the
-//! move's frontier still refuses for lack of origin evidence.
+//! received group it would otherwise drop is corrupt or incomplete. Reaching
+//! that refusal walks the history only as far as the planted fault, lets no
+//! droppable received group reach the final filter, and holds no validation
+//! records for dropped history; nightly, it costs the same memory however
+//! much received history comes before it. After a move, a declaration
+//! authored locally above the move's frontier still refuses for lack of
+//! origin evidence.
+#![expect(
+    clippy::result_large_err,
+    reason = "The measured operations return the public Error, which keeps inline NativeRefusal diagnostics."
+)]
 use super::outbound_declaration_walk_support::*;
 use contextdb_core::{Error, Lsn};
 use contextdb_engine::database::DdlEvidenceEditForTest as Edit;
@@ -16,9 +23,10 @@ enum Fault {
     PartlyReceivedAtTheFirstOccurrence,
     SupersededDigest,
     PartlySupersededAtTheLastOccurrence,
+    PartlySupersededAtTheFirstOccurrence,
 }
 
-const FAULTS: [Fault; 7] = [
+const FAULTS: [Fault; 8] = [
     Fault::ArrivalDigest,
     Fault::GenerationSidecarAltered,
     Fault::GenerationSidecarRemoved,
@@ -26,6 +34,7 @@ const FAULTS: [Fault; 7] = [
     Fault::PartlyReceivedAtTheFirstOccurrence,
     Fault::SupersededDigest,
     Fault::PartlySupersededAtTheLastOccurrence,
+    Fault::PartlySupersededAtTheFirstOccurrence,
 ];
 
 /// Plant `fault` on the received group at `lsn` of `members` occurrences and
@@ -71,6 +80,10 @@ fn plant(db: &contextdb_engine::Database, (lsn, members): (Lsn, u32), fault: Fau
             edit(last, Edit::MarkSuperseded);
             "superseded DDL evidence marks only part of one local schema commit".into()
         }
+        Fault::PartlySupersededAtTheFirstOccurrence => {
+            edit(0, Edit::MarkSuperseded);
+            "superseded DDL evidence marks only part of one local schema commit".into()
+        }
     }
 }
 
@@ -89,103 +102,166 @@ fn assert_refused<T: std::fmt::Debug>(
     }
 }
 
-#[test]
-fn a_corrupt_received_declaration_is_refused_without_holding_the_received_history() {
+/// Every fault at `size`; returns (size, LSN, peak) per fault.
+fn corrupt_received_group(size: usize, nightly: bool) -> Vec<(usize, Lsn, usize)> {
     let _clock = fixed_clock();
     let runtime = runtime();
-    let mut samples = vec![Vec::new(); FAULTS.len()];
-    let mut works = Vec::new();
-    for size in SIZES {
-        let base = tempfile::tempdir().unwrap();
-        pulled_edge(&runtime, base.path(), size, &|_| {}).close(&runtime);
-        for (case, fault) in FAULTS.into_iter().enumerate() {
-            let directory = tempfile::tempdir().unwrap();
-            copy_setup(base.path(), directory.path());
-            let network = Network::connect(
-                &runtime,
-                Peer::reopen(directory.path(), "edge"),
-                Peer::reopen(directory.path(), "hub"),
-            );
-            let group = last_multi_occurrence_received_group(&network.edge.db);
-            let expected = plant(&network.edge.db, group, fault);
-            sql(&network.edge.db, "INSERT INTO notes VALUES (2, 'second')");
-            let hub_schema = occurrences(&network.hub.db);
-            let pushed = measure(&network.edge.db, || runtime.block_on(network.client.push()));
-            let what = format!("{fault:?}");
-            receipt(&what, size, &pushed);
-            assert_refused(&what, size, &pushed.value, &expected);
-            assert_eq!(
-                occurrences(&network.hub.db),
-                hub_schema,
-                "{what}: a refused push sends nothing"
-            );
-            assert_eq!(ids(&network.hub.db, "notes"), vec![1]);
-            samples[case].push(comparable(&pushed));
-            works.push((what, size, pushed.work));
-            network.close(&runtime);
-        }
-    }
-    for (case, fault) in FAULTS.into_iter().enumerate() {
-        assert_same_across_sizes(&format!("{fault:?} refusal"), &samples[case]);
-    }
-    for (what, size, work) in works {
-        assert_eq!(
-            work.suppressed_output_peak_bytes, 0,
-            "{what} at {size}: no received declaration sits in outbound output before the refusal: {work:?}"
+    let base = tempfile::tempdir().unwrap();
+    pulled_edge(
+        &runtime,
+        base.path(),
+        size,
+        nightly_pad(size, nightly),
+        &|_| {},
+    )
+    .close(&runtime);
+    let mut samples = Vec::new();
+    for fault in FAULTS {
+        let directory = tempfile::tempdir().unwrap();
+        copy_setup(base.path(), directory.path());
+        let network = Network::connect(
+            &runtime,
+            Peer::reopen(directory.path(), "edge"),
+            Peer::reopen(directory.path(), "hub"),
         );
-        assert!(work.suppressed_held_peak <= 1, "{what} at {size}: {work:?}");
-        assert_no_fallback(&what, size, &work);
+        let group = last_multi_occurrence_received_group(&network.edge.db);
+        let refusal = plant(&network.edge.db, group, fault);
+        sql(&network.edge.db, "INSERT INTO notes VALUES (2, 'second')");
+        let expected = expected_walk(
+            &occurrences(&network.edge.db),
+            network.client.push_watermark(),
+            None,
+        );
+        let hub_schema = occurrences(&network.hub.db);
+        let pushed = measure(&network.edge.db, || runtime.block_on(network.client.push()));
+        let what = format!("{fault:?}");
+        receipt(&what, size, &pushed);
+        assert_refused(&what, size, &pushed.value, &refusal);
+        assert_eq!(
+            occurrences(&network.hub.db),
+            hub_schema,
+            "{what}: a refused push sends nothing"
+        );
+        assert_eq!(ids(&network.hub.db, "notes"), vec![1]);
+        if !nightly {
+            assert_one_epoch(&what, &pushed.work, None, false);
+        }
+        assert_sent(&what, &pushed.work, &[]);
+        if !nightly {
+            assert_refused_walk(&what, &pushed.work, &expected, (group.0, group.1 - 1));
+        }
+        samples.push((size, pushed.lsn, pushed.peak));
+        network.close(&runtime);
     }
+    samples
+}
+
+#[test]
+fn a_corrupt_received_declaration_is_refused_without_holding_the_received_history() {
+    corrupt_received_group(PR_SIZE, false);
+}
+
+#[cfg(feature = "nightly-tests")]
+#[test]
+fn a_corrupt_received_declaration_is_refused_without_holding_the_received_history_as_received_history_grows()
+ {
+    let [small, large] = NIGHTLY_SIZES.map(|size| corrupt_received_group(size, true));
+    let [small_control, large_control] =
+        NIGHTLY_SIZES.map(|size| control_sample(size, || corrupt_received_group(PR_SIZE, true)));
+    for (case, fault) in FAULTS.into_iter().enumerate() {
+        assert_bounded_by_control(
+            &format!("{fault:?} refusal"),
+            &[small[case], large[case]],
+            &[small_control[case], large_control[case]],
+            BallastIn::NoWalk,
+        );
+    }
+}
+
+fn authored_after_move(size: usize, nightly: bool) -> (usize, Lsn, usize) {
+    let _clock = fixed_clock();
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let moved = moved_edge(
+        &runtime,
+        directory.path(),
+        size,
+        Prefix::AuthoredByTheEdge,
+        false,
+        &|edge| {
+            sql(
+                edge,
+                "CREATE TABLE after_move (id INTEGER PRIMARY KEY) SYNC TWO WAY",
+            );
+        },
+    );
+    let network = &moved.network;
+    let history = occurrences(&network.edge.db);
+    let authored = history
+        .iter()
+        .rev()
+        .find(|occurrence| names(&occurrence.ddl, "after_move"))
+        .expect("the edge authored after_move")
+        .clone();
+    assert!(!authored.received && authored.lsn > moved.frontier);
+    let expected = expected_walk(&history, REUPLOAD_PUSH_SINCE, Some(moved.frontier));
+    assert_eq!(
+        expected.dropped.len(),
+        size,
+        "exactly the second hub's declarations are droppable: {expected:?}"
+    );
+    assert!(
+        expected
+            .collected
+            .contains(&(authored.lsn, authored.ordinal)),
+        "an unmarked declaration above F reaches the final filter, which refuses it"
+    );
+    let hub_schema = occurrences(&network.hub.db);
+    let pushed = measure(&network.edge.db, || runtime.block_on(network.client.push()));
+    receipt("authored_after_move", size, &pushed);
+    assert_refused(
+        "authored after move",
+        size,
+        &pushed.value,
+        &format!(
+            "schema published after the move at source LSN {} has no durable origin evidence",
+            authored.lsn.0
+        ),
+    );
+    assert_eq!(occurrences(&network.hub.db), hub_schema);
+    if !nightly {
+        assert_one_epoch(
+            "authored after move",
+            &pushed.work,
+            Some(moved.frontier),
+            false,
+        );
+    }
+    assert_sent("authored after move", &pushed.work, &[]);
+    if !nightly {
+        assert_walk("authored after move", &pushed.work, &expected);
+    }
+    let sample = (size, pushed.lsn, pushed.peak);
+    moved.network.close(&runtime);
+    sample
 }
 
 #[test]
 fn a_declaration_authored_after_a_move_is_refused_without_holding_the_received_history() {
-    let _clock = fixed_clock();
-    let runtime = runtime();
-    let mut samples = Vec::new();
-    let mut works = Vec::new();
-    for size in SIZES {
-        let directory = tempfile::tempdir().unwrap();
-        let moved = moved_edge(
-            &runtime,
-            directory.path(),
-            size,
-            Prefix::AuthoredByTheEdge,
-            &|edge| {
-                sql(
-                    edge,
-                    "CREATE TABLE after_move (id INTEGER PRIMARY KEY) SYNC TWO WAY",
-                );
-            },
-        );
-        let network = &moved.network;
-        let authored = occurrences(&network.edge.db)
-            .into_iter()
-            .rev()
-            .find(|occurrence| names(&occurrence.ddl, "after_move"))
-            .expect("the edge authored after_move");
-        assert!(!authored.received && authored.lsn > moved.frontier);
-        let hub_schema = occurrences(&network.hub.db);
-        let pushed = measure(&network.edge.db, || runtime.block_on(network.client.push()));
-        receipt("authored_after_move", size, &pushed);
-        assert_refused(
-            "authored after move",
-            size,
-            &pushed.value,
-            &format!(
-                "schema published after the move at source LSN {} has no durable origin evidence",
-                authored.lsn.0
-            ),
-        );
-        assert_eq!(occurrences(&network.hub.db), hub_schema);
-        samples.push(comparable(&pushed));
-        works.push((size, pushed.work));
-        moved.network.close(&runtime);
-    }
-    assert_same_across_sizes("refusal of a declaration authored after a move", &samples);
-    for (size, work) in works {
-        assert_eq!(work.suppressed_output_peak_bytes, 0, "at {size}: {work:?}");
-        assert!(work.suppressed_held_peak <= 1, "at {size}: {work:?}");
-        assert_no_fallback("authored after move", size, &work);
-    }
+    authored_after_move(PR_SIZE, false);
+}
+
+#[cfg(feature = "nightly-tests")]
+#[test]
+fn a_declaration_authored_after_a_move_is_refused_without_holding_the_received_history_as_received_history_grows()
+ {
+    let measured = NIGHTLY_SIZES.map(|size| authored_after_move(size, true));
+    let control =
+        NIGHTLY_SIZES.map(|size| control_sample(size, || authored_after_move(PR_SIZE, true)));
+    assert_bounded_by_control(
+        "refusal of a declaration authored after a move",
+        &measured,
+        &control,
+        BallastIn::TheWalk,
+    );
 }

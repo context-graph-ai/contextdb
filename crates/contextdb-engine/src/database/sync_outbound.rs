@@ -1179,8 +1179,6 @@ impl Database {
         let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         let mut entries = Vec::new();
         while let Some(window) = cursor.next_ddl_history()? {
-            #[cfg(feature = "test-seams")]
-            crate::outbound_ddl_test_seams::note_walked();
             output.try_grow_for(
                 answer_list_entry_bytes::<(Lsn, DdlChange)>(window.value.1.estimated_bytes()),
                 "writer_source",
@@ -1188,8 +1186,6 @@ impl Database {
                 "Raise MEMORY_LIMIT to return declaration history.",
             )?;
             entries.push(window.value);
-            #[cfg(feature = "test-seams")]
-            crate::outbound_ddl_test_seams::note_collected();
         }
         Ok(writer_read::DdlHistory {
             entries,
@@ -1278,6 +1274,8 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<DdlChange> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        #[cfg(feature = "test-seams")]
+        let _raw_read = crate::outbound_ddl_test_seams::raw_read((lsn, ordinal));
 
         if let Some(history) = self.image_history.as_ref() {
             let mut seen = 0u32;
@@ -5932,11 +5930,9 @@ impl Database {
             let group = groups.entry(entry.source_lsn).or_insert((false, true));
             group.0 |= is_marked;
             group.1 &= is_marked;
+            #[cfg(feature = "test-seams")]
+            crate::outbound_ddl_test_seams::note_validation_records(groups.len() + marked.len());
         }
-        #[cfg(feature = "test-seams")]
-        crate::outbound_ddl_test_seams::note_validation_records(
-            (groups.len() + marked.len()) as u64,
-        );
         if groups
             .values()
             .any(|(some_marked, all_marked)| *some_marked && !*all_marked)
@@ -6015,11 +6011,9 @@ impl Database {
             let group = groups.entry(entry.source_lsn).or_insert((false, true));
             group.0 |= is_superseded;
             group.1 &= is_superseded;
+            #[cfg(feature = "test-seams")]
+            crate::outbound_ddl_test_seams::note_validation_records(groups.len() + marked.len());
         }
-        #[cfg(feature = "test-seams")]
-        crate::outbound_ddl_test_seams::note_validation_records(
-            (groups.len() + marked.len()) as u64,
-        );
         if groups
             .values()
             .any(|(some_marked, all_marked)| *some_marked && !*all_marked)
@@ -6052,26 +6046,27 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let entries = source.surviving_entries(&changes)?;
-        let arrivals = self.received_ddl_arrival_marks(source, read_memory.clone())?;
-        let superseded = self.superseded_ddl_occurrence_marks(source, read_memory.clone())?;
         #[cfg(feature = "test-seams")]
         {
-            let resent = |lsn: Lsn| destination_frontier.is_some_and(|frontier| lsn <= frontier);
-            let (count, bytes) = changes
-                .ddl
-                .iter()
-                .zip(entries.iter())
-                .filter(|(_, entry)| {
-                    let key = (entry.source_lsn, entry.ordinal);
-                    !superseded.contains(&key)
-                        && arrivals.is_received(&key)
-                        && !resent(entry.source_lsn)
-                })
-                .fold((0u64, 0u64), |(count, bytes), (change, _)| {
-                    (count + 1, bytes + change.estimated_bytes() as u64)
-                });
-            crate::outbound_ddl_test_seams::note_suppressed(count, count, bytes);
+            crate::outbound_ddl_test_seams::note_event(
+                crate::outbound_ddl_test_seams::OutboundDdlEvent::FilterFrontier(
+                    destination_frontier,
+                ),
+            );
+            crate::outbound_ddl_test_seams::note_collected(
+                source
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.source_lsn, entry.ordinal)),
+            );
         }
+        let arrivals = self.received_ddl_arrival_marks(source, read_memory.clone())?;
+        #[cfg(feature = "test-seams")]
+        let _held_arrival_marks =
+            crate::outbound_ddl_test_seams::hold_validation_records(match &arrivals {
+                ReceivedDdlArrivalValidation::Marked(marked) => marked.len(),
+            });
+        let superseded = self.superseded_ddl_occurrence_marks(source, read_memory.clone())?;
         let mut ddl = Vec::with_capacity(changes.ddl.len());
         let mut ddl_lsn = Vec::with_capacity(changes.ddl_lsn.len());
         for ((change, lsn), entry) in changes.ddl.into_iter().zip(changes.ddl_lsn).zip(entries) {
