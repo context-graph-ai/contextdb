@@ -588,18 +588,21 @@ impl U64GroupedBitmap {
 #[cfg(feature = "test-seams")]
 impl BtreeBitmap {
     /// Invert the summary bit over leaf word 0, one level above the leaves,
-    /// leaving every leaf untouched; returns its `(height, entry)`, or `None`
+    /// leaving every leaf untouched; returns its `(height, entry)` and
+    /// whether the bit now disagrees with that word's fullness, or `None`
     /// when the bitmap is a single level with no summary.
-    pub(crate) fn invert_first_leaf_parent_bit_for_test(&mut self) -> Option<(u32, u32)> {
+    pub(crate) fn invert_first_leaf_parent_bit_for_test(&mut self) -> Option<(u32, u32, bool)> {
         let height = self.get_height().checked_sub(2)?;
         self.forget_root();
+        let child_full = self.get_level(height + 1).word(0) == u64::MAX;
         let level = self.get_level_mut(height);
         if level.get(0) {
             level.clear(0);
         } else {
             level.set(0);
         }
-        Some((height, 0))
+        let disagrees = self.get_level(height).get(0) != child_full;
+        Some((height, 0, disagrees))
     }
 }
 

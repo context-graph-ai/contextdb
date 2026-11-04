@@ -1269,7 +1269,7 @@ impl TransactionalMemory {
     ) -> Result<bool> {
         #[cfg(test)]
         allocator_growth_tests::SAVE_CALLS.with(|calls| calls.set(calls.get() + 1));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(hook) = BEFORE_NEXT_ALLOCATOR_SAVE.with(|slot| slot.borrow_mut().take()) {
             hook(self);
         }
@@ -1459,18 +1459,21 @@ impl TransactionalMemory {
     }
 
     /// Invert one order-0 summary bit of region 0 without touching its
-    /// leaves; returns `(region, order, height, entry)`, or `None` when
-    /// order 0 has no summary level.
+    /// leaves; returns `(region, order, height, entry)` and whether that bit
+    /// now disagrees with the word it summarises, or `None` when order 0 has
+    /// no summary level.
     #[cfg(feature = "test-seams")]
-    pub(crate) fn plant_allocator_summary_mismatch_for_test(&self) -> Option<(u32, u8, u32, u32)> {
-        let (height, entry) = self
+    pub(crate) fn plant_allocator_summary_mismatch_for_test(
+        &self,
+    ) -> Option<((u32, u8, u32, u32), bool)> {
+        let (height, entry, disagrees) = self
             .state
             .lock()
             .unwrap()
             .allocators
             .get_region_mut(0)
             .invert_order_0_summary_bit_for_test()?;
-        Some((0, 0, height, entry))
+        Some(((0, 0, height, entry), disagrees))
     }
 
     /// Trusted `(free pages, region pages, trailing free pages)`; `None` while
@@ -3322,10 +3325,10 @@ impl TransactionalMemory {
 }
 
 /// A test hook run at the entry of one allocator save.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 type AllocatorSaveHook = Box<dyn FnOnce(&TransactionalMemory)>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// Runs once, on this thread, at the entry of the next
     /// `try_save_allocator_state`: after the commit's last allocation and
@@ -3334,14 +3337,17 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-// Test-only inspection of the allocator's summary levels.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 impl TransactionalMemory {
     /// Run `hook` at the entry of the next allocator save on this thread.
     pub(crate) fn before_next_allocator_save_for_test(hook: AllocatorSaveHook) {
         BEFORE_NEXT_ALLOCATOR_SAVE.with(|slot| *slot.borrow_mut() = Some(hook));
     }
+}
 
+// Test-only inspection of the allocator's summary levels.
+#[cfg(test)]
+impl TransactionalMemory {
     /// Every inexact regional summary bit, as `(region, order, height, entry)`.
     pub(crate) fn summary_mismatches_for_test(&self) -> Vec<(u32, u8, u32, u32)> {
         let mut state = self.state.lock().unwrap();

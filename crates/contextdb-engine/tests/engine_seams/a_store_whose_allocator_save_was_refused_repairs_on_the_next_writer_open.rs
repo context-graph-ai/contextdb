@@ -53,17 +53,25 @@ fn latched_store(path: &Path) -> u64 {
     database.close().expect("close fixture owner");
 
     let raw = redb::Database::open(path).expect("open physical store");
-    let planted = raw.plant_allocator_summary_mismatch_for_test();
+    // Drop runs the quick-repair commit that saves the allocator table; the
+    // plant is made at that save's entry, after the commit's last
+    // allocation, so nothing the commit allocates can clear it.
+    let at_save = redb::Database::plant_allocator_summary_mismatch_at_next_save_for_test();
+    drop(raw);
+    let plant = at_save
+        .lock()
+        .unwrap()
+        .take()
+        .expect("closing the raw store never reached the allocator save");
     assert!(
-        planted.is_some(),
+        plant.planted.is_some(),
         "fixture: region 0's order-0 allocator bitmap has no summary level to plant in"
     );
-    // Drop runs the quick-repair commit that saves the allocator table. If
-    // that commit's own allocations healed the plant, a correct save would
-    // publish an exact table, the direct read below would open, and this
-    // test would fail: a healed plant can only cause a false failure, never
-    // a false pass.
-    drop(raw);
+    assert!(
+        plant.mismatch_at_entry,
+        "the plant at {:?} was not present at the allocator save's entry",
+        plant.planted
+    );
     identity
 }
 

@@ -201,6 +201,9 @@ pub use db::allocator_metadata_test_seams::observe_allocator_region_loads_for_te
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
+pub use db::AllocatorSaveEntryPlant;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
 pub use db::FreeTotalsSaveForTest;
 
 #[cfg(feature = "contextdb-internal")]

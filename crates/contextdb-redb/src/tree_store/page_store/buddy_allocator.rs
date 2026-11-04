@@ -591,8 +591,9 @@ impl BuddyAllocator {
 #[cfg(feature = "test-seams")]
 impl BuddyAllocator {
     /// Invert order 0's summary bit over its first leaf word; returns
-    /// `(height, entry)`, or `None` when order 0 has no summary level.
-    pub(crate) fn invert_order_0_summary_bit_for_test(&mut self) -> Option<(u32, u32)> {
+    /// `(height, entry)` and whether the bit now disagrees with that word,
+    /// or `None` when order 0 has no summary level.
+    pub(crate) fn invert_order_0_summary_bit_for_test(&mut self) -> Option<(u32, u32, bool)> {
         self.get_order_free_mut(0)
             .invert_first_leaf_parent_bit_for_test()
     }
