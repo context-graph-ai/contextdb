@@ -58,7 +58,11 @@ fn latched_store(path: &Path) -> u64 {
         planted.is_some(),
         "fixture: region 0's order-0 allocator bitmap has no summary level to plant in"
     );
-    // Drop runs the quick-repair commit that saves the allocator table.
+    // Drop runs the quick-repair commit that saves the allocator table. If
+    // that commit's own allocations healed the plant, a correct save would
+    // publish an exact table, the direct read below would open, and this
+    // test would fail: a healed plant can only cause a false failure, never
+    // a false pass.
     drop(raw);
     identity
 }
