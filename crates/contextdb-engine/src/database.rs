@@ -1254,6 +1254,45 @@ struct ReceivedSchemaSemanticProjection {
     catalog_charge: Option<StagedCopyCharge>,
 }
 
+/// One declaration occurrence of a store's durable history, as
+/// `Database::ddl_occurrences_for_test` reports it.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DdlOccurrenceForTest {
+    pub lsn: Lsn,
+    pub ordinal: u32,
+    pub ddl: DdlChange,
+    /// A received-arrival mark is recorded for this occurrence.
+    pub received: bool,
+    /// The schema author the arrival mark names: node, the author's source
+    /// LSN and ordinal. `None` for local or unattested occurrences.
+    pub author: Option<(String, Lsn, u32)>,
+    /// A superseded mark is recorded for this occurrence.
+    pub superseded: bool,
+}
+
+/// One change `Database::edit_ddl_occurrence_evidence_for_test` makes to the
+/// durable evidence of a declaration occurrence.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlEvidenceEditForTest {
+    /// Corrupt the digest of the occurrence's received-arrival mark.
+    CorruptArrivalDigest,
+    /// Remove the occurrence's received-arrival mark.
+    RemoveArrival,
+    /// Change the table generation in the occurrence's immutable generation
+    /// sidecar, so its marks no longer bind it.
+    AlterGenerationSidecar,
+    /// Remove the occurrence's immutable generation sidecar.
+    RemoveGenerationSidecar,
+    /// Record a valid superseded mark that binds the occurrence as stored.
+    MarkSuperseded,
+    /// Corrupt the digest of the occurrence's superseded mark.
+    CorruptSupersededDigest,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DurableDdlGenerationSidecar {
     pub(crate) table: Option<String>,
@@ -8266,6 +8305,8 @@ impl Database {
                         })
                         .sum::<usize>();
                     drop(ddl_log);
+                    #[cfg(feature = "test-seams")]
+                    crate::outbound_ddl_test_seams::note_resident_ddl_priced(ddl_bytes);
                     let log = self.change_log.read();
                     let start = log.partition_point(|entry| entry.lsn() <= since_lsn);
                     let change_bytes = log[start..]

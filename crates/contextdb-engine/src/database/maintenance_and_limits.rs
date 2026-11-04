@@ -1883,6 +1883,8 @@ impl Database {
         tenant_id: &TenantId,
         hub_node_id: &str,
     ) -> Result<Option<(Lsn, uuid::Uuid)>> {
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_reupload_epoch_read();
         let _operation = self.open_operation()?;
         let target = if let Some(persistence) = &self.persistence {
             let established =

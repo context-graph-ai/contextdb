@@ -11,10 +11,18 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 mod a_bounded_search_beside_a_vector_removal_pass_reads_the_published_image;
 #[path = "engine_seams/a_bounded_search_waiting_for_a_commit_keeps_its_active_time.rs"]
 mod a_bounded_search_waiting_for_a_commit_keeps_its_active_time;
+#[path = "engine_seams/a_corrupt_received_declaration_is_refused_without_holding_the_received_history.rs"]
+mod a_corrupt_received_declaration_is_refused_without_holding_the_received_history;
 #[path = "engine_seams/a_count_a_constraint_already_bounds_is_not_maintained.rs"]
 mod a_count_a_constraint_already_bounds_is_not_maintained;
 #[path = "engine_seams/a_declared_count_is_the_only_count_an_append_writes.rs"]
 mod a_declared_count_is_the_only_count_an_append_writes;
+#[path = "engine_seams/a_destination_reupload_resends_local_groups_and_holds_none_of_what_it_suppresses.rs"]
+mod a_destination_reupload_resends_local_groups_and_holds_none_of_what_it_suppresses;
+#[path = "engine_seams/a_destination_reupload_resends_what_the_edge_held_and_holds_none_of_what_it_suppresses.rs"]
+mod a_destination_reupload_resends_what_the_edge_held_and_holds_none_of_what_it_suppresses;
+#[path = "engine_seams/a_first_push_after_a_first_pull_suppresses_received_declarations_without_holding_them.rs"]
+mod a_first_push_after_a_first_pull_suppresses_received_declarations_without_holding_them;
 #[path = "engine_seams/a_held_savepoint_makes_every_commit_list_its_allocated_pages.rs"]
 mod a_held_savepoint_makes_every_commit_list_its_allocated_pages;
 #[path = "engine_seams/a_historical_index_read_costs_its_rows_and_dead_groups.rs"]
@@ -25,6 +33,12 @@ mod a_historical_read_costs_the_same_per_returned_row_as_rows_and_history_grow;
 mod a_large_journal_cleanup_is_charged_to_the_writer;
 #[path = "engine_seams/a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics.rs"]
 mod a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics;
+#[path = "engine_seams/a_pending_read_after_a_pull_holds_none_of_the_received_declarations_it_suppresses.rs"]
+mod a_pending_read_after_a_pull_holds_none_of_the_received_declarations_it_suppresses;
+#[path = "engine_seams/a_push_after_a_pull_holds_none_of_the_received_declarations_it_suppresses.rs"]
+mod a_push_after_a_pull_holds_none_of_the_received_declarations_it_suppresses;
+#[path = "engine_seams/a_push_sends_local_groups_around_suppressed_ones_with_their_ordinals_and_skips_superseded_ones.rs"]
+mod a_push_sends_local_groups_around_suppressed_ones_with_their_ordinals_and_skips_superseded_ones;
 #[path = "engine_seams/a_scoped_sink_receives_and_counts_only_its_own_events.rs"]
 mod a_scoped_sink_receives_and_counts_only_its_own_events;
 #[path = "engine_seams/a_store_whose_allocator_save_was_refused_repairs_on_the_next_writer_open.rs"]
@@ -75,8 +89,12 @@ mod memory_accounting_lifecycle_contract;
 mod one_event_append_cost_by_stream_depth;
 #[path = "engine_seams/one_event_append_work_by_family.rs"]
 mod one_event_append_work_by_family;
+#[path = "engine_seams/one_large_received_schema_commit_is_suppressed_without_being_held.rs"]
+mod one_large_received_schema_commit_is_suppressed_without_being_held;
 #[path = "engine_seams/one_vector_append_does_not_rescan_the_directory.rs"]
 mod one_vector_append_does_not_rescan_the_directory;
+#[path = "engine_seams/outbound_declaration_walk_support.rs"]
+mod outbound_declaration_walk_support;
 #[path = "engine_seams/pinning_a_sync_incarnation_holds_across_reopen_and_refuses_a_second_pin.rs"]
 mod pinning_a_sync_incarnation_holds_across_reopen_and_refuses_a_second_pin;
 #[path = "engine_seams/pruning_report_names_reader_deferred_rows.rs"]

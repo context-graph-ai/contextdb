@@ -295,6 +295,174 @@ impl Database {
         }
     }
 
+    /// Test-only: every declaration occurrence in this store's durable history,
+    /// numbered per source LSN exactly as capture numbers them, with whether a
+    /// received-arrival mark and a superseded mark are recorded for it.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[cfg_attr(
+        feature = "test-seams",
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn ddl_occurrences_for_test(&self) -> Result<Vec<DdlOccurrenceForTest>> {
+        let read_memory = self.declared_reader_memory()?;
+        let _operation = self.open_operation()?;
+        let _writer_read = self.writer_read_scope(read_memory.clone())?;
+        let (_, root) = self.capture_writer_statement()?;
+        let root = root.ok_or_else(|| {
+            Error::Other("declaration occurrences need a file-backed writer source".into())
+        })?;
+        let mut cursor = root.ddl_history_cursor(
+            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+            Lsn(0),
+        )?;
+        let mut occurrences = Vec::<DdlOccurrenceForTest>::new();
+        while let Some(window) = cursor.next_ddl_history()? {
+            let (lsn, ddl) = window.value;
+            let ordinal = match occurrences.last() {
+                Some(previous) if previous.lsn == lsn => previous.ordinal + 1,
+                _ => 0,
+            };
+            let (received, author) = self.with_received_ddl_arrival(
+                (lsn, ordinal),
+                |arrival| {
+                    Ok((
+                        arrival.is_some(),
+                        arrival
+                            .and_then(|arrival| arrival.author.as_ref())
+                            .map(|author| {
+                                (
+                                    author.node_id.clone(),
+                                    author.source_ddl_lsn,
+                                    author.ordinal,
+                                )
+                            }),
+                    ))
+                },
+                read_memory.clone(),
+            )?;
+            let superseded = self.with_superseded_ddl_occurrence(
+                (lsn, ordinal),
+                |mark| Ok(mark.is_some()),
+                read_memory.clone(),
+            )?;
+            occurrences.push(DdlOccurrenceForTest {
+                lsn,
+                ordinal,
+                ddl,
+                received,
+                author,
+                superseded,
+            });
+        }
+        Ok(occurrences)
+    }
+
+    /// Test-only: change the durable evidence recorded for one declaration
+    /// occurrence, so a test can reach each refusal the outbound validation
+    /// gives on corrupt provenance, or record a valid superseded mark that binds
+    /// the occurrence exactly as stored.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[cfg_attr(
+        feature = "test-seams",
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    pub fn edit_ddl_occurrence_evidence_for_test(
+        &self,
+        lsn: Lsn,
+        ordinal: u32,
+        edit: DdlEvidenceEditForTest,
+    ) -> Result<()> {
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            Error::Other("declaration evidence edits need a file-backed store".into())
+        })?;
+        let read_memory = self.declared_reader_memory()?;
+        let _operation = self.open_operation()?;
+        let arrival_key = Self::durable_received_ddl_arrival_key(lsn, ordinal);
+        let superseded_key = Self::durable_superseded_ddl_occurrence_key(lsn, ordinal);
+        let sidecar_key = Self::durable_ddl_generation_sidecar_key(lsn, ordinal);
+        let missing = |what: &str| {
+            Error::Other(
+                (format!("no {what} is recorded at LSN {} ordinal {ordinal}", lsn.0)).into(),
+            )
+        };
+        let operation = || -> Result<()> {
+            match edit {
+                DdlEvidenceEditForTest::CorruptArrivalDigest => {
+                    let mut arrival = persistence
+                        .load_config_value::<DurableReceivedDdlArrival>(&arrival_key)?
+                        .ok_or_else(|| missing("received-arrival mark"))?;
+                    arrival.digest.iter_mut().for_each(|byte| *byte ^= 0xff);
+                    self.publish_direct_metadata(|| {
+                        persistence.flush_config_value(&arrival_key, &arrival)
+                    })
+                }
+                DdlEvidenceEditForTest::RemoveArrival => {
+                    persistence
+                        .load_config_value::<DurableReceivedDdlArrival>(&arrival_key)?
+                        .ok_or_else(|| missing("received-arrival mark"))?;
+                    self.publish_direct_metadata(|| persistence.remove_config_value(&arrival_key))
+                }
+                DdlEvidenceEditForTest::AlterGenerationSidecar => {
+                    let mut sidecar = persistence
+                        .load_config_value::<DurableDdlGenerationSidecar>(&sidecar_key)?
+                        .ok_or_else(|| missing("generation sidecar"))?;
+                    sidecar.table_generation = Some(
+                        sidecar
+                            .table_generation
+                            .map_or(1, |generation| generation + 1),
+                    );
+                    self.publish_direct_metadata(|| {
+                        persistence.flush_config_value(&sidecar_key, &sidecar)
+                    })
+                }
+                DdlEvidenceEditForTest::RemoveGenerationSidecar => {
+                    persistence
+                        .load_config_value::<DurableDdlGenerationSidecar>(&sidecar_key)?
+                        .ok_or_else(|| missing("generation sidecar"))?;
+                    self.publish_direct_metadata(|| persistence.remove_config_value(&sidecar_key))
+                }
+                DdlEvidenceEditForTest::MarkSuperseded => {
+                    let raw = self.raw_ddl_log_occurrence(lsn, ordinal, read_memory.clone())?;
+                    let sidecar = self
+                        .recorded_ddl_generation_sidecar(lsn, ordinal)?
+                        .ok_or_else(|| missing("generation sidecar"))?;
+                    let mark = DurableSupersededDdlOccurrence {
+                        local_lsn: lsn,
+                        persisted_ordinal: ordinal,
+                        digest: Self::canonical_local_ddl_arrival_digest(
+                            &raw, lsn, ordinal, &sidecar,
+                        )?,
+                    };
+                    self.publish_direct_metadata(|| {
+                        persistence.flush_config_value(&superseded_key, &mark)
+                    })
+                }
+                DdlEvidenceEditForTest::CorruptSupersededDigest => {
+                    let mut mark = persistence
+                        .load_config_value::<DurableSupersededDdlOccurrence>(&superseded_key)?
+                        .ok_or_else(|| missing("superseded mark"))?;
+                    mark.digest.iter_mut().for_each(|byte| *byte ^= 0xff);
+                    self.publish_direct_metadata(|| {
+                        persistence.flush_config_value(&superseded_key, &mark)
+                    })
+                }
+            }
+        };
+        if self.tx_mgr.commit_boundary_held_by_current_thread() {
+            operation()
+        } else {
+            self.tx_mgr.with_maintenance_publication(|_| operation())
+        }
+    }
+
     /// Per-tenant record of the highest edge-LSN this database has applied
     /// from sync pushes. Stored as a config value so `export_snapshot` carries
     /// it with the artifact at the snapshot point, exactly like the tenant sync
@@ -1011,6 +1179,8 @@ impl Database {
         let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         let mut entries = Vec::new();
         while let Some(window) = cursor.next_ddl_history()? {
+            #[cfg(feature = "test-seams")]
+            crate::outbound_ddl_test_seams::note_walked();
             output.try_grow_for(
                 answer_list_entry_bytes::<(Lsn, DdlChange)>(window.value.1.estimated_bytes()),
                 "writer_source",
@@ -1018,6 +1188,8 @@ impl Database {
                 "Raise MEMORY_LIMIT to return declaration history.",
             )?;
             entries.push(window.value);
+            #[cfg(feature = "test-seams")]
+            crate::outbound_ddl_test_seams::note_collected();
         }
         Ok(writer_read::DdlHistory {
             entries,
@@ -1166,6 +1338,10 @@ impl Database {
         let found = match in_memory {
             Some(change) => Some(change),
             None if self.persistence.is_some() => {
+                #[cfg(feature = "test-seams")]
+                crate::outbound_ddl_test_seams::note_fallback(
+                    crate::outbound_ddl_test_seams::FallbackCollector::RawOccurrenceDurableHistory,
+                );
                 occurrence(&self.durable_ddl_history_for_provenance(read_memory.clone())?)
             }
             None => None,
@@ -1576,6 +1752,10 @@ impl Database {
             drop(ddl_log);
             (projection.admit)(copied)?;
         }
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_fallback(
+            crate::outbound_ddl_test_seams::FallbackCollector::PersistedStateFromSnapshot,
+        );
         let history = self.ddl_log_entries_since_unlocked(Lsn(0), read_memory.clone())?;
         if !history.is_empty() {
             let (history_lsn, history_ddl): (Vec<_>, Vec<_>) = history.into_iter().unzip();
@@ -1842,6 +2022,10 @@ impl Database {
             .min()
             .unwrap_or(snapshot_ceiling);
         let snapshot_ddl = self.full_state_snapshot_ddl();
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_fallback(
+            crate::outbound_ddl_test_seams::FallbackCollector::PersistedStateSinceThrough,
+        );
         let history = self.ddl_log_entries_since_unlocked(Lsn(0), read_memory.clone())?;
         let complete_history = if history.is_empty() {
             false
@@ -1968,6 +2152,10 @@ impl Database {
     ) -> Result<(Vec<DdlChange>, Vec<Lsn>)> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_fallback(
+            crate::outbound_ddl_test_seams::FallbackCollector::ReceivedSchemaAsAuthored,
+        );
         let history = self.durable_ddl_history_for_provenance(read_memory.clone())?;
         let mut next_ordinal = HashMap::<Lsn, u32>::new();
         let occurrences = history
@@ -5745,6 +5933,10 @@ impl Database {
             group.0 |= is_marked;
             group.1 &= is_marked;
         }
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_validation_records(
+            (groups.len() + marked.len()) as u64,
+        );
         if groups
             .values()
             .any(|(some_marked, all_marked)| *some_marked && !*all_marked)
@@ -5824,6 +6016,10 @@ impl Database {
             group.0 |= is_superseded;
             group.1 &= is_superseded;
         }
+        #[cfg(feature = "test-seams")]
+        crate::outbound_ddl_test_seams::note_validation_records(
+            (groups.len() + marked.len()) as u64,
+        );
         if groups
             .values()
             .any(|(some_marked, all_marked)| *some_marked && !*all_marked)
@@ -5858,6 +6054,24 @@ impl Database {
         let entries = source.surviving_entries(&changes)?;
         let arrivals = self.received_ddl_arrival_marks(source, read_memory.clone())?;
         let superseded = self.superseded_ddl_occurrence_marks(source, read_memory.clone())?;
+        #[cfg(feature = "test-seams")]
+        {
+            let resent = |lsn: Lsn| destination_frontier.is_some_and(|frontier| lsn <= frontier);
+            let (count, bytes) = changes
+                .ddl
+                .iter()
+                .zip(entries.iter())
+                .filter(|(_, entry)| {
+                    let key = (entry.source_lsn, entry.ordinal);
+                    !superseded.contains(&key)
+                        && arrivals.is_received(&key)
+                        && !resent(entry.source_lsn)
+                })
+                .fold((0u64, 0u64), |(count, bytes), (change, _)| {
+                    (count + 1, bytes + change.estimated_bytes() as u64)
+                });
+            crate::outbound_ddl_test_seams::note_suppressed(count, count, bytes);
+        }
         let mut ddl = Vec::with_capacity(changes.ddl.len());
         let mut ddl_lsn = Vec::with_capacity(changes.ddl_lsn.len());
         for ((change, lsn), entry) in changes.ddl.into_iter().zip(changes.ddl_lsn).zip(entries) {

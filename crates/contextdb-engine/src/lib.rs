@@ -50,6 +50,9 @@
 // The server crate exposes the stable safe façade instead of a capability.
 extern crate self as contextdb_engine;
 
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod outbound_ddl_test_seams;
 #[cfg(feature = "in-process-test-seams")]
 #[doc(hidden)]
 pub mod writer_commit_test_seams;
