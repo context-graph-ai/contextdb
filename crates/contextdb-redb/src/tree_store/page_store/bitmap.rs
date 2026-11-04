@@ -915,7 +915,8 @@ mod summary_exactness_contract {
     /// word-aligned and mid-word cuts, a cut across a higher summary word, and
     /// growth spanning several words with allocated and free fills, including
     /// free-fill growth from a word-aligned length, which must refresh the old
-    /// boundary at every height of a three-level tree. After
+    /// boundary at every height of a three-level tree (4160 leaves end a word
+    /// while the 65-bit level above them ends mid-word). After
     /// each resize the summary is exact and the descent finds the first free
     /// id; one more free id near the new end must then be found too.
     #[test]
@@ -946,6 +947,7 @@ mod summary_exactness_contract {
             (4100, 4100, true, three, Pattern::FreeTail(4097)),
             (64, 8192, false, three, Pattern::Full),
             (4096, 9000, false, three, Pattern::Full),
+            (4160, 9000, false, three, Pattern::Full),
         ];
         let mut failures = Vec::new();
         for (from, to, fill_full, capacity, pattern) in cases {
