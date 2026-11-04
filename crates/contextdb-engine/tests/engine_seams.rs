@@ -35,10 +35,10 @@ mod a_large_journal_cleanup_is_charged_to_the_writer;
 mod a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics;
 #[path = "engine_seams/a_pending_read_after_a_pull_holds_none_of_the_received_declarations_it_suppresses.rs"]
 mod a_pending_read_after_a_pull_holds_none_of_the_received_declarations_it_suppresses;
-#[path = "engine_seams/a_push_never_sends_an_older_key_version_after_sync_closes.rs"]
-mod a_push_never_sends_an_older_key_version_after_sync_closes;
 #[path = "engine_seams/a_push_after_a_pull_holds_none_of_the_received_declarations_it_suppresses.rs"]
 mod a_push_after_a_pull_holds_none_of_the_received_declarations_it_suppresses;
+#[path = "engine_seams/a_push_never_sends_an_older_key_version_after_sync_closes.rs"]
+mod a_push_never_sends_an_older_key_version_after_sync_closes;
 #[path = "engine_seams/a_push_sends_local_groups_around_suppressed_ones_with_their_ordinals_and_skips_superseded_ones.rs"]
 mod a_push_sends_local_groups_around_suppressed_ones_with_their_ordinals_and_skips_superseded_ones;
 #[path = "engine_seams/a_scoped_sink_receives_and_counts_only_its_own_events.rs"]
@@ -305,3 +305,6 @@ mod reader_peak_covers_the_complete_query;
 
 #[path = "engine_seams/a_captured_file_root_survives_partition_retirement.rs"]
 mod a_captured_file_root_survives_partition_retirement;
+
+#[path = "engine_seams/outbound_selection_regressions.rs"]
+mod outbound_selection_regressions;
