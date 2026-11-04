@@ -19825,7 +19825,7 @@
      fn height_for_capacity(mut capacity: u32) -> usize {
          let mut height = 1;
          while capacity > 64 {
-@@ -162,27 +259,131 @@
+@@ -162,27 +259,138 @@
      }
  
      pub(crate) fn resize(&mut self, mut new_len: u32, full: bool) {
@@ -19836,20 +19836,27 @@
 +            return;
 +        }
 +        self.forget_root();
-+        let mut boundary_full = None;
-+        for (index, height) in self.heights.iter_mut().rev().enumerate() {
-+            let fullness = height.resize(new_len, full);
-+            if index == 0 {
-+                boundary_full = fullness;
++        for height in (0..self.heights.len()).rev() {
++            let old_height_len = self.heights[height].len();
++            let boundary_full = self.heights[height].resize(new_len, full);
++            // Repair each child's old boundary before resizing its parent.
++            // An aligned leaf can still have a partial word higher up, and
++            // that word's free fill must reach the next summary level too.
++            if height > 0
++                && let Some(boundary_full) = boundary_full
++            {
++                let entry = (old_height_len - 1) / 64;
++                let parent = &mut self.heights[height - 1];
++                if parent.get(entry) != boundary_full {
++                    if boundary_full {
++                        parent.set(entry);
++                    } else {
++                        parent.clear(entry);
++                    }
++                }
 +            }
              new_len = new_len.div_ceil(64);
          }
-+        // A free growth fill can change the old partial word. Allocated
-+        // fill preserves its masked ones; shrink's new boundary is reconciled
-+        // below, without touching removed entries.
-+        if let Some(full) = boundary_full {
-+            self.update_to_root(old_len - 1, full);
-+        }
 +        // Growing with allocated bits only replaces masked ones with real
 +        // ones at every level. No word's fullness changes, so reading those
 +        // boundaries would just evict useful allocator windows.
@@ -19960,7 +19967,7 @@
          self.update_to_root(i, false);
      }
  
-@@ -221,9 +422,30 @@
+@@ -221,9 +429,30 @@
  pub(crate) struct U64GroupedBitmap {
      len: u32,
      data: Vec<u64>,
@@ -19991,7 +19998,7 @@
      fn required_words(elements: u32) -> usize {
          let words = elements.div_ceil(64);
          words as usize
-@@ -231,40 +453,117 @@
+@@ -231,40 +460,117 @@
  
      pub fn new_full(len: u32, capacity: u32) -> Self {
          let data = vec![u64::MAX; Self::required_words(capacity)];
@@ -20127,7 +20134,7 @@
      }
  
      pub fn from_bytes(serialized: &[u8]) -> Self {
-@@ -282,7 +581,11 @@
+@@ -282,7 +588,11 @@
              data.push(value);
          }
  
@@ -20140,7 +20147,7 @@
      }
  
      fn data_index_of(bit: u32) -> (usize, usize) {
-@@ -294,11 +597,9 @@
+@@ -294,11 +604,9 @@
      }
  
      fn count_unset(&self) -> u32 {
@@ -20155,7 +20162,7 @@
      }
  
      fn first_unset(&self, start_bit: u32, end_bit: u32) -> Option<u32> {
-@@ -309,7 +610,7 @@
+@@ -309,7 +617,7 @@
  
          let (index, bit) = Self::data_index_of(start_bit);
          let mask = (1 << bit) - 1;
@@ -20164,7 +20171,7 @@
          let group = group | mask;
          match group.trailing_ones() {
              64 => None,
-@@ -321,8 +622,8 @@
+@@ -321,8 +629,8 @@
          self.len
      }
  
@@ -20175,13 +20182,13 @@
              let default_value = if full { u64::MAX } else { 0 };
              self.data
                  .resize(Self::required_words(new_len), default_value);
-@@ -339,12 +640,16 @@
+@@ -339,12 +647,16 @@
                  }
              }
          }
 +        // Read the old boundary after the complete fill: its last set/clear
 +        // may have touched a different word.
-+        (!full && old_len < new_len && !old_len.is_multiple_of(64))
++        (!full && old_len != 0 && old_len < new_len)
 +            .then(|| self.word(((old_len - 1) / 64) as usize) == u64::MAX)
      }
  
@@ -20193,7 +20200,7 @@
          group & U64GroupedBitmap::select_mask(bit_index) != 0
      }
  
-@@ -352,9 +657,9 @@
+@@ -352,9 +664,9 @@
      pub fn set(&mut self, bit: u32) -> bool {
          assert!(bit < self.len);
          let (index, bit_index) = Self::data_index_of(bit);
@@ -20205,7 +20212,7 @@
  
          group == u64::MAX
      }
-@@ -362,7 +667,29 @@
+@@ -362,7 +674,29 @@
      pub fn clear(&mut self, bit: u32) {
          assert!(bit < self.len, "{bit} must be less than {}", self.len);
          let (index, bit_index) = Self::data_index_of(bit);
@@ -20236,7 +20243,7 @@
      }
  }
  
-@@ -532,3 +859,210 @@
+@@ -532,3 +866,216 @@
          assert!(allocator.alloc().is_none());
      }
  }
@@ -20381,7 +20388,10 @@
 +    /// Every length transition the allocator performs, at two and three
 +    /// summary levels: empty orders, growth from empty, unchanged lengths,
 +    /// word-aligned and mid-word cuts, a cut across a higher summary word, and
-+    /// growth spanning several words with allocated and free fills. After
++    /// growth spanning several words with allocated and free fills, including
++    /// free-fill growth from a word-aligned length, which must refresh the old
++    /// boundary at every height of a three-level tree (4160 leaves end a word
++    /// while the 65-bit level above them ends mid-word). After
 +    /// each resize the summary is exact and the descent finds the first free
 +    /// id; one more free id near the new end must then be found too.
 +    #[test]
@@ -20410,6 +20420,9 @@
 +            (4000, 9000, true, three, Pattern::Full),
 +            (4000, 9000, false, three, Pattern::Full),
 +            (4100, 4100, true, three, Pattern::FreeTail(4097)),
++            (64, 8192, false, three, Pattern::Full),
++            (4096, 9000, false, three, Pattern::Full),
++            (4160, 9000, false, three, Pattern::Full),
 +        ];
 +        let mut failures = Vec::new();
 +        for (from, to, fill_full, capacity, pattern) in cases {

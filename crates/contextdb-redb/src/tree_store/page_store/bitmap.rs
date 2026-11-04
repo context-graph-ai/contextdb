@@ -264,19 +264,26 @@ impl BtreeBitmap {
             return;
         }
         self.forget_root();
-        let mut boundary_full = None;
-        for (index, height) in self.heights.iter_mut().rev().enumerate() {
-            let fullness = height.resize(new_len, full);
-            if index == 0 {
-                boundary_full = fullness;
+        for height in (0..self.heights.len()).rev() {
+            let old_height_len = self.heights[height].len();
+            let boundary_full = self.heights[height].resize(new_len, full);
+            // Repair each child's old boundary before resizing its parent.
+            // An aligned leaf can still have a partial word higher up, and
+            // that word's free fill must reach the next summary level too.
+            if height > 0
+                && let Some(boundary_full) = boundary_full
+            {
+                let entry = (old_height_len - 1) / 64;
+                let parent = &mut self.heights[height - 1];
+                if parent.get(entry) != boundary_full {
+                    if boundary_full {
+                        parent.set(entry);
+                    } else {
+                        parent.clear(entry);
+                    }
+                }
             }
             new_len = new_len.div_ceil(64);
-        }
-        // A free growth fill can change the old partial word. Allocated
-        // fill preserves its masked ones; shrink's new boundary is reconciled
-        // below, without touching removed entries.
-        if let Some(full) = boundary_full {
-            self.update_to_root(old_len - 1, full);
         }
         // Growing with allocated bits only replaces masked ones with real
         // ones at every level. No word's fullness changes, so reading those
@@ -642,7 +649,7 @@ impl U64GroupedBitmap {
         }
         // Read the old boundary after the complete fill: its last set/clear
         // may have touched a different word.
-        (!full && old_len < new_len && !old_len.is_multiple_of(64))
+        (!full && old_len != 0 && old_len < new_len)
             .then(|| self.word(((old_len - 1) / 64) as usize) == u64::MAX)
     }
 
