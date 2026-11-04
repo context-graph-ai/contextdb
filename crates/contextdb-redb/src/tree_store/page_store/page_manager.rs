@@ -30,7 +30,8 @@ use crate::tree_store::page_store::header::TransactionHeader;
 use crate::tree_store::page_store::header::{DB_HEADER_SIZE, DatabaseHeader, MAGICNUMBER};
 use crate::tree_store::page_store::layout::DatabaseLayout;
 use crate::tree_store::page_store::region::{
-    Allocators, FREE_TOTALS_ENCODED_LEN, FreeTotals, RegionTracker, SavedBitmapWindow, layout_pages,
+    Allocators, FREE_TOTALS_ENCODED_LEN, FreeTotals, RegionTracker, SavedBitmapWindow,
+    SavedRegionHeader, layout_pages,
 };
 use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
 use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
@@ -77,6 +78,21 @@ impl SavedAllocatorValue<'_> {
         out.copy_from_slice(&data);
         Ok(())
     }
+    /// The value's fixed header: `(maximum order, saved page count)`.
+    fn header(&self) -> io::Result<(u8, u32)> {
+        let mut max_order = [0];
+        self.read(0, &mut max_order)?;
+        if max_order[0] > MAX_MAX_PAGE_ORDER {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid allocator maximum order",
+            ));
+        }
+        let mut num_pages = [0; 4];
+        self.read(4, &mut num_pages)?;
+        Ok((max_order[0], u32::from_le_bytes(num_pages)))
+    }
+
     fn u32(&self, offset: usize) -> io::Result<usize> {
         let mut word = [0; 4];
         self.read(offset, &mut word)?;
@@ -1524,6 +1540,33 @@ impl TransactionalMemory {
             let mem = StdArc::downgrade(&tree.mem);
             let root = tree.get_root();
             let hint = tree.hint();
+            let header: StdArc<SavedRegionHeader> = {
+                let mem = mem.clone();
+                StdArc::new(move |region| {
+                    let mem = mem.upgrade().ok_or_else(|| {
+                        io::Error::new(ErrorKind::BrokenPipe, "allocator source database closed")
+                    })?;
+                    let Some((page_number, range)) =
+                        crate::tree_store::btree::fixed_key_value_location::<AllocatorStateKey>(
+                            root,
+                            &mem,
+                            hint,
+                            &AllocatorStateKey::Region(region),
+                        )
+                        .map_err(storage_error_as_io)?
+                    else {
+                        return Ok(None);
+                    };
+                    SavedAllocatorValue {
+                        mem: &mem,
+                        page: page_number,
+                        range,
+                        hint,
+                    }
+                    .header()
+                    .map(Some)
+                })
+            };
             let source: StdArc<SavedBitmapWindow> =
                 StdArc::new(move |region, order, height, page, out| {
                     let mem = mem.upgrade().ok_or_else(|| {
@@ -1559,7 +1602,7 @@ impl TransactionalMemory {
             // Geometry masks slots past the real regions without loading them.
             let saved_totals = Self::saved_free_totals(tree)?;
             let mut state = self.state.lock().unwrap();
-            state.allocators.set_saved_source(source)?;
+            state.allocators.set_saved_source(source, header)?;
             Self::adopt_or_recount_free_totals(&mut state, saved_totals.as_deref())?;
             state.header.recovery_required = false;
             self.needs_recovery.store(false, Ordering::Release);
@@ -3227,7 +3270,7 @@ mod allocator_growth_tests {
         let mut state = paged_state(layout(LARGE_STORE_FULL_REGIONS, None));
         state
             .allocators
-            .set_saved_source(Arc::new(|_, _, _, _, _| Ok(false)))
+            .set_saved_source(Arc::new(|_, _, _, _, _| Ok(false)), Arc::new(|_| Ok(None)))
             .unwrap();
         assert!(
             !state
@@ -3456,21 +3499,17 @@ mod saved_allocator_install_contract {
         }
     }
 
-    /// The saved-value header request of the `SavedBitmapWindow` interface:
-    /// asked for a region at this order (height 0, page 0), the source
-    /// writes the value's fixed header, its maximum order and its saved
-    /// page count, into the window's first `SAVED_HEADER_BYTES` bytes. The
-    /// install reads the saved length from it.
-    const SAVED_HEADER_ORDER: u8 = u8::MAX;
-    const SAVED_HEADER_BYTES: usize = 8;
+    /// One region's saved value header, `(maximum order, saved page count)`,
+    /// read from the encoded value as `SavedAllocatorValue::header` reads
+    /// it from the allocator table.
+    fn region_header(bytes: &[u8]) -> (u8, u32) {
+        (
+            bytes[0],
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        )
+    }
 
     fn region_window(bytes: &[u8], order: u8, height: u8, page: u32, out: &mut [u8; 4096]) {
-        if order == SAVED_HEADER_ORDER {
-            if height == 0 && page == 0 {
-                out[..SAVED_HEADER_BYTES].copy_from_slice(&bytes[..SAVED_HEADER_BYTES]);
-            }
-            return;
-        }
         let max_order = bytes[0];
         if order > max_order {
             return;
@@ -3523,8 +3562,8 @@ mod saved_allocator_install_contract {
         let (region, tracker) = (Arc::clone(&saved.region), Arc::clone(&saved.tracker));
         state
             .allocators
-            .set_saved_source(Arc::new(
-                move |which, order, height, page, out| -> io::Result<bool> {
+            .set_saved_source(
+                Arc::new(move |which, order, height, page, out| -> io::Result<bool> {
                     out.fill(0xFF);
                     match which {
                         Some(0) => region_window(&region, order, height, page, out),
@@ -3532,8 +3571,12 @@ mod saved_allocator_install_contract {
                         None => tracker_window(&tracker, order, height, page, out),
                     }
                     Ok(true)
+                }),
+                {
+                    let region = Arc::clone(&saved.region);
+                    Arc::new(move |which| Ok((which == 0).then(|| region_header(&region))))
                 },
-            ))
+            )
             .unwrap();
     }
 
@@ -3758,8 +3801,8 @@ mod saved_allocator_install_contract {
         let (region, tracker) = (Arc::clone(&saved.region), Arc::clone(&saved.tracker));
         state
             .allocators
-            .set_saved_source(Arc::new(
-                move |which, order, height, page, out| -> io::Result<bool> {
+            .set_saved_source(
+                Arc::new(move |which, order, height, page, out| -> io::Result<bool> {
                     out.fill(0xFF);
                     match which {
                         Some(0) => region_window(&region, order, height, page, out),
@@ -3767,8 +3810,12 @@ mod saved_allocator_install_contract {
                         None => tracker_window(&tracker, order, height, page, out),
                     }
                     Ok(true)
+                }),
+                {
+                    let region = Arc::clone(&saved.region);
+                    Arc::new(move |which| Ok((which == 0).then(|| region_header(&region))))
                 },
-            ))
+            )
             .unwrap();
         let after_install = counters(&state);
         let _ = state.allocators.get_region(0).count_free_pages();

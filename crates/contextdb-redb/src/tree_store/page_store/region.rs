@@ -21,6 +21,11 @@ thread_local! {
 
 pub(super) type SavedBitmapWindow =
     dyn Fn(Option<u32>, u8, u8, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
+/// The fixed header of one region's saved allocator value, as
+/// `(maximum order, saved page count)`, or `None` when the region has no
+/// saved value. The saved page count is the region's length when it was
+/// saved, which a later trim can make longer than the layout's.
+pub(super) type SavedRegionHeader = dyn Fn(u32) -> io::Result<Option<(u8, u32)>> + Send + Sync;
 type PagedBaseLoader = dyn Fn(u64, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
 
 // Test-only inspection of the region tracker.
@@ -476,7 +481,14 @@ impl Allocators {
         }
     }
 
-    pub(super) fn set_saved_source(&mut self, source: Arc<SavedBitmapWindow>) -> io::Result<()> {
+    pub(super) fn set_saved_source(
+        &mut self,
+        source: Arc<SavedBitmapWindow>,
+        header: Arc<SavedRegionHeader>,
+    ) -> io::Result<()> {
+        // Each regional view is built at the layout's length straight over
+        // the saved words, so the saved length is not consulted here.
+        drop(header);
         // The saved bitmaps replace the in-memory ones; the loader adopts the
         // saved totals or recounts.
         self.free_totals.trusted = false;
