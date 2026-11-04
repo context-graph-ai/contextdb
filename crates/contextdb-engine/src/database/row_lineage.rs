@@ -4205,6 +4205,10 @@ impl Database {
                 writes.push((tenant_id.config_key("sync_pending_push_result"), RedbPersistence::encode_config_value(&crate::protocol::WireApplyResult::from(result.clone()))?));
             }
             publication.reserve()?;
+            #[cfg(feature = "test-seams")]
+            crate::outbound_ddl_test_seams::note_pre_reply_high_water(
+                self.accountant.high_water_for_test(),
+            );
             persistence.commit_sync_reply_effects(&sources, &writes, &deletes)?;
             self.relational_store.set_sync_source_lsns(sources.iter().map(|(table, row, lsn, _)| (table.clone(), *row, *lsn)).collect::<Vec<_>>());
             self.relational_store.set_sync_source_kinds(sources.into_iter().map(|(table, row, _, _)|

@@ -20,9 +20,8 @@
     reason = "The measured operations return the public Error, which keeps inline NativeRefusal diagnostics."
 )]
 use super::outbound_declaration_walk_support::*;
-use contextdb_core::Lsn;
 
-fn reupload_local(size: usize, nightly: bool) -> [(usize, Lsn, usize); 2] {
+fn reupload_local(size: usize, nightly: bool) -> (Sample, PushSample) {
     let _clock = fixed_clock();
     let runtime = runtime();
     let directory = tempfile::tempdir().unwrap();
@@ -169,10 +168,10 @@ fn reupload_local(size: usize, nightly: bool) -> [(usize, Lsn, usize); 2] {
             &expected,
         );
     }
-    let samples = [
+    let samples = (
         (size, pending.lsn, pending.peak),
-        (size, pushed.lsn, pushed.peak),
-    ];
+        push_sample(size, &pushed, true),
+    );
     moved.network.close(&runtime);
     samples
 }
@@ -186,19 +185,18 @@ fn a_destination_reupload_resends_local_groups_and_holds_none_of_what_it_suppres
 #[test]
 fn a_destination_reupload_resends_local_groups_and_holds_none_of_what_it_suppresses_as_received_history_grows()
  {
-    let [small, large] = NIGHTLY_SIZES.map(|size| reupload_local(size, true));
-    let [small_control, large_control] =
-        NIGHTLY_SIZES.map(|size| control_sample(size, || reupload_local(PR_SIZE, true)));
+    let measured = WALK_FROM_ZERO_SIZES.map(|size| reupload_local(size, true));
+    let control =
+        WALK_FROM_ZERO_SIZES.map(|size| control_sample(size, || reupload_local(PR_SIZE, true)));
     assert_bounded_by_control(
         "pending read under an armed epoch",
-        &[small[0], large[0]],
-        &[small_control[0], large_control[0]],
+        &[measured[0].0, measured[2].0],
+        &[control[0].0, control[2].0],
         BallastIn::TheWalk,
     );
-    assert_bounded_by_control(
+    assert_walk_from_zero_push(
         "destination re-upload of local groups",
-        &[small[1], large[1]],
-        &[small_control[1], large_control[1]],
-        BallastIn::TheWalk,
+        &measured.map(|sample| sample.1),
+        &control.map(|sample| sample.1),
     );
 }

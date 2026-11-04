@@ -79,6 +79,8 @@ pub struct SentDdl {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OutboundDdlWork {
+    /// Source accountant high-water immediately before the first durable reply commit.
+    pub pre_reply_high_water: Option<usize>,
     pub walked: Vec<Occurrence>,
     pub walked_held: Vec<usize>,
     pub collected: Vec<Occurrence>,
@@ -144,6 +146,14 @@ pub fn observe<T>(operation: impl FnOnce() -> T) -> (T, OutboundDdlWork) {
     });
     drop(restore);
     (value, observed)
+}
+
+/// Capture before the real durable reply commit, without resetting the accountant.
+/// Later reply commits cannot overwrite the extraction/build phase's boundary.
+pub(crate) fn note_pre_reply_high_water(peak: usize) {
+    update(|observation| {
+        observation.work.pre_reply_high_water.get_or_insert(peak);
+    });
 }
 
 fn update(change: impl FnOnce(&mut Observation)) {

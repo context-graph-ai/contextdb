@@ -10,7 +10,7 @@
 use super::outbound_declaration_walk_support::*;
 use contextdb_core::Lsn;
 
-fn first_push_after_first_pull(size: usize, nightly: bool) -> (usize, Lsn, usize) {
+fn first_push_after_first_pull(size: usize, nightly: bool) -> PushSample {
     let _clock = fixed_clock();
     let runtime = runtime();
     let directory = tempfile::tempdir().unwrap();
@@ -59,7 +59,7 @@ fn first_push_after_first_pull(size: usize, nightly: bool) -> (usize, Lsn, usize
     if !nightly {
         assert_walk("first push after a first pull", &pushed.work, &expected);
     }
-    let sample = (size, pushed.lsn, pushed.peak);
+    let sample = push_sample(size, &pushed, true);
     network.close(&runtime);
     sample
 }
@@ -73,13 +73,8 @@ fn a_first_push_after_a_first_pull_suppresses_received_declarations_without_hold
 #[test]
 fn a_first_push_after_a_first_pull_suppresses_received_declarations_without_holding_them_as_received_history_grows()
  {
-    let measured = NIGHTLY_SIZES.map(|size| first_push_after_first_pull(size, true));
-    let control = NIGHTLY_SIZES
+    let measured = WALK_FROM_ZERO_SIZES.map(|size| first_push_after_first_pull(size, true));
+    let control = WALK_FROM_ZERO_SIZES
         .map(|size| control_sample(size, || first_push_after_first_pull(PR_SIZE, true)));
-    assert_bounded_by_control(
-        "first push after a first pull",
-        &measured,
-        &control,
-        BallastIn::TheWalk,
-    );
+    assert_walk_from_zero_push("first push after a first pull", &measured, &control);
 }

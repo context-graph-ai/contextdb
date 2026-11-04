@@ -78,7 +78,7 @@ fn received_prefix(
     }
 }
 
-fn reupload_received_prefix(size: usize, nightly: bool) -> (usize, Lsn, usize) {
+fn reupload_received_prefix(size: usize, nightly: bool) -> PushSample {
     let _clock = fixed_clock();
     let runtime = runtime();
     let directory = tempfile::tempdir().unwrap();
@@ -143,7 +143,7 @@ fn reupload_received_prefix(size: usize, nightly: bool) -> (usize, Lsn, usize) {
     if !nightly {
         assert_walk("destination re-upload", &pushed.work, &expected);
     }
-    let sample = (size, pushed.lsn, pushed.peak);
+    let sample = push_sample(size, &pushed, true);
     moved.network.close(&runtime);
     sample
 }
@@ -159,15 +159,10 @@ fn a_destination_reupload_resends_what_the_edge_held_and_holds_none_of_what_it_s
 #[ignore = "CDB-235: an edge that pulled schema cannot re-upload after a move; the companion row pins the refusal"]
 fn a_destination_reupload_resends_what_the_edge_held_and_holds_none_of_what_it_suppresses_as_received_history_grows()
  {
-    let measured = NIGHTLY_SIZES.map(|size| reupload_received_prefix(size, true));
-    let control =
-        NIGHTLY_SIZES.map(|size| control_sample(size, || reupload_received_prefix(PR_SIZE, true)));
-    assert_bounded_by_control(
-        "destination re-upload",
-        &measured,
-        &control,
-        BallastIn::TheWalk,
-    );
+    let measured = WALK_FROM_ZERO_SIZES.map(|size| reupload_received_prefix(size, true));
+    let control = WALK_FROM_ZERO_SIZES
+        .map(|size| control_sample(size, || reupload_received_prefix(PR_SIZE, true)));
+    assert_walk_from_zero_push("destination re-upload", &measured, &control);
 }
 
 #[test]

@@ -87,7 +87,7 @@ async fn stop_server(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn incremental_sync_samples(sizes: &[usize], nightly: bool) {
+fn incremental_sync_samples(sizes: &[usize], nightly: bool, bootstrap: bool) {
     // Rows carry their write time, and the push envelope encodes each payload
     // byte at or above 0x80 in two bytes, so a live clock moves the measured
     // peak with the millisecond. One fixed clock on this thread and on every
@@ -343,49 +343,68 @@ fn incremental_sync_samples(sizes: &[usize], nightly: bool) {
         source.close().unwrap();
         hub.close().unwrap();
     }
+    for pair in payloads.windows(2) {
+        assert_eq!(
+            pair[0], pair[1],
+            "unrelated immutable declarations cannot change the fixed authenticated payload"
+        );
+    }
+    let (phase, measured) = if bootstrap {
+        ("bootstrap", bootstrap_push_peaks.as_slice())
+    } else {
+        ("fixed_delta", peaks.as_slice())
+    };
+    assert_push_growth(phase, measured, nightly);
+}
+
+fn assert_push_growth(phase: &str, peaks: &[usize], nightly: bool) {
     // A reply commit touches a bounded set of B-tree leaves plus their depth.
     // Allow that logarithmic term while rejecting a retained per-declaration term.
     const PAGE_INVOICE: i128 = 4_224;
-    let first_delta = bootstrap_push_peaks[1] as i128 - bootstrap_push_peaks[0] as i128;
+    let first_delta = peaks[1] as i128 - peaks[0] as i128;
     if nightly {
-        let next_delta = bootstrap_push_peaks[2] as i128 - bootstrap_push_peaks[1] as i128;
+        let next_delta = peaks[2] as i128 - peaks[1] as i128;
         eprintln!(
-            "INCREMENTAL_CURVATURE peaks={bootstrap_push_peaks:?} first_delta={first_delta} next_delta={next_delta} slack={}",
+            "INCREMENTAL_CURVATURE phase={phase} peaks={peaks:?} first_delta={first_delta} next_delta={next_delta} slack={}",
             2 * PAGE_INVOICE
         );
         assert!(
             next_delta <= first_delta + 2 * PAGE_INVOICE,
-            "declaration growth must add only a B-tree-depth term, not linear retained history: peaks={bootstrap_push_peaks:?}, first_delta={first_delta}, next_delta={next_delta}, slack={}",
+            "declaration growth must add only a B-tree-depth term, not linear retained history: peaks={peaks:?}, first_delta={first_delta}, next_delta={next_delta}, slack={}",
             2 * PAGE_INVOICE
         );
     } else {
         eprintln!(
-            "INCREMENTAL_PR_BOUND peaks={bootstrap_push_peaks:?} delta={first_delta} bound={}",
+            "INCREMENTAL_PR_BOUND phase={phase} peaks={peaks:?} delta={first_delta} bound={}",
             8 * PAGE_INVOICE
         );
         assert!(
             first_delta <= 8 * PAGE_INVOICE,
-            "the first post-bootstrap push may add at most eight reply-commit page invoices: peaks={bootstrap_push_peaks:?}, delta={first_delta}, bound={}",
+            "{phase} push may add at most eight reply-commit page invoices: peaks={peaks:?}, delta={first_delta}, bound={}",
             8 * PAGE_INVOICE
         );
     }
-    assert_eq!(
-        payloads[0], payloads[1],
-        "unrelated immutable declarations cannot change the fixed authenticated payload"
-    );
-    assert_eq!(
-        peaks[0], peaks[1],
-        "actual writer peak for a fixed sync delta cannot grow with unrelated declaration history"
-    );
 }
 
 #[test]
 fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
-    incremental_sync_samples(&[32, 256], false);
+    incremental_sync_samples(&[32, 256], false, true);
 }
 
 #[cfg(feature = "nightly-tests")]
 #[test]
 fn incremental_sync_charges_sublinear_memory_as_unrelated_ddl_history_grows() {
-    incremental_sync_samples(&[32, 256, 2_048], true);
+    incremental_sync_samples(&[32, 256, 2_048], true, true);
+}
+
+// Separate rows ensure a bootstrap RED cannot hide the fixed-delta bound.
+#[test]
+fn incremental_sync_fixed_delta_charges_bounded_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256], false, false);
+}
+
+#[cfg(feature = "nightly-tests")]
+#[test]
+fn incremental_sync_fixed_delta_charges_sublinear_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256, 2_048], true, false);
 }
