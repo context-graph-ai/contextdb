@@ -3258,3 +3258,448 @@ impl TransactionalMemory {
         self.storage.evict_unpinned_clean_pages_for_test()
     }
 }
+
+// Test-only inspection of the allocator's summary levels.
+#[cfg(test)]
+impl TransactionalMemory {
+    /// Every inexact regional summary bit, as `(region, order, height, entry)`.
+    pub(crate) fn summary_mismatches_for_test(&self) -> Vec<(u32, u8, u32, u32)> {
+        let mut state = self.state.lock().unwrap();
+        let regions = state.header.layout().num_regions();
+        let mut mismatches = Vec::new();
+        for region in 0..regions {
+            mismatches.extend(
+                state
+                    .allocators
+                    .get_region(region)
+                    .summary_mismatches_for_test()
+                    .into_iter()
+                    .map(|(order, height, entry)| (region, order, height, entry)),
+            );
+        }
+        mismatches
+    }
+
+    pub(crate) fn plant_summary_bit_for_test(
+        &self,
+        region: u32,
+        order: u8,
+        height: u32,
+        entry: u32,
+        full: bool,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .get_region_mut(region)
+            .plant_summary_bit_for_test(order, height, entry, full);
+    }
+
+    pub(crate) fn summary_levels_for_test(&self, region: u32, order: u8) -> Vec<u32> {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .get_region(region)
+            .summary_levels_for_test(order)
+    }
+
+    pub(crate) fn summary_word_for_test(
+        &self,
+        region: u32,
+        order: u8,
+        height: u32,
+        index: u32,
+    ) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .get_region(region)
+            .summary_word_for_test(order, height, index)
+    }
+
+    pub(crate) fn region_max_order_for_test(&self, region: u32) -> u8 {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .get_region(region)
+            .get_max_order()
+    }
+
+    pub(crate) fn region_free_pages_for_test(&self, region: u32) -> u32 {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .get_region(region)
+            .count_free_pages()
+    }
+
+    pub(crate) fn layout_len_for_test(&self) -> u64 {
+        self.state.lock().unwrap().header.layout().len()
+    }
+
+    pub(crate) fn region_count_for_test(&self) -> u32 {
+        self.state.lock().unwrap().header.layout().num_regions()
+    }
+}
+
+/// A saved allocator installed under a shorter geometry (the trim a
+/// quick-repair commit does after saving, then the next open) and every other
+/// length transition leave each regional summary exact, count every free page
+/// and keep every counted page allocatable.
+#[cfg(test)]
+mod saved_allocator_install_contract {
+    use super::InMemoryState;
+    use crate::transaction_tracker::TransactionId;
+    use crate::tree_store::page_store::base::MAX_PAGE_INDEX;
+    use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
+    use crate::tree_store::page_store::header::DatabaseHeader;
+    use crate::tree_store::page_store::layout::{DatabaseLayout, RegionLayout};
+    use std::io;
+    use std::sync::Arc;
+
+    const PAGE_SIZE: u32 = 4096;
+    const SAVED_PAGES: u32 = 5120;
+    const GROWN_PAGES: u32 = 5400;
+
+    fn layout(pages: u32) -> DatabaseLayout {
+        DatabaseLayout::new(
+            0,
+            RegionLayout::new(MAX_PAGE_INDEX + 1, 1, PAGE_SIZE),
+            Some(RegionLayout::new(pages, 1, PAGE_SIZE)),
+        )
+    }
+
+    fn paged_state(pages: u32) -> InMemoryState {
+        let scratch = crate::scratch_backend_in_directory(&std::env::temp_dir()).unwrap();
+        InMemoryState::new(
+            DatabaseHeader::new(layout(pages), TransactionId::new(0)),
+            Some(scratch),
+            0,
+        )
+        .unwrap()
+    }
+
+    fn u32_at(bytes: &[u8], at: usize) -> usize {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+    }
+
+    /// One saved bitmap layer window, cut from the encoded value the way
+    /// `SavedAllocatorValue::bitmap_window` cuts it from the allocator table.
+    fn window(bytes: &[u8], start: usize, height: u8, page: u32, out: &mut [u8; 4096]) {
+        let count = u32_at(bytes, start);
+        if usize::from(height) >= count {
+            return;
+        }
+        let layer_start = if height == 0 {
+            4 + count * 4
+        } else {
+            u32_at(bytes, start + 4 + (usize::from(height) - 1) * 4)
+        };
+        let layer_end = u32_at(bytes, start + 4 + usize::from(height) * 4);
+        let words_start = start + layer_start + 4;
+        let words_len = layer_end - layer_start - 4;
+        let offset = page as usize * out.len();
+        if offset < words_len {
+            let len = (words_len - offset).min(out.len());
+            out[..len].copy_from_slice(&bytes[words_start + offset..words_start + offset + len]);
+        }
+    }
+
+    fn region_window(bytes: &[u8], order: u8, height: u8, page: u32, out: &mut [u8; 4096]) {
+        let max_order = bytes[0];
+        if order > max_order {
+            return;
+        }
+        let start = if order == 0 {
+            8 + (usize::from(max_order) + 1) * 4
+        } else {
+            u32_at(bytes, 8 + (usize::from(order) - 1) * 4)
+        };
+        window(bytes, start, height, page, out);
+    }
+
+    fn tracker_window(bytes: &[u8], order: u8, height: u8, page: u32, out: &mut [u8; 4096]) {
+        let orders = u32_at(bytes, 0);
+        let mut start = 4 + orders * 4;
+        for earlier in 0..usize::from(order) {
+            start += u32_at(bytes, 4 + earlier * 4);
+        }
+        window(bytes, start, height, page, out);
+    }
+
+    /// The saved allocator values a quick-repair commit writes: region 0 and
+    /// the region tracker, encoded at the geometry they were saved under.
+    struct Saved {
+        region: Arc<Vec<u8>>,
+        tracker: Arc<Vec<u8>>,
+    }
+
+    fn save(state: &mut InMemoryState) -> Saved {
+        let region = state.allocators.get_region(0);
+        let mut region_bytes = vec![0; region.encoded_len()];
+        region.encode_into(&mut region_bytes);
+        let mut tracker_bytes = vec![0; state.allocators.region_tracker.encoded_len()];
+        state
+            .allocators
+            .region_tracker
+            .encode_into(&mut tracker_bytes);
+        Saved {
+            region: Arc::new(region_bytes),
+            tracker: Arc::new(tracker_bytes),
+        }
+    }
+
+    /// The commit's trim to `cut`, then the next open installing `saved`.
+    fn trim_then_install(state: &mut InMemoryState, saved: &Saved, cut: u32) {
+        state.allocators.resize_to(layout(cut)).unwrap();
+        let (region, tracker) = (Arc::clone(&saved.region), Arc::clone(&saved.tracker));
+        state
+            .allocators
+            .set_saved_source(Arc::new(
+                move |which, order, height, page, out| -> io::Result<bool> {
+                    out.fill(0xFF);
+                    match which {
+                        Some(0) => region_window(&region, order, height, page, out),
+                        Some(_) => return Ok(false),
+                        None => tracker_window(&tracker, order, height, page, out),
+                    }
+                    Ok(true)
+                },
+            ))
+            .unwrap();
+    }
+
+    fn exact(state: &mut InMemoryState, context: &str) {
+        let mismatches = state.allocators.get_region(0).summary_mismatches_for_test();
+        assert!(
+            mismatches.is_empty(),
+            "{context}: region 0 summary bits disagree with their words at (order, height, entry) {mismatches:?}"
+        );
+    }
+
+    /// Allocate every page of a fresh `SAVED_PAGES` region, then free `free`.
+    fn region_with_free_pages(free: impl IntoIterator<Item = u32>) -> InMemoryState {
+        let mut state = paged_state(SAVED_PAGES);
+        for _ in 0..SAVED_PAGES {
+            state.allocators.get_region_mut(0).alloc_lowest(0).unwrap();
+        }
+        for page in free {
+            state.allocators.get_region_mut(0).free(page, 0);
+        }
+        state
+    }
+
+    /// The install alone, before any growth or other resize, must be exact,
+    /// count every free page below the cut and allocate from them. The free
+    /// tail merges into one 16-page block (pages 5104-5119, order-4 bit 319)
+    /// and the trim cuts it in half at 5112, as `try_shrink` does for a
+    /// `trailing_free` of 16. Masking that block at the shorter geometry loses
+    /// pages 5104-5111 at every order.
+    #[test]
+    fn install_under_a_shorter_geometry_is_exact_counts_every_free_page_and_allocates() {
+        let lower = [10, 11, 2000];
+        let mut state = region_with_free_pages(lower.into_iter().chain(5104..SAVED_PAGES));
+        exact(&mut state, "before the save");
+        let saved = save(&mut state);
+        trim_then_install(&mut state, &saved, 5112);
+        exact(
+            &mut state,
+            "right after installing the saved state under 5112 pages",
+        );
+        let expected = u32::try_from(lower.len()).unwrap() + (5112 - 5104);
+        assert_eq!(
+            state.allocators.get_region(0).count_free_pages(),
+            expected,
+            "the install lost free pages below the cut"
+        );
+        let mut allocated = Vec::new();
+        for _ in 0..expected {
+            let region = state.allocators.get_region_mut(0);
+            match region.alloc_lowest(0) {
+                Some(page) => allocated.push(page),
+                None => panic!(
+                    "{} counted-free pages are not allocatable after {} allocations (highest free order {:?})",
+                    region.count_free_pages(),
+                    allocated.len(),
+                    region.highest_free_order()
+                ),
+            }
+        }
+        allocated.sort_unstable();
+        assert_eq!(
+            allocated,
+            [10, 11, 2000, 5104, 5105, 5106, 5107, 5108, 5109, 5110, 5111]
+        );
+        assert_eq!(state.allocators.get_region(0).count_free_pages(), 0);
+    }
+
+    /// One fragmented region: every page allocated, one page in five below
+    /// `cut` freed (deterministic per seed), the tail `[cut, SAVED_PAGES)` free;
+    /// saved, trimmed to `cut`, installed, grown, then allocated one page at a
+    /// time. Returns the counted-free pages left unallocatable (0 = healthy).
+    fn stranded_after_install_and_growth(seed: u64, cut: u32) -> u32 {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut free = Vec::new();
+        for page in 0..cut {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(5) {
+                free.push(page);
+            }
+        }
+        let mut state = region_with_free_pages(free.into_iter().chain(cut..SAVED_PAGES));
+        let saved = save(&mut state);
+        trim_then_install(&mut state, &saved, cut);
+        state.allocators.resize_to(layout(GROWN_PAGES)).unwrap();
+        loop {
+            let region = state.allocators.get_region_mut(0);
+            let free = region.count_free_pages();
+            if free == 0 {
+                return 0;
+            }
+            if region.alloc_lowest(0).is_none() {
+                return free;
+            }
+        }
+    }
+
+    /// Two geometries a masking install strands: after the install and a growth,
+    /// 144 counted-free pages there cannot be allocated.
+    #[test]
+    fn saved_allocator_reloaded_under_shorter_geometry_keeps_free_space_findable() {
+        for cut in [5105, 5106] {
+            assert_eq!(
+                stranded_after_install_and_growth(1, cut),
+                0,
+                "seed 1, cut {cut}: counted-free pages are unallocatable after install and growth"
+            );
+        }
+    }
+
+    /// The same property over 120 geometries: seeds 1-2, every cut
+    /// 5060-5119 (60 cuts in the last order-6 block, which holds 5105-5106).
+    #[test]
+    fn no_install_geometry_strands_counted_free_pages() {
+        const SWEEP_CUTS: std::ops::Range<u32> = 5060..SAVED_PAGES;
+        let mut stranded = Vec::new();
+        for seed in 1..=2u64 {
+            for cut in SWEEP_CUTS {
+                let pages = stranded_after_install_and_growth(seed, cut);
+                if pages > 0 {
+                    stranded.push((seed, cut, pages));
+                }
+            }
+        }
+        assert!(
+            stranded.is_empty(),
+            "{} of 120 geometries strand counted-free pages, (seed, cut, pages): {:?}",
+            stranded.len(),
+            &stranded[..stranded.len().min(10)]
+        );
+    }
+
+    /// Every length transition keeps every regional summary exact: the
+    /// commit's own trim, growth, the non-paged decode plus resize, the paged
+    /// install, materialising the installed source, and spilling the repaired
+    /// words to scratch and reading them back.
+    #[test]
+    fn every_length_transition_keeps_regional_summaries_exact() {
+        let mut state = region_with_free_pages([10, 11, 2000].into_iter().chain(5104..SAVED_PAGES));
+        let saved = save(&mut state);
+
+        // The non-paged load: decode at the saved length, then resize.
+        let mut decoded = BuddyAllocator::from_bytes(&saved.region);
+        decoded.resize(5112);
+        assert!(
+            decoded.summary_mismatches_for_test().is_empty(),
+            "non-paged decode + resize: {:?}",
+            decoded.summary_mismatches_for_test()
+        );
+
+        // The commit's trim, in process.
+        state.allocators.resize_to(layout(5112)).unwrap();
+        exact(&mut state, "after the in-process trim to 5112");
+        state.allocators.resize_to(layout(5300)).unwrap();
+        exact(&mut state, "after growing back to 5300");
+
+        // The next open: install under the shorter geometry.
+        let mut state = region_with_free_pages([10, 11, 2000].into_iter().chain(5104..SAVED_PAGES));
+        let saved = save(&mut state);
+        trim_then_install(&mut state, &saved, 5112);
+        exact(&mut state, "after the install under 5112");
+
+        // Spill everything to scratch at the minimum window budget, then
+        // read every word back.
+        state.allocators.set_window_budget(0).unwrap();
+        exact(
+            &mut state,
+            "after spilling the installed words and reading them back",
+        );
+
+        // Materialise the installed source and drop it.
+        state.allocators.materialize_saved_source().unwrap();
+        assert!(!state.allocators.has_saved_source());
+        exact(
+            &mut state,
+            "after materialising and detaching the saved source",
+        );
+        state.allocators.resize_to(layout(5300)).unwrap();
+        exact(&mut state, "after growth on the materialised allocator");
+    }
+
+    /// A measurement, not a gate: window loads and word
+    /// reads of encoding one fragmented full region at the minimum window
+    /// budget (the save's encode), and of installing it under a shorter
+    /// geometry and building the view. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_save_encode_and_install_paging() {
+        let pages = (MAX_PAGE_INDEX + 1).min(1 << 20);
+        let scratch = crate::scratch_backend_in_directory(&std::env::temp_dir()).unwrap();
+        let mut state = InMemoryState::new(
+            DatabaseHeader::new(layout(pages), TransactionId::new(0)),
+            Some(scratch),
+            0,
+        )
+        .unwrap();
+        for _ in 0..pages {
+            state.allocators.get_region_mut(0).alloc_lowest(0).unwrap();
+        }
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for page in 0..pages - 64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(7) {
+                state.allocators.get_region_mut(0).free(page, 0);
+            }
+        }
+        for page in pages - 64..pages {
+            state.allocators.get_region_mut(0).free(page, 0);
+        }
+        state.allocators.set_window_budget(0).unwrap();
+        let counters =
+            |state: &InMemoryState| state.allocators.pager().unwrap().counters_for_test();
+        let before = counters(&state);
+        let saved = save(&mut state);
+        let after_encode = counters(&state);
+        trim_then_install(&mut state, &saved, pages - 32);
+        let after_install = counters(&state);
+        let _ = state.allocators.get_region(0).count_free_pages();
+        let after_view = counters(&state);
+        let delta = |a: (u64, u64, u64), b: (u64, u64, u64)| (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+        println!(
+            "ALLOCATOR-PAGING pages={pages} encoded_bytes={} (word_reads, window_loads, scratch_reads): encode={:?} install={:?} first_full_count={:?}",
+            saved.region.len(),
+            delta(before, after_encode),
+            delta(after_encode, after_install),
+            delta(after_install, after_view),
+        );
+    }
+}

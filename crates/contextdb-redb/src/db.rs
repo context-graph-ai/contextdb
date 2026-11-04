@@ -3840,3 +3840,349 @@ impl ReadCacheObservation {
         self.memory.evict_unpinned_clean_pages_for_test()
     }
 }
+
+/// An allocator whose regional summary disagrees with its own words
+/// is never saved. The quick-repair commit that finds it publishes no
+/// allocator table, the handle keeps refusing through later commits, Drop and
+/// a read-only handoff, the next open takes the full repair, and the running
+/// writer reaches the free space the summary hid without growing the file.
+#[cfg(test)]
+mod allocator_save_check_contract {
+    use super::{Builder, Database, ReadOnlyDatabase, TransactionGuard};
+    use crate::transactions::{ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey};
+    use crate::tree_store::{PageHint, TableTree, TableType, TransactionalMemory};
+    use crate::{DatabaseError, ReadableDatabase, TableDefinition};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ROWS: TableDefinition<u64, &[u8]> = TableDefinition::new("save_check_rows");
+    /// One row per leaf page, so freeing rows frees single pages.
+    const VALUE_BYTES: usize = 3000;
+    /// Enough rows that region 0's order-0 bitmap has two leaf-parent words.
+    const ROW_COUNT: u64 = 5000;
+
+    fn value(key: u64) -> Vec<u8> {
+        vec![(key % 251) as u8; VALUE_BYTES]
+    }
+
+    /// Opens an existing store; reports whether the open ran the full repair
+    /// instead of loading a saved allocator table. Only reopens are counted:
+    /// a fresh `create` has no allocator table and always takes that path.
+    fn reopen(path: &Path) -> (Database, bool) {
+        let repaired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&repaired);
+        let mut builder = Builder::new();
+        builder.set_repair_callback(move |_| flag.store(true, Ordering::SeqCst));
+        let db = builder.open(path).expect("reopen");
+        (db, repaired.load(Ordering::SeqCst))
+    }
+
+    /// Rows `0..ROW_COUNT`, then the rows `removed` deleted and their pages
+    /// reclaimed, so region 0 holds free single pages where those rows were.
+    fn fixture(path: &Path, removed: impl Iterator<Item = u64>) -> Database {
+        let db = Builder::new().create(path).expect("create fixture");
+        for batch in 0..ROW_COUNT / 500 {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(ROWS).unwrap();
+                for key in batch * 500..(batch + 1) * 500 {
+                    table.insert(key, value(key).as_slice()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(ROWS).unwrap();
+            for key in removed {
+                table.remove(key).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        db.drain_deferred_frees().unwrap();
+        #[cfg(debug_assertions)]
+        assert!(
+            db.mem.uses_paged_allocator(),
+            "fixture must use the paged allocator"
+        );
+        assert_eq!(
+            db.mem.region_count_for_test(),
+            1,
+            "fixture must stay in one region"
+        );
+        assert!(
+            db.mem.summary_mismatches_for_test().is_empty(),
+            "fixture must start exact: {:?}",
+            db.mem.summary_mismatches_for_test()
+        );
+        db
+    }
+
+    fn removed_low() -> impl Iterator<Item = u64> {
+        (100..1200).step_by(2)
+    }
+
+    fn removed_high() -> impl Iterator<Item = u64> {
+        (4600..4900).step_by(2)
+    }
+
+    /// Whether the committed system directory holds an allocator table at
+    /// all, read from the system root without the staleness check.
+    fn allocator_table_present(mem: &Arc<TransactionalMemory>) -> bool {
+        TableTree::new(
+            mem.get_system_root(),
+            PageHint::None,
+            Arc::new(TransactionGuard::fake()),
+            mem.clone(),
+        )
+        .unwrap()
+        .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+        .unwrap()
+        .is_some()
+    }
+
+    fn quick_repair_commit(db: &Database, key: u64) {
+        let mut write = db.begin_write().unwrap();
+        write.set_quick_repair(true);
+        write
+            .open_table(ROWS)
+            .unwrap()
+            .insert(key, value(key).as_slice())
+            .unwrap();
+        write
+            .commit()
+            .expect("a refused allocator save is not a failed commit");
+    }
+
+    fn assert_rows(db: &Database, present: impl Iterator<Item = u64>) {
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(ROWS).unwrap();
+        for key in present {
+            let row = table
+                .get(key)
+                .unwrap()
+                .unwrap_or_else(|| panic!("row {key} lost"));
+            assert_eq!(row.value(), value(key).as_slice(), "row {key} changed");
+        }
+    }
+
+    /// The order-0 summary level a plant targets.
+    #[derive(Clone, Copy, Debug)]
+    enum Level {
+        /// The level directly above the leaf words.
+        LeafParent,
+        /// The level above that.
+        Upper,
+    }
+
+    /// Plant one wrong order-0 summary bit, away from each level's last word:
+    /// `full` over a word that is not full, or not-full over a full word.
+    fn plant(mem: &TransactionalMemory, level: Level, full: bool) -> (u32, u32) {
+        let levels = mem.summary_levels_for_test(0, 0);
+        assert!(levels.len() >= 3, "order 0 needs three levels: {levels:?}");
+        let child_height = match level {
+            Level::LeafParent => u32::try_from(levels.len()).unwrap() - 1,
+            Level::Upper => u32::try_from(levels.len()).unwrap() - 2,
+        };
+        let height = child_height - 1;
+        let child_words = levels[child_height as usize].div_ceil(64);
+        assert!(
+            child_words >= 2,
+            "{level:?}: the child level needs two words: {levels:?}"
+        );
+        let entry = (0..child_words - 1)
+            .find(|&word| (mem.summary_word_for_test(0, 0, child_height, word) == u64::MAX) != full)
+            .unwrap_or_else(|| panic!("{level:?}: no non-last word to plant full={full} over"));
+        mem.plant_summary_bit_for_test(0, 0, height, entry, full);
+        assert!(
+            mem.summary_mismatches_for_test()
+                .contains(&(0, 0, height, entry)),
+            "the plant at height {height} entry {entry} did not take"
+        );
+        (height, entry)
+    }
+
+    /// Plant, refuse, keep refusing, close, and repair on reopen. `handoff`
+    /// closes through `prepare_read_only_handoff` instead of plain Drop.
+    fn refusal_lifecycle(
+        level: Level,
+        full: bool,
+        removed: fn() -> Box<dyn Iterator<Item = u64>>,
+        handoff: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latched.redb");
+        let context = format!("{level:?} full={full} handoff={handoff}");
+        {
+            let mut db = fixture(&path, removed());
+            let planted = plant(&db.mem, level, full);
+            quick_repair_commit(&db, ROW_COUNT);
+            assert!(
+                !allocator_table_present(&db.mem),
+                "{context}: the quick-repair commit after the plant at {planted:?} published an allocator table"
+            );
+            quick_repair_commit(&db, ROW_COUNT + 1);
+            assert!(
+                !allocator_table_present(&db.mem),
+                "{context}: a later quick-repair commit on the refusing handle published an allocator table"
+            );
+
+            // A healthy database open in the same process still saves.
+            let other_path = dir.path().join("healthy.redb");
+            let other = fixture(&other_path, removed_low());
+            quick_repair_commit(&other, ROW_COUNT);
+            assert!(
+                allocator_table_present(&other.mem),
+                "{context}: one database's refusal stopped another database's allocator save"
+            );
+            drop(other);
+
+            if handoff {
+                db.prepare_read_only_handoff().unwrap();
+            }
+        }
+        assert!(
+            matches!(
+                ReadOnlyDatabase::open(&path),
+                Err(DatabaseError::RepairAborted)
+            ),
+            "{context}: the closed refusing store still carries an allocator table a reader trusts"
+        );
+        let (mut reopened, repaired) = reopen(&path);
+        assert!(
+            repaired,
+            "{context}: the reopen of a refusing store must take the full repair"
+        );
+        let removed: std::collections::HashSet<u64> = removed().collect();
+        assert_rows(
+            &reopened,
+            (0..ROW_COUNT + 2).filter(|key| !removed.contains(key)),
+        );
+        assert!(
+            reopened.check_integrity().unwrap(),
+            "{context}: repaired store fails its integrity check"
+        );
+        assert!(
+            reopened.mem.summary_mismatches_for_test().is_empty(),
+            "{context}: the repaired allocator is not exact"
+        );
+    }
+
+    #[test]
+    fn full_over_free_at_a_leaf_parent_refuses_the_save_through_drop_and_repairs() {
+        refusal_lifecycle(Level::LeafParent, true, || Box::new(removed_low()), false);
+    }
+
+    #[test]
+    fn not_full_over_full_at_a_leaf_parent_refuses_the_save_through_handoff_and_repairs() {
+        refusal_lifecycle(Level::LeafParent, false, || Box::new(removed_low()), true);
+    }
+
+    #[test]
+    fn full_over_free_at_an_upper_level_refuses_the_save_and_repairs() {
+        refusal_lifecycle(Level::Upper, true, || Box::new(removed_low()), false);
+    }
+
+    #[test]
+    fn not_full_over_full_at_an_upper_level_refuses_the_save_and_repairs() {
+        refusal_lifecycle(Level::Upper, false, || Box::new(removed_high()), false);
+    }
+
+    /// Control: an exact allocator saves its table on every quick-repair
+    /// commit and reopens without repair.
+    #[test]
+    fn an_exact_allocator_saves_and_reopens_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.redb");
+        {
+            let db = fixture(&path, removed_low());
+            quick_repair_commit(&db, ROW_COUNT);
+            assert!(
+                allocator_table_present(&db.mem),
+                "an exact allocator must be saved"
+            );
+        }
+        assert!(
+            ReadOnlyDatabase::open(&path).is_ok(),
+            "a cleanly closed exact store must open read-only"
+        );
+        let (reopened, repaired) = reopen(&path);
+        assert!(!repaired, "an exact store must reopen without repair");
+        // Drop trimmed the file after the save, so this open installed the
+        // saved allocator under a shorter geometry: the production install.
+        let mismatches = reopened.mem.summary_mismatches_for_test();
+        assert!(
+            mismatches.is_empty(),
+            "the reopen installed an inexact allocator at (region, order, height, entry) {mismatches:?}"
+        );
+    }
+
+    /// The running writer: a summary that hides region 0's free pages makes
+    /// an allocation fail and the writer learn the region as full and grow.
+    /// The next quick-repair commit refuses the save and rebuilds the summary
+    /// and the region tracker, and a later write on the same handle reuses the
+    /// recovered pages without growing the file and without a reopen.
+    #[test]
+    fn the_running_writer_reuses_space_a_refused_save_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("running.redb");
+        let db = fixture(&path, (200..4200).step_by(2));
+        let hidden = db.mem.region_free_pages_for_test(0);
+        assert!(hidden > 1500, "fixture must free many pages: {hidden}");
+
+        // Hide every word that holds a free block, at every order.
+        for order in 0..=db.mem.region_max_order_for_test(0) {
+            let levels = db.mem.summary_levels_for_test(0, order);
+            if levels.len() < 2 {
+                continue;
+            }
+            let leaf = u32::try_from(levels.len()).unwrap() - 1;
+            for word in 0..levels[leaf as usize].div_ceil(64) {
+                if db.mem.summary_word_for_test(0, order, leaf, word) != u64::MAX {
+                    db.mem
+                        .plant_summary_bit_for_test(0, order, leaf - 1, word, true);
+                }
+            }
+        }
+
+        // The writer finds no free page, learns region 0 as full, and grows.
+        let before_learning = db.mem.layout_len_for_test();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(ROWS)
+            .unwrap()
+            .insert(ROW_COUNT, value(ROW_COUNT).as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        let learned = db.mem.layout_len_for_test();
+        assert!(
+            learned > before_learning,
+            "fixture: the hidden region must make the writer grow"
+        );
+
+        // The quick-repair commit refuses the save and rebuilds.
+        quick_repair_commit(&db, ROW_COUNT + 1);
+        assert!(
+            !allocator_table_present(&db.mem),
+            "the hiding summary was saved"
+        );
+        let after_refusal = db.mem.layout_len_for_test();
+
+        // A write of well over the growth slack but under the recovered space.
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(ROWS).unwrap();
+            for key in ROW_COUNT + 2..ROW_COUNT + 2 + u64::from(hidden) / 2 {
+                table.insert(key, value(key).as_slice()).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        assert_eq!(
+            db.mem.layout_len_for_test(),
+            after_refusal,
+            "the writer grew the file while the rebuilt allocator held {hidden} recovered free pages"
+        );
+        assert!(db.mem.summary_mismatches_for_test().is_empty());
+    }
+}

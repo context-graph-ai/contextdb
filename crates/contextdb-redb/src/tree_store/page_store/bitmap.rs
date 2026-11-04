@@ -750,3 +750,210 @@ mod test {
         assert!(allocator.alloc().is_none());
     }
 }
+
+// Test-only inspection of the allocator's summary levels.
+#[cfg(test)]
+impl BtreeBitmap {
+    /// Every summary bit that disagrees with the word it summarises, as
+    /// `(parent height, entry)`; a resident root cache that differs from level
+    /// 0 is reported as `(u32::MAX, 0)`. A summary bit is exact when it is set
+    /// exactly while its child word is full over that word's valid bits.
+    pub(crate) fn summary_mismatches_for_test(&self) -> Vec<(u32, u32)> {
+        let mut mismatches = Vec::new();
+        if self.root_known.load(Ordering::Relaxed)
+            && self.get_level(0).len() > 0
+            && self.root_word.load(Ordering::Relaxed) != self.get_level(0).word(0)
+        {
+            mismatches.push((u32::MAX, 0));
+        }
+        for parent_height in 0..self.get_height().saturating_sub(1) {
+            let parent = self.get_level(parent_height);
+            let child = self.get_level(parent_height + 1);
+            for entry in 0..parent.len() {
+                if u64::from(entry) * 64 >= u64::from(child.len()) {
+                    break;
+                }
+                let child_full = child.word(entry as usize) == u64::MAX;
+                if parent.get(entry) != child_full {
+                    mismatches.push((parent_height, entry));
+                }
+            }
+        }
+        mismatches
+    }
+
+    /// Overwrite one summary bit without touching anything below it.
+    pub(crate) fn plant_summary_bit_for_test(&mut self, height: u32, entry: u32, full: bool) {
+        self.forget_root();
+        let level = self.get_level_mut(height);
+        if full {
+            level.set(entry);
+        } else {
+            level.clear(entry);
+        }
+    }
+
+    /// The length of every level, root first.
+    pub(crate) fn level_lens_for_test(&self) -> Vec<u32> {
+        (0..self.get_height())
+            .map(|height| self.get_level(height).len())
+            .collect()
+    }
+
+    /// One word of one level, masked past the level's length as `word()` is.
+    pub(crate) fn word_for_test(&self, height: u32, index: u32) -> u64 {
+        self.get_level(height).word(index as usize)
+    }
+
+    /// The first unset id found by scanning every leaf bit.
+    pub(crate) fn first_unset_by_scan_for_test(&self) -> Option<u32> {
+        (0..self.len()).find(|&id| !self.get(id))
+    }
+}
+
+/// A summary bit is set exactly when the leaf word it summarises is
+/// full. Every length change keeps that true, so the descent in
+/// `find_first_unset` finds the lowest free id whenever one exists.
+#[cfg(test)]
+mod summary_exactness_contract {
+    use super::BtreeBitmap;
+
+    fn exact(bitmap: &BtreeBitmap, context: &str) {
+        let mismatches = bitmap.summary_mismatches_for_test();
+        assert!(
+            mismatches.is_empty(),
+            "{context}: summary bits disagree with their words at (height, entry) {mismatches:?}; level lengths {:?}",
+            bitmap.level_lens_for_test()
+        );
+        assert_eq!(
+            bitmap.find_first_unset(),
+            bitmap.first_unset_by_scan_for_test(),
+            "{context}: the summary descent and a leaf scan disagree on the first free id"
+        );
+    }
+
+    /// A shorter length that cuts a word whose cut-off tail was free leaves
+    /// that word full; its summary bit must say so, and the free id a later
+    /// growth adds must be found.
+    #[test]
+    fn shrink_mid_word_after_free_tail_then_grow_keeps_free_space_findable() {
+        let mut bitmap = BtreeBitmap::new(640, 640);
+        for id in 629..640 {
+            bitmap.clear(id);
+        }
+        exact(&bitmap, "before the shrink");
+        bitmap.resize(629, true);
+        exact(&bitmap, "after shrinking 640 -> 629 over a free tail");
+        bitmap.resize(700, true);
+        bitmap.clear(690);
+        exact(&bitmap, "after growing 629 -> 700 and freeing id 690");
+        assert_eq!(bitmap.find_first_unset(), Some(690));
+    }
+
+    /// Growth that adds free ids must clear the summary of the word they land
+    /// in. A repair of the shrink path alone leaves id 63 hidden here.
+    #[test]
+    fn growth_63_to_64_with_free_fill_keeps_the_new_id_findable() {
+        let mut bitmap = BtreeBitmap::new(63, 4096);
+        exact(&bitmap, "63 allocated ids");
+        bitmap.resize(64, false);
+        exact(&bitmap, "after growing 63 -> 64 with a free fill");
+        assert_eq!(bitmap.find_first_unset(), Some(63));
+    }
+
+    /// Deterministic leaf patterns for the boundary matrix.
+    #[derive(Clone, Copy, Debug)]
+    enum Pattern {
+        /// Every id allocated.
+        Full,
+        /// One id in three free, spread over every word.
+        Scattered,
+        /// Every id below `cut` allocated, every id at or above it free: the
+        /// state a trim of a free tail starts from.
+        FreeTail(u32),
+    }
+
+    fn build(len: u32, capacity: u32, pattern: Pattern) -> BtreeBitmap {
+        let mut bitmap = BtreeBitmap::new(len, capacity);
+        for id in 0..len {
+            let free = match pattern {
+                Pattern::Full => false,
+                Pattern::Scattered => (u64::from(id).wrapping_mul(0x9E37_79B9) >> 7) % 3 == 0,
+                Pattern::FreeTail(cut) => id >= cut,
+            };
+            if free {
+                bitmap.clear(id);
+            }
+        }
+        bitmap
+    }
+
+    /// Every length transition the allocator performs, at two and three
+    /// summary levels: empty orders, growth from empty, unchanged lengths,
+    /// word-aligned and mid-word cuts, a cut across a higher summary word, and
+    /// growth spanning several words with allocated and free fills. After
+    /// each resize the summary is exact and the descent finds the first free
+    /// id; one more free id near the new end must then be found too.
+    #[test]
+    fn every_resize_boundary_keeps_the_summary_exact() {
+        // (from, to, fill_full, capacity, pattern)
+        let two = 4096;
+        let three = 1 << 18;
+        let cases: Vec<(u32, u32, bool, u32, Pattern)> = vec![
+            (0, 0, true, two, Pattern::Full),
+            (0, 5, false, two, Pattern::Full),
+            (0, 100, true, two, Pattern::Full),
+            (100, 0, true, two, Pattern::Scattered),
+            (100, 100, true, two, Pattern::Scattered),
+            (640, 576, true, two, Pattern::FreeTail(576)),
+            (640, 576, true, two, Pattern::Scattered),
+            (640, 629, true, two, Pattern::FreeTail(629)),
+            (640, 629, true, two, Pattern::Scattered),
+            (63, 64, false, two, Pattern::Full),
+            (63, 64, true, two, Pattern::Scattered),
+            (100, 700, true, two, Pattern::Full),
+            (100, 700, false, two, Pattern::Full),
+            (100, 700, true, two, Pattern::Scattered),
+            (8192, 4100, true, three, Pattern::FreeTail(4100)),
+            (8192, 4096, true, three, Pattern::FreeTail(4096)),
+            (8192, 4100, true, three, Pattern::Scattered),
+            (4000, 9000, true, three, Pattern::Full),
+            (4000, 9000, false, three, Pattern::Full),
+            (4100, 4100, true, three, Pattern::FreeTail(4097)),
+        ];
+        let mut failures = Vec::new();
+        for (from, to, fill_full, capacity, pattern) in cases {
+            let context =
+                format!("{from} -> {to} fill_full={fill_full} capacity={capacity} {pattern:?}");
+            let outcome = std::panic::catch_unwind(|| {
+                let mut bitmap = build(from, capacity, pattern);
+                exact(&bitmap, &format!("{context}: before"));
+                bitmap.resize(to, fill_full);
+                exact(&bitmap, &format!("{context}: after the resize"));
+                if to > 0 {
+                    let last = to - 1;
+                    bitmap.clear(last);
+                    exact(&bitmap, &format!("{context}: after freeing id {last}"));
+                    assert!(
+                        bitmap.find_first_unset().is_some(),
+                        "{context}: id {last} is free but not found"
+                    );
+                }
+            });
+            if let Err(panic) = outcome {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
+                failures.push(message);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} boundary cases broke the summary:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}

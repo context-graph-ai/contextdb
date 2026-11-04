@@ -587,6 +587,41 @@ impl BuddyAllocator {
     }
 }
 
+// Test-only inspection of the allocator's summary levels.
+#[cfg(test)]
+impl BuddyAllocator {
+    /// Every inexact summary bit of every order, as `(order, height, entry)`.
+    pub(crate) fn summary_mismatches_for_test(&self) -> Vec<(u8, u32, u32)> {
+        (0..=self.max_order)
+            .flat_map(|order| {
+                self.get_order_free(order)
+                    .summary_mismatches_for_test()
+                    .into_iter()
+                    .map(move |(height, entry)| (order, height, entry))
+            })
+            .collect()
+    }
+
+    pub(crate) fn plant_summary_bit_for_test(
+        &mut self,
+        order: u8,
+        height: u32,
+        entry: u32,
+        full: bool,
+    ) {
+        self.get_order_free_mut(order)
+            .plant_summary_bit_for_test(height, entry, full);
+    }
+
+    pub(crate) fn summary_levels_for_test(&self, order: u8) -> Vec<u32> {
+        self.get_order_free(order).level_lens_for_test()
+    }
+
+    pub(crate) fn summary_word_for_test(&self, order: u8, height: u32, index: u32) -> u64 {
+        self.get_order_free(order).word_for_test(height, index)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::tree_store::page_store::buddy_allocator::{BuddyAllocator, TENTATIVE_ALLOCATIONS};
