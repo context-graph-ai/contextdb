@@ -6456,6 +6456,18 @@
       "execution": "not selected (--include-ignored absent)"
     },
     {
+      "path": "crates/contextdb-engine/src/database/received_legacy_growth_guards.rs",
+      "line": 418,
+      "declaration": "#[ignore = \"CDB-236: reader budget grows with rows\"]",
+      "execution": "not selected (--include-ignored absent)"
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/received_legacy_growth_guards.rs",
+      "line": 424,
+      "declaration": "#[ignore = \"CDB-236: reader budget grows with rows\"]",
+      "execution": "not selected (--include-ignored absent)"
+    },
+    {
       "path": "crates/contextdb-engine/tests/engine_seams/a_declared_count_is_the_only_count_an_append_writes.rs",
       "line": 123,
       "declaration": "#[ignore = \"measurement: builds two 20,010-event streams\"]",

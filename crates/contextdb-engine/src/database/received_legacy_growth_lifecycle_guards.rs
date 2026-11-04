@@ -89,6 +89,13 @@ fn failed_preparation_cleanup(durable: bool) {
             outcome.is_err(),
             "the real cancellation/durable failure refuses the unit"
         );
+        if durable {
+            assert!(
+                matches!(&outcome, Err(error @ Error::Other(_))
+                    if error.to_string().contains("injected received-schema Redb pre-commit failure")),
+                "the durable apply must reach its injected pre-commit fault, not an earlier refusal: {outcome:?}"
+            );
+        }
         assert!(
             reached.load(Ordering::SeqCst),
             "full bounded staging must reach pre_commit before this refusal"
@@ -271,5 +278,65 @@ fn production_legacy_budget_refusal_releases_population_and_retries_at_fixed_bud
         receiver.db.close().unwrap();
         drop(receiver);
     });
+    author.db.close().unwrap();
+}
+
+/// CDB-224: a stage refused at the fixed writer budget is retried on the same
+/// live handle, at the same budget, without a reopen. The refusal is one-shot:
+/// a competing writer owner takes every spare byte and is released before the
+/// retry, so the budget itself never changes.
+#[test]
+#[serial]
+fn production_legacy_refused_stage_retries_live_at_the_same_budget() {
+    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let root = tempfile::tempdir().unwrap();
+    let (author, receiver, before, retained_at) = seeded(root.path(), N);
+    let delivery = Delivery::authored_by(&author, before);
+    receiver.db.with_reader_memory_high_water_for_test(|| ());
+    assert_eq!(receiver.db.accountant.usage().limit, Some(WRITER));
+    let old_lsn = receiver.db.current_lsn();
+    let old_publication = format!("{:?}", receiver.db.published_state_snapshot_for_test());
+    let held = receiver.db.accountant.usage().used;
+    let competing = WRITER - held;
+    receiver.db.accountant.try_allocate(competing).unwrap();
+    let (outcome, memory) = receiver
+        .db
+        .with_reader_memory_high_water_for_test(|| delivery.apply(&receiver));
+    assert!(
+        matches!(
+            &outcome,
+            Err(Error::MemoryBudgetExceeded { budget_limit_bytes, .. }) if *budget_limit_bytes == WRITER
+        ),
+        "the competitor makes the stage refuse with the typed budget error at the unchanged limit: {outcome:?}"
+    );
+    drop(outcome);
+    receiver.db.accountant.release(competing);
+    assert_eq!(
+        receiver.db.accountant.usage().used,
+        held,
+        "the refused stage returns its writer custody before the retry"
+    );
+    assert_eq!(memory.after, memory.before);
+    assert_eq!(receiver.db.current_lsn(), old_lsn);
+    assert_eq!(
+        format!("{:?}", receiver.db.published_state_snapshot_for_test()),
+        old_publication
+    );
+    assert_eq!(receiver.db.accountant.usage().limit, Some(WRITER));
+    exact(&receiver.db, N, false, retained_at);
+    receiver.db.accountant.reset_high_water_for_test();
+    let retried = delivery.apply(&receiver);
+    assert!(
+        retried.is_ok(),
+        "the live retry at the same budget succeeds without a reopen: {retried:?}"
+    );
+    drop(retried);
+    assert!(receiver.db.write_memory_high_water_for_test() <= WRITER);
+    assert_eq!(receiver.db.accountant.usage().limit, Some(WRITER));
+    exact(&receiver.db, N, true, retained_at);
+    let receiver = reopen(receiver, WRITER);
+    exact(&receiver.db, N, true, retained_at);
+    receiver.db.close().unwrap();
+    drop(receiver);
     author.db.close().unwrap();
 }
