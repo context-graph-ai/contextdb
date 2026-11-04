@@ -584,6 +584,25 @@ impl U64GroupedBitmap {
     }
 }
 
+// Planting a wrong summary bit, for tests of the allocator-save check.
+#[cfg(feature = "test-seams")]
+impl BtreeBitmap {
+    /// Invert the summary bit over leaf word 0, one level above the leaves,
+    /// leaving every leaf untouched; returns its `(height, entry)`, or `None`
+    /// when the bitmap is a single level with no summary.
+    pub(crate) fn invert_first_leaf_parent_bit_for_test(&mut self) -> Option<(u32, u32)> {
+        let height = self.get_height().checked_sub(2)?;
+        self.forget_root();
+        let level = self.get_level_mut(height);
+        if level.get(0) {
+            level.clear(0);
+        } else {
+            level.set(0);
+        }
+        Some((height, 0))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::tree_store::page_store::bitmap::BtreeBitmap;

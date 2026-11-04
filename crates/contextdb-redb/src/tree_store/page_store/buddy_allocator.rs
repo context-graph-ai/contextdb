@@ -587,6 +587,17 @@ impl BuddyAllocator {
     }
 }
 
+// Planting a wrong summary bit, for tests of the allocator-save check.
+#[cfg(feature = "test-seams")]
+impl BuddyAllocator {
+    /// Invert order 0's summary bit over its first leaf word; returns
+    /// `(height, entry)`, or `None` when order 0 has no summary level.
+    pub(crate) fn invert_order_0_summary_bit_for_test(&mut self) -> Option<(u32, u32)> {
+        self.get_order_free_mut(0)
+            .invert_first_leaf_parent_bit_for_test()
+    }
+}
+
 // Test-only inspection of the allocator's summary levels.
 #[cfg(test)]
 impl BuddyAllocator {

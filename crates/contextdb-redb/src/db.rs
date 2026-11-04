@@ -1955,6 +1955,17 @@ impl Database {
         self.mem.distrust_free_totals_for_test();
     }
 
+    /// Make region 0's allocator summary disagree with its own words: invert
+    /// one order-0 summary bit over a leaf word, leaving every leaf as it
+    /// is. Returns `(region, order, height, entry)`, or `None` when order 0
+    /// has no summary level. A save of this allocator is a save of an
+    /// inexact summary.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn plant_allocator_summary_mismatch_for_test(&self) -> Option<(u32, u8, u32, u32)> {
+        self.mem.plant_allocator_summary_mismatch_for_test()
+    }
+
     /// Change how the next allocator-state save on this thread treats the
     /// free totals; the mode is consumed by that save.
     #[cfg(feature = "test-seams")]

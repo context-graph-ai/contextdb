@@ -1438,6 +1438,21 @@ impl TransactionalMemory {
             .mark_free_totals_untrusted();
     }
 
+    /// Invert one order-0 summary bit of region 0 without touching its
+    /// leaves; returns `(region, order, height, entry)`, or `None` when
+    /// order 0 has no summary level.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn plant_allocator_summary_mismatch_for_test(&self) -> Option<(u32, u8, u32, u32)> {
+        let (height, entry) = self
+            .state
+            .lock()
+            .unwrap()
+            .allocators
+            .get_region_mut(0)
+            .invert_order_0_summary_bit_for_test()?;
+        Some((0, 0, height, entry))
+    }
+
     /// Trusted `(free pages, region pages, trailing free pages)`; `None` while
     /// untrusted. The trailing free pages end the last region: a trim gives
     /// them back without relocating anything. Counting them walks the free
