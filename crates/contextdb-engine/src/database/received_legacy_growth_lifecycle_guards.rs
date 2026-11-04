@@ -220,8 +220,11 @@ fn production_legacy_grown_stage_remains_invisible_before_final_publication() {
                 panic!("bounded preparation must reach the final publication gate: success={ok}")
             }
             PublicationEvent::Prepared => {
+                // Read the committed position without opening a public
+                // operation: the parked stage holds the schema publication
+                // gate, and a public read waits for it by design.
                 assert_eq!(
-                    receiver.db.current_lsn(),
+                    receiver.db.tx_mgr.current_lsn(),
                     old_lsn,
                     "acceptance position stays unpublished until the final commit"
                 );
