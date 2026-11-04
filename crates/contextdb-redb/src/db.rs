@@ -4174,10 +4174,11 @@ mod allocator_save_check_contract {
     /// writer learns region 0 as full and allocates elsewhere. A reader held
     /// throughout keeps every later free pending, so nothing frees a page
     /// into region 0, and growth of the last region never re-marks it. The
-    /// next quick-repair commit refuses the save and rebuilds; from that
-    /// commit on, the writer on the same handle must take its pages from
-    /// region 0's recovered space, without growing the file and without a
-    /// reopen.
+    /// next quick-repair commit refuses the save and rebuilds. That commit
+    /// may itself grow the file: it allocates before its save finds the
+    /// hidden summary. After it, the next write on the same handle must take
+    /// its pages from region 0's recovered space, without growing the file
+    /// and without a reopen.
     #[test]
     fn the_running_writer_reuses_space_a_refused_save_recovered() {
         let dir = tempfile::tempdir().unwrap();
@@ -4231,10 +4232,6 @@ mod allocator_save_check_contract {
             "fixture: the writer did not learn region 0 as full"
         );
 
-        // From the refusing commit onward, region 0's recovered pages are
-        // the writer's to take, so this is the last unchanged count.
-        let before_refusal = db.mem.layout_len_for_test();
-
         // The quick-repair commit refuses the save and rebuilds.
         quick_repair_commit(&db, ROW_COUNT + 1);
         assert!(
@@ -4247,8 +4244,10 @@ mod allocator_save_check_contract {
             db.mem.summary_mismatches_for_test()
         );
 
-        // The refusing commit and the next write take their new pages from
-        // region 0.
+        // The next write takes its new pages from region 0's recovered
+        // space, measured from the end of the refusing commit.
+        let after_refusal = db.mem.layout_len_for_test();
+        let free_after_refusal = db.mem.region_counted_free_pages_for_test(0);
         let write = db.begin_write().unwrap();
         {
             let mut table = write.open_table(ROWS).unwrap();
@@ -4257,17 +4256,17 @@ mod allocator_save_check_contract {
             }
         }
         write.commit().unwrap();
-        let reused = hidden - db.mem.region_counted_free_pages_for_test(0);
+        let reused = free_after_refusal - db.mem.region_counted_free_pages_for_test(0);
         assert!(
             u64::from(reused) >= REUSED_ROWS,
-            "from the refusing commit on, the running writer took {reused} of region 0's \
-             {hidden} recovered pages for {REUSED_ROWS} new rows: region 0 is still learned \
-             as full"
+            "after the refused save, the running writer took {reused} of region 0's \
+             {free_after_refusal} recovered pages for {REUSED_ROWS} new rows: region 0 is \
+             still learned as full"
         );
         assert!(
-            db.mem.layout_len_for_test() <= before_refusal,
-            "the writer grew the file from {before_refusal} to {} bytes while region 0 held \
-             {hidden} recovered free pages",
+            db.mem.layout_len_for_test() <= after_refusal,
+            "the writer grew the file from {after_refusal} to {} bytes while region 0 held \
+             {free_after_refusal} recovered free pages",
             db.mem.layout_len_for_test()
         );
         assert!(db.mem.summary_mismatches_for_test().is_empty());
