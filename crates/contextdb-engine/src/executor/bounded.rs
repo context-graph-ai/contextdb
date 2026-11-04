@@ -19148,7 +19148,9 @@ pub(crate) fn drain_chosen_plan_with_native_trace_refund(
         trace: result_trace,
         cascade: None,
     });
-    let internal_row_id = result.columns.iter().position(|column| column == "row_id");
+    let internal_row_id = (!plan_projects_row_id(plan))
+        .then(|| result.columns.iter().position(|column| column == "row_id"))
+        .flatten();
     if let Some(position) = internal_row_id {
         result.columns.remove(position);
     }
@@ -19543,6 +19545,7 @@ pub(super) fn execute_with_native_trace_refund(
             checked_size_add(plan_bytes, prepaid, "kernel construction adoption")?;
         // The kernel owns its copies now. Free the consumed plan before
         // reconciling kernel capacity, retaining its separate construction credit.
+        let projects_row_id = plan_projects_row_id(&plan);
         drop(plan);
         context.release(plan_bytes)?;
         // Keep adopted credit while the root is alive if admission refuses.
@@ -19580,7 +19583,9 @@ pub(super) fn execute_with_native_trace_refund(
             trace: result_trace,
             cascade: None,
         });
-        let internal_row_id = result.columns.iter().position(|column| column == "row_id");
+        let internal_row_id = (!projects_row_id)
+            .then(|| result.columns.iter().position(|column| column == "row_id"))
+            .flatten();
         if let Some(position) = internal_row_id {
             result.columns.remove(position);
         }
@@ -20962,6 +20967,7 @@ pub(super) fn open_cursor_with_native_trace_refund(
             checked_size_add(plan_bytes, prepaid, "kernel construction adoption")?;
         // The kernel owns its copies now. Free the consumed plan before
         // reconciling kernel capacity, retaining its separate construction credit.
+        let projects_row_id = plan_projects_row_id(&plan);
         drop(plan);
         context.release(plan_bytes)?;
         // Keep adopted credit while the root is alive if admission refuses.
@@ -20974,7 +20980,9 @@ pub(super) fn open_cursor_with_native_trace_refund(
             context.release(construction_bytes - root_bytes)?;
         }
         context.bind_final_trace(&root.trace)?;
-        let internal_row_id = root.columns.iter().position(|column| column == "row_id");
+        let internal_row_id = (!projects_row_id)
+            .then(|| root.columns.iter().position(|column| column == "row_id"))
+            .flatten();
         let (mut visible_columns, visible_column_bytes) =
             clone_strings_with_reservation(&root.columns, &context, "cursor columns")?;
         if let Some(position) = internal_row_id {

@@ -1182,7 +1182,13 @@ impl Database {
         let duration = started.elapsed();
         let outcome = query_outcome_from_result(&result);
         self.plugin.post_query(sql, duration, &outcome);
-        result.map(strip_internal_row_id)
+        result.map(|answer| {
+            if matches!(stmt, Statement::Select(_)) {
+                answer
+            } else {
+                strip_internal_row_id(answer)
+            }
+        })
     }
 
     pub(super) fn execute_event_bus_statement(
