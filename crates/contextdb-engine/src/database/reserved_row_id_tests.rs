@@ -379,3 +379,175 @@ fn cdb_228_select_returns_allocated_ids_after_filter_sort_and_reopen() {
         }
     }
 }
+
+// Challenges 202/203: every schema door refuses the reserved name before
+// publication, and wildcard joins hide identities without losing explicit ids.
+#[test]
+fn cdb_240_r2_rename_refuses_reserved_destination_without_changing_rows() {
+    let store = Store::new();
+    sql(
+        &store.db,
+        "CREATE TABLE renamed (id INTEGER PRIMARY KEY, payload INTEGER)",
+    );
+    sql(&store.db, "INSERT INTO renamed VALUES (9001, 999)");
+    let before = shape(&store.db, "SELECT id, payload FROM renamed").unwrap();
+    let meta = store.db.table_meta("renamed");
+    let lsn = store.db.current_lsn();
+    let result = store
+        .db
+        .execute(
+            "ALTER TABLE renamed RENAME COLUMN payload TO row_id",
+            &HashMap::new(),
+        )
+        .map(|_| ());
+    let live_meta = store.db.table_meta("renamed");
+    let live_rows = shape(&store.db, "SELECT id, payload FROM renamed");
+    let live_lsn = store.db.current_lsn();
+    let store = store.reopen();
+    let durable_meta = store.db.table_meta("renamed");
+    let durable_rows = shape(&store.db, "SELECT id, payload FROM renamed");
+    let durable_lsn = store.db.current_lsn();
+    store.close();
+    reserved_column(result, "renamed");
+    assert_eq!((live_meta, durable_meta), (meta.clone(), meta));
+    assert_eq!(
+        (live_rows.unwrap(), durable_rows.unwrap()),
+        (before.clone(), before)
+    );
+    assert_eq!((live_lsn, durable_lsn), (lsn, lsn));
+}
+
+fn received_vector_alter(column: &str) -> DdlChange {
+    DdlChange::AlterTable {
+        name: "received_reserved".into(),
+        columns: vec![
+            ("id".into(), "INTEGER PRIMARY KEY".into()),
+            (column.into(), "VECTOR(3)".into()),
+        ],
+        constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+        composite_foreign_keys: Vec::new(),
+        composite_unique: Vec::new(),
+    }
+}
+
+#[test]
+fn cdb_240_r2_sync_vector_alter_refuses_reserved_column_atomically() {
+    let store = Store::new();
+    sql(
+        &store.db,
+        "CREATE TABLE received_reserved (id INTEGER PRIMARY KEY)",
+    );
+    sql(&store.db, "INSERT INTO received_reserved VALUES (9001)");
+    let before = shape(&store.db, "SELECT id FROM received_reserved").unwrap();
+    let meta = store.db.table_meta("received_reserved");
+    let lsn = store.db.current_lsn();
+    let result = store
+        .db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![received_vector_alter("row_id")],
+                ddl_lsn: vec![Lsn(90)],
+                ..ChangeSet::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .map(|_| ());
+    let live_meta = store.db.table_meta("received_reserved");
+    let live_rows = shape(&store.db, "SELECT id FROM received_reserved");
+    let live_lsn = store.db.current_lsn();
+    let store = store.reopen();
+    let durable_meta = store.db.table_meta("received_reserved");
+    let durable_rows = shape(&store.db, "SELECT id FROM received_reserved");
+    let durable_lsn = store.db.current_lsn();
+    store.close();
+    reserved_column(result, "received_reserved");
+    assert_eq!((live_meta, durable_meta), (meta.clone(), meta));
+    assert_eq!(
+        (live_rows.unwrap(), durable_rows.unwrap()),
+        (before.clone(), before)
+    );
+    assert_eq!((live_lsn, durable_lsn), (lsn, lsn));
+}
+
+#[test]
+fn cdb_240_r2_typed_received_metadata_refuses_reserved_column() {
+    let store = Store::new();
+    sql(
+        &store.db,
+        "CREATE TABLE received_reserved (id INTEGER PRIMARY KEY)",
+    );
+    // The ordinary-name full vector shape must be accepted by this exact path.
+    store
+        .db
+        .project_received_schema_source_order(&[received_vector_alter("embedding")])
+        .unwrap();
+    let result = store
+        .db
+        .project_received_schema_source_order(&[received_vector_alter("row_id")])
+        .map(|_| ());
+    store.close();
+    reserved_column(result, "received_reserved");
+}
+
+fn joined_store() -> (Store, i64) {
+    let store = Store::new();
+    sql(
+        &store.db,
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, payload TEXT)",
+    );
+    sql(
+        &store.db,
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, other TEXT)",
+    );
+    let tx = store.db.begin().unwrap();
+    let id = store
+        .db
+        .insert_row(
+            tx,
+            "a",
+            HashMap::from([
+                ("id".into(), Value::Int64(9001)),
+                ("payload".into(), Value::Text("left".into())),
+            ]),
+        )
+        .unwrap();
+    store.db.commit(tx).unwrap();
+    sql(&store.db, "INSERT INTO b VALUES (9001, 'right')");
+    (store, i64::try_from(id.0).unwrap())
+}
+
+#[test]
+fn cdb_240_r2_wildcard_join_hides_both_qualified_engine_ids() {
+    let (store, _) = joined_store();
+    let answer = shape(&store.db, "SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
+    store.close();
+    assert_eq!(
+        answer.0,
+        vec!["a.id", "a.payload", "b.id", "b.other"],
+        "wildcard JOIN exposed hidden engine identities"
+    );
+    assert_eq!(
+        answer.1,
+        vec![vec![
+            Value::Int64(9001),
+            Value::Text("left".into()),
+            Value::Int64(9001),
+            Value::Text("right".into())
+        ]]
+    );
+}
+
+#[test]
+fn cdb_228_r2_explicit_qualified_join_id_is_the_stored_identity() {
+    let (store, stored) = joined_store();
+    assert_ne!(stored, 9001);
+    let live = shape(&store.db, "SELECT a.row_id FROM a JOIN b ON a.id = b.id").unwrap();
+    let store = store.reopen();
+    let durable = shape(&store.db, "SELECT a.row_id FROM a JOIN b ON a.id = b.id").unwrap();
+    store.close();
+    assert_eq!(live.0.len(), 1);
+    assert!(matches!(live.0[0].as_str(), "row_id" | "a.row_id"));
+    assert_eq!(live.1, vec![vec![Value::Int64(stored)]]);
+    assert_eq!(durable, live);
+}
