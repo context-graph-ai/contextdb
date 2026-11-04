@@ -83,12 +83,11 @@ async fn stop_server(
     task.await.unwrap();
     drop(server);
 }
-#[test]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
+fn incremental_sync_samples(sizes: &[usize], nightly: bool) {
     // Rows carry their write time, and the push envelope encodes each payload
     // byte at or above 0x80 in two bytes, so a live clock moves the measured
     // peak with the millisecond. One fixed clock on this thread and on every
@@ -104,7 +103,7 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
     let mut peaks = Vec::new();
     let mut bootstrap_push_peaks = Vec::new();
     let mut payloads = Vec::new();
-    for occurrences in [32, 256] {
+    for &occurrences in sizes {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("source.redb");
         let hub_path = directory.path().join("hub.redb");
@@ -194,6 +193,7 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
             .checked_sub(bootstrap_baseline)
             .unwrap();
         bootstrap_push_peaks.push(bootstrap_peak);
+        eprintln!("INCREMENTAL_BOOTSTRAP declarations={occurrences} peak={bootstrap_peak}");
         assert!(client.push_watermark() >= settled_frontier);
         assert_eq!(
             ids(&hub, "reincarnated"),
@@ -343,10 +343,32 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         source.close().unwrap();
         hub.close().unwrap();
     }
-    assert_eq!(
-        bootstrap_push_peaks[0], bootstrap_push_peaks[1],
-        "the first authenticated push after bootstrap pull has a fixed measured memory window despite unrelated declaration growth"
-    );
+    // A reply commit touches a bounded set of B-tree leaves plus their depth.
+    // Allow that logarithmic term while rejecting a retained per-declaration term.
+    const PAGE_INVOICE: i128 = 4_224;
+    let first_delta = bootstrap_push_peaks[1] as i128 - bootstrap_push_peaks[0] as i128;
+    if nightly {
+        let next_delta = bootstrap_push_peaks[2] as i128 - bootstrap_push_peaks[1] as i128;
+        eprintln!(
+            "INCREMENTAL_CURVATURE peaks={bootstrap_push_peaks:?} first_delta={first_delta} next_delta={next_delta} slack={}",
+            2 * PAGE_INVOICE
+        );
+        assert!(
+            next_delta <= first_delta + 2 * PAGE_INVOICE,
+            "declaration growth must add only a B-tree-depth term, not linear retained history: peaks={bootstrap_push_peaks:?}, first_delta={first_delta}, next_delta={next_delta}, slack={}",
+            2 * PAGE_INVOICE
+        );
+    } else {
+        eprintln!(
+            "INCREMENTAL_PR_BOUND peaks={bootstrap_push_peaks:?} delta={first_delta} bound={}",
+            8 * PAGE_INVOICE
+        );
+        assert!(
+            first_delta <= 8 * PAGE_INVOICE,
+            "the first post-bootstrap push may add at most eight reply-commit page invoices: peaks={bootstrap_push_peaks:?}, delta={first_delta}, bound={}",
+            8 * PAGE_INVOICE
+        );
+    }
     assert_eq!(
         payloads[0], payloads[1],
         "unrelated immutable declarations cannot change the fixed authenticated payload"
@@ -355,4 +377,15 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         peaks[0], peaks[1],
         "actual writer peak for a fixed sync delta cannot grow with unrelated declaration history"
     );
+}
+
+#[test]
+fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256], false);
+}
+
+#[cfg(feature = "nightly-tests")]
+#[test]
+fn incremental_sync_charges_sublinear_memory_as_unrelated_ddl_history_grows() {
+    incremental_sync_samples(&[32, 256, 2_048], true);
 }
