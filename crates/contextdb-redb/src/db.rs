@@ -3860,12 +3860,16 @@ impl ReadCacheObservation {
 #[cfg(test)]
 mod allocator_save_check_contract {
     use super::{Builder, Database, ReadOnlyDatabase, TransactionGuard};
-    use crate::transactions::{ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey};
-    use crate::tree_store::{PageHint, TableTree, TableType, TransactionalMemory};
+    use crate::transactions::{
+        ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTreeMut,
+    };
+    use crate::tree_store::{
+        BtreeMut, PageHint, PageTrackerPolicy, TableTree, TableType, TransactionalMemory,
+    };
     use crate::{DatabaseError, ReadableDatabase, TableDefinition};
     use std::path::Path;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     const ROWS: TableDefinition<u64, &[u8]> = TableDefinition::new("save_check_rows");
     /// One row per leaf page, so freeing rows frees single pages.
@@ -3889,11 +3893,29 @@ mod allocator_save_check_contract {
         (db, repaired.load(Ordering::SeqCst))
     }
 
-    /// Rows `0..ROW_COUNT`, then the rows `removed` deleted and their pages
-    /// reclaimed, so region 0 holds free single pages where those rows were.
+    /// Rows `0..ROW_COUNT` in one region, then the rows `removed` deleted
+    /// and their pages reclaimed, so region 0 holds free single pages where
+    /// those rows were.
     fn fixture(path: &Path, removed: impl Iterator<Item = u64>) -> Database {
-        let db = Builder::new().create(path).expect("create fixture");
-        for batch in 0..ROW_COUNT / 500 {
+        let db = build_fixture(Builder::new(), path, ROW_COUNT, removed);
+        assert_eq!(
+            db.mem.region_count_for_test(),
+            1,
+            "fixture must stay in one region"
+        );
+        db
+    }
+
+    /// Rows `0..rows` in stores made by `builder`, then the rows `removed`
+    /// deleted and their pages reclaimed; every summary starts exact.
+    fn build_fixture(
+        builder: Builder,
+        path: &Path,
+        rows: u64,
+        removed: impl Iterator<Item = u64>,
+    ) -> Database {
+        let db = builder.create(path).expect("create fixture");
+        for batch in 0..rows / 500 {
             let write = db.begin_write().unwrap();
             {
                 let mut table = write.open_table(ROWS).unwrap();
@@ -3916,11 +3938,6 @@ mod allocator_save_check_contract {
         assert!(
             db.mem.uses_paged_allocator(),
             "fixture must use the paged allocator"
-        );
-        assert_eq!(
-            db.mem.region_count_for_test(),
-            1,
-            "fixture must stay in one region"
         );
         assert!(
             db.mem.summary_mismatches_for_test().is_empty(),
@@ -4129,20 +4146,41 @@ mod allocator_save_check_contract {
         );
     }
 
-    /// The running writer: a summary that hides region 0's free pages makes
-    /// an allocation fail and the writer learn the region as full and grow.
-    /// The next quick-repair commit refuses the save and rebuilds the summary
-    /// and the region tracker, and a later write on the same handle reuses the
-    /// recovered pages without growing the file and without a reopen.
+    /// Region size of the running-writer store: 4 MiB, 1,024 pages, so its
+    /// rows span several regions and region 0 is not the last one.
+    const SMALL_REGION_BYTES: u64 = 4 << 20;
+    /// Rows the reuse write adds; each needs at least one new leaf page.
+    const REUSED_ROWS: u64 = 200;
+
+    /// The running writer: region 0, which is not the last region, holds
+    /// free pages its summary hides. A write cannot allocate there, so the
+    /// writer learns region 0 as full and allocates elsewhere. A reader held
+    /// throughout keeps every later free pending, so nothing frees a page
+    /// into region 0, and growth of the last region never re-marks it. The
+    /// next quick-repair commit refuses the save and rebuilds; the next
+    /// write on the same handle must then take its pages from region 0's
+    /// recovered space, without growing the file and without a reopen.
     #[test]
     fn the_running_writer_reuses_space_a_refused_save_recovered() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("running.redb");
-        let db = fixture(&path, (200..4200).step_by(2));
-        let hidden = db.mem.region_free_pages_for_test(0);
-        assert!(hidden > 1500, "fixture must free many pages: {hidden}");
+        let mut builder = Builder::new();
+        builder.set_region_size(SMALL_REGION_BYTES);
+        let db = build_fixture(builder, &path, ROW_COUNT, (100..900).step_by(2));
+        let regions = db.mem.region_count_for_test();
+        assert!(
+            regions >= 2,
+            "fixture: region 0 must not be the last region ({regions} regions)"
+        );
+        let hidden = db.mem.region_counted_free_pages_for_test(0);
+        assert!(
+            u64::from(hidden) >= REUSED_ROWS + 100,
+            "fixture: region 0 must hold the freed pages: {hidden}"
+        );
+        // Every free from here on stays pending while this reader is open.
+        let reader = db.begin_read().unwrap();
 
-        // Hide every word that holds a free block, at every order.
+        // Hide every word of region 0 that holds a free block, at every order.
         for order in 0..=db.mem.region_max_order_for_test(0) {
             let levels = db.mem.summary_levels_for_test(0, order);
             if levels.len() < 2 {
@@ -4157,8 +4195,7 @@ mod allocator_save_check_contract {
             }
         }
 
-        // The writer finds no free page, learns region 0 as full, and grows.
-        let before_learning = db.mem.layout_len_for_test();
+        // The writer finds no free page in region 0 and learns it as full.
         let write = db.begin_write().unwrap();
         write
             .open_table(ROWS)
@@ -4166,10 +4203,14 @@ mod allocator_save_check_contract {
             .insert(ROW_COUNT, value(ROW_COUNT).as_slice())
             .unwrap();
         write.commit().unwrap();
-        let learned = db.mem.layout_len_for_test();
+        assert_eq!(
+            db.mem.region_counted_free_pages_for_test(0),
+            hidden,
+            "fixture: the write allocated from the hidden region"
+        );
         assert!(
-            learned > before_learning,
-            "fixture: the hidden region must make the writer grow"
+            db.mem.region_marked_full_for_test(0, 0),
+            "fixture: the writer did not learn region 0 as full"
         );
 
         // The quick-repair commit refuses the save and rebuilds.
@@ -4178,22 +4219,87 @@ mod allocator_save_check_contract {
             !allocator_table_present(&db.mem),
             "the hiding summary was saved"
         );
+        assert!(
+            db.mem.summary_mismatches_for_test().is_empty(),
+            "the refused save left region summaries inexact: {:?}",
+            db.mem.summary_mismatches_for_test()
+        );
+        assert_eq!(
+            db.mem.region_counted_free_pages_for_test(0),
+            hidden,
+            "fixture: a page was freed into or taken from region 0 before the reuse write"
+        );
         let after_refusal = db.mem.layout_len_for_test();
 
-        // A write of well over the growth slack but under the recovered space.
+        // The next write takes its new pages from region 0.
         let write = db.begin_write().unwrap();
         {
             let mut table = write.open_table(ROWS).unwrap();
-            for key in ROW_COUNT + 2..ROW_COUNT + 2 + u64::from(hidden) / 2 {
+            for key in ROW_COUNT + 2..ROW_COUNT + 2 + REUSED_ROWS {
                 table.insert(key, value(key).as_slice()).unwrap();
             }
         }
         write.commit().unwrap();
+        let reused = hidden - db.mem.region_counted_free_pages_for_test(0);
+        assert!(
+            u64::from(reused) >= REUSED_ROWS,
+            "the running writer took {reused} of region 0's {hidden} recovered pages for \
+             {REUSED_ROWS} new rows: region 0 is still learned as full"
+        );
         assert_eq!(
             db.mem.layout_len_for_test(),
             after_refusal,
-            "the writer grew the file while the rebuilt allocator held {hidden} recovered free pages"
+            "the writer grew the file while region 0 held {hidden} recovered free pages"
         );
         assert!(db.mem.summary_mismatches_for_test().is_empty());
+        drop(reader);
+    }
+
+    /// Rows of the save-cost store: about 60,000 pages in one region.
+    const MEASURED_ROWS: u64 = 60_000;
+
+    /// A measurement, not a gate: allocator window loads and word reads of
+    /// the production allocator save, `try_save_allocator_state` with its
+    /// summary check, on a fragmented one-region store at the minimum
+    /// window budget. The save must report success, so the check passed.
+    /// Run with `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_the_checked_allocator_save_at_the_minimum_window_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("measured.redb");
+        let db = build_fixture(
+            Builder::new(),
+            &path,
+            MEASURED_ROWS,
+            (0..MEASURED_ROWS).filter(|key| key % 7 == 3),
+        );
+        db.mem.set_allocator_window_budget_for_test(0);
+        let mut tree: AllocatorStateTreeMut = BtreeMut::new(
+            None,
+            Arc::new(TransactionGuard::fake()),
+            db.mem.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(PageTrackerPolicy::Ignore)),
+        );
+        let transaction_id = db.mem.get_last_committed_transaction_id().unwrap().next();
+        let regions = db
+            .mem
+            .reserve_allocator_state(&mut tree, transaction_id)
+            .unwrap();
+        let before = db.mem.allocator_paging_counters_for_test();
+        let outcome = format!("{:?}", db.mem.try_save_allocator_state(&mut tree, regions));
+        let after = db.mem.allocator_paging_counters_for_test();
+        assert!(
+            matches!(outcome.as_str(), "Ok(true)" | "Ok(Saved)"),
+            "the checked save of an exact allocator did not save: {outcome}"
+        );
+        println!(
+            "ALLOCATOR-SAVE regions={regions} layout_len={} free_pages={} outcome={outcome} (word_reads, window_loads, scratch_reads): save={:?}",
+            db.mem.layout_len_for_test(),
+            db.mem.region_counted_free_pages_for_test(0),
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+        );
+        drop(tree);
     }
 }

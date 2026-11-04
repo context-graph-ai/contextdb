@@ -3344,7 +3344,7 @@ impl TransactionalMemory {
             .get_max_order()
     }
 
-    pub(crate) fn region_free_pages_for_test(&self, region: u32) -> u32 {
+    pub(crate) fn region_counted_free_pages_for_test(&self, region: u32) -> u32 {
         self.state
             .lock()
             .unwrap()
@@ -3359,6 +3359,37 @@ impl TransactionalMemory {
 
     pub(crate) fn region_count_for_test(&self) -> u32 {
         self.state.lock().unwrap().header.layout().num_regions()
+    }
+
+    /// Whether the region tracker holds `region` as full at `order`.
+    pub(crate) fn region_marked_full_for_test(&self, region: u32, order: u8) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .region_tracker
+            .marked_full_for_test(order, region)
+    }
+
+    /// Shrink the allocator's resident window budget, spilling to scratch.
+    pub(crate) fn set_allocator_window_budget_for_test(&self, bytes: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .set_window_budget(bytes)
+            .unwrap();
+    }
+
+    /// The allocator pager's `(word reads, window loads, scratch reads)`.
+    pub(crate) fn allocator_paging_counters_for_test(&self) -> (u64, u64, u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .pager()
+            .expect("the paged allocator")
+            .counters_for_test()
     }
 }
 
@@ -3425,7 +3456,21 @@ mod saved_allocator_install_contract {
         }
     }
 
+    /// The saved-value header request of the `SavedBitmapWindow` interface:
+    /// asked for a region at this order (height 0, page 0), the source
+    /// writes the value's fixed header, its maximum order and its saved
+    /// page count, into the window's first `SAVED_HEADER_BYTES` bytes. The
+    /// install reads the saved length from it.
+    const SAVED_HEADER_ORDER: u8 = u8::MAX;
+    const SAVED_HEADER_BYTES: usize = 8;
+
     fn region_window(bytes: &[u8], order: u8, height: u8, page: u32, out: &mut [u8; 4096]) {
+        if order == SAVED_HEADER_ORDER {
+            if height == 0 && page == 0 {
+                out[..SAVED_HEADER_BYTES].copy_from_slice(&bytes[..SAVED_HEADER_BYTES]);
+            }
+            return;
+        }
         let max_order = bytes[0];
         if order > max_order {
             return;
@@ -3440,6 +3485,9 @@ mod saved_allocator_install_contract {
 
     fn tracker_window(bytes: &[u8], order: u8, height: u8, page: u32, out: &mut [u8; 4096]) {
         let orders = u32_at(bytes, 0);
+        if usize::from(order) >= orders {
+            return;
+        }
         let mut start = 4 + orders * 4;
         for earlier in 0..usize::from(order) {
             start += u32_at(bytes, 4 + earlier * 4);
@@ -3668,13 +3716,14 @@ mod saved_allocator_install_contract {
         exact(&mut state, "after growth on the materialised allocator");
     }
 
-    /// A measurement, not a gate: window loads and word
-    /// reads of encoding one fragmented full region at the minimum window
-    /// budget (the save's encode), and of installing it under a shorter
-    /// geometry and building the view. Run with `--ignored --nocapture`.
+    /// A measurement, not a gate: allocator window loads and word reads, at
+    /// the minimum window budget, of a fragmented full region's trim to a
+    /// 32-page-shorter length, of installing its saved state under that
+    /// length, and of the first full free count over the installed view,
+    /// each in its own interval. Run with `--ignored --nocapture`.
     #[test]
     #[ignore = "measurement"]
-    fn measure_save_encode_and_install_paging() {
+    fn measure_trim_and_install_paging() {
         let pages = (MAX_PAGE_INDEX + 1).min(1 << 20);
         let scratch = crate::scratch_backend_in_directory(&std::env::temp_dir()).unwrap();
         let mut state = InMemoryState::new(
@@ -3698,22 +3747,37 @@ mod saved_allocator_install_contract {
         for page in pages - 64..pages {
             state.allocators.get_region_mut(0).free(page, 0);
         }
+        let saved = save(&mut state);
         state.allocators.set_window_budget(0).unwrap();
         let counters =
             |state: &InMemoryState| state.allocators.pager().unwrap().counters_for_test();
+        let delta = |a: (u64, u64, u64), b: (u64, u64, u64)| (b.0 - a.0, b.1 - a.1, b.2 - a.2);
         let before = counters(&state);
-        let saved = save(&mut state);
-        let after_encode = counters(&state);
-        trim_then_install(&mut state, &saved, pages - 32);
+        state.allocators.resize_to(layout(pages - 32)).unwrap();
+        let after_trim = counters(&state);
+        let (region, tracker) = (Arc::clone(&saved.region), Arc::clone(&saved.tracker));
+        state
+            .allocators
+            .set_saved_source(Arc::new(
+                move |which, order, height, page, out| -> io::Result<bool> {
+                    out.fill(0xFF);
+                    match which {
+                        Some(0) => region_window(&region, order, height, page, out),
+                        Some(_) => return Ok(false),
+                        None => tracker_window(&tracker, order, height, page, out),
+                    }
+                    Ok(true)
+                },
+            ))
+            .unwrap();
         let after_install = counters(&state);
         let _ = state.allocators.get_region(0).count_free_pages();
         let after_view = counters(&state);
-        let delta = |a: (u64, u64, u64), b: (u64, u64, u64)| (b.0 - a.0, b.1 - a.1, b.2 - a.2);
         println!(
-            "ALLOCATOR-PAGING pages={pages} encoded_bytes={} (word_reads, window_loads, scratch_reads): encode={:?} install={:?} first_full_count={:?}",
+            "ALLOCATOR-PAGING pages={pages} encoded_bytes={} (word_reads, window_loads, scratch_reads): trim={:?} install={:?} first_full_count={:?}",
             saved.region.len(),
-            delta(before, after_encode),
-            delta(after_encode, after_install),
+            delta(before, after_trim),
+            delta(after_trim, after_install),
             delta(after_install, after_view),
         );
     }

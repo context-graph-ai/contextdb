@@ -23,6 +23,16 @@ pub(super) type SavedBitmapWindow =
     dyn Fn(Option<u32>, u8, u8, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
 type PagedBaseLoader = dyn Fn(u64, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
 
+// Test-only inspection of the region tracker.
+#[cfg(test)]
+impl RegionTracker {
+    /// Whether the tracker holds `region` as full at `order`, so allocation
+    /// of that order skips it.
+    pub(crate) fn marked_full_for_test(&self, order: u8, region: u32) -> bool {
+        self.order_trackers[usize::from(order)].get(region)
+    }
+}
+
 // Tracks the page orders that MAY BE free in each region. This data structure is optimistic, so
 // a region may not actually have a page free for a given order
 pub(crate) struct RegionTracker {
