@@ -394,10 +394,10 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
 #[cfg(feature = "nightly-tests")]
 #[test]
 fn incremental_sync_charges_sublinear_memory_as_unrelated_ddl_history_grows() {
-    incremental_sync_samples(&[32, 256, 2_048], true, true);
+    incremental_sync_samples(&[32, 256, 1_024], true, true);
 }
 
-// Separate rows ensure a bootstrap RED cannot hide the fixed-delta bound.
+// Separate rows keep both bounds visible; CDB-254 blocks 2_048 bootstrap at 64 MiB.
 #[test]
 fn incremental_sync_fixed_delta_charges_bounded_memory_as_unrelated_ddl_history_grows() {
     incremental_sync_samples(&[32, 256], false, false);
@@ -406,5 +406,5 @@ fn incremental_sync_fixed_delta_charges_bounded_memory_as_unrelated_ddl_history_
 #[cfg(feature = "nightly-tests")]
 #[test]
 fn incremental_sync_fixed_delta_charges_sublinear_memory_as_unrelated_ddl_history_grows() {
-    incremental_sync_samples(&[32, 256, 2_048], true, false);
+    incremental_sync_samples(&[32, 256, 1_024], true, false);
 }

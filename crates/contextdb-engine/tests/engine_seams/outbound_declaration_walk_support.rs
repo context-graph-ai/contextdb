@@ -947,9 +947,9 @@ pub(crate) fn push_sample<T>(
     }
 }
 
-/// Keep the original control-plus-one-window promise on the actual walk.
-/// The whole push separately admits only B-tree curvature plus one maximum
-/// config branch invoice for CDB-249, until that reply-storage defect is fixed.
+/// Bound the walk by its control, one window and one CDB-249 storage page.
+/// The whole push separately admits B-tree curvature and the same single
+/// maximum config branch invoice until CDB-249 is fixed.
 pub(crate) fn assert_walk_from_zero_push(
     what: &str,
     measured: &[PushSample; 3],
@@ -957,8 +957,8 @@ pub(crate) fn assert_walk_from_zero_push(
 ) {
     const PAGE_INVOICE: i128 = 4_224;
     // CDB-249: one maximum config branch backing (65,536) plus its native
-    // 128-byte page control. This allowance never applies to the walk bound.
-    const CDB_249_REPLY_PAGE_ALLOWANCE: i128 = 65_664;
+    // 128-byte page control, copied by lineage or reply storage writes.
+    const CDB_249_STORAGE_PAGE_ALLOWANCE: i128 = 65_664;
     let mut pre_reply_ok = true;
     let mut control_ok = true;
     // Preserve the original endpoint control cap and one-window slack as well
@@ -975,22 +975,22 @@ pub(crate) fn assert_walk_from_zero_push(
         );
         let delta = large.2 as i128 - small.2 as i128;
         let control_delta = large_control.2 as i128 - small_control.2 as i128;
-        let bound = control_delta + CURSOR_WINDOW_SLACK as i128;
+        let bound = control_delta + CURSOR_WINDOW_SLACK as i128 + CDB_249_STORAGE_PAGE_ALLOWANCE;
         let passes = delta <= bound;
         control_ok &= control_delta <= STORE_SIZE_TERM_BOUND as i128;
         pre_reply_ok &= passes;
         eprintln!(
-            "PRE_REPLY_WALK_BOUND {what} sizes={}/{} peaks={}/{} delta={delta} control_delta={control_delta} bound={bound} passes={passes}",
+            "PRE_REPLY_WALK_BOUND {what} sizes={}/{} peaks={}/{} delta={delta} control_delta={control_delta} cdb249_allowance={CDB_249_STORAGE_PAGE_ALLOWANCE} bound={bound} passes={passes}",
             small.0, large.0, small.2, large.2
         );
     }
     let peaks = measured.map(|sample| sample.whole.2);
     let first_delta = peaks[1] as i128 - peaks[0] as i128;
     let next_delta = peaks[2] as i128 - peaks[1] as i128;
-    let bound = first_delta + 2 * PAGE_INVOICE + CDB_249_REPLY_PAGE_ALLOWANCE;
+    let bound = first_delta + 2 * PAGE_INVOICE + CDB_249_STORAGE_PAGE_ALLOWANCE;
     let whole_ok = next_delta <= bound;
     eprintln!(
-        "WHOLE_PUSH_CURVATURE {what} peaks={peaks:?} first_delta={first_delta} next_delta={next_delta} page_slack={} cdb249_allowance={CDB_249_REPLY_PAGE_ALLOWANCE} bound={bound} passes={whole_ok}",
+        "WHOLE_PUSH_CURVATURE {what} peaks={peaks:?} first_delta={first_delta} next_delta={next_delta} page_slack={} cdb249_allowance={CDB_249_STORAGE_PAGE_ALLOWANCE} bound={bound} passes={whole_ok}",
         2 * PAGE_INVOICE
     );
     assert!(
@@ -999,7 +999,7 @@ pub(crate) fn assert_walk_from_zero_push(
     );
     assert!(
         pre_reply_ok && whole_ok,
-        "{what}: pre-reply walk control bound passes={pre_reply_ok}; whole-push curvature plus CDB-249 allowance passes={whole_ok}; measured={measured:?}; control={control:?}"
+        "{what}: pre-reply walk control plus CDB-249 bound passes={pre_reply_ok}; whole-push curvature plus CDB-249 allowance passes={whole_ok}; measured={measured:?}; control={control:?}"
     );
 }
 

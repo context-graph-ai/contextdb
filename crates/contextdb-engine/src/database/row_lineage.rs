@@ -4109,10 +4109,16 @@ impl Database {
             && pending.is_none()
             && let Some(through) = confirmed_through
         {
-            self.publish_direct_metadata(|| persistence.flush_sync_progress_value(
-                &tenant_id.config_key("sync_push_watermark"),
-                &through.0,
-            ))?;
+            self.publish_direct_metadata(|| {
+                #[cfg(feature = "test-seams")]
+                crate::outbound_ddl_test_seams::note_pre_reply_high_water(
+                    self.accountant.high_water_for_test(),
+                );
+                persistence.flush_sync_progress_value(
+                    &tenant_id.config_key("sync_push_watermark"),
+                    &through.0,
+                )
+            })?;
             return Ok(());
         }
         self.tx_mgr.with_maintenance_publication(|publication| {
