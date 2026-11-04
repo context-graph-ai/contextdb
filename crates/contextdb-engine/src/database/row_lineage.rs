@@ -3377,6 +3377,19 @@ impl Database {
         since_lsn: Lsn,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DurablePendingDelete>> {
+        self.durable_pending_deletes_since_selected(since_lsn, false, read_memory)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn durable_pending_deletes_since_selected(
+        &self,
+        since_lsn: Lsn,
+        outbound: bool,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Vec<DurablePendingDelete>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let lineage_state = self.lineage_state_lock.lock();
@@ -3387,6 +3400,15 @@ impl Database {
                 != self.durable_lineage_table_generation(&record.table, read_memory.clone())?
                 || record.delete_obligation != DurableDeleteObligation::Pending
                 || record.delete_lsn <= since_lsn.0
+            {
+                continue;
+            }
+            if outbound
+                && !self.outbound_direction_includes(
+                    &record.table,
+                    Lsn(record.delete_lsn),
+                    read_memory.clone(),
+                )?
             {
                 continue;
             }
@@ -3521,10 +3543,28 @@ impl Database {
         projection: &ChangeProjection<'_>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Vec<DurablePendingDelete>> {
+        self.durable_pending_deletes_selected(since_lsn, projection, false, read_memory)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn durable_pending_deletes_selected(
+        &self,
+        since_lsn: Lsn,
+        projection: &ChangeProjection<'_>,
+        outbound: bool,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Vec<DurablePendingDelete>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let Some(startup) = self.committed_image_startup.as_ref() else {
-            let pending = self.durable_pending_deletes_since(since_lsn, read_memory.clone())?;
+            let pending = self.durable_pending_deletes_since_selected(
+                since_lsn,
+                outbound,
+                read_memory.clone(),
+            )?;
             if projection.bounded {
                 (projection.admit)(
                     pending
@@ -3596,6 +3636,15 @@ impl Database {
                 if record.table_generation != generation
                     || record.delete_obligation != DurableDeleteObligation::Pending
                     || record.delete_lsn <= since_lsn.0
+                {
+                    return Ok(());
+                }
+                if outbound
+                    && !self.outbound_direction_includes(
+                        &record.table,
+                        Lsn(record.delete_lsn),
+                        read_memory.clone(),
+                    )?
                 {
                     return Ok(());
                 }

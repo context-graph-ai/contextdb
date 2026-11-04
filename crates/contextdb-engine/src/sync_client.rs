@@ -2124,19 +2124,15 @@ impl SyncClient {
 
         let _schema_read = self.db.enter_outbound_sync_schema_read();
         let since = self.push_watermark.load(Ordering::SeqCst);
-        let (changes, _, ddl_provenance_source) = self.db.checked_changes_since_with_arrivals(
-            since,
-            vector_copy_owner,
-            read_memory.clone(),
-            selection_credit,
-            None,
-        )?;
-        let history = self
-            .db
-            .try_sync_direction_history_for_changes(&changes, read_memory.clone())?;
-        let changes = changes
-            .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
         let reupload_epoch = self.destination_reupload_epoch()?;
+        let (changes, _, ddl_provenance_source) =
+            self.db.checked_outbound_changes_since_with_arrivals(
+                since,
+                vector_copy_owner,
+                read_memory.clone(),
+                selection_credit,
+                reupload_epoch.map(|(through, _)| through),
+            )?;
         let changes = self.db.filter_outbound_received_ddl(
             changes,
             &ddl_provenance_source,
@@ -3423,18 +3419,14 @@ impl SyncClient {
         }
         let schema_read = self.db.enter_outbound_sync_schema_read();
         refuse_keyless_tables_with_no_identity_fallback(&self.db, &HashMap::new())?;
-        let (changeset, _, ddl_provenance_source) = self.db.checked_changes_since_with_arrivals(
-            since,
-            vector_copy_owner,
-            unit_memory.clone(),
-            &mut selection_credit,
-            None,
-        )?;
-        let history = self
-            .db
-            .try_sync_direction_history_for_changes(&changeset, unit_memory.clone())?;
-        let changeset = changeset
-            .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
+        let (changeset, _, ddl_provenance_source) =
+            self.db.checked_outbound_changes_since_with_arrivals(
+                since,
+                vector_copy_owner,
+                unit_memory.clone(),
+                &mut selection_credit,
+                destination_reupload_epoch.map(|(through, _)| through),
+            )?;
         let changeset = self.db.filter_outbound_received_ddl(
             changeset,
             &ddl_provenance_source,

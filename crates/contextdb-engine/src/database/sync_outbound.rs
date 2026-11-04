@@ -1193,6 +1193,159 @@ impl Database {
         })
     }
 
+    /// Outbound selection validates every occurrence but only funds history
+    /// it can send. A dropped group owns no collection, even for a large commit.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn outbound_ddl_entries_since(
+        &self,
+        since: Lsn,
+        frontier: Option<Lsn>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<writer_read::DdlHistory> {
+        let (_, root) = self.capture_writer_statement()?;
+        let Some(root) = root else {
+            return self.ddl_log_entries_since_unlocked(since, read_memory);
+        };
+        if since >= root.lsn {
+            return Ok(Vec::new().into());
+        }
+        let mut cursor = root.ddl_history_cursor(
+            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+            since,
+        )?;
+        let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let mut entries = Vec::new();
+        let mut group_lsn = None;
+        let mut ordinal = 0_u32;
+        let mut any_received = false;
+        let mut all_received = true;
+        let mut any_superseded = false;
+        let mut all_superseded = true;
+        let mut drop_group = false;
+        while let Some(window) = cursor.next_ddl_history()? {
+            let (lsn, ddl) = window.value;
+            if group_lsn != Some(lsn) {
+                Self::validate_outbound_ddl_group(
+                    any_received,
+                    all_received,
+                    any_superseded,
+                    all_superseded,
+                )?;
+                group_lsn = Some(lsn);
+                ordinal = 0;
+                any_received = false;
+                all_received = true;
+                any_superseded = false;
+                all_superseded = true;
+            }
+            let entry = SourceDdlIdentity {
+                ddl,
+                source_lsn: lsn,
+                ordinal,
+            };
+            let received = self.received_ddl_arrival_mark(&entry, read_memory.clone())?;
+            let superseded = self.superseded_ddl_occurrence_mark(&entry, read_memory.clone())?;
+            if ordinal == 0 {
+                drop_group = received && frontier.is_none_or(|frontier| lsn > frontier);
+            }
+            any_received |= received;
+            all_received &= received;
+            any_superseded |= superseded;
+            all_superseded &= superseded;
+            ordinal = ordinal.saturating_add(1);
+            if !drop_group {
+                output.try_grow_for(
+                    answer_list_entry_bytes::<(Lsn, DdlChange)>(entry.ddl.estimated_bytes()),
+                    "writer_source",
+                    "declaration_history_output",
+                    "Raise MEMORY_LIMIT to return declaration history.",
+                )?;
+                entries.push((lsn, entry.ddl));
+            }
+        }
+        Self::validate_outbound_ddl_group(
+            any_received,
+            all_received,
+            any_superseded,
+            all_superseded,
+        )?;
+        Ok(writer_read::DdlHistory {
+            entries,
+            memory: Some(output),
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn validate_outbound_ddl_group(
+        any_received: bool,
+        all_received: bool,
+        any_superseded: bool,
+        all_superseded: bool,
+    ) -> Result<()> {
+        if any_received && !all_received {
+            return Err(Error::SyncError(
+                "received DDL arrival evidence marks only part of one local schema commit"
+                    .to_string()
+                    .into(),
+            ));
+        }
+        if any_superseded && !all_superseded {
+            return Err(Error::SyncError(
+                "superseded DDL evidence marks only part of one local schema commit"
+                    .to_string()
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Same source-LSN declaration and missing-declaration default as
+    /// filter_by_direction_history. Rows, vectors and pending deletes all use
+    /// this predicate before retaining output; no per-row policy cache exists.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn outbound_direction_includes(
+        &self,
+        table: &str,
+        lsn: Lsn,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<bool> {
+        let include = &[SyncDirection::Push, SyncDirection::Both];
+        let Some(root) = self.writer_read_root()? else {
+            return Ok(self
+                .try_sync_direction_history(read_memory)?
+                .includes(table, lsn, include));
+        };
+        // The checkpoint also carries schema bytes and its DDL key. They
+        // are temporary lookup state, never retained per walked row.
+        let memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+            (*self.finalization.accountant).clone(),
+            read_memory.clone(),
+            "writer_source",
+            "cursor_window",
+            "Raise MEMORY_LIMIT to admit this writer cursor window.",
+        );
+        let direction = memory
+            .scope(|| {
+                RedbPersistence::declared_direction_in_read(
+                    &root,
+                    &crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+                    table,
+                    Some(lsn),
+                )
+            })?
+            .unwrap_or(SyncDirection::Both);
+        Ok(include.contains(&direction))
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -5761,6 +5914,51 @@ impl Database {
                 table_generation,
             });
         }
+        self.historical_ddl_generation_sidecar(entry, read_memory)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn with_historical_ddl_generation_sidecar<T>(
+        &self,
+        entry: &SourceDdlIdentity,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        visit: impl FnOnce(&DurableDdlGenerationSidecar) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(root) = self.writer_read_root()? {
+            let sidecar = root
+                .config_point::<DurableDdlGenerationSidecar>(
+                    crate::persistence::writer_source::SourceWindowOwner::Read(read_memory),
+                    &Self::durable_ddl_generation_sidecar_key(entry.source_lsn, entry.ordinal),
+                )?
+                .ok_or_else(|| Self::missing_ddl_generation_evidence(entry))?;
+            return visit(&sidecar.value);
+        }
+        let sidecar = self.historical_ddl_generation_sidecar(entry, read_memory)?;
+        visit(&sidecar)
+    }
+
+    fn missing_ddl_generation_evidence(entry: &SourceDdlIdentity) -> Error {
+        Error::SyncError(
+            format!(
+                "DDL at source LSN {} ordinal {} lacks immutable generation evidence",
+                entry.source_lsn.0, entry.ordinal,
+            )
+            .into(),
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn historical_ddl_generation_sidecar(
+        &self,
+        entry: &SourceDdlIdentity,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<DurableDdlGenerationSidecar> {
         self.recorded_ddl_generation_sidecar(entry.source_lsn, entry.ordinal)?
             .ok_or_else(|| {
                 Error::SyncError(
@@ -5863,6 +6061,104 @@ impl Database {
         canonical
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn received_ddl_arrival_mark(
+        &self,
+        entry: &SourceDdlIdentity,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<bool> {
+        let key = (entry.source_lsn, entry.ordinal);
+        self.with_received_ddl_arrival(
+            key,
+            |arrival| {
+                Ok(if let Some(arrival) = arrival {
+                    let raw_ddl = self.raw_ddl_log_occurrence(
+                        entry.source_lsn,
+                        entry.ordinal,
+                        read_memory.clone(),
+                    )?;
+                    self.with_historical_ddl_generation_sidecar(
+                        entry,
+                        read_memory.clone(),
+                        |sidecar| {
+                            let expected = Self::canonical_local_ddl_arrival_digest(
+                                &raw_ddl,
+                                entry.source_lsn,
+                                entry.ordinal,
+                                sidecar,
+                            )?;
+                            if arrival.local_lsn != entry.source_lsn
+                                || arrival.persisted_ordinal != entry.ordinal
+                                || arrival.digest != expected
+                            {
+                                return Err(Error::SyncError((
+                            "received DDL arrival digest does not bind its local schema occurrence"
+                                .to_string()).into()));
+                            }
+                            Ok(true)
+                        },
+                    )?
+                } else {
+                    false
+                })
+            },
+            read_memory.clone(),
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn superseded_ddl_occurrence_mark(
+        &self,
+        entry: &SourceDdlIdentity,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<bool> {
+        let key = (entry.source_lsn, entry.ordinal);
+        self.with_superseded_ddl_occurrence(
+            key,
+            |occurrence| {
+                Ok(if let Some(occurrence) = occurrence {
+                    let raw_ddl = self.raw_ddl_log_occurrence(
+                        entry.source_lsn,
+                        entry.ordinal,
+                        read_memory.clone(),
+                    )?;
+                    self.with_historical_ddl_generation_sidecar(
+                        entry,
+                        read_memory.clone(),
+                        |sidecar| {
+                            let expected = Self::canonical_local_ddl_arrival_digest(
+                                &raw_ddl,
+                                entry.source_lsn,
+                                entry.ordinal,
+                                sidecar,
+                            )?;
+                            if occurrence.local_lsn != entry.source_lsn
+                                || occurrence.persisted_ordinal != entry.ordinal
+                                || occurrence.digest != expected
+                            {
+                                return Err(Error::SyncError(
+                            ("superseded DDL evidence does not bind its local schema occurrence"
+                                .to_string())
+                            .into(),
+                        ));
+                            }
+                            Ok(true)
+                        },
+                    )?
+                } else {
+                    false
+                })
+            },
+            read_memory.clone(),
+        )
+    }
+
     /// Validate receiver-local arrival evidence for every captured occurrence.
     /// If one occurrence of a local DDL group is marked received, the entire
     /// group must be marked and each marker must rebind to that exact local
@@ -5891,42 +6187,10 @@ impl Database {
         let mut marked = HashSet::new();
         for entry in source.entries.iter() {
             let key = (entry.source_lsn, entry.ordinal);
-            let is_marked = self.with_received_ddl_arrival(
-                key,
-                |arrival| {
-                    Ok(if let Some(arrival) = arrival {
-                        let raw_ddl = self.raw_ddl_log_occurrence(
-                            entry.source_lsn,
-                            entry.ordinal,
-                            read_memory.clone(),
-                        )?;
-                        let sidecar = self.ddl_provenance_sidecar_for_source_entry(
-                            source,
-                            entry,
-                            read_memory.clone(),
-                        )?;
-                        let expected = Self::canonical_local_ddl_arrival_digest(
-                            &raw_ddl,
-                            entry.source_lsn,
-                            entry.ordinal,
-                            &sidecar,
-                        )?;
-                        if arrival.local_lsn != entry.source_lsn
-                            || arrival.persisted_ordinal != entry.ordinal
-                            || arrival.digest != expected
-                        {
-                            return Err(Error::SyncError((
-                            "received DDL arrival digest does not bind its local schema occurrence"
-                                .to_string()).into()));
-                        }
-                        marked.insert(key);
-                        true
-                    } else {
-                        false
-                    })
-                },
-                read_memory.clone(),
-            )?;
+            let is_marked = self.received_ddl_arrival_mark(entry, read_memory.clone())?;
+            if is_marked {
+                marked.insert(key);
+            }
             let group = groups.entry(entry.source_lsn).or_insert((false, true));
             group.0 |= is_marked;
             group.1 &= is_marked;
@@ -5972,42 +6236,10 @@ impl Database {
         let mut marked = HashSet::new();
         for entry in source.entries.iter() {
             let key = (entry.source_lsn, entry.ordinal);
-            let is_superseded = self.with_superseded_ddl_occurrence(
-                key,
-                |occurrence| {
-                    Ok(if let Some(occurrence) = occurrence {
-                        let raw_ddl = self.raw_ddl_log_occurrence(
-                            entry.source_lsn,
-                            entry.ordinal,
-                            read_memory.clone(),
-                        )?;
-                        let sidecar = self.ddl_provenance_sidecar_for_source_entry(
-                            source,
-                            entry,
-                            read_memory.clone(),
-                        )?;
-                        let expected = Self::canonical_local_ddl_arrival_digest(
-                            &raw_ddl,
-                            entry.source_lsn,
-                            entry.ordinal,
-                            &sidecar,
-                        )?;
-                        if occurrence.local_lsn != entry.source_lsn
-                            || occurrence.persisted_ordinal != entry.ordinal
-                            || occurrence.digest != expected
-                        {
-                            return Err(Error::SyncError((
-                                "superseded DDL evidence does not bind its local schema occurrence"
-                                    .to_string()).into()));
-                        }
-                        marked.insert(key);
-                        true
-                    } else {
-                        false
-                    })
-                },
-                read_memory.clone(),
-            )?;
+            let is_superseded = self.superseded_ddl_occurrence_mark(entry, read_memory.clone())?;
+            if is_superseded {
+                marked.insert(key);
+            }
             let group = groups.entry(entry.source_lsn).or_insert((false, true));
             group.0 |= is_superseded;
             group.1 &= is_superseded;

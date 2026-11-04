@@ -7953,6 +7953,29 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(ChangeSet, DdlProvenanceSource)> {
+        self.changes_since_base_selected(
+            since_lsn,
+            None,
+            None,
+            projection,
+            vector_copy_owner,
+            read_memory,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn changes_since_base_selected(
+        &self,
+        since_lsn: Lsn,
+        outbound_frontier: Option<Option<Lsn>>,
+        history_selected: Option<&std::cell::Cell<bool>>,
+        projection: &ChangeProjection<'_>,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<(ChangeSet, DdlProvenanceSource)> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let since_lsn = self.connected_history_since(since_lsn, read_memory.clone())?;
@@ -8319,7 +8342,11 @@ impl Database {
                     (projection.admit)(ddl_bytes.saturating_add(change_bytes))?;
                 }
                 let ddl = if projection.ddl {
-                    self.ddl_log_entries_since_unlocked(since_lsn, read_memory.clone())?
+                    if let Some(frontier) = outbound_frontier {
+                        self.outbound_ddl_entries_since(since_lsn, frontier, read_memory.clone())?
+                    } else {
+                        self.ddl_log_entries_since_unlocked(since_lsn, read_memory.clone())?
+                    }
                 } else {
                     Vec::new().into()
                 };
@@ -8337,10 +8364,16 @@ impl Database {
             }
             let (mut ddl_lsn, mut ddl): (Vec<_>, Vec<_>) = ddl_entries.into_iter().unzip();
 
-            let mut rows = Vec::new();
+            if outbound_frontier.is_some()
+                && self.image_history.is_none()
+                && let Some(selected) = history_selected
+            {
+                selected.set(true);
+            }
+            let mut rows = Vec::<RowChange>::new();
             let mut pending_deletes = Vec::new();
             let mut edges = Vec::new();
-            let mut vectors = Vec::new();
+            let mut vectors = Vec::<VectorChange>::new();
             let mut deleted_vector_owners = HashMap::<(String, RowId), Lsn>::new();
             let mut deleted_vector_owner_row_ids = HashMap::<(Vec<u8>, Lsn), RowId>::new();
             let mut inserted_vector_owners = HashMap::<(String, RowId), Lsn>::new();
@@ -8400,6 +8433,97 @@ impl Database {
                     &mut ddl_lsn,
                     &mut ddl,
                 )?;
+                // Direction is resolved before row bodies, owner maps and
+                // answer admission. Every excluded occurrence dies with its
+                // source window, rather than surviving until the final filter.
+                if outbound_frontier.is_some() {
+                    let table = match &entry {
+                        ChangeLogEntry::RowInsert { table, .. }
+                        | ChangeLogEntry::RowDelete { table, .. } => Some(table.as_str()),
+                        ChangeLogEntry::VectorInsert { index, .. }
+                        | ChangeLogEntry::VectorDelete { index, .. } => Some(index.table.as_str()),
+                        _ => None,
+                    };
+                    if let Some(table) = table
+                        && !self.outbound_direction_includes(
+                            table,
+                            entry.lsn(),
+                            read_memory.clone(),
+                        )?
+                    {
+                        // A later excluded insert still supersedes older
+                        // admitted versions. Inspect its key only when this
+                        // table already has output to suppress; never retain
+                        // an index of the excluded history. The row copy is
+                        // transient under this iteration's writer-output scope.
+                        if let ChangeLogEntry::RowInsert { table, row_id, lsn } = &entry {
+                            if rows.iter().any(|row| row.table == *table)
+                                && let Some(row) = self.row_for_change(
+                                    table,
+                                    *row_id,
+                                    *lsn,
+                                    read_memory.clone(),
+                                    projection.checkpoint,
+                                    None,
+                                )?
+                            {
+                                let key = self.with_change_table_meta(
+                                    table,
+                                    &row,
+                                    read_memory.clone(),
+                                    |meta| {
+                                        Ok(meta.and_then(|meta| {
+                                            natural_key_from_row_values(meta, &row.values)
+                                        }))
+                                    },
+                                )?;
+                                if let Some(key) = key {
+                                    rows.retain(|older| {
+                                        if older.table != *table
+                                            || older.natural_key != key
+                                            || older.lsn > *lsn
+                                        {
+                                            return true;
+                                        }
+                                        // Remove the vector pairing of a
+                                        // superseded admitted owner as well.
+                                        vectors.retain(|vector| {
+                                            vector.index.table != *table
+                                                || !inserted_vector_owners.iter().any(
+                                                    |((owner_table, owner_id), owner_lsn)| {
+                                                        owner_table == table
+                                                            && *owner_id == vector.row_id
+                                                            && *owner_lsn == older.lsn
+                                                    },
+                                                )
+                                        });
+                                        false
+                                    });
+                                }
+                            }
+                            vectors.retain(|vector| {
+                                vector.index.table != *table
+                                    || vector.row_id != *row_id
+                                    || vector.lsn > *lsn
+                            });
+                            deleted_vector_owners.retain(|(owner_table, owner_id), _| {
+                                owner_table != table || owner_id != row_id
+                            });
+                        }
+                        if let ChangeLogEntry::RowDelete {
+                            table, row_id, lsn, ..
+                        } = &entry
+                        {
+                            vectors.retain(|vector| {
+                                vector.index.table != *table
+                                    || vector.row_id != *row_id
+                                    || vector.vector.is_empty()
+                                    || vector.lsn > *lsn
+                            });
+                        }
+                        continue;
+                    }
+                }
                 if projection.bounded {
                     // The owner-tracking maps below key each row entry once more.
                     (projection.admit)(match &entry {
@@ -9735,6 +9859,53 @@ impl Database {
         selection_credit: &mut contextdb_core::read_memory::ReadCredit,
         page: Option<PullPageRequest<'_>>,
     ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>, DdlProvenanceSource)> {
+        self.checked_changes_since_selected(
+            since_lsn,
+            vector_copy_owner,
+            read_memory,
+            selection_credit,
+            None,
+            page,
+        )
+    }
+
+    /// Push and pending inspection suppress excluded history during extraction.
+    #[cfg(feature = "sync-orchestration")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn checked_outbound_changes_since_with_arrivals(
+        &self,
+        since_lsn: Lsn,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        selection_credit: &mut contextdb_core::read_memory::ReadCredit,
+        frontier: Option<Lsn>,
+    ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>, DdlProvenanceSource)> {
+        self.checked_changes_since_selected(
+            since_lsn,
+            vector_copy_owner,
+            read_memory,
+            selection_credit,
+            Some(frontier),
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn checked_changes_since_selected(
+        &self,
+        since_lsn: Lsn,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        selection_credit: &mut contextdb_core::read_memory::ReadCredit,
+        outbound_frontier: Option<Option<Lsn>>,
+        page: Option<PullPageRequest<'_>>,
+    ) -> Result<(ChangeSet, HashMap<Lsn, Option<Lsn>>, DdlProvenanceSource)> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         (|| {
@@ -9791,10 +9962,18 @@ impl Database {
             let pending = if page.is_some() {
                 Vec::new()
             } else {
-                self.durable_pending_deletes_projected(since_lsn, &projection, read_memory.clone())?
+                self.durable_pending_deletes_selected(
+                    since_lsn,
+                    &projection,
+                    outbound_frontier.is_some(),
+                    read_memory.clone(),
+                )?
             };
-            let (base, provenance_source) = self.changes_since_base_projected(
+            let history_selected = std::cell::Cell::new(false);
+            let (base, provenance_source) = self.changes_since_base_selected(
                 since_lsn,
+                outbound_frontier,
+                Some(&history_selected),
                 &projection,
                 vector_copy_owner,
                 read_memory.clone(),
@@ -9809,6 +9988,19 @@ impl Database {
             };
             let changes =
                 Self::reconcile_durable_pending_deletes_projected(base, pending, &projection)?;
+            // Only legacy snapshot/image fallbacks still need direction
+            // reduction. The normal walk has already resolved every selected
+            // row/vector at its source LSN, including pending-delete rows.
+            let changes = if outbound_frontier.is_some() && !history_selected.get() {
+                let history =
+                    self.try_sync_direction_history_for_changes(&changes, read_memory.clone())?;
+                changes.filter_by_direction_history(
+                    &history,
+                    &[SyncDirection::Push, SyncDirection::Both],
+                )
+            } else {
+                changes
+            };
             let arrivals = self.sync_arrivals_for_changes_within(
                 &changes,
                 projection.checkpoint,
