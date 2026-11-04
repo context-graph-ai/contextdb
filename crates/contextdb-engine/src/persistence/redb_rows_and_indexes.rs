@@ -4250,30 +4250,35 @@ impl RedbPersistence {
                                 .saturating_add(value.value().len().saturating_mul(32))
                                 .saturating_add(1024),
                         )?;
-                        // Retirement needs coordinates and the stored codec, not
-                        // an expanded f32 body. Keep one encoded placement window.
-                        let entry = Self::decode_persisted_vector_entry_exact(value.value())?;
-                        let remove = matches(&entry.index);
-                        let mutations = if remove && retire_identity {
-                            let quantization = entry.vector.quantization();
-                            vec![
-                                content_identity::remove_vector_mutation(
-                                    &entry.index,
-                                    entry.row_id,
-                                    quantization,
-                                ),
-                                content_identity::remove_vector_version_mutation(
-                                    &entry.index,
-                                    entry.row_id,
-                                    entry.created_tx,
-                                    entry.lsn,
-                                    quantization,
-                                ),
-                            ]
-                        } else {
-                            Vec::new()
-                        };
-                        Ok::<_, Error>((key.value().to_vec(), remove, mutations))
+                        let row_memory = crate::read_image_memory::ImageMemory::operation_writer(
+                            self.require_decode_accountant()?,
+                        )?;
+                        row_memory.scope(|| {
+                            // Retirement needs coordinates and the stored codec, not
+                            // an expanded f32 body. Keep one encoded placement window.
+                            let entry = Self::decode_persisted_vector_entry_exact(value.value())?;
+                            let remove = matches(&entry.index);
+                            let mutations = if remove && retire_identity {
+                                let quantization = entry.vector.quantization();
+                                vec![
+                                    content_identity::remove_vector_mutation(
+                                        &entry.index,
+                                        entry.row_id,
+                                        quantization,
+                                    ),
+                                    content_identity::remove_vector_version_mutation(
+                                        &entry.index,
+                                        entry.row_id,
+                                        entry.created_tx,
+                                        entry.lsn,
+                                        quantization,
+                                    ),
+                                ]
+                            } else {
+                                Vec::new()
+                            };
+                            Ok::<_, Error>((key.value().to_vec(), remove, mutations))
+                        })
                     })
                     .transpose()?
             };
