@@ -289,6 +289,8 @@ mod pull_page_contract_tests;
 mod pull_source_page_tests;
 #[cfg(test)]
 mod query_trace_rows_examined_contract_tests;
+#[cfg(all(test, feature = "test-seams", feature = "sync-orchestration"))]
+mod received_indexed_purge_hook_tests;
 #[cfg(test)]
 mod received_row_restatement_tests;
 #[cfg(test)]
