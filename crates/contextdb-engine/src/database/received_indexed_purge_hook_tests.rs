@@ -287,3 +287,174 @@ fn received_indexed_purge_after_pull_hook_local_commit_erases_or_returns_typed_r
         network.close();
     });
 }
+
+// Only the receiver pull thread arms this observer, after the hub has
+// committed its journal. It observes the real irreversible purge cutpoint.
+thread_local! {
+    static PURGE_COMMITTED: std::cell::RefCell<Option<Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+pub(in crate::database) fn purge_committed_for_test() {
+    PURGE_COMMITTED.with(|slot| {
+        if let Some(observed) = slot.borrow().as_ref() {
+            observed.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+#[derive(Default)]
+struct ErasureObserver {
+    db: Mutex<std::sync::Weak<Database>>,
+    created_local: AtomicBool,
+    armed: AtomicBool,
+    purged: Arc<AtomicBool>,
+    origin_deliveries: std::sync::atomic::AtomicUsize,
+    delivery_preceded_erasure: Mutex<Vec<bool>>,
+}
+impl DatabasePlugin for ErasureObserver {
+    fn on_sync_pull(&self, changes: &mut ChangeSet) -> Result<()> {
+        if self.armed.load(Ordering::SeqCst)
+            && changes.rows.iter().any(|row| {
+                row.table == "notes"
+                    && !row.deleted
+                    && row.values.get("id") == Some(&Value::Int64(1))
+            })
+            && !self.created_local.swap(true, Ordering::SeqCst)
+        {
+            self.db
+                .lock()
+                .upgrade()
+                .unwrap()
+                .execute("INSERT INTO hook_log VALUES (1)", &HashMap::new())?;
+            eprintln!(
+                "CDB258 real pull hook committed its ordinary transaction and triggered local creation before the received indexed purge"
+            );
+        }
+        Ok(())
+    }
+
+    fn post_commit(&self, ws: &WriteSet, _source: CommitSource) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.origin_deliveries.fetch_add(
+            ws.relational_inserts
+                .iter()
+                .filter(|(table, row)| {
+                    table == "hook_log" && row.values.get("id") == Some(&Value::Int64(1))
+                })
+                .count(),
+            Ordering::SeqCst,
+        );
+        for (_, row) in ws
+            .relational_inserts
+            .iter()
+            .filter(|(table, _)| table == "erased_local")
+        {
+            assert_eq!(
+                row.values.get("body"),
+                Some(&Value::Text("private callback content".into()))
+            );
+            // A SQL read here could inherit an older statement snapshot.
+            // Compare delivery with actual erasure publication instead.
+            self.delivery_preceded_erasure
+                .lock()
+                .push(!self.purged.load(Ordering::SeqCst));
+        }
+    }
+}
+
+#[test]
+fn received_indexed_purge_after_pull_hook_never_delivers_erased_callback_rows() {
+    bounded(|| {
+        let hook = Arc::new(ErasureObserver::default());
+        let network = Network::new(hook.clone());
+        *hook.db.lock() = Arc::downgrade(&network.edge);
+        for db in [&network.hub, &network.edge] {
+            sql(
+                db,
+                "CREATE TABLE erased_local (id INTEGER PRIMARY KEY, body TEXT) SYNC OFF",
+            );
+            assert!(db.column_has_covering_index("erased_local", "id"));
+        }
+        sql(
+            &network.edge,
+            "CREATE TRIGGER derive_erased_local ON hook_log WHEN INSERT",
+        );
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        network
+            .edge
+            .register_trigger_callback("derive_erased_local", {
+                let fired = fired.clone();
+                move |handle, context| {
+                    handle.execute_in_tx(
+                        context.tx,
+                        "INSERT INTO erased_local VALUES ($id, 'private callback content')",
+                        &HashMap::from([("id".into(), context.row_values["id"].clone())]),
+                    )?;
+                    fired.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .unwrap();
+        network.edge.complete_initialization().unwrap();
+        hook.armed.store(true, Ordering::SeqCst);
+        sql(
+            &network.hub,
+            "INSERT INTO notes VALUES (1, 'incoming page unit')",
+        );
+        sql(&network.hub, "PURGE FROM erased_local WHERE id = 1");
+        PURGE_COMMITTED.with(|slot| *slot.borrow_mut() = Some(hook.purged.clone()));
+        let pulled = network.pull();
+        PURGE_COMMITTED.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "real transactional callback created the local row"
+        );
+        assert!(hook.created_local.load(Ordering::SeqCst));
+        eprintln!("CDB258_ERASURE indexed pull outcome={pulled:?}");
+        pulled.expect("indexed purge must succeed before checking erased callback delivery");
+        assert!(
+            hook.purged.load(Ordering::SeqCst),
+            "the actual receiver purge crossed irreversible publication"
+        );
+        assert!(
+            network
+                .edge
+                .execute("SELECT id FROM erased_local", &HashMap::new())
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        assert!(
+            network
+                .edge
+                .durable_deletion_state_for_test("erased_local", &Value::Int64(1))
+                .purge_frontier
+                .is_some(),
+            "the selected life was actually erased"
+        );
+        assert_eq!(
+            hook.origin_deliveries.load(Ordering::SeqCst),
+            1,
+            "the non-erased originating unit is delivered once; dropping the entire tail is not a repair"
+        );
+        assert_eq!(
+            network
+                .edge
+                .execute("SELECT id FROM hook_log", &HashMap::new())
+                .unwrap()
+                .rows(),
+            vec![vec![Value::Int64(1)]]
+        );
+        let preceded = hook.delivery_preceded_erasure.lock().clone();
+        eprintln!(
+            "CDB258_ERASURE delivery_preceded_irreversible_erasure={preceded:?} trigger_fired=1 purge_frontier=present final_rows=0"
+        );
+        network.close();
+        assert!(
+            preceded.iter().all(|before| *before),
+            "a callback must never receive a row after the page has erased it: {preceded:?}"
+        );
+    });
+}

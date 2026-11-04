@@ -2,6 +2,10 @@ use super::*;
 
 #[cfg(any(test, feature = "test-seams"))]
 pub(super) fn crash_at_purge_publication_boundary_for_test(boundary: &str) {
+    #[cfg(all(test, feature = "test-seams"))]
+    if boundary == "after-durable-commit" {
+        super::received_indexed_purge_hook_tests::purge_committed_for_test();
+    }
     if std::env::var("CONTEXTDB_PURGE_PUBLICATION_CRASH_AT").as_deref() == Ok(boundary) {
         // This process must disappear without destructors: dropping the
         // prepared guard would deliberately unlock but leave pending state,
