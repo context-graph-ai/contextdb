@@ -486,9 +486,8 @@ impl Allocators {
         source: Arc<SavedBitmapWindow>,
         header: Arc<SavedRegionHeader>,
     ) -> io::Result<()> {
-        // Each regional view is built at the layout's length straight over
-        // the saved words, so the saved length is not consulted here.
-        drop(header);
+        // Install at the saved geometry before shrinking, as upstream's
+        // decoded load does. Masking alone loses a free block crossing the cut.
         // The saved bitmaps replace the in-memory ones; the loader adopts the
         // saved totals or recounts.
         self.free_totals.trusted = false;
@@ -511,7 +510,44 @@ impl Allocators {
                 &paged.pager,
             );
         }
+        if let Some(paged) = &mut self.paged {
+            let layout = *paged.layout.lock().unwrap();
+            // Only the last region can have a shorter installed geometry.
+            // Full regions retain their saved dimensions; opening remains
+            // fixed work rather than walking every region in the store.
+            if let Some(region) = layout.num_regions().checked_sub(1) {
+                let len = layout.region_layout(region).num_pages();
+                let saved_len = header(region)?.map_or(len, |(_, saved_len)| saved_len);
+                paged.active = None;
+                let mut allocator = BuddyAllocator::new_paged(
+                    saved_len.max(len),
+                    layout.full_region_layout().num_pages(),
+                    region,
+                    &paged.pager,
+                    false,
+                );
+                if saved_len > len {
+                    allocator.resize(len);
+                }
+                allocator.refresh_summary_paths();
+                // Mutated words live in the pager; subsequent use builds a
+                // normal layout-sized descriptor through get_region_mut.
+            }
+            if let Some(error) = paged.pager.io_failure() {
+                return Err(error);
+            }
+        }
         Ok(())
+    }
+
+    pub(super) fn rebuild_summaries(&mut self) {
+        for region in 0..u32::try_from(self.region_count()).unwrap() {
+            let allocator = self.get_region_mut(region);
+            allocator.rebuild_summaries();
+            if let Some(order) = allocator.highest_free_order() {
+                self.region_tracker.mark_free(order, region);
+            }
+        }
     }
 
     pub(super) fn reset_for_repair(&mut self, layout: DatabaseLayout) -> io::Result<()> {

@@ -259,12 +259,95 @@ impl BtreeBitmap {
     }
 
     pub(crate) fn resize(&mut self, mut new_len: u32, full: bool) {
+        let old_len = self.len();
+        if old_len == new_len {
+            return;
+        }
         self.forget_root();
-        for height in self.heights.iter_mut().rev() {
-            height.resize(new_len, full);
+        let mut boundary_full = None;
+        for (index, height) in self.heights.iter_mut().rev().enumerate() {
+            let fullness = height.resize(new_len, full);
+            if index == 0 {
+                boundary_full = fullness;
+            }
             new_len = new_len.div_ceil(64);
         }
+        // A free growth fill can change the old partial word. Allocated
+        // fill preserves its masked ones; shrink's new boundary is reconciled
+        // below, without touching removed entries.
+        if let Some(full) = boundary_full {
+            self.update_to_root(old_len - 1, full);
+        }
+        // Growing with allocated bits only replaces masked ones with real
+        // ones at every level. No word's fullness changes, so reading those
+        // boundaries would just evict useful allocator windows.
+        if !full || self.len() < old_len {
+            self.refresh_summary_path();
+        }
         assert!(self.get_level(0).len() <= 64);
+    }
+
+    /// Reconcile the masked last word at every height, once after install
+    /// or resize. Exact words are left clean in the allocator pager.
+    pub(crate) fn refresh_summary_path(&mut self) {
+        self.forget_root();
+        for child_height in (1..self.heights.len()).rev() {
+            let child = &self.heights[child_height];
+            if child.len() == 0 {
+                continue;
+            }
+            let entry = (child.len() - 1) / 64;
+            let full = child.word(entry as usize) == u64::MAX;
+            let parent = &mut self.heights[child_height - 1];
+            if parent.get(entry) != full {
+                if full {
+                    parent.set(entry);
+                } else {
+                    parent.clear(entry);
+                }
+            }
+        }
+    }
+
+    /// Compare against the parent bytes already encoded into the reserved
+    /// destination, so validation does not reload evicted pager windows.
+    pub(crate) fn encoded_summary_is_exact(&self, encoded: &[u8]) -> bool {
+        let mut parent_start = END_OFFSETS + self.heights.len() * size_of::<u32>();
+        for child_height in 1..self.heights.len() {
+            let field = END_OFFSETS + (child_height - 1) * size_of::<u32>();
+            let child_start =
+                u32::from_le_bytes(encoded[field..field + 4].try_into().unwrap()) as usize;
+            for entry in 0..self.heights[child_height].word_count() {
+                let start = child_start + 4 + entry * 8;
+                let child = u64::from_le_bytes(encoded[start..start + 8].try_into().unwrap());
+                let start = parent_start + 4 + (entry / 64) * 8;
+                let parent = u64::from_le_bytes(encoded[start..start + 8].try_into().unwrap());
+                if (parent & (1u64 << (entry % 64)) != 0) != (child == u64::MAX) {
+                    return false;
+                }
+            }
+            parent_start = child_start;
+        }
+        true
+    }
+
+    /// Rebuild only summaries, leaving leaf ownership unchanged.
+    pub(crate) fn rebuild_summaries(&mut self) {
+        self.forget_root();
+        for child_height in (1..self.heights.len()).rev() {
+            for entry in 0..self.heights[child_height].word_count() {
+                let full = self.heights[child_height].word(entry) == u64::MAX;
+                let parent = &mut self.heights[child_height - 1];
+                let bit = u32::try_from(entry).unwrap();
+                if parent.get(bit) != full {
+                    if full {
+                        parent.set(bit);
+                    } else {
+                        parent.clear(bit);
+                    }
+                }
+            }
+        }
     }
 
     // Returns the first unset id, and sets it
@@ -539,7 +622,7 @@ impl U64GroupedBitmap {
         self.len
     }
 
-    pub fn resize(&mut self, new_len: u32, full: bool) {
+    pub fn resize(&mut self, new_len: u32, full: bool) -> Option<bool> {
         if self.paged.is_none() && self.data.len() < Self::required_words(new_len) {
             let default_value = if full { u64::MAX } else { 0 };
             self.data
@@ -557,6 +640,10 @@ impl U64GroupedBitmap {
                 }
             }
         }
+        // Read the old boundary after the complete fill: its last set/clear
+        // may have touched a different word.
+        (!full && old_len < new_len && !old_len.is_multiple_of(64))
+            .then(|| self.word(((old_len - 1) / 64) as usize) == u64::MAX)
     }
 
     pub fn get(&self, bit: u32) -> bool {

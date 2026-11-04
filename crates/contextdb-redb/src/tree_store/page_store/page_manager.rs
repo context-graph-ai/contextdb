@@ -16,7 +16,9 @@ use crate::ScratchBackend;
 use crate::transaction_tracker::TransactionId;
 #[cfg(feature = "contextdb-internal")]
 use crate::transactions::DurablePublication;
-use crate::transactions::{AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut};
+use crate::transactions::{
+    AllocatorSaveOutcome, AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut,
+};
 use crate::tree_store::btree_base::{BtreeHeader, Checksum};
 use crate::tree_store::page_store::allocator_pager::AllocatorPager;
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
@@ -358,6 +360,8 @@ pub(crate) struct TransactionalMemory {
     // True if the allocator state was corrupted when the file was opened
     // TODO: maybe we can remove this flag now that CheckedBackend exists?
     needs_recovery: AtomicBool,
+    // Terminal for this handle, including Drop and read-only handoff commits.
+    allocator_save_refused: AtomicBool,
     #[cfg(feature = "contextdb-internal")]
     publication_needs_recovery: AtomicBool,
     // contextdb: the most one growth may add, as the exact binary value of
@@ -787,6 +791,7 @@ impl TransactionalMemory {
             allocated_since_commit: Mutex::new(Default::default()),
             unpersisted: Mutex::new(Default::default()),
             needs_recovery: AtomicBool::new(needs_recovery),
+            allocator_save_refused: AtomicBool::new(false),
             #[cfg(feature = "contextdb-internal")]
             publication_needs_recovery: AtomicBool::new(false),
             #[cfg(feature = "contextdb-internal")]
@@ -1261,12 +1266,16 @@ impl TransactionalMemory {
         Ok(num_regions)
     }
 
-    // Returns true on success, or false if the number of regions has changed
+    pub(crate) fn allocator_save_refused(&self) -> bool {
+        self.allocator_save_refused.load(Ordering::Acquire)
+    }
+
+    // A geometry retry is distinct from a terminal summary refusal.
     pub(crate) fn try_save_allocator_state(
         &self,
         tree: &mut AllocatorStateTreeMut,
         num_regions: u32,
-    ) -> Result<bool> {
+    ) -> Result<AllocatorSaveOutcome> {
         #[cfg(test)]
         allocator_growth_tests::SAVE_CALLS.with(|calls| calls.set(calls.get() + 1));
         #[cfg(any(test, feature = "test-seams"))]
@@ -1274,9 +1283,12 @@ impl TransactionalMemory {
             hook(self);
         }
         self.check_io_errors()?;
+        if self.allocator_save_refused() {
+            return Ok(AllocatorSaveOutcome::Inconsistent);
+        }
         // Has the number of regions changed since reserve_allocator_state() was called?
         if num_regions != self.state.lock().unwrap().header.layout().num_regions() {
-            return Ok(false);
+            return Ok(AllocatorSaveOutcome::Retry);
         }
 
         for i in 0..num_regions {
@@ -1285,9 +1297,28 @@ impl TransactionalMemory {
             let region = state.allocators.get_region(i);
             if destination.value().len() < region.encoded_len() {
                 // The allocator state grew too much since we reserved space
-                return Ok(false);
+                return Ok(AllocatorSaveOutcome::Retry);
             }
-            region.encode_into(destination.value_mut());
+            let exact = region.encode_checked(destination.value_mut());
+            if let Some(error) = state
+                .allocators
+                .pager()
+                .and_then(|pager| pager.storage_failure())
+            {
+                return Err(error);
+            }
+            if !exact {
+                self.allocator_save_refused.store(true, Ordering::Release);
+                state.allocators.rebuild_summaries();
+                if let Some(error) = state
+                    .allocators
+                    .pager()
+                    .and_then(|pager| pager.storage_failure())
+                {
+                    return Err(error);
+                }
+                return Ok(AllocatorSaveOutcome::Inconsistent);
+            }
             drop(state);
             drop(destination);
         }
@@ -1296,7 +1327,7 @@ impl TransactionalMemory {
         let state = self.state.lock().unwrap();
         if destination.value().len() < state.allocators.region_tracker.encoded_len() {
             // The allocator state grew too much since we reserved space
-            return Ok(false);
+            return Ok(AllocatorSaveOutcome::Retry);
         }
         state
             .allocators
@@ -1348,7 +1379,7 @@ impl TransactionalMemory {
         {
             return Err(error);
         }
-        Ok(true)
+        Ok(AllocatorSaveOutcome::Saved)
     }
 
     // Returns true if the allocator state table is up to date, or false if it's stale

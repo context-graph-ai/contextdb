@@ -113,6 +113,13 @@ pub(crate) const SYSTEM_FREED_TABLE: SystemTableDefinition<TransactionIdWithPagi
 // The allocator state table is stored in the system table tree, but it's accessed using
 // raw btree operations rather than open_system_table(), so there's no SystemTableDefinition
 pub(crate) const ALLOCATOR_STATE_TABLE_NAME: &str = "allocator_state";
+#[derive(Debug)]
+pub(crate) enum AllocatorSaveOutcome {
+    Saved,
+    Retry,
+    Inconsistent,
+}
+
 pub(crate) type AllocatorStateTree = Btree<AllocatorStateKey, &'static [u8]>;
 pub(crate) type AllocatorStateTreeMut<'a> = BtreeMut<'a, AllocatorStateKey, &'static [u8]>;
 pub(crate) type SystemFreedTree<'a> = BtreeMut<'a, TransactionIdWithPagination, PageList<'static>>;
@@ -3043,7 +3050,7 @@ impl WriteTransaction {
                 .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
         }
 
-        if self.quick_repair {
+        if self.quick_repair && !self.mem.allocator_save_refused() {
             system_tree.create_table_and_flush_table_root(
                 ALLOCATOR_STATE_TABLE_NAME,
                 |system_tree_ref, tree: &mut AllocatorStateTreeMut| {
@@ -3064,8 +3071,11 @@ impl WriteTransaction {
                             &mut pagination_counter,
                         )?;
 
-                        if self.mem.try_save_allocator_state(tree, num_regions)? {
-                            return Ok(());
+                        match self.mem.try_save_allocator_state(tree, num_regions)? {
+                            AllocatorSaveOutcome::Saved | AllocatorSaveOutcome::Inconsistent => {
+                                return Ok(());
+                            }
+                            AllocatorSaveOutcome::Retry => {}
                         }
 
                         // Clear out the table before retrying, just in case the number of regions
@@ -3080,6 +3090,13 @@ impl WriteTransaction {
                     }
                 },
             )?;
+            // The helper publishes its table root after the closure returns.
+            // Delete only now, so a refused snapshot stays physically absent.
+            if self.mem.allocator_save_refused() {
+                system_tree
+                    .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+                    .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+            }
         }
 
         let system_root = system_tree.finalize_dirty_checksums()?;
@@ -3161,7 +3178,7 @@ impl WriteTransaction {
                 .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
         }
 
-        if self.quick_repair {
+        if self.quick_repair && !self.mem.allocator_save_refused() {
             system_tree.create_table_and_flush_table_root(
                 ALLOCATOR_STATE_TABLE_NAME,
                 |system_tree_ref, tree: &mut AllocatorStateTreeMut| {
@@ -3182,8 +3199,11 @@ impl WriteTransaction {
                             &mut pagination_counter,
                         )?;
 
-                        if self.mem.try_save_allocator_state(tree, num_regions)? {
-                            return Ok(());
+                        match self.mem.try_save_allocator_state(tree, num_regions)? {
+                            AllocatorSaveOutcome::Saved | AllocatorSaveOutcome::Inconsistent => {
+                                return Ok(());
+                            }
+                            AllocatorSaveOutcome::Retry => {}
                         }
 
                         // Clear out the table before retrying, just in case the number of regions
@@ -3198,6 +3218,13 @@ impl WriteTransaction {
                     }
                 },
             )?;
+            // The helper publishes its table root after the closure returns.
+            // Delete only now, so a refused snapshot stays physically absent.
+            if self.mem.allocator_save_refused() {
+                system_tree
+                    .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+                    .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+            }
         }
 
         let system_root = system_tree.finalize_dirty_checksums()?;

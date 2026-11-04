@@ -192,6 +192,32 @@ impl BuddyAllocator {
         }
     }
 
+    pub(crate) fn encode_checked(&self, out: &mut [u8]) -> bool {
+        self.encode_into(out);
+        let mut start = FREE_END_OFFSETS + self.free.len() * size_of::<u32>();
+        for (order, bitmap) in self.free.iter().enumerate() {
+            let field = FREE_END_OFFSETS + order * size_of::<u32>();
+            let end = u32::from_le_bytes(out[field..field + 4].try_into().unwrap()) as usize;
+            if !bitmap.encoded_summary_is_exact(&out[start..end]) {
+                return false;
+            }
+            start = end;
+        }
+        true
+    }
+
+    pub(crate) fn refresh_summary_paths(&mut self) {
+        for bitmap in &mut self.free {
+            bitmap.refresh_summary_path();
+        }
+    }
+
+    pub(crate) fn rebuild_summaries(&mut self) {
+        for bitmap in &mut self.free {
+            bitmap.rebuild_summaries();
+        }
+    }
+
     pub(crate) fn from_bytes(data: &[u8]) -> Self {
         let max_order = data[MAX_ORDER_OFFSET];
         let num_pages = u32::from_le_bytes(
