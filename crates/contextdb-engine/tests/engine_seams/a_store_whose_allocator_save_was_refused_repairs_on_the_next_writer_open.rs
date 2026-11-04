@@ -1,15 +1,26 @@
-//! A store whose writer refused to save an allocator
-//! table (its regional summary disagreed with its own words) closes with no
-//! allocator table. What the engine sees on such a store is named here: a
-//! direct read is refused with a typed "needs a writer" failure, the format
-//! classification repairs it and answers "not legacy", and a writable open
-//! repairs it, keeps every row and keeps its database identity.
+//! A store whose writer refused to save an allocator table (its regional
+//! summary disagreed with its own words) closes with no allocator table.
+//! What the engine sees on such a store:
+//! - a direct read is refused with the typed "needs a writer" failure;
+//! - an open that cannot take the store's claim classifies it without
+//!   repair, which cannot judge it (the classification is `None`), so the
+//!   claim's own refusal stands and the store is left byte-for-byte as it
+//!   was, still refusing direct reads;
+//! - `contextdb diagnose` (`RedbPersistence::is_legacy_format_store`) lets
+//!   redb's crash repair run, as it documents for a store left without
+//!   allocator state, and answers "current format, nothing to correct"
+//!   (`Ok(false)`), after which direct reads open;
+//! - a writable open repairs it, keeps every row and keeps its database
+//!   identity.
+#![cfg(unix)]
 
 use contextdb_core::{Error, Value, read_contract::ReadFailureKind};
 use contextdb_engine::persistence::RedbPersistence;
 use contextdb_engine::{Database, ReadSession};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 const ROWS: i64 = 300;
 
@@ -81,21 +92,89 @@ fn assert_rows(database: &Database, context: &str) {
     );
 }
 
+/// Puts permissions back when dropped, so a failing assertion still leaves
+/// the scratch directory removable.
+struct PermissionRestore(Vec<(PathBuf, fs::Permissions)>);
+
+impl PermissionRestore {
+    fn for_paths(paths: &[&Path]) -> Self {
+        Self(
+            paths
+                .iter()
+                .map(|path| {
+                    let permissions = fs::metadata(path).expect("read permissions").permissions();
+                    ((*path).to_path_buf(), permissions)
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for PermissionRestore {
+    fn drop(&mut self) {
+        for (path, permissions) in &self.0 {
+            let _ = fs::set_permissions(path, permissions.clone());
+        }
+    }
+}
+
+/// The two names a store's claim companion can have.
+fn remove_companions(path: &Path) {
+    let mut appended = path.as_os_str().to_os_string();
+    appended.push(".lock");
+    for companion in [PathBuf::from(appended), path.with_extension("lock")] {
+        match fs::remove_file(&companion) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove {}: {error}", companion.display()),
+        }
+    }
+}
+
 #[test]
 fn a_store_whose_allocator_save_was_refused_repairs_on_the_next_writer_open() {
+    assert_ne!(
+        nix::unistd::Uid::effective().as_raw(),
+        0,
+        "the read-only directory step needs a non-root test process"
+    );
     let root = tempfile::tempdir().expect("task-scoped store");
 
-    // The format classification is allowed to repair, and answers.
-    let classified = root.path().join("classified.db");
-    latched_store(&classified);
-    assert_direct_read_needs_a_writer(&classified, "before classification");
+    // Inspection that may not repair leaves the store exactly as it was.
+    let directory = root.path().join("inspected");
+    fs::create_dir(&directory).expect("create store directory");
+    let inspected = directory.join("inspected.db");
+    latched_store(&inspected);
+    assert_direct_read_needs_a_writer(&inspected, "before any inspection");
+    remove_companions(&inspected);
+    let bytes = fs::read(&inspected).expect("read the store's bytes");
+    {
+        let _restore = PermissionRestore::for_paths(&[&directory, &inspected]);
+        fs::set_permissions(&inspected, fs::Permissions::from_mode(0o444))
+            .expect("store is read-only");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o555))
+            .expect("store directory is read-only");
+        match Database::open(&inspected) {
+            Ok(_) => panic!("an open with no claim possible opened the store"),
+            Err(Error::LegacyVectorStoreDetected { .. }) => {
+                panic!("the classification without repair judged a current store legacy")
+            }
+            Err(_claim_refusal) => {}
+        }
+    }
     assert!(
-        !RedbPersistence::is_legacy_format_store(&classified)
-            .expect("classification repairs and answers"),
-        "a current-format store whose allocator save was refused classified as legacy"
+        fs::read(&inspected).expect("read the store's bytes again") == bytes,
+        "the classification without repair changed the store"
     );
-    let file = ReadSession::open(&classified)
-        .expect("direct read after the classification repaired the store");
+    assert_direct_read_needs_a_writer(&inspected, "after the classification without repair");
+
+    // `contextdb diagnose` repairs it and answers "current format".
+    assert!(
+        !RedbPersistence::is_legacy_format_store(&inspected).expect("diagnose repairs and answers"),
+        "diagnose judged a current-format store whose allocator save was refused legacy"
+    );
+    let file =
+        ReadSession::open(&inspected).expect("direct read after diagnose repaired the store");
     drop(file);
 
     // A writable open repairs it, keeps every row and its identity.
