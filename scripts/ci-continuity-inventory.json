@@ -6457,20 +6457,26 @@
     },
     {
       "path": "crates/contextdb-engine/src/database/received_legacy_growth_guards.rs",
-      "line": 418,
+      "line": 430,
       "declaration": "#[ignore = \"CDB-236: reader budget grows with rows\"]",
       "execution": "not selected (--include-ignored absent)"
     },
     {
       "path": "crates/contextdb-engine/src/database/received_legacy_growth_guards.rs",
-      "line": 424,
+      "line": 436,
       "declaration": "#[ignore = \"CDB-236: reader budget grows with rows\"]",
       "execution": "not selected (--include-ignored absent)"
     },
     {
       "path": "crates/contextdb-engine/src/database/received_legacy_growth_lifecycle_guards.rs",
-      "line": 158,
-      "declaration": "#[ignore = \"CDB-223: residual after deep refusal\"]",
+      "line": 297,
+      "declaration": "#[ignore = \"CDB-223: residual after deep refusal; enable in nightly contextdb-engine --lib (nightly-tests) when fixed\"]",
+      "execution": "not selected (--include-ignored absent)"
+    },
+    {
+      "path": "crates/contextdb-engine/src/database/received_legacy_growth_lifecycle_guards.rs",
+      "line": 532,
+      "declaration": "#[ignore = \"CDB-223: full N=2043 lifecycle exceeds the 60 s PR budget; run nightly contextdb-engine --lib (nightly-tests) with --ignored\"]",
       "execution": "not selected (--include-ignored absent)"
     },
     {

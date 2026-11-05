@@ -3910,6 +3910,10 @@ pub(crate) fn measured_live_bytes_for_test() -> usize {
     }
 }
 
+// Retired: failed_attempt_storage_observes_a_counter_refund_with_retained_storage.
+// This observer-specific negative control required the removed fork observer.
+// An accountant-only test cannot detect retained storage after an early refund;
+// destruction-before-refund is now a source ownership proof for CDB-223.
 mod original_failure_contract {
     use super::*;
     struct FreeWatch;

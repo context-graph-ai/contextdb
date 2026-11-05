@@ -108,8 +108,13 @@ mod received_legacy_growth_guards {
                     lsn: retained_at,
                 })
                 .collect();
-            receiver.db.persistence.as_ref().unwrap()
-                .append_graph_edges_batch(&edges).unwrap();
+            receiver
+                .db
+                .persistence
+                .as_ref()
+                .unwrap()
+                .append_graph_edges_batch(&edges)
+                .unwrap();
         }
         let receiver = reopen(receiver, SEED);
         for first in (0..count).step_by(N) {
@@ -226,6 +231,13 @@ mod received_legacy_growth_guards {
             }
         }
         fn apply(&self, receiver: &JourneyPeer) -> Result<ApplyResult> {
+            self.apply_with_contact(receiver, None)
+        }
+        fn apply_with_contact(
+            &self,
+            receiver: &JourneyPeer,
+            hub_contact_ms: Option<i64>,
+        ) -> Result<ApplyResult> {
             let tenant = TenantId::from(JOURNEY_TENANT);
             let request = crate::protocol::PushRequest {
                 changeset: self.wire.clone(),
@@ -271,7 +283,7 @@ mod received_legacy_growth_guards {
                 incarnation: self.incarnation,
                 source_lsn: changes.max_lsn().expect("source frontier"),
                 dependency_complete: true,
-                hub_contact_ms: None,
+                hub_contact_ms,
             };
             let mut copy_owner = contextdb_engine::vector_read_memory::admission(memory.clone());
             receiver

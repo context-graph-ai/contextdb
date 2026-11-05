@@ -1841,3 +1841,149 @@ impl ReceivedWorkingWrite {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod io_failure_cleanup_tests {
+    use super::*;
+    use redb::StorageBackend;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default, Debug)]
+    struct GrowthFault {
+        armed: AtomicBool,
+        hits: AtomicUsize,
+    }
+    #[derive(Debug)]
+    struct FailingGrowthBackend {
+        inner: redb::backends::InMemoryBackend,
+        fault: Arc<GrowthFault>,
+    }
+    impl StorageBackend for FailingGrowthBackend {
+        fn len(&self) -> io::Result<u64> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+            self.inner.read(offset, out)
+        }
+        fn write(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+            self.inner.write(offset, bytes)
+        }
+        fn sync_data(&self) -> io::Result<()> {
+            self.inner.sync_data()
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            if self.fault.armed.load(Ordering::SeqCst) {
+                self.fault.hits.fetch_add(1, Ordering::SeqCst);
+                return Err(io::Error::from(io::ErrorKind::Other));
+            }
+            self.inner.set_len(len)
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ordinary_growth_io_error_drops_unfinished_received_write_without_panicking() {
+        use crate::memory_accounting::MemoryAccountant;
+        let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("received.redb");
+        let store = RedbPersistence::create(&path).unwrap();
+        let writer = MemoryAccountant::writer_budget(64 << 20).unwrap();
+        let accountant = writer.accountant();
+        let baseline = accountant.usage().used;
+        let funder = writer.prepare_source_funder().unwrap();
+        let original = writer.reserve_assembly_original(&funder).unwrap();
+        let scope =
+            super::super::native_storage_admission::StorageAdmissionScope::writer_original_native(
+                &original,
+            )
+            .unwrap();
+        let fault = Arc::new(GrowthFault::default());
+        let mut builder = redb::Database::builder();
+        builder.set_cache_size(128 << 10);
+        // Start from the actual engine-created empty store, including its
+        // authenticated metadata, so production begin_in validates normally.
+        let image = std::fs::read(&path).unwrap();
+        assert!(
+            image.len() < 8 << 20,
+            "the attempted page exceeds the initial store extent"
+        );
+        let backend = redb::backends::InMemoryBackend::new();
+        backend.set_len(image.len() as u64).unwrap();
+        backend.write(0, &image).unwrap();
+        drop(image);
+        let raw = scope
+            .run_native(|| {
+                builder
+                    .create_with_backend(FailingGrowthBackend {
+                        inner: backend,
+                        fault: fault.clone(),
+                    })
+                    .map_err(RedbPersistence::storage_error)
+            })
+            .unwrap();
+        let cache = super::super::cache_reserve::original(
+            &accountant,
+            (128 << 10) + raw.cache_index_bytes(),
+            false,
+        )
+        .unwrap();
+        let controls = raw.retain_cache_reserve(cache);
+        const TABLE: redb::TableDefinition<u64, &[u8]> =
+            redb::TableDefinition::new("received_io_fault");
+        scope
+            .run_native(|| {
+                let write = RedbPersistence::begin_history_write(&raw)?;
+                write
+                    .open_table(TABLE)
+                    .map_err(RedbPersistence::storage_error)?;
+                write.commit().map_err(RedbPersistence::storage_error)
+            })
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let failure = scope.run_original_unqualified(|| {
+                let working = ReceivedWorkingWrite::begin_in(&store, &raw, &original).unwrap();
+                let mut table = working.open_table(TABLE).unwrap();
+                fault.armed.store(true, Ordering::SeqCst);
+                // An oversized page forces real file growth. The backend
+                // returns an ordinary non-quota I/O error, never a panic.
+                let failure = table.insert_reserve(1, 8 << 20).err().expect("growth must fail before commit");
+                assert!(matches!(&failure, redb::StorageError::Io(error) if error.kind() == io::ErrorKind::Other), "preserve the typed original growth I/O error: {failure:?}");
+                drop(table);
+                eprintln!("RECEIVED_GROWTH_IO_BEFORE_DROP hits={}", fault.hits.load(Ordering::SeqCst));
+                drop(working);
+                Ok(failure)
+            }).unwrap();
+            Err::<(), _>(failure)
+        }));
+        assert!(
+            fault.hits.load(Ordering::SeqCst) > 0,
+            "the real backend growth boundary was reached"
+        );
+        let returned_io = matches!(&outcome, Ok(Err(redb::StorageError::Io(error))) if error.kind() == io::ErrorKind::Other);
+        let cleanup_panicked = outcome.is_err();
+        drop(outcome);
+        drop(controls);
+        drop(raw);
+        drop(scope);
+        drop(original);
+        drop(funder);
+        let used = accountant.usage().used;
+        eprintln!(
+            "RECEIVED_GROWTH_IO_DONE cleanup_panicked={cleanup_panicked} returned_io={returned_io} used={used} held={baseline}"
+        );
+        assert!(
+            !cleanup_panicked,
+            "dropping an unfinished received working write must preserve the ordinary I/O error without panicking"
+        );
+        assert!(
+            returned_io,
+            "the original typed I/O error must reach the caller"
+        );
+        assert_eq!(
+            used, baseline,
+            "all working-write and native storage funding returns after destruction"
+        );
+    }
+}
