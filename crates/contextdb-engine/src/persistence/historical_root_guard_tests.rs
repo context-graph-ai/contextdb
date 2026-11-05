@@ -415,3 +415,136 @@ fn historical_root_d_accessed_owned_damage_refuses() {
         }
     }
 }
+
+#[test]
+fn cdb_255_lost_reply_refuses_damaged_retained_version_without_accepting_arrival() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("damaged-history.db");
+    let db = Database::open(&path).unwrap();
+    db.set_maintenance_policy(crate::database::MaintenancePolicy::CallerDriven);
+    for sql in [
+        "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT) HISTORY ALL",
+        "INSERT INTO notes VALUES (1, 'version-0000')",
+        "UPDATE notes SET id = 2, body = 'version-0001' WHERE id = 1",
+        "UPDATE notes SET id = 3, body = 'version-0002' WHERE id = 2",
+    ] {
+        db.execute(sql, &HashMap::new()).unwrap();
+    }
+    let echo = vec![
+        db.changes_since(Lsn(0))
+            .unwrap()
+            .rows
+            .into_iter()
+            .rev()
+            .find(|row| !row.deleted && row.values.get("id") == Some(&Value::Int64(3)))
+            .expect("the lost reply echoes the current live key"),
+    ];
+    db.mark_outbound_rows_pending(Lsn(0), None).unwrap();
+    db.close().unwrap();
+    drop(db);
+
+    // Use the historical guards' raw missing-posting fixture, targeting only
+    // a retired version. Current rows and the echoed latest value stay intact.
+    let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+    let scope =
+        crate::read_image_memory::ImageMemory::enter_writer_operation(accountant.clone().into())
+            .unwrap();
+    let store = RedbPersistence::open(&path).unwrap();
+    store.attach_memory_accountant(accountant.into());
+    let metadata = store
+        .load_all_table_meta()
+        .unwrap()
+        .remove("notes")
+        .unwrap();
+    let old = store
+        .load_relational_table("notes")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.values.get("body") == Some(&Value::Text("version-0000".into())))
+        .unwrap();
+    assert!(
+        old.deleted_tx.is_some(),
+        "damage must target retained history"
+    );
+    let index = metadata
+        .indexes
+        .iter()
+        .find(|index| index.columns[0].0 == "id")
+        .unwrap();
+    let name = RedbPersistence::relational_index_table_name("notes", &index.name);
+    drop(store);
+    let raw = redb::Database::open(&path).unwrap();
+    // Inspect the authoritative sidecars directly: ordinary history reads
+    // must themselves refuse this deliberately damaged index root.
+    let provenance = |raw: &redb::Database| {
+        let read = raw.begin_read().unwrap();
+        let lsns = read.open_table(SYNC_ROW_SOURCE_LSN_TABLE).unwrap();
+        let kinds = read.open_table(SYNC_ROW_SOURCE_KIND_TABLE).unwrap();
+        lsns.iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, lsn) = entry.unwrap();
+                (
+                    key.value().to_vec(),
+                    lsn.value(),
+                    kinds.get(key.value()).unwrap().unwrap().value(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let pending = provenance(&raw);
+    assert!(
+        pending.iter().any(|(_, _, kind)| *kind == 2),
+        "fixture has a lost-reply pending row"
+    );
+    // Keep physical-root witnesses current while withholding the historical
+    // posting itself: this isolates semantic completeness from root tampering.
+    let write = RedbPersistence::begin_history_write(&raw).unwrap();
+    {
+        let mut postings = write
+            .open_table(TableDefinition::<DurableRelationalIndexKey, &[u8]>::new(
+                &name,
+            ))
+            .unwrap();
+        let key = postings
+            .iter()
+            .unwrap()
+            .find_map(|entry| {
+                let (key, value) = entry.unwrap();
+                let position = key.value().decode_canonical().unwrap();
+                let retired: Option<TxId> = RedbPersistence::decode_exact(value.value()).unwrap();
+                (position.row_id == old.row_id
+                    && position.created_tx == old.created_tx
+                    && retired == old.deleted_tx)
+                    .then(|| key.value())
+            })
+            .expect("the retained version has its original retired posting");
+        assert!(postings.remove(&key).unwrap().is_some());
+    }
+    RedbPersistence::write_writer_recovery_bounds_in_write(&write, None).unwrap();
+    write.commit().unwrap();
+    drop(raw);
+    drop(scope);
+
+    let db = Database::open(&path).unwrap();
+    db.set_maintenance_policy(crate::database::MaintenancePolicy::CallerDriven);
+    let arrivals = HashMap::from([(echo[0].lsn, Some(Lsn(9000)))]);
+    let outcome = db.refresh_confirmed_pending_rows_with_read_memory(
+        &echo,
+        &arrivals,
+        db.declared_reader_memory().unwrap(),
+    );
+    db.close().unwrap();
+    drop(db);
+    let raw = redb::Database::open(&path).unwrap();
+    let after = provenance(&raw);
+    assert_eq!(
+        after, pending,
+        "damaged history must not accept any arrival"
+    );
+    assert!(
+        matches!(outcome, Err(Error::StoreCorrupted { .. })),
+        "lost-reply reconciliation must preserve typed historical integrity refusal: {outcome:?}"
+    );
+}
