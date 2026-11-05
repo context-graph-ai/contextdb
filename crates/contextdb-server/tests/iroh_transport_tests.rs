@@ -2101,7 +2101,38 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     let edge_node_id = FabricIdentity::load_or_generate(&edge_identity)
         .expect("persist edge identity")
         .node_id();
-    let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
+    // Observe delivered application units without copying their large bodies.
+    #[derive(Default)]
+    struct IntactRowGroup(std::sync::Mutex<Vec<Vec<(Uuid, contextdb_core::Lsn)>>>);
+    impl contextdb_engine::plugin::DatabasePlugin for IntactRowGroup {
+        fn on_sync_pull(
+            &self,
+            changes: &mut contextdb_engine::sync_types::ChangeSet,
+        ) -> contextdb_core::Result<()> {
+            let mut group = Vec::new();
+            for row in changes.rows.iter().filter(|row| row.table == "notes") {
+                assert!(!row.deleted);
+                assert!(
+                    matches!(row.values.get("body"), Some(Value::Text(body))
+                    if body.len() == 112 * 1024 && body.bytes().all(|byte| byte == b'r')),
+                    "a reconciliation row body arrives intact"
+                );
+                let Some(Value::Uuid(id)) = row.values.get("id") else {
+                    panic!("the reconciliation row retains its UUID key");
+                };
+                group.push((*id, row.lsn));
+            }
+            if !group.is_empty() {
+                self.0.lock().unwrap().push(group);
+            }
+            Ok(())
+        }
+    }
+    let delivered_groups = Arc::new(IntactRowGroup::default());
+    let edge = Arc::new(
+        Database::open_with_plugin(&edge_path, delivered_groups.clone())
+            .expect("open edge database"),
+    );
     create_notes_table(&edge);
     let declaration_lsn = edge.current_lsn();
     edge.persist_sync_push_watermark(&tenant, declaration_lsn)
@@ -2381,9 +2412,8 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         before_reconciliation.accepted_fragment_sequences,
         "reconciliation does not accept a second full upload"
     );
-    // A hub contact row no longer holds a page open (95382cc3 "pull: exclude hub contacts from
-    // page limit enforcement"), so the oversized page reports `has_more = false` and the client
-    // stops after the one over-frame reply: there is no separate empty terminal follow-up pull.
+    // Selection stops between intact source groups before later bookkeeping
+    // filtering. It can therefore require a small terminal follow-up reply.
     let reconciliation_replies = &after_reconciliation.authenticated_pull_reply_bytes_after_reset;
     assert!(
         (1..=MAX_OVERSIZED_RECONCILIATION_ATTEMPTS).contains(&reconciliation_replies.len()),
@@ -2392,9 +2422,37 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     assert!(
         reconciliation_replies
             .iter()
+            .take(reconciliation_replies.len() - 1)
             .all(|bytes| *bytes > FRAME_CEILING),
-        "every reconciliation pull carries the unsplittable over-frame source-LSN group"
+        "only the terminal reconciliation reply may be below the frame ceiling"
     );
+    let groups = delivered_groups.0.lock().unwrap();
+    assert_eq!(
+        groups.len(),
+        1,
+        "the oversized source group is delivered once and never split"
+    );
+    assert_eq!(
+        groups[0].len(),
+        notes.len(),
+        "one delivered unit carries every source row"
+    );
+    assert!(
+        groups[0].iter().all(|(_, lsn)| *lsn == groups[0][0].1),
+        "the delivered rows retain one source-LSN group"
+    );
+    assert_eq!(
+        groups[0]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        notes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the complete source group arrives with every original key"
+    );
+    drop(groups);
     assert_completed_oversized_response_lifecycle(&after_reconciliation, &edge_node_id);
     assert_eq!(
         controller
