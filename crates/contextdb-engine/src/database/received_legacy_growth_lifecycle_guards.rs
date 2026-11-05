@@ -978,6 +978,31 @@ fn received_contact_cleanup_schedule(
     let old_lsn = receiver.db.current_lsn();
     let old_publication = format!("{:?}", receiver.db.published_state_snapshot_for_test());
     let held = receiver.db.accountant.usage().used;
+    // Failed preparation must also return native pages, which are not
+    // represented by the refunded writer invoice. Inspect the live handle
+    // through the shipping storage-statistics API before and after unwind.
+    let allocated_pages = || {
+        receiver
+            .db
+            .persistence
+            .as_ref()
+            .unwrap()
+            .with_db(|db| {
+                let snapshot = db
+                    .storage_statistics_snapshot()
+                    .map_err(RedbPersistence::storage_error)?;
+                Ok(snapshot
+                    .stats()
+                    .map_err(RedbPersistence::storage_error)?
+                    .allocated_pages())
+            })
+            .unwrap()
+    };
+    let pages_before = if !early_error && !hub_contact {
+        Some(allocated_pages())
+    } else {
+        None
+    };
     plugin.held.store(held, Ordering::SeqCst);
     plugin.armed.store(true, Ordering::SeqCst);
     plugin.failed_armed.store(
@@ -1034,6 +1059,13 @@ fn received_contact_cleanup_schedule(
         );
         memory
     };
+    if let Some(pages_before) = pages_before {
+        assert_eq!(
+            allocated_pages(),
+            pages_before,
+            "a panicking received preparation returns all unpublished native pages before retry"
+        );
+    }
     let active = receiver
         .db
         .tx_mgr
