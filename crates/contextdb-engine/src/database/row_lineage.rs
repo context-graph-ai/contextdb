@@ -4924,6 +4924,11 @@ impl Database {
 
         let _operation = self.assert_open_operation();
         self.tx_mgr.with_maintenance_publication(|publication| {
+            let root = self.writer_read_root()?;
+            let _writer_read = self.enter_writer_read(root.clone(), read_memory.clone());
+            let mut source = root
+                .map(|root| self.statement_relational_source(root, read_memory.clone()))
+                .transpose()?;
             let mut entries = Vec::new();
             let mut tombstone_refreshes = Vec::new();
             for row in rows.iter().filter(|row| !row.deleted) {
@@ -4932,7 +4937,7 @@ impl Database {
                 };
                 let meta = self.table_meta(&row.table);
                 let table = row.table.as_str();
-                self.visit_row_versions_for_natural_key(table, &row.natural_key, |current| {
+                self.visit_row_versions_for_natural_key(&mut source, table, &row.natural_key, |current| {
                     if matches!(self.relational_sync_source_at_read_root(table, current.row_id, read_memory.clone())?.1,
                             Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending))
                         && self.sync_incoming_row_matches_committed(&row.values, current, table, meta.as_ref(), read_memory.clone())? {

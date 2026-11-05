@@ -3630,6 +3630,7 @@ impl Database {
     )]
     pub(super) fn visit_row_versions_for_natural_key(
         &self,
+        source: &mut Option<crate::persistence::writer_adapters::WriterRelationalSource>,
         table: &str,
         key: &NaturalKey,
         mut visit: impl FnMut(&VersionedRow) -> Result<()>,
@@ -3639,7 +3640,7 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         use contextdb_relational::source::RelationalReadSource;
-        let Some(root) = self.writer_read_root()? else {
+        let Some(source) = source.as_mut() else {
             if let Some(rows) = self.relational_store.tables.read().get(table) {
                 for row in rows {
                     visit(row)?;
@@ -3647,7 +3648,7 @@ impl Database {
             }
             return Ok(());
         };
-        let Some(meta) = root.borrow_captured_table_meta(table) else {
+        let Some(meta) = source.captured_root().borrow_captured_table_meta(table) else {
             return Ok(());
         };
         let columns = key.key_columns();
@@ -3664,8 +3665,11 @@ impl Database {
                         .all(|((have, _), want)| have == want)
             })
             .cloned();
-        let source = self.statement_relational_source(root, read_memory.clone())?;
-        source.verify_historical_versions(table)?;
+        source.prepare_historical_versions(
+            table,
+            index.as_ref().map(|index| index.name.as_str()),
+            &mut || Ok(()),
+        )?;
         let Some(index) = index else {
             let mut rows = source.row_cursor(
                 table,
@@ -3678,7 +3682,6 @@ impl Database {
             }
             return Ok(());
         };
-        source.historical_index_versions_preflight(table, &index.name, &mut || Ok(()))?;
         let mut memory = contextdb_core::read_memory::ReadCredit::try_new(
             read_memory.clone(),
             values

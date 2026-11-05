@@ -15,9 +15,78 @@ pub(crate) struct WriterRelationalSource {
     root: WriterSnapshotHandle,
     owner: SourceWindowOwner,
     requested_snapshot: SnapshotId,
+    prepared_versions: Option<Box<PreparedVersions>>,
     _control: SourceWindowCredit,
 }
+// Markers belong to this immutable source and reader, never to a numeric
+// snapshot alone. Each node owns its admission until its strings are freed.
+struct PreparedVersions {
+    table: Box<str>,
+    index: Option<Box<str>>,
+    next: Option<Box<PreparedVersions>>,
+    _credit: SourceWindowCredit,
+}
+
+impl Drop for PreparedVersions {
+    fn drop(&mut self) {
+        while let Some(mut next) = self.next.take() {
+            self.next = next.next.take();
+        }
+    }
+}
+
 impl WriterRelationalSource {
+    pub(crate) fn captured_root(&self) -> &WriterSnapshotHandle {
+        &self.root
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Inline refusal diagnostics avoid allocating on exhaustion."
+    )]
+    pub(crate) fn prepare_historical_versions(
+        &mut self,
+        table: &str,
+        index: Option<&str>,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        before()?;
+        // Received overlays can change without changing their durable root.
+        if self.working.is_some() {
+            self.verify_historical_versions_with_checkpoint(table, before)?;
+            if let Some(index) = index {
+                self.historical_index_versions_preflight(table, index, before)?;
+            }
+            return before();
+        }
+        let mut marker = self.prepared_versions.as_deref();
+        while let Some(prepared) = marker {
+            if prepared.table.as_ref() == table && prepared.index.as_deref() == index {
+                return before();
+            }
+            marker = prepared.next.as_deref();
+        }
+        let credit = self.owner.reserve(
+            std::mem::size_of::<PreparedVersions>()
+                .saturating_add(table.len())
+                .saturating_add(index.map_or(0, str::len)),
+            "historical_versions_prepared",
+        )?;
+        if let Some(index) = index {
+            self.historical_index_versions_preflight(table, index, before)?;
+        } else {
+            self.verify_historical_versions_with_checkpoint(table, before)?;
+        }
+        before()?;
+        self.prepared_versions = Some(Box::new(PreparedVersions {
+            table: table.into(),
+            index: index.map(Into::into),
+            next: self.prepared_versions.take(),
+            _credit: credit,
+        }));
+        Ok(())
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -30,6 +99,7 @@ impl WriterRelationalSource {
         mut self,
         working: super::received_working_source::WorkingReadSource,
     ) -> Self {
+        self.prepared_versions = None;
         self.requested_snapshot = working.snapshot();
         self.working = Some(working);
         self
@@ -195,6 +265,7 @@ impl WriterRelationalSource {
         let requested_snapshot = root.snapshot;
         Ok(Self {
             working: None,
+            prepared_versions: None,
             root,
             owner,
             requested_snapshot,
@@ -394,16 +465,24 @@ impl WriterRelationalSource {
             true,
             before,
         )?;
+        // The cache is an optimization, never a directory of retained history.
+        // Eviction forces full validation again; only successful checks enter it.
+        let _cache_credit = self.owner.reserve(
+            std::mem::size_of::<([Option<SnapshotId>; 64], usize)>(),
+            "historical_frontier_cache",
+        )?;
+        let mut validated = [None; 64];
+        let mut replacement = 0;
         let mut versions =
             self.row_cursor_owned(table, Bound::Unbounded, Bound::Unbounded, false, None)?;
         while let Some(row) = versions.next_window_before(before)? {
-            self.historical_index_preflight_with_intent(
-                table,
-                index,
-                SnapshotId(row.value().created_tx.0),
-                true,
-                before,
-            )?;
+            let snapshot = SnapshotId(row.value().created_tx.0);
+            if snapshot == self.root.snapshot || validated.contains(&Some(snapshot)) {
+                continue;
+            }
+            self.historical_index_preflight_with_intent(table, index, snapshot, true, before)?;
+            validated[replacement] = Some(snapshot);
+            replacement = (replacement + 1) % validated.len();
         }
         before()
     }
