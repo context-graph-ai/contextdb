@@ -6504,6 +6504,12 @@
       "execution": "not selected (--include-ignored absent)"
     },
     {
+      "path": "crates/contextdb-engine/tests/engine_seams/outbound_selection_regressions.rs",
+      "line": 405,
+      "declaration": "#[ignore = \"CDB-265: post-extraction push consumers reread excluded bodies\"]",
+      "execution": "not selected (--include-ignored absent)"
+    },
+    {
       "path": "crates/contextdb-engine/tests/engine_seams/where_an_appends_chunk_rewrites_sit_in_the_proof_tree.rs",
       "line": 24,
       "declaration": "#[ignore = \"builds a 5,010-event store; run with --ignored\"]",
