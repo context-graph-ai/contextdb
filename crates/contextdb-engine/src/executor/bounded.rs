@@ -3056,7 +3056,133 @@ pub(super) fn observe_access_control_row() {}
 
 pub(super) fn observe_rank_candidate() {}
 
+/// Hidden source identity positions. Construction owns its reservation until
+/// the retained kernel ledger adopts the allocation.
+#[derive(Default)]
+struct HiddenOutputSlots {
+    positions: Vec<usize>,
+    construction: Option<ControlArc<RequestContext>>,
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+impl HiddenOutputSlots {
+    fn try_collect(
+        context: &ControlArc<RequestContext>,
+        count: usize,
+        slots: impl Iterator<Item = usize>,
+    ) -> std::result::Result<Self, BoundedExecutionError> {
+        if count == 0 {
+            return Ok(Self::default());
+        }
+        let planned = checked_size_mul(count, size_of::<usize>(), "hidden output slots")?;
+        context.reserve(BoundedWorkSource::TableScan, planned)?;
+        let mut charge = ReservedBytes::new(context, planned);
+        let mut positions = Vec::new();
+        positions.try_reserve_exact(count).map_err(|_| {
+            BoundedExecutionError::from(Error::Other("hidden output slot allocation failed".into()))
+        })?;
+        positions.extend(slots);
+        debug_assert_eq!(positions.len(), count);
+        let actual = checked_size_mul(
+            positions.capacity(),
+            size_of::<usize>(),
+            "hidden output slots",
+        )?;
+        if actual > charge.bytes {
+            context.reserve(BoundedWorkSource::TableScan, actual - charge.bytes)?;
+        } else if charge.bytes > actual {
+            context.release(charge.bytes - actual)?;
+        }
+        charge.bytes = 0;
+        Ok(Self {
+            positions,
+            construction: Some(context.clone()),
+        })
+    }
+
+    fn source(
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<Self, BoundedExecutionError> {
+        Self::try_collect(context, 1, std::iter::once(0))
+    }
+
+    fn try_clone(
+        &self,
+        context: &ControlArc<RequestContext>,
+    ) -> std::result::Result<Self, BoundedExecutionError> {
+        Self::try_collect(
+            context,
+            self.positions.len(),
+            self.positions.iter().copied(),
+        )
+    }
+
+    fn join(
+        context: &ControlArc<RequestContext>,
+        left: &PullNode,
+        right: &PullNode,
+    ) -> std::result::Result<Self, BoundedExecutionError> {
+        let count = checked_size_add(
+            left.hidden_slots.positions.len(),
+            right.hidden_slots.positions.len(),
+            "join hidden output slots",
+        )?;
+        Self::try_collect(
+            context,
+            count,
+            left.hidden_slots.positions.iter().copied().chain(
+                right
+                    .hidden_slots
+                    .positions
+                    .iter()
+                    .map(|position| left.columns.len() + position),
+            ),
+        )
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        self.positions.capacity() * size_of::<usize>()
+    }
+
+    fn adopt_construction(&mut self) -> usize {
+        self.construction
+            .take()
+            .map_or(0, |_| self.capacity_bytes())
+    }
+
+    fn retain_visible<T>(&self, values: &mut Vec<T>) {
+        if self.positions.is_empty() {
+            return;
+        }
+        let mut hidden = self.positions.iter().copied();
+        let mut next = hidden.next();
+        let mut position = 0;
+        values.retain(|_| {
+            let visible = next != Some(position);
+            if !visible {
+                next = hidden.next();
+            }
+            position += 1;
+            visible
+        });
+    }
+}
+
+impl Drop for HiddenOutputSlots {
+    fn drop(&mut self) {
+        if let Some(context) = self.construction.take() {
+            let bytes = self.capacity_bytes();
+            drop(std::mem::take(&mut self.positions));
+            context.release_parked(bytes);
+        }
+    }
+}
+
 struct PullNode {
+    hidden_slots: HiddenOutputSlots,
     columns: Vec<String>,
     trace: QueryTrace,
     kind: PullKind,
@@ -6091,7 +6217,11 @@ fn completed_vector_control_bytes(node: &PullNode) -> usize {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, BoundedExecutionError> {
-    let mut bytes = strings_capacity_bytes(&node.columns, "pull output columns")?;
+    let mut bytes = checked_size_add(
+        strings_capacity_bytes(&node.columns, "pull output columns")?,
+        node.hidden_slots.capacity_bytes(),
+        "pull output visibility",
+    )?;
     bytes = checked_size_add(
         bytes,
         query_trace_capacity_bytes(&node.trace)?,
@@ -13491,6 +13621,7 @@ fn build_authenticated_index_count(
     let retained_bytes = value_refs_retained_bytes(values.iter(), values.len())?;
     context.reserve(BoundedWorkSource::IndexRange, retained_bytes)?;
     Ok(Some(Box::new(PullNode {
+        hidden_slots: HiddenOutputSlots::default(),
         columns: project_output_columns(columns),
         trace: QueryTrace {
             physical_plan: "IndexScan",
@@ -14504,6 +14635,7 @@ fn build_ranked_prefix(
         )?;
         let partition_bytes = values_retained_bytes(&group.key)?;
         let ranked = Box::new(PullNode {
+            hidden_slots: source.hidden_slots.try_clone(context)?,
             columns: source.columns.clone(),
             trace: source.trace.clone(),
             kind: PullKind::Window(WindowState {
@@ -14521,6 +14653,7 @@ fn build_ranked_prefix(
             }),
         });
         let projected = PullNode {
+            hidden_slots: HiddenOutputSlots::default(),
             columns: project_output_columns(columns),
             trace: ranked.trace.clone(),
             kind: PullKind::Project(ProjectState {
@@ -14539,6 +14672,7 @@ fn build_ranked_prefix(
     }
     trace.sort_elided = true;
     let mut node = Box::new(PullNode {
+        hidden_slots: HiddenOutputSlots::default(),
         columns: project_output_columns(columns),
         trace,
         kind: PullKind::Union(UnionState {
@@ -14558,6 +14692,10 @@ fn build_ranked_prefix(
         )
         .into());
     }
+    // The scratch reservation covers the complete tree, including visibility.
+    // Transfer separate construction credit before adopting that whole tree.
+    let prepaid = adopt_kernel_construction(&mut node)?;
+    context.release(prepaid)?;
     if let PullKind::Union(union) = &mut node.kind {
         union.prepaid_construction = retained;
     }
@@ -14761,6 +14899,7 @@ fn build_kernel_with_ctes<'plan>(
             context.reserve(BoundedWorkSource::UnindexedSort, node_bytes)?;
             let mut node_construction_charge = ReservedBytes::new(context, node_bytes);
             let sorted = Box::new(PullNode {
+                hidden_slots: built.hidden_slots.try_clone(context)?,
                 columns: sort_columns,
                 trace: trace.clone(),
                 kind: PullKind::Sort(SortState {
@@ -14776,6 +14915,7 @@ fn build_kernel_with_ctes<'plan>(
                 }),
             });
             let node = Box::new(PullNode {
+                hidden_slots: sorted.hidden_slots.try_clone(context)?,
                 columns,
                 trace,
                 kind: PullKind::Window(WindowState {
@@ -14908,6 +15048,7 @@ fn build_kernel_with_ctes<'plan>(
                 state.prepaid_construction =
                     checked_size_add(state.prepaid_construction, bytes, "vector projection")?;
                 input.columns = project_output_columns(columns);
+                input.hidden_slots = HiddenOutputSlots::default();
                 return Ok(input);
             }
             let mut trace = input.trace.clone();
@@ -14924,6 +15065,7 @@ fn build_kernel_with_ctes<'plan>(
                 return Err(mixed_aggregate_error().into());
             }
             Ok(Box::new(PullNode {
+                hidden_slots: HiddenOutputSlots::default(),
                 columns: project_output_columns(columns),
                 trace,
                 kind: PullKind::Project(ProjectState {
@@ -14941,6 +15083,7 @@ fn build_kernel_with_ctes<'plan>(
         PhysicalPlan::Limit { input, count } => {
             let input = build_kernel_with_ctes(db, input, params, snapshot, ctes, context)?;
             Ok(Box::new(PullNode {
+                hidden_slots: input.hidden_slots.try_clone(context)?,
                 columns: input.columns.clone(),
                 trace: input.trace.clone(),
                 kind: PullKind::Limit(LimitState {
@@ -15030,6 +15173,7 @@ fn build_kernel_with_ctes<'plan>(
             }
             let input = built;
             Ok(Box::new(PullNode {
+                hidden_slots: input.hidden_slots.try_clone(context)?,
                 columns: input.columns.clone(),
                 trace: input.trace.clone(),
                 kind: PullKind::Sort(SortState {
@@ -15055,6 +15199,7 @@ fn build_kernel_with_ctes<'plan>(
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
             limit_ranked_sort(input, predicate, &params, &mut built);
             Ok(Box::new(PullNode {
+                hidden_slots: built.hidden_slots.try_clone(context)?,
                 columns: built.columns.clone(),
                 trace: built.trace.clone(),
                 kind: PullKind::Filter(FilterState {
@@ -15071,6 +15216,7 @@ fn build_kernel_with_ctes<'plan>(
                 return Ok(input);
             }
             Ok(Box::new(PullNode {
+                hidden_slots: input.hidden_slots.try_clone(context)?,
                 columns: input.columns.clone(),
                 trace: input.trace.clone(),
                 kind: PullKind::Distinct(DistinctState {
@@ -15100,6 +15246,10 @@ fn build_kernel_with_ctes<'plan>(
                 .first()
                 .map_or_else(QueryTrace::scan, |input| input.trace.clone());
             Ok(Box::new(PullNode {
+                hidden_slots: match built.first() {
+                    Some(input) => input.hidden_slots.try_clone(context)?,
+                    None => HiddenOutputSlots::default(),
+                },
                 columns,
                 trace,
                 kind: PullKind::Union(UnionState {
@@ -15147,6 +15297,7 @@ fn build_kernel_with_ctes<'plan>(
             );
             let trace = left.trace.clone();
             Ok(Box::new(PullNode {
+                hidden_slots: HiddenOutputSlots::join(context, &left, &right)?,
                 columns: output_columns,
                 trace,
                 kind: PullKind::Join(JoinState {
@@ -15369,6 +15520,7 @@ fn build_kernel_with_ctes<'plan>(
             columns.push("id".to_string());
             columns.push("depth".to_string());
             Ok(Box::new(PullNode {
+                hidden_slots: HiddenOutputSlots::default(),
                 columns,
                 trace,
                 kind: PullKind::Graph(Box::new(GraphState {
@@ -16929,6 +17081,7 @@ fn build_vector_kernel<'plan>(
         size_of::<VectorState>(),
     )?;
     Ok(PullNode {
+        hidden_slots: HiddenOutputSlots::source(context)?,
         columns,
         trace,
         kind: PullKind::Vector(Box::new(VectorState {
@@ -17561,6 +17714,7 @@ fn bounded_query_vector(
 
 fn empty_node() -> PullNode {
     PullNode {
+        hidden_slots: HiddenOutputSlots::default(),
         columns: Vec::new(),
         trace: QueryTrace::scan(),
         kind: PullKind::Static(StaticState {
@@ -17637,6 +17791,7 @@ fn build_scan(
     // gets that table: its rows, its columns, and its vector index.
     if table == "dual" && db.table_meta(table).is_none() {
         return Ok(PullNode {
+            hidden_slots: HiddenOutputSlots::default(),
             columns: Vec::new(),
             trace: QueryTrace::scan(),
             kind: PullKind::Static(StaticState {
@@ -17915,6 +18070,7 @@ fn build_scan(
     let mut columns = vec!["row_id".to_string()];
     columns.extend(schema_columns.iter().cloned());
     Ok(PullNode {
+        hidden_slots: HiddenOutputSlots::source(context)?,
         columns,
         trace: match &mode {
             ScanMode::Ordered { cursor, .. } => QueryTrace {
@@ -18074,12 +18230,17 @@ fn declare_supplemented_columns(
 fn adopt_kernel_construction(
     node: &mut PullNode,
 ) -> std::result::Result<usize, BoundedExecutionError> {
-    let mut credit = match &mut node.kind {
-        PullKind::Window(window) => std::mem::take(&mut window.prepaid_construction),
-        PullKind::Vector(vector) => std::mem::take(&mut vector.prepaid_construction),
-        PullKind::Union(union) => std::mem::take(&mut union.prepaid_construction),
-        _ => 0,
-    };
+    let mut credit = node.hidden_slots.adopt_construction();
+    credit = checked_size_add(
+        credit,
+        match &mut node.kind {
+            PullKind::Window(window) => std::mem::take(&mut window.prepaid_construction),
+            PullKind::Vector(vector) => std::mem::take(&mut vector.prepaid_construction),
+            PullKind::Union(union) => std::mem::take(&mut union.prepaid_construction),
+            _ => 0,
+        },
+        "kernel visibility construction",
+    )?;
     for child in pull_node_inputs_mut(&mut node.kind) {
         credit = checked_size_add(
             credit,
@@ -18124,23 +18285,34 @@ fn collect_expr_columns(expr: &Expr, into: &mut std::collections::BTreeSet<Strin
 }
 
 /// The nodes this one reads from, borrowed for change.
-fn pull_node_inputs_mut(kind: &mut PullKind) -> Vec<&mut PullNode> {
+fn pull_node_inputs_mut(kind: &mut PullKind) -> impl Iterator<Item = &mut PullNode> {
+    let mut first = None;
+    let mut second = None;
+    let mut many = None;
     match kind {
-        PullKind::Graph(state) => state.start_candidates.as_deref_mut().into_iter().collect(),
-        PullKind::Vector(state) => match &mut state.preparation {
-            VectorPreparation::Candidates(Some(candidates)) => vec![candidates.as_mut()],
-            _ => Vec::new(),
-        },
-        PullKind::Project(state) => vec![state.input.as_mut()],
-        PullKind::Sort(state) => vec![state.input.as_mut()],
-        PullKind::Window(state) => vec![state.input.as_mut()],
-        PullKind::Limit(state) => vec![state.input.as_mut()],
-        PullKind::Filter(state) => vec![state.input.as_mut()],
-        PullKind::Distinct(state) => vec![state.input.as_mut()],
-        PullKind::Join(state) => vec![state.left.as_mut(), state.right.as_mut()],
-        PullKind::Union(state) => state.inputs.iter_mut().collect(),
-        PullKind::Scan(_) | PullKind::Static(_) => Vec::new(),
+        PullKind::Graph(state) => first = state.start_candidates.as_deref_mut(),
+        PullKind::Vector(state) => {
+            if let VectorPreparation::Candidates(Some(candidates)) = &mut state.preparation {
+                first = Some(candidates.as_mut());
+            }
+        }
+        PullKind::Project(state) => first = Some(state.input.as_mut()),
+        PullKind::Sort(state) => first = Some(state.input.as_mut()),
+        PullKind::Window(state) => first = Some(state.input.as_mut()),
+        PullKind::Limit(state) => first = Some(state.input.as_mut()),
+        PullKind::Filter(state) => first = Some(state.input.as_mut()),
+        PullKind::Distinct(state) => first = Some(state.input.as_mut()),
+        PullKind::Join(state) => {
+            first = Some(state.left.as_mut());
+            second = Some(state.right.as_mut());
+        }
+        PullKind::Union(state) => many = Some(state.inputs.iter_mut()),
+        PullKind::Scan(_) | PullKind::Static(_) => {}
     }
+    first
+        .into_iter()
+        .chain(second)
+        .chain(many.into_iter().flatten())
 }
 
 /// One complete answer about the store itself, admitted row by row.
@@ -18229,6 +18401,7 @@ fn build_store_state(
         });
     }
     Ok(PullNode {
+        hidden_slots: HiddenOutputSlots::default(),
         columns: answered.columns,
         trace: answered.trace,
         kind: PullKind::Static(StaticState { rows }),
@@ -18330,6 +18503,7 @@ fn build_direct_index_scan(
     let mut columns = vec!["row_id".to_string()];
     columns.extend(schema_columns.iter().cloned());
     Ok(PullNode {
+        hidden_slots: HiddenOutputSlots::source(context)?,
         columns,
         trace: QueryTrace {
             physical_plan: "IndexScan",
@@ -19148,12 +19322,7 @@ pub(crate) fn drain_chosen_plan_with_native_trace_refund(
         trace: result_trace,
         cascade: None,
     });
-    let internal_row_id = (!plan_projects_row_id(plan))
-        .then(|| result.columns.iter().position(|column| column == "row_id"))
-        .flatten();
-    if let Some(position) = internal_row_id {
-        result.columns.remove(position);
-    }
+    root.hidden_slots.retain_visible(&mut result.columns);
     {
         let admitted_bytes = result_column_bytes;
         let retained_bytes = strings_capacity_bytes(&result.columns, "result columns")?;
@@ -19169,11 +19338,7 @@ pub(crate) fn drain_chosen_plan_with_native_trace_refund(
     let mut retained_rows = Vec::<usize>::new();
     let mut held_container_bytes = 0usize;
     while let Some(mut row) = pull(db, &context, &mut root)? {
-        if let Some(position) = internal_row_id
-            && position < row.values.len()
-        {
-            row.values.remove(position);
-        }
+        root.hidden_slots.retain_visible(&mut row.values);
         if let Some(binding) = row.group_binding {
             context.stage_group_return(binding)?;
         }
@@ -19545,7 +19710,6 @@ pub(super) fn execute_with_native_trace_refund(
             checked_size_add(plan_bytes, prepaid, "kernel construction adoption")?;
         // The kernel owns its copies now. Free the consumed plan before
         // reconciling kernel capacity, retaining its separate construction credit.
-        let projects_row_id = plan_projects_row_id(&plan);
         drop(plan);
         context.release(plan_bytes)?;
         // Keep adopted credit while the root is alive if admission refuses.
@@ -19583,12 +19747,7 @@ pub(super) fn execute_with_native_trace_refund(
             trace: result_trace,
             cascade: None,
         });
-        let internal_row_id = (!projects_row_id)
-            .then(|| result.columns.iter().position(|column| column == "row_id"))
-            .flatten();
-        if let Some(position) = internal_row_id {
-            result.columns.remove(position);
-        }
+        root.hidden_slots.retain_visible(&mut result.columns);
         let retained_result_column_bytes =
             strings_capacity_bytes(&result.columns, "bounded result columns")?;
         {
@@ -19642,11 +19801,7 @@ pub(super) fn execute_with_native_trace_refund(
             let Some(mut row) = pull(db, &context, &mut root)? else {
                 break;
             };
-            if let Some(position) = internal_row_id
-                && position < row.values.len()
-            {
-                row.values.remove(position);
-            }
+            root.hidden_slots.retain_visible(&mut row.values);
             grow_result_containers(
                 &context,
                 &mut result.rows,
@@ -19725,7 +19880,6 @@ pub(super) struct CursorState {
     root: PullNode,
     replay: VecDeque<PulledRow>,
     visible_columns: Vec<String>,
-    internal_row_id: Option<usize>,
     sql: String,
     created_ms: u64,
     last_used_ms: u64,
@@ -20019,11 +20173,7 @@ impl CursorState {
         let Some(mut row) = pull(self.database.as_ref(), &self.context, &mut self.root)? else {
             return Ok(None);
         };
-        if let Some(position) = self.internal_row_id
-            && position < row.values.len()
-        {
-            row.values.remove(position);
-        }
+        self.root.hidden_slots.retain_visible(&mut row.values);
         Ok(Some(row))
     }
 
@@ -20967,7 +21117,6 @@ pub(super) fn open_cursor_with_native_trace_refund(
             checked_size_add(plan_bytes, prepaid, "kernel construction adoption")?;
         // The kernel owns its copies now. Free the consumed plan before
         // reconciling kernel capacity, retaining its separate construction credit.
-        let projects_row_id = plan_projects_row_id(&plan);
         drop(plan);
         context.release(plan_bytes)?;
         // Keep adopted credit while the root is alive if admission refuses.
@@ -20980,14 +21129,9 @@ pub(super) fn open_cursor_with_native_trace_refund(
             context.release(construction_bytes - root_bytes)?;
         }
         context.bind_final_trace(&root.trace)?;
-        let internal_row_id = (!projects_row_id)
-            .then(|| root.columns.iter().position(|column| column == "row_id"))
-            .flatten();
         let (mut visible_columns, visible_column_bytes) =
             clone_strings_with_reservation(&root.columns, &context, "cursor columns")?;
-        if let Some(position) = internal_row_id {
-            visible_columns.remove(position);
-        }
+        root.hidden_slots.retain_visible(&mut visible_columns);
         let retained_visible_column_bytes =
             strings_capacity_bytes(&visible_columns, "cursor columns")?;
         {
@@ -21045,7 +21189,6 @@ pub(super) fn open_cursor_with_native_trace_refund(
             root,
             replay,
             visible_columns,
-            internal_row_id,
             sql: retained_sql,
             created_ms: now,
             last_used_ms: now,

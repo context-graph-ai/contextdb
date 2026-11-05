@@ -900,6 +900,10 @@ impl Database {
     ) -> Result<ReceivedSchemaSemanticProjection> {
         for change in ddl {
             (projection.checkpoint)()?;
+            Self::validate_received_column_declarations(change)?;
+        }
+        for change in ddl {
+            (projection.checkpoint)()?;
             if projection.bounded {
                 (projection.admit)(change.estimated_bytes())?;
             }
@@ -3140,6 +3144,9 @@ impl Database {
         preparation_original: Option<&OwnedMemoryReservation>,
         working_preparation: &ReceivedWorkingPreparation<'_>,
     ) -> Result<ReceivedSchemaStage> {
+        for change in &changes.ddl {
+            Self::validate_received_column_declarations(change)?;
+        }
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
         // Its working preparation is a loan from the live store's write.
         if self.persistence.is_none() {

@@ -455,6 +455,7 @@ fn served_groups(
     let rows = group_rows(groups.into_iter(), list, columns, &mut held, context)?;
     held.release()?;
     Ok(Some(Box::new(PullNode {
+        hidden_slots: HiddenOutputSlots::default(),
         columns: output_columns(columns),
         trace: QueryTrace {
             physical_plan: "IndexScan",
@@ -572,6 +573,7 @@ fn counted_groups(
     let rows = group_rows(groups.into_iter(), list, columns, &mut held, context)?;
     held.release()?;
     Ok(Box::new(PullNode {
+        hidden_slots: HiddenOutputSlots::default(),
         columns: output_columns(columns),
         trace,
         kind: PullKind::Static(StaticState { rows }),

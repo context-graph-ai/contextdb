@@ -3031,6 +3031,9 @@ impl Database {
         old_meta: &TableMeta,
         mut new_meta: TableMeta,
     ) -> Result<TableMeta> {
+        for column in &new_meta.columns {
+            crate::executor::validate_declared_column_name(table, &column.name)?;
+        }
         let old_auto_names = old_meta
             .indexes
             .iter()
@@ -3100,6 +3103,61 @@ impl Database {
         Ok(new_meta)
     }
 
+    /// A declared name cannot shadow the engine identity, regardless of
+    /// whether this declaration is applied through SQL or typed metadata.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn validate_received_column_declarations(change: &DdlChange) -> Result<()> {
+        let (name, columns, constraints) = match change {
+            DdlChange::CreateTable {
+                name,
+                columns,
+                constraints,
+                ..
+            }
+            | DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+                ..
+            } => (name, columns, constraints),
+            _ => return Ok(()),
+        };
+        for (column, _) in columns {
+            crate::executor::validate_declared_column_name(name, column)?;
+        }
+        // Borrow the same marker fields the rename decoders use. Preflight
+        // must not allocate uppercase strings or copied names before admission.
+        for constraint in constraints {
+            let marker = constraint.trim();
+            for prefix in ["COLUMN_RENAME(", "VECTOR_RENAME("] {
+                if !marker
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                    || !marker.ends_with(')')
+                {
+                    continue;
+                }
+                let body = &marker[prefix.len()..marker.len() - 1];
+                let Some((from, to)) = body.split_once(',') else {
+                    continue;
+                };
+                let from = from
+                    .trim()
+                    .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
+                let to = to
+                    .trim()
+                    .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
+                if !from.is_empty() && !to.is_empty() {
+                    crate::executor::validate_declared_column_name(name, to)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -3108,6 +3166,7 @@ impl Database {
         projected: &HashMap<String, TableMeta>,
         change: &DdlChange,
     ) -> Result<()> {
+        Self::validate_received_column_declarations(change)?;
         // Judge explicit author markers against this exact source prefix,
         // before parsing/copying the incoming shape or applying any mutation.
         refuse_dag_defining_column_sync_ddl(projected, change)?;

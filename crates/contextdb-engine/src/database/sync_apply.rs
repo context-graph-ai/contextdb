@@ -1497,6 +1497,7 @@ impl Database {
         authenticated_schema: bool,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<Error>> {
+        Self::validate_received_column_declarations(change)?;
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let (name, columns, constraints, foreign_keys, composite_foreign_keys, composite_unique) =
@@ -1661,6 +1662,9 @@ impl Database {
         source: Option<&str>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        for change in &changes.ddl {
+            Self::validate_received_column_declarations(change)?;
+        }
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let planned = if role == SyncApplyRole::HubPushApply
@@ -1703,6 +1707,9 @@ impl Database {
         hub: &str,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        for change in &changes.ddl {
+            Self::validate_received_column_declarations(change)?;
+        }
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let mut refusals = HashMap::new();
@@ -1806,6 +1813,9 @@ impl Database {
         projection: Option<&PullPolicyProjection>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ReceivedPolicyPlan> {
+        for change in &changes.ddl {
+            Self::validate_received_column_declarations(change)?;
+        }
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let identity = received
@@ -4382,6 +4392,9 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         private_replay: Option<connected_replay::PrivateReplayContext<'_>>,
     ) -> Result<ApplyResult> {
+        for change in &changes.ddl {
+            Self::validate_received_column_declarations(change)?;
+        }
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         (|| {
@@ -4560,6 +4573,7 @@ impl Database {
                     .map(crate::memory_accounting::AdmittedSchemaUnit::enter);
                 let ddl_result = (|| -> Result<()> {
                     for (phase_ordinal, ddl) in changes.ddl.clone().into_iter().enumerate() {
+                        Self::validate_received_column_declarations(&ddl)?;
                         let source_generation =
                             if let (DdlChange::CreateTable { name, .. }, Some(generations)) = (
                                 &ddl,

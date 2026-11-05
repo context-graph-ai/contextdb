@@ -4827,7 +4827,7 @@ fn vector_partition_inspection_row(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn validate_declared_column_name(table: &str, column: &str) -> Result<()> {
+pub(crate) fn validate_declared_column_name(table: &str, column: &str) -> Result<()> {
     if column == PREDICATE_PSEUDO_COLUMN {
         return Err(Error::ReservedColumnName {
             table: table.to_string(),
@@ -5833,6 +5833,7 @@ fn execute_alter_table_plan(
                     (format!("table '{}' not found", p.table)).into(),
                 ));
             }
+            validate_declared_column_name(&p.table, to)?;
             refuse_engine_owned_reserved_name_column_alter(&p.table)?;
             if let Some(block) = vector_partition_key_component_blocker(db, &p.table, from) {
                 return Err(block);
@@ -10147,30 +10148,6 @@ fn project_output_columns(columns: &[contextdb_planner::ProjectColumn]) -> Vec<S
             })
         })
         .collect()
-}
-
-/// Whether the answer explicitly names row_id rather than inheriting a scan's
-/// internal identity slot. Inspect only the output projection, so a wildcard
-/// over a derived relation does not expose a hidden source identity.
-fn plan_projects_row_id(plan: &PhysicalPlan) -> bool {
-    match plan {
-        PhysicalPlan::Project { columns, .. } | PhysicalPlan::GroupedCount { columns, .. } => {
-            columns.iter().any(|column| {
-                column.alias.as_deref().map_or_else(
-                    || matches!(&column.expr, Expr::Column(reference) if reference.column == PREDICATE_PSEUDO_COLUMN),
-                    |alias| alias == PREDICATE_PSEUDO_COLUMN,
-                )
-            })
-        }
-        PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Distinct { input }
-        | PhysicalPlan::Limit { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::WindowRank { input, .. }
-        | PhysicalPlan::MaterializeCte { input, .. } => plan_projects_row_id(input),
-        PhysicalPlan::Union { inputs, .. } => inputs.first().is_some_and(plan_projects_row_id),
-        _ => false,
-    }
 }
 
 fn plan_anchor_table(plan: &PhysicalPlan) -> Option<String> {
