@@ -9966,6 +9966,13 @@ impl Database {
         }
         let authenticated_snapshot = received_ddl.map(|_| changes.clone());
         self.plugin.on_sync_pull(&mut changes)?;
+        // The hook may commit an ordinary local transaction. Its publication
+        // supersedes the root captured when this apply operation opened; all
+        // subsequent validation and mutation must read the post-hook state.
+        if let Some(operation) = operation.as_mut() {
+            drop(operation._writer_read.take());
+            operation._writer_read = Some(self.writer_root_scope()?);
+        }
         if let (Some(expected), Some(context)) = (authenticated_snapshot.as_ref(), received_ddl) {
             Self::validate_authenticated_received_plugin_output(expected, &changes, context)?;
             if let Some(tenant_id) = lineage_tenant {
