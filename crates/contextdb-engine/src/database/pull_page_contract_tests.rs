@@ -1906,3 +1906,157 @@ fn an_exported_snapshot_after_recreation_replays_authored_body_schema_and_a_dist
         "the unrelated neighbor survives the artifact reopen"
     );
 }
+
+// CDB-255: exercise the synchronous production refresh reached after an
+// oversized push loses its reply and its status probe confirms acceptance.
+mod lost_reply_reconciliation {
+    use super::*;
+    use contextdb_core::read_memory::{ReadMemoryBudget, ReadMemoryOwner};
+
+    #[derive(Debug)]
+    struct Measured {
+        budget: Arc<CountingBudget>,
+        preflights: AtomicUsize,
+    }
+    impl ReadMemoryBudget for Measured {
+        fn try_reserve(
+            &self,
+            bytes: usize,
+            subsystem: &'static str,
+            operation: &'static str,
+            hint: &'static str,
+        ) -> Result<()> {
+            self.budget.try_reserve(bytes, subsystem, operation, hint)?;
+            if operation == "index_preflight_controls" {
+                self.preflights.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            self.budget.release(bytes);
+        }
+    }
+
+    fn fixture(db: &Database, rows: i64, versions: usize) -> Vec<RowChange> {
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute(
+            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT) HISTORY ALL",
+            &HashMap::new(),
+        )
+        .unwrap();
+        for version in 0..versions {
+            let tx = db.begin().unwrap();
+            for id in 0..rows {
+                let sql = if version == 0 {
+                    "INSERT INTO notes VALUES ($id, $body)"
+                } else {
+                    "UPDATE notes SET body = $body WHERE id = $id"
+                };
+                db.execute_in_tx(
+                    tx,
+                    sql,
+                    &HashMap::from([
+                        ("id".into(), Value::Int64(id)),
+                        ("body".into(), Value::Text(format!("version-{version:04}"))),
+                    ]),
+                )
+                .unwrap();
+            }
+            db.commit(tx).unwrap();
+        }
+        let changes = db.changes_since(Lsn(0)).unwrap();
+        // The pull echo contains only the latest value of each requested key.
+        (0..rows)
+            .map(|id| {
+                changes
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.values.get("id") == Some(&Value::Int64(id)))
+                    .unwrap()
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn reconcile(db: &Database, rows: &[RowChange]) -> (usize, usize) {
+        db.mark_outbound_rows_pending(Lsn(0), None).unwrap();
+        let arrivals = rows
+            .iter()
+            .map(|row| (row.lsn, Some(Lsn(9000 + row.lsn.0))))
+            .collect::<HashMap<_, _>>();
+        let measured = Arc::new(Measured {
+            budget: CountingBudget::new(db.declared_reader_memory().unwrap().into()),
+            preflights: AtomicUsize::new(0),
+        });
+        let owner: ReadMemoryOwner = measured.clone().into();
+        db.refresh_confirmed_pending_rows_with_read_memory(rows, &arrivals, owner)
+            .unwrap();
+        assert_eq!(
+            measured.budget.held(),
+            0,
+            "refresh releases temporary memory"
+        );
+        let (_, actual) = db.changes_since_with_arrivals(Lsn(0)).unwrap();
+        for row in rows {
+            assert_eq!(
+                actual.get(&row.lsn),
+                arrivals.get(&row.lsn),
+                "the confirmed echo must finish provenance reconciliation"
+            );
+        }
+        (
+            measured.preflights.load(AtomicOrdering::SeqCst),
+            measured.budget.held_high.load(AtomicOrdering::SeqCst),
+        )
+    }
+
+    #[test]
+    fn cdb_255_lost_reply_history_validation_is_prepared_once_per_batch() {
+        let mut counts = Vec::new();
+        for rows in [2, 8] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(dir.path().join("edge.db")).unwrap();
+            let echo = fixture(&db, rows, 4);
+            let (preflights, peak) = reconcile(&db, &echo);
+            println!("CDB255_TIME rows={rows} versions=4 preflights={preflights} peak={peak}");
+            assert!(
+                preflights > 0,
+                "historical integrity validation remains active"
+            );
+            counts.push(preflights);
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "a fixed four-frontier history is prepared once, not once per row/version"
+        );
+    }
+
+    #[test]
+    fn cdb_255_fixed_reconciliation_batch_has_fixed_peak_across_distinct_history() {
+        let mut peaks = Vec::new();
+        for distinct in [8, 32] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(dir.path().join("edge.db")).unwrap();
+            let echo = fixture(&db, 2, 4);
+            for id in 0..distinct - 4 {
+                // Each unrelated version has its own created_tx, with fixed-width
+                // keys and bodies. The echo and its retained versions stay fixed.
+                db.execute(
+                    "INSERT INTO notes VALUES ($id, 'unrelated---')",
+                    &HashMap::from([("id".into(), Value::Int64(100 + id))]),
+                )
+                .unwrap();
+            }
+            let (preflights, peak) = reconcile(&db, &echo);
+            println!(
+                "CDB255_MEMORY total_created_tx={distinct} batch=2 preflights={preflights} peak={peak}"
+            );
+            peaks.push(peak);
+        }
+        assert_eq!(
+            peaks[0], peaks[1],
+            "four times the unrelated distinct frontiers must not grow batch working memory"
+        );
+    }
+}
