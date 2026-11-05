@@ -1,17 +1,111 @@
 use super::*;
 
 /// The legacy manager destroys its detached write set before unwinding back to
-/// this frame. Retire its recorded row invoices only after that destruction;
-/// ordinary returns keep the existing success/failure cleanup as their owner.
+/// this frame. Retire its recorded payload invoices after that destruction;
+/// ordinary returns transfer to the capture or failed-write-set disposal.
 struct DetachedRowUnwindRefund<'a> {
     accountant: &'a crate::memory_accounting::AccountantHandle,
     bytes: std::cell::Cell<usize>,
+    vector_bytes: std::cell::Cell<usize>,
+}
+
+impl DetachedRowUnwindRefund<'_> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Keep the existing inline refusal while arming exact payload custody."
+    )]
+    fn arm(
+        &self,
+        database: &Database,
+        ws: &WriteSet,
+        vector_owner: &mut contextdb_vector::VectorCopyAdmission,
+        include_vectors: bool,
+    ) -> Result<()> {
+        let rows = ws
+            .relational_inserts
+            .iter()
+            .try_fold(0usize, |bytes, (table, row)| {
+                let admitted = database.staged_row_release_bytes(
+                    ws,
+                    table,
+                    row,
+                    database.relational_store.table_meta(table),
+                );
+                bytes
+                    .checked_add(admitted)
+                    .ok_or_else(|| Error::Other("private captured row invoice overflow".into()))
+            })?;
+        self.bytes.set(rows);
+        let vectors = if include_vectors {
+            ws.vector_inserts.iter().try_fold(0usize, |bytes, entry| {
+                let admitted = database.vector_insert_accounted_bytes(
+                    &entry.index,
+                    entry.vector.len(),
+                    vector_owner,
+                )?;
+                bytes
+                    .checked_add(admitted)
+                    .ok_or_else(|| Error::Other("private captured vector invoice overflow".into()))
+            })?
+        } else {
+            0
+        };
+        self.vector_bytes.set(vectors);
+        Ok(())
+    }
+
+    fn disarm(&self) {
+        self.bytes.set(0);
+        self.vector_bytes.set(0);
+    }
 }
 
 impl Drop for DetachedRowUnwindRefund<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking() && self.bytes.get() != 0 {
+        if std::thread::panicking() {
             self.accountant.release(self.bytes.get());
+            self.accountant.release(self.vector_bytes.get());
+        }
+    }
+}
+
+/// A mutable preparation owns its actual body on unwind, so additions and
+/// removals made before a panic do not leave an obsolete refund snapshot.
+struct PreparedPayloadUnwind<'a, 'b> {
+    database: &'a Database,
+    payload: &'a mut WriteSet,
+    vector_owner: &'a std::cell::RefCell<&'b mut contextdb_vector::VectorCopyAdmission>,
+    refund: &'a DetachedRowUnwindRefund<'a>,
+}
+impl Drop for PreparedPayloadUnwind<'_, '_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let payload = std::mem::take(self.payload);
+            self.refund.disarm();
+            let _ = self
+                .database
+                .dispose_unwound_commit_payload(payload, &mut self.vector_owner.borrow_mut());
+        }
+    }
+}
+
+/// Active preparation can mutate the directory payload. Retire that actual
+/// owner before the manager's terminal guard and before outer credits die.
+struct ActivePayloadUnwind<'a, 'b> {
+    database: &'a Database,
+    tx: TxId,
+    vector_owner: &'a std::cell::RefCell<&'b mut contextdb_vector::VectorCopyAdmission>,
+    refund: &'a DetachedRowUnwindRefund<'a>,
+}
+impl Drop for ActivePayloadUnwind<'_, '_> {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(payload) = self.database.take_aborted_legacy_payload(self.tx)
+        {
+            self.refund.disarm();
+            let _ = self
+                .database
+                .dispose_unwound_commit_payload(payload, &mut self.vector_owner.borrow_mut());
         }
     }
 }
@@ -32,6 +126,60 @@ impl Drop for CommitMetadataUnwindCleanup<'_> {
 }
 
 impl Database {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Keep the existing inline refusal while disposing an unwound payload."
+    )]
+    fn dispose_unwound_commit_payload(
+        &self,
+        payload: WriteSet,
+        vector_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<()> {
+        if self.private_received_rows_hold_delete_invoices() {
+            return self.dispose_private_abandoned_write_set(payload, vector_owner);
+        }
+        // Match ordinary insert pricing, with this earlier refund local
+        // surviving the owned payload on both return and unwind.
+        let refund = DetachedRowUnwindRefund {
+            accountant: &self.finalization.accountant,
+            bytes: std::cell::Cell::new(0),
+            vector_bytes: std::cell::Cell::new(0),
+        };
+        let owned_payload = payload;
+        refund.arm(self, &owned_payload, vector_owner, true)?;
+        let graph_bytes = owned_payload
+            .row_adj_deletes
+            .iter()
+            .map(|(edge, _)| edge.estimated_bytes())
+            .chain(
+                owned_payload
+                    .row_adj_inserts
+                    .iter()
+                    .map(|edge| edge.estimated_bytes()),
+            )
+            .chain(
+                owned_payload
+                    .adj_inserts
+                    .iter()
+                    .map(standalone_edge_retained_bytes),
+            )
+            .try_fold(0usize, |bytes, next| {
+                bytes
+                    .checked_add(next)
+                    .ok_or_else(|| Error::Other("unwound graph invoice overflow".into()))
+            })?;
+        refund.bytes.set(
+            refund
+                .bytes
+                .get()
+                .checked_add(graph_bytes)
+                .ok_or_else(|| Error::Other("unwound payload invoice overflow".into()))?,
+        );
+        drop(owned_payload);
+        drop(refund);
+        Ok(())
+    }
+
     pub(super) fn take_local_schema_stage(&self, lsn: Lsn) -> Option<LocalSchemaStage> {
         self.local_schema_stages.lock().remove(&lsn)
     }
@@ -180,6 +328,9 @@ impl Database {
                 let detached_rows_funding = std::cell::RefCell::new(
                     None::<(contextdb_core::read_memory::ReadMemoryOwner, usize)>,
                 );
+                // Declared before the returned write set: every post-commit
+                // error or unwind destroys that payload before its invoice.
+                let detached_payload_invoice = std::cell::RefCell::new(None);
 
                 let discard_selections = self
                     .pending_commit_metadata
@@ -271,12 +422,28 @@ impl Database {
                 let detached_row_unwind_refund = DetachedRowUnwindRefund {
                     accountant: &self.finalization.accountant,
                     bytes: std::cell::Cell::new(0),
+                    vector_bytes: std::cell::Cell::new(0),
                 };
+                // Seed exact original debits while the transaction still owns
+                // its payload, before any manager/user callback can unwind.
+                self.tx_mgr.with_write_set(tx, |ws| {
+                    detached_row_unwind_refund.arm(
+                        self,
+                        ws,
+                        &mut vector_copy_owner.borrow_mut(),
+                        self.private_received_rows_hold_delete_invoices(),
+                    )
+                })??;
                 let (lsn, ws) = {
                     match self.tx_mgr.commit_with_lsn_precanonicalized_active_prepare_and_applied_mut(
                 tx,
                 read_memory.clone(),
                 || {
+                    let _active_payload = ActivePayloadUnwind {
+                        database: self, tx,
+                        vector_owner: &vector_copy_owner,
+                        refund: &detached_row_unwind_refund,
+                    };
                     // The manager holds its commit guard, but not the active-tx
                     // map, while projecting both families. Meaningful DDL joins
                     // the same atomic prepared apply as row mutations; unchanged
@@ -297,6 +464,11 @@ impl Database {
                     Ok(event_bus_changes || trigger_changes)
                 },
                 |lsn, visibility_tx| {
+                    let _active_payload = ActivePayloadUnwind {
+                        database: self, tx,
+                        vector_owner: &vector_copy_owner,
+                        refund: &detached_row_unwind_refund,
+                    };
                     // Transaction-local absence is never an ordinary DELETE event.
                     if !discard_selections.is_empty() {
                         self.tx_mgr.with_write_set(tx, |ws| {
@@ -449,6 +621,13 @@ impl Database {
                     Ok(())
                 },
                 |ws| {
+                    let payload_unwind = PreparedPayloadUnwind {
+                        database: self,
+                        payload: ws,
+                        vector_owner: &vector_copy_owner,
+                        refund: &detached_row_unwind_refund,
+                    };
+                    let ws = &mut *payload_unwind.payload;
                     if !ws.is_empty() {
                         if source == CommitSource::SyncPull && sync_trigger_dispatch_required.get() {
                             self.rewrite_txid_placeholders_for_rows_not_in(
@@ -689,14 +868,26 @@ impl Database {
                             && crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())?.is_some() {
                             let owner=self.private_replay_owner(tx).ok_or_else(||Error::Other(
                                 "paged private capture has no original preparation owner".into()))?;
-                            let bytes=ws.relational_inserts.iter().try_fold(0usize,|bytes,(table,row)| {
+                            let row_bytes=ws.relational_inserts.iter().try_fold(0usize,|bytes,(table,row)| {
                                 let admitted=ws.admitted_bytes_for_staged_row(table,row.row_id).ok_or_else(||
                                     Error::Other("paged private capture lost its row admission record".into()))?;
                                 bytes.checked_add(admitted).ok_or_else(||Error::Other("private captured row invoice overflow".into()))
                             })?;
-                            // Do not adopt until commit succeeds. Failure
-                            // disposal still owns the active staged debits.
+                            let vector_bytes = ws.vector_inserts.iter().try_fold(0usize, |bytes, entry| {
+                                let admitted = self.vector_insert_accounted_bytes(
+                                    &entry.index, entry.vector.len(), &mut vector_copy_owner.borrow_mut(),
+                                )?;
+                                bytes.checked_add(admitted).ok_or_else(||
+                                    Error::Other("private captured vector invoice overflow".into()))
+                            })?;
+                            let bytes = row_bytes.checked_add(vector_bytes).ok_or_else(||
+                                Error::Other("private captured payload invoice overflow".into()))?;
+                            // Paged apply retires its transient vector store;
+                            // the captured write set keeps the original debit.
+                            // A returned failure still belongs to disposal.
                             *detached_rows_funding.borrow_mut()=Some((owner,bytes));
+                            detached_row_unwind_refund.bytes.set(row_bytes);
+                            detached_row_unwind_refund.vector_bytes.set(vector_bytes);
                         }
                         detached_capture.set(Some(refused));
                     }
@@ -715,6 +906,11 @@ impl Database {
                     Ok(())
                 },
                 |lsn, ws| {
+                    // Ordinary apply has adopted vector funding. A private
+                    // paged capture instead keeps that original debit in ws.
+                    if detached_rows_funding.borrow().is_none() {
+                        detached_row_unwind_refund.vector_bytes.set(0);
+                    }
                     // The durable apply has consumed this commit's snapshot
                     // sample and erasure image; what they held is its now.
                     if let Some(registration) = vector_snapshot_registration.borrow_mut().as_mut() {
@@ -815,14 +1011,24 @@ impl Database {
                 },
             ) {
                 Ok(committed) => {
-                    detached_row_unwind_refund.bytes.set(0);
+                    // from_prepaid cannot refuse or allocate. Adopt before
+                    // any later callback or fallible audit work. The invoice
+                    // outlives `committed`, including on a later unwind.
+                    detached_row_unwind_refund.disarm();
+                    *detached_payload_invoice.borrow_mut() = detached_rows_funding
+                        .borrow_mut()
+                        .take()
+                        .map(|(owner, bytes)| {
+                            contextdb_core::read_memory::ReadCredit::from_prepaid(owner, bytes)
+                        });
                     if let Some(watch) = publication_watch.borrow_mut().take() {
                         watch.completed();
                     }
                     committed
                 }
                 Err(mut failure) => {
-                    detached_row_unwind_refund.bytes.set(0);
+                    // Keep the unwind refund armed across failure callbacks:
+                    // `failure` owns and drops its payload before this guard.
                     // An ordinary failure: nothing was published, and the
                     // durable apply either did not happen or reported its own
                     // error. A refusal before the storage commit keeps serving.
@@ -831,8 +1037,18 @@ impl Database {
                     if let Some(watch) = publication_watch.borrow_mut().take() {
                         watch.completed();
                     }
-                    if let Some(ws) = failure.write_set.as_deref() {
-                        self.plugin.commit_failed(ws, source, failure.error.engine_diagnostic());
+                    if let Some(ws) = failure.write_set.as_deref_mut() {
+                        // Own the actual early-failure body while the callback
+                        // runs; its invoice need not depend on late preparation.
+                        let payload_unwind = PreparedPayloadUnwind {
+                            database: self,
+                            payload: ws,
+                            vector_owner: &vector_copy_owner,
+                            refund: &detached_row_unwind_refund,
+                        };
+                        self.plugin.commit_failed(
+                            payload_unwind.payload, source, failure.error.engine_diagnostic(),
+                        );
                     }
                     if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
                         // A received-schema stage is registered during
@@ -849,6 +1065,9 @@ impl Database {
                         self.discard_staged_trigger_ddl_commit(lsn);
                         self.discard_staged_trigger_audits_for_persistence(lsn);
                     }
+                    // Disposal now owns the exact debits on both normal
+                    // return and unwind; it destroys its payload first.
+                    detached_row_unwind_refund.disarm();
                     if self.private_received_rows_hold_delete_invoices() {
                         if let Some(ws) = failure.write_set.take() {
                             // Cleanup refusal must not replace the failed commit.
@@ -909,13 +1128,7 @@ impl Database {
                             write_set: ws,
                             refused,
                             prefix: None,
-                            rows_invoice: detached_rows_funding.borrow_mut().take().map(
-                                |(owner, bytes)| {
-                                    contextdb_core::read_memory::ReadCredit::from_prepaid(
-                                        owner, bytes,
-                                    )
-                                },
-                            ),
+                            rows_invoice: detached_payload_invoice.borrow_mut().take(),
                         });
                 }
                 Ok(CommitValidationOutcome {

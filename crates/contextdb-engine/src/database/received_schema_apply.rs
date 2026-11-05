@@ -1699,7 +1699,7 @@ impl Database {
                 // The same figure `RetainedNonVectorMemoryOwner` releases for a
                 // copied declaration, admitted before the copy exists.
                 self.finalization.accountant.try_allocate_for(
-                    meta.estimated_bytes(),
+                    retained_table_metadata_bytes(&working.relational_store, meta),
                     "sync",
                     "stage_received_unit_table_image",
                     STAGE_RECEIVED_UNIT_COPY_HINT,
@@ -6109,16 +6109,6 @@ impl Database {
         // exactly as a direct ALTER refuses it.
         let changed_vector_refs =
             self.received_unit_changed_vector_refs(changes, vector_copy_owner)?;
-        let tx = self.begin()?;
-        if apply_role == SyncApplyRole::HubPushApply
-            && let Some(receipt) = receipt.as_ref()
-            && let Some(contact_ms) = receipt.hub_contact_ms
-            && let Err(error) =
-                self.stage_hub_node_contact(tx, &receipt.node_id, contact_ms, read_memory.clone())
-        {
-            let _ = self.rollback(tx);
-            return Err(error);
-        }
         // The after-apply publisher consumes the stage and records its result
         // only after Redb succeeds, immediately before publication moves the
         // prepared memory image into place.
@@ -6136,6 +6126,20 @@ impl Database {
             std::cell::RefCell::new(None::<connected_replay::PrivatePrefixEffects>);
         let moved_preparation_custody =
             std::cell::RefCell::new(None::<ReceivedSchemaPreparationCustody>);
+        let tx = self.begin()?;
+        let mut terminal_cleanup = matches!(&self.tx_mgr, DatabaseTransactionHost::Legacy(_))
+            .then(|| ReceivedTransactionCleanup::new(self, tx, read_memory.clone(), false));
+        if apply_role == SyncApplyRole::HubPushApply
+            && let Some(receipt) = receipt.as_ref()
+            && let Some(contact_ms) = receipt.hub_contact_ms
+            && let Err(error) =
+                self.stage_hub_node_contact(tx, &receipt.node_id, contact_ms, read_memory.clone())
+        {
+            if terminal_cleanup.is_none() {
+                let _ = self.rollback(tx);
+            }
+            return Err(error);
+        }
         let applied = std::cell::Cell::new(false);
         let published_stage = std::cell::RefCell::new(None::<ReceivedSchemaStage>);
         let policy_releases = std::cell::RefCell::new(Vec::new());
@@ -6166,6 +6170,12 @@ impl Database {
                 interval_positions,
                 read_memory.clone(),
                 |scope, start, lsn, receiver_tx| {
+                    // Refund the original outer rows before the manager's
+                    // terminal guard can drop them on preparation unwind.
+                    // Returned errors remain owned by the enclosing cleanup.
+                    let _active_cleanup = scope.is_none().then(|| {
+                        ReceivedTransactionCleanup::new(self, tx, read_memory.clone(), true)
+                    });
                     // The outer request may have waited for the commit lock.
                     // Bind preparation and all its callbacks to the publication
                     // actually preceding this SAME unpublished write.
@@ -6349,7 +6359,11 @@ impl Database {
                             )
                         })?;
                     let finalized_tx = write_set.finalized_tx;
-                    *write_set = replacement;
+                    if let Some(cleanup) = terminal_cleanup.as_ref() {
+                        cleanup.replace_original_body(write_set, replacement);
+                    } else {
+                        *write_set = replacement;
+                    }
                     write_set.finalized_tx = finalized_tx;
                     self.plugin.pre_commit(write_set, CommitSource::SyncPull)?;
                     #[cfg(any(test, feature = "test-seams"))]
@@ -6388,6 +6402,9 @@ impl Database {
                     Ok(())
                 },
                 |lsn, _write_set| {
+                    if let Some(cleanup) = terminal_cleanup.as_ref() {
+                        cleanup.disable_original_refund();
+                    }
                     applied.set(true);
                     debug_assert!(
                         registration
@@ -6409,8 +6426,11 @@ impl Database {
                     }
                 },
             )
-            .map_err(|failure| {
-                failure.with_write_set(|write_set| {
+            .map_err(|mut failure| {
+                let retained_original = terminal_cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| failure.retain_legacy_original(cleanup));
+                let notify_failure = |write_set: Option<&WriteSet>| {
                     if let Some(write_set) = write_set {
                         self.plugin.commit_failed(
                             write_set,
@@ -6421,9 +6441,18 @@ impl Database {
                             let _ = self.take_received_schema_stage(lsn);
                         }
                     }
-                });
+                };
+                match terminal_cleanup.as_ref().filter(|_| retained_original) {
+                    Some(cleanup) => cleanup.with_original_body(notify_failure),
+                    None => failure.with_write_set(notify_failure),
+                }
                 failure.into_error()
             });
+        // Only success certifies terminal handoff. On a returned failure the
+        // guard checks whether any pre-handoff entry still needs retirement.
+        if let Some(cleanup) = terminal_cleanup.as_mut() {
+            cleanup.armed = committed.is_err();
+        }
         // Two orders meet here. Durable order: this stage's commit, and its
         // storage-version publication, completed under the commit boundary
         // above; nothing below writes. In-memory order: the stage is published

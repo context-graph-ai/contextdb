@@ -976,7 +976,23 @@ impl std::ops::Deref for ReceivedWorkingWrite {
     }
 }
 impl Drop for ReceivedWorkingWrite {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(write) = self.write.take() {
+            // Native Drop handles normal aborts and recovery-latched I/O
+            // failures. It skips abort only while unwinding, so explicitly
+            // release healthy unpublished pages in that case before funding
+            // fields die. Commit already took the transaction.
+            if std::thread::panicking() {
+                // Cleanup must not replace the callback's original panic,
+                // including if native abort itself encounters an invariant.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = write.abort();
+                }));
+            } else {
+                drop(write);
+            }
+        }
+    }
 }
 impl WorkingRow {
     pub(crate) fn value(&self) -> &VersionedRow {

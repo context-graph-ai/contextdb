@@ -39,6 +39,89 @@ impl ReceivedDdlArrivalValidation {
     }
 }
 
+/// This receiver created the transaction and owns its pre-manager aborts.
+/// Its scope is inside every credit/effects carrier that can fund the payload.
+pub(super) struct ReceivedTransactionCleanup<'a> {
+    pub(super) database: &'a Database,
+    pub(super) tx: TxId,
+    pub(super) armed: bool,
+    pub(super) unwind_only: bool,
+    original_body: std::cell::RefCell<Option<WriteSet>>,
+    refund_original: std::cell::Cell<bool>,
+    pub(super) read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+}
+impl<'a> ReceivedTransactionCleanup<'a> {
+    pub(super) fn new(
+        database: &'a Database,
+        tx: TxId,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        unwind_only: bool,
+    ) -> Self {
+        Self {
+            database,
+            tx,
+            armed: true,
+            unwind_only,
+            original_body: std::cell::RefCell::new(None),
+            refund_original: std::cell::Cell::new(true),
+            read_memory,
+        }
+    }
+
+    /// Borrow the destination before moving the original. Nothing fallible
+    /// separates its removal from installation in this take-once owner.
+    pub(super) fn replace_original_body(&self, current: &mut WriteSet, replacement: WriteSet) {
+        let mut original = self.original_body.borrow_mut();
+        assert!(original.is_none(), "one original received body");
+        *original = Some(std::mem::replace(current, replacement));
+    }
+
+    pub(super) fn with_original_body<R>(&self, f: impl FnOnce(Option<&WriteSet>) -> R) -> R {
+        f(self.original_body.borrow().as_ref())
+    }
+
+    /// Applied contact work retains its admission even if publication unwinds.
+    pub(super) fn disable_original_refund(&self) {
+        self.refund_original.set(false);
+    }
+
+    fn dispose_original(&self, body: WriteSet) {
+        let mut owner = crate::vector_read_memory::admission(self.read_memory.clone());
+        let _ = self
+            .database
+            .dispose_private_abandoned_write_set(body, &mut owner);
+    }
+}
+impl Drop for ReceivedTransactionCleanup<'_> {
+    fn drop(&mut self) {
+        let original = self.original_body.get_mut().take();
+        let had_original = original.is_some();
+        if let Some(body) = original {
+            if self.refund_original.get() {
+                self.dispose_original(body);
+            } else {
+                drop(body);
+            }
+        }
+        if !self.armed || (self.unwind_only && !std::thread::panicking()) {
+            return;
+        }
+        if !had_original && let Some(body) = self.database.take_aborted_legacy_payload(self.tx) {
+            self.dispose_original(body);
+        }
+        self.database.remove_original_terminal_stages(self.tx);
+    }
+}
+
+impl Database {
+    /// The enclosing commit may already hold its boundary lock. Remove only
+    /// this active entry, and release the map lock before destroying its body.
+    pub(super) fn take_aborted_legacy_payload(&self, tx: TxId) -> Option<WriteSet> {
+        self.tx_mgr
+            .with_active_write_sets(|active| active.remove(&tx))
+    }
+}
+
 impl DdlProvenanceSource {
     pub(super) fn capture(kind: DdlProvenanceKind, changes: &ChangeSet) -> Self {
         let mut next_ordinal = HashMap::<Lsn, u32>::new();
@@ -2934,6 +3017,27 @@ impl ReceivedCommitTerminal {
     }
 }
 impl ReceivedCommitFailure {
+    /// Before replacement, a returned failure owns the original. Move it into
+    /// receiver custody before any failure callback can unwind. A separately
+    /// funded replacement stays with its existing failure owner.
+    pub(super) fn retain_legacy_original(
+        &mut self,
+        cleanup: &ReceivedTransactionCleanup<'_>,
+    ) -> bool {
+        let Self::Legacy(failure) = self else {
+            return false;
+        };
+        let mut original = cleanup.original_body.borrow_mut();
+        if original.is_some() {
+            return false;
+        }
+        let Some(body) = failure.write_set.take() else {
+            return false;
+        };
+        *original = Some(*body);
+        true
+    }
+
     pub(super) fn error(&self) -> &Error {
         match self {
             Self::Legacy(failure) => &failure.error,

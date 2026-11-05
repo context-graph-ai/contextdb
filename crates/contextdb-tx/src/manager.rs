@@ -27,6 +27,10 @@ thread_local! {
 thread_local! {
     // Identifies only this thread's commit guard; no allocation or retained owner.
     static CURRENT_COMMIT_MANAGER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // A detached validation step must return its actual mutated body to this
+    // enclosing terminal owner on unwind. No payload or heap owner lives here.
+    static CURRENT_ACTIVE_PREPARATION: std::cell::Cell<Option<(usize, TxId)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 struct OwedPublication {
@@ -319,6 +323,37 @@ impl ActiveTransactions {
         match self {
             Self::Engine(active) => active,
             Self::Legacy(_) => panic!("engine active host is not installed"),
+        }
+    }
+}
+
+/// Own terminal removal until the payload is detached into its next owner.
+struct ActivePreparationCleanup<'a> {
+    active: &'a Mutex<ActiveTransactions>,
+    tx: TxId,
+    armed: bool,
+    previous: Option<(usize, TxId)>,
+}
+impl Drop for ActivePreparationCleanup<'_> {
+    fn drop(&mut self) {
+        CURRENT_ACTIVE_PREPARATION.with(|current| current.set(self.previous));
+        if self.armed {
+            let removed = self.active.lock().remove(&self.tx);
+            drop(removed);
+        }
+    }
+}
+
+/// Preparation can return its reservation; an unwind during apply cannot.
+struct UnpublishedIntervalCleanup<'a> {
+    next: &'a AtomicLsn,
+    start: Lsn,
+    armed: bool,
+}
+impl Drop for UnpublishedIntervalCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.next.store(self.start, Ordering::SeqCst);
         }
     }
 }
@@ -679,11 +714,43 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(&mut WriteSet) -> R,
     {
         self.writable_directory()?;
-        let mut ws = {
+        let ws = {
             let mut active = self.active_txs.lock();
             active.remove(&tx).ok_or(Error::TxNotFound(tx))?
         };
-        let result = f(&mut ws);
+        // During active preparation the enclosing terminal guard, not this
+        // temporary detachment, owns an abort. Preserve the actual mutated
+        // payload for that guard instead of destroying it under stale counts.
+        struct DetachedPreparation<'a> {
+            active: &'a Mutex<ActiveTransactions>,
+            tx: TxId,
+            payload: Option<WriteSet>,
+            restore: bool,
+        }
+        impl Drop for DetachedPreparation<'_> {
+            fn drop(&mut self) {
+                if let Some(payload) = self.payload.take() {
+                    if self.restore && std::thread::panicking() {
+                        self.active.lock().insert(self.tx, payload);
+                    } else {
+                        drop(payload);
+                    }
+                }
+            }
+        }
+        let restore = CURRENT_ACTIVE_PREPARATION
+            .with(|current| current.get() == Some((self as *const Self as usize, tx)));
+        let mut detached = DetachedPreparation {
+            active: &self.active_txs,
+            tx,
+            payload: Some(ws),
+            restore,
+        };
+        let result = f(detached
+            .payload
+            .as_mut()
+            .expect("detached payload is owned"));
+        let ws = detached.payload.take().expect("detached payload is owned");
         self.active_txs.lock().insert(tx, ws);
         Ok(result)
     }
@@ -1025,6 +1092,14 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                 write_set: None,
             });
         }
+        let previous = CURRENT_ACTIVE_PREPARATION
+            .with(|current| current.replace(Some((self as *const Self as usize, tx))));
+        let mut terminal = ActivePreparationCleanup {
+            active: &self.active_txs,
+            tx,
+            armed: true,
+            previous,
+        };
         let requires_commit = match requires_commit() {
             Ok(required) => required,
             Err(error) => {
@@ -1061,6 +1136,11 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             });
         };
         let lsn = Lsn(next - 1);
+        let mut interval = UnpublishedIntervalCleanup {
+            next: &self.next_lsn,
+            start,
+            armed: true,
+        };
         self.next_lsn.store(Lsn(next), Ordering::SeqCst);
         {
             let mut active = self.active_txs.lock();
@@ -1084,6 +1164,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                 write_set: None,
             })?
         };
+        terminal.armed = false;
         ws.canonicalize_final_state();
         ws.reassign_tx(tx, visibility_tx);
         ws.finalized_tx = Some(visibility_tx);
@@ -1125,6 +1206,9 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
 
         // Prepare may replace the write set; the manager remains the identity authority.
         ws.finalized_tx = Some(visibility_tx);
+        // Once apply starts, a panic cannot certify that nothing reached durable
+        // storage. Only a returned Err retains the existing explicit rewind.
+        interval.armed = false;
         if let Err(error) = self.store.apply(&ws, read_memory.clone()) {
             self.next_lsn.store(start, Ordering::SeqCst);
             return Err(CommitFailure {
