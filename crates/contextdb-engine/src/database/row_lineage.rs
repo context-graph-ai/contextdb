@@ -3559,6 +3559,15 @@ impl Database {
     ) -> Result<Vec<DurablePendingDelete>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        if let Some(root) = self.writer_read_root()? {
+            return self.durable_pending_deletes_at_root(
+                &root,
+                since_lsn,
+                projection,
+                outbound,
+                read_memory,
+            );
+        }
         let Some(startup) = self.committed_image_startup.as_ref() else {
             let pending = self.durable_pending_deletes_since_selected(
                 since_lsn,
@@ -3587,10 +3596,25 @@ impl Database {
             prefix,
             projection,
             &mut |key, bytes| {
+                // The decoded record is source scratch, not retained answer
+                // output. Its credit must end with this callback, even when
+                // the record is terminal, below the frontier, or excluded.
+                let decode_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
+                    (*self.finalization.accountant).clone(),
+                    read_memory.clone(),
+                    "reader",
+                    "pending_delete_window",
+                    "Raise the declared memory limit to decode one lineage record.",
+                );
+                let mut decode_credit =
+                    contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
                 if projection.bounded {
-                    (projection.admit)(
+                    decode_credit.try_grow_for(
                         std::mem::size_of::<DurableLineageRecord>()
                             .saturating_add(bytes.len().saturating_mul(3)),
+                        "reader",
+                        "pending_delete_window",
+                        "Raise the declared memory limit to decode one lineage record.",
                     )?;
                 }
                 #[cfg(any(test, feature = "test-seams"))]
@@ -3599,7 +3623,8 @@ impl Database {
                 } else {
                     bytes
                 };
-                let record = RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)
+                let record = decode_memory
+                    .scope(|| RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes))
                     .map_err(|error| {
                         crate::funded_error::corruption_display(
                             Ok(read_memory.clone()),
@@ -3668,6 +3693,75 @@ impl Database {
                 Ok(())
             },
         )?;
+        Ok(pending)
+    }
+
+    /// Walk the authoritative lineage family at the operation's existing
+    /// root. A discarded record owns just its current cursor window; only a
+    /// selected delete acquires answer credit and survives that window.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn durable_pending_deletes_at_root(
+        &self,
+        root: &crate::persistence::WriterSnapshotHandle,
+        since_lsn: Lsn,
+        projection: &ChangeProjection<'_>,
+        outbound: bool,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<Vec<DurablePendingDelete>> {
+        let prefix = Self::DURABLE_LINEAGE_CONFIG_PREFIX;
+        let mut cursor = root.lineage_cursor_from(
+            crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+            prefix,
+            prefix,
+        )?;
+        let mut pending = Vec::new();
+        while let Some(window) = cursor
+            .next_before(&mut || (projection.checkpoint)(), |_, bytes| {
+                RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)
+            })?
+        {
+            let record = window.value;
+            // Generation validation precedes every eligibility exclusion, as
+            // it did on the collected route, and reuses this captured root.
+            if record.table_generation
+                != self.durable_lineage_table_generation(&record.table, read_memory.clone())?
+                || record.delete_obligation != DurableDeleteObligation::Pending
+                || record.delete_lsn <= since_lsn.0
+            {
+                continue;
+            }
+            if outbound
+                && !self.outbound_direction_includes(
+                    &record.table,
+                    Lsn(record.delete_lsn),
+                    read_memory.clone(),
+                )?
+            {
+                continue;
+            }
+            if projection.bounded {
+                let row_bytes = std::mem::size_of::<RowChange>()
+                    .saturating_add(held::text(&record.table))
+                    .saturating_add(record.natural_key.held_bytes())
+                    .saturating_add(held::map::<String, Value>(1))
+                    .saturating_add(held::text("__deleted"));
+                (projection.admit)(answer_list_entry_bytes::<DurablePendingDelete>(row_bytes))?;
+            }
+            pending.push(DurablePendingDelete {
+                row: RowChange {
+                    table: record.table,
+                    natural_key: record.natural_key,
+                    values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
+                    deleted: true,
+                    lsn: Lsn(record.delete_lsn),
+                    created_at: None,
+                },
+                local_row_id: record.local_row_id,
+            });
+        }
         Ok(pending)
     }
 

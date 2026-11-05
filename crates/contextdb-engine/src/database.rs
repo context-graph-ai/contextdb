@@ -8377,6 +8377,13 @@ impl Database {
             let mut deleted_vector_owners = HashMap::<(String, RowId), Lsn>::new();
             let mut deleted_vector_owner_row_ids = HashMap::<(Vec<u8>, Lsn), RowId>::new();
             let mut inserted_vector_owners = HashMap::<(String, RowId), Lsn>::new();
+            // Parallel to retained row output, never to excluded history.
+            // The admitted occurrence stays on RowChange. Retain its owner
+            // id and latest seen version for exact selected-delete pairing.
+            let mut row_owner_ids = Vec::<Option<(RowId, Lsn)>>::new();
+            let mut row_owner_credit = 0_usize;
+            let mut vector_owner_lsns = Vec::<Option<Lsn>>::new();
+            let mut vector_owner_credit = 0_usize;
 
             // The last source LSN this page has taken in full.
             let mut page_lsn: Option<Lsn> = None;
@@ -8433,6 +8440,21 @@ impl Database {
                     &mut ddl_lsn,
                     &mut ddl,
                 )?;
+                // Keep the latest occurrence only for owners already retained
+                // in output. An excluded update can advance this scalar without
+                // retaining any identity or payload for an excluded-only owner.
+                if outbound_frontier.is_some()
+                    && let ChangeLogEntry::RowInsert { table, row_id, lsn } = &entry
+                {
+                    for (row, owner) in rows.iter().zip(&mut row_owner_ids) {
+                        if row.table == *table
+                            && let Some((id, latest)) = owner
+                            && *id == *row_id
+                        {
+                            *latest = *lsn;
+                        }
+                    }
+                }
                 // Direction is resolved before row bodies, owner maps and
                 // answer admission. Every excluded occurrence dies with its
                 // source window, rather than surviving until the final filter.
@@ -8451,61 +8473,64 @@ impl Database {
                             read_memory.clone(),
                         )?
                     {
-                        // A later excluded insert still supersedes older
-                        // admitted versions. Inspect its key only when this
-                        // table already has output to suppress; never retain
-                        // an index of the excluded history. The row copy is
-                        // transient under this iteration's writer-output scope.
+                        // Resolve identity without reading an excluded
+                        // payload when an exact retained identity index exists.
                         if let ChangeLogEntry::RowInsert { table, row_id, lsn } = &entry {
-                            if rows.iter().any(|row| row.table == *table)
-                                && let Some(row) = self.row_for_change(
+                            if rows.iter().any(|row| row.table == *table) {
+                                self.with_outbound_insert_key(
                                     table,
                                     *row_id,
                                     *lsn,
                                     read_memory.clone(),
                                     projection.checkpoint,
-                                    None,
-                                )?
-                            {
-                                let key = self.with_change_table_meta(
-                                    table,
-                                    &row,
-                                    read_memory.clone(),
-                                    |meta| {
-                                        Ok(meta.and_then(|meta| {
-                                            natural_key_from_row_values(meta, &row.values)
-                                        }))
+                                    |key| {
+                                        if let Some(key) = key {
+                                            let mut at = 0;
+                                            let mut kept = 0;
+                                            rows.retain(|older| {
+                                                let owner = row_owner_ids[at];
+                                                at += 1;
+                                                if older.table != *table
+                                                    || older.natural_key != *key
+                                                    || older.lsn > *lsn
+                                                {
+                                                    row_owner_ids[kept] = owner;
+                                                    kept += 1;
+                                                    return true;
+                                                }
+                                                if let Some((owner, _)) = owner {
+                                                    // Same-commit siblings have
+                                                    // another row id. A vector
+                                                    // may have a later mutation
+                                                    // LSN than its owning insert.
+                                                    Self::retain_outbound_vectors(
+                                                        &mut vectors,
+                                                        &mut vector_owner_lsns,
+                                                        |vector, owner_lsn| {
+                                                            vector.index.table != *table
+                                                                || vector.row_id != owner
+                                                                || owner_lsn != Some(older.lsn)
+                                                                || vector.lsn > *lsn
+                                                        },
+                                                    );
+                                                }
+                                                false
+                                            });
+                                            row_owner_ids.truncate(kept);
+                                        }
+                                        Ok(())
                                     },
                                 )?;
-                                if let Some(key) = key {
-                                    rows.retain(|older| {
-                                        if older.table != *table
-                                            || older.natural_key != key
-                                            || older.lsn > *lsn
-                                        {
-                                            return true;
-                                        }
-                                        // Remove the vector pairing of a
-                                        // superseded admitted owner as well.
-                                        vectors.retain(|vector| {
-                                            vector.index.table != *table
-                                                || !inserted_vector_owners.iter().any(
-                                                    |((owner_table, owner_id), owner_lsn)| {
-                                                        owner_table == table
-                                                            && *owner_id == vector.row_id
-                                                            && *owner_lsn == older.lsn
-                                                    },
-                                                )
-                                        });
-                                        false
-                                    });
-                                }
                             }
-                            vectors.retain(|vector| {
-                                vector.index.table != *table
-                                    || vector.row_id != *row_id
-                                    || vector.lsn > *lsn
-                            });
+                            Self::retain_outbound_vectors(
+                                &mut vectors,
+                                &mut vector_owner_lsns,
+                                |vector, _| {
+                                    vector.index.table != *table
+                                        || vector.row_id != *row_id
+                                        || vector.lsn > *lsn
+                                },
+                            );
                             deleted_vector_owners.retain(|(owner_table, owner_id), _| {
                                 owner_table != table || owner_id != row_id
                             });
@@ -8514,12 +8539,16 @@ impl Database {
                             table, row_id, lsn, ..
                         } = &entry
                         {
-                            vectors.retain(|vector| {
-                                vector.index.table != *table
-                                    || vector.row_id != *row_id
-                                    || vector.vector.is_empty()
-                                    || vector.lsn > *lsn
-                            });
+                            Self::retain_outbound_vectors(
+                                &mut vectors,
+                                &mut vector_owner_lsns,
+                                |vector, _| {
+                                    vector.index.table != *table
+                                        || vector.row_id != *row_id
+                                        || vector.vector.is_empty()
+                                        || vector.lsn > *lsn
+                                },
+                            );
                         }
                         continue;
                     }
@@ -8571,6 +8600,14 @@ impl Database {
                                 read_memory.clone(),
                             )?
                         {
+                            if outbound_frontier.is_some() {
+                                Self::push_outbound_owner(
+                                    &mut row_owner_ids,
+                                    &mut row_owner_credit,
+                                    Some((row_id, lsn)),
+                                    projection,
+                                )?;
+                            }
                             rows.push(RowChange {
                                 table,
                                 natural_key,
@@ -8628,6 +8665,14 @@ impl Database {
                             (projection.admit)(answer_list_entry_bytes::<RowChange>(
                                 change.held_bytes(),
                             ))?;
+                        }
+                        if outbound_frontier.is_some() {
+                            Self::push_outbound_owner(
+                                &mut row_owner_ids,
+                                &mut row_owner_credit,
+                                None,
+                                projection,
+                            )?;
                         }
                         rows.push(change);
                     }
@@ -8781,6 +8826,14 @@ impl Database {
                                     .saturating_add(held::ALLOCATION_BYTES),
                             ))?;
                         }
+                        if outbound_frontier.is_some() {
+                            Self::push_outbound_owner(
+                                &mut vector_owner_lsns,
+                                &mut vector_owner_credit,
+                                Some(row.lsn),
+                                projection,
+                            )?;
+                        }
                         vectors.push(VectorChange {
                             vector: entry.vector,
                             ..change
@@ -8797,6 +8850,22 @@ impl Database {
                             )?,
                             read_memory.clone(),
                         )? {
+                            if outbound_frontier.is_some() {
+                                let owner_lsn = rows
+                                    .iter()
+                                    .zip(&row_owner_ids)
+                                    .filter(|(row, _)| row.table == index.table)
+                                    .filter_map(|(_, owner)| owner.as_ref())
+                                    .filter(|(id, _)| *id == row_id)
+                                    .map(|(_, latest)| *latest)
+                                    .max();
+                                Self::push_outbound_owner(
+                                    &mut vector_owner_lsns,
+                                    &mut vector_owner_credit,
+                                    owner_lsn,
+                                    projection,
+                                )?;
+                            }
                             vectors.push(VectorChange {
                                 index,
                                 row_id,
@@ -8806,6 +8875,11 @@ impl Database {
                         }
                     }
                 }
+            }
+            drop(vector_owner_lsns);
+            drop(row_owner_ids);
+            if projection.bounded {
+                (projection.release)(vector_owner_credit.saturating_add(row_owner_credit))?;
             }
             // Declarations after the last change-log group are later groups.
             if !page_ended {
@@ -9867,6 +9941,333 @@ impl Database {
             None,
             page,
         )
+    }
+
+    /// Fund the actual owner buffer, including its initial capacity and a
+    /// growth's overlapping old allocation. Compacting output can reuse this
+    /// buffer without accumulating admission for discarded occurrences.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn push_outbound_owner<T: Copy>(
+        owners: &mut Vec<Option<T>>,
+        credit: &mut usize,
+        owner: Option<T>,
+        projection: &ChangeProjection<'_>,
+    ) -> Result<()> {
+        if owners.len() == owners.capacity() {
+            let capacity = owners.capacity().max(2).saturating_mul(2);
+            let bytes = capacity
+                .saturating_mul(std::mem::size_of::<Option<T>>())
+                .saturating_add(held::ALLOCATION_BYTES);
+            if projection.bounded {
+                (projection.admit)(bytes)?;
+            }
+            owners.reserve_exact(capacity - owners.len());
+            if projection.bounded {
+                (projection.release)(*credit)?;
+                *credit = bytes;
+            }
+        }
+        owners.push(owner);
+        Ok(())
+    }
+
+    /// Compact the selected vectors and their exact owning-row occurrences
+    /// together. The vector mutation LSN need not be its owner's row LSN.
+    fn retain_outbound_vectors(
+        vectors: &mut Vec<VectorChange>,
+        owner_lsns: &mut Vec<Option<Lsn>>,
+        mut keep: impl FnMut(&VectorChange, Option<Lsn>) -> bool,
+    ) {
+        let mut at = 0;
+        let mut retained = 0;
+        vectors.retain(|vector| {
+            let owner = owner_lsns[at];
+            at += 1;
+            if keep(vector, owner) {
+                owner_lsns[retained] = owner;
+                retained += 1;
+                true
+            } else {
+                false
+            }
+        });
+        owner_lsns.truncate(retained);
+    }
+
+    /// Borrow the identity of an excluded insertion. Exact identity postings
+    /// contain no non-key payload, including on a cold physical read. Missing
+    /// or retired exact indexes retain the charged body route (CDB-259).
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn with_outbound_insert_key<T>(
+        &self,
+        table: &str,
+        row_id: RowId,
+        lsn: Lsn,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        checkpoint: &dyn Fn() -> Result<()>,
+        consume: impl FnOnce(Option<&NaturalKey>) -> Result<T>,
+    ) -> Result<T> {
+        use contextdb_relational::source::{RelationalIndexRange, RelationalReadSource};
+        use std::ops::Bound;
+
+        if let Some(root) = self.writer_read_root()? {
+            let owner =
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone());
+            let declaration =
+                RedbPersistence::declared_meta_in_read(&root, owner.clone(), table, lsn)?;
+            if let Some(declaration) = declaration.as_ref() {
+                let meta = &declaration.value.0;
+                // Admit resolver/declaration scratch before cloning it. This
+                // owner ends after consume, rather than per-history entry.
+                let mut scratch = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                let columns_bytes = meta
+                    .columns
+                    .iter()
+                    .map(|column| held::text(&column.name))
+                    .chain(
+                        meta.primary_key_columns
+                            .iter()
+                            .map(|column| held::text(column)),
+                    )
+                    .sum::<usize>()
+                    .saturating_add(meta.natural_key_column.as_deref().map_or(0, held::text))
+                    .saturating_add(
+                        meta.columns
+                            .len()
+                            .saturating_add(meta.primary_key_columns.len())
+                            .saturating_add(1)
+                            .saturating_mul(std::mem::size_of::<String>()),
+                    )
+                    .saturating_add(held::ALLOCATION_BYTES);
+                scratch.try_grow_for(
+                    columns_bytes,
+                    "reader",
+                    "outbound_identity_window",
+                    "Raise the declared memory limit to inspect one row identity.",
+                )?;
+                let Some(columns) = natural_key_columns_for_meta(meta) else {
+                    // No identity columns is genuinely keyless. No suitable
+                    // retained index, on its own, is NEVER a keyless table.
+                    return consume(None);
+                };
+                if let Some(current) = root.borrow_captured_table_meta(table) {
+                    let (bytes, _, _) = crate::executor::relational_declaration_plan(current)?;
+                    scratch.try_grow_for(
+                        bytes,
+                        "reader",
+                        "outbound_identity_window",
+                        "Raise the declared memory limit to inspect one row identity.",
+                    )?;
+                    let automatic = crate::executor::auto_indexes_for_table_meta(current);
+                    let index = automatic
+                        .iter()
+                        .chain(current.indexes.iter())
+                        .find(|index| {
+                            index.columns.len() == columns.len()
+                                && index
+                                    .columns
+                                    .iter()
+                                    .zip(&columns)
+                                    .all(|((column, _), identity)| column == identity)
+                                && columns.iter().all(|name| {
+                                    current
+                                        .columns
+                                        .iter()
+                                        .find(|column| column.name == *name)
+                                        .zip(
+                                            meta.columns.iter().find(|column| column.name == *name),
+                                        )
+                                        .is_some_and(|(now, then)| {
+                                            now.column_type == then.column_type
+                                        })
+                                })
+                        });
+                    if let Some(index) = index {
+                        let Some(tx) = root.transaction_at_lsn(owner, lsn)? else {
+                            return consume(None);
+                        };
+                        let source =
+                            self.statement_relational_source(root.clone(), read_memory.clone())?;
+                        let mut cursor = source.index_cursor(
+                            table,
+                            &index.name,
+                            RelationalIndexRange {
+                                current: false,
+                                lower: Bound::Unbounded,
+                                upper: Bound::Unbounded,
+                                reverse: false,
+                            },
+                        )?;
+                        while let Some(window) = cursor.next_window_before(&mut || checkpoint())? {
+                            let posting = window.value();
+                            RedbPersistence::validated_index_key(index, meta, &posting.key)
+                                .map_err(|reason| {
+                                    crate::funded_error::corruption_display(
+                                        Ok(read_memory.clone()),
+                                        table,
+                                        reason,
+                                    )
+                                })?;
+                            if posting.entry.row_id != row_id
+                                || !posting.entry.visible_at(SnapshotId(tx.0))
+                            {
+                                continue;
+                            }
+                            let key_bytes = columns
+                                .iter()
+                                .zip(&posting.key)
+                                .map(|(column, part)| {
+                                    let value = match part {
+                                        contextdb_core::DirectedValue::Asc(value) => &value.0,
+                                        contextdb_core::DirectedValue::Desc(value) => &value.0,
+                                    };
+                                    std::mem::size_of::<(String, Value)>()
+                                        .saturating_add(held::text(column))
+                                        .saturating_add(held::value(value))
+                                })
+                                .sum::<usize>()
+                                .saturating_add(held::ALLOCATION_BYTES);
+                            scratch.try_grow_for(
+                                key_bytes,
+                                "reader",
+                                "outbound_identity_window",
+                                "Raise the declared memory limit to inspect one row identity.",
+                            )?;
+                            let key = NaturalKey::from_pairs(
+                                columns
+                                    .iter()
+                                    .zip(&posting.key)
+                                    .map(|(column, part)| {
+                                        let value = match part {
+                                            contextdb_core::DirectedValue::Asc(value) => &value.0,
+                                            contextdb_core::DirectedValue::Desc(value) => &value.0,
+                                        };
+                                        (column.clone(), value.clone())
+                                    })
+                                    .collect(),
+                            );
+                            return consume(key.as_ref());
+                        }
+                        // An index built/replaced after this mutation may not
+                        // retain its occurrence. Preserve CDB-259's correct,
+                        // charged fallback rather than silently skipping it.
+                    }
+                }
+            }
+        }
+        let Some(row) =
+            self.row_for_change(table, row_id, lsn, read_memory.clone(), checkpoint, None)?
+        else {
+            return consume(None);
+        };
+        let key = self.with_change_table_meta(table, &row, read_memory, |meta| {
+            Ok(meta.and_then(|meta| natural_key_from_row_values(meta, &row.values)))
+        })?;
+        consume(key.as_ref())
+    }
+
+    /// A local current owner cannot have arrived by sync. Resolve only its
+    /// authenticated identity posting and provenance, without opening the row
+    /// relation. Pulled owners still need the existing exact-version check;
+    /// missing exact indexes keep that charged path too (CDB-259).
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn row_change_has_no_pulled_source(
+        &self,
+        row: &RowChange,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<bool> {
+        use contextdb_relational::source::{RelationalIndexRange, RelationalReadSource};
+        use std::ops::Bound;
+
+        // A received working stage has its own declaration and overlay. Keep
+        // its established exact-version route rather than mix captured metadata.
+        if crate::persistence::received_working_source::WorkingReadSource::current_for(
+            self.tx_mgr.identity(),
+        )?
+        .is_some()
+        {
+            return Ok(false);
+        }
+        let Some(root) = self.writer_read_root()? else {
+            return Ok(false);
+        };
+        let Some(meta) = root.borrow_captured_table_meta(&row.table) else {
+            return Ok(false);
+        };
+        let mut scratch = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+        let (bytes, _, _) = crate::executor::relational_declaration_plan(meta)?;
+        scratch.try_grow_for(
+            bytes,
+            "reader",
+            "outbound_arrival_identity",
+            "Raise the declared memory limit to inspect one row identity.",
+        )?;
+        let automatic = crate::executor::auto_indexes_for_table_meta(meta);
+        let key_parts = || {
+            std::iter::once((&row.natural_key.column, &row.natural_key.value)).chain(
+                row.natural_key
+                    .rest
+                    .iter()
+                    .map(|(column, value)| (column, value)),
+            )
+        };
+        let Some(index) = automatic.iter().chain(meta.indexes.iter()).find(|index| {
+            index.columns.len() == 1 + row.natural_key.rest.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(key_parts())
+                    .all(|((column, _), (wanted, _))| column == wanted)
+        }) else {
+            return Ok(false);
+        };
+        let source = self.statement_relational_source(root.clone(), read_memory.clone())?;
+        let mut cursor = source.index_cursor(
+            &row.table,
+            &index.name,
+            RelationalIndexRange {
+                current: false,
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                reverse: false,
+            },
+        )?;
+        while let Some(window) = cursor.next_window()? {
+            let posting = window.value();
+            RedbPersistence::validated_index_key(index, meta, &posting.key).map_err(|reason| {
+                crate::funded_error::corruption_display(Ok(read_memory.clone()), &row.table, reason)
+            })?;
+            if !posting.entry.visible_at(source.snapshot())
+                || !posting
+                    .key
+                    .iter()
+                    .zip(key_parts())
+                    .all(|(part, (_, wanted))| {
+                        let value = match part {
+                            contextdb_core::DirectedValue::Asc(value) => &value.0,
+                            contextdb_core::DirectedValue::Desc(value) => &value.0,
+                        };
+                        value == wanted
+                    })
+            {
+                continue;
+            }
+            return Ok(!matches!(
+                source.sync_source(&row.table, posting.entry.row_id)?,
+                Some((_, contextdb_relational::store::SyncSourceKind::Pulled))
+            ));
+        }
+        // No live owner carries this identity at the captured frontier.
+        Ok(true)
     }
 
     /// Push and pending inspection suppress excluded history during extraction.

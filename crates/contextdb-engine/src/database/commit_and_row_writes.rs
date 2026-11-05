@@ -3749,6 +3749,9 @@ impl Database {
             if self.table_meta(&row.table).is_none() {
                 return Ok(false);
             }
+            if self.row_change_has_no_pulled_source(row, read_memory.clone())? {
+                return Ok(false);
+            }
             let snapshot = self.snapshot_for_read();
             let current = self.visible_row_by_natural_key(
                 &row.table,
