@@ -5623,3 +5623,15 @@ pub(super) fn registry_lock_descriptor_departed(file: &File) -> bool {
             && metadata.len() == 0
     })
 }
+
+// A passive test-only notification before the normal credit field destructor
+// refunds the fixed owner control and its bounded pool growth together.
+#[cfg(all(test, feature = "test-seams"))]
+impl Drop for ReadHistoryProofOwner {
+    fn drop(&mut self) {
+        content_identity::proof_refund_test_scope::history_pool_dropping(
+            self.credit.get_mut(),
+            std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>(),
+        );
+    }
+}

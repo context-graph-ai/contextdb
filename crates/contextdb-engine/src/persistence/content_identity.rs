@@ -4130,6 +4130,8 @@ impl ProofAdmission {
     pub(super) fn release(&mut self, bytes: usize) {
         let bytes = bytes.min(self.held);
         if let Some(reader) = &self.reader_budget {
+            #[cfg(test)]
+            let _proof_refund = proof_refund_test_scope::Scope::enter();
             reader.release(bytes);
         } else if let Some(accountant) = &self.accountant {
             accountant.release(bytes);
@@ -4237,6 +4239,8 @@ impl AdmittedBytes {
 impl Drop for AdmittedBytes {
     fn drop(&mut self) {
         if let Some(reader) = &self.reader_budget {
+            #[cfg(test)]
+            let _proof_refund = proof_refund_test_scope::Scope::enter();
             reader.release(self.bytes);
         } else if let Some(accountant) = &self.accountant {
             accountant.release(self.bytes);
@@ -17104,5 +17108,98 @@ pub(crate) mod original_version_manifest {
             .checked_add(ORDERED_HISTORY_MAGIC.len() + 1)
             .and_then(|bytes| bytes.checked_add(usize::from(present)))
             .ok_or_else(|| bad("mutation layout overflow"))
+    }
+}
+
+// Test-only provenance for refunds: the budget refund door has no operation
+// label. Neither observer changes an invoice or releases it before its owner.
+#[cfg(test)]
+pub(crate) mod proof_refund_test_scope {
+    thread_local! {
+        static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static OWNER: std::cell::RefCell<Option<contextdb_core::read_memory::ReadMemoryOwner>> = const { std::cell::RefCell::new(None) };
+        static TARGET: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+        static POOL_REFUND: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    pub(crate) fn active() -> bool {
+        ACTIVE.with(|slot| slot.get())
+    }
+    pub(crate) struct Scope(bool);
+    impl Scope {
+        pub(super) fn enter() -> Self {
+            Self(ACTIVE.with(|slot| slot.replace(true)))
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.with(|slot| slot.set(self.0));
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    pub(crate) struct Observation;
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn observe(owner: &contextdb_core::read_memory::ReadMemoryOwner) -> Observation {
+        OWNER.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(owner.clone());
+        });
+        contextdb_core::read_memory::set_trace_credit_drop_observer_for_test(
+            owner.accounting_identity(),
+            Some(credit_drop),
+        );
+        Observation
+    }
+    #[cfg(feature = "test-seams")]
+    impl Drop for Observation {
+        fn drop(&mut self) {
+            assert_eq!(POOL_REFUND.with(|slot| slot.get()), None);
+            contextdb_core::read_memory::set_trace_credit_drop_observer_for_test(0, None);
+            OWNER.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    #[cfg(feature = "test-seams")]
+    fn credit_drop(after: bool, address: usize, _payer: usize, bytes: usize) {
+        TARGET.with(|target| {
+            let (expected, total, pool) = target.get();
+            if address != expected {
+                return;
+            }
+            assert_eq!(
+                bytes, total,
+                "the original pool credit owns its full invoice"
+            );
+            POOL_REFUND.with(|slot| slot.set((!after).then_some(pool)));
+            if after {
+                target.set((0, 0, 0));
+            }
+        });
+    }
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn history_pool_dropping(
+        credit: &contextdb_core::read_memory::ReadCredit,
+        fixed: usize,
+    ) {
+        OWNER.with(|slot| {
+            if slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|owner| credit.is_funded_by(owner))
+            {
+                let total = credit.bytes();
+                TARGET.with(|target| {
+                    target.set((
+                        credit as *const _ as usize,
+                        total,
+                        total.checked_sub(fixed).expect("pool control"),
+                    ))
+                });
+            }
+        });
+    }
+    pub(crate) fn pool_refund() -> Option<usize> {
+        POOL_REFUND.with(|slot| slot.get())
+    }
+    pub(crate) fn pool_ceiling() -> usize {
+        super::super::READ_HISTORY_PROOF_POOL_BYTES
     }
 }

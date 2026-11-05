@@ -1913,10 +1913,24 @@ mod lost_reply_reconciliation {
     use super::*;
     use contextdb_core::read_memory::{ReadMemoryBudget, ReadMemoryOwner};
 
+    #[derive(Debug, Default, Clone)]
+    struct Census {
+        operations: BTreeMap<&'static str, (usize, usize)>,
+        non_proof_live: usize,
+        non_proof_peak: usize,
+        peak_operation: &'static str,
+        peak_reservation: usize,
+        pool_live: usize,
+        pool_peak: usize,
+        proof_live: usize,
+        proof_peak: usize,
+    }
+
     #[derive(Debug)]
     struct Measured {
         budget: Arc<CountingBudget>,
         preflights: AtomicUsize,
+        census: std::sync::Mutex<Census>,
     }
     impl ReadMemoryBudget for Measured {
         fn try_reserve(
@@ -1930,10 +1944,53 @@ mod lost_reply_reconciliation {
             if operation == "index_preflight_controls" {
                 self.preflights.fetch_add(1, AtomicOrdering::SeqCst);
             }
+            let mut census = self.census.lock().unwrap();
+            let total = census.operations.entry(operation).or_default();
+            total.0 += bytes;
+            total.1 += 1;
+            if operation == "authenticated_history_range" {
+                census.pool_live += bytes;
+                census.pool_peak = census.pool_peak.max(census.pool_live);
+            } else if operation == "read_committed_proof" {
+                census.proof_live += bytes;
+                census.proof_peak = census.proof_peak.max(census.proof_live);
+            } else {
+                census.non_proof_live += bytes;
+                if census.non_proof_live > census.non_proof_peak {
+                    census.non_proof_peak = census.non_proof_live;
+                    census.peak_operation = operation;
+                    census.peak_reservation = bytes;
+                }
+            }
+            assert_eq!(
+                census.proof_live + census.pool_live + census.non_proof_live,
+                self.budget.held()
+            );
             Ok(())
         }
         fn release(&self, bytes: usize) {
+            let mut census = self.census.lock().unwrap();
+            if let Some(pool) =
+                crate::persistence::content_identity::proof_refund_test_scope::pool_refund()
+            {
+                census.pool_live = census.pool_live.checked_sub(pool).expect("pool refund");
+                census.non_proof_live = census
+                    .non_proof_live
+                    .checked_sub(bytes - pool)
+                    .expect("fixed pool control refund");
+            } else if crate::persistence::content_identity::proof_refund_test_scope::active() {
+                census.proof_live = census.proof_live.checked_sub(bytes).expect("proof refund");
+            } else {
+                census.non_proof_live = census
+                    .non_proof_live
+                    .checked_sub(bytes)
+                    .expect("non-proof refund");
+            }
             self.budget.release(bytes);
+            assert_eq!(
+                census.proof_live + census.pool_live + census.non_proof_live,
+                self.budget.held()
+            );
         }
     }
 
@@ -1979,7 +2036,7 @@ mod lost_reply_reconciliation {
             .collect()
     }
 
-    fn reconcile(db: &Database, rows: &[RowChange]) -> (usize, usize) {
+    fn reconcile(db: &Database, rows: &[RowChange]) -> (usize, usize, Census) {
         db.mark_outbound_rows_pending(Lsn(0), None).unwrap();
         let arrivals = rows
             .iter()
@@ -1988,8 +2045,11 @@ mod lost_reply_reconciliation {
         let measured = Arc::new(Measured {
             budget: CountingBudget::new(db.declared_reader_memory().unwrap().into()),
             preflights: AtomicUsize::new(0),
+            census: std::sync::Mutex::new(Census::default()),
         });
         let owner: ReadMemoryOwner = measured.clone().into();
+        let _proof_observation =
+            crate::persistence::content_identity::proof_refund_test_scope::observe(&owner);
         db.refresh_confirmed_pending_rows_with_read_memory(rows, &arrivals, owner)
             .unwrap();
         assert_eq!(
@@ -2008,6 +2068,7 @@ mod lost_reply_reconciliation {
         (
             measured.preflights.load(AtomicOrdering::SeqCst),
             measured.budget.held_high.load(AtomicOrdering::SeqCst),
+            measured.census.lock().unwrap().clone(),
         )
     }
 
@@ -2018,8 +2079,10 @@ mod lost_reply_reconciliation {
             let dir = tempfile::tempdir().unwrap();
             let db = Database::open(dir.path().join("edge.db")).unwrap();
             let echo = fixture(&db, rows, 4);
-            let (preflights, peak) = reconcile(&db, &echo);
-            println!("CDB255_TIME rows={rows} versions=4 preflights={preflights} peak={peak}");
+            let (preflights, peak, census) = reconcile(&db, &echo);
+            println!(
+                "CDB255_TIME rows={rows} versions=4 preflights={preflights} peak={peak} census={census:?}"
+            );
             assert!(
                 preflights > 0,
                 "historical integrity validation remains active"
@@ -2032,6 +2095,11 @@ mod lost_reply_reconciliation {
         );
     }
 
+    // A guard on both revisions: the parent's constant-memory traversal is
+    // slow; preparing validation must not replace it with a history directory.
+    // ReadHistoryProofOwner (reader_registration.rs) retains authenticated
+    // ancestors under authenticated_history_range, capped by the existing
+    // READ_HISTORY_PROOF_POOL_BYTES. Its fixed control remains non-proof.
     #[test]
     fn cdb_255_fixed_reconciliation_batch_has_fixed_peak_across_distinct_history() {
         let mut peaks = Vec::new();
@@ -2048,15 +2116,25 @@ mod lost_reply_reconciliation {
                 )
                 .unwrap();
             }
-            let (preflights, peak) = reconcile(&db, &echo);
+            let (preflights, peak, census) = reconcile(&db, &echo);
             println!(
-                "CDB255_MEMORY total_created_tx={distinct} batch=2 preflights={preflights} peak={peak}"
+                "CDB255_MEMORY total_created_tx={distinct} batch=2 preflights={preflights} peak={peak} census={census:?}"
             );
-            peaks.push(peak);
+            assert_eq!(
+                (census.non_proof_live, census.pool_live, census.proof_live),
+                (0, 0, 0)
+            );
+            assert!(census.pool_peak > 0 && census.pool_peak <= crate::persistence::content_identity::proof_refund_test_scope::pool_ceiling(),
+                "the authenticated ancestor cache stays within its declared 4MiB cap: {census:?}");
+            assert!(
+                census.proof_peak > 0 && census.proof_peak <= PAGE_BYTES,
+                "decoded proof nodes have a separate fixed 64KiB transient allowance: {census:?}"
+            );
+            peaks.push(census.non_proof_peak);
         }
         assert_eq!(
             peaks[0], peaks[1],
-            "four times the unrelated distinct frontiers must not grow batch working memory"
+            "four times the distinct frontiers must not grow peak live non-proof working memory"
         );
     }
 }
