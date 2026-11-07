@@ -7,6 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+#[doc(hidden)]
+pub use crate::json_read_builder::{
+    ClosedJsonReadHooks, JsonReadAdmissionGuard, deserialize_json_in_read_scope,
+    json_retained_heap_bytes,
+};
+
 pub type NodeId = Uuid;
 pub type EdgeType = String;
 pub type TableName = String;
@@ -278,7 +284,7 @@ impl AtomicLsn {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -294,17 +300,193 @@ pub enum Value {
     TxId(TxId),
 }
 
+/// SQL value equality: floats compare as PostgreSQL's float8 (`float8_cmp`),
+/// so `-0.0 == 0.0` and every NaN equals every other NaN. Code that needs a
+/// stored float's exact bits compares `to_bits()` instead.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::Int64(left), Value::Int64(right)) => left == right,
+            (Value::Float64(left), Value::Float64(right)) => float8_cmp(*left, *right).is_eq(),
+            (Value::Text(left), Value::Text(right)) => left == right,
+            (Value::Uuid(left), Value::Uuid(right)) => left == right,
+            (Value::Timestamp(left), Value::Timestamp(right)) => left == right,
+            (Value::Json(left), Value::Json(right)) => left == right,
+            (Value::Vector(left), Value::Vector(right)) => left == right,
+            (Value::TxId(left), Value::TxId(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+/// A row encoded as a key under SQL equality: bincode of the row with every
+/// float replaced by its `float8_canonical` representative, so rows SQL calls
+/// equal (`-0.0` and `0.0`, any two NaNs) encode to the same bytes. The
+/// encoded length equals the row's own, since a float always encodes in eight
+/// bytes. Borrows the row; nothing is copied.
+pub struct SqlEqualityKey<'a>(pub &'a [Value]);
+
+impl Serialize for SqlEqualityKey<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut row = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 {
+            match value {
+                Value::Float64(float) => {
+                    row.serialize_element(&Value::Float64(float8_canonical(*float)))?
+                }
+                value => row.serialize_element(value)?,
+            }
+        }
+        row.end()
+    }
+}
+
+thread_local! {
+    static BORROWED_JSON_WIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Internal bincode producer scope: the borrowed byte sequence has the same
+/// binary string representation. Other serializers keep Value's public shape.
+#[doc(hidden)]
+pub fn with_borrowed_json_wire<T>(make: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BORROWED_JSON_WIRE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(BORROWED_JSON_WIRE.with(|slot| slot.replace(true)));
+    make()
+}
+
 mod json_as_string {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(value: &serde_json::Value, ser: S) -> Result<S::Ok, S::Error> {
-        let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
-        s.serialize(ser)
+        // Concrete engine callers count/admit their largest JSON field before
+        // entering this serializer, including the outer codec sizing pass.
+        // Count only Value's closed implementation; no custom Display replay.
+        struct Count(Option<usize>);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.and_then(|n| n.checked_add(bytes.len()));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(Some(0));
+        serde_json::to_writer(&mut count, value).map_err(serde::ser::Error::custom)?;
+        // Binary serde encodes a byte sequence with exactly the same length
+        // prefix and UTF-8 bytes as a string. Stream the closed JSON producer
+        // on both codec visits; no temporary text buffer exists to fund.
+        if super::BORROWED_JSON_WIRE.with(std::cell::Cell::get) && !ser.is_human_readable() {
+            use serde::ser::{Error, SerializeSeq};
+            struct BinaryText<S: SerializeSeq> {
+                sequence: S,
+                failure: Option<S::Error>,
+            }
+            impl<S: SerializeSeq> std::io::Write for BinaryText<S> {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    for byte in bytes {
+                        if let Err(error) = self.sequence.serialize_element(byte) {
+                            self.failure = Some(error);
+                            return Err(std::io::ErrorKind::InvalidData.into());
+                        }
+                    }
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let length = count
+                .0
+                .ok_or_else(|| S::Error::custom("JSON text length overflow"))?;
+            let mut output = BinaryText {
+                sequence: ser.serialize_seq(Some(length))?,
+                failure: None,
+            };
+            let encoded = serde_json::to_writer(&mut output, value);
+            if let Some(error) = output.failure {
+                return Err(error);
+            }
+            encoded.map_err(S::Error::custom)?;
+            return output.sequence.end();
+        }
+        let layout = count
+            .0
+            .and_then(|bytes| std::alloc::Layout::array::<u8>(bytes).ok());
+        let Some(layout) = layout else {
+            // Generic/unadmitted callers retain their original native path.
+            // Selected engine preflight refuses this size before codec entry.
+            let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+            return s.serialize(ser);
+        };
+        // JSON text is nonempty. Use the exact admitted Layout rather than a
+        // Vec growth recurrence or an assumption about an allocator's capacity.
+        struct TextBuffer {
+            pointer: std::ptr::NonNull<u8>,
+            layout: std::alloc::Layout,
+        }
+        impl Drop for TextBuffer {
+            fn drop(&mut self) {
+                // SAFETY: this unique buffer owns precisely this allocation.
+                unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+            }
+        }
+        assert!(layout.size() != 0, "JSON Value text is nonempty");
+        // SAFETY: the checked layout is nonzero and valid. Zero initialization
+        // permits constructing a u8 slice before the fixed-slice writer runs.
+        let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let buffer = TextBuffer { pointer, layout };
+        // SAFETY: buffer uniquely owns layout.size() initialized bytes and
+        // remains alive through serialize_str, including errors and unwinding.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(buffer.pointer.as_ptr(), layout.size()) };
+        let mut output = &mut bytes[..];
+        serde_json::to_writer(&mut output, value).map_err(serde::ser::Error::custom)?;
+        assert!(output.is_empty(), "JSON Value matches its measured size");
+        let text = std::str::from_utf8(bytes).expect("serde_json emits UTF-8");
+        // The temporary is physically freed on return, before the enclosing
+        // engine scratch invoice can refund. No String or realloc is created.
+        ser.serialize_str(text)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<serde_json::Value, D::Error> {
         let s = String::deserialize(de)?;
-        serde_json::from_str(&s).map_err(serde::de::Error::custom)
+        if crate::json_read_builder::has_closed_hooks() {
+            let result = crate::json_read_builder::deserialize_json_closed(&s);
+            crate::json_read_builder::release_serialized_input(s);
+            match result {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    // Latch the authentic source before crossing the outer
+                    // selected CodecError boundary. Its custom implementation
+                    // sees the ledger cause and returns Captured without text.
+                    match crate::json_read_builder::capture_closed_json(error) {
+                        Ok(()) => Err(serde::de::Error::custom(
+                            "JSON diagnosis retained by producer",
+                        )),
+                        // Unknown native/custom recipes keep their original
+                        // conversion and remain outside positive coverage.
+                        Err(error) => Err(serde::de::Error::custom(error)),
+                    }
+                }
+            }
+        } else if crate::json_read_builder::in_scope() {
+            let result = super::deserialize_json_in_read_scope(&s);
+            // The engine's outer String visitor separately admitted this
+            // serialized input. Return its credit only after native drop.
+            crate::json_read_builder::release_serialized_input(s);
+            result.map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_str::<serde_json::Value>(&s).map_err(serde::de::Error::custom)
+        }
     }
 }
 
@@ -368,6 +550,17 @@ pub fn retained_row_side_map_bytes(table: &str) -> usize {
     ROW_SIDE_MAP_BYTES
         .saturating_add(ROW_VERSION_SLOT_BYTES)
         .saturating_add(table.len().saturating_mul(2))
+}
+
+/// Test-only decomposition of the existing row-side-map charge.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn row_side_map_family_bytes_for_test(table: &str) -> (usize, usize, usize) {
+    let provenance = 36 + 36;
+    let positions = ROW_SIDE_MAP_BYTES
+        .saturating_sub(provenance)
+        .saturating_add(table.len().saturating_mul(2));
+    (ROW_VERSION_SLOT_BYTES, positions, provenance)
 }
 
 /// What holds ONE index posting besides the clone of its key: the map slot it
@@ -490,32 +683,7 @@ pub fn estimate_value_key_bytes(key: &str) -> usize {
 /// leaves an operator's limit holding a thirty-second of the documents it
 /// says it will.
 fn json_heap_bytes(value: &serde_json::Value) -> usize {
-    /// One node's own slot: what a `serde_json::Value` occupies inside its
-    /// parent's storage.
-    const NODE: usize = std::mem::size_of::<serde_json::Value>();
-    /// A map entry carries its key's own header beside the value's slot, in a
-    /// tree node that is not densely packed.
-    const MAP_ENTRY: usize = 48;
-    /// The allocator rounds, and a container reserves slots rather than
-    /// filling them exactly.
-    const SLACK: usize = 8;
-
-    match value {
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
-        serde_json::Value::String(text) => text.capacity().saturating_add(SLACK),
-        serde_json::Value::Array(items) => items
-            .capacity()
-            .saturating_mul(NODE)
-            .saturating_add(items.len().saturating_mul(SLACK))
-            .saturating_add(items.iter().fold(0usize, |acc, item| {
-                acc.saturating_add(json_heap_bytes(item))
-            })),
-        serde_json::Value::Object(members) => members.iter().fold(0usize, |acc, (name, member)| {
-            acc.saturating_add(NODE + MAP_ENTRY + SLACK)
-                .saturating_add(name.capacity())
-                .saturating_add(json_heap_bytes(member))
-        }),
-    }
+    json_retained_heap_bytes(value)
 }
 
 impl Value {
@@ -804,10 +972,35 @@ impl PartialOrd for DirectedValue {
     }
 }
 
-/// Total ordering over `Value`. Stub uses a simple discriminant tiebreak +
-/// `f64::total_cmp` for Float64 + NULL-LAST-ASC semantics. Works uniformly
-/// for every value type; impl may replace this with a more specialized lookup
-/// in its own pass.
+/// Whether two values are the same index key: equal under the total order
+/// every index posting and maintained count is keyed by. Floats follow
+/// PostgreSQL's float8: `-0.0` and `0.0` are one key, and every NaN is one key.
+pub fn index_key_value_eq(a: &Value, b: &Value) -> bool {
+    value_total_cmp(a, b).is_eq()
+}
+
+/// The one representative of a float's PostgreSQL float8 equality class:
+/// `-0.0` becomes `0.0` and every NaN becomes the one positive quiet NaN.
+/// Anything keyed by a float's bytes (a maintained count, a hash) keys this.
+#[inline]
+pub fn float8_canonical(value: f64) -> f64 {
+    if value.is_nan() {
+        f64::NAN
+    } else if value == 0.0 {
+        0.0
+    } else {
+        value
+    }
+}
+
+/// PostgreSQL's float8 order: a total order in which `-0.0 = 0.0`, every NaN
+/// equals every other NaN, and NaN sorts above every number.
+#[inline]
+pub fn float8_cmp(left: f64, right: f64) -> std::cmp::Ordering {
+    float8_canonical(left).total_cmp(&float8_canonical(right))
+}
+
+/// Total ordering over `Value`, NULLS LAST ascending, floats by `float8_cmp`.
 fn value_total_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     // NULL > any finite under ASC per shp_05 (NULLS LAST ASC).
@@ -819,7 +1012,7 @@ fn value_total_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
     match (a, b) {
         (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Float64(x), Value::Float64(y)) => x.total_cmp(y),
+        (Value::Float64(x), Value::Float64(y)) => float8_cmp(*x, *y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
@@ -832,7 +1025,7 @@ fn value_total_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // Json / Vector variants are unreachable because DDL5 / DDL6 reject
         // them with ColumnNotIndexable at CREATE INDEX time.
         //
-        // F-S6: panic on internal invariant violation — better than silently
+        // Panic on internal invariant violation — better than silently
         // returning Ordering::Equal which corrupts BTree ordering.
         (a, b) => panic!(
             "value_total_cmp called on non-indexable / mismatched variants: \
@@ -924,6 +1117,9 @@ pub enum VectorSearchMode {
     /// Require a maintained route for the complete authorized scope, including
     /// small nonempty partitions. An unavailable route gives a typed refusal;
     /// the query never builds a graph, waits for a full build, or silently scans.
+    /// A partition below the column's declared `FLAT_BELOW` is served by its
+    /// maintained flat representation, compared exactly and disclosed on the
+    /// route receipt; that declared, disclosed route is not a silent scan.
     Indexed,
 }
 
@@ -990,8 +1186,32 @@ impl VectorPartitionComponent {
 /// Equality uses the typed components themselves, never a hash or rendered
 /// JSON. `canonical_bytes` is a fixed, versioned encoding used anywhere the
 /// identity crosses a persistence boundary.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct VectorPartitionKey(Vec<VectorPartitionComponent>);
+///
+/// The components are shared: a clone is a reference, so bookkeeping that
+/// keys several maps by the same route holds one copy of a long key, not one
+/// per map. The serialized form is the plain component sequence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(from = "VectorPartitionKeyRepr")]
+pub struct VectorPartitionKey(Arc<[VectorPartitionComponent]>);
+
+#[derive(Deserialize)]
+#[serde(rename = "VectorPartitionKey")]
+struct VectorPartitionKeyRepr(Vec<VectorPartitionComponent>);
+
+impl From<VectorPartitionKeyRepr> for VectorPartitionKey {
+    fn from(repr: VectorPartitionKeyRepr) -> Self {
+        Self(repr.0.into())
+    }
+}
+
+impl Serialize for VectorPartitionKey {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_newtype_struct("VectorPartitionKey", &*self.0)
+    }
+}
 
 impl VectorPartitionKey {
     const CANONICAL_VERSION: u8 = 1;
@@ -1001,7 +1221,7 @@ impl VectorPartitionKey {
     }
 
     pub fn from_components(components: Vec<VectorPartitionComponent>) -> Self {
-        Self(components)
+        Self(components.into())
     }
 
     /// Build a key from already type-checked row values. `None` means one of
@@ -1011,7 +1231,7 @@ impl VectorPartitionKey {
             .iter()
             .map(VectorPartitionComponent::from_value)
             .collect::<Option<Vec<_>>>()
-            .map(Self)
+            .map(|components| Self(components.into()))
     }
 
     pub fn components(&self) -> &[VectorPartitionComponent] {
@@ -1022,13 +1242,15 @@ impl VectorPartitionKey {
         self.0.is_empty()
     }
 
-    /// Memory retained by this key itself, including a large TEXT payload.
+    /// Memory retained by one copy of this key, including a large TEXT
+    /// payload. Clones share that copy (see [`Self::shared_clone_bytes`]).
     /// Hash-map/tree slot overhead is charged by the registry that owns it.
     pub fn estimated_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
             .saturating_add(
                 self.0
-                    .capacity()
+                    .len()
                     .saturating_mul(std::mem::size_of::<VectorPartitionComponent>()),
             )
             .saturating_add(
@@ -1039,11 +1261,16 @@ impl VectorPartitionKey {
             )
     }
 
+    /// What one more clone of an existing key retains: the shared reference.
+    pub const fn shared_clone_bytes() -> usize {
+        std::mem::size_of::<Self>()
+    }
+
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.push(Self::CANONICAL_VERSION);
         bytes.extend_from_slice(&(self.0.len() as u64).to_be_bytes());
-        for component in &self.0 {
+        for component in self.0.iter() {
             match component {
                 VectorPartitionComponent::Uuid(value) => {
                     bytes.push(0);
@@ -1158,7 +1385,7 @@ impl VectorPartitionKey {
         if cursor != bytes.len() {
             return Err("trailing bytes in vector partition key");
         }
-        Ok(Self(components))
+        Ok(Self(components.into()))
     }
 }
 
@@ -1252,12 +1479,23 @@ mod tests {
     }
 
     #[test]
-    fn public_vector_errors_render_the_sql_column_identity() {
-        let error = crate::Error::VectorIndexedRouteUnavailable {
+    fn unavailable_index_is_a_typed_refusal_without_data() {
+        let result: crate::Result<Vec<Value>> = Err(crate::Error::VectorIndexedRouteUnavailable {
             index: VectorIndexRef::new("documents", "embedding"),
-        }
-        .to_string();
-        assert!(error.contains("documents.embedding"));
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(rows) => panic!("an unavailable INDEXED route returned data: {rows:?}"),
+        };
+        assert!(matches!(
+            &error,
+            crate::Error::VectorIndexedRouteUnavailable { .. }
+        ));
+        let error = error.to_string();
+        assert_eq!(
+            error,
+            "no vector index ships in this release; use EXACT or AUTO"
+        );
         assert!(!error.contains("VectorIndexRef"));
         assert!(!error.contains("table:"));
     }

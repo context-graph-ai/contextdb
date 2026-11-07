@@ -24,15 +24,19 @@ fn order_key_offset() -> usize {
     1 + 4 + TABLE.len() + 4 + INDEX.len() + 1
 }
 
-fn fixture(path: &std::path::Path, rows: u64) -> (redb::Database, Vec<ContentIdentityMutation>) {
-    let database = redb::Database::create(path).expect("create proof fixture");
+fn fixture(
+    path: &std::path::Path,
+    rows: u64,
+) -> (ProofFixtureDatabase, Vec<ContentIdentityMutation>) {
+    let database = ProofFixtureDatabase::create(path).expect("create proof fixture");
     let records = (0..rows).map(|row| posting(row, false)).collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -52,7 +56,7 @@ fn damage_leaf_key(
     let family = LogicalFamily::SchemaAndIndexes;
     let write = database.begin_write().unwrap();
     {
-        let mut nodes = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        let mut nodes = crate::persistence::content_identity::payloads::open(&write).unwrap();
         let mut target = None;
         for row in nodes.iter().unwrap() {
             let (key, value) = row.unwrap();
@@ -81,7 +85,19 @@ fn damage_leaf_key(
     write.commit().unwrap();
 }
 
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn read_failure(database: &redb::Database, records: &[ContentIdentityMutation]) -> Error {
+    // Raw proof verification has no public request to supply its decode owner.
+    let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
     let read = database.begin_read().unwrap();
     let verifier =
         ContentIdentityReadVerifier::open(&read, std::path::Path::new("proofs.db"), None).unwrap();
@@ -164,6 +180,13 @@ fn a_self_consistent_chunk_with_a_changed_direction_is_typed_corruption() {
 
 #[test]
 fn the_proof_comparator_never_ties_or_panics_on_a_mixed_key() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let ascending = mutation_tree_key(&posting(7, false)).unwrap();
     let descending = mutation_tree_key(&posting(7, true)).unwrap();
     let direction = identity_key_cmp(&ascending, &descending)

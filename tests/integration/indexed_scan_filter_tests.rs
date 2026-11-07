@@ -62,8 +62,8 @@ fn ep01_equality_on_indexed_column_picks_index_scan() {
             &empty(),
         )
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
     // Trace-liar gate: a full-scan impl that writes "IndexScan" into trace
     // examines every row (>= 51). A real IndexScan examines at most the
     // matching postings (2 rows sharing a=7).
@@ -72,9 +72,9 @@ fn ep01_equality_on_indexed_column_picks_index_scan() {
         "IndexScan must not examine more than a small multiple of result cardinality; got {}",
         db.__rows_examined()
     );
-    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows().len(), 2);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(7), Value::Int64(107), Value::Text("r7".into())],
             vec![Value::Int64(7), Value::Int64(100), Value::Text("x".into())],
@@ -104,10 +104,10 @@ fn ep02_between_on_indexed_column_picks_index_scan() {
             &empty(),
         )
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
     let pushed: Vec<&str> = r
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref())
@@ -115,7 +115,7 @@ fn ep02_between_on_indexed_column_picks_index_scan() {
     assert_eq!(pushed, vec!["a"]);
     // Trace-liar gate: table size = 50; real IndexScan touches ~2.
     assert!(db.__rows_examined() <= 4, "got {}", db.__rows_examined());
-    assert_eq!(r.rows, vec![vec![Value::Int64(5)], vec![Value::Int64(9)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(5)], vec![Value::Int64(9)]]);
 }
 
 // ============================================================================
@@ -135,9 +135,9 @@ fn ep03_in_const_list_on_indexed_column_returns_exact_rows() {
             &empty(),
         )
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![
                 Value::Int64(1),
@@ -168,10 +168,10 @@ fn ep03b_in_real_literal_on_integer_index_matches_evaluator() {
     let r = db
         .execute("SELECT a, tag FROM t WHERE a IN (1.0)", &empty())
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Int64(1), Value::Text("one".into())]]
     );
     assert_eq!(db.__rows_examined(), 1);
@@ -191,8 +191,8 @@ fn ep04_not_equal_on_indexed_column_picks_index_scan() {
     let r = db
         .execute("SELECT a FROM t WHERE a != 5 ORDER BY a ASC", &empty())
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, vec![vec![Value::Int64(1)], vec![Value::Int64(9)]]);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows(), vec![vec![Value::Int64(1)], vec![Value::Int64(9)]]);
 }
 
 // ============================================================================
@@ -234,13 +234,13 @@ fn ep05_function_call_in_predicate_disqualifies_index() {
             &empty(),
         )
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "Scan");
-    assert!(r.trace.index_used.is_none());
+    assert_eq!(r.trace().physical_plan, "Scan");
+    assert!(r.trace().index_used.is_none());
     // Filter out auto-indexes (__pk_id, __unique_...) — those are always
     // considered now that the planner sees them. User-declared candidates
     // carry the meaningful rejection reason on this surface.
     let considered: Vec<&str> = r
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .filter(|c| !c.name.starts_with("__pk_") && !c.name.starts_with("__unique_"))
@@ -248,7 +248,7 @@ fn ep05_function_call_in_predicate_disqualifies_index() {
         .collect();
     assert_eq!(considered, vec!["idx_name"]);
     let idx_name_cand = r
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .find(|c| c.name == "idx_name")
@@ -277,10 +277,10 @@ fn ep06_arithmetic_in_predicate_disqualifies_index() {
     let r = db
         .execute("SELECT a FROM t WHERE a + 1 = 5", &empty())
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "Scan");
-    assert!(r.trace.index_used.is_none());
+    assert_eq!(r.trace().physical_plan, "Scan");
+    assert!(r.trace().index_used.is_none());
     let idx_a = r
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .find(|c| c.name == "idx_a")
@@ -300,15 +300,15 @@ fn ep07_column_ref_rhs_disqualifies_index() {
     let r = db
         .execute("SELECT a, b FROM t WHERE a = b", &empty())
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "Scan");
+    assert_eq!(r.trace().physical_plan, "Scan");
     let idx_a = r
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .find(|c| c.name == "idx_a")
         .expect("idx_a must be among considered");
     assert_eq!(idx_a.rejected_reason.as_ref(), "non-literal rhs");
-    assert_eq!(r.rows, vec![vec![Value::Int64(3), Value::Int64(3)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(3), Value::Int64(3)]]);
 }
 
 // ============================================================================
@@ -329,9 +329,9 @@ fn ep08_subquery_rhs_disqualifies_outer_index() {
     let r = db
         .execute("SELECT a FROM t WHERE a IN (SELECT x FROM sub)", &empty())
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "Scan");
-    assert!(r.trace.index_used.is_none());
-    assert_eq!(r.rows, vec![vec![Value::Int64(5)]]);
+    assert_eq!(r.trace().physical_plan, "Scan");
+    assert!(r.trace().index_used.is_none());
+    assert_eq!(r.rows(), vec![vec![Value::Int64(5)]]);
 }
 
 // ============================================================================
@@ -348,8 +348,8 @@ fn ep09_parameterized_equality_picks_index_scan() {
             &params(vec![("p", Value::Int64(42))]),
         )
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, vec![vec![Value::Int64(42)]]);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows(), vec![vec![Value::Int64(42)]]);
 }
 
 // ============================================================================
@@ -372,9 +372,9 @@ fn ep10_parameterized_equality_with_null_bind_returns_no_rows() {
             &params(vec![("p", Value::Null)]),
         )
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.rows(), Vec::<Vec<Value>>::new());
     // Trace-liar gate: NULL-bind short-circuit examines zero postings.
     assert!(db.__rows_examined() <= 1, "got {}", db.__rows_examined());
 }
@@ -419,9 +419,9 @@ fn ep11_is_null_on_indexed_column_uses_index() {
             &empty(),
         )
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Text("null1".into())],
             vec![Value::Text("null2".into())],
@@ -462,8 +462,8 @@ fn ep12_is_not_null_on_indexed_column_uses_index() {
     let r = db
         .execute("SELECT tag FROM t WHERE a IS NOT NULL", &empty())
         .expect("SELECT");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, vec![vec![Value::Text("nonnull".into())]]);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows(), vec![vec![Value::Text("nonnull".into())]]);
 }
 
 // ============================================================================
@@ -483,11 +483,11 @@ fn ep13_tie_break_by_creation_order() {
     let r = db
         .execute("SELECT a, b, tag FROM t WHERE a = 1", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
     assert!(db.__rows_examined() <= 4, "got {}", db.__rows_examined());
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![
             Value::Int64(1),
             Value::Int64(100),
@@ -535,10 +535,10 @@ fn ep14_picker_prefers_equality_over_range() {
     let r = db
         .execute("SELECT a, b FROM t WHERE a = 5 AND b > 0", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
     assert!(db.__rows_examined() <= 4, "got {}", db.__rows_examined());
-    assert_eq!(r.rows, vec![vec![Value::Int64(5), Value::Int64(100)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(5), Value::Int64(100)]]);
 }
 
 // ============================================================================
@@ -581,17 +581,17 @@ fn ep15_composite_index_pushes_full_matched_prefix() {
     let r = db
         .execute("SELECT a, b FROM t WHERE a = 1 AND b = 20", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_ab"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_ab"));
     let pushed: Vec<&str> = r
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref())
         .collect();
     assert_eq!(pushed, vec!["a", "b"]);
     assert_eq!(db.__rows_examined(), 1);
-    assert_eq!(r.rows, vec![vec![Value::Int64(1), Value::Int64(20)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(1), Value::Int64(20)]]);
 }
 
 // ============================================================================
@@ -616,9 +616,9 @@ fn ep16_like_is_residual_only() {
     let r = db
         .execute("SELECT name FROM t WHERE name LIKE 'pay%'", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "Scan");
+    assert_eq!(r.trace().physical_plan, "Scan");
     let idx_name = r
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .find(|c| c.name == "idx_name")
@@ -656,9 +656,9 @@ fn ep17_index_scan_with_residual_like_returns_intersection() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Int64(3), Value::Text("xavier".into())]]
     );
 }
@@ -676,8 +676,8 @@ fn mv01_reader_before_insert_sees_zero_rows_via_index_scan() {
     let r = db
         .execute_at_snapshot("SELECT a FROM t WHERE a = 7", &empty(), snap_before)
         .expect("SELECT at snapshot");
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows(), Vec::<Vec<Value>>::new());
 }
 
 // ============================================================================
@@ -703,13 +703,16 @@ fn mv02_pre_delete_reader_still_sees_row() {
             snap_before_delete,
         )
         .unwrap();
-    assert_eq!(r_before.trace.physical_plan, "IndexScan");
-    assert_eq!(r_before.rows, vec![vec![Value::Int64(9), Value::Int64(99)]]);
+    assert_eq!(r_before.trace().physical_plan, "IndexScan");
+    assert_eq!(
+        r_before.rows(),
+        vec![vec![Value::Int64(9), Value::Int64(99)]]
+    );
 
     let r_now = db
         .execute("SELECT a, b FROM t WHERE a = 9", &empty())
         .unwrap();
-    assert_eq!(r_now.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r_now.rows(), Vec::<Vec<Value>>::new());
 }
 
 // ============================================================================
@@ -731,15 +734,15 @@ fn mv03_update_changes_indexed_column_visibility() {
     let r_old_snap_old_key = db
         .execute_at_snapshot("SELECT a FROM t WHERE a = 1", &empty(), snap_before_update)
         .unwrap();
-    assert_eq!(r_old_snap_old_key.rows, vec![vec![Value::Int64(1)]]);
+    assert_eq!(r_old_snap_old_key.rows(), vec![vec![Value::Int64(1)]]);
 
     let r_new_snap_new_key = db
         .execute("SELECT a FROM t WHERE a = 99", &empty())
         .unwrap();
-    assert_eq!(r_new_snap_new_key.rows, vec![vec![Value::Int64(99)]]);
+    assert_eq!(r_new_snap_new_key.rows(), vec![vec![Value::Int64(99)]]);
 
     let r_new_snap_old_key = db.execute("SELECT a FROM t WHERE a = 1", &empty()).unwrap();
-    assert_eq!(r_new_snap_old_key.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r_new_snap_old_key.rows(), Vec::<Vec<Value>>::new());
 }
 
 // ============================================================================
@@ -757,8 +760,8 @@ fn mv04_rollback_leaves_index_unchanged() {
     let r = db
         .execute("SELECT a FROM t WHERE a = 55", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows(), Vec::<Vec<Value>>::new());
 }
 
 // ============================================================================
@@ -818,9 +821,9 @@ fn mv06_cross_open_index_scan_preserved() {
     let r = db
         .execute("SELECT a, b, tag FROM t WHERE a = 11", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![
             Value::Int64(11),
             Value::Int64(111),
@@ -879,9 +882,9 @@ fn indexed_scan_concurrent_writer_reader_no_ghost_rows() {
 
     let _new_id = writer.join().expect("writer");
     let r_reader = reader.join().expect("reader");
-    assert_eq!(r_reader.trace.physical_plan, "IndexScan");
+    assert_eq!(r_reader.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r_reader.rows,
+        r_reader.rows(),
         Vec::<Vec<Value>>::new(),
         "snapshot reader must not see the post-snapshot insert"
     );
@@ -890,9 +893,9 @@ fn indexed_scan_concurrent_writer_reader_no_ghost_rows() {
     let r_now = db
         .execute("SELECT a, tag FROM t WHERE a = 200", &empty())
         .unwrap();
-    assert_eq!(r_now.trace.physical_plan, "IndexScan");
+    assert_eq!(r_now.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r_now.rows,
+        r_now.rows(),
         vec![vec![Value::Int64(200), Value::Text("post".into())]]
     );
 }
@@ -1231,8 +1234,8 @@ fn ddl10_drop_index_falls_back_to_scan() {
     insert_row_t(&db, 1, 0, "x");
     db.execute("DROP INDEX idx_a ON t", &empty()).unwrap();
     let r = db.execute("SELECT a FROM t WHERE a = 1", &empty()).unwrap();
-    assert_eq!(r.trace.physical_plan, "Scan");
-    assert!(r.trace.index_used.is_none());
+    assert_eq!(r.trace().physical_plan, "Scan");
+    assert!(r.trace().index_used.is_none());
 }
 
 // ============================================================================
@@ -1266,7 +1269,7 @@ fn ddl12_drop_index_if_exists_is_idempotent() {
     let r1 = db
         .execute("DROP INDEX IF EXISTS no_such ON t", &empty())
         .expect("IF EXISTS first call must succeed");
-    assert_eq!(r1.rows_affected, 0);
+    assert_eq!(r1.rows_affected(), 0);
     // Only user-declared indexes are cleared; auto-indexes (kind=Auto) stay.
     assert!(
         db.table_meta("t")
@@ -1278,7 +1281,7 @@ fn ddl12_drop_index_if_exists_is_idempotent() {
     let r2 = db
         .execute("DROP INDEX IF EXISTS no_such ON t", &empty())
         .expect("IF EXISTS second call must succeed (idempotent)");
-    assert_eq!(r2.rows_affected, 0);
+    assert_eq!(r2.rows_affected(), 0);
     assert!(
         db.table_meta("t")
             .unwrap()
@@ -1358,7 +1361,7 @@ fn ddl15_drop_column_cascade_drops_indexes_and_reports() {
     let r = db
         .execute("ALTER TABLE t DROP COLUMN a CASCADE", &empty())
         .expect("CASCADE must succeed");
-    let cascade = r.cascade.expect("cascade must be populated");
+    let cascade = r.cascade().expect("cascade must be populated");
     let mut dropped = cascade.dropped_indexes.clone();
     dropped.sort();
     assert_eq!(dropped, vec!["idx_a".to_string(), "idx_ab".to_string()]);
@@ -1387,7 +1390,7 @@ fn ddl16_drop_column_cascade_empty_vec_when_unindexed() {
     let r = db
         .execute("ALTER TABLE t DROP COLUMN b CASCADE", &empty())
         .unwrap();
-    let cascade = r.cascade.expect("cascade Some");
+    let cascade = r.cascade().expect("cascade Some");
     assert!(cascade.dropped_indexes.is_empty());
     // Column actually removed from the schema.
     let meta = db.table_meta("t").unwrap();
@@ -1544,14 +1547,14 @@ fn pk01_pk_constraint_check_routes_through_index() {
     let probe = db
         .__probe_constraint_check("t", "id", Value::Uuid(id))
         .expect("probe result");
-    assert_eq!(probe.trace.physical_plan, "IndexScan");
+    assert_eq!(probe.trace().physical_plan, "IndexScan");
     let r = db
         .execute(
             "SELECT a FROM t WHERE id = $id",
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(r.rows, vec![vec![Value::Int64(730)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(730)]]);
 }
 
 // ============================================================================
@@ -1596,7 +1599,7 @@ fn pk02_unique_constraint_check_routes_through_index() {
     let probe = db
         .__probe_constraint_check("t", "email", Value::Text("a@b.c".into()))
         .unwrap();
-    assert_eq!(probe.trace.physical_plan, "IndexScan");
+    assert_eq!(probe.trace().physical_plan, "IndexScan");
 }
 
 // ============================================================================
@@ -1651,7 +1654,7 @@ fn pk03_composite_unique_routes_through_index() {
     let probe = db
         .__probe_constraint_check("t", "a", Value::Int64(1))
         .unwrap();
-    assert_eq!(probe.trace.physical_plan, "IndexScan");
+    assert_eq!(probe.trace().physical_plan, "IndexScan");
 }
 
 // ============================================================================
@@ -1676,10 +1679,10 @@ fn ord05_two_identical_selects_return_identical_order() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r1.trace.physical_plan, "IndexScan");
-    assert_eq!(r2.trace.physical_plan, "IndexScan");
-    assert_eq!(r1.rows.len(), 4, "must return all four rows");
-    assert_eq!(r1.rows, r2.rows);
+    assert_eq!(r1.trace().physical_plan, "IndexScan");
+    assert_eq!(r2.trace().physical_plan, "IndexScan");
+    assert_eq!(r1.rows().len(), 4, "must return all four rows");
+    assert_eq!(r1.rows(), r2.rows());
 }
 
 // ============================================================================
@@ -1697,7 +1700,7 @@ fn ord06_non_unique_index_tie_break_by_row_id_ascending() {
         .unwrap();
     // The first-inserted row has the smaller row_id, so appears first.
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Uuid(id_first), Value::Int64(100)],
             vec![Value::Uuid(id_second), Value::Int64(200)],
@@ -1733,7 +1736,7 @@ fn nul01_asc_null_sorts_last() {
         .execute("SELECT a FROM t ORDER BY a ASC", &empty())
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
@@ -1770,7 +1773,7 @@ fn nul02_desc_null_sorts_first() {
         .execute("SELECT a FROM t ORDER BY a DESC", &empty())
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Null],
             vec![Value::Int64(2)],
@@ -1803,9 +1806,9 @@ fn nan01_asc_nan_sorts_greater_than_finite() {
     let r = db
         .execute("SELECT f FROM t ORDER BY f ASC", &empty())
         .unwrap();
-    assert_eq!(r.rows.len(), 3);
+    assert_eq!(r.rows().len(), 3);
     // First two are finite 1.0, 2.0.
-    match (&r.rows[0][0], &r.rows[1][0]) {
+    match (&r.rows()[0][0], &r.rows()[1][0]) {
         (Value::Float64(a), Value::Float64(b)) => {
             assert_eq!(*a, 1.0);
             assert_eq!(*b, 2.0);
@@ -1813,7 +1816,7 @@ fn nan01_asc_nan_sorts_greater_than_finite() {
         other => panic!("expected finite floats first, got {other:?}"),
     }
     // Last is NaN (Float64 NaN; identity via is_nan).
-    match &r.rows[2][0] {
+    match &r.rows()[2][0] {
         Value::Float64(x) => assert!(x.is_nan(), "expected NaN last, got {x}"),
         other => panic!("expected Float64 NaN, got {other:?}"),
     }
@@ -1853,8 +1856,8 @@ fn nan02_where_equal_nan_returns_zero_rows() {
             &params(vec![("v", Value::Float64(1.0))]),
         )
         .unwrap();
-    assert_eq!(r_pos.trace.physical_plan, "IndexScan");
-    assert_eq!(r_pos.rows, vec![vec![Value::Uuid(id_finite)]]);
+    assert_eq!(r_pos.trace().physical_plan, "IndexScan");
+    assert_eq!(r_pos.rows(), vec![vec![Value::Uuid(id_finite)]]);
     // Division by zero in a WHERE predicate is a statement error (standard-SQL),
     // not a short-circuit to NaN. The planner no longer resolves 0.0/0.0 to NaN.
     let r = db.execute("SELECT f FROM t WHERE f = 0.0/0.0", &empty());
@@ -1866,10 +1869,11 @@ fn nan02_where_equal_nan_returns_zero_rows() {
 }
 
 // ============================================================================
-// NAN03 — parameterized NaN bind returns zero rows.
+// NAN03 — parameterized NaN bind matches the stored NaN row, as PostgreSQL's
+// float8 equality does (NaN = NaN).
 // ============================================================================
 #[test]
-fn nan03_param_nan_bind_returns_zero_rows() {
+fn nan03_param_nan_bind_matches_the_stored_nan() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY, f REAL)", &empty())
         .unwrap();
@@ -1899,17 +1903,17 @@ fn nan03_param_nan_bind_returns_zero_rows() {
             &params(vec![("p", Value::Float64(2.5))]),
         )
         .unwrap();
-    assert_eq!(r_pos.trace.physical_plan, "IndexScan");
-    assert_eq!(r_pos.rows, vec![vec![Value::Uuid(id_finite)]]);
-    // Negative: NaN-bind short-circuits.
+    assert_eq!(r_pos.trace().physical_plan, "IndexScan");
+    assert_eq!(r_pos.rows(), vec![vec![Value::Uuid(id_finite)]]);
+    // A NaN bind is an ordinary index probe that finds the NaN row.
     let r = db
         .execute(
-            "SELECT f FROM t WHERE f = $p",
+            "SELECT id FROM t WHERE f = $p",
             &params(vec![("p", Value::Float64(f64::NAN))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(id_nan)]]);
 }
 
 // ============================================================================
@@ -1936,11 +1940,11 @@ fn nan04_is_null_does_not_match_nan() {
     let r = db
         .execute("SELECT id FROM t WHERE f IS NULL", &empty())
         .unwrap();
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    assert_eq!(r.rows(), Vec::<Vec<Value>>::new());
     let r2 = db
         .execute("SELECT id FROM t WHERE f IS NOT NULL", &empty())
         .unwrap();
-    assert_eq!(r2.rows, vec![vec![Value::Uuid(id_nan)]]);
+    assert_eq!(r2.rows(), vec![vec![Value::Uuid(id_nan)]]);
 }
 
 // ============================================================================
@@ -1968,14 +1972,14 @@ fn indexed_scan_float64_nan_ordering_desc_mirrors_total_cmp() {
     let r = db
         .execute("SELECT f FROM t ORDER BY f DESC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert!(r.trace.sort_elided);
-    assert_eq!(r.rows.len(), 3);
-    match &r.rows[0][0] {
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert!(r.trace().sort_elided);
+    assert_eq!(r.rows().len(), 3);
+    match &r.rows()[0][0] {
         Value::Float64(x) => assert!(x.is_nan(), "expected NaN first under DESC; got {x}"),
         other => panic!("expected Float64 NaN, got {other:?}"),
     }
-    match (&r.rows[1][0], &r.rows[2][0]) {
+    match (&r.rows()[1][0], &r.rows()[2][0]) {
         (Value::Float64(a), Value::Float64(b)) => {
             assert_eq!(*a, 2.0);
             assert_eq!(*b, 1.0);
@@ -2006,8 +2010,8 @@ fn ord01_prefix_compatible_order_by_elides_sort() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert!(r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert!(r.trace().sort_elided);
 }
 
 // ============================================================================
@@ -2029,8 +2033,8 @@ fn ord02_direction_mismatch_keeps_sort() {
     let r = db
         .execute("SELECT id FROM t ORDER BY created_at ASC, id ASC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "Sort");
-    assert!(!r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "Sort");
+    assert!(!r.trace().sort_elided);
 }
 
 // ============================================================================
@@ -2060,10 +2064,10 @@ fn ord03_prefix_of_composite_elides_sort() {
     let r = db
         .execute("SELECT a FROM t ORDER BY a ASC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert!(r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert!(r.trace().sort_elided);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(1)],
             vec![Value::Int64(2)],
@@ -2099,10 +2103,10 @@ fn ord04_non_prefix_keeps_sort() {
     let r = db
         .execute("SELECT b FROM t ORDER BY b ASC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "Sort");
-    assert!(!r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "Sort");
+    assert!(!r.trace().sort_elided);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(10)],
             vec![Value::Int64(20)],
@@ -2142,10 +2146,10 @@ fn order_by_composite_mixed_direction_elision_requires_exact_match() {
     let r_match = db
         .execute("SELECT a, b FROM t ORDER BY a ASC, b DESC", &empty())
         .unwrap();
-    assert_eq!(r_match.trace.physical_plan, "IndexScan");
-    assert!(r_match.trace.sort_elided);
+    assert_eq!(r_match.trace().physical_plan, "IndexScan");
+    assert!(r_match.trace().sort_elided);
     assert_eq!(
-        r_match.rows,
+        r_match.rows(),
         vec![
             vec![Value::Int64(1), Value::Int64(30)],
             vec![Value::Int64(1), Value::Int64(20)],
@@ -2158,10 +2162,10 @@ fn order_by_composite_mixed_direction_elision_requires_exact_match() {
     let r_mismatch = db
         .execute("SELECT a, b FROM t ORDER BY a ASC, b ASC", &empty())
         .unwrap();
-    assert_eq!(r_mismatch.trace.physical_plan, "Sort");
-    assert!(!r_mismatch.trace.sort_elided);
+    assert_eq!(r_mismatch.trace().physical_plan, "Sort");
+    assert!(!r_mismatch.trace().sort_elided);
     assert_eq!(
-        r_mismatch.rows,
+        r_mismatch.rows(),
         vec![
             vec![Value::Int64(1), Value::Int64(10)],
             vec![Value::Int64(1), Value::Int64(20)],
@@ -2205,8 +2209,8 @@ fn pr01_index_survives_reopen() {
     let r = db
         .execute("SELECT a FROM t WHERE a = 42", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, vec![vec![Value::Int64(42)]]);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows(), vec![vec![Value::Int64(42)]]);
 }
 
 // ============================================================================
@@ -2290,7 +2294,7 @@ fn pr03_index_ddl_emits_ddl_log_entries() {
     db.execute("CREATE INDEX idx ON t (a ASC)", &empty())
         .unwrap();
     db.execute("DROP INDEX idx ON t", &empty()).unwrap();
-    let entries = db.ddl_log_since(before);
+    let entries = db.ddl_log_since(before).unwrap();
     let has_create = entries.iter().any(|d| matches!(
         d,
         DdlChange::CreateIndex { table, name, columns }
@@ -2405,11 +2409,11 @@ fn file_backed_open_with_indexed_rows_completes() {
     let r = db
         .execute("SELECT id FROM t WHERE bucket = 42", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows.len(), 10);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows().len(), 10);
     assert!(db.__rows_examined() <= 50, "got {}", db.__rows_examined());
     let count = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
-    assert_eq!(count.rows, vec![vec![Value::Int64(1_000)]]);
+    assert_eq!(count.rows(), vec![vec![Value::Int64(1_000)]]);
     // Full-row identity: the sampled row is readable back by PK.
     let r2 = db
         .execute(
@@ -2417,8 +2421,8 @@ fn file_backed_open_with_indexed_rows_completes() {
             &params(vec![("id", Value::Uuid(sampled_id.unwrap()))]),
         )
         .unwrap();
-    assert_eq!(r2.rows.len(), 1);
-    match (&r2.rows[0][0], &r2.rows[0][1]) {
+    assert_eq!(r2.rows().len(), 1);
+    match (&r2.rows()[0][0], &r2.rows()[0][1]) {
         (Value::Uuid(u), Value::Int64(b)) => {
             assert_eq!(*u, sampled_id.unwrap());
             assert_eq!(*b, 730 % 100);
@@ -2456,8 +2460,8 @@ fn in_memory_pk_inserts_mid_load_durability() {
             &params(vec![("id", Value::Uuid(sampled_id.unwrap()))]),
         )
         .unwrap();
-    assert_eq!(r.rows.len(), 1);
-    match &r.rows[0][0] {
+    assert_eq!(r.rows().len(), 1);
+    match &r.rows()[0][0] {
         Value::Int64(b) => assert_eq!(*b, 730),
         other => panic!("expected Int64, got {other:?}"),
     }
@@ -2476,7 +2480,7 @@ fn sy01_create_index_replicates_through_sync() {
     origin
         .execute("CREATE INDEX idx ON t (a)", &empty())
         .unwrap();
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -2532,7 +2536,7 @@ fn sy02_drop_index_replicates_through_sync() {
             .all(|i| i.kind == IndexKind::Auto),
         "origin must show no user-declared indexes after DROP"
     );
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -2604,7 +2608,7 @@ fn tr01_physical_plan_always_populated() {
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER)", &empty())
         .unwrap();
     let r1 = db.execute("SELECT a FROM t", &empty()).unwrap();
-    assert_eq!(r1.trace.physical_plan, "Scan");
+    assert_eq!(r1.trace().physical_plan, "Scan");
     db.execute("CREATE INDEX idx_a ON t (a)", &empty()).unwrap();
     db.execute(
         "INSERT INTO t (id, a) VALUES ($id, $a)",
@@ -2615,7 +2619,7 @@ fn tr01_physical_plan_always_populated() {
     )
     .unwrap();
     let r2 = db.execute("SELECT a FROM t WHERE a = 1", &empty()).unwrap();
-    assert_eq!(r2.trace.physical_plan, "IndexScan");
+    assert_eq!(r2.trace().physical_plan, "IndexScan");
 }
 
 // ============================================================================
@@ -2628,7 +2632,7 @@ fn tr02_predicates_pushed_is_exact_singleton() {
     insert_row_t(&db, 1, 0, "x");
     let r = db.execute("SELECT a FROM t WHERE a = 1", &empty()).unwrap();
     let pushed: Vec<String> = r
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref().to_string())
@@ -2651,7 +2655,7 @@ fn tr03_indexes_considered_populated_with_reasons() {
         .unwrap();
     // Filter out auto-indexes; the meaningful surface is the user-declared set.
     let user_considered: Vec<_> = r
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .filter(|c| !c.name.starts_with("__pk_") && !c.name.starts_with("__unique_"))
@@ -2677,11 +2681,11 @@ fn tr04_sort_elided_populated_independently() {
     let r_elided = db
         .execute("SELECT a FROM t ORDER BY a ASC", &empty())
         .unwrap();
-    assert!(r_elided.trace.sort_elided);
+    assert!(r_elided.trace().sort_elided);
     let r_not = db
         .execute("SELECT a FROM t ORDER BY a DESC", &empty())
         .unwrap();
-    assert!(!r_not.trace.sort_elided);
+    assert!(!r_not.trace().sort_elided);
 }
 
 // ============================================================================
@@ -2714,9 +2718,9 @@ fn indexed_scan_select_at_10k_rows_sublinear_rows_examined() {
     let r = db
         .execute("SELECT v FROM t WHERE bucket = 42", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_bucket"));
-    assert_eq!(r.rows.len(), 10, "bucket=42 has exactly 10 rows");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_bucket"));
+    assert_eq!(r.rows().len(), 10, "bucket=42 has exactly 10 rows");
     // Non-fakeable gate: a Scan touches 10,000; IndexScan must stay under 100.
     assert!(
         db.__rows_examined() < 100,
@@ -2752,8 +2756,8 @@ fn scan_select_at_10k_rows_examines_full_table() {
     let r = db
         .execute("SELECT v FROM t WHERE bucket = 42", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "Scan");
-    assert_eq!(r.rows.len(), 10);
+    assert_eq!(r.trace().physical_plan, "Scan");
+    assert_eq!(r.rows().len(), 10);
     assert!(
         db.__rows_examined() >= 10_000,
         "Scan must examine the full table; got {}",
@@ -2772,8 +2776,8 @@ fn ex01_programmatic_trace_indexed_query() {
     seed_t_with_index(&db);
     insert_row_t(&db, 1, 0, "x");
     let r = db.execute("SELECT a FROM t WHERE a = 1", &empty()).unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_a"));
 }
 
 // ============================================================================
@@ -2786,8 +2790,8 @@ fn ex02_programmatic_trace_unindexed_query() {
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER)", &empty())
         .unwrap();
     let r = db.execute("SELECT a FROM t WHERE a = 1", &empty()).unwrap();
-    assert_eq!(r.trace.physical_plan, "Scan");
-    assert!(r.trace.index_used.is_none());
+    assert_eq!(r.trace().physical_plan, "Scan");
+    assert!(r.trace().index_used.is_none());
 }
 
 // ============================================================================
@@ -2903,9 +2907,9 @@ fn ba01_batch_apply_create_index_before_rows() {
     let r = db
         .execute("SELECT COUNT(*) FROM t WHERE a = 42", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     // COUNT(*) path: assert exactly one row with Int64(50).
-    assert_eq!(r.rows, vec![vec![Value::Int64(50)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Int64(50)]]);
 }
 
 // ============================================================================
@@ -2956,9 +2960,9 @@ fn engine_side_entity_list_filter_under_budget() {
             ]),
         )
         .unwrap();
-    assert_eq!(filtered.rows.len(), 100);
-    assert_eq!(filtered.trace.physical_plan, "IndexScan");
-    assert!(filtered.trace.sort_elided);
+    assert_eq!(filtered.rows().len(), 100);
+    assert_eq!(filtered.trace().physical_plan, "IndexScan");
+    assert!(filtered.trace().sort_elided);
     // Trace-liar gate: ~500 rows match (entity_type = "Service"). A full
     // scan examines 1000. IndexScan must examine close to the match count.
     assert!(
@@ -3007,13 +3011,13 @@ fn co01_index_on_immutable_column_succeeds_and_filters() {
             &params(vec![("l", Value::Text("frozen".into()))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert!(
         db.__rows_examined() <= 4,
         "trace-liar gate: got {}",
         db.__rows_examined()
     );
-    assert_eq!(r.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(id)]]);
 }
 
 // ============================================================================
@@ -3060,13 +3064,13 @@ fn co02_index_on_state_machine_column_succeeds_and_filters() {
             &params(vec![("s", Value::Text("active".into()))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert!(
         db.__rows_examined() <= 4,
         "trace-liar gate: got {}",
         db.__rows_examined()
     );
-    assert_eq!(r.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(id)]]);
 }
 
 // ============================================================================
@@ -3111,13 +3115,13 @@ fn co03_index_on_dag_table_succeeds() {
             &params(vec![("n", Value::Text("root".into()))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert!(
         db.__rows_examined() <= 4,
         "trace-liar gate: got {}",
         db.__rows_examined()
     );
-    assert_eq!(r.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(id)]]);
 }
 
 // ============================================================================
@@ -3161,13 +3165,13 @@ fn co04_index_on_retain_table_succeeds() {
             &params(vec![("n", Value::Text("kept".into()))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert!(
         db.__rows_examined() <= 4,
         "trace-liar gate: got {}",
         db.__rows_examined()
     );
-    assert_eq!(r.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(id)]]);
 }
 
 // ============================================================================
@@ -3231,13 +3235,13 @@ fn co05_index_on_references_column_succeeds() {
             &params(vec![("p", Value::Uuid(parent_id))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert!(
         db.__rows_examined() <= 4,
         "trace-liar gate: got {}",
         db.__rows_examined()
     );
-    assert_eq!(r.rows, vec![vec![Value::Uuid(child_id)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(child_id)]]);
 }
 
 // ============================================================================
@@ -3285,13 +3289,13 @@ fn co06_index_on_expires_column_succeeds() {
             &params(vec![("e", ts)]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert!(
         db.__rows_examined() <= 4,
         "trace-liar gate: got {}",
         db.__rows_examined()
     );
-    assert_eq!(r.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(r.rows(), vec![vec![Value::Uuid(id)]]);
 }
 
 // ============================================================================
@@ -3326,10 +3330,10 @@ fn ddl19_create_index_on_uuid_column_succeeds_and_walks_sorted() {
     let r = db
         .execute("SELECT tag FROM t ORDER BY ref_id ASC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert!(r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert!(r.trace().sort_elided);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Text("a".into())],
             vec![Value::Text("b".into())],
@@ -3387,10 +3391,10 @@ fn ddl20_create_index_on_txid_column_succeeds_and_walks_sorted() {
     let r = db
         .execute("SELECT tag FROM t ORDER BY seen_tx ASC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert!(r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert!(r.trace().sort_elided);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Text("lo".into())],
             vec![Value::Text("mid".into())],
@@ -3430,9 +3434,9 @@ fn ddl21_create_index_on_bool_column_succeeds_and_walks_sorted() {
             &params(vec![("b", Value::Bool(true))]),
         )
         .unwrap();
-    assert_eq!(r_true.trace.physical_plan, "IndexScan");
+    assert_eq!(r_true.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r_true.rows,
+        r_true.rows(),
         vec![
             vec![Value::Text("t1".into())],
             vec![Value::Text("t2".into())],
@@ -3444,9 +3448,9 @@ fn ddl21_create_index_on_bool_column_succeeds_and_walks_sorted() {
             &params(vec![("b", Value::Bool(false))]),
         )
         .unwrap();
-    assert_eq!(r_false.trace.physical_plan, "IndexScan");
+    assert_eq!(r_false.trace().physical_plan, "IndexScan");
     assert_eq!(
-        r_false.rows,
+        r_false.rows(),
         vec![
             vec![Value::Text("f1".into())],
             vec![Value::Text("f2".into())],
@@ -3475,13 +3479,13 @@ fn ord07_tie_break_row_id_ascending_cross_reopen_stable() {
         .execute("SELECT id, tag FROM t WHERE a = 7", &empty())
         .unwrap();
     // Extract the observed row_id sequence via id field.
-    let ids: Vec<Value> = r.rows.iter().map(|row| row[0].clone()).collect();
+    let ids: Vec<Value> = r.rows().iter().map(|row| row[0].clone()).collect();
     // row_id is internal; the observable tie-break is "same sequence every
     // time." The pre-reopen sequence is the insert order; post-reopen must
     // match. Assert full row-vec identity (id + tag) across all 5 rows.
     let expected_tags = vec!["p", "q", "r", "s", "t"];
     let got_tags: Vec<String> = r
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[1] {
             Value::Text(s) => s.clone(),
@@ -3510,7 +3514,7 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
     for tag in ["p", "q", "r", "s", "t"] {
         ids_in_insert_order.push(insert_row_t(&edge_a, 7, 0, tag));
     }
-    let ddl = edge_a.ddl_log_since(Lsn(0));
+    let ddl = edge_a.ddl_log_since(Lsn(0)).unwrap();
     let rows_changes: Vec<RowChange> = edge_a
         .change_log_rows_since(before)
         .expect("change log rows");
@@ -3534,7 +3538,8 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
         .execute("SELECT id, tag FROM t WHERE a = 7", &empty())
         .unwrap();
     assert_eq!(
-        r_a.rows, r_b.rows,
+        r_a.rows(),
+        r_b.rows(),
         "edge A and edge B must agree row-by-row"
     );
     // And both must match the insertion-order id sequence.
@@ -3542,7 +3547,7 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
         .iter()
         .map(|u| Value::Uuid(*u))
         .collect();
-    let a_ids: Vec<Value> = r_a.rows.iter().map(|row| row[0].clone()).collect();
+    let a_ids: Vec<Value> = r_a.rows().iter().map(|row| row[0].clone()).collect();
     assert_eq!(a_ids, expected_ids);
 }
 
@@ -3560,7 +3565,7 @@ fn sy04_desc_direction_replicates_through_sync_ddl() {
     origin
         .execute("CREATE INDEX idx_a ON t (a DESC)", &empty())
         .unwrap();
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -3607,10 +3612,10 @@ fn sy04_desc_direction_replicates_through_sync_ddl() {
     let r = receiver
         .execute("SELECT a FROM t ORDER BY a DESC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert!(r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert!(r.trace().sort_elided);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(3)],
             vec![Value::Int64(2)],
@@ -3636,7 +3641,7 @@ fn sy05_mixed_direction_composite_replicates_through_sync_ddl() {
     origin
         .execute("CREATE INDEX idx_ab ON t (a ASC, b DESC)", &empty())
         .unwrap();
-    let ddl = origin.ddl_log_since(before);
+    let ddl = origin.ddl_log_since(before).unwrap();
 
     let receiver = Database::open_memory();
     receiver
@@ -3685,10 +3690,10 @@ fn sy05_mixed_direction_composite_replicates_through_sync_ddl() {
     let r = receiver
         .execute("SELECT a, b FROM t ORDER BY a ASC, b DESC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert!(r.trace.sort_elided);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert!(r.trace().sort_elided);
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![
             vec![Value::Int64(1), Value::Int64(30)],
             vec![Value::Int64(1), Value::Int64(20)],
@@ -3841,7 +3846,7 @@ fn do03_getting_started_md_filtered_select_with_explain() {
     for block in sql_blocks {
         for stmt in block.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             if let Ok(r) = db.execute(stmt, &empty()) {
-                if r.trace.physical_plan == "IndexScan" {
+                if r.trace().physical_plan == "IndexScan" {
                     observed_index_scan = true;
                 }
             }
@@ -3979,7 +3984,7 @@ fn non_id_pk_column_probe_routes_through_index() {
     let probe = db
         .__probe_constraint_check("t", "user_id", Value::Uuid(sample_user.unwrap()))
         .expect("probe result");
-    assert_eq!(probe.trace.physical_plan, "IndexScan");
+    assert_eq!(probe.trace().physical_plan, "IndexScan");
 
     // Full-row identity: the sampled row is still readable back.
     let r = db
@@ -3988,8 +3993,8 @@ fn non_id_pk_column_probe_routes_through_index() {
             &params(vec![("id", Value::Uuid(sample_user.unwrap()))]),
         )
         .unwrap();
-    assert_eq!(r.rows.len(), 1);
-    match (&r.rows[0][0], &r.rows[0][1]) {
+    assert_eq!(r.rows().len(), 1);
+    match (&r.rows()[0][0], &r.rows()[0][1]) {
         (Value::Uuid(u), Value::Text(n)) => {
             assert_eq!(*u, sample_user.unwrap());
             assert_eq!(n, "u500");
@@ -4057,15 +4062,15 @@ fn sort_elision_refused_for_inlist_indexscan() {
         )
         .unwrap();
     // IndexScan is still picked (faster than full scan for an IN-list)...
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     // ...but the ORDER BY Sort node MUST run; elision is refused for InList.
     assert!(
-        !r.trace.sort_elided,
+        !r.trace().sort_elided,
         "sort_elided must be false for InList IndexScan"
     );
     // Rows ARE in the requested order — the real Sort node ran.
     let actual: Vec<i64> = r
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(v) => *v,
@@ -4105,9 +4110,9 @@ fn sort_elision_fires_for_equality_indexscan() {
     let r = db
         .execute("SELECT b FROM t WHERE a = 7 ORDER BY b ASC", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     assert!(
-        r.trace.sort_elided,
+        r.trace().sort_elided,
         "equality IndexScan must permit elision"
     );
 }
@@ -4144,13 +4149,13 @@ fn snapshot_override_honoured_by_all_readers() {
     let r = db
         .execute_at_snapshot("SELECT COUNT(*) FROM t", &empty(), snap_after_one)
         .unwrap();
-    match &r.rows[0][0] {
+    match &r.rows()[0][0] {
         Value::Int64(n) => assert_eq!(*n, 1, "pinned snapshot must see exactly 1 row"),
         other => panic!("expected Int64, got {other:?}"),
     }
     // But unpinned reads see the committed state (2 rows).
     let r2 = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
-    match &r2.rows[0][0] {
+    match &r2.rows()[0][0] {
         Value::Int64(n) => assert_eq!(*n, 2),
         other => panic!("expected Int64, got {other:?}"),
     }
@@ -4273,7 +4278,7 @@ fn select_by_pk_routes_through_auto_index() {
             &params(vec![("id", Value::Uuid(sample_id.unwrap()))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     // Trace-liar gate: a full scan would examine 10_000 rows. An auto-PK
     // IndexScan must examine <= 2.
     assert!(
@@ -4282,8 +4287,8 @@ fn select_by_pk_routes_through_auto_index() {
         db.__rows_examined()
     );
     // Full-row identity: the sampled row is exactly what we inserted.
-    assert_eq!(r.rows.len(), 1);
-    match (&r.rows[0][0], &r.rows[0][1]) {
+    assert_eq!(r.rows().len(), 1);
+    match (&r.rows()[0][0], &r.rows()[0][1]) {
         (Value::Uuid(u), Value::Int64(a)) => {
             assert_eq!(*u, sample_id.unwrap());
             assert_eq!(*a, 7_000);
@@ -4359,9 +4364,9 @@ fn explain_shows_auto_indexes_considered() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace().physical_plan, "IndexScan");
     let used = r
-        .trace
+        .trace()
         .index_used
         .as_ref()
         .expect("index_used must be set on IndexScan");
@@ -4391,6 +4396,7 @@ fn sync_ddl_createtable_regenerates_auto_indexes_on_peer() {
     // Replicate CreateTable DDL (only) to peer.
     let create_ddl = origin
         .ddl_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .into_iter()
         .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "t"))
         .expect("CreateTable DDL must exist");

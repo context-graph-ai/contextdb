@@ -46,7 +46,7 @@ fn insert(db: &Database, id: i64, label: &str) {
 
 fn ids(result: &QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
@@ -57,7 +57,7 @@ fn ids(result: &QueryResult) -> Vec<i64> {
 
 fn labels(result: &QueryResult) -> Vec<String> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(1) {
             Some(Value::Text(label)) => label.clone(),

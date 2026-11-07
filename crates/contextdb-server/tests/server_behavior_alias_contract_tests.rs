@@ -18,10 +18,11 @@ const BEHAVIOR_ALIASES: [(&str, &str); 7] = [
 
 fn explicit_command(root: &Path) -> Command {
     let endpoint = peer_bind_spec(&root.join("explicit.key"));
+    let db_path = root.join("explicit.db").to_string_lossy().into_owned();
     let mut command = Command::new(env!("CARGO_BIN_EXE_contextdb-server"));
     command.args([
         "--db-path",
-        ":memory:",
+        &db_path,
         "--tenant-id",
         "acme",
         "--sync-endpoint",
@@ -47,10 +48,11 @@ fn explicit_command(root: &Path) -> Command {
 fn tenant_and_sync_aliases_cannot_supply_behavior_configuration() {
     let root = tempfile::tempdir().expect("temporary directory");
     let endpoint = peer_bind_spec(&root.path().join("tenant.key"));
+    let db_path = root.path().join("tenant.db").to_string_lossy().into_owned();
     let tenant_output = Command::new(env!("CARGO_BIN_EXE_contextdb-server"))
         .args([
             "--db-path",
-            ":memory:",
+            &db_path,
             "--sync-endpoint",
             &endpoint,
             "--show-ticket",
@@ -67,7 +69,7 @@ fn tenant_and_sync_aliases_cannot_supply_behavior_configuration() {
     let sync_output = Command::new(env!("CARGO_BIN_EXE_contextdb-server"))
         .args([
             "--db-path",
-            ":memory:",
+            &db_path,
             "--tenant-id",
             "acme",
             "--show-ticket",
@@ -112,10 +114,15 @@ fn behavior_aliases_leave_explicit_invocation_bytes_and_exit_unchanged() {
 fn optional_behavior_aliases_cannot_supply_policy_configuration() {
     let root = tempfile::tempdir().expect("temporary directory");
     let endpoint = peer_bind_spec(&root.path().join("defaults.key"));
+    let db_path = root
+        .path()
+        .join("defaults.db")
+        .to_string_lossy()
+        .into_owned();
     let baseline = Command::new(env!("CARGO_BIN_EXE_contextdb-server"))
         .args([
             "--db-path",
-            ":memory:",
+            &db_path,
             "--tenant-id",
             "acme",
             "--sync-endpoint",
@@ -140,7 +147,7 @@ fn optional_behavior_aliases_cannot_supply_policy_configuration() {
     with_aliases
         .args([
             "--db-path",
-            ":memory:",
+            &db_path,
             "--tenant-id",
             "acme",
             "--sync-endpoint",

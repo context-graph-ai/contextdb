@@ -1,11 +1,17 @@
+#![cfg_attr(
+    not(feature = "iroh"),
+    expect(
+        dead_code,
+        reason = "Only the Iroh sync transport calls this; builds without that feature keep it for the shared wire, custody and blob types."
+    )
+)]
 use super::engine_answer::{BodyField, ReadChannelError, body_grammar};
+use super::query_funding::{Funded, FundedVec};
 use super::{
     LOCAL_PROTOCOL_MARKER, LOCAL_PROTOCOL_VERSION, LocalTransportError, MAX_FRAME_BYTES,
     frame_read_refusal, invalid_channel_data, response_decode_refusal,
 };
-use crate::read_contract::{decode_cursor_page, decode_metadata_page};
-use bincode::config::standard;
-use bincode::serde::{decode_from_slice, encode_to_vec};
+use crate::read_contract::decode_metadata_page;
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, MetadataPageVocabulary, OwnerReadLimits, OwnerReadStatus,
     OwnerServiceTimeouts, ReadFailure, ReadLimits, WriterRunNumber,
@@ -20,6 +26,13 @@ pub enum FrameViolation {
     LengthExceedsMaximum,
     TruncatedLength,
     TruncatedPayload,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+        )
+    )]
     TrailingBytes,
 }
 
@@ -34,7 +47,10 @@ pub enum PayloadViolation {
     /// name the number they would have to raise.
     MemoryCeilingExceeded {
         ceiling: u64,
+        required: Option<u64>,
     },
+    /// The linked JSON configuration cannot produce an admitted native tree.
+    /// This is an engine refusal with static taxonomy, not malformed bytes.
     TrailingBytes,
 }
 
@@ -117,6 +133,10 @@ impl LocalHandshake {
 
 /// Validate the protocol marker, version, database identity, writer run,
 /// and authenticated user before a request enters service admission.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn validate_handshake(
     expected: &LocalHandshake,
     presented: &LocalHandshake,
@@ -154,6 +174,10 @@ pub fn validate_handshake(
 
 /// Decode the fixed handshake shape and map malformed channel data to the
 /// stable local-channel refusal before admission.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_handshake_exact(bytes: &[u8]) -> Result<LocalHandshake, LocalTransportError> {
     #[cfg(feature = "test-seams")]
     HANDSHAKE_DECODE_ENTRIES.with(|entries| entries.set(entries.get().saturating_add(1)));
@@ -181,6 +205,9 @@ pub enum LocalMetadataRequest {
         continuation: Option<String>,
     },
     MaintenanceStatus,
+    VerifyHistory {
+        table: String,
+    },
     DeliveryStatus {
         root_table: String,
         continuation: Option<String>,
@@ -238,12 +265,28 @@ pub enum LocalRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultChunk {
+    #[serde(deserialize_with = "deserialize_result_bytes")]
     pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSuccess {
+    #[serde(deserialize_with = "deserialize_result_bytes")]
     pub final_bytes: Vec<u8>,
+}
+
+// The admitted binary decoder knows the byte count before allocating. Use
+// its exact scalar-vector admission rather than the generic Vec growth
+// allowance, which charges four bytes for every byte in a full result frame.
+fn deserialize_result_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    if crate::read_image_memory::active_owner().is_ok() {
+        crate::read_image_memory::deserialize_exact_vec(deserializer, false)
+    } else {
+        // Preserve ordinary serde use outside a scoped engine decode.
+        Vec::<u8>::deserialize(deserializer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +343,10 @@ pub struct LocalEffectiveLimits {
 }
 
 impl LocalEffectiveLimits {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn from_owner_limits(
         owner: OwnerReadLimits,
         source: LocalConfigurationSource,
@@ -338,6 +385,10 @@ pub struct LocalOwnerTimeouts {
 }
 
 impl LocalOwnerTimeouts {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn from_owner_timeouts(
         timeouts: OwnerServiceTimeouts,
         source: LocalConfigurationSource,
@@ -391,10 +442,18 @@ fn configured_value(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalOwnerStatusResponse {
     pub status: OwnerReadStatus,
+    /// The writer's published committed frontier when it accepted this reader.
+    pub committed_lsn: contextdb_core::Lsn,
     pub effective_limits: LocalEffectiveLimits,
     pub timeouts: LocalOwnerTimeouts,
     pub admission: OwnerAdmissionCounters,
     pub memory: OwnerMemoryCounters,
+    /// Actual serving storage; absence means this owner has no file cache.
+    pub serving_cache_capacity_bytes: Option<u64>,
+    pub serving_cache_index_bytes: Option<u64>,
+    pub serving_cache_held_page_bytes: Option<u64>,
+    pub serving_cache_budget_bytes: u64,
+    pub reader_charged_bytes: u64,
 }
 
 /// Everything an owner can answer. Result, page, and metadata payloads are
@@ -471,6 +530,11 @@ pub enum LocalResponse {
     CancelApplied {
         request_ordinal: u64,
     },
+    /// A cancelled fetch publishes only the work that actually ran. The
+    /// cursor remains open and the client still receives ReadCancelled.
+    CursorCancelled {
+        page: CursorPageResponse,
+    },
 }
 
 /// An engine answer, carried in the read channel's own vocabulary.
@@ -493,23 +557,26 @@ pub enum LocalResponse {
 /// the fallback class with its name and its words intact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalEngineFailure {
-    document: Vec<u8>,
+    document: crate::read_contract::EncodedReadBytes,
 }
 
 impl LocalEngineFailure {
-    pub fn from_error(error: &contextdb_core::Error) -> Self {
-        let document = ReadChannelError::from(error);
-        Self {
-            // An engine answer that cannot be written down is itself an
-            // engine answer: the caller still learns what happened, in the
-            // one class that carries prose.
-            document: encode_message(&document).unwrap_or_else(|_| {
-                encode_message(&ReadChannelError::Other {
-                    message: error.to_string(),
-                })
-                .unwrap_or_default()
-            }),
-        }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
+    pub fn from_error(
+        error: &contextdb_core::Error,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<Self> {
+        Self::from_query_error(error, owner).map(|answer| answer.value)
     }
 
     /// Rebuild the answer under the memory ceiling in force for this exchange.
@@ -518,9 +585,60 @@ impl LocalEngineFailure {
             .map(contextdb_core::Error::from)
             .unwrap_or_else(|_| {
                 contextdb_core::Error::Other(
-                    "the owner's engine answer did not arrive in a readable shape".to_owned(),
+                    ("the owner's engine answer did not arrive in a readable shape".to_owned())
+                        .into(),
                 )
             })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn from_query_error(
+        error: &contextdb_core::Error,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<Funded<Self>> {
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
+        let document = super::engine_answer::encode_query_error_funded(error, owner)?;
+        let document = crate::read_contract::EncodedReadBytes::from_funded(document, u64::MAX)
+            .map_err(|error| match error {
+                crate::read_contract::ReadEncodingError::Admission(error) => error,
+                _ => contextdb_core::Error::Other("invalid funded engine error document".into()),
+            })?;
+        Ok(Funded::external(Self { document }))
+    }
+
+    /// Private ordinary-query conversion. It never constructs a decoder root
+    /// and never charges already-funded document bytes as a new input copy.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn decode_query_error(
+        &self,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+        ceiling: u64,
+    ) -> contextdb_core::Result<Funded<contextdb_core::Error>> {
+        preflight_read_channel_error(&self.document, ceiling).map_err(|error| match error {
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { .. }) => {
+                contextdb_core::Error::ReadFailure(super::memory_ceiling_read_failure(
+                    ceiling, None,
+                ))
+            }
+            _ => contextdb_core::Error::Other(
+                "the owner's engine answer did not arrive in a readable shape".into(),
+            ),
+        })?;
+        let document = super::query_funding::decode::<ReadChannelError>(&self.document, memory)?;
+        let mut converted = super::engine_answer::convert_query_error(document, memory)?;
+        // Both original decoded fields and conversion outputs remain charged
+        // on the same root through the actual public error handoff.
+        if let Some(credit) = converted.credit.take() {
+            credit.transfer();
+        }
+        Ok(converted)
     }
 
     /// The class this answer travels as, for tests that pin the wire.
@@ -555,6 +673,13 @@ pub enum LocalInboundMessage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalInboundKind {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+        )
+    )]
     Handshake,
     Request,
     Response(LocalResponseExpectation),
@@ -658,7 +783,9 @@ const fn payload_answer_budget(
 fn answer_payload_mut(response: &mut LocalResponse) -> Option<&mut Vec<u8>> {
     match response {
         LocalResponse::CursorOpened { opened } => Some(&mut opened.payload),
-        LocalResponse::CursorPage { page } => Some(&mut page.payload),
+        LocalResponse::CursorPage { page } | LocalResponse::CursorCancelled { page } => {
+            Some(&mut page.payload)
+        }
         LocalResponse::Metadata { metadata } => Some(&mut metadata.payload),
         LocalResponse::Explain { payload } => Some(payload),
         _ => None,
@@ -680,6 +807,8 @@ const fn ends_the_exchange(response: &LocalResponse) -> bool {
 #[derive(Debug)]
 pub struct LocalProtocolBoundary {
     effective_limits: ReadLimits,
+    cursor_receive_memory: Option<u64>,
+    query_funding: std::sync::Mutex<Option<contextdb_core::read_memory::ReadMemoryOwner>>,
     ordinary_bytes: std::sync::Mutex<OrdinaryBoundaryBytes>,
     payload_assembly: std::sync::Mutex<PayloadAssemblyBytes>,
 }
@@ -688,9 +817,49 @@ impl LocalProtocolBoundary {
     pub fn with_effective_limits(effective_limits: ReadLimits) -> Self {
         Self {
             effective_limits,
+            cursor_receive_memory: None,
+            query_funding: std::sync::Mutex::new(None),
             ordinary_bytes: std::sync::Mutex::new(OrdinaryBoundaryBytes::default()),
             payload_assembly: std::sync::Mutex::new(PayloadAssemblyBytes::default()),
         }
+    }
+
+    /// Private headroom from the cursor's existing retention owner. This
+    /// never changes the request envelope or the owner's execution limits.
+    pub(crate) fn with_cursor_receive_memory(mut self, memory: Option<u64>) -> Self {
+        self.cursor_receive_memory = memory;
+        self
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn cursor_frame_allowance(&self) -> Result<Option<u64>, LocalTransportError> {
+        let Some(memory) = self.cursor_receive_memory else {
+            return Ok(None);
+        };
+        let held = self
+            .payload_assembly
+            .lock()
+            .map_err(|_| invalid_channel_data())?
+            .inbound
+            .capacity() as u64;
+        Ok(Some(memory.saturating_sub(held)))
+    }
+
+    pub(crate) fn query_funding(&self) -> Option<contextdb_core::read_memory::ReadMemoryOwner> {
+        self.query_funding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_query_funding(
+        &self,
+        owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) {
+        *self.query_funding.lock().unwrap_or_else(|p| p.into_inner()) = owner;
     }
 
     pub const fn effective_limits(&self) -> ReadLimits {
@@ -700,10 +869,48 @@ impl LocalProtocolBoundary {
     /// Validate and encode one complete length-prefixed message. Successful
     /// response payloads are decoded and structurally validated here before
     /// the containing response can be emitted.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub fn encode_frame(
         &self,
         message: LocalOutboundMessage<'_>,
-    ) -> Result<Vec<u8>, LocalTransportError> {
+        caller_owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<crate::read_contract::EncodedReadBytes, LocalTransportError> {
+        let owner = self.query_funding().unwrap_or(caller_owner);
+        let frame = self.encode_frame_on_owner(message, Some(owner))?;
+        crate::read_contract::EncodedReadBytes::from_funded(frame, self.effective_limits.memory)
+            .map_err(transport_decode_error)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn encode_frame_funded(
+        &self,
+        message: LocalOutboundMessage<'_>,
+    ) -> Result<Funded<Vec<u8>>, LocalTransportError> {
+        self.encode_frame_on_owner(message, self.query_funding())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn encode_frame_on_owner(
+        &self,
+        message: LocalOutboundMessage<'_>,
+        owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Funded<Vec<u8>>, LocalTransportError> {
         let ordinary_response = match message {
             LocalOutboundMessage::Response {
                 response,
@@ -715,10 +922,22 @@ impl LocalProtocolBoundary {
         };
         let encoded = (|| {
             let payload = match message {
-                LocalOutboundMessage::Handshake(handshake) => encode_message(handshake)?,
+                LocalOutboundMessage::Handshake(handshake) => {
+                    crate::read_contract::encode_transport_funded(
+                        handshake,
+                        owner.clone(),
+                        self.effective_limits.memory,
+                    )
+                    .map_err(transport_decode_error)?
+                }
                 LocalOutboundMessage::Request(request) => {
                     validate_request(request)?;
-                    encode_message(request)?
+                    crate::read_contract::encode_request_funded(
+                        request,
+                        owner.clone(),
+                        self.effective_limits.memory,
+                    )
+                    .map_err(transport_decode_error)?
                 }
                 LocalOutboundMessage::Response {
                     response,
@@ -726,10 +945,15 @@ impl LocalProtocolBoundary {
                 } => {
                     let position = self.note_outbound_answer_frame(response, expectation);
                     validate_response(response, expectation, self.effective_limits, position)?;
-                    encode_message(response)?
+                    crate::read_contract::encode_transport_funded(
+                        response,
+                        owner.clone(),
+                        self.effective_limits.memory,
+                    )
+                    .map_err(transport_decode_error)?
                 }
             };
-            frame_length_prefix(payload.len())?;
+            let prefix = frame_length_prefix(payload.value.len())?;
             if let Some((response, expectation)) = ordinary_response {
                 self.admit_ordinary_response(
                     response,
@@ -737,7 +961,15 @@ impl LocalProtocolBoundary {
                     OrdinaryBoundaryDirection::Outbound,
                 )?;
             }
-            encode_payload_frame(&payload)
+            Funded::allocate_owned(owner.clone(), payload.value.len() + 4, || {
+                let mut frame = Vec::with_capacity(payload.value.len() + 4);
+                frame.extend_from_slice(&prefix);
+                frame.extend_from_slice(&payload.value);
+                frame
+            })
+            .map_err(|error| {
+                transport_decode_error(crate::read_contract::ReadEncodingError::Admission(error))
+            })
         })();
         if encoded.is_err() {
             if ordinary_response.is_some() {
@@ -752,6 +984,17 @@ impl LocalProtocolBoundary {
     /// hostile nested length is rejected before asking the allocator for that
     /// nested buffer. Every malformed complete message is normalized to the
     /// stable invalid-channel-data refusal.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+        )
+    )]
     pub fn receive_frame(
         &self,
         kind: LocalInboundKind,
@@ -764,8 +1007,12 @@ impl LocalProtocolBoundary {
             LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)
         );
         let received = (|| {
-            let payload =
-                read_payload_with_admission(reader, allocator).map_err(frame_read_refusal)?;
+            let payload = read_payload_with_memory_admission(
+                reader,
+                allocator,
+                self.cursor_frame_allowance()?,
+            )
+            .map_err(frame_read_refusal)?;
             self.decode_payload(kind, &payload).map_err(|error| {
                 if response_frame {
                     response_decode_refusal(error)
@@ -790,18 +1037,42 @@ impl LocalProtocolBoundary {
     /// directly -- not off a live, unauthenticated connection -- needs the
     /// typed refusal a decode failure actually carries, such as one naming
     /// the memory ceiling it crossed, to reach it.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub(crate) fn receive_frame_preserving_refusal(
         &self,
         kind: LocalInboundKind,
         reader: &mut dyn FrameReader,
         allocator: &mut dyn FrameBufferAllocator,
     ) -> Result<LocalInboundMessage, LocalTransportError> {
-        let payload = read_payload_with_admission(reader, allocator).map_err(frame_read_refusal)?;
+        let payload =
+            read_payload_with_memory_admission(reader, allocator, self.cursor_frame_allowance()?)
+                .map_err(frame_read_refusal)?;
         self.decode_payload(kind, &payload)
     }
 
     /// Receive an ordinary result through this same boundary and feed only a
     /// validated response into the publication state machine.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+        )
+    )]
     pub fn receive_ordinary_result_frame(
         &self,
         receiver: &mut OrdinaryResultReceiver,
@@ -842,6 +1113,10 @@ impl LocalProtocolBoundary {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn decode_payload(
         &self,
         kind: LocalInboundKind,
@@ -859,18 +1134,50 @@ impl LocalProtocolBoundary {
                 Ok(LocalInboundMessage::Request(request))
             }
             LocalInboundKind::Response(expectation) => {
-                let memory_ceiling = self.effective_limits.memory;
+                let memory_ceiling = self
+                    .cursor_frame_allowance()?
+                    .map_or(self.effective_limits.memory, |available| {
+                        available.saturating_sub(payload.len() as u64)
+                    });
                 let continued = self.answer_assembly_in_flight();
                 preflight_response(payload, &expectation, memory_ceiling, continued)?;
-                let response: LocalResponse = if continued {
-                    decode_preflighted_message(payload)?
-                } else {
-                    decode_message_under_memory_ceiling(payload, memory_ceiling)?
-                };
+                let response: LocalResponse = decode_preflighted_message(payload, memory_ceiling)?;
                 // The frame ceiling stops here: an answer that arrived in
                 // pieces is whole again before anything validates or reads it.
-                let (response, position) = self.assemble_inbound_answer(response, &expectation)?;
-                validate_response(&response, &expectation, self.effective_limits, position)?;
+                let (response, position) =
+                    self.assemble_inbound_answer(response, &expectation, payload.len())?;
+                let mut validation_limits = self.effective_limits;
+                if let Some(memory) = self.cursor_receive_memory {
+                    let cursor_payload = match &response {
+                        LocalResponse::CursorOpened { opened } => Some(opened.payload.as_slice()),
+                        LocalResponse::CursorPage { page }
+                        | LocalResponse::CursorCancelled { page } => Some(page.payload.as_slice()),
+                        _ => None,
+                    };
+                    if let Some(bytes) = cursor_payload {
+                        validation_limits.memory = memory
+                            .saturating_sub(payload.len() as u64)
+                            .saturating_sub(bytes.len() as u64);
+                        preflight_observed_cursor_page_payload(
+                            bytes,
+                            memory
+                                .saturating_sub(payload.len() as u64)
+                                .saturating_sub(bytes.len() as u64),
+                        )
+                        .map_err(|error| match error {
+                            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                                ceiling,
+                            } => LocalTransportError::Payload(
+                                PayloadViolation::MemoryCeilingExceeded {
+                                    ceiling,
+                                    required: None,
+                                },
+                            ),
+                            _ => invalid_channel_data(),
+                        })?;
+                    }
+                }
+                validate_response(&response, &expectation, validation_limits, position)?;
                 self.admit_ordinary_response(
                     &response,
                     &expectation,
@@ -881,6 +1188,63 @@ impl LocalProtocolBoundary {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn decode_query_request(
+        &self,
+        payload: &[u8],
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+    ) -> Result<Funded<LocalRequestEnvelope>, LocalTransportError> {
+        preflight_request(payload, self.effective_limits.memory)?;
+        let request = super::query_funding::decode::<LocalRequestEnvelope>(payload, memory)
+            .map_err(|error| {
+                transport_decode_error(crate::read_contract::encoding_error_from_core(
+                    error,
+                    self.effective_limits.memory,
+                ))
+            })?;
+        validate_request(&request.value)?;
+        Ok(request)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn decode_query_response(
+        &self,
+        payload: &[u8],
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+    ) -> Result<Funded<LocalResponse>, LocalTransportError> {
+        let expectation = LocalResponseExpectation::OrdinaryResult;
+        preflight_response(payload, &expectation, self.effective_limits.memory, false)?;
+        let response =
+            super::query_funding::decode::<LocalResponse>(payload, memory).map_err(|error| {
+                transport_decode_error(crate::read_contract::encoding_error_from_core(
+                    error,
+                    self.effective_limits.memory,
+                ))
+            })?;
+        validate_response(
+            &response.value,
+            &expectation,
+            self.effective_limits,
+            PayloadPosition::Whole,
+        )?;
+        self.admit_ordinary_response(
+            &response.value,
+            &expectation,
+            OrdinaryBoundaryDirection::Inbound,
+        )?;
+        Ok(response)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit_ordinary_response(
         &self,
         response: &LocalResponse,
@@ -1000,10 +1364,15 @@ impl LocalProtocolBoundary {
     /// frame it is; the frame that ends the exchange receives every byte that
     /// went before it, so what leaves this boundary is the one complete
     /// payload the owner produced.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn assemble_inbound_answer(
         &self,
         mut response: LocalResponse,
         expectation: &LocalResponseExpectation,
+        wire_bytes: usize,
     ) -> Result<(LocalResponse, PayloadPosition), LocalTransportError> {
         let Some(budget) = payload_answer_budget(expectation, self.effective_limits) else {
             return Ok((response, PayloadPosition::Whole));
@@ -1022,7 +1391,21 @@ impl LocalProtocolBoundary {
                 tracked.inbound = Vec::new();
                 return Err(invalid_channel_data());
             }
-            tracked.inbound.extend_from_slice(&chunk.bytes);
+            if let Some(memory) = self.cursor_receive_memory {
+                admit_cursor_assembly(
+                    memory,
+                    wire_bytes,
+                    tracked.inbound.capacity(),
+                    chunk.bytes.capacity(),
+                    total as usize,
+                )?;
+                let mut whole = Vec::with_capacity(total as usize);
+                whole.extend_from_slice(&tracked.inbound);
+                whole.extend_from_slice(&chunk.bytes);
+                tracked.inbound = whole;
+            } else {
+                tracked.inbound.extend_from_slice(&chunk.bytes);
+            }
             return Ok((response, PayloadPosition::AnswerFrame { earlier_bytes }));
         }
         if !ends_the_exchange(&response) {
@@ -1033,7 +1416,24 @@ impl LocalProtocolBoundary {
             return Ok((response, PayloadPosition::Whole));
         }
         if let Some(slot) = answer_payload_mut(&mut response) {
-            let mut whole = earlier;
+            let mut whole = if let Some(memory) = self.cursor_receive_memory {
+                let total = earlier
+                    .len()
+                    .checked_add(slot.len())
+                    .ok_or_else(invalid_channel_data)?;
+                admit_cursor_assembly(
+                    memory,
+                    wire_bytes,
+                    earlier.capacity(),
+                    slot.capacity(),
+                    total,
+                )?;
+                let mut whole = Vec::with_capacity(total);
+                whole.extend_from_slice(&earlier);
+                whole
+            } else {
+                earlier
+            };
             whole.extend_from_slice(slot);
             if u64::try_from(whole.len()).map_err(|_| invalid_channel_data())? > budget {
                 return Err(invalid_channel_data());
@@ -1042,6 +1442,32 @@ impl LocalProtocolBoundary {
         }
         Ok((response, PayloadPosition::Whole))
     }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn admit_cursor_assembly(
+    memory: u64,
+    wire: usize,
+    earlier: usize,
+    fragment: usize,
+    whole: usize,
+) -> Result<(), LocalTransportError> {
+    let bytes = wire
+        .checked_add(earlier)
+        .and_then(|n| n.checked_add(fragment))
+        .and_then(|n| n.checked_add(whole));
+    if bytes.is_none_or(|bytes| bytes as u64 > memory) {
+        return Err(LocalTransportError::Payload(
+            PayloadViolation::MemoryCeilingExceeded {
+                ceiling: memory,
+                required: bytes.map(|bytes| bytes as u64),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// A received ordinary reply cannot be rendered until its terminal success
@@ -1061,9 +1487,37 @@ pub struct AssembledOrdinaryResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultReceiveOutcome {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     Pending,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_paged.rs"
+        )
+    )]
     Published(AssembledOrdinaryResult),
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     Failed(ReadFailure),
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session.rs"
+        )
+    )]
     EngineFailed(LocalEngineFailure),
     Disconnected,
 }
@@ -1179,44 +1633,30 @@ fn canonical_bytes_identity(bytes: &[u8]) -> CanonicalBytesIdentity {
     }
 }
 
-/// An upper bound on the number of nodes the decoded form of this JSON text
-/// can hold. Every value in a JSON document is either the whole document or
-/// sits immediately after an opening bracket, a comma, or a colon, so counting
-/// those bytes cannot undercount the tree. Text that only looks like structure
-/// — those bytes inside a quoted string — inflates the count, which charges
-/// more than the decode will use and never less.
-fn json_node_ceiling(text: &[u8]) -> usize {
-    let mut nodes = 1_usize;
-    for byte in text {
-        if matches!(byte, b'[' | b'{' | b',' | b':') {
-            nodes = nodes.saturating_add(1);
-        }
-    }
-    nodes
-}
-
 /// Executable canonical grammar that walks the assembled result bytes without
 /// allocating anything: every nested container length is bounded by the bytes
-/// that remain, and the native allocation each length would claim is charged
-/// against the effective memory ceiling. A hostile or truncated assembly is
-/// refused here, before the deserializer is asked to build one container.
+/// that remain. Native buffers and JSON parser allocations are admitted by
+/// the shared scoped decoder; a cumulative wire-shape count cannot describe
+/// their live peak or the lifetime of temporary serialized JSON strings.
 struct CanonicalAllocationPreflight<'a> {
     bytes: &'a [u8],
     offset: usize,
     charged_bytes: u64,
-    memory_ceiling: u64,
 }
 
 impl<'a> CanonicalAllocationPreflight<'a> {
-    const fn new(bytes: &'a [u8], memory_ceiling: u64) -> Self {
+    const fn new(bytes: &'a [u8], _memory_ceiling: u64) -> Self {
         Self {
             bytes,
             offset: 0,
             charged_bytes: 0,
-            memory_ceiling,
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn malformed<T>() -> Result<T, crate::read_contract::ReadEncodingError> {
         Err(crate::read_contract::ReadEncodingError::InvalidPayload)
     }
@@ -1225,6 +1665,10 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         self.bytes.len().saturating_sub(self.offset)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn take(&mut self, length: usize) -> Result<&'a [u8], crate::read_contract::ReadEncodingError> {
         let Some(end) = self.offset.checked_add(length) else {
             return Self::malformed();
@@ -1236,14 +1680,26 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(value)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn byte(&mut self) -> Result<u8, crate::read_contract::ReadEncodingError> {
         Ok(self.take(1)?[0])
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fixed(&mut self, length: usize) -> Result<(), crate::read_contract::ReadEncodingError> {
         self.take(length).map(|_| ())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn unsigned(
         &mut self,
         maximum_width: usize,
@@ -1275,20 +1731,36 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn u32(&mut self) -> Result<u32, crate::read_contract::ReadEncodingError> {
         u32::try_from(self.unsigned(4)?)
             .map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn u64(&mut self) -> Result<u64, crate::read_contract::ReadEncodingError> {
         self.unsigned(8)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn length(&mut self) -> Result<usize, crate::read_contract::ReadEncodingError> {
         usize::try_from(self.unsigned(8)?)
             .map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn enumeration(
         &mut self,
         maximum: u32,
@@ -1300,6 +1772,10 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(value)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn boolean(&mut self) -> Result<bool, crate::read_contract::ReadEncodingError> {
         match self.byte()? {
             0 => Ok(false),
@@ -1308,10 +1784,18 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn option(&mut self) -> Result<bool, crate::read_contract::ReadEncodingError> {
         self.boolean()
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn charge<T>(&mut self, length: usize) -> Result<(), crate::read_contract::ReadEncodingError> {
         let element_bytes = u64::try_from(std::mem::size_of::<T>().max(1))
             .map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)?;
@@ -1321,20 +1805,14 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             .checked_mul(element_bytes)
             .and_then(|bytes| self.charged_bytes.checked_add(bytes))
             .ok_or(crate::read_contract::ReadEncodingError::InvalidPayload)?;
-        if claimed > self.memory_ceiling {
-            // A payload that is exactly what it claims to be and simply too
-            // large to hold inside the ceiling in force is a budget answer,
-            // not unreadable content.
-            return Err(
-                crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
-                    ceiling: self.memory_ceiling,
-                },
-            );
-        }
         self.charged_bytes = claimed;
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn byte_vector(&mut self) -> Result<&'a [u8], crate::read_contract::ReadEncodingError> {
         let length = self.length()?;
         if length > self.remaining() {
@@ -1344,6 +1822,10 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         self.take(length)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn string(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         let bytes = self.byte_vector()?;
         std::str::from_utf8(bytes)
@@ -1351,20 +1833,24 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             .map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
     }
 
-    /// A JSON value travels as text and decodes into a tree of nodes plus
-    /// copies of the text it holds. Both are charged from the text itself,
-    /// before the tree is built.
+    /// Validate the serialized string only. Native JSON payload and parser
+    /// scratch are admitted incrementally by the shared core builder.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn json_text(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         let text = self.byte_vector()?;
         if std::str::from_utf8(text).is_err() {
             return Self::malformed();
         }
-        let nodes = json_node_ceiling(text);
-        let text_length = text.len();
-        self.charge::<serde_json::Value>(nodes)?;
-        self.charge::<u8>(text_length)
+        Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn strings(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         let length = self.length()?;
         if length > self.remaining() {
@@ -1377,6 +1863,10 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn value(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         match self.enumeration(9)? {
             0 => {}
@@ -1411,6 +1901,10 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn rows(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         let rows = self.length()?;
         if rows > self.remaining() {
@@ -1430,6 +1924,10 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn vector_search_disclosure(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         self.string()?;
         self.string()?;
@@ -1437,6 +1935,7 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         if self.option()? {
             self.u64()?;
         }
+        // effective_auto_index_at, auto_index_at_source
         self.u64()?;
         self.string()?;
         self.strings()?;
@@ -1459,7 +1958,7 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         if partitions > self.remaining() {
             return Self::malformed();
         }
-        self.charge::<crate::read_contract::CanonicalVectorPartitionHnswDisclosure>(partitions)?;
+        self.charge::<crate::read_contract::CanonicalVectorPartitionDisclosure>(partitions)?;
         for _ in 0..partitions {
             self.string()?;
             if self.option()? {
@@ -1468,13 +1967,20 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             if self.option()? {
                 self.string()?;
             }
-            self.u64()?;
-            self.u64()?;
-            self.u64()?;
-            self.string()?;
+            // lists, probes and refine factor, each with its source.
+            for _ in 0..3 {
+                if self.option()? {
+                    self.u64()?;
+                }
+                if self.option()? {
+                    self.string()?;
+                }
+            }
             self.u64()?;
         }
-        for _ in 0..4 {
+        // global_candidate_budget, admission_evaluations,
+        // expansion_evaluations, rescore_evaluations, layers_admitted
+        for _ in 0..5 {
             if self.option()? {
                 self.u64()?;
             }
@@ -1485,6 +1991,10 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn query_trace(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         self.string()?;
         if self.option()? {
@@ -1525,14 +2035,38 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             if lists > self.remaining() {
                 return Self::malformed();
             }
+            self.charge::<Vec<(String, bool)>>(lists)?;
             for _ in 0..lists {
                 self.maintained_count_columns()?;
             }
+        }
+        let groups = self.length()?;
+        if groups > self.remaining() {
+            return Self::malformed();
+        }
+        // Three counters, the owned key, and a full word for the route tag
+        // conservatively cover the decoded group without importing storage.
+        self.charge::<(u64, String, u64, u64, u64)>(groups)?;
+        for _ in 0..groups {
+            // Keep the serde wire order of GroupDisclosure: ordinal precedes
+            // the rendered partition key, then the counters and route.
+            self.u64()?;
+            self.string()?;
+            self.u64()?;
+            self.u64()?;
+            self.enumeration(1)?;
+        }
+        if self.option()? {
+            self.fixed(8)?;
         }
         Ok(())
     }
 
     /// One `Vec<(String, bool)>` column list of a maintained-count disclosure.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn maintained_count_columns(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         let columns = self.length()?;
         if columns > self.remaining() {
@@ -1546,35 +2080,150 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
-    fn query_result(mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn observed_cursor_page(&mut self) -> Result<u64, crate::read_contract::ReadEncodingError> {
+        self.charge::<crate::read_contract::cursor_observation::CanonicalObservedCursorPage>(1)?;
+        let columns = self.length()?;
+        if columns > self.remaining() {
+            return Self::malformed();
+        }
+        self.charge::<String>(columns)?;
+        for _ in 0..columns {
+            self.string()?;
+        }
+        let rows = self.length()?;
+        if rows > self.remaining() {
+            return Self::malformed();
+        }
+        if rows != 0 {
+            self.charge::<u8>(crate::owned_cursor_page::SharedRows::allocation_header_bytes())?;
+        }
+        self.charge::<Vec<Value>>(rows)?;
+        for _ in 0..rows {
+            let values = self.length()?;
+            if values != columns || values > self.remaining() {
+                return Self::malformed();
+            }
+            self.charge::<Value>(values)?;
+            for _ in 0..values {
+                self.value()?;
+            }
+        }
+        self.boolean()?;
+        let before_trace = self.charged_bytes;
+        self.query_trace()?;
+        if self.offset != self.bytes.len() {
+            return Self::malformed();
+        }
+        Ok(self.charged_bytes - before_trace)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn query_result(&mut self) -> Result<u64, crate::read_contract::ReadEncodingError> {
         self.charge::<crate::read_contract::CanonicalQueryResult>(1)?;
         self.strings()?;
         self.rows()?;
         self.u64()?;
+        let before_trace = self.charged_bytes;
         self.query_trace()?;
+        let trace_bytes = self.charged_bytes - before_trace;
         if self.option()? {
             self.strings()?;
         }
         if self.offset != self.bytes.len() {
             return Self::malformed();
         }
-        Ok(())
+        Ok(trace_bytes)
     }
 }
 
 #[derive(Debug)]
 pub struct OrdinaryResultReceiver {
-    chunks: Vec<Vec<u8>>,
+    chunks: FundedVec<Funded<Vec<u8>>>,
     buffered_bytes: usize,
     byte_limit: u64,
     memory_ceiling: u64,
     state: Option<ResultReceiveState>,
+    receiving_memory: Option<crate::read_image_memory::ImageMemoryHandle>,
+}
+
+pub(crate) struct FundedOrdinaryResult {
+    pub(crate) bytes: Funded<Vec<u8>>,
+    pub(crate) terminal: Funded<TerminalSuccess>,
+}
+
+pub(crate) enum FundedResultReceiveOutcome {
+    Pending,
+    Published(FundedOrdinaryResult),
+    Failed(Funded<contextdb_core::read_contract::ReadFailure>),
+    EngineFailed(Funded<LocalEngineFailure>),
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn split_canonical_result_funded(
+    bytes: &[u8],
+    owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    memory_ceiling: u64,
+) -> Result<Funded<Vec<LocalResponse>>, LocalTransportError> {
+    let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+
+    let capacity = MAX_FRAME_BYTES - 6;
+    let count = bytes.len().saturating_sub(1) / capacity + 1;
+    let invoice = count
+        .checked_mul(std::mem::size_of::<LocalResponse>())
+        .and_then(|n| n.checked_add(bytes.len()))
+        .ok_or_else(invalid_channel_data)?;
+    Funded::allocate_owned(Some(owner), invoice, || {
+        let mut responses = Vec::with_capacity(count);
+        let mut remainder = bytes;
+        while remainder.len() > capacity {
+            let (chunk, rest) = remainder.split_at(capacity);
+            responses.push(LocalResponse::ResultChunk {
+                chunk: ResultChunk {
+                    bytes: chunk.to_vec(),
+                },
+            });
+            remainder = rest;
+        }
+        responses.push(LocalResponse::TerminalSuccess {
+            success: TerminalSuccess {
+                final_bytes: remainder.to_vec(),
+            },
+        });
+        responses
+    })
+    .map_err(|error| {
+        transport_decode_error(crate::read_contract::encoding_error_from_core(
+            error,
+            memory_ceiling,
+        ))
+    })
 }
 
 /// Split route-neutral canonical bytes into result envelopes whose complete
 /// encoded payload, including the `LocalResponse` variant and vector length,
 /// fits the local frame ceiling. The final envelope is always terminal
 /// success, including for an empty result.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub fn split_canonical_result(
     canonical_bytes: &[u8],
 ) -> Result<Vec<LocalResponse>, LocalTransportError> {
@@ -1602,6 +2251,74 @@ pub fn split_canonical_result(
     Ok(responses)
 }
 
+/// Split engine-created metadata using its original payload invoice. The
+/// small answer moves without copying; larger answers admit both the response
+/// slots and every copied byte while the source buffer is still alive.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn split_payload_answer_funded(
+    mut payload: Funded<Vec<u8>>,
+    terminal: impl Fn(Vec<u8>) -> LocalResponse,
+    _memory_ceiling: u64,
+) -> Result<Funded<Vec<LocalResponse>>, LocalTransportError> {
+    let empty = crate::read_contract::encoded_size(&terminal(Vec::new()))
+        .map_err(transport_decode_error)?;
+    let terminal_capacity = MAX_FRAME_BYTES.saturating_sub(empty + 4);
+    let owner = payload
+        .credit
+        .as_ref()
+        .ok_or_else(invalid_channel_data)?
+        .owner();
+    if payload.value.len() <= terminal_capacity {
+        payload
+            .credit
+            .as_mut()
+            .expect("funded payload keeps credit")
+            .try_grow_for(
+                std::mem::size_of::<LocalResponse>(),
+                "reader",
+                "query_buffer",
+                "Reduce simultaneous query working memory or raise the declared reader limit.",
+            )
+            .map_err(|error| {
+                transport_decode_error(crate::read_contract::ReadEncodingError::Admission(error))
+            })?;
+        let responses = vec![terminal(payload.value)];
+        return Ok(Funded {
+            value: responses,
+            credit: payload.credit,
+        });
+    }
+    let capacity = MAX_FRAME_BYTES - 6;
+    let chunks = (payload.value.len() - terminal_capacity).div_ceil(capacity);
+    let count = chunks.checked_add(1).ok_or_else(invalid_channel_data)?;
+    let invoice = count
+        .checked_mul(std::mem::size_of::<LocalResponse>())
+        .and_then(|n| n.checked_add(payload.value.len()))
+        .ok_or_else(invalid_channel_data)?;
+    Funded::allocate_owned(Some(owner), invoice, || {
+        let mut responses = Vec::with_capacity(count);
+        let mut remainder = payload.value.as_slice();
+        while remainder.len() > terminal_capacity {
+            let take = capacity.min(remainder.len());
+            let (chunk, rest) = remainder.split_at(take);
+            responses.push(LocalResponse::ResultChunk {
+                chunk: ResultChunk {
+                    bytes: chunk.to_vec(),
+                },
+            });
+            remainder = rest;
+        }
+        responses.push(terminal(remainder.to_vec()));
+        responses
+    })
+    .map_err(|error| {
+        transport_decode_error(crate::read_contract::ReadEncodingError::Admission(error))
+    })
+}
+
 /// Split one payload-carrying answer into the frames this channel can move,
 /// with the response that ends the exchange carrying the last of them.
 ///
@@ -1611,6 +2328,17 @@ pub fn split_canonical_result(
 /// larger than one frame is cut into as many as it needs, exactly as an
 /// ordinary result already is. An answer that fits travels as the single
 /// response it always was -- not one byte on the wire moves for it.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from mod.rs"
+    )
+)]
 pub fn split_payload_answer(
     payload: Vec<u8>,
     terminal: impl Fn(Vec<u8>) -> LocalResponse,
@@ -1623,7 +2351,8 @@ pub fn split_payload_answer(
     // real encoder rather than assumed, plus the four bytes a payload length
     // grows by once it needs the widest variable-length form.
     const LENGTH_GROWTH: usize = 4;
-    let empty = encode_message(&terminal(Vec::new()))?.len();
+    let empty = crate::read_contract::encoded_size(&terminal(Vec::new()))
+        .map_err(transport_decode_error)?;
     let terminal_capacity = MAX_FRAME_BYTES.saturating_sub(empty + LENGTH_GROWTH);
     if payload.len() <= terminal_capacity {
         return Ok(vec![terminal(payload)]);
@@ -1655,6 +2384,10 @@ impl OrdinaryResultReceiver {
     /// A receiver bound to the request's effective ceilings from its first
     /// byte, so a deliberately raised result or memory limit governs terminal
     /// assembly instead of the shipped defaults.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_effective_ceilings(
         byte_limit: u64,
         memory_ceiling: u64,
@@ -1664,26 +2397,53 @@ impl OrdinaryResultReceiver {
         Ok(receiver)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn with_receiving_memory(
+        byte_limit: u64,
+        memory_ceiling: u64,
+        receiving_memory: crate::read_image_memory::ImageMemoryHandle,
+    ) -> Result<Self, LocalTransportError> {
+        let mut receiver = Self::with_effective_ceilings(byte_limit, memory_ceiling)?;
+        receiver.receiving_memory = Some(receiving_memory);
+        Ok(receiver)
+    }
+
     pub fn new() -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: FundedVec::default(),
             buffered_bytes: 0,
             byte_limit: ReadLimits::SHIPPED_RESULT_BYTES,
             memory_ceiling: ReadLimits::SHIPPED_MEMORY,
             state: Some(ResultReceiveState::Receiving),
+            receiving_memory: None,
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub fn with_byte_limit(byte_limit: u64) -> Result<Self, LocalTransportError> {
         if byte_limit == 0 {
             return Err(invalid_channel_data());
         }
         Ok(Self {
-            chunks: Vec::new(),
+            chunks: FundedVec::default(),
             buffered_bytes: 0,
             byte_limit,
             memory_ceiling: ReadLimits::SHIPPED_MEMORY,
             state: Some(ResultReceiveState::Receiving),
+            receiving_memory: None,
         })
     }
 
@@ -1692,6 +2452,13 @@ impl OrdinaryResultReceiver {
     }
 
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+        )
+    )]
     pub fn buffered_byte_count(&self) -> usize {
         self.buffered_bytes
     }
@@ -1763,11 +2530,17 @@ impl OrdinaryResultReceiver {
     /// remaining bytes and charged against the effective memory ceiling, so an
     /// assembly that fits the result-byte ceiling on the wire but would claim
     /// hostile native memory is refused here.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn preflight_canonical_result(
         bytes: &[u8],
         memory_ceiling: u64,
     ) -> Result<(), crate::read_contract::ReadEncodingError> {
-        let admitted = CanonicalAllocationPreflight::new(bytes, memory_ceiling).query_result();
+        let admitted = CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+            .query_result()
+            .map(|_| ());
         #[cfg(feature = "test-seams")]
         Self::observe_canonical_preflight_for_test(bytes, memory_ceiling, admitted.is_ok());
         admitted
@@ -1775,6 +2548,10 @@ impl OrdinaryResultReceiver {
 
     /// Decode the exact assembled bytes the preflight above just admitted.
     /// This is the only canonical decoder entrance on the receive path.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode_preflighted_canonical_result(
         bytes: &[u8],
         memory_ceiling: u64,
@@ -1830,6 +2607,13 @@ impl OrdinaryResultReceiver {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn preflight_canonical_result_for_test(
         bytes: &[u8],
         memory_ceiling: u64,
@@ -1839,6 +2623,13 @@ impl OrdinaryResultReceiver {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn decode_preflighted_canonical_result_for_test(
         bytes: &[u8],
         memory_ceiling: u64,
@@ -1889,6 +2680,10 @@ impl OrdinaryResultReceiver {
     /// The effective result-byte ceiling bounds the assembled bytes; the
     /// effective memory ceiling travels beside it so terminal assembly can
     /// charge the native allocation the assembly would claim.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn set_effective_ceilings(
         &mut self,
         byte_limit: u64,
@@ -1906,6 +2701,10 @@ impl OrdinaryResultReceiver {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit_bytes(&self, additional: usize) -> Result<usize, LocalTransportError> {
         let total = self
             .buffered_bytes
@@ -1923,20 +2722,86 @@ impl OrdinaryResultReceiver {
         self.state = Some(ResultReceiveState::Discarded);
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn discard_if_receiving(&mut self) {
         if self.state() == ResultReceiveState::Receiving {
             self.discard_buffered();
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn with_query_memory(
+        byte_limit: u64,
+        memory_ceiling: u64,
+        memory: crate::read_image_memory::ImageMemoryHandle,
+    ) -> Result<Self, LocalTransportError> {
+        let mut receiver = Self::with_receiving_memory(byte_limit, memory_ceiling, memory.clone())?;
+        receiver.chunks = FundedVec::new_owned(Some(memory.owner()));
+        Ok(receiver)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn receive(
         &mut self,
         response: LocalResponse,
     ) -> Result<ResultReceiveOutcome, LocalTransportError> {
+        Ok(match self.receive_funded(Funded::external(response))? {
+            FundedResultReceiveOutcome::Pending => ResultReceiveOutcome::Pending,
+            FundedResultReceiveOutcome::Published(result) => {
+                ResultReceiveOutcome::Published(AssembledOrdinaryResult {
+                    bytes: result.bytes.into_public(),
+                    terminal: result.terminal.into_public(),
+                })
+            }
+            FundedResultReceiveOutcome::Failed(failure) => {
+                ResultReceiveOutcome::Failed(failure.into_public())
+            }
+            FundedResultReceiveOutcome::EngineFailed(failure) => {
+                ResultReceiveOutcome::EngineFailed(failure.into_public())
+            }
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn receive_funded(
+        &mut self,
+        response: Funded<LocalResponse>,
+    ) -> Result<FundedResultReceiveOutcome, LocalTransportError> {
         if self.state() != ResultReceiveState::Receiving {
             return Err(invalid_channel_data());
         }
-        match response {
+        if let Some(owner) = self.chunks.owner()
+            && !response
+                .credit
+                .as_ref()
+                .is_some_and(|credit| credit.is_funded_by(&owner))
+        {
+            self.discard_buffered();
+            return Err(invalid_channel_data());
+        }
+        match response.value {
             LocalResponse::ResultChunk { chunk } => {
                 if chunk.bytes.len() > MAX_FRAME_BYTES {
                     self.discard_buffered();
@@ -1949,35 +2814,107 @@ impl OrdinaryResultReceiver {
                         return Err(error);
                     }
                 };
-                self.chunks.push(chunk.bytes);
+                let chunk = Funded {
+                    value: chunk.bytes,
+                    credit: response.credit,
+                };
+                if let Err(error) = self.chunks.push(chunk) {
+                    self.discard_buffered();
+                    return Err(transport_decode_error(
+                        crate::read_contract::encoding_error_from_core(error, self.memory_ceiling),
+                    ));
+                }
                 self.buffered_bytes = new_total;
-                Ok(ResultReceiveOutcome::Pending)
+                Ok(FundedResultReceiveOutcome::Pending)
             }
             LocalResponse::TerminalSuccess { success } => {
-                if success.final_bytes.len() > MAX_FRAME_BYTES {
+                let success = Funded {
+                    value: success,
+                    credit: response.credit,
+                };
+                if success.value.final_bytes.len() > MAX_FRAME_BYTES {
                     self.discard_buffered();
                     return Err(invalid_channel_data());
                 }
-                let final_length = match self.admit_bytes(success.final_bytes.len()) {
+                let final_length = match self.admit_bytes(success.value.final_bytes.len()) {
                     Ok(total) => total,
                     Err(error) => {
                         self.discard_buffered();
                         return Err(error);
                     }
                 };
-                let mut bytes = Vec::with_capacity(final_length);
-                for chunk in std::mem::take(&mut self.chunks) {
-                    bytes.extend_from_slice(&chunk);
+                let owner = self.chunks.owner();
+                let mut bytes = match Funded::allocate_owned(owner.clone(), final_length, || {
+                    Vec::with_capacity(final_length)
+                }) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.discard_buffered();
+                        return Err(transport_decode_error(
+                            crate::read_contract::encoding_error_from_core(
+                                error,
+                                self.memory_ceiling,
+                            ),
+                        ));
+                    }
+                };
+                let chunks = std::mem::take(&mut self.chunks);
+                for chunk in &chunks.values {
+                    bytes.value.extend_from_slice(&chunk.value);
                 }
-                bytes.extend_from_slice(&success.final_bytes);
+                bytes.value.extend_from_slice(&success.value.final_bytes);
+                // All copied source allocations die before their invoices.
+                drop(chunks);
                 self.buffered_bytes = 0;
                 // Only an assembly that survives the allocation-free walk and
                 // then decodes as one exact canonical result is published; the
                 // decoded value itself is released here, because the caller is
                 // handed the assembled bytes.
-                let admitted = Self::preflight_canonical_result(&bytes, self.memory_ceiling)
+                let admitted = Self::preflight_canonical_result(&bytes.value, self.memory_ceiling)
                     .and_then(|()| {
-                        Self::decode_preflighted_canonical_result(&bytes, self.memory_ceiling)
+                        if let Some(memory) =
+                            self.receiving_memory.as_ref().filter(|_| owner.is_some())
+                        {
+                            #[cfg(feature = "test-seams")]
+                            Self::authorize_canonical_decode_for_test(
+                                &bytes.value,
+                                self.memory_ceiling,
+                            );
+                            let decoded = crate::read_contract::decode_query_result_funded(
+                                &bytes.value,
+                                memory,
+                                self.memory_ceiling,
+                            )?;
+                            drop(decoded);
+                            Ok(())
+                        } else if let Some(memory) = self.receiving_memory.as_ref() {
+                            #[cfg(feature = "test-seams")]
+                            Self::authorize_canonical_decode_for_test(
+                                &bytes.value,
+                                self.memory_ceiling,
+                            );
+                            let validation = memory.row_owner().map_err(|error| {
+                                crate::read_contract::encoding_error_from_core(
+                                    error,
+                                    self.memory_ceiling,
+                                )
+                            })?;
+                            let decoded = crate::read_contract::decode_query_result_with_memory(
+                                &bytes.value,
+                                &validation,
+                                self.memory_ceiling,
+                            )?;
+                            // Destroy the temporary tree before its row owner refunds.
+                            drop(decoded);
+                            drop(validation);
+                            Ok(())
+                        } else {
+                            Self::decode_preflighted_canonical_result(
+                                &bytes.value,
+                                self.memory_ceiling,
+                            )
+                            .map(drop)
+                        }
                     })
                     .map(|_decoded| ());
                 if let Err(error) = admitted {
@@ -1988,8 +2925,10 @@ impl OrdinaryResultReceiver {
                         } => {
                             LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
                                 ceiling,
+                                required: None,
                             })
                         }
+
                         _ => invalid_channel_data(),
                     });
                 }
@@ -1998,18 +2937,26 @@ impl OrdinaryResultReceiver {
                 self.state = Some(ResultReceiveState::Published);
                 #[cfg(feature = "test-seams")]
                 Self::observe_canonical_assembly_for_test();
-                Ok(ResultReceiveOutcome::Published(AssembledOrdinaryResult {
-                    bytes,
-                    terminal: success,
-                }))
+                Ok(FundedResultReceiveOutcome::Published(
+                    FundedOrdinaryResult {
+                        bytes,
+                        terminal: success,
+                    },
+                ))
             }
             LocalResponse::Failure { failure } => {
                 self.discard_buffered();
-                Ok(ResultReceiveOutcome::Failed(failure))
+                Ok(FundedResultReceiveOutcome::Failed(Funded {
+                    value: failure,
+                    credit: response.credit,
+                }))
             }
             LocalResponse::EngineFailure { failure } => {
                 self.discard_buffered();
-                Ok(ResultReceiveOutcome::EngineFailed(failure))
+                Ok(FundedResultReceiveOutcome::EngineFailed(Funded {
+                    value: failure,
+                    credit: response.credit,
+                }))
             }
             _ => {
                 self.discard_buffered();
@@ -2018,6 +2965,10 @@ impl OrdinaryResultReceiver {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn disconnect(&mut self) -> Result<ResultReceiveOutcome, LocalTransportError> {
         if self.state() != ResultReceiveState::Receiving {
             return Err(invalid_channel_data());
@@ -2028,9 +2979,25 @@ impl OrdinaryResultReceiver {
 }
 
 /// Encode one local payload with bincode standard configuration.
-pub fn encode_message<T: Serialize>(message: &T) -> Result<Vec<u8>, LocalTransportError> {
-    encode_to_vec(message, standard())
-        .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from inbound.rs"
+    )
+)]
+pub fn encode_message<T: Serialize>(
+    message: &T,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<crate::read_contract::EncodedReadBytes, LocalTransportError> {
+    let bytes = crate::read_contract::encode_transport_funded(message, Some(owner), u64::MAX)
+        .map_err(transport_decode_error)?;
+    crate::read_contract::EncodedReadBytes::from_funded(bytes, u64::MAX)
+        .map_err(transport_decode_error)
 }
 
 /// Prove one response can be encoded and framed under the shared wire-format
@@ -2041,26 +3008,24 @@ pub fn encode_message<T: Serialize>(message: &T) -> Result<Vec<u8>, LocalTranspo
 /// the shape- and limit-aware validation a caller is entitled to
 /// (`LocalProtocolBoundary::encode_frame`) still runs moments later, at the
 /// real send.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn response_is_encodable(response: &LocalResponse) -> Result<(), LocalTransportError> {
-    let encoded = encode_message(response)?;
-    encode_payload_frame(&encoded)?;
+    let len = crate::read_contract::encoded_size(response).map_err(transport_decode_error)?;
+    frame_length_prefix(len)?;
     Ok(())
 }
-
-/// The decoder's own limit counts the bytes it reads off the wire, and it
-/// counts each integer field at its fixed width rather than the shorter
-/// variable-length form actually consumed: one maximal result chunk claims
-/// twelve units for a six-byte envelope. Stated in those units, this backstop
-/// admits any payload the four-mebibyte wire ceiling already admits, at the
-/// decoder's worst-case eight units per wire byte. It bounds wire reads only.
-/// What the decoded form costs in live memory is bounded before this point, by
-/// the allocation-free preflight below.
-const DECODE_WIRE_CLAIM_CEILING: usize = MAX_FRAME_BYTES * 8;
 
 /// Decode one complete bincode-standard payload and reject trailing bytes.
 /// The decoded footprint is charged against the shipped memory ceiling; a
 /// caller holding narrower or wider effective limits decodes through
 /// [`decode_message_under_memory_ceiling`] instead.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_message_exact<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, LocalTransportError> {
@@ -2069,12 +3034,31 @@ pub fn decode_message_exact<T: serde::de::DeserializeOwned>(
 
 /// Decode one complete bincode-standard payload whose decoded footprint is
 /// charged against the memory ceiling in force for this exchange.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_message_under_memory_ceiling<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     memory_ceiling: u64,
 ) -> Result<T, LocalTransportError> {
     preflight_known_message::<T>(bytes, memory_ceiling)?;
-    decode_preflighted_message(bytes)
+    decode_preflighted_message(bytes, memory_ceiling)
+}
+
+/// Decode a bounded blob refusal through the existing read-channel grammar.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn decode_read_error_under_memory_ceiling(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<contextdb_core::Error, LocalTransportError> {
+    if bytes.len() > super::engine_answer::BLOB_SOURCE_REFUSAL_MAX_BYTES {
+        return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
+    }
+    decode_message_under_memory_ceiling::<ReadChannelError>(bytes, memory_ceiling).map(Into::into)
 }
 
 /// Decode a payload whose structural preflight has already run, with the
@@ -2083,18 +3067,38 @@ pub(crate) fn decode_message_under_memory_ceiling<T: serde::de::DeserializeOwned
 /// answer of its own, so the shape pass that would insist it be one has
 /// already been made to stand aside, and repeating it here by type name would
 /// undo that.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_preflighted_message<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
+    memory_ceiling: u64,
 ) -> Result<T, LocalTransportError> {
-    let configuration = standard().with_limit::<DECODE_WIRE_CLAIM_CEILING>();
-    let (value, consumed) = decode_from_slice(bytes, configuration)
-        .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
-    if consumed != bytes.len() {
-        return Err(LocalTransportError::Payload(
-            PayloadViolation::TrailingBytes,
-        ));
+    let memory = crate::read_contract::decoder_memory(memory_ceiling).map_err(|error| {
+        transport_decode_error(crate::read_contract::encoding_error_from_core(
+            error,
+            memory_ceiling,
+        ))
+    })?;
+    crate::read_contract::decode_exact_with_memory(bytes, &memory, memory_ceiling)
+        .map_err(transport_decode_error)
+}
+
+fn transport_decode_error(error: crate::read_contract::ReadEncodingError) -> LocalTransportError {
+    match error {
+        crate::read_contract::ReadEncodingError::Admission(error) => {
+            super::query_funding::transport_error(error, u64::MAX)
+        }
+        crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                ceiling,
+                required: None,
+            })
+        }
+
+        _ => LocalTransportError::Payload(PayloadViolation::Malformed),
     }
-    Ok(value)
 }
 
 /// The live memory one payload would occupy once decoded, accumulated as the
@@ -2157,16 +3161,28 @@ impl<'a> WirePreflight<'a> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn malformed<T>() -> Result<T, LocalTransportError> {
         Err(LocalTransportError::Payload(PayloadViolation::Malformed))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn finish(self) -> Result<(), LocalTransportError> {
         self.finish_into_budget().map(|_| ())
     }
 
     /// Complete this pass and hand back the running total, so a payload that
     /// was walked inside another keeps charging the enclosing budget.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn finish_into_budget(self) -> Result<WireBudget, LocalTransportError> {
         if self.bytes.len() > self.byte_ceiling || self.offset != self.bytes.len() {
             return Err(LocalTransportError::Payload(
@@ -2180,6 +3196,10 @@ impl<'a> WirePreflight<'a> {
         self.bytes.len().saturating_sub(self.offset)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn take(&mut self, length: usize) -> Result<&'a [u8], LocalTransportError> {
         if self.bytes.len() > self.byte_ceiling {
             return Self::malformed();
@@ -2194,14 +3214,26 @@ impl<'a> WirePreflight<'a> {
         Ok(value)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn byte(&mut self) -> Result<u8, LocalTransportError> {
         Ok(self.take(1)?[0])
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fixed(&mut self, length: usize) -> Result<(), LocalTransportError> {
         self.take(length).map(|_| ())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn unsigned(&mut self, maximum_width: usize) -> Result<u64, LocalTransportError> {
         match self.byte()? {
             value @ 0..=250 => Ok(u64::from(value)),
@@ -2230,25 +3262,45 @@ impl<'a> WirePreflight<'a> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn u16(&mut self) -> Result<u16, LocalTransportError> {
         u16::try_from(self.unsigned(2)?)
             .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn u32(&mut self) -> Result<u32, LocalTransportError> {
         u32::try_from(self.unsigned(4)?)
             .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn u64(&mut self) -> Result<u64, LocalTransportError> {
         self.unsigned(8)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn length(&mut self) -> Result<usize, LocalTransportError> {
         usize::try_from(self.unsigned(8)?)
             .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn enumeration(&mut self, maximum: u32) -> Result<u32, LocalTransportError> {
         let value = self.u32()?;
         if value > maximum {
@@ -2257,6 +3309,10 @@ impl<'a> WirePreflight<'a> {
         Ok(value)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn boolean(&mut self) -> Result<bool, LocalTransportError> {
         match self.byte()? {
             0 => Ok(false),
@@ -2265,6 +3321,10 @@ impl<'a> WirePreflight<'a> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn option(&mut self) -> Result<bool, LocalTransportError> {
         self.boolean()
     }
@@ -2272,6 +3332,10 @@ impl<'a> WirePreflight<'a> {
     /// Charge what one declared container costs in live memory once decoded.
     /// The total stands for the rest of the payload, so a container nested in
     /// another is charged on top of it rather than in place of it.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn charge<T>(&mut self, length: usize) -> Result<(), LocalTransportError> {
         let element_bytes = u64::try_from(std::mem::size_of::<T>().max(1))
             .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
@@ -2281,28 +3345,39 @@ impl<'a> WirePreflight<'a> {
             .checked_mul(element_bytes)
             .and_then(|bytes| self.budget.charged_bytes.checked_add(bytes))
             .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
-        if charged > self.budget.memory_ceiling {
-            return Err(LocalTransportError::Payload(
-                PayloadViolation::MemoryCeilingExceeded {
-                    ceiling: self.budget.memory_ceiling,
-                },
-            ));
-        }
         self.budget.charged_bytes = charged;
         Ok(())
     }
 
     /// Walk a cursor page carried inside this payload under the same running
     /// total, so the page cannot claim a fresh allowance by being nested.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn nested_cursor_page(&mut self, payload: &[u8]) -> Result<(), LocalTransportError> {
-        let mut nested = WirePreflight::with_budget(payload, self.budget);
-        nested.cursor_page()?;
-        self.budget = nested.finish_into_budget()?;
+        let mut nested = CanonicalAllocationPreflight::new(payload, self.budget.memory_ceiling);
+        nested.charged_bytes = self.budget.charged_bytes;
+        nested.observed_cursor_page().map_err(|error| match error {
+            crate::read_contract::ReadEncodingError::MemoryCeilingExceeded { ceiling } => {
+                LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                    ceiling,
+                    required: None,
+                })
+            }
+
+            _ => LocalTransportError::Payload(PayloadViolation::Malformed),
+        })?;
+        self.budget.charged_bytes = nested.charged_bytes;
         Ok(())
     }
 
     /// Walk a metadata page carried inside this payload under the same running
     /// total, so the page cannot claim a fresh allowance by being nested.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn nested_metadata_page(&mut self, payload: &[u8]) -> Result<(), LocalTransportError> {
         let mut nested = WirePreflight::with_budget(payload, self.budget);
         nested.metadata_page()?;
@@ -2310,6 +3385,10 @@ impl<'a> WirePreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn byte_vector(&mut self) -> Result<&'a [u8], LocalTransportError> {
         let length = self.length()?;
         if length > self.remaining() {
@@ -2319,6 +3398,10 @@ impl<'a> WirePreflight<'a> {
         self.take(length)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn string(&mut self) -> Result<(), LocalTransportError> {
         let bytes = self.byte_vector()?;
         std::str::from_utf8(bytes)
@@ -2326,20 +3409,24 @@ impl<'a> WirePreflight<'a> {
             .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))
     }
 
-    /// A JSON value travels as text and decodes into a tree of nodes plus
-    /// copies of the text it holds. Both are charged from the text itself,
-    /// before the tree is built.
+    /// Validate the serialized string only. Native JSON payload and parser
+    /// scratch are admitted incrementally by the shared core builder.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn json_text(&mut self) -> Result<(), LocalTransportError> {
         let text = self.byte_vector()?;
         if std::str::from_utf8(text).is_err() {
             return Self::malformed();
         }
-        let nodes = json_node_ceiling(text);
-        let text_length = text.len();
-        self.charge::<serde_json::Value>(nodes)?;
-        self.charge::<u8>(text_length)
+        Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn value(&mut self) -> Result<(), LocalTransportError> {
         match self.enumeration(9)? {
             0 => {}
@@ -2377,6 +3464,10 @@ impl<'a> WirePreflight<'a> {
     /// Walk one reader's declared visibility. Both sets are unbounded in
     /// shape, so each declared length is charged before its elements are read
     /// and a length larger than the bytes that remain is malformed on sight.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_declaration(&mut self) -> Result<(), LocalTransportError> {
         if self.option()? {
             let length = self.length()?;
@@ -2411,6 +3502,10 @@ impl<'a> WirePreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn string_value_map(&mut self) -> Result<(), LocalTransportError> {
         let length = self.length()?;
         if length > self.remaining() {
@@ -2424,6 +3519,10 @@ impl<'a> WirePreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cursor_page(&mut self) -> Result<(), LocalTransportError> {
         let columns = self.length()?;
         if columns > self.remaining() {
@@ -2453,6 +3552,10 @@ impl<'a> WirePreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn metadata_page(&mut self) -> Result<(), LocalTransportError> {
         self.enumeration(1)?;
         let items = self.length()?;
@@ -2480,6 +3583,10 @@ impl<'a> WirePreflight<'a> {
     /// One progress report: the phase, then the six counters, one of which
     /// is optional. Every field is a fixed-width number, so a progress frame
     /// declares no container and can claim no memory beyond its own bytes.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn progress(&mut self) -> Result<(), LocalTransportError> {
         self.enumeration(1)?;
         self.u64()?;
@@ -2493,11 +3600,19 @@ impl<'a> WirePreflight<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn engine_failure(&mut self) -> Result<(), LocalTransportError> {
         self.byte_vector()?;
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn failure(&mut self) -> Result<(), LocalTransportError> {
         self.enumeration(READ_FAILURE_KIND_MAXIMUM_DISCRIMINANT)?;
         match self.enumeration(READ_FAILURE_DETAIL_MAXIMUM_DISCRIMINANT)? {
@@ -2538,17 +3653,27 @@ impl<'a> WirePreflight<'a> {
                 self.string()?;
             }
             6 => self.string()?,
+            // Absent read-readiness: one reason string, like the plain reason.
+            7 => self.string()?,
             _ => unreachable!("bounded failure-detail discriminant"),
         }
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn configured_value(&mut self) -> Result<(), LocalTransportError> {
         self.u64()?;
         self.enumeration(1)?;
         Ok(())
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn owner_status(&mut self) -> Result<(), LocalTransportError> {
         self.enumeration(3)?;
         if self.option()? {
@@ -2558,6 +3683,7 @@ impl<'a> WirePreflight<'a> {
                 _ => unreachable!("bounded owner-reason discriminant"),
             }
         }
+        self.u64()?; // published committed LSN
         for _ in 0..10 {
             self.configured_value()?;
         }
@@ -2570,10 +3696,21 @@ impl<'a> WirePreflight<'a> {
         if self.option()? {
             self.u64()?;
         }
+        for _ in 0..3 {
+            if self.option()? {
+                self.u64()?;
+            }
+        }
+        self.u64()?; // owner's serving-cache budget
+        self.u64()?; // owner's declared reader charge
         Ok(())
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn preflight_handshake(bytes: &[u8], memory_ceiling: u64) -> Result<(), LocalTransportError> {
     let mut wire = WirePreflight::with_memory_ceiling(bytes, memory_ceiling);
     wire.fixed(LOCAL_PROTOCOL_MARKER.len())?;
@@ -2596,6 +3733,10 @@ fn preflight_handshake(bytes: &[u8], memory_ceiling: u64) -> Result<(), LocalTra
     wire.finish()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn preflight_known_message<T>(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -2636,6 +3777,10 @@ fn preflight_known_message<T>(
 /// the body shape, and the shape is read from the one table that also drives
 /// how the document is written, so a body can never be admitted under a
 /// grammar different from the one that produced it.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preflight_read_channel_error(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -2645,6 +3790,10 @@ pub(crate) fn preflight_read_channel_error(
     wire.finish()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_channel_error_body(wire: &mut WirePreflight<'_>) -> Result<(), LocalTransportError> {
     let tag = wire.u16()?;
     let Some(grammar) = body_grammar(tag) else {
@@ -2679,6 +3828,10 @@ fn read_channel_error_body(wire: &mut WirePreflight<'_>) -> Result<(), LocalTran
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn preflight_read_limits(wire: &mut WirePreflight<'_>) -> Result<(), LocalTransportError> {
     for _ in 0..9 {
         wire.u64()?;
@@ -2686,6 +3839,10 @@ fn preflight_read_limits(wire: &mut WirePreflight<'_>) -> Result<(), LocalTransp
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn preflight_request(bytes: &[u8], memory_ceiling: u64) -> Result<(), LocalTransportError> {
     let mut wire = WirePreflight::with_memory_ceiling(bytes, memory_ceiling);
     preflight_read_limits(&mut wire)?;
@@ -2741,15 +3898,25 @@ fn preflight_request(bytes: &[u8], memory_ceiling: u64) -> Result<(), LocalTrans
 
 /// Admit one canonical query-result payload on its own, charging its decoded
 /// footprint against the memory ceiling in force.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preflight_canonical_query_result(
     bytes: &[u8],
     memory_ceiling: u64,
 ) -> Result<(), crate::read_contract::ReadEncodingError> {
-    CanonicalAllocationPreflight::new(bytes, memory_ceiling).query_result()
+    CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+        .query_result()
+        .map(|_| ())
 }
 
 /// Admit one cursor-page payload on its own, charging its decoded footprint
 /// against the memory ceiling in force.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preflight_cursor_page_payload(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -2759,8 +3926,42 @@ pub(crate) fn preflight_cursor_page_payload(
     wire.finish()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn preflight_observed_cursor_page_payload(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<(), crate::read_contract::ReadEncodingError> {
+    CanonicalAllocationPreflight::new(bytes, memory_ceiling)
+        .observed_cursor_page()
+        .map(|_| ())
+}
+
+/// Decoded allocation allowance, obtained without allocating the answer.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn observed_cursor_page_allocation_bytes(
+    bytes: &[u8],
+    memory_ceiling: u64,
+) -> Result<(usize, usize), crate::read_contract::ReadEncodingError> {
+    let mut preflight = CanonicalAllocationPreflight::new(bytes, memory_ceiling);
+    let trace = preflight.observed_cursor_page()?;
+    let convert = |bytes| {
+        usize::try_from(bytes).map_err(|_| crate::read_contract::ReadEncodingError::InvalidPayload)
+    };
+    Ok((convert(preflight.charged_bytes)?, convert(trace)?))
+}
+
 /// Admit one metadata-page payload on its own, charging its decoded footprint
 /// against the memory ceiling in force.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preflight_metadata_page_payload(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -2780,12 +3981,16 @@ const READ_FAILURE_KIND_MAXIMUM_DISCRIMINANT: u32 =
 /// vocabulary has no list to read a length from, so appending a detail means
 /// raising this number and walking the new shape in `failure` above --
 /// otherwise the preflight refuses a refusal the owner legitimately sends.
-const READ_FAILURE_DETAIL_MAXIMUM_DISCRIMINANT: u32 = 6;
+const READ_FAILURE_DETAIL_MAXIMUM_DISCRIMINANT: u32 = 7;
 
 /// `continued` says earlier frames of this exchange already carried the
 /// leading bytes of the answer, so this frame's payload is a tail: it is not a
 /// nested answer of its own and cannot be read as one. The complete payload is
 /// still checked, once, after the pieces are put back together.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn preflight_response(
     bytes: &[u8],
     expectation: &LocalResponseExpectation,
@@ -2793,7 +3998,7 @@ fn preflight_response(
     continued: bool,
 ) -> Result<(), LocalTransportError> {
     let mut wire = WirePreflight::with_memory_ceiling(bytes, memory_ceiling);
-    match wire.enumeration(12)? {
+    match wire.enumeration(13)? {
         0 | 1 | 6 | 8 => {
             wire.byte_vector()?;
         }
@@ -2819,7 +4024,7 @@ fn preflight_response(
                 wire.nested_cursor_page(payload)?;
             }
         }
-        3 => {
+        3 | 13 => {
             let payload = wire.byte_vector()?;
             if !continued {
                 wire.nested_cursor_page(payload)?;
@@ -2855,6 +4060,10 @@ fn preflight_response(
 }
 
 /// Check a payload length before allocating the payload or writing a prefix.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn frame_length_prefix(payload_len: usize) -> Result<[u8; 4], LocalTransportError> {
     if payload_len > MAX_FRAME_BYTES {
         return Err(LocalTransportError::Frame(
@@ -2868,17 +4077,69 @@ pub fn frame_length_prefix(payload_len: usize) -> Result<[u8; 4], LocalTransport
 
 /// A reader/allocator split makes it possible to prove that a hostile length
 /// prefix is rejected before any payload-sized allocation is requested.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub trait FrameReader {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), LocalTransportError>;
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+    )
+)]
 pub trait FrameBufferAllocator {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn allocate(&mut self, length: usize) -> Result<Vec<u8>, LocalTransportError>;
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub fn read_payload_with_admission(
     reader: &mut dyn FrameReader,
     allocator: &mut dyn FrameBufferAllocator,
+) -> Result<Vec<u8>, LocalTransportError> {
+    read_payload_with_memory_admission(reader, allocator, None)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
+fn read_payload_with_memory_admission(
+    reader: &mut dyn FrameReader,
+    allocator: &mut dyn FrameBufferAllocator,
+    memory: Option<u64>,
 ) -> Result<Vec<u8>, LocalTransportError> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix)?;
@@ -2886,6 +4147,14 @@ pub fn read_payload_with_admission(
     if length > MAX_FRAME_BYTES {
         return Err(LocalTransportError::Frame(
             FrameViolation::LengthExceedsMaximum,
+        ));
+    }
+    if memory.is_some_and(|available| length as u64 > available) {
+        return Err(LocalTransportError::Payload(
+            PayloadViolation::MemoryCeilingExceeded {
+                ceiling: memory.unwrap(),
+                required: Some(length as u64),
+            },
         ));
     }
     let mut payload = allocator.allocate(length)?;
@@ -2898,6 +4167,17 @@ pub fn read_payload_with_admission(
 
 /// Read, admit, decode, and publish one ordinary-result frame through the
 /// production receiving state machine.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_refusal_taxonomy.rs"
+    )
+)]
 pub fn receive_framed_ordinary_result(
     receiver: &mut OrdinaryResultReceiver,
     reader: &mut dyn FrameReader,
@@ -2923,7 +4203,21 @@ pub fn receive_framed_ordinary_result(
 }
 
 /// Encode one complete four-byte-length-prefixed payload frame.
-pub fn encode_payload_frame(payload: &[u8]) -> Result<Vec<u8>, LocalTransportError> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
+pub fn encode_payload_frame(
+    payload: &[u8],
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<crate::read_contract::EncodedReadBytes, LocalTransportError> {
     let prefix = frame_length_prefix(payload.len())?;
     let capacity = payload
         .len()
@@ -2931,13 +4225,26 @@ pub fn encode_payload_frame(payload: &[u8]) -> Result<Vec<u8>, LocalTransportErr
         .ok_or(LocalTransportError::Frame(
             FrameViolation::LengthExceedsMaximum,
         ))?;
-    let mut frame = Vec::with_capacity(capacity);
-    frame.extend_from_slice(&prefix);
-    frame.extend_from_slice(payload);
-    Ok(frame)
+    let mut frame = Funded::allocate_owned(Some(owner), capacity, || Vec::with_capacity(capacity))
+        .map_err(|error| super::query_funding::transport_error(error, u64::MAX))?;
+    frame.value.extend_from_slice(&prefix);
+    frame.value.extend_from_slice(payload);
+    crate::read_contract::EncodedReadBytes::from_funded(frame, u64::MAX)
+        .map_err(transport_decode_error)
 }
 
 /// Decode precisely one complete frame, with no trailing bytes.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub fn decode_frame_exact(frame: &[u8]) -> Result<Vec<u8>, LocalTransportError> {
     let Some(prefix) = frame.get(..4) else {
         return Err(LocalTransportError::Frame(FrameViolation::TruncatedLength));
@@ -2962,6 +4269,10 @@ pub fn decode_frame_exact(frame: &[u8]) -> Result<Vec<u8>, LocalTransportError> 
     Ok(frame[4..].to_vec())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_request(request: &LocalRequestEnvelope) -> Result<(), LocalTransportError> {
     request
         .limits
@@ -2969,6 +4280,10 @@ fn validate_request(request: &LocalRequestEnvelope) -> Result<(), LocalTransport
         .map_err(|_| invalid_channel_data())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_response(
     response: &LocalResponse,
     expectation: &LocalResponseExpectation,
@@ -3001,7 +4316,7 @@ fn validate_response(
             LocalResponse::CursorOpened { .. },
             LocalResponseExpectation::CursorOpen
         ) | (
-            LocalResponse::CursorPage { .. },
+            LocalResponse::CursorPage { .. } | LocalResponse::CursorCancelled { .. },
             LocalResponseExpectation::CursorFetch
         ) | (
             LocalResponse::CursorClosed { .. },
@@ -3049,13 +4364,15 @@ fn validate_response(
                 limits.cursor_page_bytes,
             )?;
             if position.is_whole() {
-                decode_cursor_page(&opened.payload).map_err(|_| invalid_channel_data())?;
+                crate::read_contract::decode_observed_cursor_page(&opened.payload, limits.memory)
+                    .map_err(transport_decode_error)?;
             }
         }
-        LocalResponse::CursorPage { page } => {
+        LocalResponse::CursorPage { page } | LocalResponse::CursorCancelled { page } => {
             validate_answer_payload_limit(page.payload.len(), position, limits.cursor_page_bytes)?;
             if position.is_whole() {
-                decode_cursor_page(&page.payload).map_err(|_| invalid_channel_data())?;
+                crate::read_contract::decode_observed_cursor_page(&page.payload, limits.memory)
+                    .map_err(transport_decode_error)?;
             }
         }
         LocalResponse::Metadata { metadata } => {
@@ -3080,6 +4397,7 @@ fn validate_response(
                     }
                     LocalMetadataRequest::Schema { .. }
                     | LocalMetadataRequest::MaintenanceStatus
+                    | LocalMetadataRequest::VerifyHistory { .. }
                     | LocalMetadataRequest::DeliveryStatus { .. }
                     | LocalMetadataRequest::DeliveryOutcome { .. } => {}
                 }
@@ -3103,11 +4421,19 @@ fn validate_response(
     Ok(())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_payload_limit(length: usize, limit: u64) -> Result<(), LocalTransportError> {
     let length = u64::try_from(length).map_err(|_| invalid_channel_data())?;
     validate_payload_limit_bytes(length, limit)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_payload_limit_bytes(length: u64, limit: u64) -> Result<(), LocalTransportError> {
     if length > limit {
         return Err(invalid_channel_data());
@@ -3117,6 +4443,10 @@ fn validate_payload_limit_bytes(length: u64, limit: u64) -> Result<(), LocalTran
 
 /// A payload-carrying answer is measured whole: the budget the session
 /// declared governs the answer, not whichever piece of it this frame holds.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_answer_payload_limit(
     length: usize,
     position: PayloadPosition,
@@ -3126,6 +4456,10 @@ fn validate_answer_payload_limit(
     validate_payload_limit_bytes(length.saturating_add(position.earlier_bytes()), limit)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_owner_status(status: &LocalOwnerStatusResponse) -> Result<(), LocalTransportError> {
     status
         .status

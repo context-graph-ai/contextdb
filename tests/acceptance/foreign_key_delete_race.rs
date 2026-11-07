@@ -167,7 +167,7 @@ fn t22_02_after_concurrent_race_no_dangling_child_via_join() {
             &empty(),
         )
         .unwrap()
-        .rows
+        .rows()
         .len();
     assert_eq!(
         dangling, 0,
@@ -233,12 +233,16 @@ fn t22_04_single_tx_fk_violation_rolls_back_full_writeset() {
     let count = db
         .execute("SELECT id FROM invalidations", &empty())
         .unwrap()
-        .rows
+        .rows()
         .len();
     assert_eq!(count, 0);
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn t22_05_concurrent_child_inserts_against_live_parent_both_commit() {
     // REGRESSION GUARD: validator must not spuriously reject FK validations
     // when the parent is live for both writers.
@@ -273,7 +277,7 @@ fn t22_05_concurrent_child_inserts_against_live_parent_both_commit() {
     let count = db
         .execute("SELECT id FROM invalidations", &empty())
         .unwrap()
-        .rows
+        .rows()
         .len();
     assert_eq!(count, 2);
 }

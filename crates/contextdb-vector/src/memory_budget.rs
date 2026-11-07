@@ -9,6 +9,37 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// durable-limit mutation handle.
 #[doc(hidden)]
 pub trait MemoryBudget: Debug + Send + Sync {
+    /// Retained consumers keep this original fixed invoice outside the budget Arc.
+    #[doc(hidden)]
+    fn control_invoice(
+        &self,
+    ) -> Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>
+    {
+        None
+    }
+
+    /// Lifetime-bounded identity and borrow of the retained original read payer.
+    /// The borrow does not acquire an owner, invoice, or replacement capability.
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    fn original_read_payer_for_test(
+        &self,
+    ) -> (
+        usize,
+        bool,
+        Option<&contextdb_core::read_memory::ReadMemoryOwner>,
+    ) {
+        (0, false, None)
+    }
+
+    fn stable_funder_identity(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_allocate_for(
         &self,
         bytes: usize,
@@ -17,11 +48,45 @@ pub trait MemoryBudget: Debug + Send + Sync {
         hint: &str,
     ) -> Result<()>;
 
+    /// Keep engine literals borrowed through refusal. The default preserves
+    /// the ordinary contract of externally supplied budgets.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn try_allocate_for_static(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        self.try_allocate_for(bytes, subsystem, operation, hint)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn try_allocate_for_label(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: contextdb_core::error::DiagnosticLabel,
+        hint: &'static str,
+    ) -> Result<()> {
+        self.try_allocate_for(bytes, subsystem, operation.as_ref(), hint)
+    }
+
     fn release(&self, bytes: usize);
 
     /// Atomically replace the caller's held charge. Delta-based budgets can
     /// use the default: it never exposes the old charge or adds old + new.
     /// A shared budget must validate growth against its published limit.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn transition_reservation_for(
         &self,
         old_bytes: usize,
@@ -38,6 +103,22 @@ pub trait MemoryBudget: Debug + Send + Sync {
         Ok(())
     }
 
+    /// External implementations retain their existing atomic transition.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn transition_reservation_for_static(
+        &self,
+        old_bytes: usize,
+        new_bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        self.transition_reservation_for(old_bytes, new_bytes, subsystem, operation, hint)
+    }
+
     /// Bytes currently available under a finite shared budget. Unlimited or
     /// request-local budgets return `None`, so residency is retained.
     fn available_bytes(&self) -> Option<usize> {
@@ -47,14 +128,841 @@ pub trait MemoryBudget: Debug + Send + Sync {
     /// Move bytes already charged to the active caller into a retained store
     /// owner without touching the shared total. Budgets with no caller-bound
     /// transfer return `false`, and loaders reserve those bytes themselves.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn adopt_caller_reservation(&self, _bytes: usize) -> Result<bool> {
         Ok(false)
     }
 }
 
+/// Copy funders retain either the original vector budget or the original
+/// reader capability inline. Cloning this handle allocates no adapter.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct MemoryBudgetOwner(MemoryBudgetOwnerKind);
+#[derive(Debug, Clone)]
+enum MemoryBudgetOwnerKind {
+    Legacy(
+        Arc<dyn MemoryBudget>,
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    ),
+    Reader(ReaderCopyBudget),
+    // Drop order is contractual: destroy the entire Arc allocation before
+    // settling its original external native invoice. Clones retain both.
+    Funded {
+        budget: Arc<dyn MemoryBudget>,
+        _invoice: contextdb_core::read_memory::ReadMemoryOwner,
+    },
+}
+impl From<Arc<dyn MemoryBudget>> for MemoryBudgetOwner {
+    fn from(budget: Arc<dyn MemoryBudget>) -> Self {
+        let invoice = budget.control_invoice();
+        Self(MemoryBudgetOwnerKind::Legacy(budget, invoice))
+    }
+}
+impl<T: MemoryBudget + 'static> From<Arc<T>> for MemoryBudgetOwner {
+    fn from(budget: Arc<T>) -> Self {
+        let budget: Arc<dyn MemoryBudget> = budget;
+        budget.into()
+    }
+}
+impl From<contextdb_core::read_memory::ReadMemoryOwner> for MemoryBudgetOwner {
+    fn from(reader: contextdb_core::read_memory::ReadMemoryOwner) -> Self {
+        Self(MemoryBudgetOwnerKind::Reader(ReaderCopyBudget {
+            reader,
+            observer: None,
+            mode: ReaderCopyMode::ProjectErrors,
+        }))
+    }
+}
+impl AsRef<dyn MemoryBudget> for MemoryBudgetOwner {
+    fn as_ref(&self) -> &(dyn MemoryBudget + 'static) {
+        match &self.0 {
+            MemoryBudgetOwnerKind::Legacy(budget, _) => budget.as_ref(),
+            MemoryBudgetOwnerKind::Reader(reader) => reader,
+            MemoryBudgetOwnerKind::Funded { budget, .. } => budget.as_ref(),
+        }
+    }
+}
+impl std::ops::Deref for MemoryBudgetOwner {
+    type Target = dyn MemoryBudget;
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+impl MemoryBudgetOwner {
+    /// Pair the engine's admitted Arc with its original external invoice.
+    /// The producer retains no unpaired Arc/Weak alias after this transfer.
+    #[doc(hidden)]
+    pub fn from_funded(
+        budget: Arc<dyn MemoryBudget>,
+        invoice: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Self {
+        Self(MemoryBudgetOwnerKind::Funded {
+            budget,
+            _invoice: invoice,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn control_invoice(
+        &self,
+    ) -> Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>
+    {
+        match &self.0 {
+            MemoryBudgetOwnerKind::Legacy(_, invoice) => invoice.clone(),
+            MemoryBudgetOwnerKind::Reader(_) | MemoryBudgetOwnerKind::Funded { .. } => None,
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn accounting_identity(&self) -> usize {
+        match &self.0 {
+            MemoryBudgetOwnerKind::Legacy(budget, _) => Arc::as_ptr(budget) as *const () as usize,
+            MemoryBudgetOwnerKind::Reader(reader) => reader.reader.accounting_identity(),
+            MemoryBudgetOwnerKind::Funded { budget, .. } => {
+                Arc::as_ptr(budget) as *const () as usize
+            }
+        }
+    }
+}
+/// Inline adaptation retains the actual owner; it has no control allocation.
+/// The optional observation callback carries no ownership or funding power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderCopyMode {
+    ProjectErrors,
+    PreserveErrors,
+    AnswerImage,
+}
+#[derive(Debug, Clone)]
+struct ReaderCopyBudget {
+    reader: contextdb_core::read_memory::ReadMemoryOwner,
+    observer: Option<fn(usize, &str, &str)>,
+    mode: ReaderCopyMode,
+}
+impl MemoryBudgetOwner {
+    /// Reuse an answer image's original reader without a forwarding allocation.
+    /// These are the same labels the image's budget bridge uses.
+    #[doc(hidden)]
+    pub fn for_answer_image(reader: contextdb_core::read_memory::ReadMemoryOwner) -> Self {
+        Self(MemoryBudgetOwnerKind::Reader(ReaderCopyBudget {
+            reader,
+            observer: None,
+            mode: ReaderCopyMode::AnswerImage,
+        }))
+    }
+    #[doc(hidden)]
+    pub fn with_read_copy_observer(mut self, observer: fn(usize, &str, &str)) -> Self {
+        if let MemoryBudgetOwnerKind::Reader(reader) = &mut self.0 {
+            reader.observer = Some(observer);
+        }
+        self
+    }
+    /// Existing image adapters deliberately report the image's own admission
+    /// labels. Preserve those complete errors while removing their raw Arc.
+    #[doc(hidden)]
+    pub fn preserving_read_copy_errors(mut self) -> Self {
+        if let MemoryBudgetOwnerKind::Reader(reader) = &mut self.0 {
+            reader.mode = ReaderCopyMode::PreserveErrors;
+        }
+        self
+    }
+}
+impl MemoryBudget for ReaderCopyBudget {
+    fn try_allocate_for_static(
+        &self,
+        bytes: usize,
+        component: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        use contextdb_core::read_memory::ReadMemoryBudget;
+        let (subsystem, admission, advice) = if self.mode == ReaderCopyMode::AnswerImage {
+            (
+                "reader",
+                "materialize_answer",
+                "Reduce the statement's output or raise the declared reader memory limit.",
+            )
+        } else {
+            (
+                "vector_copy",
+                "materialize",
+                "Reduce the selected copy or raise the executing reader's memory limit.",
+            )
+        };
+        let result = self.reader.try_reserve(bytes, subsystem, admission, advice);
+        let result = if self.mode != ReaderCopyMode::ProjectErrors {
+            result
+        } else {
+            result.map_err(|error| match error {
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    ..
+                } => contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem: component.into(),
+                    operation: operation.into(),
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    hint: hint.into(),
+                },
+                other => other,
+            })
+        };
+        if result.is_ok()
+            && let Some(observer) = self.observer
+        {
+            observer(self.reader.accounting_identity(), component, operation);
+        }
+        result
+    }
+    fn try_allocate_for_label(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: contextdb_core::error::DiagnosticLabel,
+        hint: &'static str,
+    ) -> Result<()> {
+        self.try_allocate_for_static(bytes, subsystem, "diagnostic_label", hint)
+            .map_err(|error| match error {
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem,
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    hint,
+                    ..
+                } if self.mode == ReaderCopyMode::ProjectErrors => {
+                    contextdb_core::Error::MemoryBudgetExceeded {
+                        subsystem,
+                        operation,
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        hint,
+                    }
+                }
+                other => other,
+            })
+    }
+    fn transition_reservation_for_static(
+        &self,
+        old_bytes: usize,
+        new_bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        if new_bytes > old_bytes {
+            self.try_allocate_for_static(new_bytes - old_bytes, subsystem, operation, hint)?;
+        } else if new_bytes < old_bytes {
+            self.release(old_bytes - new_bytes);
+        }
+        Ok(())
+    }
+    fn stable_funder_identity(&self) -> usize {
+        self.reader.accounting_identity()
+    }
+    #[cfg(feature = "test-seams")]
+    fn original_read_payer_for_test(
+        &self,
+    ) -> (
+        usize,
+        bool,
+        Option<&contextdb_core::read_memory::ReadMemoryOwner>,
+    ) {
+        (
+            self.reader.accounting_identity(),
+            contextdb_core::read_memory::ReadMemoryBudget::control_invoice(&self.reader).is_some(),
+            Some(&self.reader),
+        )
+    }
+    fn try_allocate_for(
+        &self,
+        bytes: usize,
+        component: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<()> {
+        use contextdb_core::read_memory::ReadMemoryBudget;
+        let (subsystem, admission, advice) = if self.mode == ReaderCopyMode::AnswerImage {
+            (
+                "reader",
+                "materialize_answer",
+                "Reduce the statement's output or raise the declared reader memory limit.",
+            )
+        } else {
+            (
+                "vector_copy",
+                "materialize",
+                "Reduce the selected copy or raise the executing reader's memory limit.",
+            )
+        };
+        let result = self.reader.try_reserve(bytes, subsystem, admission, advice);
+        let result = if self.mode != ReaderCopyMode::ProjectErrors {
+            result
+        } else {
+            result.map_err(|error| match error {
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    ..
+                } => contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem: component.to_owned().into(),
+                    operation: operation.to_owned().into(),
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    hint: hint.to_owned().into(),
+                },
+                other => other,
+            })
+        };
+        if result.is_ok()
+            && let Some(observer) = self.observer
+        {
+            observer(self.reader.accounting_identity(), component, operation);
+        }
+        result
+    }
+    fn release(&self, bytes: usize) {
+        contextdb_core::read_memory::ReadMemoryBudget::release(&self.reader, bytes);
+    }
+}
+
+pub(crate) fn same_funder(left: &dyn MemoryBudget, right: &dyn MemoryBudget) -> bool {
+    left.stable_funder_identity() == right.stable_funder_identity()
+}
+
+/// An owned, already admitted charge supplied by the executing caller.
+/// Ordinary drop releases its exact retained bytes. `transfer` disarms that
+/// release only after another owner has adopted the complete reservation.
+#[doc(hidden)]
+pub trait PrepaidVectorCopyCharge: Send + Sync {
+    fn accountant(&self) -> crate::memory_budget::MemoryBudgetOwner;
+    fn retained_bytes(&self) -> usize;
+    /// Whether this charge already owns admission for its enclosing Box.
+    /// When true, the charge retains that debit and its release responsibility.
+    fn prepaid_box_control_is_admitted(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "test-seams")]
+    fn original_payer_identity_for_test(&self) -> usize {
+        0
+    }
+    // capture969 begin
+    #[cfg(feature = "test-seams")]
+    fn credit_address_for_test(&self) -> usize {
+        0
+    }
+    // capture969 end
+    fn transfer(self: Box<Self>);
+}
+
+/// Explicit caller-owned admission for materialized vector copies.
+/// Construct this with the executing transaction or read working-set accountant.
+/// Keep it alive until every output charged to it has been destroyed; returning
+/// an output transfers that lifetime obligation to the caller, never to a store.
+#[doc(hidden)]
+pub struct VectorCopyAdmission {
+    accountant: crate::memory_budget::MemoryBudgetOwner,
+    prepaid: Option<Box<dyn PrepaidVectorCopyCharge>>,
+    prepaid_bytes: usize,
+    prepaid_control_bytes: usize,
+    additional_bytes: usize,
+    used_bytes: usize,
+    historical_durable_reads: bool,
+    raw_only_sources: bool,
+    _control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+}
+
+impl Debug for VectorCopyAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorCopyAdmission")
+            .field("accountant", &self.accountant)
+            .field("prepaid_bytes", &self.prepaid_bytes)
+            .field("additional_bytes", &self.additional_bytes)
+            .field("used_bytes", &self.used_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VectorCopyAdmission {
+    pub fn new(accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Self {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        let control_invoice = accountant.control_invoice();
+        Self {
+            accountant,
+            _control_invoice: control_invoice,
+            prepaid: None,
+            prepaid_bytes: 0,
+            prepaid_control_bytes: 0,
+            additional_bytes: 0,
+            used_bytes: 0,
+            historical_durable_reads: false,
+            raw_only_sources: false,
+        }
+    }
+
+    /// Consume the caller's real prepaid owner without admitting it again.
+    /// A mismatched accountant refuses and drops the supplied charge normally.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn from_prepaid<C: PrepaidVectorCopyCharge + 'static>(
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+        charge: C,
+    ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        let mut charge = Some(charge);
+        Self::from_prepaid_retaining_charge(accountant, &mut charge)
+    }
+
+    /// On refusal or callback unwind, the caller still owns its prepaid charge.
+    /// Trace handoff uses this to free buffers before returning their debit.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn from_prepaid_retaining_charge<C: PrepaidVectorCopyCharge + 'static>(
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+        charge: &mut Option<C>,
+    ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        let prepaid = charge.as_ref().expect("pending prepaid charge");
+        // capture969 begin
+        #[cfg(feature = "test-seams")]
+        crate::mem::trace_handoff_cut_for_test(
+            "bridge-borrow",
+            prepaid.credit_address_for_test(),
+            prepaid.retained_bytes(),
+            prepaid.original_payer_identity_for_test(),
+        );
+        // capture969 end
+        if !same_funder(accountant.as_ref(), prepaid.accountant().as_ref()) {
+            return Err(contextdb_core::Error::Other(
+                "vector copy prepaid charge has a different accountant".into(),
+            ));
+        }
+        let prepaid_bytes = prepaid.retained_bytes();
+        let control_invoice = accountant.control_invoice();
+        let prepaid_control_bytes = if prepaid.prepaid_box_control_is_admitted() {
+            0
+        } else {
+            let bytes = std::mem::size_of::<C>();
+            accountant.try_allocate_for_static(
+                bytes,
+                "vector_copy",
+                "prepaid_control",
+                "Raise reader memory to fund the retained copy credit.",
+            )?;
+            bytes
+        };
+        // No provider callback or fallible operation follows the move. Legacy
+        // Box allocation retains its existing process OOM behavior.
+        Ok(Self {
+            accountant,
+            _control_invoice: control_invoice,
+            prepaid: Some(Box::new(charge.take().expect("pending prepaid charge"))),
+            prepaid_bytes,
+            prepaid_control_bytes,
+            additional_bytes: 0,
+            used_bytes: 0,
+            historical_durable_reads: false,
+            raw_only_sources: false,
+        })
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn complete_invoice_for_test(
+        &self,
+        receipt: &mut crate::mem::TraceInvoiceForTest,
+    ) -> Option<&contextdb_core::read_memory::ReadMemoryOwner> {
+        receipt.prepaid_bytes = self.prepaid_bytes;
+        receipt.additional_bytes = self.additional_bytes;
+        receipt.prepaid_control_bytes = self.prepaid_control_bytes;
+        receipt.admission_control_invoice_present = self._control_invoice.is_some();
+        receipt.owner_payload_pointer = self.accountant.accounting_identity();
+        let (payer, control_present, original) = self.accountant.original_read_payer_for_test();
+        receipt.forwarding_payer = payer;
+        receipt.owner_control_invoice_present = control_present;
+        if let Some(charge) = self.prepaid.as_ref() {
+            receipt.original_payer = charge.original_payer_identity_for_test();
+            let layout = std::alloc::Layout::for_value(charge.as_ref());
+            receipt.prepaid_control = (
+                charge.as_ref() as *const _ as *const () as usize,
+                layout.size(),
+                layout.align(),
+            );
+        }
+        original
+    }
+
+    /// Transferable copy reservation, including unused prepaid capacity.
+    /// The token's own control allocation is separate and never transferred.
+    pub fn retained_bytes(&self) -> usize {
+        self.prepaid_bytes + self.additional_bytes
+    }
+
+    /// Report one retained credit and whether its actual funder is the caller.
+    /// Compare retained funders independently of their capability allocations.
+    /// The callback receives scalar observations and cannot obtain the funder.
+    #[doc(hidden)]
+    pub fn visit_retained_copy_credit(
+        credit: &Arc<Self>,
+        caller: &dyn MemoryBudget,
+        visit: &mut dyn FnMut(usize, usize, bool),
+    ) {
+        let funded_by_caller = same_funder(credit.accountant.as_ref(), caller);
+        visit(
+            Arc::as_ptr(credit) as usize,
+            credit.retained_bytes(),
+            funded_by_caller,
+        );
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn reserve(&mut self, bytes: usize) -> Result<()> {
+        self.reserve_for_static(
+            bytes,
+            "vector_copy",
+            "materialize",
+            "Reduce the selected copy or raise the executing statement's memory limit.",
+        )
+    }
+
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn reserve_for(
+        &mut self,
+        bytes: usize,
+        component: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        copy_reservation_observation::note();
+        let used_bytes = self
+            .used_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| contextdb_core::Error::Other("vector copy admission overflow".into()))?;
+        let additional_bytes = used_bytes.saturating_sub(self.prepaid_bytes);
+        if additional_bytes > self.additional_bytes {
+            self.accountant.try_allocate_for(
+                additional_bytes - self.additional_bytes,
+                component,
+                operation,
+                hint,
+            )?;
+        }
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded_scoped(
+            additional_bytes.saturating_sub(self.additional_bytes),
+        );
+        self.additional_bytes = additional_bytes;
+        self.used_bytes = used_bytes;
+        Ok(())
+    }
+
+    /// Static companion for engine-created copy labels; the dynamic host
+    /// entry point above retains its original signature and behavior.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn reserve_for_static(
+        &mut self,
+        bytes: usize,
+        component: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        copy_reservation_observation::note();
+        let used_bytes = self
+            .used_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| contextdb_core::Error::Other("vector copy admission overflow".into()))?;
+        let additional_bytes = used_bytes.saturating_sub(self.prepaid_bytes);
+        if additional_bytes > self.additional_bytes {
+            self.accountant.try_allocate_for_static(
+                additional_bytes - self.additional_bytes,
+                component,
+                operation,
+                hint,
+            )?;
+        }
+        #[cfg(feature = "test-seams")]
+        contextdb_core::family_loads::loaded_scoped(
+            additional_bytes.saturating_sub(self.additional_bytes),
+        );
+        self.additional_bytes = additional_bytes;
+        self.used_bytes = used_bytes;
+        Ok(())
+    }
+
+    /// Consume this token after the destination has adopted `retained_bytes()`.
+    /// No allocation or release occurs here; the destination now releases it.
+    pub fn transfer(mut self) {
+        if let Some(charge) = self.prepaid.take() {
+            charge.transfer();
+        }
+        self.prepaid_bytes = 0;
+        self.additional_bytes = 0;
+    }
+
+    pub(crate) fn accountant(&self) -> &crate::memory_budget::MemoryBudgetOwner {
+        &self.accountant
+    }
+
+    /// A prepaid owner already holds its copy capacity until transfer/drop.
+    #[doc(hidden)]
+    pub fn is_prepaid(&self) -> bool {
+        self.prepaid.is_some()
+    }
+
+    /// Local copies reuse prepaid headroom; other owners get a scoped charge.
+    #[doc(hidden)]
+    pub fn local_scratch(&self) -> Option<Self> {
+        (!self.is_prepaid()).then(|| self.scratch())
+    }
+
+    /// Borrow the admission's actual funder for deterministic ownership proofs.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn accountant_for_test(&self) -> &crate::memory_budget::MemoryBudgetOwner {
+        &self.accountant
+    }
+
+    /// The executing operation's actual funder. An operation-owned loader
+    /// keeps it so the residency it returns is charged to, and released by,
+    /// the same reader that admitted its load, never a store-wide parent.
+    #[doc(hidden)]
+    pub fn funder(&self) -> crate::memory_budget::MemoryBudgetOwner {
+        self.accountant.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn scratch(&self) -> Self {
+        let mut scratch = Self::new(self.accountant.clone());
+        scratch.historical_durable_reads = self.historical_durable_reads;
+        scratch.raw_only_sources = self.raw_only_sources;
+        scratch
+    }
+
+    /// Internal execution intent for a route already resolved to exact. Raw
+    /// membership/root capture remains required; graph suppliers do not exist
+    /// on this route and must not be constructed and immediately discarded.
+    #[doc(hidden)]
+    pub fn with_raw_only_sources<T>(
+        &mut self,
+        raw_only: bool,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        struct Restore<'a> {
+            owner: &'a mut VectorCopyAdmission,
+            previous: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.owner.raw_only_sources = self.previous;
+            }
+        }
+        let previous = self.raw_only_sources;
+        self.raw_only_sources = raw_only;
+        let restore = Restore {
+            owner: self,
+            previous,
+        };
+        operation(restore.owner)
+    }
+
+    /// Route durable reads through the operation's captured authority. This
+    /// routing preference does not itself authenticate a capture or a body.
+    #[doc(hidden)]
+    pub fn with_historical_durable_reads<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        struct Restore<'a> {
+            owner: &'a mut VectorCopyAdmission,
+            prior: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.owner.historical_durable_reads = self.prior;
+            }
+        }
+        let prior = self.historical_durable_reads;
+        self.historical_durable_reads = true;
+        let restore = Restore { owner: self, prior };
+        operation(restore.owner)
+    }
+
+    pub(crate) fn historical_durable_reads(&self) -> bool {
+        self.historical_durable_reads
+    }
+}
+
+/// A local copy and only its own charge. Field order frees the value first.
+/// Returned and retained outputs keep their existing caller-owned admissions.
+#[doc(hidden)]
+pub struct ScopedVectorCopy<T> {
+    value: T,
+    _admission: Option<VectorCopyAdmission>,
+}
+
+impl<T> ScopedVectorCopy<T> {
+    /// A native value and its per-value charge. Declaration order ensures
+    /// the complete decoded value drops before the admission is released.
+    #[doc(hidden)]
+    pub fn from_admitted(value: T, admission: Option<VectorCopyAdmission>) -> Self {
+        Self {
+            value,
+            _admission: admission,
+        }
+    }
+
+    /// Transform while source and output coexist under the same admitted
+    /// window; on every exit the source buffer drops before its token.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn try_map<U>(
+        self,
+        materialize: impl FnOnce(&T) -> Result<U>,
+    ) -> Result<ScopedVectorCopy<U>> {
+        let value = materialize(&self.value)?;
+        drop(self.value);
+        Ok(ScopedVectorCopy {
+            value,
+            _admission: self._admission,
+        })
+    }
+
+    /// Only for provider paths whose allocation is already funded elsewhere.
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn into_already_funded(self) -> Result<T> {
+        if self._admission.is_some() {
+            return Err(contextdb_core::Error::Other(
+                "admitted value cannot detach its charge".into(),
+            ));
+        }
+        Ok(self.value)
+    }
+
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn new(
+        owner: &mut VectorCopyAdmission,
+        materialize: impl FnOnce(&mut VectorCopyAdmission) -> Result<T>,
+    ) -> Result<Self> {
+        let mut admission = owner.local_scratch();
+        let value = materialize(admission.as_mut().unwrap_or(owner))?;
+        Ok(Self {
+            value,
+            _admission: admission,
+        })
+    }
+}
+
+impl<T> std::ops::Deref for ScopedVectorCopy<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for ScopedVectorCopy<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+/// Workspace-internal layout copy; public layout fields remain unchanged.
+#[doc(hidden)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub fn scoped_index_layout(
+    store: &crate::VectorStore,
+    index: &contextdb_core::VectorIndexRef,
+    owner: &mut VectorCopyAdmission,
+) -> Result<ScopedVectorCopy<crate::store::VectorIndexLayout>> {
+    ScopedVectorCopy::new(owner, |scratch| store.index_layout(index, scratch))
+}
+
+impl<T> ScopedVectorCopy<Vec<T>> {
+    #[allow(clippy::should_implement_trait)] // Conversion must retain this scoped copy's admission token.
+    pub fn into_iter(self) -> ScopedVectorCopy<std::vec::IntoIter<T>> {
+        ScopedVectorCopy {
+            value: self.value.into_iter(),
+            _admission: self._admission,
+        }
+    }
+}
+
+impl<I: Iterator> Iterator for ScopedVectorCopy<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.value.next()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ScopedVectorCopy<Vec<T>> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.value.iter()
+    }
+}
+
+impl Drop for VectorCopyAdmission {
+    fn drop(&mut self) {
+        // Its original payload invoice refunds itself, but the Box holding
+        // that token also needs admission through its own physical free.
+        drop(self.prepaid.take());
+        if self.additional_bytes != 0 {
+            self.accountant.release(self.additional_bytes);
+        }
+        if self.prepaid_control_bytes != 0 {
+            self.accountant.release(self.prepaid_control_bytes);
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 struct UnlimitedMemoryBudget;
 
+#[cfg(test)]
 impl MemoryBudget for UnlimitedMemoryBudget {
     fn try_allocate_for(
         &self,
@@ -69,6 +977,7 @@ impl MemoryBudget for UnlimitedMemoryBudget {
     fn release(&self, _bytes: usize) {}
 }
 
+#[cfg(test)]
 pub(crate) fn unlimited_memory_budget() -> Arc<dyn MemoryBudget> {
     Arc::new(UnlimitedMemoryBudget)
 }
@@ -77,22 +986,83 @@ pub(crate) fn unlimited_memory_budget() -> Arc<dyn MemoryBudget> {
 /// move together and are both returned by this value's single `Drop`.
 #[doc(hidden)]
 pub struct VectorWorkspaceReservation {
-    accountant: Arc<dyn MemoryBudget>,
+    accountant: crate::memory_budget::MemoryBudgetOwner,
     live_bytes: Arc<AtomicUsize>,
     bytes: usize,
+    _control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
 impl VectorWorkspaceReservation {
+    pub fn accountant(&self) -> &crate::memory_budget::MemoryBudgetOwner {
+        &self.accountant
+    }
+
+    /// Complete capacity held by this workspace's actual funder.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The destination has adopted this funding. End workspace residency
+    /// without returning the same funding a second time.
+    pub fn transfer(mut self) {
+        let previous = self.live_bytes.fetch_sub(self.bytes, Ordering::SeqCst);
+        debug_assert!(previous >= self.bytes);
+        self.bytes = 0;
+    }
+
+    /// Validate a materialization against this already admitted workspace.
+    /// The caller retains this reservation until all copied output is dropped.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn require_capacity(&self, bytes: usize) -> Result<()> {
+        require_copy_capacity(self.bytes, bytes)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new(
-        accountant: Arc<dyn MemoryBudget>,
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
         live_bytes: Arc<AtomicUsize>,
         bytes: usize,
         operation: &str,
         hint: &str,
     ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
         accountant.try_allocate_for(bytes, "vector_index", operation, hint)?;
         live_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let control_invoice = accountant.control_invoice();
         Ok(Self {
+            _control_invoice: control_invoice,
+            accountant,
+            live_bytes,
+            bytes,
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn try_new_static(
+        accountant: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+        live_bytes: Arc<AtomicUsize>,
+        bytes: usize,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<Self> {
+        let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
+
+        accountant.try_allocate_for_static(bytes, "vector_index", operation, hint)?;
+        live_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let control_invoice = accountant.control_invoice();
+        Ok(Self {
+            _control_invoice: control_invoice,
             accountant,
             live_bytes,
             bytes,
@@ -103,6 +1073,10 @@ impl VectorWorkspaceReservation {
     /// and before new owners allocate. Refusal preserves the old token and
     /// charge; success changes the token and the live workspace counter once.
     #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn resize(&mut self, bytes: usize, operation: &str, hint: &str) -> Result<()> {
         self.accountant.transition_reservation_for(
             self.bytes,
@@ -122,18 +1096,63 @@ impl VectorWorkspaceReservation {
         self.bytes = bytes;
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn resize_static(
+        &mut self,
+        bytes: usize,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Result<()> {
+        self.accountant.transition_reservation_for_static(
+            self.bytes,
+            bytes,
+            "vector_index",
+            operation,
+            hint,
+        )?;
+        if bytes > self.bytes {
+            let additional = bytes - self.bytes;
+            self.live_bytes.fetch_add(additional, Ordering::SeqCst);
+        } else if bytes < self.bytes {
+            let released = self.bytes - bytes;
+            let previous = self.live_bytes.fetch_sub(released, Ordering::SeqCst);
+            debug_assert!(previous >= released);
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl PrepaidVectorCopyCharge for VectorWorkspaceReservation {
+    fn accountant(&self) -> crate::memory_budget::MemoryBudgetOwner {
+        self.accountant.clone()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn transfer(self: Box<Self>) {
+        VectorWorkspaceReservation::transfer(*self);
+    }
 }
 
 impl Drop for VectorWorkspaceReservation {
     fn drop(&mut self) {
         let previous = self.live_bytes.fetch_sub(self.bytes, Ordering::SeqCst);
         debug_assert!(previous >= self.bytes);
-        self.accountant.release(self.bytes);
+        if self.bytes != 0 {
+            self.accountant.release(self.bytes);
+        }
         self.bytes = 0;
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep related test helpers and runtime seams together.
 mod tests {
     use super::*;
 
@@ -170,7 +1189,123 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn resizing_workspace_moves_one_charge_between_ownership_phases() {
+        // Additive historical-route ownership rows of the existing workspace host.
+        // The flag is crate-private; this module reaches it without a forwarding seam.
+        let routing_budget = Arc::new(CountingBudget::default());
+        let initial = routing_budget.0.load(Ordering::SeqCst);
+        let bytes = b"historical routing".len();
+        let mut owner = VectorCopyAdmission::new(routing_budget.clone());
+        assert!(!owner.historical_durable_reads());
+        owner.reserve(bytes).unwrap();
+        let retained = routing_budget.0.load(Ordering::SeqCst);
+        assert_eq!(retained, initial + bytes);
+        owner.with_historical_durable_reads(|marked| {
+            assert!(marked.historical_durable_reads());
+            let mut scratch = marked.scratch();
+            assert!(scratch.historical_durable_reads());
+            assert!(std::ptr::addr_eq(
+                scratch.accountant().as_ref(),
+                marked.accountant().as_ref()
+            ));
+            scratch.reserve(bytes).unwrap();
+            assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained + bytes);
+            drop(scratch);
+            assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained);
+            let local = marked.local_scratch().unwrap();
+            assert!(local.historical_durable_reads());
+            assert!(std::ptr::addr_eq(
+                local.accountant().as_ref(),
+                marked.accountant().as_ref()
+            ));
+            drop(local);
+            marked.with_historical_durable_reads(|nested| {
+                assert!(nested.historical_durable_reads());
+            });
+            assert!(marked.historical_durable_reads());
+            let failure: Result<()> = marked.with_historical_durable_reads(|nested| {
+                assert!(nested.historical_durable_reads());
+                Err(contextdb_core::Error::Other("routing control error".into()))
+            });
+            assert!(failure.is_err());
+            assert!(marked.historical_durable_reads());
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                marked.with_historical_durable_reads(|nested| {
+                    assert!(nested.historical_durable_reads());
+                    panic!("routing control unwind");
+                });
+            }));
+            assert!(panic.is_err());
+            assert!(marked.historical_durable_reads());
+            assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained);
+        });
+        assert!(!owner.historical_durable_reads());
+        drop(owner);
+        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial);
+        let prepaid_live = Arc::new(AtomicUsize::new(0));
+        let charge = VectorWorkspaceReservation::try_new(
+            routing_budget.clone(),
+            prepaid_live.clone(),
+            bytes,
+            "routing",
+            "control",
+        )
+        .unwrap();
+        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial + bytes);
+        let prepaid_control_bytes = std::mem::size_of::<VectorWorkspaceReservation>();
+        let mut prepaid =
+            VectorCopyAdmission::from_prepaid(routing_budget.clone(), charge).unwrap();
+        assert!(!prepaid.historical_durable_reads());
+        assert!(std::ptr::addr_eq(
+            prepaid.accountant().as_ref(),
+            routing_budget.as_ref()
+        ));
+        assert_eq!(prepaid.retained_bytes(), bytes);
+        assert_eq!(prepaid_live.load(Ordering::SeqCst), bytes);
+        assert_eq!(
+            routing_budget.0.load(Ordering::SeqCst),
+            initial + bytes + prepaid_control_bytes
+        );
+        #[cfg(feature = "test-seams")]
+        let prepaid_invoice = {
+            let mut invoice = crate::mem::TraceInvoiceForTest::default();
+            prepaid.complete_invoice_for_test(&mut invoice);
+            assert_eq!(invoice.prepaid_bytes, bytes);
+            assert_eq!(invoice.additional_bytes, 0);
+            assert_eq!(invoice.prepaid_control_bytes, prepaid_control_bytes);
+            assert_ne!(invoice.prepaid_control.0, 0);
+            assert_eq!(invoice.prepaid_control.1, prepaid_control_bytes);
+            assert_eq!(
+                invoice.prepaid_control.2,
+                std::mem::align_of::<VectorWorkspaceReservation>()
+            );
+            invoice
+        };
+        prepaid.with_historical_durable_reads(|marked| {
+            assert!(marked.local_scratch().is_none());
+            marked.reserve(bytes).unwrap();
+            assert!(marked.historical_durable_reads());
+            assert_eq!(
+                routing_budget.0.load(Ordering::SeqCst),
+                initial + bytes + prepaid_control_bytes
+            );
+            assert_eq!(marked.retained_bytes(), bytes);
+            assert_eq!(prepaid_live.load(Ordering::SeqCst), bytes);
+            #[cfg(feature = "test-seams")]
+            {
+                let mut invoice = crate::mem::TraceInvoiceForTest::default();
+                marked.complete_invoice_for_test(&mut invoice);
+                assert_eq!(invoice, prepaid_invoice);
+            }
+        });
+        assert!(!prepaid.historical_durable_reads());
+        drop(prepaid);
+        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial);
+        assert_eq!(prepaid_live.load(Ordering::SeqCst), 0);
         let budget = Arc::new(CountingBudget::default());
         let live = Arc::new(AtomicUsize::new(0));
         let mut reservation =
@@ -201,3 +1336,27 @@ mod tests {
         assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 }
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn require_copy_capacity(capacity: usize, bytes: usize) -> Result<()> {
+    if bytes > capacity {
+        return Err(contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: "vector_copy".into(),
+            operation: "materialize_in_workspace".into(),
+            requested_bytes: bytes,
+            available_bytes: capacity,
+            budget_limit_bytes: capacity,
+            hint: "Admit the generation copy before materialization.".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-seams")]
+mod copy_reservation_observation;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use copy_reservation_observation::observe_copy_reservations_for_test;

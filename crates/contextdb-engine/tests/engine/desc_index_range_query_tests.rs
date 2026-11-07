@@ -51,12 +51,16 @@ fn seed(db: &Database, values: &[i64]) {
     }
 }
 
+#[expect(
+    clippy::into_iter_on_ref,
+    reason = "The fixture iterates the borrowed query-result rows without consuming the retained answer."
+)]
 fn query_scores(db: &Database, sql: &str, extra: Vec<(&str, Value)>) -> Vec<i64> {
     let result = db
         .execute(sql, &params(extra))
         .unwrap_or_else(|err| panic!("query `{sql}` must not error: {err:?}"));
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row[0] {
             Value::Int64(n) => n,
@@ -198,6 +202,10 @@ fn single_point_between_on_a_desc_indexed_integer_column_returns_the_matching_ro
 /// `nan_real_predicate_tests.rs`'s ASC-index / non-indexed coverage, this
 /// pin is the DESC-index leg of that same promise).
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn nan_bounded_range_query_on_a_desc_indexed_real_column_returns_empty_without_panic() {
     let db = Database::open_memory();
     db.execute(
@@ -241,10 +249,10 @@ fn nan_bounded_range_query_on_a_desc_indexed_real_column_returns_empty_without_p
     });
     let result = result.expect("a NaN-bounded range query must not return a typed error either");
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "a NaN-bounded range query on a DESC index must return empty, matching the ASC/\
          non-indexed behavior: {:?}",
-        result.rows
+        result.rows()
     );
 }
 
@@ -276,14 +284,14 @@ fn query_a_via_composite(
         .execute(sql, &params(extra))
         .unwrap_or_else(|err| panic!("query `{sql}` must not error: {err:?}"));
     let values = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(n) => n,
             ref other => panic!("expected an INTEGER a, got {other:?}"),
         })
         .collect();
-    (values, result.trace)
+    (values, result.trace().clone())
 }
 
 /// The DESC-leading-column fix has two arms in the executor: single-column

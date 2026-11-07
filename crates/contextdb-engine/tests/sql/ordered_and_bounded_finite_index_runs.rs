@@ -96,7 +96,7 @@ fn assert_ordered_result(
     expected_sort_elided: bool,
 ) {
     let actual = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(value)] => *value,
@@ -108,21 +108,22 @@ fn assert_ordered_result(
         "{route} {transaction} read over the {index_direction} index must honor {order_by}"
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("finite_order_a_b"),
         "the composite index must supply the {route} {transaction} read: {:?}",
-        result.trace
+        result.trace()
     );
     assert_eq!(
-        result.trace.predicates_pushed.len(),
+        result.trace().predicates_pushed.len(),
         2,
         "both finite prefix columns must remain pushed: {:?}",
-        result.trace
+        result.trace()
     );
     assert_eq!(
-        result.trace.sort_elided, expected_sort_elided,
+        result.trace().sort_elided,
+        expected_sort_elided,
         "{route} must report whether its physical index walk supplies {order_by}: {:?}",
-        result.trace,
+        result.trace(),
     );
 }
 
@@ -165,7 +166,7 @@ fn contradictory_null_predicates() -> [&'static str; 8] {
 
 fn sorted_ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     let mut ids = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -183,8 +184,14 @@ fn assert_read_paths_match(
     expected_pushed: usize,
 ) {
     let sql = format!("SELECT id FROM finite_nulls WHERE {predicate}");
-    let eager = execute_eager_for_test(db, &sql, &empty())
-        .expect("the eager executor must preserve NULL predicate semantics");
+    let eager = execute_eager_for_test(
+        db,
+        &sql,
+        &empty(),
+        db.declared_reader_memory()
+            .expect("admit the eager fixture reader"),
+    )
+    .expect("the eager executor must preserve NULL predicate semantics");
     let ordinary = db
         .execute(&sql, &empty())
         .expect("ordinary execution must preserve NULL predicate semantics");
@@ -205,16 +212,16 @@ fn assert_read_paths_match(
             "{route} execution returned the wrong rows for {predicate}"
         );
         assert_eq!(
-            result.trace.index_used.as_deref(),
+            result.trace().index_used.as_deref(),
             Some("finite_nulls_lead_suffix"),
             "{route} execution must exercise the nullable composite index for {predicate}: {:?}",
-            result.trace
+            result.trace()
         );
         assert_eq!(
-            result.trace.predicates_pushed.len(),
+            result.trace().predicates_pushed.len(),
             expected_pushed,
             "{route} execution pushed the wrong finite prefix for {predicate}: {:?}",
-            result.trace
+            result.trace()
         );
     }
 }
@@ -237,7 +244,8 @@ fn is_null_beside_equality_crashes_the_query() {
             )
             .expect("a contradictory nullable indexed UPDATE must complete");
         assert_eq!(
-            update.rows_affected, 0,
+            update.rows_affected(),
+            0,
             "a contradictory nullable indexed UPDATE changed rows for {predicate}"
         );
 
@@ -248,7 +256,8 @@ fn is_null_beside_equality_crashes_the_query() {
             )
             .expect("a contradictory nullable indexed DELETE must complete");
         assert_eq!(
-            delete.rows_affected, 0,
+            delete.rows_affected(),
+            0,
             "a contradictory nullable indexed DELETE changed rows for {predicate}"
         );
     }
@@ -256,11 +265,11 @@ fn is_null_beside_equality_crashes_the_query() {
     let unchanged = db
         .execute("SELECT marker FROM finite_nulls", &empty())
         .expect("read rows after contradictory writes");
-    assert_eq!(unchanged.rows.len(), 4);
+    assert_eq!(unchanged.rows().len(), 4);
     assert!(
-        unchanged.rows.iter().all(|row| row == &[Value::Int64(0)]),
+        unchanged.rows().iter().all(|row| row == &[Value::Int64(0)]),
         "contradictory UPDATE/DELETE predicates must leave every row unchanged: {:?}",
-        unchanged.rows
+        unchanged.rows()
     );
 }
 
@@ -294,8 +303,14 @@ fn unsorted_suffix_in_runs_preserve_requested_order_across_read_paths_and_transa
             ] {
                 let sql =
                     format!("SELECT b FROM finite_order WHERE a = 7 AND b IN (3, 1, 2) {order_by}");
-                let eager = execute_eager_for_test(&db, &sql, &empty())
-                    .expect("the eager executor must answer the finite runs");
+                let eager = execute_eager_for_test(
+                    &db,
+                    &sql,
+                    &empty(),
+                    db.declared_reader_memory()
+                        .expect("admit the eager fixture reader"),
+                )
+                .expect("the eager executor must answer the finite runs");
                 assert_ordered_result(
                     &eager,
                     expected,
@@ -338,7 +353,7 @@ fn unsorted_suffix_in_runs_preserve_requested_order_across_read_paths_and_transa
                     order_by,
                     true,
                 );
-                assert_eq!(bounded.result.rows, ordinary.rows);
+                assert_eq!(bounded.result.rows(), ordinary.rows());
             }
             if staged_middle {
                 db.execute("ROLLBACK", &empty())
@@ -432,11 +447,12 @@ fn suffix_list_statement(list_len: usize) -> (String, HashMap<String, Value>) {
 }
 
 fn assert_cost_result(result: &contextdb_engine::QueryResult, expected_index: &str, pushed: usize) {
-    assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
-    assert_eq!(result.trace.index_used.as_deref(), Some(expected_index));
-    assert_eq!(result.trace.predicates_pushed.len(), pushed);
+    assert_eq!(result.rows(), vec![vec![Value::Int64(1)]]);
+    assert_eq!(result.trace().index_used.as_deref(), Some(expected_index));
+    assert_eq!(result.trace().predicates_pushed.len(), pushed);
     assert_eq!(
-        result.trace.rows_examined, 1,
+        result.trace().rows_examined,
+        1,
         "only the one stored key in the 10,000-value finite scope is examined"
     );
 }
@@ -465,7 +481,7 @@ fn execute_with_comparison_bound(
     )
     .expect("bounded execution must plan and answer the large finite scope");
     assert_cost_result(&bounded.result, expected_index, pushed);
-    assert_eq!(bounded.result.rows, ordinary.rows);
+    assert_eq!(bounded.result.rows(), ordinary.rows());
     let bounded_operations = bounded_guard.operations();
     assert!(bounded_operations.comparisons() > 0);
     assert!(bounded_operations.equality_checks() > 0);

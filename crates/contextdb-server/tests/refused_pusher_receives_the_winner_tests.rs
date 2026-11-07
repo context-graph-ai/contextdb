@@ -87,7 +87,7 @@ fn holder(db: &Database, key: &str) -> Option<String> {
             &HashMap::from([("claim_key".to_string(), Value::Text(key.to_string()))]),
         )
         .expect("claim scan");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(holder) => holder.clone(),
         other => panic!("expected a text holder, got {other:?}"),
     })
@@ -119,7 +119,8 @@ fn start_hub(broker: &InProcessBroker, tenant: &str) -> RunningHub {
             TenantId::from(tenant),
             hub_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -146,6 +147,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> Sy
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 #[tokio::test]

@@ -28,27 +28,67 @@
 // integration proofs. Its reexports and the child APIs those proofs exercise
 // intentionally have no default-build consumer; production uses the private
 // operational subset instead.
-#![cfg_attr(not(feature = "test-seams"), allow(unused_imports, dead_code))]
 
 mod address;
 mod authentication;
 mod carrier;
-mod deadlines;
+pub(crate) mod deadlines;
 mod engine_answer;
 mod framing;
+pub(crate) mod inbound_query;
+#[cfg(target_os = "linux")]
+pub(crate) mod native_driver;
+pub(crate) mod query_funding;
 mod runtime;
 mod stale;
+mod terminal;
+pub(crate) use terminal::{write_query_diagnostic, write_query_error, write_query_refusal};
 
 #[cfg(unix)]
 pub use address::ChannelKernelAddress;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
+)]
 pub use address::{channel_socket_path, derive_channel_address, opaque_channel_basename};
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from authentication.rs"
+    )
+)]
 pub use authentication::{
     AdmittedReader, authenticate_framed_stream_handshake, authenticate_stream_handshake,
 };
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from authentication.rs"
+    )
+)]
 pub use authentication::{ReadPrincipal, authenticate_peer, peer_user_from_stream};
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from carrier.rs"
+    )
+)]
 pub use carrier::{StaleRemovalInterlock, UnixLocalCarrier};
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+    )
+)]
 pub use deadlines::{
     DeadlineOperationWait, DeadlineStage, LocalDeadlineOperation, ManualDeadlineClock,
     MonotonicDeadlineClock, connect_with_deadline, drain_shutdown_with_deadline,
@@ -57,7 +97,24 @@ pub use deadlines::{
     retry_route_with_deadline, serve_request_with_deadline, write_request_with_deadline,
 };
 #[cfg(any(test, feature = "test-seams"))]
-pub use deadlines::{reset_timer_threads_started_for_test, timer_threads_started_for_test};
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from deadlines.rs"
+    )
+)]
+pub use deadlines::{
+    fail_next_timer_arms_for_test, reset_timer_threads_started_for_test,
+    timer_threads_started_for_test,
+};
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from engine_answer.rs"
+    )
+)]
 pub use engine_answer::{
     ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED, TAG_BFS_DEPTH_EXCEEDED,
     TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND, TAG_COLUMN_TYPE_MISMATCH,
@@ -81,6 +138,21 @@ pub use engine_answer::{
     TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
     TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, TAG_WINDOW_FUNCTION_NOT_SUPPORTED, body_grammar,
 };
+#[cfg_attr(
+    not(feature = "iroh"),
+    expect(
+        unused_imports,
+        reason = "Only the Iroh sync transport uses these re-exports."
+    )
+)]
+pub(crate) use engine_answer::{BLOB_SOURCE_REFUSAL_MAX_BYTES, encode_read_error_into_slice};
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_refusal_taxonomy.rs"
+    )
+)]
 pub use framing::{
     AssembledOrdinaryResult, CursorCloseAcknowledgement, CursorOpenedResponse, CursorPageResponse,
     FrameBufferAllocator, FrameReader, FrameViolation, LocalConfigurationSource,
@@ -94,14 +166,38 @@ pub use framing::{
     frame_length_prefix, read_payload_with_admission, receive_framed_ordinary_result,
     split_canonical_result, split_payload_answer, validate_handshake,
 };
+#[cfg_attr(
+    not(feature = "iroh"),
+    expect(
+        unused_imports,
+        reason = "Only the Iroh sync transport uses these re-exports."
+    )
+)]
 pub(crate) use framing::{
-    preflight_canonical_query_result, preflight_cursor_page_payload,
-    preflight_metadata_page_payload, response_is_encodable,
+    FundedOrdinaryResult, FundedResultReceiveOutcome, decode_read_error_under_memory_ceiling,
+    observed_cursor_page_allocation_bytes, preflight_canonical_query_result,
+    preflight_cursor_page_payload, preflight_metadata_page_payload,
+    preflight_observed_cursor_page_payload, response_is_encodable, split_canonical_result_funded,
+    split_payload_answer_funded,
 };
 pub use runtime::RuntimeDirectory;
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub use runtime::linux_filesystem_type_is_local;
 pub(crate) use runtime::runtime_directory_for_store;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deep_runtime_directory.rs"
+    )
+)]
 pub use runtime::{
     ChannelPathFacts, ChannelPathViolation, LocalPlatformAvailability, OWNER_ONLY_MODE,
     ProcessRuntimeDirectoryEnvironment, ResolvedRuntimeDirectory, RuntimeDirectoryEnvironment,
@@ -113,12 +209,26 @@ pub use runtime::{
     validate_channel_addressability, validate_channel_path, validate_runtime_root,
     validate_socket_path_length,
 };
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+    )
+)]
 pub use stale::{
     ChannelFilesystemIdentity, FinalStaleIdentityObservation, LivenessEvidence, StaleChannelAction,
     StaleChannelEvidence, StaleFilesystemEvidence, StaleIdentityEvidence,
     decide_stale_channel_action,
 };
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
+    )
+)]
 pub use stale::{
     StaleChannelProbe, channel_filesystem_identity, reconcile_stale_channel,
     remove_own_bound_channel,
@@ -143,13 +253,52 @@ pub const LOCAL_PROTOCOL_MARKER: [u8; 20] = *b"contextdb-local-read";
 /// bytes that are not the shape it expected.
 ///
 /// The golden byte fixtures are what make such a change impossible to miss.
-pub const LOCAL_PROTOCOL_VERSION: u16 = 4;
+pub const LOCAL_PROTOCOL_VERSION: u16 = 5;
 /// A complete local payload may be no larger than four mebibytes.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum LocalTransportError {
+    /// A genuine provider's original non-budget error moves unchanged.
+    #[error("reader operation admission failed: {0}")]
+    OriginalAdmission(contextdb_core::Error),
+    /// Original output/control admission fields. This is private transport
+    /// plumbing; the existing engine-error document carries it on the wire.
+    #[error(
+        "reader memory admission failed for {subsystem}/{operation}: requested {requested_bytes}, available {available_bytes}, limit {budget_limit_bytes}; {hint}"
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
+    MemoryAdmission {
+        subsystem: contextdb_core::error::DiagnosticLabel,
+        operation: contextdb_core::error::DiagnosticLabel,
+        requested_bytes: usize,
+        available_bytes: usize,
+        budget_limit_bytes: usize,
+        hint: contextdb_core::error::DiagnosticLabel,
+    },
+    #[error("native reader admission failed: {0:?}")]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from iroh.rs"
+        )
+    )]
+    NativeAdmission(contextdb_core::read_memory::NativeRefusal),
     #[error("local transport is not implemented")]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from bounded.rs"
+        )
+    )]
     Unimplemented,
     #[error("peer credentials are unavailable")]
     CredentialsUnavailable,
@@ -172,9 +321,31 @@ pub enum LocalTransportError {
 }
 
 impl LocalTransportError {
-    #[allow(dead_code)]
-    pub(crate) const fn unimplemented() -> Self {
-        Self::Unimplemented
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn into_admission_error(self) -> Result<contextdb_core::Error, Self> {
+        match self {
+            Self::OriginalAdmission(error) => Ok(error),
+            Self::MemoryAdmission {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            } => Ok(contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            }),
+            Self::NativeAdmission(error) => Ok(contextdb_core::Error::NativeEngineOther(error)),
+            other => Err(other),
+        }
     }
 }
 
@@ -194,6 +365,9 @@ pub(crate) fn invalid_channel_data() -> LocalTransportError {
 /// framing and payloads still name invalid channel data.
 pub(crate) fn response_decode_refusal(error: LocalTransportError) -> LocalTransportError {
     match error {
+        LocalTransportError::MemoryAdmission { .. }
+        | LocalTransportError::NativeAdmission(_)
+        | LocalTransportError::OriginalAdmission(_) => error,
         LocalTransportError::Payload(framing::PayloadViolation::MemoryCeilingExceeded {
             ..
         }) => error,
@@ -206,11 +380,16 @@ pub(crate) fn response_decode_refusal(error: LocalTransportError) -> LocalTransp
 /// already says "a read went past a ceiling it declared", so no new refusal
 /// kind is invented here: this one names MEMORY and the number that was in
 /// force, which is what a caller has to know to raise it.
-pub(crate) fn memory_ceiling_read_failure(ceiling: u64) -> ReadFailure {
+pub(crate) fn memory_ceiling_read_failure(ceiling: u64, required: Option<u64>) -> ReadFailure {
     ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail {
         limit: ReadFailureLimit::Memory,
         value: ceiling,
-        required: None,
+        required: required.map(|required_bytes| {
+            contextdb_core::read_contract::RequiredBytesSetting {
+                required_bytes,
+                required_setting: "reader memory".into(),
+            }
+        }),
         statement: None,
     })
 }
@@ -252,3 +431,50 @@ pub(crate) fn frame_read_refusal(error: LocalTransportError) -> LocalTransportEr
         other => other,
     }
 }
+
+pub(crate) use deadlines::{deadline_operation_funded, deadline_operation_owned, wait_until_owned};
+
+impl PartialEq for LocalTransportError {
+    fn eq(&self, other: &Self) -> bool {
+        use LocalTransportError::*;
+        match (self, other) {
+            (Unimplemented, Unimplemented)
+            | (CredentialsUnavailable, CredentialsUnavailable)
+            | (PlatformUnsupported, PlatformUnsupported)
+            | (StaleChannelUnverifiable, StaleChannelUnverifiable) => true,
+            (FilesystemInspection(a), FilesystemInspection(b)) => a == b,
+            (RuntimeRoot(a), RuntimeRoot(b)) => a == b,
+            (ChannelPath(a), ChannelPath(b)) => a == b,
+            (Frame(a), Frame(b)) => a == b,
+            (Payload(a), Payload(b)) => a == b,
+            (Refusal(a), Refusal(b)) => a == b,
+            (NativeAdmission(a), NativeAdmission(b)) => a == b,
+            // Original Error is deliberately move-only and has no value Eq.
+            // Preserve its unique identity without formatting/copying it.
+            (OriginalAdmission(a), OriginalAdmission(b)) => std::ptr::eq(a, b),
+            (
+                MemoryAdmission {
+                    subsystem: a,
+                    operation: b,
+                    requested_bytes: c,
+                    available_bytes: d,
+                    budget_limit_bytes: e,
+                    hint: f,
+                },
+                MemoryAdmission {
+                    subsystem: g,
+                    operation: h,
+                    requested_bytes: i,
+                    available_bytes: j,
+                    budget_limit_bytes: k,
+                    hint: l,
+                },
+            ) => **a == **g && **b == **h && c == i && d == j && e == k && **f == **l,
+            _ => false,
+        }
+    }
+}
+impl Eq for LocalTransportError {}
+
+#[cfg(unix)]
+pub(crate) use authentication::authenticate_framed_stream_handshake_funded;

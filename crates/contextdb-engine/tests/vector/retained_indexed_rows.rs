@@ -126,7 +126,7 @@ fn an_indexed_update_keeps_the_complete_disk_row_after_reopen() {
             )
             .expect("an index scan returns the complete row before the update");
         assert_eq!(
-            selected.rows,
+            selected.rows(),
             vec![vec![Value::Text(body.clone()), expected_vector()]],
             "the index posting resolves to the durable text and quantized vector, not its compact directory"
         );
@@ -148,7 +148,7 @@ fn an_indexed_update_keeps_the_complete_disk_row_after_reopen() {
         )
         .expect("a primary-key read returns the replacement");
     assert_eq!(
-        by_key.rows,
+        by_key.rows(),
         vec![vec![
             Value::Text(body.clone()),
             expected_vector(),
@@ -164,7 +164,7 @@ fn an_indexed_update_keeps_the_complete_disk_row_after_reopen() {
         )
         .expect("the retained vector remains rankable after the replacement");
     assert_eq!(
-        ranked.rows,
+        ranked.rows(),
         vec![vec![
             Value::Uuid(id),
             Value::Text(body.clone()),
@@ -184,18 +184,19 @@ fn an_indexed_update_keeps_the_complete_disk_row_after_reopen() {
     )
     .expect("the complete indexed row fits the statement's existing bounded read limits");
     assert_eq!(
-        bounded.result.rows,
+        bounded.result.rows(),
         vec![vec![Value::Text(body), expected_vector()]],
         "the bounded read agrees with the eager index scan"
     );
     assert_eq!(
-        bounded.result.trace.physical_plan, "IndexScan",
+        bounded.result.trace().physical_plan,
+        "IndexScan",
         "the bounded read keeps using the declared index"
     );
     assert!(
-        bounded.result.trace.rows_examined <= 1,
+        bounded.result.trace().rows_examined <= 1,
         "the one-row indexed read examined {} postings, so it must not hide a table scan",
-        bounded.result.trace.rows_examined
+        bounded.result.trace().rows_examined
     );
     reopened.close().expect("close the reopened writer");
 }
@@ -275,8 +276,8 @@ fn eager_indexed_projection_loads_only_selected_vector_bodies() {
             &empty(),
         )
         .expect("the eager index scan projects only ids");
-    assert_eq!(ids.rows.len(), matching as usize);
-    assert_eq!(ids.trace.physical_plan, "IndexScan");
+    assert_eq!(ids.rows().len(), matching as usize);
+    assert_eq!(ids.trace().physical_plan, "IndexScan");
     assert_eq!(
         unselected_work.counters().decoded_vectors,
         0,
@@ -289,19 +290,27 @@ fn eager_indexed_projection_loads_only_selected_vector_bodies() {
         "an unselected vector partition stays dormant"
     );
 
+    let selected_work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
     let vectors = database
         .execute(
             "SELECT embedding FROM projected_rows WHERE group_name = 'wanted'",
             &empty(),
         )
         .expect("the eager index scan projects the selected vectors");
-    assert_eq!(vectors.rows.len(), matching as usize);
-    assert_eq!(vectors.trace.physical_plan, "IndexScan");
+    assert_eq!(vectors.rows().len(), matching as usize);
+    assert_eq!(vectors.trace().physical_plan, "IndexScan");
     let activity_after_selected = database.__vector_passive_activity_counters_for_test();
     assert_eq!(
         activity_after_selected.raw_partition_loads - activity_after_unselected.raw_partition_loads,
-        1,
-        "selecting vectors loads only their one bounded partition"
+        0,
+        "projecting selected bodies does not hydrate a complete partition"
+    );
+    assert_eq!(selected_work.counters().decoded_vectors, matching as u64);
+    assert!(
+        vectors
+            .rows()
+            .iter()
+            .all(|row| row == &vec![expected_vector()])
     );
     database.close().expect("close the projection fixture");
 }
@@ -382,7 +391,7 @@ fn indexed_graph_anchor_resolution_does_not_load_unselected_vectors() {
             &empty(),
         )
         .expect("resolve the graph anchor through its relational index");
-    assert_eq!(result.rows, vec![vec![Value::Uuid(target)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Uuid(target)]]);
     let after = database.__vector_passive_activity_counters_for_test();
     assert_eq!(
         after.raw_partition_loads, before.raw_partition_loads,
@@ -443,8 +452,8 @@ fn missing_vector_membership_work(unrelated_rows: u128) -> u64 {
             &empty(),
         )
         .expect("the indexed read preserves an actually missing vector as NULL");
-    assert_eq!(result.rows, vec![vec![Value::Null]]);
-    assert_eq!(result.trace.physical_plan, "IndexScan");
+    assert_eq!(result.rows(), vec![vec![Value::Null]]);
+    assert_eq!(result.trace().physical_plan, "IndexScan");
     let decoded = database.__vector_membership_records_decoded_for_test();
     database.close().expect("close the missing-vector fixture");
     decoded
@@ -520,7 +529,7 @@ fn repeated_indexed_updates_see_staged_quantized_vectors_and_rollback_together()
         )
         .expect("the indexed read sees the transaction overlay");
     assert_eq!(
-        staged.rows,
+        staged.rows(),
         vec![vec![
             expected_stored_vector(&replacement),
             Value::Text("staged".to_string()),
@@ -536,7 +545,7 @@ fn repeated_indexed_updates_see_staged_quantized_vectors_and_rollback_together()
         )
         .expect("read the committed row after rollback");
     assert_eq!(
-        committed.rows,
+        committed.rows(),
         vec![vec![expected_vector(), Value::Text("original".to_string())]],
         "rollback removes both staged replacements and restores the committed vector"
     );
@@ -606,7 +615,7 @@ fn schema_rewrite_builds_index_postings_from_rows_it_already_holds() {
             &empty(),
         )
         .expect("the rebuilt posting table answers after publication");
-    assert_eq!(indexed.rows.len(), ROWS as usize);
-    assert_eq!(indexed.trace.physical_plan, "IndexScan");
+    assert_eq!(indexed.rows().len(), ROWS as usize);
+    assert_eq!(indexed.trace().physical_plan, "IndexScan");
     database.close().expect("close the index-rebuild fixture");
 }

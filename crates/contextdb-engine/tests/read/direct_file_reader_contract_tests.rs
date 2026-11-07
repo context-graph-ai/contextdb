@@ -1,6 +1,11 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_str_replace,
+    clippy::field_reassign_with_default
+)]
 use contextdb_core::read_contract::{
-    CursorExpiryKind, DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureKind,
-    ReadFailureLimit, ReadLimits,
+    CursorExpiryKind, DeadlineClock, ReadFailureDetail, ReadFailureKind, ReadFailureLimit,
+    ReadLimits,
 };
 #[path = "../fixtures/isolated_process.rs"]
 mod isolated_process;
@@ -28,11 +33,12 @@ use contextdb_engine::direct_file_reader::test_seams::{
     with_isolated_bounded_source_touches_for_test,
 };
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
-    DurableStoreDamage, ReadImageSourceEvent, arm_read_image_hydration_pause_for_test,
-    observe_read_image_source_events_for_test, prepare_durable_store_damage_for_test,
+    DurableStoreDamage, ReadImageSourceEvent, ReaderPausePoint,
+    observe_read_image_source_events_for_test, pause_readers_at_for_test,
+    prepare_durable_store_damage_for_test,
 };
 use contextdb_engine::read_content_test_adapter::committed_content_for_test;
-use contextdb_engine::read_contract::{encode_cursor_page, encode_query_result};
+use contextdb_engine::read_contract::encode_query_result;
 use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_vector::stored_vector_value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -41,7 +47,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use syn::visit::{self, Visit};
@@ -57,7 +63,7 @@ const CHILD_SQL_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_SQL";
 const CHILD_ID_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_ID";
 const CHILD_PAYLOAD_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_PAYLOAD";
 const CHILD_DAMAGE_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_DAMAGE";
-const CHILD_HYDRATION_STARTED: &str = "READ_IMAGE_HYDRATION_HELD=";
+const CHILD_HYDRATION_STARTED: &str = "DIRECT_FILE_SELECTION_REGISTRATION_HELD";
 const CHILD_RELEASE_SEALED: &str = "DIRECT_FILE_RELEASE_SEALED";
 const CHILD_TARGET_CONSTRUCTED: &str = "DIRECT_FILE_TARGET_CONSTRUCTED";
 const CHILD_EXTERNALLY_USABLE: &str = "DIRECT_FILE_EXTERNALLY_USABLE";
@@ -80,26 +86,7 @@ pub(crate) fn serialise_direct_file_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[derive(Default)]
-struct ManualClock {
-    now: AtomicU64,
-}
-
-impl ManualClock {
-    fn advance(&self, delta_ms: u64) {
-        self.now.fetch_add(delta_ms, Ordering::SeqCst);
-    }
-}
-
-impl DeadlineClock for ManualClock {
-    fn now_ms(&self) -> u64 {
-        self.now.load(Ordering::SeqCst)
-    }
-
-    fn wait_until(&self, _deadline_ms: u64) -> DeadlineWait<'_> {
-        Box::pin(async {})
-    }
-}
+use contextdb_engine::local_transport::ManualDeadlineClock;
 
 fn generous_limits() -> ReadLimits {
     ReadLimits {
@@ -115,11 +102,11 @@ fn generous_limits() -> ReadLimits {
     }
 }
 
-fn reader_config(clock: Arc<ManualClock>, limits: ReadLimits) -> DirectReaderConfig {
+fn reader_config(clock: Arc<ManualDeadlineClock>, limits: ReadLimits) -> DirectReaderConfig {
     DirectReaderConfig::new(limits, clock)
 }
 
-fn default_reader_config(clock: Arc<ManualClock>) -> DirectReaderConfig {
+fn default_reader_config(clock: Arc<ManualDeadlineClock>) -> DirectReaderConfig {
     reader_config(clock, generous_limits())
 }
 
@@ -522,8 +509,8 @@ fn capture_query(
         label: label.into(),
         sql,
         params,
-        columns: result.columns,
-        rows: result.rows,
+        columns: result.columns().to_vec(),
+        rows: result.rows().to_vec(),
     }
 }
 
@@ -900,18 +887,20 @@ fn seed_fixture_from_seed(
             &HashMap::from([("id".to_owned(), Value::Uuid(rows[0].id))]),
         )
         .expect("capture the ordinary explain route");
-    let explain_physical_plan = explain_result.trace.physical_plan.to_owned();
-    let explain_index = explain_result.trace.index_used;
+    let explain_physical_plan = explain_result.trace().physical_plan.to_owned();
+    let explain_index = explain_result.trace().index_used.clone();
 
     let cursor_sql =
         format!("SELECT id, ordinal, payload, note FROM {rows_table} ORDER BY ordinal");
     let cursor_result = db
         .execute(&cursor_sql, &HashMap::new())
         .expect("capture exact cursor rows");
-    let cursor_columns = cursor_result.columns;
-    let cursor_rows = cursor_result.rows;
+    let cursor_columns = cursor_result.columns();
+    let cursor_rows = cursor_result.rows();
 
-    let (changes, arrivals) = db.changes_since_with_arrivals(Lsn(0));
+    let (changes, arrivals) = db
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     let changes_state = DirectChangeState {
         current_lsn: db.current_lsn(),
         committed_watermark: db.committed_watermark(),
@@ -1225,8 +1214,8 @@ fn seed_fixture_from_seed(
         rows,
         queries,
         cursor_sql,
-        cursor_columns,
-        cursor_rows,
+        cursor_columns: cursor_columns.to_vec(),
+        cursor_rows: cursor_rows.to_vec(),
         schemas,
         changes: changes_state,
         sync,
@@ -1264,7 +1253,7 @@ fn seed_fixture_after_caller_driven_writer(root: &Path) -> Fixture {
 
 fn direct_open_with_limits(
     fixture: &Fixture,
-    clock: Arc<ManualClock>,
+    clock: Arc<ManualDeadlineClock>,
     limits: ReadLimits,
 ) -> DirectFileReader {
     open_for_test(&fixture.path, reader_config(clock, limits)).unwrap_or_else(|error| {
@@ -1275,7 +1264,7 @@ fn direct_open_with_limits(
     })
 }
 
-fn direct_open(fixture: &Fixture, clock: Arc<ManualClock>) -> DirectFileReader {
+fn direct_open(fixture: &Fixture, clock: Arc<ManualDeadlineClock>) -> DirectFileReader {
     direct_open_with_limits(fixture, clock, generous_limits())
 }
 
@@ -1284,17 +1273,23 @@ fn assert_query(reader: &DirectFileReader, expected: &ExpectedQuery) -> (Vec<u8>
         .execute(&expected.sql, &expected.params)
         .unwrap_or_else(|error| panic!("execute {}: {error}", expected.label));
     assert_eq!(
-        result.result.columns, expected.columns,
+        result.result.columns(),
+        expected.columns,
         "{} columns",
         expected.label
     );
-    assert_eq!(result.result.rows, expected.rows, "{} rows", expected.label);
+    assert_eq!(
+        result.result.rows(),
+        expected.rows,
+        "{} rows",
+        expected.label
+    );
     assert_eq!(
         result.canonical_bytes,
-        encode_query_result(&result.result)
+        encode_query_result(&result.result, result.result.encoding_owner_for_test())
             .expect("shared canonical encoder supplies ordinary-result bytes")
     );
-    (result.canonical_bytes, result.snapshot)
+    (result.canonical_bytes.to_vec(), result.snapshot)
 }
 
 fn expected_table_names(fixture: &Fixture) -> Vec<String> {
@@ -1403,8 +1398,13 @@ fn metadata_responses(fixture: &Fixture, reader: &DirectFileReader) -> Vec<Direc
     for response in &responses {
         assert_eq!(
             response.canonical_bytes,
-            canonical_metadata_bytes_for_test(&response.body)
-                .expect("shared route-neutral metadata encoder supplies exact bytes")
+            canonical_metadata_bytes_for_test(
+                &response.body,
+                reader
+                    .request_read_memory_for_test()
+                    .expect("fixture operation owner")
+            )
+            .expect("shared route-neutral metadata encoder supplies exact bytes")
         );
     }
     responses
@@ -1446,7 +1446,7 @@ fn assert_complete_public_image_state(
                 &HashMap::from([("source".to_owned(), Value::Uuid(edge.source))]),
             )
             .unwrap_or_else(|error| panic!("read complete graph edge set: {error}"));
-        for row in answer.result.rows {
+        for row in answer.result.rows() {
             match row.as_slice() {
                 [Value::Uuid(target)] => {
                     answered_edges.push((edge.source, edge.edge_type.clone(), *target));
@@ -1474,6 +1474,7 @@ fn assert_complete_public_image_state(
         })
         .expect("the change history answers on request")
         .body
+        .clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),
@@ -1487,27 +1488,36 @@ fn assert_complete_public_image_state(
     image.snapshot
 }
 
-fn exact_empty_page(columns: &[String], snapshot: DirectSnapshot) -> DirectCursorPage {
-    let page = contextdb_core::read_contract::CursorPage {
-        columns: columns.to_vec(),
-        rows: Vec::new(),
-        has_more: false,
-    };
-    DirectCursorPage {
-        canonical_bytes: encode_cursor_page(&page)
-            .expect("shared encoder supplies empty terminal-page bytes"),
-        page,
+fn exact_empty_page(
+    columns: &[String],
+    snapshot: DirectSnapshot,
+    reader: &DirectFileReader,
+) -> DirectCursorPage {
+    DirectCursorPage::new_for_test(
+        columns.to_vec(),
         snapshot,
-    }
+        reader
+            .request_read_memory_for_test()
+            .expect("fixture operation owner"),
+    )
 }
 
+#[expect(
+    clippy::borrow_deref_ref,
+    reason = "The assertion spells out the borrowed rows it compares without consuming their owner."
+)]
 fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCursorPage> {
     let one = NonZeroUsize::new(1).expect("one row is nonzero");
     let mut opened = reader
         .open_cursor(&fixture.cursor_sql, &HashMap::new(), one)
         .unwrap_or_else(|error| panic!("open direct cursor: {error}"));
     let mut pages = vec![opened.first_page];
-    while pages.last().expect("first cursor page").page.has_more {
+    while pages
+        .last()
+        .expect("first cursor page")
+        .page_for_test()
+        .has_more
+    {
         pages.push(
             opened
                 .cursor
@@ -1517,16 +1527,23 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
     }
     assert_eq!(pages.len(), fixture.cursor_rows.len());
     for (ordinal, page) in pages.iter().enumerate() {
-        assert_eq!(page.page.columns, fixture.cursor_columns);
-        assert_eq!(page.page.rows, vec![fixture.cursor_rows[ordinal].clone()]);
-        assert_eq!(page.page.has_more, ordinal + 1 < fixture.cursor_rows.len());
+        assert_eq!(page.page_for_test().columns, fixture.cursor_columns);
+        assert_eq!(
+            &*page.page_for_test().rows,
+            &[fixture.cursor_rows[ordinal].clone()]
+        );
+        assert_eq!(
+            page.page_for_test().has_more,
+            ordinal + 1 < fixture.cursor_rows.len()
+        );
         assert_eq!(
             page.canonical_bytes,
-            encode_cursor_page(&page.page).expect("shared encoder supplies cursor bytes")
+            page.encode_page_for_test()
+                .expect("shared encoder supplies cursor bytes")
         );
     }
     let snapshot = pages[0].snapshot;
-    let empty = exact_empty_page(&fixture.cursor_columns, snapshot);
+    let empty = exact_empty_page(&fixture.cursor_columns, snapshot, reader);
     assert_eq!(
         opened
             .cursor
@@ -1548,7 +1565,7 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
     pages
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct ReadEvidence {
     queries: Vec<(Vec<u8>, DirectSnapshot)>,
     metadata: Vec<DirectMetadataResponse>,
@@ -1754,7 +1771,7 @@ fn released_image_is_the_first_gate_and_survives_complete_source_removal() {
         let observer = Arc::new(RecordingObserver::default());
         let reader = open_with_hydration_observer_for_test(
             &fixture.path,
-            default_reader_config(Arc::new(ManualClock::default())),
+            default_reader_config(Arc::new(ManualDeadlineClock::default())),
             Arc::clone(&observer) as Arc<dyn HydrationObserver>,
         )
         .unwrap_or_else(|error| panic!("publish released image: {error}"));
@@ -1807,7 +1824,7 @@ fn direct_read_keeps_recursive_bytes_modes_links_and_companions_identical() {
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "recursive-manifest-identity");
     let before = directory_manifest(&fixture.root);
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     let _ = representative_reads(&fixture, &reader);
     let after = directory_manifest(&fixture.root);
     assert_companions_unchanged(&before, &after, &fixture);
@@ -1833,7 +1850,7 @@ fn caller_driven_writer_policy_is_forgotten_by_the_fresh_direct_session() {
     reopened.close().expect("close ordinary comparison handle");
 
     reset_counters_for_test().unwrap_or_else(|error| panic!("install subsystem probes: {error}"));
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     let response = reader
         .metadata(DirectMetadataRequest::MaintenanceStatus)
         .unwrap_or_else(|error| panic!("direct maintenance status: {error}"));
@@ -1853,6 +1870,19 @@ fn caller_driven_writer_policy_is_forgotten_by_the_fresh_direct_session() {
 }
 
 #[derive(Default)]
+struct BindingCollector(BTreeSet<String>);
+impl<'ast> Visit<'ast> for BindingCollector {
+    fn visit_pat_ident(&mut self, binding: &'ast syn::PatIdent) {
+        self.0.insert(binding.ident.to_string());
+        visit::visit_pat_ident(self, binding);
+    }
+    fn visit_type_param(&mut self, parameter: &'ast syn::TypeParam) {
+        self.0.insert(parameter.ident.to_string());
+        visit::visit_type_param(self, parameter);
+    }
+}
+
+#[derive(Default)]
 struct PathCollector {
     paths: Vec<Vec<String>>,
     skip_test_modules: bool,
@@ -1868,6 +1898,34 @@ impl PathCollector {
 }
 
 impl<'ast> Visit<'ast> for PathCollector {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if self.skip_test_modules && test_observation_item(item) {
+            return;
+        }
+        visit::visit_item(self, item);
+    }
+    fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+        if self.skip_test_modules
+            && [
+                "original_image_payer_for_physical_test",
+                "original_parent_for_physical_test",
+                "request_read_memory_for_test",
+                "open_inner",
+            ]
+            .iter()
+            .any(|name| method.sig.ident == *name)
+        {
+            assert!(
+                method
+                    .attrs
+                    .iter()
+                    .any(|attribute| attribute.path().is_ident("cfg"))
+            );
+            return;
+        }
+        visit::visit_impl_item_fn(self, method);
+    }
+
     fn visit_attribute(&mut self, _attribute: &'ast syn::Attribute) {
         // Attributes are not module dependencies. Conditional attributes are
         // audited independently by CfgAttributeCollector, and lint attributes
@@ -1906,6 +1964,92 @@ fn path_equals(path: &[String], expected: &[&str]) -> bool {
 }
 
 fn legal_direct_dependency(path: &[String]) -> bool {
+    if matches!(path, [name] if ["EngineDiagnostic", "PreparedEngineDiagnostic", "FnOnce", "Into", "f64"].contains(&name.as_str()))
+    {
+        return true;
+    }
+    if [
+        &["Error", "FundedEngine"][..],
+        &["Error", "MemoryBudgetExceeded"][..],
+        &["Error", "NativeEngineOther"][..],
+        &["Error", "Other"][..],
+        &["PreparedEngineDiagnostic", "new"][..],
+        &["ReadCredit", "try_new_owned"][..],
+        &["contextdb_core", "Error"][..],
+        &["contextdb_core", "Error", "MemoryBudgetExceeded"][..],
+        &["contextdb_core", "Error", "StoreCorrupted"][..],
+        &["contextdb_core", "error", "DiagnosticLabel"][..],
+        &["contextdb_core", "error", "DiagnosticText"][..],
+        &["contextdb_core", "error", "DiagnosticText", "from_shared"][..],
+        &[
+            "contextdb_core",
+            "error",
+            "DiagnosticText",
+            "try_prepare_shared",
+        ][..],
+        &["contextdb_core", "read_memory", "ReadMemoryOwner"][..],
+        &["contextdb_core", "read_memory", "ReadPrepared"][..],
+        &["crate", "HistoricalIndexVerification"][..],
+        &["crate", "database", "QueryTrace", "scan"][..],
+        &["crate", "executor", "CursorObservation"][..],
+        &["crate", "executor", "PublicationTables"][..],
+        &["crate", "executor", "PublicationTables", "try_one"][..],
+        &["crate", "executor", "ReadPublicationBudget"][..],
+        &["crate", "executor", "ReadPublicationScope", "funded"][..],
+        &["crate", "executor", "bounded", "ReadOpenContext", "new"][..],
+        &["crate", "executor", "bounded", "with_request_read_memory"][..],
+        &[
+            "crate",
+            "owned_cursor_page",
+            "OwnedCursorPage",
+            "try_prepare_public",
+        ][..],
+        &[
+            "crate",
+            "persistence",
+            "read_coordination",
+            "RegistrationCommitTicket",
+            "new",
+        ][..],
+        &["crate", "read_contract", "EncodedReadBytes"][..],
+        &["crate", "read_contract", "EncodedReadBytes", "from_funded"][..],
+        &["crate", "read_contract", "ReadEncodingError"][..],
+        &["crate", "read_contract", "encode_transport_funded"][..],
+        &["crate", "read_image", "history_answer_error"][..],
+        &["crate", "read_image_memory", "ImageMemoryHandle"][..],
+        &["crate", "read_image_memory", "active_owner"][..],
+        &["crate", "read_session", "MetadataAnswer"][..],
+        &["crate", "read_session", "public_cache_setting_error"][..],
+        &[
+            "crate",
+            "read_work_probe",
+            "note_commit_directory_image_memory",
+        ][..],
+        &[
+            "crate",
+            "vector_read_memory",
+            "DeclaredReadMemory",
+            "from_reader_limit",
+        ][..],
+        &["crate", "vector_read_memory", "DeclaredReadRoot"][..],
+        &["crate", "vector_read_memory", "ReadRequestProvider"][..],
+        &["crate", "vector_read_memory", "RequestReadOwner"][..],
+        &["std", "ops", "Deref"][..],
+        &["std", "sync", "Arc", "new"][..],
+        &["std", "sync", "atomic", "AtomicU64"][..],
+        &["std", "sync", "atomic", "AtomicUsize"][..],
+        &["std", "sync", "atomic", "AtomicUsize", "new"][..],
+        &["std", "sync", "atomic", "Ordering", "AcqRel"][..],
+        &["std", "sync", "atomic", "Ordering", "Acquire"][..],
+        &["std", "sync", "atomic", "Ordering", "SeqCst"][..],
+        &["u64", "MAX"][..],
+        &["u64", "try_from"][..],
+    ]
+    .iter()
+    .any(|expected| path_equals(path, expected))
+    {
+        return true;
+    }
     let Some(first) = path.first().map(String::as_str) else {
         return false;
     };
@@ -2185,12 +2329,8 @@ fn legal_direct_dependency(path: &[String]) -> bool {
             &[
                 "crate",
                 "persistence",
-                "load_read_image_with_memory_in_runtime_dir",
+                "load_read_image_at_registration_with_cache_share",
             ],
-        )
-        || path_equals(
-            path,
-            &["crate", "persistence", "load_read_image_at_registration"],
         )
         || path_equals(path, &["crate", "executor", "ReadExecutionTarget"])
         || path_equals(path, &["crate", "executor", "ReadPublicationScope"])
@@ -2318,12 +2458,154 @@ fn visit_nested_items<'a>(items: &'a [Item], visitor: &mut impl FnMut(&'a Item))
     }
 }
 
+fn assert_observation_gate(attributes: &[syn::Attribute], expected: &str) {
+    let gates = attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("cfg"))
+        .collect::<Vec<_>>();
+    assert_eq!(gates.len(), 1, "one precise observation gate");
+    assert_eq!(
+        gates[0]
+            .meta
+            .require_list()
+            .unwrap()
+            .tokens
+            .to_string()
+            .replace(' ', ""),
+        expected
+    );
+}
+
 #[derive(Default)]
 struct CfgAttributeCollector {
     cfg_attributes: Vec<String>,
+    allow_physical_observations: bool,
 }
 
 impl<'ast> Visit<'ast> for CfgAttributeCollector {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if self.allow_physical_observations
+            && matches!(call.func.as_ref(), syn::Expr::Path(path)
+            if path_equals(&path.path.segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>(), &["crate", "read_work_probe", "note_commit_directory_image_memory"]))
+        {
+            assert_observation_gate(&call.attrs, "any(test,feature=\"test-seams\")");
+            assert_eq!(call.args.len(), 1);
+            assert!(matches!(&call.args[0], syn::Expr::Reference(reference)
+                if matches!(reference.expr.as_ref(), syn::Expr::Field(field)
+                    if matches!(&field.member, syn::Member::Named(name) if name == "memory")
+                        && matches!(field.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("constructed")))));
+            for argument in &call.args {
+                self.visit_expr(argument);
+            }
+            return;
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if self.allow_physical_observations
+            && field
+                .ident
+                .as_ref()
+                .is_some_and(|name| name == "original_image_counter")
+        {
+            assert_observation_gate(&field.attrs, "all(test,feature=\"test-seams\")");
+            self.visit_type(&field.ty);
+            return;
+        }
+        visit::visit_field(self, field);
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if self.allow_physical_observations
+            && matches!(&field.member, syn::Member::Named(name) if name == "original_image_counter")
+        {
+            assert_observation_gate(&field.attrs, "all(test,feature=\"test-seams\")");
+            assert!(matches!(&field.expr, syn::Expr::Path(path) if path.path.is_ident("None")));
+            return;
+        }
+        visit::visit_field_value(self, field);
+    }
+
+    fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+        if self.allow_physical_observations {
+            let gate = match method.sig.ident.to_string().as_str() {
+                "original_image_payer_for_physical_test" | "original_parent_for_physical_test" => {
+                    Some("all(test,feature=\"test-seams\")")
+                }
+                "request_read_memory_for_test" | "open_inner" => {
+                    Some("any(test,feature=\"test-seams\")")
+                }
+                _ => None,
+            };
+            if let Some(gate) = gate {
+                assert_observation_gate(&method.attrs, gate);
+                self.visit_signature(&method.sig);
+                self.visit_block(&method.block);
+                return;
+            }
+        }
+        visit::visit_impl_item_fn(self, method);
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if self.allow_physical_observations && local.attrs.iter().any(|a| a.path().is_ident("cfg"))
+        {
+            let binding = match &local.pat {
+                syn::Pat::Ident(name) => Some(name.ident.to_string()),
+                syn::Pat::Tuple(tuple) if tuple.elems.len() == 2 && tuple.elems.iter().zip(["open_child", "original_image_counter"]).all(|(pat, expected)| matches!(pat, syn::Pat::Ident(name) if name.ident == expected)) => Some("observed_child".to_owned()),
+                _ => None,
+            };
+            if matches!(
+                binding.as_deref(),
+                Some("observed_child" | "open_child" | "reader")
+            ) {
+                let gate = if binding.as_deref() == Some("open_child") {
+                    "not(all(test,feature=\"test-seams\"))"
+                } else {
+                    "all(test,feature=\"test-seams\")"
+                };
+                assert_observation_gate(&local.attrs, gate);
+                let initializer = &local.init.as_ref().expect("observation initializer").expr;
+                let mut methods = MethodCallCollector::default();
+                methods.visit_expr(initializer);
+                match binding.as_deref() {
+                    Some("observed_child") => assert_eq!(
+                        methods.methods,
+                        ["map_err", "child_with_physical_counter_for_test"]
+                    ),
+                    Some("open_child") => assert_eq!(methods.methods, ["map_err", "child"]),
+                    Some("reader") => {
+                        assert!(methods.methods.is_empty());
+                        let syn::Expr::Block(block) = initializer.as_ref() else {
+                            panic!("observation assignment block")
+                        };
+                        assert_eq!(block.block.stmts.len(), 3);
+                        let syn::Stmt::Expr(syn::Expr::Assign(assign), _) = &block.block.stmts[1]
+                        else {
+                            panic!("counter assignment")
+                        };
+                        assert!(
+                            matches!(assign.left.as_ref(), syn::Expr::Field(field) if matches!(&field.member, syn::Member::Named(name) if name == "original_image_counter"))
+                        );
+                        let mut paths = PathCollector::default();
+                        paths.visit_expr(initializer);
+                        assert!(paths.paths.iter().all(|path| {
+                            path.len() == 1
+                                && ["reader", "Some", "original_image_counter"]
+                                    .contains(&path[0].as_str())
+                        }));
+                    }
+                    _ => unreachable!(),
+                }
+                self.visit_pat(&local.pat);
+                self.visit_expr(initializer);
+                return;
+            }
+        }
+        visit::visit_local(self, local);
+    }
+
     fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
         if attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr") {
             self.cfg_attributes.push(
@@ -2340,11 +2622,33 @@ impl<'ast> Visit<'ast> for CfgAttributeCollector {
 
 #[derive(Default)]
 struct MacroCollector {
+    allow_physical_observations: bool,
     definitions: Vec<String>,
     invocations: Vec<(String, String)>,
 }
 
 impl<'ast> Visit<'ast> for MacroCollector {
+    fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+        if self.allow_physical_observations
+            && [
+                "original_image_payer_for_physical_test",
+                "original_parent_for_physical_test",
+                "request_read_memory_for_test",
+            ]
+            .iter()
+            .any(|name| method.sig.ident == name)
+        {
+            let gate = if method.sig.ident == "request_read_memory_for_test" {
+                "any(test,feature=\"test-seams\")"
+            } else {
+                "all(test,feature=\"test-seams\")"
+            };
+            assert_observation_gate(&method.attrs, gate);
+            return;
+        }
+        visit::visit_impl_item_fn(self, method);
+    }
+
     fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
         if let Some(name) = &item.ident {
             self.definitions.push(name.to_string());
@@ -2366,25 +2670,37 @@ impl<'ast> Visit<'ast> for MacroCollector {
 }
 
 fn assert_no_use_alias_or_glob(tree: &syn::UseTree, source: &Path) {
-    match tree {
-        syn::UseTree::Path(path) => assert_no_use_alias_or_glob(&path.tree, source),
-        syn::UseTree::Group(group) => {
-            for item in &group.items {
-                assert_no_use_alias_or_glob(item, source);
+    fn inspect(tree: &syn::UseTree, source: &Path, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                inspect(&path.tree, source, prefix);
+                prefix.pop();
             }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    inspect(item, source, prefix);
+                }
+            }
+            syn::UseTree::Name(_) => {}
+            syn::UseTree::Rename(rename) => {
+                assert!(
+                    prefix == &["crate", "owned_cursor_page"]
+                        && rename.ident == "OwnedCursorPage"
+                        && rename.rename == "CursorPage",
+                    "{} aliases dependency {} as {}; direct dependencies must remain AST-visible",
+                    source.display(),
+                    rename.ident,
+                    rename.rename
+                );
+            }
+            syn::UseTree::Glob(_) => panic!(
+                "{} uses a glob import; the direct dependency allowlist requires exact names",
+                source.display()
+            ),
         }
-        syn::UseTree::Name(_) => {}
-        syn::UseTree::Rename(rename) => panic!(
-            "{} aliases dependency {} as {}; direct dependencies must remain AST-visible",
-            source.display(),
-            rename.ident,
-            rename.rename
-        ),
-        syn::UseTree::Glob(_) => panic!(
-            "{} uses a glob import; the direct dependency allowlist requires exact names",
-            source.display()
-        ),
     }
+    inspect(tree, source, &mut Vec::new());
 }
 
 fn item_identity(item: &Item) -> Option<String> {
@@ -2412,10 +2728,54 @@ fn item_identity(item: &Item) -> Option<String> {
 }
 
 fn test_observation_item(item: &Item) -> bool {
+    if let Item::Use(item_use) = item {
+        let mut cfg = CfgAttributeCollector::default();
+        cfg.visit_item(item);
+        let observation_gate = cfg.cfg_attributes.len() == 1
+            && cfg.cfg_attributes[0]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                == "any(test,feature=\"test-seams\")";
+        let observation_names = match &item_use.tree {
+            syn::UseTree::Path(path) if path.ident == "contextdb_core" => {
+                matches!(path.tree.as_ref(), syn::UseTree::Group(group)
+                    if group.items.len() == 2 && group.items.iter().all(|item|
+                        matches!(item, syn::UseTree::Name(name)
+                            if name.ident == "RowId" || name.ident == "VectorIndexRef")))
+            }
+            syn::UseTree::Path(path) if path.ident == "uuid" => {
+                matches!(path.tree.as_ref(), syn::UseTree::Name(name) if name.ident == "Uuid")
+            }
+            _ => false,
+        };
+        return observation_gate && observation_names;
+    }
+    if let Item::Impl(implementation) = item {
+        if item_identity(item).as_deref() == Some("DirectCursorPage") {
+            let observation_gate = implementation.attrs.iter().any(|attribute| {
+                attribute.path().is_ident("cfg")
+                    && attribute.meta.require_list().is_ok_and(|list| {
+                        list.tokens
+                            .to_string()
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect::<String>()
+                            == "any(test,feature=\"test-seams\")"
+                    })
+            });
+            return observation_gate && implementation.items.iter().all(|item|
+                matches!(item, ImplItem::Fn(method) if method.sig.ident.to_string().ends_with("_for_test")));
+        }
+    }
     matches!(
         item_identity(item).as_deref(),
         Some(
             "DirectCursorResourceWitness"
+                | "DirectCursorPageViewForTest"
+                | "DirectStoredRow"
+                | "DirectStoredEdge"
+                | "DirectStoredVector"
                 | "DirectReaderCounters"
                 | "DirectStorageRegistrationObservation"
                 | "HydrationCheckpoint"
@@ -2444,25 +2804,63 @@ fn assert_core_has_no_cfg_or_macro_dependency_bypass(source: &Path, syntax: &syn
                 function.sig.ident
             );
         }
+        let mut audited = item.clone();
+        if let Item::Enum(enumeration) = &mut audited {
+            if enumeration.ident == "HydrationPhase"
+                || enumeration.ident == "DirectRepairRequiredCause"
+            {
+                for variant in &mut enumeration.variants {
+                    if (enumeration.ident == "HydrationPhase"
+                        && variant.ident == "ExternallyUsable")
+                        || (enumeration.ident == "DirectRepairRequiredCause"
+                            && variant.ident == "RowVectorDivergence")
+                    {
+                        variant.attrs.retain(|attribute| {
+                            if !attribute.path().is_ident("cfg") {
+                                return true;
+                            }
+                            let list = attribute.meta.require_list().expect("observation cfg");
+                            assert_eq!(
+                                list.tokens.to_string().replace(' ', ""),
+                                "any(test,feature=\"test-seams\")"
+                            );
+                            false
+                        });
+                    }
+                }
+            }
+        }
         let mut cfg = CfgAttributeCollector::default();
-        cfg.visit_item(item);
-        let sanctioned_lint_only_cfg_attr = source.file_name().is_some_and(|name| {
-            name == "direct_file_reader.rs"
-                && matches!(
-                    item,
-                    Item::Struct(item)
-                        if ["DirectReaderConfig", "DirectStoredRow", "DirectStoredEdge", "DirectStoredVector"]
-                            .contains(&item.ident.to_string().as_str())
-                )
-        }) && matches!(
-            cfg.cfg_attributes.as_slice(),
-            [attribute]
-                if attribute
-                    .chars()
-                    .filter(|character| !character.is_whitespace())
-                    .collect::<String>()
-                    == "not(feature=\"test-seams\"),allow(dead_code)"
-        );
+        cfg.allow_physical_observations = true;
+        cfg.visit_item(&audited);
+        let sanctioned_lint_only_cfg_attr = cfg.cfg_attributes.iter().all(|text| {
+            let Ok(arguments) = syn::parse::Parser::parse_str(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                text,
+            ) else { return false; };
+            if arguments.len() != 2 { return false; }
+            let mut arguments = arguments.iter();
+            let Some(syn::Meta::List(condition)) = arguments.next() else { return false; };
+            if !condition.path.is_ident("not") || condition.tokens.to_string()
+                .chars().filter(|c| !c.is_whitespace()).collect::<String>() != "feature=\"test-seams\"" {
+                return false;
+            }
+            let Some(syn::Meta::List(lint)) = arguments.next() else { return false; };
+            if !lint.path.is_ident("allow") { return false; }
+            let Ok(lints) = lint.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else { return false; };
+            let mut lints = lints.iter();
+            if !matches!(lints.next(), Some(syn::Meta::Path(path)) if path.is_ident("dead_code")) {
+                return false;
+            }
+            match (lints.next(), lints.next()) {
+                (None, None) => true,
+                (Some(syn::Meta::NameValue(reason)), None) if reason.path.is_ident("reason") =>
+                    matches!(&reason.value, syn::Expr::Lit(value) if matches!(value.lit, syn::Lit::Str(_))),
+                _ => false,
+            }
+        });
         assert!(
             cfg.cfg_attributes.is_empty() || sanctioned_lint_only_cfg_attr,
             "{} core item {} changes by cfg: {:?}",
@@ -2471,6 +2869,7 @@ fn assert_core_has_no_cfg_or_macro_dependency_bypass(source: &Path, syntax: &syn
             cfg.cfg_attributes
         );
         let mut macros = MacroCollector::default();
+        macros.allow_physical_observations = true;
         macros.visit_item(item);
         assert!(
             macros.definitions.is_empty(),
@@ -2479,6 +2878,13 @@ fn assert_core_has_no_cfg_or_macro_dependency_bypass(source: &Path, syntax: &syn
             macros.definitions
         );
         for (name, tokens) in macros.invocations {
+            if name == "cfg" {
+                assert_eq!(
+                    tokens.replace(' ', "").replace('\n', ""),
+                    "all(target_os=\"linux\",any(target_arch=\"x86_64\",target_arch=\"aarch64\"))"
+                );
+                continue;
+            }
             assert_eq!(
                 name, "write",
                 "only formatting writes are legal in direct core"
@@ -2527,7 +2933,7 @@ impl<'ast> Visit<'ast> for CallSequenceCollector {
             && let Some(name) = function.path.segments.last()
             && matches!(
                 name.ident.to_string().as_str(),
-                "drop" | "construct_backend_neutral_target"
+                "drop" | "construct_backend_neutral_target" | "open_inner_with_cancellation"
             )
         {
             self.events.push(name.ident.to_string());
@@ -2783,6 +3189,32 @@ fn assert_shared_prerequisite_shapes() {
     }));
     let mut calls = CallSequenceCollector::default();
     calls.visit_block(&handoff.block);
+    let observed_open = direct
+        .items
+        .iter()
+        .find_map(|item| {
+            let Item::Impl(implementation) = item else {
+                return None;
+            };
+            implementation.items.iter().find_map(|item| match item {
+                ImplItem::Fn(method) if method.sig.ident == "open_inner" => Some(method),
+                _ => None,
+            })
+        })
+        .expect("test observer wraps the shipping cancellation-aware open");
+    let mut observed_calls = CallSequenceCollector::default();
+    observed_calls.visit_block(&observed_open.block);
+    assert_eq!(
+        observed_calls.events,
+        [
+            "open_inner_with_cancellation",
+            "checkpoint:ExternallyUsable"
+        ],
+        "external observation follows the completed shipping open"
+    );
+    calls
+        .events
+        .extend(observed_calls.events.into_iter().skip(1));
     assert_eq!(
         calls.events,
         vec![
@@ -2892,23 +3324,25 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
         assert_core_has_no_cfg_or_macro_dependency_bypass(source, &syntax);
         let mut collector = PathCollector::production_only();
         collector.visit_file(&syntax);
+        let mut bindings = BindingCollector::default();
+        bindings.visit_file(&syntax);
         let mut illegal_dependencies = BTreeSet::new();
         for dependency in collector.paths {
+            // Value bindings and generic type parameters are not module dependencies.
+            // Their initializers, bounds and complete paths are still audited.
+            if dependency.len() == 1 && bindings.0.contains(&dependency[0]) {
+                continue;
+            }
+
             if path_equals(
                 &dependency,
                 &[
                     "crate",
                     "persistence",
-                    "load_read_image_with_memory_in_runtime_dir",
+                    "load_read_image_at_registration_with_cache_share",
                 ],
             ) {
                 loader_calls += 1;
-            }
-            if path_equals(
-                &dependency,
-                &["crate", "persistence", "load_read_image_at_registration"],
-            ) {
-                retained_loader_calls += 1;
             }
             if !legal_direct_dependency(&dependency) {
                 illegal_dependencies.insert(dependency.join("::"));
@@ -2944,24 +3378,33 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
                         &[
                             "crate",
                             "persistence",
-                            "load_read_image_with_memory_in_runtime_dir",
+                            "load_read_image_at_registration_with_cache_share",
                         ],
                     )
                 }) {
-                    assert_eq!(method.sig.ident, "open_inner");
+                    assert_eq!(method.sig.ident, "open_inner_with_cancellation");
                 }
-                if paths.paths.iter().any(|path| {
-                    path_equals(
-                        path,
-                        &["crate", "persistence", "load_read_image_at_registration"],
-                    )
-                }) {
+                if method.sig.ident == "from_owner_snapshot_with_cancellation" {
                     retained_constructor_calls += 1;
-                    assert_eq!(method.sig.ident, "from_owner_snapshot");
-                    assert!(matches!(
-                        &method.vis,
-                        Visibility::Restricted(visibility) if visibility.path.is_ident("crate")
-                    ));
+                    retained_loader_calls += paths
+                        .paths
+                        .iter()
+                        .filter(|path| path_equals(path, &["Self", "open_inner_with_cancellation"]))
+                        .count();
+                    assert!(matches!(&method.vis,
+                        Visibility::Restricted(visibility) if visibility.path.is_ident("crate")));
+                    assert!(
+                        paths
+                            .paths
+                            .iter()
+                            .any(|path| path_equals(path, &["registration"]))
+                    );
+                    assert!(
+                        paths
+                            .paths
+                            .iter()
+                            .any(|path| path_equals(path, &["cancellation"]))
+                    );
                 }
             }
         }
@@ -2991,7 +3434,7 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
     let source_events = observe_read_image_source_events_for_test(&fixture.path);
     source_events.reset();
     reset_counters_for_test().unwrap_or_else(|error| panic!("install real probes: {error}"));
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     let _ = assert_query(&reader, &fixture.queries[0]);
     let _ = assert_exact_released_source_trace(&source_events.events());
     let counters = counters_for_test().unwrap_or_else(|error| panic!("read real probes: {error}"));
@@ -3064,13 +3507,28 @@ fn direct_file_reader_child() {
     let sql = std::env::var(CHILD_SQL_ENV).expect("child query");
     let id = Uuid::parse_str(&std::env::var(CHILD_ID_ENV).expect("child id")).expect("child UUID");
     let payload = std::env::var(CHILD_PAYLOAD_ENV).expect("child payload");
-    arm_read_image_hydration_pause_for_test();
+    let admission = pause_readers_at_for_test(&child_path(), ReaderPausePoint::AfterGate);
+    let admission_controller = std::thread::spawn(move || {
+        assert!(
+            admission
+                .wait_for_paused_reader(std::time::Duration::from_secs(30))
+                .is_some(),
+            "native reader never reached its selection/registration admission hold"
+        );
+        println!("{CHILD_HYDRATION_STARTED}");
+        std::io::stdout().flush().expect("flush admission marker");
+        PipeHydrationObserver::wait_for(CHILD_FINISH_HYDRATION);
+        drop(admission);
+    });
     let reader = open_with_hydration_observer_for_test(
         child_path(),
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
         Arc::new(PipeHydrationObserver),
     )
     .unwrap_or_else(|error| panic!("child direct hydration: {error}"));
+    admission_controller
+        .join()
+        .expect("admission controller completes");
     println!("{CHILD_SESSION_ACTIVE}");
     println!(
         "{CHILD_TYPED_DIGEST}{}",
@@ -3089,7 +3547,7 @@ fn direct_file_reader_child() {
                     .execute(&sql, &HashMap::from([("id".to_owned(), Value::Uuid(id))]))
                     .unwrap_or_else(|error| panic!("query released child image: {error}"));
                 assert_eq!(
-                    result.result.rows,
+                    result.result.rows(),
                     vec![vec![Value::Uuid(id), Value::Text(payload.clone())]]
                 );
                 println!("{CHILD_QUERY_OK}");
@@ -3101,33 +3559,103 @@ fn direct_file_reader_child() {
     }
 }
 
+#[derive(Debug)]
+enum ChildHandshakeFailure {
+    MissingMarker {
+        expected: String,
+        process_id: u32,
+        process_state: String,
+        transcript: Vec<String>,
+        input_state: String,
+    },
+}
+
 struct ChildReader {
     child: Child,
-    stdout: BufReader<ChildStdout>,
+    stdout: std::sync::mpsc::Receiver<Result<String, String>>,
+    transcript: Vec<String>,
     finished: bool,
 }
 
+impl std::fmt::Display for ChildHandshakeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingMarker {
+                expected,
+                process_id,
+                process_state,
+                transcript,
+                input_state,
+            } => write!(
+                f,
+                "missing child marker {expected:?}; pid={process_id}; state={process_state}; stdout={transcript:?}; input={input_state}"
+            ),
+        }
+    }
+}
+
 impl ChildReader {
-    fn wait_for(&mut self, expected: &str) {
+    fn marker(&mut self, expected: &str, prefix: bool) -> Result<String, ChildHandshakeFailure> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let mut line = String::new();
-            let count = self.stdout.read_line(&mut line).expect("read child marker");
-            assert_ne!(count, 0, "child exited before marker {expected}");
-            if line.trim() == expected {
-                return;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.stdout.recv_timeout(remaining) {
+                Ok(Ok(line)) => {
+                    self.transcript.push(line.clone());
+                    // libtest may place its test-name prefix on the marker's line.
+                    let marker = line
+                        .trim()
+                        .split_once(expected)
+                        .and_then(|(before, after)| {
+                            let valid_prefix = before.is_empty() || before.ends_with(" ... ");
+                            (valid_prefix && (prefix || after.is_empty()))
+                                .then(|| format!("{expected}{after}"))
+                        });
+                    if let Some(marker) = marker {
+                        return Ok(marker);
+                    }
+                    if [
+                        CHILD_HYDRATION_STARTED,
+                        CHILD_RELEASE_SEALED,
+                        CHILD_TARGET_CONSTRUCTED,
+                        CHILD_EXTERNALLY_USABLE,
+                        CHILD_SESSION_ACTIVE,
+                        CHILD_TYPED_DIGEST,
+                        CHILD_QUERY_OK,
+                    ]
+                    .iter()
+                    .any(|checkpoint| line.contains(checkpoint))
+                    {
+                        return Err(ChildHandshakeFailure::MissingMarker {
+                            expected: expected.to_owned(),
+                            process_id: self.child.id(),
+                            process_state: format!("{:?}", self.child.try_wait()),
+                            transcript: self.transcript.clone(),
+                            input_state: "unexpected protocol checkpoint".to_owned(),
+                        });
+                    }
+                }
+                failure => {
+                    return Err(ChildHandshakeFailure::MissingMarker {
+                        expected: expected.to_owned(),
+                        process_id: self.child.id(),
+                        process_state: format!("{:?}", self.child.try_wait()),
+                        transcript: self.transcript.clone(),
+                        input_state: format!("{failure:?}"),
+                    });
+                }
             }
         }
     }
 
+    fn wait_for(&mut self, expected: &str) {
+        self.marker(expected, false)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+    }
+
     fn wait_for_prefix(&mut self, expected: &str) -> String {
-        loop {
-            let mut line = String::new();
-            let count = self.stdout.read_line(&mut line).expect("read child marker");
-            assert_ne!(count, 0, "child exited before marker prefix {expected}");
-            if line.trim().starts_with(expected) {
-                return line.trim().to_owned();
-            }
-        }
+        self.marker(expected, true)
+            .unwrap_or_else(|failure| panic!("{failure}"))
     }
 
     fn send(&mut self, command: &str) {
@@ -3178,9 +3706,21 @@ fn spawn_child_reader_with_payload(fixture: &Fixture, expected_payload: &str) ->
         .spawn()
         .expect("spawn child reader");
     let stdout = child.stdout.take().expect("child stdout");
+    let (sender, stdout_lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if sender
+                .send(line.map_err(|error| error.to_string()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     ChildReader {
         child,
-        stdout: BufReader::new(stdout),
+        stdout: stdout_lines,
+        transcript: Vec::new(),
         finished: false,
     }
 }
@@ -3221,9 +3761,21 @@ fn spawn_child_reader_with_default_runtime_location(
         .spawn()
         .expect("spawn child reader");
     let stdout = child.stdout.take().expect("child stdout");
+    let (sender, stdout_lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if sender
+                .send(line.map_err(|error| error.to_string()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     ChildReader {
         child,
-        stdout: BufReader::new(stdout),
+        stdout: stdout_lines,
+        transcript: Vec::new(),
         finished: false,
     }
 }
@@ -3233,7 +3785,31 @@ fn spawn_child_reader(fixture: &Fixture) -> ChildReader {
 }
 
 fn assert_writer_is_held_by_hydrating_readers(path: &Path) -> (u64, usize) {
-    match Database::open(path) {
+    use contextdb_engine::persistence::read_persistence_test_scaffold::{
+        WriterAdmissionEvent, watch_writer_admission_for_test,
+    };
+    let watch = watch_writer_admission_for_test(path);
+    let probe_path = path.to_path_buf();
+    let probe = std::thread::spawn(move || writer_holder_probe(&probe_path));
+    assert_eq!(
+        watch.next(std::time::Duration::from_secs(30)),
+        Some(WriterAdmissionEvent::Refused),
+        "the holder probe must answer while its caller still holds the reader's release command"
+    );
+    probe.join().expect("the holder probe answers")
+}
+
+fn writer_holder_probe(path: &Path) -> (u64, usize) {
+    // The parent cannot release its child until this probe answers. Ask
+    // about the current holder with an expired deadline; ordinary opens
+    // retain their default wait for the reader to finish acquiring.
+    let options = contextdb_engine::DatabaseOpenOptions {
+        reader_wait_deadline: Some(contextdb_engine::ReaderWaitDeadline::after(
+            std::time::Duration::ZERO,
+        )),
+        ..contextdb_engine::DatabaseOpenOptions::default()
+    };
+    match Database::open_with_options(path, options) {
         Err(Error::ReadFailure(failure)) if failure.kind() == ReadFailureKind::HeldByReaders => {
             let ReadFailureDetail::HeldByReaders(detail) = failure.detail() else {
                 panic!("held_by_readers must carry concrete holder detail")
@@ -3326,6 +3902,7 @@ fn one_reader_releases_the_real_writer_lock_before_external_publication() {
     assert_eq!(held.0, 1);
     reader.send(CHILD_FINISH_HYDRATION);
     reader.wait_for(CHILD_RELEASE_SEALED);
+    assert_writer_opens_after_release(&fixture.path);
     let changed = change_source_row(&fixture);
     reader.send(CHILD_CONSTRUCT_TARGET);
     reader.wait_for(CHILD_TARGET_CONSTRUCTED);
@@ -3374,12 +3951,14 @@ fn multiple_child_readers_hold_only_their_real_hydration_windows() {
 
     second.send(CHILD_FINISH_HYDRATION);
     second.wait_for(CHILD_RELEASE_SEALED);
+    assert_writer_opens_after_release(&fixture.path);
     let _ = change_source_row(&fixture);
 
     let mut digests = Vec::new();
     for reader in [&mut first, &mut second] {
         reader.send(CHILD_CONSTRUCT_TARGET);
         reader.wait_for(CHILD_TARGET_CONSTRUCTED);
+        assert_writer_opens_after_release(&fixture.path);
         reader.send(CHILD_PUBLISH);
         reader.wait_for(CHILD_EXTERNALLY_USABLE);
         reader.wait_for(CHILD_SESSION_ACTIVE);
@@ -3476,7 +4055,7 @@ fn read_only_file_and_directory_support_the_complete_direct_surface() {
         .expect("store is read-only");
     fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o555))
         .expect("source directory is read-only");
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     let _ = representative_reads(&fixture, &reader);
     let after = directory_manifest(&fixture.root);
     let mut expected = before;
@@ -3602,7 +4181,7 @@ fn direct_file_damage_child() {
     let case = parse_damage(&std::env::var(CHILD_DAMAGE_ENV).expect("child damage case"));
     let opened = open_for_test(
         child_path(),
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     );
     if matches!(
         case,
@@ -3613,6 +4192,7 @@ fn direct_file_damage_child() {
             .metadata(DirectMetadataRequest::Tables)
             .expect("list damaged fixture tables")
             .body
+            .clone()
         {
             DirectMetadataBody::Tables { items, .. } => items,
             other => panic!("table inventory has the wrong body: {other:?}"),
@@ -3637,6 +4217,7 @@ fn direct_file_damage_child() {
                 })
                 .expect("inspect damaged fixture schema")
                 .body
+                .clone()
             {
                 DirectMetadataBody::Schema { schema } => schema,
                 other => panic!("schema inspection has the wrong body: {other:?}"),
@@ -3722,7 +4303,7 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "snapshot-after-separate-writer-change");
-    let clock = Arc::new(ManualClock::default());
+    let clock = Arc::new(ManualDeadlineClock::default());
     let source_events = observe_read_image_source_events_for_test(&fixture.path);
     source_events.reset();
     let first = direct_open(&fixture, Arc::clone(&clock));
@@ -3738,7 +4319,12 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
         .expect("open cursor before source change");
     let mut pages = vec![existing.first_page];
     let changed = change_source_row(&fixture);
-    while pages.last().expect("cursor first page").page.has_more {
+    while pages
+        .last()
+        .expect("cursor first page")
+        .page_for_test()
+        .has_more
+    {
         pages.push(
             existing
                 .cursor
@@ -3760,7 +4346,7 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
         .execute(&fixture.relation_sql(), &fixture.relation_params())
         .expect("fresh reader sees post-release writer change");
     assert_eq!(
-        fresh_row.result.rows,
+        fresh_row.result.rows(),
         vec![vec![
             Value::Uuid(fixture.first_row().id),
             Value::Text(changed),
@@ -3811,6 +4397,10 @@ fn assert_closed_cursor_aftermath(
 }
 
 #[test]
+#[expect(
+    clippy::borrow_deref_ref,
+    reason = "The assertion spells out the borrowed rows it compares without consuming their owner."
+)]
 fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() {
     if isolated_process::run_in_own_process(
         module_path!(),
@@ -3823,7 +4413,7 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
     let fixture = seed_fixture(root.path(), "caller-cancellation-before-source-work");
     reset_counters_for_test()
         .unwrap_or_else(|error| panic!("install cancellation probes: {error}"));
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
 
     // `bounded_source_touches` (read via `observed_counters`) is a process-wide counter
     // (crates/contextdb-engine/src/read_probe.rs:113-121, "the process-wide count answers
@@ -3896,7 +4486,10 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
         .cursor
         .fetch(Some(one))
         .expect("cancelled cursor resumes");
-    assert_eq!(resumed.page.rows, vec![fixture.cursor_rows[1].clone()]);
+    assert_eq!(
+        &*resumed.page_for_test().rows,
+        &[fixture.cursor_rows[1].clone()]
+    );
     opened.cursor.close().expect("close resumed cursor");
     assert_cursor_resources_released(&witness);
 }
@@ -3913,7 +4506,7 @@ fn convenience_calls_create_three_fresh_independent_cancellation_tokens() {
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "independent-convenience-tokens");
     reset_counters_for_test().unwrap_or_else(|error| panic!("install token probes: {error}"));
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     reader
         .execute(&fixture.relation_sql(), &fixture.relation_params())
         .expect("convenience execute");
@@ -3968,7 +4561,7 @@ fn terminal_page_immediately_releases_image_memory_and_cursor_state() {
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-terminal-release");
     reset_counters_for_test().unwrap_or_else(|error| panic!("install cursor probes: {error}"));
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     let one = NonZeroUsize::new(1).expect("one row");
     let mut opened = reader
         .open_cursor(&fixture.cursor_sql, &HashMap::new(), one)
@@ -3981,7 +4574,7 @@ fn terminal_page_immediately_releases_image_memory_and_cursor_state() {
     assert_ne!(after_open.retained_cursor_bytes, 0);
     let retained = after_open.retained_cursor_bytes;
     let mut terminal = opened.first_page;
-    while terminal.page.has_more {
+    while terminal.page_for_test().has_more {
         terminal = opened
             .cursor
             .fetch(Some(one))
@@ -3995,7 +4588,7 @@ fn terminal_page_immediately_releases_image_memory_and_cursor_state() {
         retained
     );
     assert_cursor_resources_released(&witness);
-    let empty = exact_empty_page(&fixture.cursor_columns, terminal.snapshot);
+    let empty = exact_empty_page(&fixture.cursor_columns, terminal.snapshot, &reader);
     assert_eq!(
         opened
             .cursor
@@ -4035,7 +4628,7 @@ fn explicit_close_before_exhaustion_releases_and_later_fetch_is_closed() {
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-explicit-close-release");
     reset_counters_for_test().unwrap_or_else(|error| panic!("install cursor probes: {error}"));
-    let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let reader = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     let one = NonZeroUsize::new(1).expect("one row");
     let mut opened = reader
         .open_cursor(&fixture.cursor_sql, &HashMap::new(), one)
@@ -4072,19 +4665,71 @@ fn cursor_page_byte_refusal_is_terminal_and_releases_the_cursor_charge() {
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-page-byte-terminal-refusal");
-    let baseline = direct_open(&fixture, Arc::new(ManualClock::default()));
+    let baseline = direct_open(&fixture, Arc::new(ManualDeadlineClock::default()));
     let baseline_pages = cursor_pages(&fixture, &baseline);
-    let first_bytes = baseline_pages[0].canonical_bytes.len() as u64;
-    let second_bytes = baseline_pages[1].canonical_bytes.len() as u64;
+    let encoded_bytes = |page: &DirectCursorPage| {
+        let public = page
+            .try_clone_page_for_test(
+                baseline
+                    .request_read_memory_for_test()
+                    .expect("admit baseline page observation"),
+            )
+            .expect("observe the shipping cursor page");
+        contextdb_engine::read_contract::cursor_page_encoded_size(&public)
+            .expect("measure the shipping page envelope") as u64
+    };
+    let first_bytes = encoded_bytes(&baseline_pages[0]);
+    let second_bytes = encoded_bytes(&baseline_pages[1]);
     assert!(
         second_bytes > first_bytes,
         "second dynamic row is the exact wide-row gate"
     );
 
+    let mut setup_limits = generous_limits();
+    setup_limits.cursor_page_bytes = first_bytes;
+    let setup = direct_open_with_limits(
+        &fixture,
+        Arc::new(ManualDeadlineClock::default()),
+        setup_limits,
+    );
+    let first_canonical_bytes = first_bytes;
+    let first_bytes = match setup.open_cursor(
+        &fixture.cursor_sql,
+        &HashMap::new(),
+        NonZeroUsize::new(1).unwrap(),
+    ) {
+        Ok(mut opened) => {
+            opened.cursor.close().unwrap();
+            first_bytes
+        }
+        Err(DirectFileReaderError::ReadFailure(failure)) => match failure.detail() {
+            ReadFailureDetail::OwnerLimitExceeded(detail)
+                if detail.limit == ReadFailureLimit::CursorPageBytes =>
+            {
+                detail
+                    .required
+                    .as_ref()
+                    .expect("the refusal discloses the first-page admission cost")
+                    .required_bytes
+            }
+            other => panic!("first-page setup refused for another reason: {other:?}"),
+        },
+        Err(other) => panic!("first-page setup failed: {other:?}"),
+    };
+    drop(setup);
+    // Both pages use the same query and fixed-width observation fields here.
+    // Fund the observed envelope from the disclosed narrow-page admission;
+    // only the independently encoded row-body size changes for the wide page.
+    let second_bytes = second_bytes + first_bytes - first_canonical_bytes;
+    assert!(
+        first_bytes < second_bytes,
+        "the disclosed first-page cost still refuses the wide second row"
+    );
     reset_counters_for_test().unwrap_or_else(|error| panic!("install cursor probes: {error}"));
     let mut limits = generous_limits();
     limits.cursor_page_bytes = first_bytes;
-    let reader = direct_open_with_limits(&fixture, Arc::new(ManualClock::default()), limits);
+    let reader =
+        direct_open_with_limits(&fixture, Arc::new(ManualDeadlineClock::default()), limits);
     let one = NonZeroUsize::new(1).expect("one row");
     let mut opened = reader
         .open_cursor(&fixture.cursor_sql, &HashMap::new(), one)
@@ -4142,7 +4787,7 @@ fn manual_clock_idle_expiry_is_terminal_and_releases_owned_resources() {
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-manual-idle-expiry");
     reset_counters_for_test().unwrap_or_else(|error| panic!("install cursor probes: {error}"));
-    let clock = Arc::new(ManualClock::default());
+    let clock = Arc::new(ManualDeadlineClock::default());
     let mut limits = generous_limits();
     limits.cursor_idle_ms = 5;
     limits.cursor_lifetime_ms = 20;
@@ -4156,7 +4801,7 @@ fn manual_clock_idle_expiry_is_terminal_and_releases_owned_resources() {
     assert_cursor_resources_retained(&witness);
     let active = observed_counters("before idle expiry");
     let retained = active.retained_cursor_bytes;
-    clock.advance(6);
+    clock.advance_to(clock.now_ms() + 6);
     let failure = match opened.cursor.fetch(Some(one)) {
         Err(DirectFileReaderError::ReadFailure(failure)) => failure,
         other => panic!("idle-expired cursor must return typed expiry: {other:?}"),
@@ -4180,6 +4825,10 @@ fn manual_clock_idle_expiry_is_terminal_and_releases_owned_resources() {
 }
 
 #[test]
+#[expect(
+    clippy::borrow_deref_ref,
+    reason = "The assertion spells out the borrowed rows it compares without consuming their owner."
+)]
 fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources() {
     if isolated_process::run_in_own_process(
         module_path!(),
@@ -4191,7 +4840,7 @@ fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources(
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-manual-lifetime-expiry");
     reset_counters_for_test().unwrap_or_else(|error| panic!("install cursor probes: {error}"));
-    let clock = Arc::new(ManualClock::default());
+    let clock = Arc::new(ManualDeadlineClock::default());
     let mut limits = generous_limits();
     limits.cursor_idle_ms = 7;
     limits.cursor_lifetime_ms = 10;
@@ -4204,14 +4853,17 @@ fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources(
         .expect("capture lifetime-expiry resources");
     let active = observed_counters("before lifetime activity");
     let retained = active.retained_cursor_bytes;
-    clock.advance(6);
+    clock.advance_to(clock.now_ms() + 6);
     let active_page = opened
         .cursor
         .fetch(Some(one))
         .expect("activity refreshes idle deadline");
-    assert_eq!(active_page.page.rows, vec![fixture.cursor_rows[1].clone()]);
+    assert_eq!(
+        &*active_page.page_for_test().rows,
+        &[fixture.cursor_rows[1].clone()]
+    );
     assert_cursor_resources_retained(&witness);
-    clock.advance(5);
+    clock.advance_to(clock.now_ms() + 5);
     let failure = match opened.cursor.fetch(Some(one)) {
         Err(DirectFileReaderError::ReadFailure(failure)) => failure,
         other => panic!("lifetime-expired cursor must return typed expiry: {other:?}"),
@@ -4359,13 +5011,13 @@ fn query_embedding_rows(
         )
         .unwrap_or_else(|error| panic!("query {declaration} column directly: {error:?}"));
     assert_eq!(
-        query.result.columns,
+        query.result.columns(),
         vec!["id".to_owned(), "note".to_owned(), store.column.clone()]
     );
     let row = |id| {
         query
             .result
-            .rows
+            .rows()
             .iter()
             .find(|row| row.first() == Some(&Value::Uuid(id)))
             .cloned()
@@ -4382,10 +5034,7 @@ fn assert_loaded_embedding_corruption(
         Err(DirectFileReaderError::CorruptStore(
             DirectStoreDiagnostic::MalformedRecord,
             reason,
-        )) => assert!(
-            !reason.is_empty(),
-            "{expected} carries a concrete diagnosis"
-        ),
+        )) => assert!(!(reason == ""), "{expected} carries a concrete diagnosis"),
         Ok(_) => panic!("{expected} must not contribute an answer"),
         Err(other) => panic!("{expected} has the wrong diagnosis: {other:?}"),
     }
@@ -4409,7 +5058,7 @@ fn a_row_with_no_embedding_keeps_the_store_directly_readable() {
 
     let reader = open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     )
     .unwrap_or_else(|error| {
         panic!("a row without an embedding keeps the store directly readable: {error:?}")
@@ -4427,8 +5076,21 @@ fn a_row_with_no_embedding_keeps_the_store_directly_readable() {
         Some(&Value::Vector(store.embedding.clone())),
         "the neighbouring embedding is unchanged"
     );
-    let content = committed_content_for_test(&store.path)
-        .unwrap_or_else(|error| panic!("inspect committed F32 vectors: {error}"));
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            )
+            .expect("admit the declared fixture root");
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&store.path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap_or_else(|error| panic!("inspect committed F32 vectors: {error}"));
     assert_eq!(
         content
             .vectors
@@ -4478,7 +5140,7 @@ fn a_vector_column_holding_a_non_vector_value_still_refuses_a_direct_read() {
 
     let reader = open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     )
     .unwrap_or_else(|error| panic!("unrelated pages do not block open: {error:?}"));
     assert_loaded_embedding_corruption(
@@ -4516,7 +5178,7 @@ fn a_row_with_no_embedding_does_not_hide_a_diverged_vector() {
 
     let reader = open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     )
     .unwrap_or_else(|error| panic!("untouched vector bodies do not block open: {error:?}"));
     assert_loaded_embedding_corruption(
@@ -4561,7 +5223,7 @@ fn a_null_in_a_required_vector_cell_still_needs_a_writer() {
 
     let reader = open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     )
     .unwrap_or_else(|error| panic!("untouched row bodies do not block open: {error:?}"));
     assert_loaded_embedding_corruption(
@@ -4593,7 +5255,7 @@ fn a_required_vector_column_and_a_nullable_one_are_told_apart_by_their_declarati
         seed_absent_embedding_store(scratch.path(), "nullable-beside-required", Value::Null);
     let reader = open_for_test(
         &nullable.path,
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     )
     .unwrap_or_else(|error| panic!("a nullable vector column still reads directly: {error:?}"));
     let (_, absent) = query_embedding_rows(&reader, &nullable, "nullable F32");
@@ -4656,7 +5318,7 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
 
         let reader = open_for_test(
             &store.path,
-            default_reader_config(Arc::new(ManualClock::default())),
+            default_reader_config(Arc::new(ManualDeadlineClock::default())),
         )
         .unwrap_or_else(|error| {
             panic!("a required {word} column reads back through the direct reader: {error:?}")
@@ -4686,8 +5348,21 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
                 "every row of a required {word} column is served the embedding it promises: {other:?}"
             ),
         }
-        let content = committed_content_for_test(&store.path)
-            .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
+        let content = {
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                )
+                .expect("admit the declared fixture root");
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&store.path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
         let embedded_row =
             stored_row_by_identity(&content.relational_rows, &store.table, store.embedded_id);
         let absent_row =
@@ -4750,7 +5425,7 @@ fn selected_quantized_vectors_are_authenticated_before_they_are_returned() {
 
         let reader = open_for_test(
             &store.path,
-            default_reader_config(Arc::new(ManualClock::default())),
+            default_reader_config(Arc::new(ManualDeadlineClock::default())),
         )
         .unwrap_or_else(|error| panic!("untouched vector bodies do not block open: {error:?}"));
         assert_loaded_embedding_corruption(
@@ -4788,7 +5463,7 @@ fn a_changed_row_tombstone_is_refused_instead_of_suppressing_the_row() {
 
     let reader = open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     )
     .unwrap_or_else(|error| panic!("an untouched row body does not block open: {error:?}"));
     assert_loaded_embedding_corruption(
@@ -4831,14 +5506,14 @@ fn historical_row_versions_remain_readable_through_their_current_version() {
 
     let reader = open_for_test(
         &path,
-        default_reader_config(Arc::new(ManualClock::default())),
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
     )
     .expect("open retained-history reader");
     let answer = reader
         .execute("SELECT id, payload FROM history_rows", &HashMap::new())
         .expect("read the authenticated current version");
     assert_eq!(
-        answer.result.rows,
+        answer.result.rows(),
         vec![vec![Value::Int64(1), Value::Text("current".to_owned())]]
     );
 }
@@ -4864,7 +5539,7 @@ fn a_nullable_quantized_column_with_no_embedding_stays_directly_readable() {
 
         let reader = open_for_test(
             &store.path,
-            default_reader_config(Arc::new(ManualClock::default())),
+            default_reader_config(Arc::new(ManualDeadlineClock::default())),
         )
         .unwrap_or_else(|error| panic!("a nullable {word} column still reads directly: {error:?}"));
         let (embedded, absent) = query_embedding_rows(&reader, &store, word);
@@ -4885,8 +5560,21 @@ fn a_nullable_quantized_column_with_no_embedding_stays_directly_readable() {
             Some(&Value::Vector(quantized.clone())),
             "the neighbouring embedding is served unchanged"
         );
-        let content = committed_content_for_test(&store.path)
-            .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
+        let content = {
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                )
+                .expect("admit the declared fixture root");
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&store.path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
         let embedded_row =
             stored_row_by_identity(&content.relational_rows, &store.table, store.embedded_id);
         let vectors = vectors_for_column(&content.vectors, &store.table, &store.column);
@@ -4938,7 +5626,7 @@ fn a_required_quantized_column_without_its_durable_vector_is_corrupt() {
 
         match open_for_test(
             &store.path,
-            default_reader_config(Arc::new(ManualClock::default())),
+            default_reader_config(Arc::new(ManualDeadlineClock::default())),
         ) {
             Err(DirectFileReaderError::CorruptStore(DirectStoreDiagnostic::MalformedRecord, _)) => {
             }
@@ -4958,4 +5646,312 @@ fn a_required_quantized_column_without_its_durable_vector_is_corrupt() {
             "refusing the read leaves every byte of the source tree alone"
         );
     }
+}
+
+#[test]
+fn a_vector_written_after_its_row_answers_its_own_value_after_reopen_and_through_the_reader() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("independent-vectors.db");
+    let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+    let database = Database::open(&path).expect("open the store");
+    database
+        .execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+            &HashMap::new(),
+        )
+        .expect("declare the table");
+    let values = [
+        vec![1.0_f32, 0.0, 0.0],
+        vec![0.0_f32, 1.0, 0.0],
+        vec![0.0_f32, 0.0, 1.0],
+    ];
+    let tx = database.begin().expect("begin the owner row");
+    let row_id = database
+        .insert_row(
+            tx,
+            "evidence",
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("embedding".to_string(), Value::Vector(values[0].clone())),
+            ]),
+        )
+        .expect("insert the owner row");
+    database.commit(tx).expect("commit the owner row");
+    let mut expected = vec![(values[0].clone(), database.current_lsn())];
+    for value in &values[1..] {
+        let tx = database.begin().expect("begin the vector");
+        database
+            .insert_vector(tx, index.clone(), row_id, value.clone())
+            .expect("write the vector");
+        database.commit(tx).expect("commit the vector");
+        expected.push((value.clone(), database.current_lsn()));
+    }
+    let written = |vectors: &[contextdb_engine::sync_types::VectorChange]| {
+        vectors
+            .iter()
+            .filter(|vector| !vector.vector.is_empty())
+            .map(|vector| (vector.vector.clone(), vector.lsn))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        written(
+            &database
+                .changes_since(Lsn(0))
+                .expect("writer history")
+                .vectors
+        ),
+        expected
+    );
+    database.close().expect("close the writer");
+
+    let database = Database::open(&path).expect("reopen the writer");
+    assert_eq!(
+        written(
+            &database
+                .changes_since(Lsn(0))
+                .expect("reopened history")
+                .vectors
+        ),
+        expected,
+        "a superseded vector still answers its own value after a writable reopen"
+    );
+    database.close().expect("close the reopened writer");
+
+    let reader = open_for_test(
+        &path,
+        default_reader_config(Arc::new(ManualDeadlineClock::default())),
+    )
+    .expect("open the reader");
+    match reader
+        .metadata(DirectMetadataRequest::ImageState {
+            kind: DirectImageMetadataKind::ChangeLog,
+        })
+        .expect("the change history answers on request")
+        .body
+        .clone()
+    {
+        DirectMetadataBody::ImageState {
+            state: DirectImageState::ChangeLog(changes),
+        } => assert_eq!(
+            written(&changes.vectors),
+            expected,
+            "the reader route selects the same vectors"
+        ),
+        other => panic!("change history answers as change-log state: {other:?}"),
+    }
+}
+
+/// What the closed store answers on the file route.
+fn vector_cells_on_the_file_route(path: &std::path::Path, sql: &str) -> Vec<Vec<Value>> {
+    let session = contextdb_engine::ReadSession::open_with_clock_for_test(
+        path,
+        contextdb_engine::ReadSessionOptions::default(),
+        Arc::new(ManualDeadlineClock::default()),
+    )
+    .expect("the file route opens a healthy store");
+    session
+        .execute(sql, &HashMap::new())
+        .expect("a healthy store reads")
+        .rows()
+        .to_vec()
+}
+
+#[test]
+fn an_empty_slot_beside_a_stored_vector_reads_on_every_route() {
+    for same_transaction in [true, false] {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("empty-slot.db");
+        let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+        let vector = vec![0.0_f32, 1.0, 0.0];
+        let expected = vec![vec![Value::Vector(vector.clone())]];
+        let database = Database::open(&path).expect("open the store");
+        database
+            .execute(
+                "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+                &HashMap::new(),
+            )
+            .expect("declare the table");
+        let tx = database.begin().expect("begin the row");
+        let row_id = database
+            .insert_row(
+                tx,
+                "evidence",
+                HashMap::from([("id".to_string(), Value::Int64(1))]),
+            )
+            .expect("insert the row without its vector");
+        let tx = if same_transaction {
+            tx
+        } else {
+            database.commit(tx).expect("commit the row");
+            database.begin().expect("begin the vector")
+        };
+        database
+            .insert_vector(tx, index.clone(), row_id, vector.clone())
+            .expect("write the vector");
+        database.commit(tx).expect("commit the vector");
+        const SELECT: &str = "SELECT embedding FROM evidence";
+        assert_eq!(
+            database
+                .execute(SELECT, &HashMap::new())
+                .expect("writer read")
+                .rows(),
+            expected
+        );
+        database.close().expect("close the writer");
+        assert_eq!(vector_cells_on_the_file_route(&path, SELECT), expected);
+        let database = Database::open(&path).expect("reopen the writer");
+        assert_eq!(
+            database
+                .execute(SELECT, &HashMap::new())
+                .expect("reopened read")
+                .rows(),
+            expected
+        );
+        database.close().expect("close the reopened writer");
+    }
+}
+
+#[test]
+fn an_inline_vector_replaced_or_deleted_keeps_one_answer_on_every_route() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("inline-vector.db");
+    let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+    let kept_index = contextdb_core::VectorIndexRef::new("evidence", "kept");
+    let (first, second, third) = (
+        vec![1.0_f32, 0.0, 0.0],
+        vec![0.0_f32, 1.0, 0.0],
+        vec![0.0_f32, 0.0, 1.0],
+    );
+    const SELECT: &str = "SELECT embedding, kept FROM evidence";
+    let answer = |embedding: Value| vec![vec![embedding, Value::Vector(third.clone())]];
+    let database = Database::open(&path).expect("open the store");
+    database
+        .execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3), kept VECTOR(3))",
+            &HashMap::new(),
+        )
+        .expect("declare the table");
+    let tx = database.begin().expect("begin the row");
+    let row_id = database
+        .insert_row(
+            tx,
+            "evidence",
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("embedding".to_string(), Value::Vector(first.clone())),
+                ("kept".to_string(), Value::Vector(third.clone())),
+            ]),
+        )
+        .expect("insert the row");
+    database.commit(tx).expect("commit the row");
+
+    let tx = database.begin().expect("begin the edit");
+    database
+        .insert_vector(tx, index.clone(), row_id, second.clone())
+        .expect("replace the vector");
+    database.commit(tx).expect("commit the edit");
+    assert_eq!(
+        database
+            .execute(SELECT, &HashMap::new())
+            .expect("writer read")
+            .rows(),
+        answer(Value::Vector(second.clone())),
+        "SELECT answers the vector search finds, and the row keeps its other vector"
+    );
+    let hits = database
+        .query_vector(index.clone(), &second, 1, None, database.snapshot())
+        .expect("search the edited column");
+    assert!(hits[0].1 > 0.99, "search finds the new vector: {hits:?}");
+    let kept_hits = database
+        .query_vector(kept_index.clone(), &third, 1, None, database.snapshot())
+        .expect("search the other column");
+    assert!(
+        kept_hits[0].1 > 0.99,
+        "the other vector is still found: {kept_hits:?}"
+    );
+    database.close().expect("close the writer");
+    assert_eq!(
+        vector_cells_on_the_file_route(&path, SELECT),
+        answer(Value::Vector(second.clone()))
+    );
+
+    // The caller's row id still names the row after commit and reopen.
+    let database = Database::open(&path).expect("reopen the writer");
+    let tx = database.begin().expect("begin the later edit");
+    database
+        .insert_vector(tx, index.clone(), row_id, first.clone())
+        .expect("edit through the original row id");
+    database.commit(tx).expect("commit the later edit");
+    database.close().expect("close the writer");
+    assert_eq!(
+        vector_cells_on_the_file_route(&path, SELECT),
+        answer(Value::Vector(first.clone()))
+    );
+
+    let database = Database::open(&path).expect("reopen the writer");
+    let tx = database.begin().expect("begin the delete");
+    database
+        .delete_vector(tx, index.clone(), row_id)
+        .expect("delete the vector");
+    database.commit(tx).expect("commit the delete");
+    assert_eq!(
+        database
+            .execute(SELECT, &HashMap::new())
+            .expect("writer read")
+            .rows(),
+        answer(Value::Null),
+        "the row no longer answers a vector search cannot find"
+    );
+    assert!(
+        database
+            .query_vector(index, &first, 1, None, database.snapshot())
+            .expect("search after the delete")
+            .is_empty()
+    );
+    database.close().expect("close the writer");
+    assert_eq!(
+        vector_cells_on_the_file_route(&path, SELECT),
+        answer(Value::Null)
+    );
+}
+
+#[test]
+fn replacing_an_inline_vector_with_one_equal_but_for_a_zero_sign_keeps_the_new_bits() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("zero-sign.db");
+    let index = contextdb_core::VectorIndexRef::new("evidence", "embedding");
+    let database = Database::open(&path).expect("open the store");
+    database
+        .execute(
+            "CREATE TABLE evidence (id INTEGER PRIMARY KEY, embedding VECTOR(3))",
+            &HashMap::new(),
+        )
+        .expect("declare the table");
+    let tx = database.begin().expect("begin the row");
+    let row_id = database
+        .insert_row(
+            tx,
+            "evidence",
+            HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("embedding".to_string(), Value::Vector(vec![0.0, 1.0, 0.0])),
+            ]),
+        )
+        .expect("insert the row");
+    database.commit(tx).expect("commit the row");
+    let tx = database.begin().expect("begin the edit");
+    database
+        .insert_vector(tx, index, row_id, vec![-0.0, 1.0, 0.0])
+        .expect("replace the vector");
+    database.commit(tx).expect("commit the edit");
+    database.close().expect("close the writer");
+    let rows = vector_cells_on_the_file_route(&path, "SELECT embedding FROM evidence");
+    let [Value::Vector(vector)] = rows[0].as_slice() else {
+        panic!("the file route answers the vector: {rows:?}");
+    };
+    assert_eq!(
+        vector[0].to_bits(),
+        (-0.0_f32).to_bits(),
+        "the inserted bits are what every route answers"
+    );
 }

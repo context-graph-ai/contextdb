@@ -84,7 +84,9 @@ fn fixb_owner_row_synthesis_dedups_on_the_whole_key_not_the_leading_column() {
     // Reopen: the ephemeral change log is empty, so `changes_since` derives the
     // delta from persisted state — the path that synthesizes owner rows.
     let db = Arc::new(Database::open(&path).expect("reopen sender"));
-    let changeset = db.changes_since(Lsn(1));
+    let changeset = db
+        .changes_since(Lsn(1))
+        .expect("read changes_since fixture");
 
     assert_eq!(
         changeset.vectors.len(),

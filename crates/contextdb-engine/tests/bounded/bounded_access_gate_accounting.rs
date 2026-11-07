@@ -158,7 +158,7 @@ fn a_gated_relational_read_charges_the_grant_table_once_not_once_per_row() {
     .expect("a gated relational read must be served");
 
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         GATED_ROWS as usize,
         "every stored row carries an entitlement the principal holds"
     );
@@ -198,7 +198,7 @@ fn a_gated_relational_read_is_served_under_a_ceiling_sized_for_its_rows_and_gran
             limits.work
         ),
     };
-    assert_eq!(served.result.rows.len(), GATED_ROWS as usize);
+    assert_eq!(served.result.rows().len(), GATED_ROWS as usize);
 }
 
 /// A gated graph fixture: every node and edge carries the entitlement, and the
@@ -266,7 +266,7 @@ fn traversal_access_work(grants: u64, salt: u128) -> u64 {
     )
     .expect("a gated traversal must be served");
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         TRAVERSAL_EDGES as usize,
         "every neighbour carries an entitlement the principal holds"
     );

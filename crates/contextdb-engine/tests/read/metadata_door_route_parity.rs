@@ -203,6 +203,10 @@ fn the_idle_file_answers_every_question_a_store_is_asked_about_itself() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn the_owner_answers_the_same_questions_in_the_same_words() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "served-runtime");
@@ -278,6 +282,10 @@ fn the_owner_answers_the_same_questions_in_the_same_words() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn both_routes_describe_the_same_store_the_same_way() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "parity-runtime");
@@ -303,7 +311,11 @@ fn both_routes_describe_the_same_store_the_same_way() {
         let events = session
             .metadata(MetadataRequest::EventsStatus, None)
             .expect("the owner answers");
-        (tables.body, schema.body, events.body)
+        (
+            tables.body.clone(),
+            schema.body.clone(),
+            events.body.clone(),
+        )
     };
 
     // The same store, now idle, asked the same questions.
@@ -317,7 +329,8 @@ fn both_routes_describe_the_same_store_the_same_way() {
         session
             .metadata(MetadataRequest::Tables, None)
             .expect("the file answers")
-            .body,
+            .body
+            .clone(),
         session
             .metadata(
                 MetadataRequest::Schema {
@@ -326,11 +339,13 @@ fn both_routes_describe_the_same_store_the_same_way() {
                 None,
             )
             .expect("the file answers")
-            .body,
+            .body
+            .clone(),
         session
             .metadata(MetadataRequest::EventsStatus, None)
             .expect("the file answers")
-            .body,
+            .body
+            .clone(),
     );
 
     assert_eq!(
@@ -388,6 +403,10 @@ fn both_routes_describe_the_same_store_the_same_way() {
 /// binding -- so a constrained handle asking why ITS query routes as it does
 /// gets the same bound answer, however it is routed.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn the_owner_route_and_the_file_route_both_explain_a_bound_partition_key_the_way_the_owner_plans_it_locally()
  {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
@@ -510,6 +529,10 @@ fn the_owner_route_and_the_file_route_both_explain_a_bound_partition_key_the_way
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_execution() {
     let directory = tempfile::TempDir::new().expect("task-scoped trace directory");
     let runtime_root = secure_runtime_root(directory.path(), "vector-trace-runtime");
@@ -551,7 +574,7 @@ fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_executio
         .execute(sql, &params)
         .expect("the live writer executes the vector query");
     let local_trace = local
-        .trace
+        .trace()
         .vector_search
         .clone()
         .expect("local execution publishes its bounded vector disclosure");
@@ -568,7 +591,7 @@ fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_executio
         .execute(sql, &params)
         .expect("the live owner returns the executed query");
     assert_eq!(
-        owner_result.trace.vector_search.as_ref(),
+        owner_result.trace().vector_search.as_ref(),
         Some(&local_trace),
         "the canonical owner result restores the exact bounded and redacted vector trace"
     );
@@ -582,7 +605,10 @@ fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_executio
     let file_result = file
         .execute(sql, &params)
         .expect("the committed file executes the same query");
-    assert_eq!(file_result.trace.vector_search.as_ref(), Some(&local_trace));
+    assert_eq!(
+        file_result.trace().vector_search.as_ref(),
+        Some(&local_trace)
+    );
 }
 
 #[test]
@@ -642,6 +668,7 @@ fn a_continuation_is_refused_by_a_question_that_never_issues_one() {
         .metadata(MetadataRequest::Tables, None)
         .expect("the table inventory answers")
         .continuation
+        .clone()
         .expect("this ceiling stops the inventory early, so it issues a token");
 
     let crossed = paging.metadata(MetadataRequest::EventsStatus, Some(&issued));
@@ -659,6 +686,10 @@ fn a_continuation_is_refused_by_a_question_that_never_issues_one() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_document_that_does_not_fit_the_caller_s_byte_ceiling_says_what_would_fit_it() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "ceiling-runtime");
@@ -726,7 +757,7 @@ fn drain_the_table_inventory(session: &ReadSession) -> Vec<Vec<String>> {
             .metadata(MetadataRequest::Tables, resume.as_deref())
             .expect("a page of the table inventory");
         pages.push(table_names(&answer.body));
-        match answer.continuation {
+        match answer.continuation.clone() {
             Some(next) => resume = Some(next),
             None => break,
         }
@@ -752,6 +783,10 @@ fn paging_options() -> ReadSessionOptions {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_table_inventory_too_big_for_one_answer_pages_the_same_way_on_both_routes() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "paging-runtime");
@@ -811,6 +846,10 @@ fn a_table_inventory_too_big_for_one_answer_pages_the_same_way_on_both_routes() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_continuation_from_one_route_resumes_the_same_place_on_the_other() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "cross-route-runtime");
@@ -827,7 +866,10 @@ fn a_continuation_from_one_route_resumes_the_same_place_on_the_other() {
             .expect("the owner's first page");
         (
             table_names(&answer.body),
-            answer.continuation.expect("the owner has more to give"),
+            answer
+                .continuation
+                .clone()
+                .expect("the owner has more to give"),
         )
     };
 
@@ -895,6 +937,10 @@ fn owner_route_image_state_refusal(
 /// three questions is the control -- without it, a reader that had simply
 /// stopped answering image-state everywhere would satisfy the refusal.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_image_state_question_over_the_owner_route_names_what_it_cannot_answer() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
     let runtime_root = secure_runtime_root(directory.path(), "unsupported-runtime");
@@ -919,7 +965,7 @@ fn an_image_state_question_over_the_owner_route_names_what_it_cannot_answer() {
         assert_eq!(
             failure.detail(),
             &ReadFailureDetail::OwnerRouteUnsupported(OwnerRouteUnsupportedDetail {
-                inspection: IMAGE_STATE_INSPECTION.to_owned(),
+                inspection: IMAGE_STATE_INSPECTION.to_owned().into(),
             }),
             "the refusal names the inspection it could not answer, for {kind:?}"
         );

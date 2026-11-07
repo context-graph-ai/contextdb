@@ -14,15 +14,15 @@ fn p() -> HashMap<String, Value> {
 
 fn row_count(db: &Database, table: &str) -> usize {
     let result = db.execute(&format!("SELECT * FROM {table}"), &p()).unwrap();
-    result.rows.len()
+    result.rows().len()
 }
 
 fn col_idx(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == name)
-        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns()))
 }
 
 // ---------------------------------------------------------------------------
@@ -64,14 +64,14 @@ fn r01_basic_age_pruning() {
     db.execute("INSERT INTO obs (id, data) VALUES (3, 'young')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "pruning must delete expired rows");
     assert_eq!(row_count(&db, "obs"), 1, "only the young row survives");
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("young".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("young".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -104,13 +104,13 @@ fn r02_short_ttl_prunes_old_not_new() {
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'new')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert!(pruned > 0, "at least the old row must be pruned");
     assert_eq!(row_count(&db, "obs"), 1, "only the new row survives");
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("new".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("new".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +143,8 @@ fn r03_sync_safe_unsynced_rows_survive() {
 
     // Sync watermark is 0 — no rows synced
     db.set_sync_watermark(Lsn(0));
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("run pruning with unsynced rows protected");
 
     assert_eq!(
         row_count(&db, "obs"),
@@ -183,7 +184,7 @@ fn r04_sync_safe_synced_rows_pruned() {
 
     // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "synced expired row must be pruned");
     assert_eq!(row_count(&db, "obs"), 0);
@@ -215,14 +216,14 @@ fn r05_expires_column_per_row_override() {
     )
     .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "past-expiry row must be pruned");
     assert_eq!(row_count(&db, "obs"), 1, "only future row survives");
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("future".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("future".to_string()));
 }
 
 #[test]
@@ -245,13 +246,16 @@ fn r05b_pruning_expired_history_keeps_newer_live_version() {
     )
     .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert_eq!(pruned, 1, "only the expired historical version is pruned");
     assert_eq!(row_count(&db, "obs"), 1, "newer live version must survive");
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("live-version".to_string()));
+    assert_eq!(
+        result.rows()[0][idx],
+        Value::Text("live-version".to_string())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +289,8 @@ fn r06_expires_infinity_never_pruned() {
 
     // Advance 2 s past the row's stamped time — beyond the 1 s TTL (infinity ignores it).
     mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("run pruning with infinite expiry protected");
 
     assert_eq!(
         row_count(&db, "obs"),
@@ -326,7 +331,7 @@ fn r07_null_expires_uses_default_ttl() {
 
     // Advance 3 s past the row's stamped time — beyond the 2 s table TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "NULL expires row must be pruned by table TTL");
     assert_eq!(row_count(&db, "obs"), 0);
@@ -355,7 +360,8 @@ fn r08_alter_table_set_retain() {
         .unwrap();
 
     // No retention initially — pruning does nothing
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("run pruning before adding retention");
     assert_eq!(row_count(&db, "obs"), 1);
 
     // Add retention
@@ -369,7 +375,7 @@ fn r08_alter_table_set_retain() {
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'young')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(
         pruned > 0,
@@ -379,7 +385,7 @@ fn r08_alter_table_set_retain() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("young".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("young".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +419,8 @@ fn r09_alter_table_drop_retain() {
 
     // Advance 3 s past the row's stamped time — the DROP means it must survive anyway.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("run pruning after dropping retention");
 
     assert_eq!(
         row_count(&db, "obs"),
@@ -453,7 +460,8 @@ fn r10_alter_table_set_retain_sync_safe() {
 
     // Sync watermark at 0 — unsynced
     db.set_sync_watermark(Lsn(0));
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("run pruning before advancing the sync watermark");
 
     assert_eq!(
         row_count(&db, "obs"),
@@ -463,7 +471,7 @@ fn r10_alter_table_set_retain_sync_safe() {
 
     // Now sync and prune
     db.set_sync_watermark(Lsn(u64::MAX));
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "synced expired row must be pruned");
     assert_eq!(row_count(&db, "obs"), 0);
@@ -551,7 +559,7 @@ fn r14_timestamp_iso8601_round_trip() {
         .execute("SELECT * FROM events WHERE id = 1", &p())
         .unwrap();
     let idx = col_idx(&result, "ts");
-    match &result.rows[0][idx] {
+    match &result.rows()[0][idx] {
         Value::Timestamp(millis) => {
             // 2026-03-24T12:00:00Z in epoch millis
             assert!(*millis > 0, "timestamp must be positive epoch millis");
@@ -587,7 +595,7 @@ fn r15_infinity_sentinel_value() {
 
     let result = db.execute("SELECT * FROM obs WHERE id = 1", &p()).unwrap();
     let idx = col_idx(&result, "expires_at");
-    match &result.rows[0][idx] {
+    match &result.rows()[0][idx] {
         Value::Timestamp(millis) => {
             assert_eq!(*millis, i64::MAX, "'infinity' must be stored as i64::MAX");
         }
@@ -716,7 +724,8 @@ fn r18_pruning_removes_graph_edges() {
 
     // Advance 3 s past the nodes' stamped time — beyond the 2 s TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired nodes and their graph edges");
 
     assert_eq!(row_count(&db, "nodes"), 0, "both nodes must be pruned");
 
@@ -775,14 +784,15 @@ fn r19_pruning_removes_vector_entries() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "vector search must find the row before pruning"
     );
 
     // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired rows and their vector entries");
 
     assert_eq!(row_count(&db, "obs"), 0, "row must be pruned");
 
@@ -794,7 +804,7 @@ fn r19_pruning_removes_vector_entries() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "vector search must return nothing after pruning"
     );
@@ -889,7 +899,8 @@ fn r20_legacy_rows_without_created_at_survive() {
 
     // Advance 2 s past the row's stamped time — beyond the 1 s TTL.
     mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired row after adding retention");
 
     // The row was inserted by the engine, so it HAS created_at and IS old → pruned
     assert_eq!(
@@ -931,14 +942,14 @@ fn r21_in_memory_retention_works() {
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'young')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "in-memory DB must support pruning");
     assert_eq!(row_count(&db, "obs"), 1, "only the young row survives");
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("young".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("young".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -993,7 +1004,8 @@ fn r22_pruning_does_not_fire_commit_event() {
 
     // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
     mock_now.fetch_add(3_000, Ordering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired row without firing a commit event");
 
     let after_prune = commit_count.load(Ordering::SeqCst);
     assert_eq!(
@@ -1230,18 +1242,18 @@ fn r28_concurrent_prune_and_insert() {
     });
 
     // Run pruning concurrently
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     // A concurrent registered statement can still own the expired versions.
     // New statements must see expiry immediately; reclamation follows release.
     assert_eq!(
         db.execute("SELECT id FROM obs WHERE id < 100", &p())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
     inserter.join().expect("inserter thread must not panic");
-    let reclaimed_after_release = db.run_pruning_cycle();
+    let reclaimed_after_release = db.run_pruning_cycle().unwrap();
     assert!(
         pruned + reclaimed_after_release > 0,
         "old rows must be reclaimed after the concurrent statement releases its snapshot"
@@ -1315,7 +1327,8 @@ fn mr1_ann_accuracy_after_vector_pruning() {
         .unwrap();
     }
 
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired vectors before checking ANN accuracy");
 
     assert_eq!(row_count(&db, "docs"), 5, "only 5 new rows survive");
 
@@ -1331,15 +1344,15 @@ fn mr1_ann_accuracy_after_vector_pruning() {
 
     // Must return exactly 5 results (the surviving new vectors).
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         5,
         "ANN search must return only surviving vectors, got {}",
-        result.rows.len()
+        result.rows().len()
     );
 
     // None of the old IDs should appear in results.
     let result_ids: Vec<uuid::Uuid> = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match &row[0] {
             Value::Uuid(id) => Some(*id),
@@ -1416,7 +1429,7 @@ fn mr2_graph_edge_cleanup_after_prune_reopen() {
 
         // Advance 2 s past the nodes' stamped time — beyond the 1 s TTL.
         mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-        let pruned = db.run_pruning_cycle();
+        let pruned = db.run_pruning_cycle().unwrap();
         assert!(pruned > 0, "nodes must be pruned");
 
         // In-memory edges must be removed.
@@ -1473,7 +1486,8 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
     // With watermark at 0 and row lsn at 0, the row is "unsynced" (lsn >= watermark).
     // Sync-safe must NOT prune it.
     db.set_sync_watermark(Lsn(0));
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("run pruning with the zero-LSN row protected");
     assert_eq!(
         row_count(&db, "obs"),
         1,
@@ -1483,7 +1497,7 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
     // Set watermark high enough that the row's LSN is below it.
     // This means the row has been synced → eligible for pruning.
     db.set_sync_watermark(Lsn(u64::MAX));
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert!(pruned > 0, "row must be pruned when watermark > lsn");
     assert_eq!(row_count(&db, "obs"), 0);
 }
@@ -1617,7 +1631,7 @@ fn retention_defers_physical_reclaim_to_a_two_pass_statement() {
         .execute("SELECT * FROM obs", &p())
         .expect("a fresh SELECT must succeed even though reclaim is deferred");
     assert_eq!(
-        fresh.rows.len(),
+        fresh.rows().len(),
         0,
         "logical expiry must have advanced under the live two-pass statement"
     );
@@ -1631,13 +1645,13 @@ fn retention_defers_physical_reclaim_to_a_two_pass_statement() {
     // complete, intact row set it registered against — one statement, one
     // view.
     assert_eq!(
-        original.rows.len(),
+        original.rows().len(),
         EXPIRING_ROWS,
         "the two-pass statement must return every row from the snapshot it registered"
     );
     let id = col_idx(&original, "id");
     let data = col_idx(&original, "data");
-    let mut original_rows = original.rows;
+    let mut original_rows = original.rows().to_vec();
     original_rows.sort_by_key(|row| match &row[id] {
         Value::Int64(value) => *value,
         other => panic!("selected id must be an integer, got {other:?}"),
@@ -1764,7 +1778,7 @@ fn mr4_pruning_under_concurrent_read() {
         .execute("SELECT * FROM obs", &p())
         .expect("a fresh SELECT must succeed while reads continue");
     assert_eq!(
-        fresh_after_cycle_1.rows.len(),
+        fresh_after_cycle_1.rows().len(),
         0,
         "logical expiry must have advanced while the continuous read loop kept running"
     );
@@ -1776,7 +1790,7 @@ fn mr4_pruning_under_concurrent_read() {
         .expect("reader A must still be waiting for release");
     let reader_a_result = reader_a.join().expect("reader A thread must not panic");
     assert_eq!(
-        reader_a_result.rows.len(),
+        reader_a_result.rows().len(),
         EXPIRING_ROWS,
         "reader A must return every row from the snapshot it registered"
     );
@@ -1815,7 +1829,7 @@ fn mr4_pruning_under_concurrent_read() {
         .expect("reader B must still be waiting for release");
     let reader_b_result = reader_b.join().expect("reader B thread must not panic");
     assert_eq!(
-        reader_b_result.rows.len(),
+        reader_b_result.rows().len(),
         0,
         "reader B registered after expiry must return zero rows"
     );
@@ -1902,7 +1916,7 @@ fn retention_defers_reclaim_without_breaking_vector_search() {
         )
         .expect("vector search over a stamped-but-unreclaimed row must succeed, not error");
     assert_eq!(
-        current_search.rows.len(),
+        current_search.rows().len(),
         0,
         "vector search must not return a logically expired row"
     );
@@ -1918,7 +1932,7 @@ fn retention_defers_reclaim_without_breaking_vector_search() {
         )
         .expect("vector search at the pinned snapshot must succeed");
     assert_eq!(
-        pinned_search.rows.len(),
+        pinned_search.rows().len(),
         SEEDED_VECTOR_ROWS,
         "the pinned snapshot must still see every seeded row"
     );
@@ -1939,7 +1953,7 @@ fn retention_defers_reclaim_without_breaking_vector_search() {
             &search_params,
         )
         .expect("vector search must still succeed after physical reclaim");
-    assert_eq!(search_after_reclaim.rows.len(), 0);
+    assert_eq!(search_after_reclaim.rows().len(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2014,7 +2028,7 @@ fn retention_expiry_stamp_survives_reopen() {
             .execute("SELECT * FROM obs", &p())
             .expect("SELECT must succeed immediately after reopen");
         assert_eq!(
-            rows.rows.len(),
+            rows.rows().len(),
             0,
             "the logical expiry stamp must survive a reopen with no cycle run yet"
         );
@@ -2025,7 +2039,7 @@ fn retention_expiry_stamp_survives_reopen() {
             )
             .expect("vector search must succeed immediately after reopen");
         assert_eq!(
-            search.rows.len(),
+            search.rows().len(),
             0,
             "the vector tombstone must survive a reopen with no cycle run yet"
         );
@@ -2049,7 +2063,7 @@ fn retention_expiry_stamp_survives_reopen() {
                 &search_params,
             )
             .expect("vector search must succeed after the second reopen");
-        assert_eq!(search.rows.len(), 0);
+        assert_eq!(search.rows().len(), 0);
     }
 }
 
@@ -2084,7 +2098,7 @@ fn retention_keeps_rows_an_explicit_snapshot_pin_is_entitled_to() {
     let pinned = db
         .execute_at_snapshot("SELECT data FROM obs", &p(), snapshot)
         .expect("the pinned snapshot must remain readable across calls");
-    assert_eq!(pinned.rows, vec![vec![Value::Text("pinned".to_string())]]);
+    assert_eq!(pinned.rows(), vec![vec![Value::Text("pinned".to_string())]]);
 
     drop(pin);
     let reclaimed = db
@@ -2132,7 +2146,7 @@ fn mr5_persistence_round_trip_with_pruning() {
 
         // Advance 2 s past the rows' stamped time — beyond the 1 s TTL.
         mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-        let pruned = db.run_pruning_cycle();
+        let pruned = db.run_pruning_cycle().unwrap();
         assert!(pruned > 0, "rows must be pruned");
         assert_eq!(row_count(&db, "obs"), 0, "all rows must be pruned");
     }
@@ -2188,8 +2202,9 @@ fn retention_wallclock_now_hoisted_once_per_pass() {
     // Reset counter AFTER setup — inserts may legitimately read the clock for row timestamps.
     counter.store(0, AtomicOrdering::SeqCst);
 
-    // run_pruning_cycle returns the count of pruned rows (u64), not Result.
-    let _pruned = db.run_pruning_cycle();
+    let _pruned = db
+        .run_pruning_cycle()
+        .expect("prune expired rows before checking the clock read count");
 
     let reads = counter.load(AtomicOrdering::SeqCst);
     assert_eq!(
@@ -2234,15 +2249,16 @@ fn retention_tolerates_ntp_backward_jump() {
     // Row must survive.
     mock_now.store(900, AtomicOrdering::SeqCst);
 
-    // run_pruning_cycle returns the pruned count (u64), not Result.
-    let _pruned = db.run_pruning_cycle();
+    let _pruned = db
+        .run_pruning_cycle()
+        .expect("run pruning after the clock moves backward");
 
     let result = db
         .execute("SELECT COUNT(*) FROM t", &Default::default())
         .expect("SELECT COUNT must succeed");
-    assert_eq!(result.rows.len(), 1, "COUNT returns exactly one row");
+    assert_eq!(result.rows().len(), 1, "COUNT returns exactly one row");
     assert_eq!(
-        result.rows[0][0],
+        result.rows()[0][0],
         Value::Int64(1),
         "row with created_at > now must survive pruning (saturating_sub semantics)"
     );
@@ -2302,7 +2318,7 @@ fn retention_expiry_budget_refusal_publishes_nothing_and_ownership_releases_once
             &p()
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         1
     );
@@ -2316,7 +2332,7 @@ fn retention_expiry_budget_refusal_publishes_nothing_and_ownership_releases_once
             snapshot
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         1
     );

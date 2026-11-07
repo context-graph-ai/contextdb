@@ -101,14 +101,14 @@ fn setup_seeded_db() -> (Database, Vec<Uuid>) {
     assert_eq!(
         db.execute("SELECT id FROM decisions", &empty())
             .expect("count parents")
-            .rows
+            .rows()
             .len(),
         pre_gate_rows
     );
     assert_eq!(
         db.execute("SELECT id FROM invalidations", &empty())
             .expect("count children")
-            .rows
+            .rows()
             .len(),
         pre_gate_rows
     );
@@ -164,6 +164,13 @@ fn assert_report(report: &FkReport) {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "tier2_fk_revalidation_overhead/100k_seeded_1k_mixed_fk_commits",
+            |_| {},
+        );
+        return;
+    }
     let (db, parents) = setup_seeded_db();
     let pre_gate = run_fk_commits(&db, &parents);
     assert_report(&pre_gate);

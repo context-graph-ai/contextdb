@@ -48,11 +48,11 @@ fn ordered_writer_read_fetches_each_version_by_its_complete_key() {
         .expect("read ordered rows");
     let counters = work.counters();
     assert_eq!(
-        answer.trace.index_used.as_deref(),
+        answer.trace().index_used.as_deref(),
         Some("ordered_rows_sequence")
     );
-    assert_eq!(answer.rows.len(), 64);
-    for (sequence, row) in answer.rows.iter().enumerate() {
+    assert_eq!(answer.rows().len(), 64);
+    for (sequence, row) in answer.rows().iter().enumerate() {
         let expected_id = 63 - sequence as i64;
         assert_eq!(
             row,
@@ -115,19 +115,19 @@ fn ordered_anchor_lookup_seeks_the_filtered_index_run() {
         )
         .expect("read one event's anchors");
     assert_eq!(
-        answer.rows,
+        answer.rows(),
         vec![vec![Value::Uuid(uuid::Uuid::from_u128(131))]]
     );
-    assert!(answer.trace.sort_elided);
-    assert!(answer.trace.rows_examined <= 2, "{:?}", answer.trace);
+    assert!(answer.trace().sort_elided);
+    assert!(answer.trace().rows_examined <= 2, "{:?}", answer.trace());
     assert!(
         !answer
-            .trace
+            .trace()
             .indexes_considered
             .iter()
-            .any(|candidate| Some(candidate.name.as_str()) == answer.trace.index_used.as_deref()),
+            .any(|candidate| Some(candidate.name.as_str()) == answer.trace().index_used.as_deref()),
         "the used index must not be reported as rejected: {:?}",
-        answer.trace
+        answer.trace()
     );
     drop(reader);
     database.close().expect("close writer");

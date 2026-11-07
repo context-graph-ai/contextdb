@@ -14,6 +14,14 @@ use read_cli_support::*;
 
 const SHIPPED_RESULT_ROWS: i64 = 500;
 
+/// A work declaration below what the 12,000-vector AUTO fallback needs. The
+/// exact scan is charged per vector and dimension: on both the writer-owned and
+/// the direct-file route it first succeeds at 36,003 (12,001 x 3) and refuses
+/// below, so 50,000 no longer refuses anything. Half of that observed need
+/// refuses on both routes; the sufficient 5,000,000 runs in the same journey are
+/// the admitted positive control.
+const LOW_VECTOR_WORK: &str = "18000";
+
 fn store_of(rows: usize) -> Store {
     store_with(&create_seeded_table("bounded", rows))
 }
@@ -418,13 +426,17 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
             store.path_str(),
             "--write",
             "--json",
-            "--owner-read-work",
-            "5000000",
+            // The writer's own SELECT is governed by its own `--read-work`
+            // declaration. `--owner-read-work` is only the allowance offered
+            // to other readers, so the low declaration goes on `--read-work`;
+            // the sufficient 5,000,000 above is the admitted positive control.
+            "--read-work",
+            LOW_VECTOR_WORK,
         ],
         &format!("{query};\n"),
     );
     let direct_low_work = run_with_active_budget(
-        &[store.path_str(), "--json", "--read-work", "50000"],
+        &[store.path_str(), "--json", "--read-work", LOW_VECTOR_WORK],
         &format!("{query};\n"),
     );
     for (route, outcome, expected_route, remedy) in [
@@ -563,6 +575,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
     let store = auto_vector_store(1_024);
     let query = "SELECT id FROM vector_budget_docs \
@@ -572,12 +585,19 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
         &["--read-work", "5000000", "--owner-read-work", "5000000"],
         "",
     );
-    owner.send_line(".maintenance run");
-    owner.wait_for("\"maintenance_cycle\"");
-    let maintenance_cycle = expect_document(
-        &owner.documents(),
-        "maintenance_cycle",
-        "the writer's JSON maintenance receipt",
+    // Each maintenance run is one finite cycle; 64 consecutive runs cover the build, and
+    // the status line after them answers only once every run has been processed.
+    for _ in 0..64 {
+        owner.send_line(".maintenance run");
+    }
+    owner.send_line(".maintenance status");
+    owner.wait_for("{\"maintenance\":{");
+    let maintenance_cycle = documents_named(&owner.documents(), "maintenance_cycle")
+        .pop()
+        .expect("the writer's JSON maintenance receipt");
+    assert_eq!(
+        maintenance_cycle["vector"]["remaining_partitions"], 0,
+        "the repeated cycles leave no partition with work: {maintenance_cycle}"
     );
     assert_eq!(maintenance_cycle["vector"]["nonempty_partitions"], 1);
     assert_eq!(maintenance_cycle["vector"]["ready_partitions"], 1);
@@ -606,7 +626,7 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
 
     let reader = run(
         &[store.path_str(), "--json", "--read-work", "5000000"],
-        &format!("{query}\n"),
+        &format!(".trace on\n{query}\n"),
     );
     assert_eq!(
         reader.code,
@@ -618,6 +638,25 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
         reader.stderr.contains("\"route\":\"owner\""),
         "the proof must use the live owner's read route.\n{}",
         reader.describe()
+    );
+    // The search's work crosses the owner channel with its answer: the
+    // stored vectors it read to score its candidates are reported.
+    let trace = reader
+        .stderr_docs()
+        .into_iter()
+        .filter_map(|document| document.get("trace").cloned())
+        .find(|trace| trace["vector_search"].is_object())
+        .unwrap_or_else(|| {
+            panic!(
+                "the live reader publishes its executed route.\n{}",
+                reader.describe()
+            )
+        });
+    assert!(
+        trace["vector_search"]["rescore_evaluations"]
+            .as_u64()
+            .is_some_and(|reads| reads > 0),
+        "the owner's answer reports the stored vectors its search read: {trace}"
     );
 
     let owner_result = documents_named(&owner.documents(), "result")
@@ -637,6 +676,7 @@ fn maintenance_publishes_one_indexed_route_to_the_writer_and_its_live_reader() {
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli() {
     let store = auto_vector_store(1_024);
     let outcome = run(
@@ -675,9 +715,102 @@ fn maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli()
             outcome.describe()
         );
     }
+
+    // A cycle with no check due measured nothing: its receipt says unknown,
+    // never 0. Every run and compact receipt names the policy that governed it.
+    let receipts = run(
+        &[store.path_str(), "--write"],
+        ".maintenance run\n.maintenance run\n.maintenance compact\n",
+    );
+    assert_eq!(receipts.code, Some(0), "{}", receipts.describe());
+    assert!(
+        receipts
+            .stdout
+            .contains("auto_compact_fragmentation_before=unknown"),
+        "the second cycle's text receipt says unknown:\n{}",
+        receipts.describe()
+    );
+    let policy = "compaction_policy=start_ratio:0.5(default),min_interval_ms:3600000(default),\
+                  stop_ratio:0.05(default),max_sweeps:8(default)";
+    assert_eq!(
+        receipts.stdout.matches(policy).count(),
+        3,
+        "every run and compact text receipt names the governing policy:\n{}",
+        receipts.describe()
+    );
+    let json_receipts = run(
+        &[store.path_str(), "--write", "--json"],
+        ".maintenance run\n.maintenance run\n",
+    );
+    assert_eq!(json_receipts.code, Some(0), "{}", json_receipts.describe());
+    let cycles = documents_named(&json_receipts.stdout_docs(), "maintenance_cycle");
+    assert_eq!(cycles.len(), 2, "{}", json_receipts.describe());
+    assert!(
+        cycles[1]["compaction"]["fragmentation_before"].is_null(),
+        "the second cycle's JSON receipt says null: {}",
+        cycles[1]
+    );
+    for (name, value) in [
+        ("start_ratio", serde_json::json!(0.5)),
+        ("min_interval_ms", serde_json::json!(3_600_000)),
+        ("stop_ratio", serde_json::json!(0.05)),
+        ("max_sweeps", serde_json::json!(8)),
+    ] {
+        assert_eq!(
+            cycles[1]["compaction"]["policy"][name],
+            serde_json::json!({ "value": value, "source": "default" }),
+            "the JSON receipt names {name}: {}",
+            cycles[1]
+        );
+    }
+}
+
+/// Counts every attempted index page read while a closure runs.
+#[derive(Default)]
+struct PageReadAttempts(std::sync::atomic::AtomicUsize);
+
+impl contextdb_engine::vector_ivf_observations::NativeIvfSealObserver for PageReadAttempts {
+    fn observe(&self, event: contextdb_engine::vector_ivf_observations::NativeIvfSealEvent<'_>) {
+        if matches!(
+            event,
+            contextdb_engine::vector_ivf_observations::NativeIvfSealEvent::PageReadAttempt { .. }
+        ) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn before_boundary(
+        &self,
+        _boundary: contextdb_engine::vector_ivf_observations::NativeIvfFaultBoundary<'_>,
+    ) -> contextdb_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Opens the ordinary read-only session with the page-read observer installed
+/// for the open alone, and returns the attempts it made before any query.
+fn open_counting_page_read_attempts(
+    path: &std::path::Path,
+) -> (usize, contextdb_engine::ReadSession) {
+    let attempts = std::sync::Arc::new(PageReadAttempts::default());
+    let session = contextdb_engine::vector_ivf_observations::with_native_ivf_seal_observer_for_test(
+        attempts.clone(),
+        || {
+            contextdb_engine::ReadSession::open_with_options(
+                path,
+                contextdb_engine::ReadSessionOptions::default(),
+            )
+            .expect("open the ordinary read session")
+        },
+    );
+    (
+        attempts.0.load(std::sync::atomic::Ordering::SeqCst),
+        session,
+    )
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_route() {
     let store = auto_vector_store(1_024);
     let indexed = "SELECT id FROM vector_budget_docs \
@@ -698,10 +831,11 @@ fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_rou
             "5000000",
         ],
         &format!(
-            ".maintenance run\n\
-             INSERT INTO vector_budget_docs (id, kind, embedding) \
+            "{}INSERT INTO vector_budget_docs (id, kind, embedding) \
              VALUES (0, 'eligible', '[1,0,0]');\n\
-             {writer_script}"
+             {writer_script}",
+            // One `.maintenance run` is one finite cycle; 64 cover the build.
+            ".maintenance run\n".repeat(64)
         ),
     );
     assert_eq!(
@@ -788,11 +922,94 @@ fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_rou
             .is_some_and(|bytes| bytes > 0),
         "the read-only catalog exposes the durable graph: {reader_inspection_row}"
     );
-    assert!(
-        reader_inspection_row["charged_index_bytes"].as_i64()
-            < writer_inspection_row["charged_index_bytes"].as_i64(),
-        "opening the committed image registers only the durable descriptor; it must not load the graph body. \
-         writer={writer_inspection_row} reader={reader_inspection_row}"
+    // Independent metadata-only control: the same declaration, key and committed
+    // rows (row zero included) as the maintained fixture, with no maintenance
+    // driven, so no index was ever published.
+    let control_store = auto_vector_store(1_024);
+    {
+        let control_db = contextdb_engine::Database::open_with_options(
+            &control_store.path,
+            contextdb_engine::DatabaseOpenOptions {
+                maintenance_policy: contextdb_engine::MaintenancePolicy::CallerDriven,
+                ..contextdb_engine::DatabaseOpenOptions::default()
+            },
+        )
+        .expect("open the caller-driven control");
+        control_db
+            .execute(
+                "INSERT INTO vector_budget_docs (id, kind, embedding) \
+                 VALUES (0, 'eligible', '[1,0,0]')",
+                &std::collections::HashMap::new(),
+            )
+            .expect("commit row zero into the control");
+    }
+    // The page-read observer wraps only the ordinary session open: the CLI
+    // subprocess above is a different process and cannot be observed from here.
+    let (control_open_page_reads, control_session) =
+        open_counting_page_read_attempts(&control_store.path);
+    let (image_open_page_reads, image_session) =
+        open_counting_page_read_attempts(std::path::Path::new(store.path_str()));
+    assert_eq!(
+        control_open_page_reads, 0,
+        "opening the unpublished control attempts no index page read"
+    );
+    assert_eq!(
+        image_open_page_reads, 0,
+        "opening the committed image attempts no index page read"
+    );
+    for session in [&control_session, &image_session] {
+        assert_eq!(
+            session.route(),
+            contextdb_engine::ReadRoute::File,
+            "the ordinary session opens the ownerless file route"
+        );
+    }
+    let session_value = |session: &contextdb_engine::ReadSession, sql: &str, column: &str| {
+        let result = session
+            .execute(sql, &std::collections::HashMap::new())
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let at = result
+            .columns()
+            .iter()
+            .position(|name| name == column)
+            .unwrap_or_else(|| panic!("{sql} has {column}"));
+        result.rows()[0][at].clone()
+    };
+    let partitions = "SHOW VECTOR_PARTITIONS FOR vector_budget_docs.embedding";
+    assert_eq!(
+        session_value(&control_session, partitions, "base_generation"),
+        contextdb_core::Value::Null,
+        "the control publishes no generation"
+    );
+    assert_eq!(
+        session_value(&control_session, partitions, "durable_index_bytes"),
+        contextdb_core::Value::Null,
+        "the control has no published durable index bytes"
+    );
+    let indexes = "SHOW VECTOR_INDEXES";
+    let control_charge = session_value(&control_session, indexes, "charged_index_bytes");
+    assert_eq!(
+        session_value(&image_session, indexes, "charged_index_bytes"),
+        control_charge,
+        "the in-process image session charges the metadata-only control amount"
+    );
+    assert_eq!(
+        session_value(&image_session, indexes, "charged_index_bytes"),
+        control_charge,
+        "passive inspection leaves the charge unchanged"
+    );
+    assert_eq!(
+        reader_inspection_row["charged_index_bytes"].as_i64(),
+        match control_charge {
+            contextdb_core::Value::Int64(bytes) => Some(bytes),
+            other => panic!("charged_index_bytes is an integer, got {other:?}"),
+        },
+        "opening the committed image registers only the index metadata; it must not load the index body. \
+         reader={reader_inspection_row}"
+    );
+    assert_eq!(
+        reader_inspection_row["charged_index_bytes"], writer_inspection_row["charged_index_bytes"],
+        "supporting: both doors charge the same index metadata: writer={writer_inspection_row} reader={reader_inspection_row}"
     );
 
     let vector_results = |documents: &[serde_json::Value]| {
@@ -825,6 +1042,7 @@ fn a_closed_writer_leaves_the_plain_read_only_door_the_same_indexed_and_auto_rou
 /// the engine's `context_restricted_handle_searches_its_own_partition_bounded`
 /// coverage; this journey pins the user-visible ordinary-door behavior.
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn a_context_grouped_nearest_neighbour_answers_its_own_tuple_not_a_closer_foreign_one() {
     let query = "SELECT id FROM context_grouped_docs WHERE context_id = 1 \
                  ORDER BY embedding <=> '[1,0,0]' LIMIT 1;";
@@ -888,6 +1106,11 @@ fn a_context_grouped_nearest_neighbour_answers_its_own_tuple_not_a_closer_foreig
 fn memory_limit_bounds_read_work_on_file_and_owner_routes_without_changing_the_store() {
     let store = store_of(64);
     let sql = "SELECT id, label FROM bounded ORDER BY label;\n";
+    // A reader's root (96 B) and request control (104 B) need 200 bytes. Below
+    // that the reader cannot start: a typed startup memory refusal, reached
+    // before any statement. At exactly 200 setup is admitted and the selected
+    // statement is what is refused. Each pair declares one small and one large
+    // budget, so the smaller one must be the effective limit.
     for owned in [false, true] {
         let owner = owned.then(|| {
             let mut owner = background(&[store.path_str(), "--write", "--json"]);
@@ -896,8 +1119,7 @@ fn memory_limit_bounds_read_work_on_file_and_owner_routes_without_changing_the_s
             owner
         });
         let before = std::fs::read(&store.path).unwrap();
-        for (memory_limit, read_memory, expected) in [("128", "16777216", 128), ("16M", "128", 128)]
-        {
+        for (memory_limit, read_memory) in [("128", "16777216"), ("16M", "128")] {
             let outcome = run(
                 &[
                     store.path_str(),
@@ -911,25 +1133,38 @@ fn memory_limit_bounds_read_work_on_file_and_owner_routes_without_changing_the_s
             );
             assert_eq!(outcome.code, Some(1), "{}", outcome.describe());
             assert!(outcome.stdout.trim().is_empty(), "{}", outcome.describe());
-            if !owned && memory_limit == "128" {
-                assert!(
-                    outcome.stderr.contains("memory budget exceeded"),
-                    "{}",
-                    outcome.describe()
-                );
-                assert!(
-                    !outcome.stderr.contains("owner_limit_exceeded"),
-                    "{}",
-                    outcome.describe()
-                );
-            } else {
-                let error = limit_error(&outcome);
-                assert_eq!(error["detail"]["limit"], "memory", "{error}");
-                assert_eq!(
-                    error["detail"]["value"], expected,
-                    "the smaller declared reader budget actually refused: {error}"
-                );
-            }
+            assert!(
+                outcome.stderr.contains("memory budget exceeded")
+                    && outcome.stderr.contains("reader/request_owner"),
+                "a 128-byte reader refuses at startup, naming the owner it could not admit.\n{}",
+                outcome.describe()
+            );
+            assert!(
+                !outcome.stderr.contains("owner_limit_exceeded"),
+                "{}",
+                outcome.describe()
+            );
+        }
+        for (memory_limit, read_memory) in [("200", "16777216"), ("16M", "200")] {
+            let outcome = run(
+                &[
+                    store.path_str(),
+                    "--json",
+                    "--memory-limit",
+                    memory_limit,
+                    "--read-memory",
+                    read_memory,
+                ],
+                sql,
+            );
+            assert_eq!(outcome.code, Some(1), "{}", outcome.describe());
+            assert!(outcome.stdout.trim().is_empty(), "{}", outcome.describe());
+            let error = limit_error(&outcome);
+            assert_eq!(error["detail"]["limit"], "memory", "{error}");
+            assert_eq!(
+                error["detail"]["value"], 200,
+                "the smaller declared reader budget actually refused: {error}"
+            );
         }
         let recovered = run(&[store.path_str(), "--json", "--memory-limit", "16M"], sql);
         assert_eq!(recovered.code, Some(0), "{}", recovered.describe());

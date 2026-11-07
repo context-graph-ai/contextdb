@@ -30,11 +30,11 @@ fn query_trace_rows_examined_is_statement_scoped_across_ddl() {
     create_and_seed(&db, "trace_small", 3);
 
     let first_select = execute(&db, "SELECT id FROM trace_small");
-    assert_eq!(first_select.trace.rows_examined, 3);
+    assert_eq!(first_select.trace().rows_examined, 3);
 
     let ddl_after_select = execute(
         &db,
         "CREATE TABLE trace_ddl_after_select (id INTEGER PRIMARY KEY)",
     );
-    assert_eq!(ddl_after_select.trace.rows_examined, 0);
+    assert_eq!(ddl_after_select.trace().rows_examined, 0);
 }

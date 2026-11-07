@@ -406,6 +406,10 @@ fn verify_payload_readable(path: &Path) {
 /// by prior batches. The recycling batch returns before another recording
 /// is appended: its caller can join any queued gap read before the next
 /// writer commit, making the read's expected committed image deterministic.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn drive_to_recycling_batch(
     db: &Database,
     observer: Arc<dyn Fn(WriterFileRecycleObservation) + Send + Sync>,
@@ -644,7 +648,7 @@ fn writer_descriptor_survives_all_three_recycle_boundaries_and_refuses_every_ali
                             "the routed session executes a read during the recycle gap, with no retry",
                         );
                         let route = cursor.route();
-                        let rows = cursor.first_page().rows.clone();
+                        let rows = cursor.first_page().rows().to_vec();
                         cursor.close().expect("close the routed cursor");
                         (route, rows)
                     });
@@ -788,7 +792,7 @@ fn writer_descriptor_survives_all_three_recycle_boundaries_and_refuses_every_ali
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(999999)]]
     );
 
@@ -881,7 +885,7 @@ fn authenticated_external_page_holds_survive_an_actual_storage_handle_recycle() 
             &HashMap::new(),
         )
         .expect("hydrated route remains on its pre-recycle snapshot");
-    assert_eq!(old.rows, vec![vec![Value::Text("before-recycle".into())]]);
+    assert_eq!(old.rows(), vec![vec![Value::Text("before-recycle".into())]]);
 
     drop(reader);
     for id in 100_000..100_003i64 {
@@ -1017,7 +1021,7 @@ fn reopen_fault_holds_and_releases_after_close_body() {
         reopened
             .execute("SELECT COUNT(*) FROM recordings", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(committed_recordings)]],
         "every recording committed before the failed recycle is durable"
     );
@@ -1305,7 +1309,7 @@ fn panic_unwinding_through_the_after_view_close_boundary_releases_the_descriptor
         reopened
             .execute("SELECT COUNT(*) FROM recordings", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(committed)]],
         "every recording committed before the unwinding batch is durable"
     );
@@ -1431,6 +1435,10 @@ enum FailedWriterRelease {
 /// holds a descriptor and refuses separate-process opens; the chosen release
 /// then returns the inode to baseline and frees the lock; a fresh open
 /// recovers every committed recording.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn fault_cycle_releases(dir: &Path, name: &str, release: FailedWriterRelease) {
     let (db, path, identity, baseline) = open_fragmented_writer(dir, name);
     let boundaries: Arc<Mutex<Vec<WriterFileRecycleBoundary>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1547,7 +1555,7 @@ fn fault_cycle_releases(dir: &Path, name: &str, release: FailedWriterRelease) {
         reopened
             .execute("SELECT COUNT(*) FROM recordings", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(committed)]],
         "{name}: every recording committed before the fault is durable"
     );
@@ -1652,7 +1660,7 @@ fn a_refused_second_writer_construction_leaves_the_real_holder_and_its_lock_unto
         holder
             .execute("SELECT id FROM recordings", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
 

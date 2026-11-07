@@ -364,6 +364,10 @@ fn a_companionless_store_its_writer_holds_is_never_reported_unowned() {
 /// The same window, resolved: a caller already waiting when the writer
 /// publishes gets the writer's real answer, on the writer's own channel.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_caller_waiting_on_a_companionless_store_gets_the_writer_s_answer() {
     let directory = tempfile::TempDir::new().expect("task-scoped companion-less directory");
     let runtime_root = secure_runtime_root(directory.path(), "companionless-resolve-runtime");
@@ -397,7 +401,7 @@ fn a_caller_waiting_on_a_companionless_store_gets_the_writer_s_answer() {
     let rows = session
         .execute("SELECT id FROM claim_rows", &HashMap::new())
         .expect("the owner answers the caller that waited for it");
-    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows().len(), 1);
     drop(session);
 
     assert_eq!(writer.finish(), OwnerServingState::Serving);
@@ -663,7 +667,7 @@ fn an_unwritable_directory_still_reports_what_is_wrong_with_the_file() {
     match refusal {
         Error::StoreCorrupted { path: named, .. } => assert_eq!(
             named,
-            path.display().to_string(),
+            path.display().to_string().as_str(),
             "the refusal names the file the caller pointed at",
         ),
         Error::LegacyVectorStoreDetected { .. } => {}

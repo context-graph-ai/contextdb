@@ -127,7 +127,7 @@ fn publication_keeps_commits_after_its_snapshot_in_the_observed_durable_tail() {
     .unwrap();
     db.run_maintenance_cycle().unwrap();
     db.execute(
-        "ALTER TABLE items ALTER COLUMN embedding SET HNSW (M = 24)",
+        "ALTER TABLE items ALTER COLUMN embedding SET IVF DEFAULT",
         &HashMap::new(),
     )
     .unwrap();
@@ -168,7 +168,7 @@ fn publication_keeps_commits_after_its_snapshot_in_the_observed_durable_tail() {
                 &HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0]))]),
             )
             .unwrap();
-        sender.send(rows.rows.len()).unwrap();
+        sender.send(rows.rows().len()).unwrap();
     });
     let completed = receiver.recv_timeout(Duration::from_secs(5));
     pause.release();
@@ -210,7 +210,7 @@ fn publication_keeps_commits_after_its_snapshot_in_the_observed_durable_tail() {
         )
         .unwrap();
     assert_eq!(
-        answer.rows,
+        answer.rows(),
         vec![vec![Value::Int64(1)], vec![Value::Int64(3)]]
     );
 }

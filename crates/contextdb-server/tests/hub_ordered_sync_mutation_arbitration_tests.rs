@@ -64,7 +64,8 @@ fn start_hub_ddl(broker: &InProcessBroker, ddl: &str) -> Hub {
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -83,7 +84,8 @@ fn start_hub_db(broker: &InProcessBroker, identity: Arc<FabricIdentity>, db: Arc
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -107,7 +109,8 @@ fn edge_ddl(broker: &InProcessBroker, _role: &str, ddl: &str) -> (Arc<Database>,
         broker.client_as(&node_id),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -183,7 +186,7 @@ async fn composite_key_synced_delete_removes_the_whole_natural_key_everywhere() 
         assert!(
             db.execute("SELECT * FROM notes WHERE a=1 AND b=2", &p())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty(),
             "whole composite key must be absent"
         );
@@ -217,7 +220,7 @@ async fn initial_vector_owner_delete_reaches_row_and_ann_absence_everywhere() {
                 &p()
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
             "fixture owner/vector row exists before delete"
         );
@@ -248,7 +251,7 @@ async fn initial_vector_owner_delete_reaches_row_and_ann_absence_everywhere() {
                 &p()
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
             "row and vector payload absent after delete"
         );
@@ -281,7 +284,7 @@ fn delete(db: &Database) {
 fn body(db: &Database) -> Option<String> {
     db.execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("scan notes")
-        .rows
+        .rows()
         .first()
         .map(|row| match &row[0] {
             Value::Text(v) => v.clone(),

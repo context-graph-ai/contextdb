@@ -9,9 +9,9 @@ on:
       impact_reason:
         type: string
         default: manual-integration
-      path_classes:
+      path_classes_artifact:
         type: string
-        default: '{}'
+        default: ''
       performance_qualification:
         type: string
         default: pending-controlled-native-qualification
@@ -66,10 +66,16 @@ jobs:
       source_fingerprint: ${{ steps.plan.outputs.source_fingerprint }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Load complete path classifications
+        if: inputs.path_classes_artifact != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.path_classes_artifact }}
+          path: ${{ runner.temp }}/ci-impact
       - id: plan
         env:
           IMPACT_REASON: ${{ inputs.impact_reason }}
-          PATH_CLASSES: ${{ inputs.path_classes }}
+          PATH_CLASSES_FILE: ${{ inputs.path_classes_artifact != '' && format('{0}/ci-impact/path-classes.json', runner.temp) || '' }}
           PERFORMANCE_QUALIFICATION: ${{ inputs.performance_qualification }}
         run: python3 -B scripts/ci-integration.py plan
 
@@ -79,10 +85,6 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ needs.plan.outputs.gate_mode == 'normal' && 30 || 330 }}
-    env:
-      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
-      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
-      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}

@@ -18,11 +18,12 @@
 //! publish the same bytes, and a payload that really is over the declared
 //! budget still refuses by naming that budget.
 
+use super::wire_fixture_test_support::encode_cursor_page;
 use contextdb_core::read_contract::{
     OwnerReadLimits, ReadFailureKind, ReadFailureLimit, ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Value};
-use contextdb_engine::read_contract::encode_cursor_page;
+
 use contextdb_engine::{
     Database, DatabaseOpenOptions, MetadataBody, MetadataRequest, OwnerReadConfig, ReadSession,
     ReadSessionOptions,
@@ -105,75 +106,155 @@ fn inventory_bytes(body: &MetadataBody) -> usize {
 /// A store whose rows are wide enough that one page of them cannot fit a
 /// single local frame, plus one row wider than the declared budget itself,
 /// plus a table whose complete schema answer is larger than that budget.
-fn seed(database: &Database) {
-    database
-        .execute(
-            &format!("CREATE TABLE {WIDE_TABLE} (id INTEGER PRIMARY KEY, body TEXT)"),
-            &HashMap::new(),
-        )
-        .expect("create the wide-row table");
+#[expect(
+    clippy::result_large_err,
+    reason = "Keep the engine's inline original-writer refusal available to price setup."
+)]
+fn seed(database: &Database) -> contextdb_core::Result<()> {
+    database.execute(
+        &format!("CREATE TABLE {WIDE_TABLE} (id INTEGER PRIMARY KEY, body TEXT)"),
+        &HashMap::new(),
+    )?;
     for row in 0..WIDE_ROWS {
-        database
-            .execute(
-                &format!("INSERT INTO {WIDE_TABLE} (id, body) VALUES ($id, $body)"),
-                &HashMap::from([
-                    ("id".to_owned(), Value::Int64(row as i64)),
-                    ("body".to_owned(), Value::Text(filler(WIDE_ROW_BYTES))),
-                ]),
-            )
-            .expect("store one wide row");
-    }
-    database
-        .execute(
-            &format!("CREATE TABLE {OVER_TABLE} (id INTEGER PRIMARY KEY, body TEXT)"),
-            &HashMap::new(),
-        )
-        .expect("create the over-budget table");
-    database
-        .execute(
-            &format!("INSERT INTO {OVER_TABLE} (id, body) VALUES ($id, $body)"),
+        database.execute(
+            &format!("INSERT INTO {WIDE_TABLE} (id, body) VALUES ($id, $body)"),
             &HashMap::from([
-                ("id".to_owned(), Value::Int64(0)),
-                ("body".to_owned(), Value::Text(filler(OVER_BUDGET_BYTES))),
+                ("id".to_owned(), Value::Int64(row as i64)),
+                ("body".to_owned(), Value::Text(filler(WIDE_ROW_BYTES))),
             ]),
-        )
-        .expect("store the over-budget row");
-    for index in 0..LONG_NAMED_TABLES {
-        database
-            .execute(
-                &format!(
-                    "CREATE TABLE {} (id INTEGER PRIMARY KEY)",
-                    long_table_name(index)
-                ),
-                &HashMap::new(),
-            )
-            .expect("create a table whose name alone weighs on the inventory");
+        )?;
     }
+    database.execute(
+        &format!("CREATE TABLE {OVER_TABLE} (id INTEGER PRIMARY KEY, body TEXT)"),
+        &HashMap::new(),
+    )?;
+    database.execute(
+        &format!("INSERT INTO {OVER_TABLE} (id, body) VALUES ($id, $body)"),
+        &HashMap::from([
+            ("id".to_owned(), Value::Int64(0)),
+            ("body".to_owned(), Value::Text(filler(OVER_BUDGET_BYTES))),
+        ]),
+    )?;
+    for index in 0..LONG_NAMED_TABLES {
+        database.execute(
+            &format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY)",
+                long_table_name(index)
+            ),
+            &HashMap::new(),
+        )?;
+    }
+    Ok(())
 }
 
 /// A writer serving owner reads under the same declared budgets the reader
 /// states, so the effective ceiling is the declared one on both sides.
 fn served_store(directory: &Path, runtime_root: PathBuf) -> (Database, PathBuf) {
     let path = directory.join("budgets.db");
+    let options = DatabaseOpenOptions {
+        owner_reads: OwnerReadConfig {
+            runtime_dir: Some(runtime_root),
+            limits: OwnerReadLimits {
+                limits: declared_limits(),
+                concurrency: 4,
+            },
+            ..OwnerReadConfig::default()
+        },
+        ..DatabaseOpenOptions::default()
+    };
+    // PAGE/RESULT declarations fund reads, not writable setup. A fresh control
+    // starts with this fixture's existing finite memory declaration. If setup
+    // needs more, only the engine's exact original-writer shortfall may fund it;
+    // no guessed bytes, multiplier, or unbounded writer is involved.
+    static SETUP_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let setup_bytes = *SETUP_BYTES.get_or_init(|| {
+        let mut setup_bytes = usize::try_from(declared_limits().memory).expect("memory fits");
+        loop {
+            let control_dir =
+                tempfile::TempDir::new_in(directory).expect("fresh setup cost control");
+            let control = Database::open_with_options(
+                control_dir.path().join("setup-cost.db"),
+                DatabaseOpenOptions {
+                    memory_limit: Some(setup_bytes),
+                    ..options.clone()
+                },
+            )
+            .expect("open the matched finite-budget setup control");
+            match seed(&control) {
+                Ok(()) => {
+                    assert!(control.write_memory_high_water_for_test() <= setup_bytes);
+                    control.close().expect("release the setup control's owners");
+                    break;
+                }
+                Err(Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    ..
+                }) => {
+                    assert_eq!(budget_limit_bytes, setup_bytes, "setup charges its writer");
+                    assert!(
+                        requested_bytes > available_bytes,
+                        "a disclosed setup shortfall"
+                    );
+                    // Only the configured cache capacity has a published pure
+                    // policy. The installed reserve also holds native index
+                    // bytes; keep those measured bytes in used rather than
+                    // inventing a formula for the next native index.
+                    let (configured, writer, process, capacity, reserve) =
+                        control.writer_cache_for_test();
+                    let cache_capacity = |limit| {
+                        contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(
+                            Some(limit),
+                        )
+                    };
+                    assert_eq!(configured, cache_capacity(setup_bytes));
+                    assert_eq!(capacity, configured);
+                    assert_eq!(writer, reserve);
+                    assert_eq!(process, 0, "this declared writer owns its cache");
+                    assert!(reserve >= capacity);
+                    let required = setup_bytes
+                        .checked_sub(available_bytes)
+                        .and_then(|used| used.checked_sub(capacity))
+                        .and_then(|fixed| fixed.checked_add(requested_bytes))
+                        .expect("the disclosed non-capacity setup cost fits");
+                    // Solve limit - cache_capacity(limit) >= required using
+                    // cheap integer iterations. Reopen only to discover a
+                    // later setup stage or a changed native index invoice.
+                    loop {
+                        let next = required
+                            .checked_add(cache_capacity(setup_bytes))
+                            .expect("the disclosed setup and cache cost fits");
+                        if next <= setup_bytes {
+                            break;
+                        }
+                        setup_bytes = next;
+                    }
+                }
+                Err(error) => {
+                    panic!("setup needs an engine-disclosed original-writer cost: {error:?}")
+                }
+            }
+            drop(control);
+        }
+        setup_bytes
+    });
     let database = Database::open_with_options(
         &path,
         DatabaseOpenOptions {
-            owner_reads: OwnerReadConfig {
-                runtime_dir: Some(runtime_root),
-                limits: OwnerReadLimits {
-                    limits: declared_limits(),
-                    concurrency: 4,
-                },
-                ..OwnerReadConfig::default()
-            },
-            ..DatabaseOpenOptions::default()
+            memory_limit: Some(setup_bytes),
+            ..options
         },
     )
     .expect("open a writer that serves owner reads under the declared budgets");
-    seed(&database);
+    seed(&database).expect("the original writer funds exactly the matched setup");
     (database, path)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owner_session(runtime_root: &Path, path: &Path) -> ReadSession {
     let session = ReadSession::with_runtime_directory_for_test(runtime_root, || {
         ReadSession::open_with_options(path, declared_session())
@@ -183,6 +264,10 @@ fn owner_session(runtime_root: &Path, path: &Path) -> ReadSession {
     session
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn file_session(runtime_root: &Path, path: &Path) -> ReadSession {
     let session = ReadSession::with_runtime_directory_for_test(runtime_root, || {
         ReadSession::open_with_options(path, declared_session())
@@ -261,7 +346,7 @@ fn a_metadata_answer_inside_the_declared_result_budget_is_served_over_the_owner_
         let session = owner_session(&owner_runtime, &path);
         session
             .metadata(MetadataRequest::Tables, None)
-            .map(|answer| answer.body)
+            .map(|answer| answer.body.clone())
     };
 
     drop(database);
@@ -272,6 +357,7 @@ fn a_metadata_answer_inside_the_declared_result_budget_is_served_over_the_owner_
             .metadata(MetadataRequest::Tables, None)
             .expect("the committed file answers the table inventory")
             .body
+            .clone()
     };
 
     let published = inventory_bytes(&from_the_file);

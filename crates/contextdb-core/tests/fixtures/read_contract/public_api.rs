@@ -28,7 +28,7 @@ impl OwnerRequestHandler for Handler {
         _cancel: &OwnerReadCancellation,
     ) -> Result<Vec<u8>> {
         if request.is_empty() {
-            Err(Error::Other("custom owner handler failed".to_owned()))
+            Err(Error::Other("custom owner handler failed".into()))
         } else {
             Ok(request.to_vec())
         }

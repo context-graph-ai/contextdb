@@ -36,30 +36,38 @@ async fn schema_replay_is_proportional_to_affected_tables() {
             )
             .unwrap();
     }
-    let entries = source.changes_since(since).ddl.len();
+    let entries = source
+        .changes_since(since)
+        .expect("read authored schema changes")
+        .ddl
+        .len();
     assert_eq!(
         entries, 100,
         "one hundred distinct declarations, one per commit"
     );
+    let mut receiver_indexes = physical_index_tables(&receiver, &affected);
     let trace = ReceivedSchemaApplyObserverForTest::new();
     let scope = receiver.observe_received_schema_applies_for_test(&trace);
     let exchange_start = hub.broker.recorded_exchanges().len();
     push_phase(&client, "distinct-replay-push").await;
     drop(scope);
+    receiver_indexes.extend(physical_index_tables(&receiver, &affected));
     let observed = trace.observation().expect("actual received schema apply");
     cost_receipt("different-push", &observed);
     let contact_exchanges = sent_push_request_count_since(&hub, exchange_start);
     assert_eq!(contact_exchanges, entries as u64);
-    assert_affected_only(&observed, &affected, contact_exchanges);
+    assert_affected_only(&observed, &affected, &receiver_indexes, contact_exchanges);
     assert_eq!(observed.staged_rows_copied, 0);
     assert_eq!(observed.staged_vectors_copied, 0);
     assert_table_work_bound(&observed, entries);
+    let mut peer_indexes = physical_index_tables(&peer, &affected);
     let pull_trace = ReceivedSchemaApplyObserverForTest::new();
     let pull_scope = peer.observe_received_schema_applies_for_test(&pull_trace);
     pull_phase(&peer_client, "distinct-replay-peer-pull").await;
     drop(pull_scope);
+    peer_indexes.extend(physical_index_tables(&peer, &affected));
     let pulled = pull_trace.observation().expect("real pull schema apply");
-    assert_affected_only(&pulled, &affected, 0);
+    assert_affected_only(&pulled, &affected, &peer_indexes, 0);
     cost_receipt("different-pull", &pulled);
     assert_table_work_bound(&pulled, entries);
     pull_phase(&client, "distinct-reconcile-pull").await;

@@ -18,16 +18,18 @@
 //! narrow, test-only observation wall this draft needs. They reset/take only
 //! debug receipt state around one already-public call; they neither choose a
 //! route nor mutate data, graphs, snapshots, or maintenance state.
-//! `VectorSearchDebugTrace::selected_generations` binds retained-generation
-//! evidence to that same completed call rather than consulting an independent
-//! selector after the fact.
+//! The trace's executed partition routes bind the route evidence to that same
+//! completed call rather than consulting an independent selector after the fact.
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey, VectorSearchMode};
+use contextdb_engine::database::VectorSearchTraceObservation;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
+use contextdb_engine::vector_ivf_observations::{
+    NativeIvfFaultBoundary, NativeIvfSealEvent, NativeIvfSealObserver,
+    with_native_ivf_seal_observer_for_test,
+};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
-use contextdb_vector::VectorSearchDebugTrace;
-use contextdb_vector::store::VectorPartitionRef;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,7 +39,6 @@ const F32_INDEX_THRESHOLD: usize = 1_000;
 const MAINTENANCE_CYCLES: usize = 64;
 const VECTOR_REFUSAL_HEADROOM_BYTES: usize = 8 * 1024;
 const SELECTED_SCOPE: u128 = 0xA110_0000_0000_0000_0000_0000_0000_0001;
-const OTHER_SCOPE: u128 = 0xA110_0000_0000_0000_0000_0000_0000_0002;
 
 #[derive(Clone, Copy)]
 struct FrozenClock;
@@ -60,9 +61,35 @@ struct VectorTouches {
     graph_edges: AtomicU64,
     adjacency_entries: AtomicU64,
     brute_force_vectors: AtomicU64,
-    hnsw_vectors: AtomicU64,
+    indexed_vectors: AtomicU64,
     rank_candidates: AtomicU64,
     access_rows: AtomicU64,
+}
+
+impl NativeIvfSealObserver for VectorTouches {
+    fn observe(&self, event: NativeIvfSealEvent<'_>) {
+        if let NativeIvfSealEvent::QueryExecuted { work, .. } = event {
+            self.indexed_vectors.fetch_add(
+                work.centroid_evaluations
+                    + work.quantized_evaluations
+                    + work.full_precision_evaluations
+                    + work.buffer_evaluations,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn before_boundary(&self, _boundary: NativeIvfFaultBoundary<'_>) -> contextdb_core::Result<()> {
+        Ok(())
+    }
+}
+
+fn execute_observed(
+    db: &Database,
+    request: &bounded::BoundedReadRequest,
+    counter: &Arc<VectorTouches>,
+) -> Result<bounded::TestResult, bounded::TestError> {
+    with_native_ivf_seal_observer_for_test(counter.clone(), || bounded::execute(db, request))
 }
 
 impl bounded::ExecutionProbe for VectorTouches {
@@ -88,9 +115,6 @@ impl bounded::ExecutionProbe for VectorTouches {
             bounded::TestSourceTouch::BruteForceVectorCandidate => {
                 self.brute_force_vectors.fetch_add(1, Ordering::SeqCst);
             }
-            bounded::TestSourceTouch::HnswCandidate => {
-                self.hnsw_vectors.fetch_add(1, Ordering::SeqCst);
-            }
             bounded::TestSourceTouch::RankCandidate => {
                 self.rank_candidates.fetch_add(1, Ordering::SeqCst);
             }
@@ -111,7 +135,7 @@ struct VectorTouchSnapshot {
     graph_edges: u64,
     adjacency_entries: u64,
     brute_force_vectors: u64,
-    hnsw_vectors: u64,
+    indexed_vectors: u64,
     rank_candidates: u64,
     access_rows: u64,
 }
@@ -124,7 +148,7 @@ fn vector_touches(counter: &VectorTouches) -> VectorTouchSnapshot {
         graph_edges: counter.graph_edges.load(Ordering::SeqCst),
         adjacency_entries: counter.adjacency_entries.load(Ordering::SeqCst),
         brute_force_vectors: counter.brute_force_vectors.load(Ordering::SeqCst),
-        hnsw_vectors: counter.hnsw_vectors.load(Ordering::SeqCst),
+        indexed_vectors: counter.indexed_vectors.load(Ordering::SeqCst),
         rank_candidates: counter.rank_candidates.load(Ordering::SeqCst),
         access_rows: counter.access_rows.load(Ordering::SeqCst),
     }
@@ -195,10 +219,6 @@ fn selected_scope() -> Uuid {
     Uuid::from_u128(SELECTED_SCOPE)
 }
 
-fn other_scope() -> Uuid {
-    Uuid::from_u128(OTHER_SCOPE)
-}
-
 fn index() -> VectorIndexRef {
     VectorIndexRef::new("vector_truth", "embedding")
 }
@@ -208,18 +228,14 @@ fn partition(scope: Uuid) -> VectorPartitionKey {
         .expect("a UUID partition key has a canonical public identity")
 }
 
-fn partition_ref(scope: Uuid) -> VectorPartitionRef {
-    VectorPartitionRef::new(index(), partition(scope))
-}
-
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("the vector projection includes its UUID id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(column) {
             Some(Value::Uuid(id)) => *id,
@@ -296,10 +312,25 @@ fn seed_indexed_partition(db: &Database, scope: Uuid, first: u128, kind: &str) {
 
 fn drive_until_indexed(db: &Database, scope: Uuid) {
     for _ in 0..MAINTENANCE_CYCLES {
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         if db
             .vector_store_for_test()
-            .partition_info(&index(), &partition(scope))
-            .is_some_and(|info| info.graph_available)
+            .partition_info(
+                &index(),
+                &partition(scope),
+                &mut partition_observation_owner_1,
+            )
+            .unwrap()
+            .is_some_and(|info| {
+                db.__debug_vector_partition_indexed_for_test(
+                    info.partition.index.clone(),
+                    info.partition.partition_key.clone(),
+                )
+            })
         {
             return;
         }
@@ -309,37 +340,36 @@ fn drive_until_indexed(db: &Database, scope: Uuid) {
     panic!("the deterministic maintained partition never became INDEXED-ready");
 }
 
-fn generation(db: &Database, scope: Uuid) -> contextdb_vector::store::VectorGraphGeneration {
-    let status = db
-        .vector_store_for_test()
-        .partition_graph_generation_status(&partition_ref(scope))
-        .expect("the selected partition exists");
-    status
-        .change
-        .or(status.base)
-        .or(status.dormant_change)
-        .or(status.dormant_base)
-        .expect("the maintained partition has a published generation")
-}
-
 /// Start one trace receipt for exactly the call that follows. The test-only
 /// reset is required because a process-global last trace could otherwise let a
+fn used_indexed_route(trace: &VectorSearchTraceObservation) -> bool {
+    trace
+        .partition_routes
+        .iter()
+        .any(|route| route.route == contextdb_vector::mem::VectorPartitionSearchRoute::Indexed)
+}
+
 /// Rust or snapshot call inherit an earlier SQL route.
-fn reset_hnsw_trace(db: &Database) {
+fn reset_index_trace(db: &Database) {
     db.__reset_last_query_vector_trace_for_test();
 }
 
-fn assert_hnsw_trace(db: &Database, what: &str) -> VectorSearchDebugTrace {
-    let trace = db
-        .__take_last_query_vector_trace_for_test()
-        .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
+fn assert_indexed_trace(db: &Database, what: &str) -> VectorSearchTraceObservation {
+    let trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
     assert!(
-        trace.used_hnsw,
-        "{what}: the selected maintained route must use the committed graph, trace={trace:?}"
+        used_indexed_route(&trace),
+        "{what}: the selected maintained route must use the committed index, trace={trace:?}"
     );
     assert!(
-        trace.hnsw_candidate_count > 0,
-        "{what}: the maintained graph must score committed candidates, trace={trace:?}"
+        !trace.final_row_ids.is_empty(),
+        "{what}: the maintained index must score committed candidates, trace={trace:?}"
     );
     assert_eq!(
         trace.fallback_reason, None,
@@ -349,18 +379,27 @@ fn assert_hnsw_trace(db: &Database, what: &str) -> VectorSearchDebugTrace {
 }
 
 fn assert_exact_trace(db: &Database, what: &str) {
-    let trace = db
-        .__take_last_query_vector_trace_for_test()
-        .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
+    let trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
     assert!(
-        !trace.used_hnsw && trace.hnsw_candidate_count == 0,
-        "{what}: AUTO must use exact candidate work without a hidden HNSW route, trace={trace:?}"
+        !used_indexed_route(&trace),
+        "{what}: AUTO must use exact candidate work without a hidden indexed route, trace={trace:?}"
     );
 }
 
 /// This call is the deliberate transaction-entrance compile wall described in
 /// the module documentation. It observes the existing transaction-aware semantic kernel
 /// without choosing a new public Rust transaction interface.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn semantic_in_tx(
     db: &Database,
     tx: contextdb_core::TxId,
@@ -410,7 +449,7 @@ fn indexed_transaction_overlay_keeps_the_committed_graph_and_scores_only_staged_
         ("query", Value::Vector(vec![1.0, 0.0, 0.0])),
     ]);
     db.__reset_vector_full_index_entries_touched_for_test();
-    reset_hnsw_trace(&db);
+    reset_index_trace(&db);
     let sql_rows = db
         .execute_in_tx(tx, sql, &bound)
         .expect("SQL INDEXED sees its staged vector delta");
@@ -420,28 +459,28 @@ fn indexed_transaction_overlay_keeps_the_committed_graph_and_scores_only_staged_
     );
     assert!(!ids(&sql_rows).contains(&deleted));
     assert!(!ids(&sql_rows).contains(&replaced));
-    assert_hnsw_trace(&db, "SQL transaction overlay");
+    assert_indexed_trace(&db, "SQL transaction overlay");
     assert_eq!(
         db.__vector_full_index_entries_touched_for_test(),
         0,
-        "SQL transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
+        "SQL transaction search cannot enumerate every committed vector behind a truthful indexed trace"
     );
 
     let mut semantic = SemanticQuery::new("vector_truth", "embedding", vec![1.0, 0.0, 0.0], 4);
     semantic.search_mode = Some(VectorSearchMode::Indexed);
     db.__reset_vector_full_index_entries_touched_for_test();
-    reset_hnsw_trace(&db);
+    reset_index_trace(&db);
     let rust_rows = semantic_ids(
         semantic_in_tx(&db, tx, semantic).expect("Rust INDEXED sees the same staged vector delta"),
     );
     assert!(rust_rows.contains(&staged_nearest));
     assert!(!rust_rows.contains(&deleted));
     assert!(!rust_rows.contains(&replaced));
-    assert_hnsw_trace(&db, "Rust transaction overlay");
+    assert_indexed_trace(&db, "Rust transaction overlay");
     assert_eq!(
         db.__vector_full_index_entries_touched_for_test(),
         0,
-        "Rust transaction search cannot enumerate every committed vector behind a truthful HNSW trace"
+        "Rust transaction search cannot enumerate every committed vector behind a truthful indexed trace"
     );
     db.rollback(tx)
         .expect("discard the explicit transaction after both public transaction doors");
@@ -480,17 +519,17 @@ fn indexed_transaction_overlay_keeps_the_committed_graph_and_scores_only_staged_
     let counter = Arc::new(VectorTouches::default());
     let mut request = bounded_request(sql, bound);
     request.probe = Some(Arc::clone(&counter) as Arc<dyn bounded::ExecutionProbe>);
-    reset_hnsw_trace(&db);
-    let bounded_rows = bounded::execute(&db, &request)
+    reset_index_trace(&db);
+    let bounded_rows = execute_observed(&db, &request, &counter)
         .expect("the bounded production kernel serves the transaction overlay");
-    assert_hnsw_trace(&db, "bounded transaction overlay");
+    assert_indexed_trace(&db, "bounded transaction overlay");
     db.execute("ROLLBACK", &empty())
         .expect("discard the bounded observation transaction");
     assert!(ids(&bounded_rows.result).contains(&bounded_staged_nearest));
     assert!(!ids(&bounded_rows.result).contains(&replaced));
     assert!(!ids(&bounded_rows.result).contains(&deleted));
     assert!(
-        counter.hnsw_vectors.load(Ordering::SeqCst) > 0,
+        counter.indexed_vectors.load(Ordering::SeqCst) > 0,
         "the committed side of a transaction overlay remains graph-driven"
     );
     assert!(
@@ -554,20 +593,48 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
     .expect("commit its rank-policy value");
     let order_index = VectorIndexRef::new("order_truth", "embedding");
     for _ in 0..MAINTENANCE_CYCLES {
+        let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         if db
             .vector_store_for_test()
-            .partition_info(&order_index, &VectorPartitionKey::unpartitioned())
-            .is_some_and(|info| info.graph_available)
+            .partition_info(
+                &order_index,
+                &VectorPartitionKey::unpartitioned(),
+                &mut partition_observation_owner_2,
+            )
+            .unwrap()
+            .is_some_and(|info| {
+                db.__debug_vector_partition_indexed_for_test(
+                    info.partition.index.clone(),
+                    info.partition.partition_key.clone(),
+                )
+            })
         {
             break;
         }
         db.run_maintenance_cycle()
             .expect("publish the committed tie route in one finite batch");
     }
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert!(
         db.vector_store_for_test()
-            .partition_info(&order_index, &VectorPartitionKey::unpartitioned())
-            .is_some_and(|info| info.graph_available),
+            .partition_info(
+                &order_index,
+                &VectorPartitionKey::unpartitioned(),
+                &mut partition_observation_owner_3
+            )
+            .unwrap()
+            .is_some_and(|info| db.__debug_vector_partition_indexed_for_test(
+                info.partition.index.clone(),
+                info.partition.partition_key.clone()
+            )),
         "the tie fixture has a maintained committed route before staging its delta"
     );
 
@@ -597,7 +664,7 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
         "SELECT id FROM order_truth ORDER BY embedding <=> $query USE VECTOR INDEXED \
          USE RANK weighted LIMIT 2",
     ] {
-        reset_hnsw_trace(&db);
+        reset_index_trace(&db);
         let result = db
             .execute_in_tx(
                 tx,
@@ -610,14 +677,14 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
             vec![committed, staged],
             "{sql}: score-descending ties always use ascending internal row id"
         );
-        assert_hnsw_trace(&db, "transaction equal-score route");
+        assert_indexed_trace(&db, "transaction equal-score route");
     }
 
     for sort_key in [None, Some("weighted")] {
         let mut semantic = SemanticQuery::new("order_truth", "embedding", vec![1.0, 0.0, 0.0], 2);
         semantic.search_mode = Some(VectorSearchMode::Indexed);
         semantic.sort_key = sort_key.map(str::to_owned);
-        reset_hnsw_trace(&db);
+        reset_index_trace(&db);
         assert_eq!(
             semantic_ids(
                 semantic_in_tx(&db, tx, semantic)
@@ -626,7 +693,7 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
             vec![committed, staged],
             "Rust SemanticQuery ranked and unranked ties use ascending internal row id"
         );
-        assert_hnsw_trace(&db, "Rust semantic transaction equal-score route");
+        assert_indexed_trace(&db, "Rust semantic transaction equal-score route");
     }
 
     db.commit(tx)
@@ -637,7 +704,7 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
          USE RANK weighted LIMIT 2",
     ] {
         let request = bounded_request(sql, params([("query", Value::Vector(vec![1.0, 0.0, 0.0]))]));
-        reset_hnsw_trace(&db);
+        reset_index_trace(&db);
         let result = bounded::execute(&db, &request)
             .unwrap_or_else(|error| panic!("bounded equal-score query {sql:?}: {error:?}"));
         assert_eq!(
@@ -645,7 +712,7 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
             vec![committed, staged],
             "{sql}: bounded ranked and unranked ties use the same ascending internal row id"
         );
-        assert_hnsw_trace(&db, "bounded transaction equal-score route");
+        assert_indexed_trace(&db, "bounded transaction equal-score route");
     }
 }
 
@@ -693,7 +760,7 @@ fn rust_semantic_filter_merges_staged_matches_and_removals_before_vector_scoring
     db.__reset_relational_scan_rows_touched();
     db.__reset_relational_index_entries_touched();
     db.__reset_vector_full_index_entries_touched_for_test();
-    reset_hnsw_trace(&db);
+    reset_index_trace(&db);
     let rows = semantic_ids(
         semantic_in_tx(&db, tx, query).expect("Rust semantic filtering sees its transaction image"),
     );
@@ -711,7 +778,7 @@ fn rust_semantic_filter_merges_staged_matches_and_removals_before_vector_scoring
             && committed_filter_touches <= (F32_INDEX_THRESHOLD + 1) as u64,
         "the committed filter source touches only its bounded postings"
     );
-    assert_hnsw_trace(&db, "Rust semantic filter transaction overlay");
+    assert_indexed_trace(&db, "Rust semantic filter transaction overlay");
     assert_eq!(
         db.__vector_full_index_entries_touched_for_test(),
         0,
@@ -752,15 +819,15 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     db.__reset_relational_scan_rows_touched();
     db.__reset_relational_index_entries_touched();
     db.__reset_vector_full_index_entries_touched_for_test();
-    reset_hnsw_trace(&db);
+    reset_index_trace(&db);
     let sql_narrow = db
         .execute(narrow_sql, &narrow)
         .expect("SQL narrow AUTO search");
     assert_eq!(ids(&sql_narrow), vec![wanted]);
     assert!(
-        sql_narrow.trace.rows_examined <= 4,
+        sql_narrow.trace().rows_examined <= 4,
         "ordinary SQL must not evaluate the narrow predicate across the 1,002-row table: {:?}",
-        sql_narrow.trace
+        sql_narrow.trace()
     );
     assert_exact_trace(&db, "SQL narrow AUTO route");
     assert_eq!(
@@ -784,7 +851,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     db.__reset_relational_scan_rows_touched();
     db.__reset_relational_index_entries_touched();
     db.__reset_vector_full_index_entries_touched_for_test();
-    reset_hnsw_trace(&db);
+    reset_index_trace(&db);
     assert_eq!(
         semantic_ids(
             db.semantic_search(semantic)
@@ -812,9 +879,9 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     let mut narrow_request = bounded_request(narrow_sql, narrow.clone());
     narrow_request.probe = Some(Arc::clone(&narrow_counter) as Arc<dyn bounded::ExecutionProbe>);
     db.__reset_vector_full_index_entries_touched_for_test();
-    reset_hnsw_trace(&db);
-    let bounded_narrow =
-        bounded::execute(&db, &narrow_request).expect("bounded narrow AUTO search");
+    reset_index_trace(&db);
+    let bounded_narrow = execute_observed(&db, &narrow_request, &narrow_counter)
+        .expect("bounded narrow AUTO search");
     assert_eq!(ids(&bounded_narrow.result), vec![wanted]);
     assert_exact_trace(&db, "bounded narrow AUTO route");
     assert_eq!(
@@ -858,10 +925,10 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     );
     threshold_request.probe =
         Some(Arc::clone(&threshold_counter) as Arc<dyn bounded::ExecutionProbe>);
-    reset_hnsw_trace(&threshold_db);
-    bounded::execute(&threshold_db, &threshold_request)
+    reset_index_trace(&threshold_db);
+    execute_observed(&threshold_db, &threshold_request, &threshold_counter)
         .expect("AUTO crosses the maintained F32 threshold");
-    assert_hnsw_trace(&threshold_db, "bounded AUTO threshold route");
+    assert_indexed_trace(&threshold_db, "bounded AUTO threshold route");
     assert_eq!(
         threshold_counter.table_rows.load(Ordering::SeqCst),
         0,
@@ -877,7 +944,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
          relational entries, not by draining the relation"
     );
     assert!(
-        threshold_counter.hnsw_vectors.load(Ordering::SeqCst) > 0,
+        threshold_counter.indexed_vectors.load(Ordering::SeqCst) > 0,
         "AUTO at the F32 threshold must use the maintained vector route"
     );
     assert_eq!(
@@ -948,7 +1015,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     let mut broad_request = bounded_request(broad_sql, broad.clone());
     broad_request.probe = Some(Arc::clone(&broad_counter) as Arc<dyn bounded::ExecutionProbe>);
     reset_refusal_source_touches(&unindexed);
-    let bounded_error = bounded::execute(&unindexed, &broad_request)
+    let bounded_error = execute_observed(&unindexed, &broad_request, &broad_counter)
         .expect_err("bounded INDEXED broad filtering refuses rather than scanning");
     assert_no_refusal_source_touches(&unindexed, "bounded INDEXED broad filter");
     assert!(
@@ -965,7 +1032,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     assert_eq!(broad_counter.graph_edges.load(Ordering::SeqCst), 0);
     assert_eq!(broad_counter.adjacency_entries.load(Ordering::SeqCst), 0);
     assert_eq!(broad_counter.brute_force_vectors.load(Ordering::SeqCst), 0);
-    assert_eq!(broad_counter.hnsw_vectors.load(Ordering::SeqCst), 0);
+    assert_eq!(broad_counter.indexed_vectors.load(Ordering::SeqCst), 0);
     assert_eq!(broad_counter.rank_candidates.load(Ordering::SeqCst), 0);
     assert_eq!(broad_counter.access_rows.load(Ordering::SeqCst), 0);
 
@@ -977,7 +1044,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
                     ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 1";
     unindexed.__reset_relational_scan_rows_touched();
     unindexed.__reset_relational_index_entries_touched();
-    reset_hnsw_trace(&unindexed);
+    reset_index_trace(&unindexed);
     let sql_auto = unindexed
         .execute(auto_sql, &broad)
         .expect("SQL AUTO may pay for an exact unindexed broad predicate");
@@ -992,7 +1059,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
 
     unindexed.__reset_relational_scan_rows_touched();
     unindexed.__reset_relational_index_entries_touched();
-    reset_hnsw_trace(&unindexed);
+    reset_index_trace(&unindexed);
     let rust_auto = unindexed
         .semantic_search({
             let mut query = SemanticQuery::new("vector_truth", "embedding", vec![1.0, 0.0, 0.0], 1);
@@ -1012,7 +1079,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
 
     unindexed.__reset_relational_scan_rows_touched();
     unindexed.__reset_relational_index_entries_touched();
-    reset_hnsw_trace(&unindexed);
+    reset_index_trace(&unindexed);
     let read_session_auto = unindexed
         .read_session(roomy_limits())
         .expect("open a bounded AUTO production read session")
@@ -1034,8 +1101,8 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     let auto_counter = Arc::new(VectorTouches::default());
     let mut auto_request = bounded_request(auto_sql, broad.clone());
     auto_request.probe = Some(Arc::clone(&auto_counter) as Arc<dyn bounded::ExecutionProbe>);
-    reset_hnsw_trace(&unindexed);
-    let bounded_auto = bounded::execute(&unindexed, &auto_request)
+    reset_index_trace(&unindexed);
+    let bounded_auto = execute_observed(&unindexed, &auto_request, &auto_counter)
         .expect("the bounded kernel completes exact broad work inside roomy limits");
     assert_eq!(ids(&bounded_auto.result), vec![id(60_000)]);
     assert_exact_trace(&unindexed, "bounded budgeted broad AUTO exact route");
@@ -1050,7 +1117,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
         (F32_INDEX_THRESHOLD + 1) as u64,
         "the permitted fallback compares every allowed stored vector exactly"
     );
-    assert_eq!(auto_counter.hnsw_vectors.load(Ordering::SeqCst), 0);
+    assert_eq!(auto_counter.indexed_vectors.load(Ordering::SeqCst), 0);
 
     unindexed
         .execute(
@@ -1143,8 +1210,9 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     refused_auto_request.probe =
         Some(Arc::clone(&refused_auto_counter) as Arc<dyn bounded::ExecutionProbe>);
     reset_refusal_source_touches(&unindexed);
-    let bounded_auto_error = bounded::execute(&unindexed, &refused_auto_request)
-        .expect_err("bounded AUTO refuses before over-budget broad exact work starts");
+    let bounded_auto_error =
+        execute_observed(&unindexed, &refused_auto_request, &refused_auto_counter)
+            .expect_err("bounded AUTO refuses before over-budget broad exact work starts");
     assert_no_refusal_source_touches(&unindexed, "bounded AUTO broad budget refusal");
     assert!(
         matches!(
@@ -1163,7 +1231,7 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
             graph_edges: 0,
             adjacency_entries: 0,
             brute_force_vectors: 0,
-            hnsw_vectors: 0,
+            indexed_vectors: 0,
             rank_candidates: 0,
             access_rows: 0,
         }
@@ -1228,241 +1296,6 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
     }
 }
 
-#[test]
-fn old_snapshot_indexed_uses_its_retained_generation_and_ignores_unselected_growth() {
-    let root = tempfile::tempdir().expect("create the durable retained-generation fixture");
-    let db = Database::open(root.path().join("retained-generation.redb"))
-        .expect("open the durable retained-generation fixture");
-    create_vector_truth(&db, "INDEXED");
-    db.execute(
-        "ALTER TABLE vector_truth ALTER COLUMN embedding \
-         SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 1)",
-        &empty(),
-    )
-    .expect("make this generation-transition fixture explicitly eager");
-    seed_indexed_partition(&db, selected_scope(), 70_000, "selected");
-    let before = id(70_000);
-    let g1 = generation(&db, selected_scope());
-    let old_snapshot = db.snapshot();
-    let old_pin = db.pin_snapshot(old_snapshot);
-
-    for ordinal in 0..6_u128 {
-        db.execute(
-            "UPDATE vector_truth SET embedding = $embedding WHERE id = $id",
-            &params([
-                ("embedding", Value::Vector(vec![0.0, 1.0, 0.0])),
-                ("id", Value::Uuid(id(70_000 + ordinal))),
-            ]),
-        )
-        .expect("commit enough selected-partition work to cross the declared change threshold");
-    }
-    // First seal the change layer, then commit one more searchable change so
-    // the next publication really replaces the base and retires the old chain.
-    // Stopping at the first change checkpoint would still search G1 as a base.
-    for _ in 0..MAINTENANCE_CYCLES {
-        db.run_maintenance_cycle().unwrap();
-        let status = db
-            .vector_store_for_test()
-            .partition_graph_generation_status(&partition_ref(selected_scope()))
-            .unwrap();
-        if status.change.is_some() || status.dormant_change.is_some() {
-            break;
-        }
-    }
-    for ordinal in 0..6_u128 {
-        db.execute(
-            "UPDATE vector_truth SET embedding = $embedding WHERE id = $id",
-            &params([
-                ("embedding", Value::Vector(vec![0.0, 0.0, 1.0])),
-                ("id", Value::Uuid(id(70_000 + ordinal))),
-            ]),
-        )
-        .expect("commit the next threshold-crossing wave that requires a replacement base");
-    }
-    for _ in 0..MAINTENANCE_CYCLES {
-        db.run_maintenance_cycle()
-            .expect("drive a finite later-generation publication batch");
-        let status = db
-            .vector_store_for_test()
-            .partition_graph_generation_status(&partition_ref(selected_scope()))
-            .unwrap();
-        if status
-            .base
-            .or(status.dormant_base)
-            .is_some_and(|base| base != g1)
-        {
-            break;
-        }
-    }
-    let g2 = generation(&db, selected_scope());
-    assert_ne!(
-        g2, g1,
-        "later selected work publishes G2 while G1 is pinned"
-    );
-
-    let selected_sql = "SELECT id FROM vector_truth WHERE scope_id = $scope \
-                        ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1";
-    let selected = params([
-        ("scope", Value::Uuid(selected_scope())),
-        ("query", Value::Vector(vec![1.0, 0.0, 0.0])),
-    ]);
-    reset_hnsw_trace(&db);
-    let old_rows = db
-        .execute_at_snapshot(selected_sql, &selected, old_snapshot)
-        .expect("an old snapshot INDEXED query uses its retained compatible generation");
-    assert_eq!(
-        ids(&old_rows),
-        vec![before],
-        "the G1-only nearest row proves the old INDEXED query did not select G2"
-    );
-    let old_trace = assert_hnsw_trace(&db, "old snapshot retained generation");
-    assert_eq!(
-        old_trace.selected_generations,
-        vec![g1],
-        "the old INDEXED call used its retained G1 generation, not merely any HNSW graph"
-    );
-    reset_hnsw_trace(&db);
-    let current_rows = db
-        .execute(selected_sql, &selected)
-        .expect("a current INDEXED query uses G2");
-    assert_ne!(
-        ids(&current_rows),
-        vec![before],
-        "the current answer must reflect the replacement rather than reusing pinned G1"
-    );
-    let current_trace = assert_hnsw_trace(&db, "current snapshot later generation");
-    assert_eq!(
-        current_trace.selected_generations,
-        vec![g2],
-        "the current INDEXED call selects G2 while the pinned old call selects G1"
-    );
-
-    let selected_status_before = generation(&db, selected_scope());
-    let selected_build_serial_before = db
-        .vector_store_for_test()
-        .raw_hnsw_build_serial_for_partition_for_test(&index(), &partition(selected_scope()));
-    let selected_raw_residency_before = db
-        .vector_store_for_test()
-        .raw_partition_resident_for_test(&index(), &partition(selected_scope()));
-    let baseline_counter = Arc::new(VectorTouches::default());
-    let mut baseline_request = bounded_request(selected_sql, selected.clone());
-    baseline_request.probe =
-        Some(Arc::clone(&baseline_counter) as Arc<dyn bounded::ExecutionProbe>);
-    reset_hnsw_trace(&db);
-    bounded::execute(&db, &baseline_request).expect("baseline selected-partition INDEXED read");
-    assert_hnsw_trace(&db, "baseline selected-partition INDEXED route");
-    let baseline_touches = vector_touches(&baseline_counter);
-    assert!(
-        baseline_touches.hnsw_vectors > 0,
-        "the baseline selected query records maintained graph work"
-    );
-    assert_eq!(
-        baseline_touches.brute_force_vectors, 0,
-        "the baseline selected INDEXED query has no exact fallback"
-    );
-    let baseline_raw_residency = db
-        .vector_store_for_test()
-        .raw_partition_resident_for_test(&index(), &partition(selected_scope()));
-
-    let tx = db
-        .begin()
-        .expect("open unselected-partition growth transaction");
-    for ordinal in 0..32_u128 {
-        insert_in_tx(
-            &db,
-            tx,
-            id(79_000 + ordinal),
-            other_scope(),
-            "unselected",
-            vec![0.0, 1.0, ordinal as f32 * 0.0001],
-        );
-    }
-    db.commit(tx)
-        .expect("commit growth in the unselected partition only");
-    db.execute(
-        "UPDATE vector_truth SET embedding = $embedding WHERE id = $id",
-        &params([
-            ("embedding", Value::Vector(vec![0.0, 0.0, 1.0])),
-            ("id", Value::Uuid(id(79_000))),
-        ]),
-    )
-    .expect("commit an unselected-partition replacement");
-    drive_until_indexed(&db, other_scope());
-
-    assert_eq!(
-        generation(&db, selected_scope()),
-        selected_status_before,
-        "unselected growth does not load, build, or publish another selected-partition generation"
-    );
-    assert_eq!(
-        db.vector_store_for_test()
-            .raw_hnsw_build_serial_for_partition_for_test(&index(), &partition(selected_scope()),),
-        selected_build_serial_before,
-        "unselected growth cannot rebuild the selected partition's graph"
-    );
-    assert_eq!(
-        db.vector_store_for_test()
-            .raw_partition_resident_for_test(&index(), &partition(selected_scope())),
-        selected_raw_residency_before,
-        "unselected growth cannot load or evict selected raw vectors before the selected query"
-    );
-    let after_counter = Arc::new(VectorTouches::default());
-    let mut after_request = bounded_request(selected_sql, selected.clone());
-    after_request.probe = Some(Arc::clone(&after_counter) as Arc<dyn bounded::ExecutionProbe>);
-    reset_hnsw_trace(&db);
-    bounded::execute(&db, &after_request)
-        .expect("selected INDEXED read remains usable after unselected growth");
-    assert_hnsw_trace(&db, "selected INDEXED route after unselected growth");
-    assert_eq!(
-        vector_touches(&after_counter),
-        baseline_touches,
-        "unselected growth leaves every available selected-query source counter unchanged: \
-         table/index/sort, graph-distance/adjacency, raw-vector/HNSW, rank, and access work"
-    );
-    assert_eq!(
-        after_counter.brute_force_vectors.load(Ordering::SeqCst),
-        0,
-        "the selected INDEXED query cannot gain an exact raw-vector fallback after other-partition growth"
-    );
-    assert_eq!(
-        db.vector_store_for_test()
-            .raw_partition_resident_for_test(&index(), &partition(selected_scope())),
-        baseline_raw_residency,
-        "unselected growth cannot make the selected query load or evict raw vector bodies"
-    );
-    reset_hnsw_trace(&db);
-    assert_eq!(
-        ids(&db
-            .execute_at_snapshot(selected_sql, &selected, old_snapshot)
-            .expect("the pinned G1 route still serves after unrelated partition growth"),),
-        vec![before],
-        "unrelated growth cannot change the old snapshot's selected generation or answer"
-    );
-    let old_trace_after_growth =
-        assert_hnsw_trace(&db, "old snapshot after unrelated partition growth");
-    assert_eq!(
-        old_trace_after_growth.selected_generations,
-        vec![g1],
-        "the retained old-snapshot query still used G1 after unrelated partition growth"
-    );
-    reset_hnsw_trace(&db);
-    assert_ne!(
-        ids(&db
-            .execute(selected_sql, &selected)
-            .expect("the current G2 route survives unrelated maintained growth"),),
-        vec![before],
-        "unrelated maintenance cannot move the current selected route back to G1"
-    );
-    let current_trace_after_growth =
-        assert_hnsw_trace(&db, "current snapshot after unrelated partition growth");
-    assert_eq!(
-        current_trace_after_growth.selected_generations,
-        vec![g2],
-        "unrelated maintenance cannot change the current selected partition's G2 route"
-    );
-    drop(old_pin);
-}
-
 struct PauseRegisteredVectorRead {
     reached: std::sync::mpsc::SyncSender<()>,
     resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -1484,9 +1317,15 @@ impl bounded::ExecutionProbe for PauseRegisteredVectorRead {
 
 fn assert_three_current_vectors(db: &Database, expected: &[f32]) {
     let snapshot = db.snapshot();
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     let entries = db
         .vector_store_for_test()
-        .entries_for_index(&index())
+        .entries_for_index(&index(), &mut vector_fixture_copy_1)
         .unwrap();
     let visible = entries
         .iter()
@@ -1515,7 +1354,7 @@ fn assert_three_current_vectors(db: &Database, expected: &[f32]) {
             .unwrap()
             .execute(&sql, &bound)
             .unwrap();
-        assert_eq!(ordinary.rows, bounded.rows);
+        assert_eq!(ordinary.rows(), bounded.rows());
         let actual_ids = ids(&ordinary);
         assert_eq!(actual_ids.len(), 3);
         assert_eq!(
@@ -1548,14 +1387,14 @@ fn assert_three_current_vectors(db: &Database, expected: &[f32]) {
         let point_rows = db.execute(&point, &point_bound).unwrap();
         assert_eq!(ids(&point_rows), vec![id(7)]);
         assert_eq!(
-            point_rows.rows,
+            point_rows.rows(),
             db.read_session(roomy_limits())
                 .unwrap()
                 .execute(&point, &point_bound)
                 .unwrap()
-                .rows
+                .rows()
         );
-        assert!(ordinary.rows.contains(&point_rows.rows[0]));
+        assert!(ordinary.rows().contains(&point_rows.rows()[0]));
     }
 }
 
@@ -1582,7 +1421,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
     drive_until_indexed(&db, selected_scope());
     assert_three_current_vectors(&db, &[1.0, 0.0, 0.0]);
     let initial_snapshot = db.snapshot();
-    let initial_pin = db.pin_snapshot(initial_snapshot);
+    let initial_pin = db.pin_snapshot(initial_snapshot).unwrap();
     let lower = db.begin().unwrap();
     let higher = db.begin().unwrap();
     assert!(lower < higher);
@@ -1598,7 +1437,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
     .unwrap();
     db.commit(higher).unwrap();
     let intermediate_snapshot = db.snapshot();
-    let intermediate_pin = db.pin_snapshot(intermediate_snapshot);
+    let intermediate_pin = db.pin_snapshot(intermediate_snapshot).unwrap();
     assert_three_current_vectors(&db, &[0.6, 0.8, 0.0]);
     let mut waiting = Vec::new();
     for keyword in ["EXACT", "INDEXED"] {
@@ -1639,23 +1478,29 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
     assert!(db.snapshot() > intermediate_snapshot);
     for (resume, task, expected, sql, bound) in waiting {
         resume.send(()).unwrap();
-        assert_eq!(task.join().unwrap().rows, expected.rows);
+        assert_eq!(task.join().unwrap().rows(), expected.rows());
         assert_eq!(
             db.execute_at_snapshot(&sql, &bound, intermediate_snapshot)
                 .unwrap()
-                .rows,
-            expected.rows
+                .rows(),
+            expected.rows()
         );
         let initial = db
             .execute_at_snapshot(&sql, &bound, initial_snapshot)
             .unwrap();
         assert_eq!(ids(&initial).len(), 3);
-        assert_ne!(initial.rows, expected.rows);
+        assert_ne!(initial.rows(), expected.rows());
     }
     assert_three_current_vectors(&db, &[0.8, 0.6, 0.0]);
+    let vector_fixture_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_2 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
     let entries = db
         .vector_store_for_test()
-        .entries_for_index(&index())
+        .entries_for_index(&index(), &mut vector_fixture_copy_2)
         .unwrap();
     assert!(entries.iter().all(|entry| {
         entry
@@ -1700,7 +1545,8 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
                 TenantId::from(tenant),
                 hub_identity.node_id(),
                 hub_identity.clone(),
-            ),
+            )
+            .expect("construct the authenticated sync endpoint"),
         );
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
@@ -1719,7 +1565,8 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
             broker.client_as(&edge_identity.node_id()),
             TenantId::from(tenant),
             edge_identity.clone(),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         client.pull_default().await.unwrap();
         drive_until_indexed(&edge, selected_scope());
         assert_three_current_vectors(
@@ -1732,7 +1579,7 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
         );
         if round == 0 {
             let before = hub.snapshot();
-            let pin = hub.pin_snapshot(before);
+            let pin = hub.pin_snapshot(before).unwrap();
             edge.execute(
                 update,
                 &params([
@@ -1768,11 +1615,11 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
             assert_three_current_vectors(&hub, &[0.0, 0.6, 0.8]);
             for (resume, task, expected, sql, bound) in waiting {
                 resume.send(()).unwrap();
-                assert_eq!(task.join().unwrap().rows, expected.rows);
+                assert_eq!(task.join().unwrap().rows(), expected.rows());
                 let old = hub.execute_at_snapshot(&sql, &bound, before).unwrap();
-                assert_eq!(old.rows, expected.rows);
+                assert_eq!(old.rows(), expected.rows());
                 assert_eq!(ids(&old), vec![id(7), id(8), id(9)]);
-                assert_ne!(hub.execute(&sql, &bound).unwrap().rows, expected.rows);
+                assert_ne!(hub.execute(&sql, &bound).unwrap().rows(), expected.rows());
             }
             drop(pin);
         }

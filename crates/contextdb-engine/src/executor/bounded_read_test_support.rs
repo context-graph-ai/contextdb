@@ -4,7 +4,8 @@
 //! the crate-private bounded-kernel entrance in the parent module.
 
 pub use super::bounded::{
-    ContinuationBytes, PENDING_INDEX_RUNS, take_vector_candidate_identity_decisions_for_test,
+    ContinuationBytes, GraphCreditTransferCut, GraphCreditTransferPhase, PENDING_INDEX_RUNS,
+    take_vector_candidate_identity_decisions_for_test,
 };
 use super::{
     BoundedCursorHandle, BoundedExecutionError, BoundedExecutionProbe, BoundedExecutionTelemetry,
@@ -58,11 +59,6 @@ pub trait ExecutionProbe: Send + Sync {
     fn after_source_capture(&self) {}
     fn before_work(&self, source: TestWorkSource, completed_work: u64);
     fn before_source_touch(&self, _touch: TestSourceTouch, _completed_items: u64) {}
-    fn after_hnsw_residual_rejection(
-        &self,
-        _event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
-    ) {
-    }
     fn before_temporary_reservation(
         &self,
         _source: TestWorkSource,
@@ -78,17 +74,14 @@ pub trait ExecutionProbe: Send + Sync {
     ) {
     }
     fn cancellation_observed(&self, completed_work: u64);
+    /// One cold vector graph load's credit move: before the destination
+    /// admits, after it admits, and after the read's credit is split off.
+    fn graph_credit_transfer(&self, _cut: GraphCreditTransferCut) {}
 }
 
 struct ProbeAdapter(Arc<dyn ExecutionProbe>);
 
 impl BoundedExecutionProbe for ProbeAdapter {
-    fn after_hnsw_residual_rejection(
-        &self,
-        event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
-    ) {
-        self.0.after_hnsw_residual_rejection(event);
-    }
     fn registered_snapshot_for_test(&self, snapshot: contextdb_core::SnapshotId) {
         self.0.registered_snapshot_for_test(snapshot);
     }
@@ -104,20 +97,9 @@ impl BoundedExecutionProbe for ProbeAdapter {
     }
 
     fn before_source_touch(&self, touch: BoundedSourceTouch, completed_items: u64) {
-        assert_ne!(
-            touch,
-            BoundedSourceTouch::HnswCandidate,
-            "HNSW touches must come from the sealed vector distance-loop handoff"
-        );
-        self.0.before_source_touch(touch.into(), completed_items);
-    }
-
-    fn before_hnsw_candidate_distance(
-        &self,
-        event: contextdb_vector::hnsw::HnswCandidateDistanceEvent,
-    ) {
-        self.0
-            .before_source_touch(TestSourceTouch::HnswCandidate, event.completed_candidates());
+        if let Some(touch) = TestSourceTouch::from_bounded(touch) {
+            self.0.before_source_touch(touch, completed_items);
+        }
     }
 
     fn before_temporary_reservation(
@@ -181,30 +163,30 @@ pub enum TestSourceTouch {
     GraphEdge,
     AdjacencyEntry,
     BruteForceVectorCandidate,
-    HnswCandidate,
     RankCandidate,
     AccessRow,
 }
 
-impl From<BoundedSourceTouch> for TestSourceTouch {
-    fn from(value: BoundedSourceTouch) -> Self {
-        match value {
+impl TestSourceTouch {
+    pub(crate) fn from_bounded(value: BoundedSourceTouch) -> Option<Self> {
+        Some(match value {
+            BoundedSourceTouch::StorageStep => return None,
             BoundedSourceTouch::TableRow => Self::TableRow,
             BoundedSourceTouch::IndexEntry => Self::IndexEntry,
             BoundedSourceTouch::SortCandidate => Self::SortCandidate,
             BoundedSourceTouch::GraphEdge => Self::GraphEdge,
             BoundedSourceTouch::AdjacencyEntry => Self::AdjacencyEntry,
             BoundedSourceTouch::BruteForceVectorCandidate => Self::BruteForceVectorCandidate,
-            BoundedSourceTouch::HnswCandidate => Self::HnswCandidate,
             BoundedSourceTouch::RankCandidate => Self::RankCandidate,
             BoundedSourceTouch::AccessRow => Self::AccessRow,
-        }
+        })
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TestTelemetry {
     pub work_units: u64,
+    pub native_source_touches: u64,
     pub source_work: BTreeMap<TestWorkSource, u64>,
     pub source_peak_temporary_bytes: BTreeMap<TestWorkSource, u64>,
     pub encoded_bytes: u64,
@@ -216,6 +198,7 @@ impl From<BoundedExecutionTelemetry> for TestTelemetry {
     fn from(value: BoundedExecutionTelemetry) -> Self {
         Self {
             work_units: value.work_units,
+            native_source_touches: value.native_source_touches,
             source_work: value
                 .source_work
                 .into_iter()
@@ -261,6 +244,14 @@ pub enum TestError {
     Unimplemented,
     Refused(ReadFailure),
     Cancelled,
+    /// The engine's typed memory refusal, kept with its figures.
+    MemoryBudgetExceeded {
+        subsystem: String,
+        operation: String,
+        requested_bytes: usize,
+        available_bytes: usize,
+        budget_limit_bytes: usize,
+    },
     Engine(String),
 }
 
@@ -269,6 +260,20 @@ fn test_error(error: BoundedExecutionError) -> TestError {
         BoundedExecutionError::Unimplemented => TestError::Unimplemented,
         BoundedExecutionError::Refused(refusal) => TestError::Refused(refusal),
         BoundedExecutionError::Cancelled => TestError::Cancelled,
+        BoundedExecutionError::Engine(contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        }) => TestError::MemoryBudgetExceeded {
+            subsystem: subsystem.to_string(),
+            operation: operation.to_string(),
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+        },
         BoundedExecutionError::Engine(error) => TestError::Engine(error.to_string()),
     }
 }
@@ -288,50 +293,89 @@ fn adapted_probe(request: &BoundedReadRequest) -> Option<Arc<dyn BoundedExecutio
 }
 
 /// Run one complete bounded ordinary read through the production kernel seam.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub fn execute(db: &Database, request: &BoundedReadRequest) -> Result<TestResult, TestError> {
     execute_bounded(
         db,
         &request.sql,
         &request.params,
+        db.declared_reader_memory()
+            .map_err(|error| test_error(error.into()))?,
         request.limits,
         Arc::clone(&request.clock),
         request.cancellation.clone(),
         adapted_probe(request),
     )
-    .map(|outcome| TestResult {
-        result: outcome.result,
-        telemetry: outcome.telemetry.into(),
+    .and_then(|outcome| {
+        Ok(TestResult {
+            result: outcome
+                .result
+                .into_public()
+                .map_err(BoundedExecutionError::from)?,
+            telemetry: outcome.telemetry.into(),
+        })
     })
     .map_err(test_error)
 }
 
 /// Open a cursor and receive its required first page.
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub fn open_cursor(
     db: Arc<Database>,
     request: &BoundedReadRequest,
 ) -> Result<TestCursorOpen, TestError> {
-    open_bounded_cursor(
-        db,
-        &request.sql,
-        &request.params,
-        request.limits,
-        Arc::clone(&request.clock),
-        request.cancellation.clone(),
-        adapted_probe(request),
-    )
-    .map(|outcome| TestCursorOpen {
-        cursor: TestCursor {
-            handle: outcome.cursor,
-            probe: request.probe.as_ref().map(Arc::clone),
-        },
-        first_page: outcome.first_page,
-        telemetry: outcome.telemetry.into(),
+    let read_memory = db
+        .declared_reader_memory()
+        .map_err(|error| test_error(error.into()))?;
+    crate::owned_cursor_page::with_public_page(|| {
+        open_bounded_cursor(
+            db,
+            &request.sql,
+            &request.params,
+            read_memory,
+            request.limits,
+            Arc::clone(&request.clock),
+            request.cancellation.clone(),
+            adapted_probe(request),
+        )
+    })
+    .and_then(|outcome| {
+        Ok(TestCursorOpen {
+            cursor: TestCursor {
+                handle: outcome.cursor,
+                probe: request.probe.as_ref().map(Arc::clone),
+            },
+            first_page: outcome
+                .first_page
+                .into_public()
+                .map_err(BoundedExecutionError::from)?,
+            telemetry: outcome.telemetry.into(),
+        })
     })
     .map_err(test_error)
 }
 
 impl TestCursor {
     /// Fetch a bounded page without rerunning the SQL statement.
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
@@ -340,12 +384,19 @@ impl TestCursor {
         let probe = self.probe.as_ref().map(|probe| {
             Arc::new(ProbeAdapter(Arc::clone(probe))) as Arc<dyn BoundedExecutionProbe>
         });
-        fetch_bounded_cursor(&mut self.handle, rows, cancellation, probe)
-            .map(|outcome| TestCursorFetch {
-                page: outcome.page,
+        crate::owned_cursor_page::with_public_page(|| {
+            fetch_bounded_cursor(&mut self.handle, rows, cancellation, probe)
+        })
+        .and_then(|outcome| {
+            Ok(TestCursorFetch {
+                page: outcome
+                    .page
+                    .into_public()
+                    .map_err(BoundedExecutionError::from)?,
                 telemetry: outcome.telemetry.into(),
             })
-            .map_err(test_error)
+        })
+        .map_err(test_error)
     }
 
     /// Replace only the proof observer used for subsequent fetches.  Cursor

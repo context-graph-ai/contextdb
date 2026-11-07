@@ -70,21 +70,23 @@ fn an_interactive_write_session_announces_write_mode_and_prompts_plainly() {
     );
 }
 
+// Regression observed 2026-10-30: this test asserted that an interactive `:memory:`
+// session was a write session with no route to report. contextdb has no
+// in-memory mode, so an interactive `:memory:` invocation is refused before a
+// prompt is ever shown. Rewritten in place, not deleted.
 #[test]
-fn an_interactive_memory_session_is_a_write_session_with_no_route_to_report() {
-    let mut session = terminal(&[":memory:"]);
+fn an_interactive_memory_invocation_is_refused_before_any_prompt() {
+    let session = terminal(&[":memory:"]);
 
-    session.wait_for(WRITE_BANNER);
-    session.wait_for(WRITE_PROMPT);
-    session.send_line("CREATE TABLE scratch (id INTEGER PRIMARY KEY);");
-    session.send_line("SELECT id FROM scratch;");
-    session.wait_for("(0 rows)");
-
-    let (code, transcript) = session.quit();
-    assert_eq!(code, Some(0), "transcript:\n{transcript}");
+    let (code, transcript) = session.finish();
+    assert_eq!(code, Some(2), "transcript:\n{transcript}");
     assert!(
-        !transcript.contains("read_route"),
-        "`:memory:` has no route, so no route notice exists to print.\n{transcript}"
+        transcript.contains("no in-memory mode"),
+        "the refusal says why.\n{transcript}"
+    );
+    assert!(
+        !transcript.contains(WRITE_PROMPT) && !transcript.contains(READ_PROMPT),
+        "a refused invocation shows no prompt.\n{transcript}"
     );
 }
 

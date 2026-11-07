@@ -424,11 +424,11 @@ fn note_body(db: &Database, id: Uuid) -> Option<String> {
         .execute("SELECT body FROM notes WHERE id = $id", &key)
         .expect("select note");
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "body")
         .expect("body column");
-    result.rows.first().map(|row| match &row[idx] {
+    result.rows().first().map(|row| match &row[idx] {
         Value::Text(text) => text.clone(),
         other => panic!("notes.body must be text, got {other:?}"),
     })
@@ -473,7 +473,8 @@ async fn start_hub(spec: &str, tenant: &str) -> RunningHub {
             contextdb_core::TenantId::from(tenant),
             node_id.clone(),
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -508,11 +509,14 @@ async fn retained_sync_server_releases_the_stopped_hub_port_for_rebind() {
         .await
         .expect("bind original hub");
     let controller = endpoint.large_request_test_controller();
-    let retained_server = Arc::new(SyncServer::new(
-        Arc::new(Database::open_memory()),
-        &endpoint,
-        contextdb_core::TenantId::from("retained-server-port-release"),
-    ));
+    let retained_server = Arc::new(
+        SyncServer::new(
+            Arc::new(Database::open_memory()),
+            &endpoint,
+            contextdb_core::TenantId::from("retained-server-port-release"),
+        )
+        .expect("construct SyncServer fixture"),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let serve_task = tokio::spawn({
         let retained_server = retained_server.clone();
@@ -548,11 +552,14 @@ async fn owner_forced_close_joins_an_active_serve_before_rebind() {
         .await
         .expect("bind original hub");
     let controller = endpoint.large_request_test_controller();
-    let retained_server = Arc::new(SyncServer::new(
-        Arc::new(Database::open_memory()),
-        &endpoint,
-        contextdb_core::TenantId::from("owner-forced-active-close"),
-    ));
+    let retained_server = Arc::new(
+        SyncServer::new(
+            Arc::new(Database::open_memory()),
+            &endpoint,
+            contextdb_core::TenantId::from("owner-forced-active-close"),
+        )
+        .expect("construct SyncServer fixture"),
+    );
     let serve_task = tokio::spawn({
         let retained_server = retained_server.clone();
         async move {
@@ -974,7 +981,8 @@ async fn sync_push_pull_status_over_iroh() {
         edge_a.clone(),
         &peer_dial_spec(&hub.ticket, &edge_a_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client_a.push()).await.expect("edge a push");
     assert_eq!(
         note_body(&hub.server_db, note_a).as_deref(),
@@ -989,7 +997,8 @@ async fn sync_push_pull_status_over_iroh() {
         edge_b.clone(),
         &peer_dial_spec(&hub.ticket, &edge_b_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client_b.pull_default()).await.expect("edge b pull");
     assert_eq!(
         note_body(&edge_b, note_a).as_deref(),
@@ -1026,7 +1035,8 @@ async fn large_changeset_moves_in_one_stream_over_iroh() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &sender_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("large push");
     assert_eq!(
         note_body(&hub.server_db, id).map(|body| body.len()),
@@ -1040,7 +1050,8 @@ async fn large_changeset_moves_in_one_stream_over_iroh() {
         reader.clone(),
         &peer_dial_spec(&hub.ticket, &reader_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(reader_client.pull_default())
         .await
         .expect("large pull");
@@ -2058,6 +2069,10 @@ async fn oversized_response_retries_receipt_backed_completion_when_its_ack_is_lo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "The delivered-group guard is explicitly dropped before the later awaits."
+)]
 async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() {
     let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const FRAME_CEILING: usize = 64 * 1024 * 1024;
@@ -2074,7 +2089,10 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     // Both stores already have the same declaration. Advancing the source
     // watermark before the row write keeps DDL off the wire in this journey.
     create_notes_table(&hub);
-    let server = Arc::new(SyncServer::new(hub.clone(), &endpoint, tenant.clone()));
+    let server = Arc::new(
+        SyncServer::new(hub.clone(), &endpoint, tenant.clone())
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
         let server = server.clone();
@@ -2087,7 +2105,38 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     let edge_node_id = FabricIdentity::load_or_generate(&edge_identity)
         .expect("persist edge identity")
         .node_id();
-    let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
+    // Observe delivered application units without copying their large bodies.
+    #[derive(Default)]
+    struct IntactRowGroup(std::sync::Mutex<Vec<Vec<(Uuid, contextdb_core::Lsn)>>>);
+    impl contextdb_engine::plugin::DatabasePlugin for IntactRowGroup {
+        fn on_sync_pull(
+            &self,
+            changes: &mut contextdb_engine::sync_types::ChangeSet,
+        ) -> contextdb_core::Result<()> {
+            let mut group = Vec::new();
+            for row in changes.rows.iter().filter(|row| row.table == "notes") {
+                assert!(!row.deleted);
+                assert!(
+                    matches!(row.values.get("body"), Some(Value::Text(body))
+                    if body.len() == 112 * 1024 && body.bytes().all(|byte| byte == b'r')),
+                    "a reconciliation row body arrives intact"
+                );
+                let Some(Value::Uuid(id)) = row.values.get("id") else {
+                    panic!("the reconciliation row retains its UUID key");
+                };
+                group.push((*id, row.lsn));
+            }
+            if !group.is_empty() {
+                self.0.lock().unwrap().push(group);
+            }
+            Ok(())
+        }
+    }
+    let delivered_groups = Arc::new(IntactRowGroup::default());
+    let edge = Arc::new(
+        Database::open_with_plugin(&edge_path, delivered_groups.clone())
+            .expect("open edge database"),
+    );
     create_notes_table(&edge);
     let declaration_lsn = edge.current_lsn();
     edge.persist_sync_push_watermark(&tenant, declaration_lsn)
@@ -2106,7 +2155,8 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         tenant.clone(),
-    );
+    )
+    .expect("construct SyncClient fixture");
     bootstrap
         .push()
         .await
@@ -2126,7 +2176,7 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         .expect("read the bootstrapped hub source");
     let hub_schema_lsn = hub.current_lsn();
     assert!(
-        hub.ddl_log_since(hub_schema_lsn).is_empty(),
+        hub.ddl_log_since(hub_schema_lsn).unwrap().is_empty(),
         "the captured hub frontier has no later DDL to deliver during row-only reconciliation"
     );
     edge.persist_sync_pull_watermark(&tenant, hub_schema_lsn)
@@ -2176,11 +2226,14 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         declaration_lsn.0 + 1,
         "the oversized row-only request must keep all rows in one accepted source LSN"
     );
-    let client = Arc::new(SyncClient::new(
-        edge.clone(),
-        &peer_dial_spec(&ticket, &edge_identity),
-        tenant.clone(),
-    ));
+    let client = Arc::new(
+        SyncClient::new(
+            edge.clone(),
+            &peer_dial_spec(&ticket, &edge_identity),
+            tenant.clone(),
+        )
+        .expect("construct SyncClient fixture"),
+    );
     let hub_before = hub.current_lsn();
     let pull_cursor_before = edge
         .persisted_sync_pull_cursor(&tenant)
@@ -2336,6 +2389,7 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     );
     let accepted_rows = hub
         .changes_since(hub_before)
+        .expect("read changes_since fixture")
         .rows
         .into_iter()
         .filter(|change| change.table == "notes")
@@ -2362,9 +2416,8 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         before_reconciliation.accepted_fragment_sequences,
         "reconciliation does not accept a second full upload"
     );
-    // A hub contact row no longer holds a page open (95382cc3 "pull: exclude hub contacts from
-    // page limit enforcement"), so the oversized page reports `has_more = false` and the client
-    // stops after the one over-frame reply: there is no separate empty terminal follow-up pull.
+    // Selection stops between intact source groups before later bookkeeping
+    // filtering. It can therefore require a small terminal follow-up reply.
     let reconciliation_replies = &after_reconciliation.authenticated_pull_reply_bytes_after_reset;
     assert!(
         (1..=MAX_OVERSIZED_RECONCILIATION_ATTEMPTS).contains(&reconciliation_replies.len()),
@@ -2373,9 +2426,37 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     assert!(
         reconciliation_replies
             .iter()
+            .take(reconciliation_replies.len() - 1)
             .all(|bytes| *bytes > FRAME_CEILING),
-        "every reconciliation pull carries the unsplittable over-frame source-LSN group"
+        "only the terminal reconciliation reply may be below the frame ceiling"
     );
+    let groups = delivered_groups.0.lock().unwrap();
+    assert_eq!(
+        groups.len(),
+        1,
+        "the oversized source group is delivered once and never split"
+    );
+    assert_eq!(
+        groups[0].len(),
+        notes.len(),
+        "one delivered unit carries every source row"
+    );
+    assert!(
+        groups[0].iter().all(|(_, lsn)| *lsn == groups[0][0].1),
+        "the delivered rows retain one source-LSN group"
+    );
+    assert_eq!(
+        groups[0]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        notes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the complete source group arrives with every original key"
+    );
+    drop(groups);
     assert_completed_oversized_response_lifecycle(&after_reconciliation, &edge_node_id);
     assert_eq!(
         controller
@@ -2417,7 +2498,8 @@ async fn reconnect_after_hub_restart_over_iroh() {
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("push before restart");
     let server_db_before = hub.server_db.clone();
     assert_eq!(
@@ -2488,7 +2570,8 @@ async fn backlog_accumulated_offline_reaches_hub_over_iroh() {
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert!(
         within(client.push()).await.is_err(),
         "pushing at a down hub must fail, not hang or silently drop"
@@ -2526,7 +2609,8 @@ async fn unreachable_hub_maps_to_transport_neutral_errors() {
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         contextdb_core::TenantId::from("iroh-downed"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let err = within(client.push())
         .await
         .expect_err("push at a downed hub must error")
@@ -2660,7 +2744,8 @@ async fn dial_spec_with_identity_pins_the_edge_fabric_identity() {
         edge.clone(),
         &combined,
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("identified push");
     assert_eq!(
         note_body(&hub.server_db, id).as_deref(),
@@ -2760,7 +2845,8 @@ async fn ticket_relay_url_enables_relay_dialing() {
         edge.clone(),
         &dial_spec,
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push())
         .await
         .expect("push through a relay-only ticket must succeed: the ticket names the relay, so the dialing endpoint must enable exactly that relay");
@@ -2780,7 +2866,8 @@ async fn unsupported_endpoint_scheme_errors_actionably() {
         edge,
         "tcp://localhost:4222",
         contextdb_core::TenantId::from("iroh-compat"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let err = within(client.ensure_connected())
         .await
         .expect_err("an unsupported endpoint scheme must error")
@@ -2800,6 +2887,31 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         .parent()
         .expect("crates dir");
     let allowed_suffixes = [
+        // Shared sync code, unused only in the no-network build.
+        "contextdb-engine/src/read_image_memory.rs",
+        "contextdb-engine/src/protocol.rs",
+        "contextdb-engine/src/sync_types.rs",
+        "contextdb-engine/src/blob_repository.rs",
+        "contextdb-engine/src/vector_read_memory.rs",
+        "contextdb-engine/src/local_transport/framing.rs",
+        "contextdb-engine/src/local_transport/engine_answer.rs",
+        "contextdb-engine/src/owner_read/native_request.rs",
+        "contextdb-engine/src/database/connected_replay.rs",
+        "contextdb-engine/src/database/transaction_host.rs",
+        "contextdb-engine/src/database/authoritative_purge_kernel.rs",
+        "contextdb-engine/src/database/metadata_and_commit_scope.rs",
+        "contextdb-engine/src/database/open_and_owner_reads.rs",
+        "contextdb-engine/src/custody/incarnation.rs",
+        "contextdb-engine/src/custody/delivery.rs",
+        "contextdb-engine/src/custody/native_selection.rs",
+        "contextdb-engine/src/custody/preparation.rs",
+        "contextdb-engine/src/custody/native_record_codec.rs",
+        "contextdb-engine/src/custody/policy.rs",
+        "contextdb-engine/src/persistence/native_storage_admission.rs",
+        "contextdb-engine/src/persistence/cold_provider.rs",
+        "contextdb-engine/src/executor/bounded.rs",
+        "contextdb-engine/src/executor/bounded/control_memory.rs",
+        "contextdb-engine/src/local_transport/mod.rs",
         // The adapter itself.
         "contextdb-server/src/transport/iroh.rs",
         // The media-plane fetch backend: the second adapter file under
@@ -2835,6 +2947,16 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         "contextdb-server/examples/media_transfer_fabric_demo.rs",
         // This test file names the module under test.
         "contextdb-server/tests/iroh_transport_tests.rs",
+        // The reopened oversized-unit suite binds the real authenticated endpoint.
+        "contextdb-server/tests/oversized_dependency_unit_reopened_tests.rs",
+        // The allocator receipt names the network-enabled build it measures.
+        "contextdb-engine/tests/native_backing_allocator.rs",
+        // Network memory-owner proofs bind a real authenticated localhost endpoint.
+        "contextdb-engine/tests/every_public_route_installs_its_own_memory_owner/network_routes.rs",
+        // The CLI exit-push proof sends oversized changes to a real localhost hub.
+        "contextdb-cli/tests/oversized_exit_push_tests.rs",
+        // This cfg(test) module drives native delivery over real localhost endpoints.
+        "contextdb-engine/src/sync_server/native_delivery_tests.rs",
         // These server suites bind a real localhost endpoint to exercise the
         // authenticated transport contract directly.
         "contextdb-server/tests/accepted_delete_suppression_cursor_tests.rs",
@@ -3174,7 +3296,8 @@ async fn enrollment_ticket_failures_redact_the_ticket_at_every_entrypoint() {
         Arc::new(Database::open_memory()),
         &format!("iroh:malformed/{ticket}"),
         TenantId::from("ticket-redaction-malformed"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     record(
         "dial malformed tagged ticket",
         within(malformed_client.ensure_connected()).await,
@@ -3187,7 +3310,8 @@ async fn enrollment_ticket_failures_redact_the_ticket_at_every_entrypoint() {
             identity.display()
         ),
         TenantId::from("ticket-redaction-bind"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     record(
         "dial bind spec with relay ticket",
         within(bind_client.ensure_connected()).await,
@@ -3506,6 +3630,7 @@ async fn published_hub_announces_to_the_operator_lookup_service() {
 #[cfg(feature = "mdns")]
 #[tokio::test]
 async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
+    use futures_util::StreamExt;
     let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     // The LOOKUP knob end to end with zero third-party anything: both sides
     // opt into lookup=mdns (LAN-local), the edge's ticket carries ONLY the
@@ -3535,25 +3660,51 @@ async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
         "iroh:?to={id_only_ticket}&lookup=mdns&identity={}",
         edge_identity.display()
     );
-    let client = SyncClient::new(edge.clone(), &dial, contextdb_core::TenantId::from(tenant));
-
-    // mDNS convergence can take a few announce cycles; retry the push until
-    // the resolve succeeds (bounded by the outer test timeout).
-    let mut last_err = String::new();
-    let mut pushed = false;
-    for _ in 0..6 {
-        match within(client.push()).await {
-            Ok(_) => {
-                pushed = true;
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(&edge_identity).expect("edge identity"));
+    let (transport, control) = client_with_test_controller_for_test(&dial);
+    control.pause_before_discovery_connect_for_test();
+    let client = Arc::new(
+        SyncClient::with_authenticated_transport_and_identity_for_test(
+            edge.clone(),
+            transport,
+            contextdb_core::TenantId::from(tenant),
+            identity,
+        )
+        .expect("construct SyncClient fixture"),
+    );
+    let push = tokio::spawn({
+        let client = client.clone();
+        async move { client.push().await }
+    });
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let endpoint = control.wait_for_discovery_endpoint_for_test().await;
+        let lookup = endpoint.address_lookup().expect("client address lookup");
+        let results = lookup.resolve(full.endpoint_addr().id);
+        tokio::pin!(results);
+        let mut discovered = false;
+        while let Some(result) = results.next().await {
+            if let Ok(Ok(item)) = result
+                && item.endpoint_id() == full.endpoint_addr().id
+                && item.provenance() == "mdns"
+                && !item.to_endpoint_addr().is_empty()
+            {
+                discovered = true;
                 break;
             }
-            Err(err) => {
-                last_err = err.to_string();
-                client.reconnect().await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
         }
-    }
+        if !discovered {
+            panic!("mDNS peer discovery never delivered");
+        }
+        control.release_discovery_connect_for_test();
+        push.await.expect("mDNS push task")
+    })
+    .await
+    .expect("mDNS peer discovery or push completion never delivered");
+    let (pushed, last_err) = match result {
+        Ok(_) => (true, String::new()),
+        Err(err) => (false, err.to_string()),
+    };
     assert!(
         pushed,
         "push via an identity-only ticket must succeed once mDNS resolves the hub, last error: {last_err}"
@@ -3669,11 +3820,18 @@ async fn sync_status_reports_unreachable_after_hub_dies() {
     create_notes_table(&edge);
     insert_note(&edge, Uuid::new_v4(), "liveness-probe");
     let edge_identity = dir.path().join("liveness-edge.fabric-identity.key");
-    let client = SyncClient::new(
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(&edge_identity).expect("edge identity"));
+    let (transport, control) =
+        client_with_test_controller_for_test(&peer_dial_spec(&hub.ticket, &edge_identity));
+    control.watch_connection_close_for_test();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge.clone(),
-        &peer_dial_spec(&hub.ticket, &edge_identity),
+        transport,
         contextdb_core::TenantId::from(tenant),
-    );
+        identity,
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("push while hub is up");
     assert!(
         client.is_connected().await,
@@ -3681,17 +3839,12 @@ async fn sync_status_reports_unreachable_after_hub_dies() {
     );
 
     hub.stop().await;
-    // Bounded poll on the observable condition (was a fixed 1 s settle sleep):
-    // after the hub dies the liveness probe must eventually report dead. The
-    // deadline is a failure ceiling, not a timing assertion.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while client.is_connected().await {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "is_connected must report the dead hub within the failure ceiling"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        control.wait_for_connection_close_for_test(),
+    )
+    .await
+    .expect("connection close never delivered");
 
     // The operator-facing health answer must tell the truth: the cached
     // connection is dead, so the client is NOT connected, and a fresh
@@ -3800,7 +3953,8 @@ async fn iroh_push_arms_the_retention_hub_and_records_client_receipts() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("push over iroh");
 
     // Consequence 1: the multi-hub refusal is armed against a REAL hub identity.

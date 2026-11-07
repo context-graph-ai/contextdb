@@ -58,9 +58,9 @@ fn closing_with_an_inserting_transaction_still_open_succeeds_and_keeps_none_of_i
         .execute("SELECT id FROM staged ORDER BY id", &HashMap::new())
         .expect("read the table the abandoned transaction wrote to");
     assert!(
-        seen.rows.is_empty(),
+        seen.rows().is_empty(),
         "an abandoned transaction's inserts are rolled back by the close that ended it: {:?}",
-        seen.rows
+        seen.rows()
     );
     reopened.close().expect("close the reopened store");
 }
@@ -91,9 +91,9 @@ fn dropping_a_handle_with_an_inserting_transaction_still_open_also_ends_cleanly(
         .execute("SELECT id FROM staged", &HashMap::new())
         .expect("read the table the abandoned transaction wrote to");
     assert!(
-        seen.rows.is_empty(),
+        seen.rows().is_empty(),
         "a dropped handle's open transaction keeps nothing either: {:?}",
-        seen.rows
+        seen.rows()
     );
     reopened.close().expect("close the reopened store");
 }

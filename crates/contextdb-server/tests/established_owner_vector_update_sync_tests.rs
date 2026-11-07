@@ -48,7 +48,8 @@ async fn hub(root: &Path, tenant: &str) -> Hub {
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -73,7 +74,8 @@ impl Hub {
 fn edge(root: &Path, name: &str, ticket: &str, tenant: &str) -> (Arc<Database>, SyncClient) {
     let db = Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open edge"));
     db.execute("CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3)) SYNC CONFLICT KEEP LATEST", &HashMap::new()).expect("edge schema");
-    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant));
+    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -135,9 +137,9 @@ async fn established_owner_vector_update_syncs_before_delete_arbitration() {
                 &HashMap::new(),
             )
             .expect("SQL owner and vector");
-        assert_eq!(sql.rows.len(), 1, "owner remains present with exact key");
+        assert_eq!(sql.rows().len(), 1, "owner remains present with exact key");
         assert_eq!(
-            sql.rows[0],
+            sql.rows()[0],
             vec![
                 Value::Text("owner first".to_string()),
                 Value::Vector(vec![1.0, 0.0, 0.0]),

@@ -4,6 +4,17 @@
 //! `randrange(24)`, and cached Box-Muller `gauss()` behavior are reproduced so
 //! the generated little-endian `f32` bytes retain the published fingerprints.
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 const SHA256_INITIAL: [u32; 8] = [
     0x6a09_e667,
     0xbb67_ae85,
@@ -15,6 +26,17 @@ const SHA256_INITIAL: [u32; 8] = [
     0x5be0_cd19,
 ];
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 const SHA256_K: [u32; 64] = [
     0x428a_2f98,
     0x7137_4491,
@@ -82,6 +104,17 @@ const SHA256_K: [u32; 64] = [
     0xc671_78f2,
 ];
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 pub(super) fn sha256(input: &[u8]) -> [u8; 32] {
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut padded = input.to_vec();
@@ -140,6 +173,10 @@ pub(super) fn sha256(input: &[u8]) -> [u8; 32] {
     digest
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by vector, vector_a_filtered_scope_is_charged_for_its_candidates, vector_first_filt"
+)]
 pub(super) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -149,6 +186,17 @@ pub(super) fn hex(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 struct PythonRandom {
     mt: [u32; 624],
     index: usize,
@@ -156,6 +204,17 @@ struct PythonRandom {
 }
 
 impl PythonRandom {
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn from_sha256(digest: [u8; 32]) -> Self {
         // Python seeds MT19937 from the absolute integer using least-significant
         // 32-bit words first. The fixture seed is a big-endian SHA-256 integer.
@@ -172,6 +231,17 @@ impl PythonRandom {
         source
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn init_genrand(&mut self, seed: u32) {
         self.mt[0] = seed;
         for index in 1..624 {
@@ -182,6 +252,17 @@ impl PythonRandom {
         self.index = 624;
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn init_by_array(&mut self, key: &[u32]) {
         self.init_genrand(19_650_218);
         let mut i = 1;
@@ -214,6 +295,17 @@ impl PythonRandom {
         self.mt[0] = 0x8000_0000;
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn gen_u32(&mut self) -> u32 {
         if self.index >= 624 {
             const MATRIX_A: u32 = 0x9908_b0df;
@@ -235,12 +327,34 @@ impl PythonRandom {
         value
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn random(&mut self) -> f64 {
         let high = u64::from(self.gen_u32() >> 5);
         let low = u64::from(self.gen_u32() >> 6);
         ((high << 26) + low) as f64 / 9_007_199_254_740_992.0
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn gauss(&mut self) -> f64 {
         if let Some(value) = self.gauss_next.take() {
             return value;
@@ -252,6 +366,17 @@ impl PythonRandom {
         value
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "nightly-tests",
+            feature = "production-smoke-driver",
+            feature = "mdns"
+        )),
+        allow(
+            dead_code,
+            reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+        )
+    )]
     fn randrange_24(&mut self) -> usize {
         loop {
             let value = (self.gen_u32() >> 27) as usize;
@@ -262,6 +387,17 @@ impl PythonRandom {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn fixture_digest(
     shape: &str,
     seed: usize,
@@ -272,14 +408,40 @@ fn fixture_digest(
     sha256(format!(r#"["{shape}",{seed},"{role}",{ordinal},{dimensions}]"#).as_bytes())
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 fn center_digest(seed: usize, topic: usize, dimensions: usize) -> [u8; 32] {
     sha256(format!(r#"["center",{seed},{topic},{dimensions}]"#).as_bytes())
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by vector, vector_a_filtered_scope_is_charged_for_its_candidates, vector_first_filt"
+)]
 pub(super) fn vector(role: &str, ordinal: usize, dimensions: usize) -> Vec<f32> {
     vector_for("topic_clusters", 17, role, ordinal, dimensions)
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "nightly-tests",
+        feature = "production-smoke-driver",
+        feature = "mdns"
+    )),
+    allow(
+        dead_code,
+        reason = "KEEP-FEATURE: live only under nightly-tests, production-smoke-driver or mdns"
+    )
+)]
 pub(super) fn vector_for(
     shape: &str,
     seed: usize,

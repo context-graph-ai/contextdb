@@ -124,13 +124,13 @@ fn a_bounded_read_of_a_user_table_named_dual_returns_its_stored_rows() {
     let outcome = bounded::execute(&db, &request("SELECT id FROM dual", HashMap::new()))
         .expect("reading a table the operator created must succeed");
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         STORED_ROWS as usize,
         "a bounded read of the table named dual must return the rows the operator \
          stored in it, not the zero-column constant source the name is intercepted \
          into; got {:?} with columns {:?}",
-        outcome.result.rows,
-        outcome.result.columns
+        outcome.result.rows(),
+        outcome.result.columns()
     );
 }
 
@@ -148,12 +148,12 @@ fn a_ranked_vector_read_of_a_user_table_named_dual_answers_with_its_rows() {
     )
     .expect("a ranked vector read of a table the operator created must succeed");
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         3,
         "a ranked vector read of the table named dual must rank the operator's own \
          rows; got {:?} with columns {:?}",
-        outcome.result.rows,
-        outcome.result.columns
+        outcome.result.rows(),
+        outcome.result.columns()
     );
 }
 
@@ -173,11 +173,11 @@ fn a_cursor_over_a_ranked_read_of_a_user_table_named_dual_pages_its_rows() {
     let opened = bounded::open_cursor(Arc::clone(&db), &paged)
         .expect("a cursor over a ranked read of an operator's table must open");
     assert_eq!(
-        opened.first_page.rows.len(),
+        opened.first_page.rows().len(),
         1,
         "the first page of a cursor over the table named dual must carry one of the \
          operator's own rows; got {:?}",
-        opened.first_page.rows
+        opened.first_page.rows()
     );
     let mut cursor = opened.cursor;
     cursor

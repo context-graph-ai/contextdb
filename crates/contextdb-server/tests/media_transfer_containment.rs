@@ -21,6 +21,26 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn allowed_transport_types(file: &Path) -> &'static [&'static str] {
     if file == from_manifest("../contextdb-engine/src/blob_store.rs") {
         &["IrohServer"]
+    } else if file == from_manifest("../contextdb-engine/src/sync_server/native_delivery_tests.rs")
+    {
+        // The cfg(test) native-delivery journeys bind real authenticated endpoints
+        // and inspect their existing adapter accounting controls.
+        &[
+            "CLIENT_REPLY_CLASSES",
+            "ClientReplyClass",
+            "IrohServer",
+            "LargeRequestTestController",
+            "MAX_CONNECTION_TASK_BYTES",
+            "NATIVE_REPLY_PROBE",
+            "NativeReplyEvent",
+            "REFUSAL_ENCODING_PROBE",
+            "TERMINAL_WRITES",
+            "abort_connection_tasks_for_test",
+            "client_with_test_controller_for_test",
+            "connection_task_bytes_for_test",
+            "native_reply_control_bytes_for_test",
+            "reply_writer_bytes_for_test",
+        ]
     } else if file == from_manifest("src/main.rs") {
         &["EndpointSpec", "IrohServer"]
     } else if file == from_manifest("src/smoke_driver.rs") {

@@ -1,161 +1,73 @@
 # contextdb-engine — Agent Rules
 
-Repo-wide rules: [root AGENTS.md](../../AGENTS.md). Read contract: [CLI](../../docs/cli.md).
-Storage and sync: [architecture](../../docs/architecture.md).
-
-**Purpose:** compose relational, graph and vector state into `Database`, execute SQL atomically,
-persist it, serve bounded reads, maintain it, and sync it.
+Purpose: compose the stores into atomic `Database` operations, persist them, serve bounded reads,
+run declared maintenance, and sync. Read the [root rules](../../AGENTS.md) first.
 
 ## Owns / must not own
 
-| Area | Owner and boundary |
-|---|---|
-| Transactions, DDL, callbacks, received schema | `database.rs`, `database/` (`gate.rs`, `trigger.rs`, `event_bus.rs`, `cron.rs`); `composite_store.rs` composes one write set. |
-| Persistence, reader holds, compact indexes, durable schema installation | `persistence.rs`, `persistence/`, `metadata_page.rs`; storage primitives belong to redb. |
-| SQL execution | `executor.rs`; every bounded read uses the one kernel in `executor/bounded.rs`. |
-| Read opening and routing | `read_session.rs`: one `ReadSession`, two routes; `direct_file_reader.rs` pins committed file state and loads bodies on demand; `owner_read/` serves live owners; `local_transport/` owns the channel. |
-| Maintenance and vector lifecycle | `database.rs`, `database/vector_maintenance_inventory.rs`, `database/vector_source_page_admission.rs`, `persistence.rs`, `vector_observations.rs`; vector owns partition state, consolidation and search; hnsw owns graph primitives. |
-| Sync and work ledger | `sync_client.rs`, `sync_server.rs`, `sync_types.rs`, `protocol.rs`, `subjects.rs`, `transport/`, `work_ledger.rs`, `transfer_receipts.rs`, `peer_directory.rs`. Server re-exports them. |
-| Custody, purge, discard | `custody/`, `database/discard.rs`, `database/purge_predicate.rs`, standalone purge kernel in `database.rs`. |
-
-Must not own grammar (parser), planning (planner), storage data structures (store crates), or
-refusal vocabulary (`core::read_contract`). Never add a shadow store, second transport, third read
-route, second read opener, duplicate refusal type, or consumer-specific execution kernel.
-Detailed reader, reclamation, vector generation, and maintenance mechanisms live in
-[architecture](../../docs/architecture.md); their guards are indexed below.
+Owns SQL execution, transaction orchestration, durable publication, reader registration, erasure,
+callbacks, sync semantics and work-ledger state. Grammar belongs to parser, planning to planner,
+store data structures to their crates, and refusal vocabulary to core. Never add a shadow store,
+a second transport, third read route, second read opener or consumer-specific execution kernel.
 
 ## Seams
 
-Below: core, tx, relational, graph, vector, parser, planner, redb. Above: CLI, server, embedders.
-Entries: `Database::open` / `open_with_options` / `open_memory` / `open_with_plugin`, `execute`,
-`begin` / `commit` / `rollback`; `ReadSession::open` / `open_owner_only` / `charged_bytes`.
-`DatabasePlugin` lifecycle hooks are not a storage seam. Transactional callbacks prepare writes
-before final validation; external effects belong to post-commit `register_sink` delivery.
+Above: CLI, server and Rust embedders. Below: core, tx, relational, graph, vector, parser, planner
+and the redb fork. Public entries are `Database::open`, `open_with_options`, `open_with_plugin`,
+`execute`, `begin`/`commit`/`rollback`, and `ReadSession::open`/`open_owner_only`/`charged_bytes`.
+`open_memory` is test-only file-backed scratch, not an embedding API or in-memory product mode.
+`DatabasePlugin` is a lifecycle seam; callbacks prepare transactional writes before validation,
+while external effects use post-commit sinks. Both read routes use `executor/bounded.rs`.
+Writer sources pin published roots and merge staged overlays; they must not hydrate history at open.
+Detailed mechanisms and claim bindings: [architecture](../../docs/architecture.md).
 
-## Clock and memory seams
-
-Persist timestamps through `contextdb_core::Wallclock::now()`, never raw epoch math. Tests use
-`Wallclock::test_clock_guard`; its override is thread-local, so drive background maintenance
-synchronously. Core `tests/test_estate_audit.rs::test_estate_audit_no_new_sleeps_or_raw_clock_reads`
-and `tests/timestamp_audit.rs::timestamp_audit_no_new_txid_shaped_columns` guard this: never raise
-the ratchet. Retained storage/proof pages carry owned charges until their final holder drops.
-File open authenticates compact vector membership and startup settings without loading bodies;
-`read_custody_config` is checked when first used. Incremental membership/custody set commitments
-live in `persistence/content_identity.rs`; repair rebuilds them, and compaction rebinds moved
-physical roots through redb's `compact_step_with_hook` / `table_root_fingerprint`.
-
-`HISTORY ALL` retains version metadata and writer retention grows with the retained version count;
-unchanged raw vector bodies share bounded allocation ownership rather than growing once per scalar
-version. The finite memory limit remains a ceiling, so sharing does not promise unlimited history.
-<!-- enforced by: crates/contextdb-engine/tests/vector/vector_memory_ownership_reconciliation_contract.rs::retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write -->
+Persist time through `contextdb_core::Wallclock::now()`. Tests use the thread-local
+`Wallclock::test_clock_guard`; drive background work synchronously. Never raise clock/sleep ratchets.
+Admit before allocation and keep charges until final physical release, including cursor-held pages.
+Test observations extend existing seams; they must not create a production execution path.
 
 ## Invariants and their guards
 
-Paths below are relative to this crate unless they start with `crates/` or `../../`.
+Paths below are relative to this crate unless they begin with `crates/` or `../../`.
 
-| Invariant | Guard (file::test) |
+| Invariant | Guard (file → test) |
 |---|---|
-| Server transport audit mirrors stay byte-identical to engine sources; they are not independent implementations | `tests/sync/sync_source_mirror_tests.rs::server_sync_sources_are_exact_engine_audit_mirrors` |
-| `:memory:` has no file, companion or owner channel | `crates/contextdb-cli/tests/read_cli_journeys_invocation.rs::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable` |
-| Commit/rollback is atomic across all three stores | `tests/engine/engine_tests.rs::test_cross_subsystem_atomic_commit`, `::test_rollback_across_all_subsystems` |
-| Snapshots exclude later row and vector commits | `tests/engine/engine_tests.rs::test_mvcc_snapshot_isolation`, `::test_vector_snapshot_isolation` |
-| Durable bounded pulls and cursors register their captured snapshot before a writer can clean up old versions | `src/database/durable_read_snapshot_admission_tests.rs::durable_pull_registers_before_releasing_its_captured_root`, `::durable_cursor_registers_before_releasing_its_captured_root` |
-| Both routes agree; ordinary owner requests do not fall back after disconnect | `tests/read/read_session_route_contract.rs::file_and_owner_routes_select_once_and_return_canonical_equivalent_results`, `::owner_disconnect_after_partial_reply_never_falls_back_within_the_session` |
-| Reader publication uses the shared platform directory even with a supplied runtime root; both root choices share purge fences | `tests/read/reader_breadcrumbs_live_in_the_default_runtime_location.rs::a_reader_given_an_override_publishes_in_the_default_runtime_location`; `tests/read/authoritative_purge_reader_publication.rs::supplied_reader_and_default_writer_share_erasure_publication`, `::default_reader_and_supplied_writer_share_erasure_publication` |
-| An unreadable candidate directory refuses purge or reclamation without blocking database open; unmatched reader presence and differing roots without a platform root cannot authorize unsafe reclamation | `tests/read/authoritative_purge_reader_publication.rs::an_unreadable_candidate_refuses_purge_without_blocking_database_open`, `::an_unreadable_candidate_refuses_writer_reclamation_until_it_is_restored`, `::different_roots_without_platform_root_refuse_unsafe_reclamation_and_purge` |
-| A direct-file reader retains its opened snapshot after writer takeover | `tests/read/reader_continuity_contract.rs::a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store` |
-| An owner cursor retains its opened storage snapshot across graceful or abrupt owner exit and later writer rewrites, while a purge during handoff invalidates an affected continuation | `tests/read/cursor_survives_writer_handover.rs::cursor_opened_before_writer_handover_finishes_its_snapshot`, `::an_abrupt_owner_exit_preserves_old_rows_through_replacement_rewrites`, `::purge_during_handoff_invalidates_affected_continuation_after_owner_exit` |
-| Cursor admission has bounded root work and charged memory as unrelated data grows | `tests/read/cursor_survives_writer_handover.rs::small_cursor_admission_work_and_charged_memory_ignore_unrelated_store_size` |
-| A provisional client hold spans owner response, owner exit and exact-root registration | `tests/read/cursor_survives_writer_handover.rs::owner_exit_after_open_response_does_not_break_client_registration` |
-| Complete, idle-expired, and memory-refused owner cursors release physical pages while their objects remain alive | `tests/read/cursor_survives_writer_handover.rs::complete_first_page_releases_the_owner_cursor_hold`, `::final_fetch_releases_pages_before_the_cursor_object_is_dropped`, `::idle_expiry_reclaims_pages_without_another_client_request`, `::memory_refusal_on_file_continuation_releases_registration_and_presence` |
-| Owner cursor page decode preserves typed memory refusals and releases client and owner cursor slots, snapshot registration, and reader presence | `tests/read/owner_cursor_decode_memory_release.rs::oversized_owner_fetch_page_releases_cursor_slot_snapshot_and_presence`, `::oversized_owner_first_page_closes_the_owner_cursor_and_preserves_the_refusal` |
-| A completed read's final publication remains cancellable and active-time bounded while a writer holds the commit lock; owner cursor authorization waits on the request worker so channel cancellation reaches it, and a final inbox check atomically chooses cancellation or page publication; refusal releases its erasure publication guard | `src/database.rs::read_publication_wait_tests::final_read_publication_wait_refuses_cancellation_and_deadline_before_writer_release`; `tests/owner_read/owner_route_progress_and_cancellation.rs::owner_channel_cancellation_reaches_cursor_publication_while_writer_is_paused`, `::owner_channel_cursor_publication_after_writer_release_completes_exactly_once` |
-| Releasing a cursor leaves deferred page cleanup bounded and durable across later writer commits | `tests/read/cursor_survives_writer_handover.rs::closing_a_cursor_keeps_the_next_small_append_cleanup_bounded`; `crates/contextdb-redb/src/transactions.rs::bounded_reclamation_tests::released_snapshot_cleanup_is_bounded_durable_and_eventually_drains`, `crates/contextdb-redb/src/transactions.rs::bounded_reclamation_tests::empty_deferred_lists_consume_the_entry_budget`, `crates/contextdb-redb/src/transactions.rs::bounded_reclamation_tests::one_unit_budget_progresses_in_both_trees` |
-| Explicit close drains eligible deferred frees before read-only handoff, reports cleanup or handoff failure even after an owner-read timeout and retry, releases resources after a handoff failure, and commits nothing after publication | `tests/read/cursor_survives_writer_handover.rs::explicit_close_drains_released_snapshot_frees_before_handoff`, `::explicit_close_reports_drain_io_failure_and_releases_the_store`, `::handoff_preparation_failure_still_releases_explicit_close_resources`; `tests/owner_read/owner_read_lifecycle_contract.rs::drain_timeout_preserves_database_resources_until_a_retry_finishes_close`, `::cleanup_error_survives_owner_read_timeout_and_retry`, `::handoff_error_survives_owner_read_timeout_and_retry` |
-| Owner-to-file replay stays within each public fetch budget and preserves its skip position | `tests/read/cursor_survives_writer_handover.rs::replay_yields_under_one_public_fetch_budget_and_keeps_its_progress`, `::an_empty_owner_first_page_does_not_skip_the_first_replayed_row` |
-| Owner-only open never touches the file | `tests/owner_read/owner_only_session_never_touches_the_file.rs::an_owner_only_open_with_no_owner_leaves_the_committed_file_alone` |
-| Owner capacity refuses N+1 without queueing; answers stay private until success | `tests/owner_read/owner_read_admission_contract.rs::default_and_raised_capacity_hold_exactly_n_and_refuse_n_plus_one_without_a_queue`; `tests/owner_read/owner_read_client_contract.rs::multiple_chunks_remain_private_until_terminal_success` |
-| Trace matches execution and both routes enforce access gates | `tests/bounded/bounded_read_plan_trace_matches_the_executor.rs::a_bounded_read_describes_its_plan_the_way_the_executor_does`; `tests/bounded/bounded_read_refuses_what_the_gate_denies.rs::a_row_the_principals_grants_hide_is_refused_by_both_doors` |
-| Oversized values refuse before allocating their source body, without leaking charge | `tests/direct_file_image_memory_lifetime.rs::one_oversized_durable_value_is_refused_before_its_source_buffer_is_allocated` |
-| Evicted pages still held by readers remain charged; all terminal statement paths clean up | `src/persistence/search_page_reuse_tests.rs::a_proof_page_a_statement_still_holds_stays_charged_after_the_cache_evicts_it`, `::statement_cleanup_after_success_refusal_and_cancellation_leaves_no_uncharged_page` |
-| Open work is independent of vector dimension; incomplete copied membership/config is refused | `tests/read/open_reads_compact_vector_and_config_state.rs::opening_equal_vector_memberships_reads_bytes_independent_of_dimension`, `::a_self_consistent_visibility_copy_cannot_hide_a_committed_vector`, `::a_custody_copy_missing_one_policy_cannot_return_a_shortened_show_list`, `::a_missing_copied_startup_setting_with_recomputed_copy_checksums_is_refused_at_open` |
-| Append/delete membership binding hashes only changed records | `tests/engine_seams/one_vector_append_does_not_rescan_the_directory.rs::appending_one_vector_hashes_only_what_that_commit_changed`, `::deleting_one_vector_hashes_only_what_that_commit_changed`, `::one_custody_policy_write_hashes_only_what_that_commit_changed` |
-| Partial ALTER preserves omitted columns; only explicit markers drop/rename | `tests/sql_surface/sql_surface_other.rs::sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column`, `::sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename`, `::sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_operation`, `::sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors_operation` |
-| An identical received schema migration returns its original apply result without mutation | `src/database/received_schema_atomic_retry_tests.rs::identical_received_marker_vector_retry_returns_its_original_observation_without_mutation` |
-| Presence scans cover every gap around authenticated readers before purge | `src/persistence/reader_presence.rs::tests::authenticated_known_reader_is_not_unknown_in_either_range`, `src/persistence/reader_presence.rs::tests::later_known_lock_cannot_hide_an_earlier_unknown_lock_in_either_range`, `src/persistence/reader_presence.rs::tests::adverse_probe_ordering_still_covers_the_earlier_unknown_offset`; `tests/read/authoritative_purge_reader_publication.rs::mixed_known_and_unknown_presence_refuses_purge_but_allows_known_reader_work` |
-| Purge recovery, storage compaction and owner cursor pinning report unavailable coordination with typed operation, path and cause | `src/persistence/coordination_error_tests.rs::closed_writer_ownership_refuses_recovery_compaction_and_cursor_pin_with_typed_paths`, `::poisoned_writer_state_refuses_recovery_compaction_and_cursor_pin_with_typed_paths`, `::missing_companion_refuses_recovery_and_cursor_pin_with_typed_database_path`, `::unusable_publication_fence_refuses_recovery_and_cursor_registration_with_typed_paths`, `::provider_inventory_refusal_preserves_owner_cursor_operation_runtime_and_cause` |
-| Ordinary owner cursor registry contention during registration and provider scanning, and a trusted last-reader teardown before descriptor validation, retry outside the commit boundary within the declared active-time and cancellation limits and recapture the complete root; unreadable or unauthenticated coordination remains a terminal typed refusal | `src/database/owner_cursor_pin_retry_tests.rs::owner_channel_cursor_retries_registry_contention_until_release`, `::owner_channel_cursor_registry_contention_obeys_active_deadline`, `::owner_channel_cursor_registry_contention_obeys_cancellation`, `::healthy_registry_scan_contention_never_refuses_concurrent_cursors`, `::owner_channel_cursor_retries_registry_scan_contention_until_release`, `::owner_channel_cursor_registry_scan_contention_obeys_active_deadline`, `::owner_channel_cursor_registry_scan_contention_obeys_cancellation`; `src/persistence/owner_cursor_admission_tests.rs::untrusted_owner_cursor_registry_is_a_terminal_typed_refusal`, `::untrusted_provider_scan_registry_is_a_terminal_typed_refusal`, `::replaced_provider_scan_registry_is_a_terminal_typed_refusal`, `::provider_io_wouldblock_does_not_imply_registry_scan_contention`; `src/database/owner_cursor_pin_retry_tests.rs::owner_channel_cursor_survives_registry_teardown_before_validation`, `::owner_channel_cursor_registry_teardown_retry_obeys_cancellation`, `::owner_channel_cursor_replaced_registry_before_validation_refuses_terminally` |
-| Owner cursor admission refuses occupied persistence ownership guards and external-root refresh serialization before the contested lock releases | `src/persistence/owner_cursor_admission_tests.rs::owner_cursor_persistence_guard_contention_refuses_before_lock_release`, `::owner_cursor_refresh_contention_refuses_before_refresh_release` |
-| A reader departing during registry scanning is discarded only after its registration lifetime lock is positively acquired; a still-locked snapshot without its authenticated data descriptor refuses terminally | `src/persistence/owner_cursor_admission_tests.rs::reader_departing_during_registry_scan_releases_its_stale_registration`, `::locked_registry_snapshot_without_its_data_descriptor_refuses_terminally` |
-| Received schema follows source transaction order, not final schema alone | `../../tests/acceptance/trigger.rs::t3_sync_trigger_table_create_drop_history_replays_chronologically`, `::t3_sync_trigger_ddl_replay_respects_sender_lsn_order` |
-| Received schema failure publishes neither a prefix nor receipt | `tests/sync/a_received_schema_transaction_never_publishes_a_prefix.rs::a_received_schema_transaction_never_publishes_a_prefix`, `::received_schema_pre_commit_failure_publishes_neither_schema_nor_receipt` |
-| Trigger callback DROP TRIGGER is a typed admin refusal | `../../tests/acceptance/trigger.rs::t3_reg_introspection_and_delete_event_rejection` |
-| Received staging discovers existing callback-written tables even after a caught lookup error, stages their dependencies, and publishes only a complete validated attempt | `tests/schema/schema_replay_is_proportional_to_affected_tables.rs::including_sync_stage_discovers_a_callback_written_table_beyond_its_declared_affected_set`, `tests/sync/synced_callback_caught_lookup.rs` |
-| Transactional callback writes and queued delivery commit or roll back together | `../../tests/integration/transactional_callback_delivery.rs::callback_created_dependency_commits_with_observation_and_pending_delivery`, `::final_commit_validation_failure_discards_callback_records_delivery_and_event` |
-| A purged lineage stays refused after rewrite/reopen | `tests/custody/custody_purge_and_discard_contract.rs::a_purge_erases_a_row_written_again_at_a_purged_key_and_every_purged_life_stays_refused` |
-| Caller-driven vector maintenance stays caller-driven | `tests/vector/vector_maintained_lifecycle_contract.rs::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance` |
-| Generation admission sizes retained raw versions separately from selected live graph points and uses the actual change delta | `src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners`, `::a_retained_raw_body_has_decode_scratch_even_without_live_graph_points`; `tests/vector/vector_generation_admission_contract.rs::retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph`; `tests/vector/vector_generation_delta_admission_contract.rs::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries` |
-| Generation workspace charges move between construction, checked encoding, candidate and persistence owners; refused growth preserves the serving generation | `src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners`; `crates/contextdb-vector/src/hnsw.rs::tests::durable_codec_capacity_bounds_all_stored_representations_and_checks_overflow`; `tests/vector/vector_generation_admission_contract.rs::encoding_shrink_transfers_held_workspace_without_additive_headroom`, `::candidate_shrink_transfers_held_workspace_without_additive_headroom`, `::growing_persistence_transitions_refuse_atomically_for_base_and_change_publication` |
-| The state digest matches the BLAKE3 hash of canonical sorted live entries; graph-page preparation counts every physical key | `src/database/maintenance_resource_tests.rs::streamed_state_digest_preserves_the_canonical_live_entry_encoding`; `src/persistence/generation_admission_tests.rs::near_extent_sized_page_roots_are_streamed_and_every_disk_key_is_counted` |
-| Resident generation admission and body copies use the same pinned frontier-live selection without pruning history | `src/database/maintenance_resource_tests.rs::resident_generation_selection_preserves_retained_canonical_digests`, `src/database/maintenance_resource_tests.rs::resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_writes`, `src/database/maintenance_resource_tests.rs::resident_generation_selection_admits_history_below_the_full_copy_bound_and_refuses_before_bodies` |
-| Frontier metadata admits a matching physical extent before read or decode | `src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_catalog_extent_refuses_during_preparation_before_decode`, `::cold_oversized_journal_extent_refuses_during_frontier_count_before_decode`, `::cold_oversized_membership_extent_refuses_before_fallback_count_decode`, `::cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serving` |
-| Bounded metadata lookup and prefix reads reject malformed complete leaf and branch layouts before offset access, returning corruption without panic | `crates/contextdb-redb/src/tree_store/bounded_bytes.rs::tests::bounded_lookup_rejects_malformed_leaf_and_branch_without_panicking`, `crates/contextdb-redb/src/tree_store/bounded_bytes.rs::tests::bounded_prefix_iteration_rejects_malformed_leaf_and_branch_without_panicking` |
-| Resident snapshots have no generation decoder owner; dormant loaders, direct cold reads and delete-only carriers retain their decode scratch floor | `src/database/vector_generation_decode_owner_tests.rs::resident_f32_generation_funds_snapshot_without_a_decoder_owner`, `src/database/vector_generation_decode_owner_tests.rs::resident_sq8_generation_funds_snapshot_without_a_decoder_owner`, `src/database/vector_generation_decode_owner_tests.rs::resident_sq4_generation_funds_snapshot_without_a_decoder_owner`, `src/database/vector_generation_decode_owner_tests.rs::direct_cold_and_delete_carrier_generations_keep_the_decode_floor`, `src/database/vector_generation_decode_owner_tests.rs::dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases` |
-| Incomplete admitted catalog inventories authorize no reclaim or retirement; refused singleton bodies permit sibling progress and fresh retries, including a later durable-only catalog | `src/database/vector_public_cycle_admission_tests.rs::public_cycle_incomplete_container_sample_preserves_serving_and_closes`, `::public_cycle_giant_before_healthy_catalog_continues`, `::public_cycle_giant_after_healthy_catalog_continues`, `::public_cycle_valid_durable_only_catalog_after_refused_giant_is_discovered`, `::public_cycle_possible_match_blocks_until_raised_limit_retries_fresh` |
-| Unknown invalid catalogs leave other routes available; an authenticated miskeyed catalog quarantines its canonical route | `src/database/vector_public_cycle_admission_tests.rs::public_cycle_small_unknown_invalid_catalog_does_not_quarantine`, `::public_cycle_miskey_before_valid_catalog_quarantines_canonical_route` |
-| Refused catalog slots and sort scratch release partial work for a fresh retry; a closing route-slot refusal preserves publication and skips removal | `src/database/vector_public_cycle_admission_tests.rs::public_cycle_sampled_route_slot_refusal_drops_partial_work_and_closes`, `::public_cycle_candidate_slot_refusal_drops_partial_work_and_closes`, `::public_cycle_closing_route_slot_refusal_preserves_publication_and_skips_removal`, `::public_cycle_candidate_sort_heap_refusal_releases_and_retries_stably` |
-| Wide typed route metadata is admitted before cold catalog lookup | `src/database/vector_frontier_metadata_admission_tests.rs::wide_text_partition_metadata_refuses_before_cold_catalog_lookup` |
-| Cancellation and publication interruption stop journal retries and post-publication cleanup; scans abort their transaction and release reservations | `src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservations`, `src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_on_restart`, `src/database/vector_journal_cleanup_cancellation_tests.rs::publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_frontier`; `src/persistence/bounded_catalog_tests.rs::journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion` |
-| A covered-journal cleanup refusal preserves that route while siblings progress; indexed reads refuse an incomplete frontier | `src/database/vector_retry_frontier_integrity_tests.rs::cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_progress` |
-| Immutable candidates refine only graph-page frame bounds; other bounds stay conservative | `src/persistence/vector_streamed_frame_tests.rs::concrete_streamed_frame_covers_exact_capacities_and_root_edges`, `::candidate_streamed_frame_is_sequential_max_and_empty_zero`; `tests/vector/vector_generation_admission_contract.rs::fresh_ten_thousand_dense_vectors_publish_and_restart_under_writer_limit`, `::tiny_limit_refuses_with_typed_details_without_partial_generation` |
-| Cleanup source-page admissions carry their actual operation and remain charged until final release | `src/database/vector_source_page_admission.rs::cleanup_attribution_tests::cleanup_page_admissions_keep_typed_attribution_and_release_their_source_owner` |
-| Uncovered deletes on historical raw-only routes are physically cleaned before retirement | `tests/vector/vector_delete_only_journal_progress_contract.rs::delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirement` |
-| Retained scalar history shares unchanged vector bodies while keeping all memberships, reconciled ownership charges and room for a small write under a fixed limit | `tests/vector/vector_memory_ownership_reconciliation_contract.rs::retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write` |
-| Reader-held old generations remain charged until their final snapshot release | `tests/vector/vector_generation_admission_contract.rs::multiple_pinned_generations_remain_charged_until_their_final_snapshot_release` |
-| A replacement refusal leaves the serving generation intact; a refused partition still closes the cycle and retires a healthy sibling | `tests/vector/vector_resource_maintenance_contract.rs::replacement_refusal_precedes_workspace_and_keeps_the_serving_generation`, `::refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition` |
-| Retention preparation borrows the committed frontier, admits due mutations before allocation and preserves protected FK rows and sync delivery | `src/database/bounded_retention_preparation_tests.rs::empty_and_not_due_retention_do_not_prepare_unrelated_history`, `::due_retention_next_to_history_is_charged_atomic_and_snapshot_safe`, `::impossible_expiry_limit_preserves_old_state_with_typed_refusal`, `::borrowed_foreign_key_frontier_preserves_protected_fixed_point_and_sync_delivery` |
-| Retention selects vector and edge identities without loading their payloads and keeps deferred adjacency charged across carry-only retries | `src/database/bounded_retention_preparation_tests.rs::reclamation_admits_vector_and_edge_identities_without_payload_copies`, `::reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted` |
-| Retention admits surviving position/index rebuilds, partition inventories, membership chains and affected-LSN sibling buffers before durable reclamation | `src/database/bounded_retention_preparation_tests.rs::surviving_wide_index_rebuild_is_admitted_before_durable_reclamation`, `::wide_partition_inventory_is_admitted_before_reclamation`, `::repeated_wide_membership_copies_are_admitted_before_reclamation`, `::affected_lsn_siblings_are_admitted_before_reclamation` |
-| Retention identity repair admits selected durable row bodies omitted from the resident directory before reclamation | `src/database/bounded_retention_preparation_tests.rs::current_row_identity_body_is_admitted_for_selected_lifetime_only` |
-| Writer residency attribution is reconciled only at quiescent samples; its per-row figures are workload observations, not capacity claims | `tests/vector/writer_residency_attribution.rs::cursor_held_during_update_bounds_attribution_to_quiescent_samples` |
+| Writable open does not load history | `tests/engine_seams/writable_open_never_touches_history_families.rs::writable_open_never_touches_history_families` |
+| Published reader roots survive writes and cleanup | `tests/engine_seams/writer_reader_root_survives_commit_eviction_and_cleanup.rs::writer_reader_root_survives_commit_eviction_and_cleanup` |
+| Doubling durable data keeps a fixed resident envelope | `tests/engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs::writer_reopen_and_doubling_keep_a_fixed_resident_envelope` |
+| Crash recovery publishes one complete commit | `tests/engine_seams/crash_cutpoints_recover_one_complete_row_index_vector_log_commit.rs::crash_cutpoints_recover_one_complete_row_index_vector_log_commit` |
+| Both read routes apply access gates | `tests/bounded/bounded_read_refuses_what_the_gate_denies.rs::a_row_the_principals_grants_hide_is_refused_by_both_doors` |
+| Held pages remain charged after cache eviction | `src/persistence/search_page_reuse_tests.rs::a_proof_page_a_statement_still_holds_stays_charged_after_the_cache_evicts_it` |
+| Session cache share is local and resets at reopen | `tests/read/read_cache_share_statements.rs::a_read_cache_share_is_scoped_to_its_session_and_not_persisted` |
+| Compaction declarations persist and invalid changes preserve state | `tests/engine_seams/storage_compaction_is_declarable_and_unmeasured_fragmentation_reads_unknown.rs::storage_compaction_declarations_show_their_source_and_survive_reopen` |
+| AUTO is exact and INDEXED is refused | `tests/vector/a_search_is_exact_with_no_index_built.rs::an_auto_find_answers_exactly_after_commit_with_no_maintenance`, `::indexed_is_refused_at_every_door` |
+| Partial synced ALTER preserves omitted columns | `tests/sql_surface/sql_surface_other.rs::sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column` |
+| Received schema failure publishes no prefix or receipt | `tests/sync/a_received_schema_transaction_never_publishes_a_prefix.rs::a_received_schema_transaction_never_publishes_a_prefix` |
+| Parent purge erases retained declared children | `tests/custody/custody_purge_and_discard_contract.rs::a_purge_erases_every_retained_life_of_a_declared_child` |
+| Retention preparation is admitted before allocation | `src/database/bounded_retention_preparation_tests.rs::impossible_expiry_limit_preserves_old_state_with_typed_refusal` |
+| Scalar history shares vector bodies without losing memberships | `tests/vector/vector_memory_ownership_reconciliation_contract.rs::retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write` |
+| Clock/sleep and persisted-column ratchets remain closed | `crates/contextdb-core/tests/test_estate_audit.rs::test_estate_audit_no_new_sleeps_or_raw_clock_reads`, `crates/contextdb-core/tests/timestamp_audit.rs::timestamp_audit_no_new_txid_shaped_columns` |
 
 ## Where a change lives
 
 | Change | Where it lands |
 |---|---|
-| Scalar function | `executor.rs`: both `eval_function` and `is_known_scalar_function`; their agreement is unguarded, so update both and test ORDER BY. |
-| Read execution, page/value admission | `executor/bounded.rs`; source reads in `direct_file_reader.rs` / `persistence.rs`; owned proof charges in `persistence/content_identity.rs`. |
-| Executor helpers and bounded-read test support | `executor/` contains the shared bounded execution kernel and its test support; statement evaluation stays in `executor.rs`. |
-| Partial ALTER, signed drop/rename, author-order replay, retry outcome | `database.rs`: author markers, schema projection and received-unit replay; durable schema/migration installation in `persistence.rs`. Never infer operations from omission. |
-| Synced large row bodies or echo equality | `database.rs` rehydrates the exact durable row; `database/custody_store.rs` uses the same body for digests; relational only owns resident projection. |
-| Read opening, channel/admission | Extend `read_session.rs`, `owner_read/`, `local_transport/`; no parallel path. |
-| Peer network transport | `transport/iroh.rs` adapts dial-by-key networking and relay choices; sync semantics remain in `sync_client.rs` / `sync_server.rs`. |
-| Wire vocabulary | `protocol.rs`, `subjects.rs`; rerun server boundary tests and `tests/sync/sync_source_mirror_tests.rs`. |
-| Vector declarations / storage | Validation and lifecycle in `database.rs`, persistence in `persistence.rs`; search belongs to vector. |
-| Admitted maintenance catalog inventory, candidates, retry cancellation or cleanup attribution | `database/vector_maintenance_inventory.rs`, `database/vector_source_page_admission.rs` and `database.rs`; transactional journal scans/deletion in `persistence.rs`. Keep startup inspection separate. |
-| Durable cleanup and custody | `persistence.rs` keeps selected row/change-log/vector/adjacency removal atomic; custody policy and standalone purge outcome in `custody/` and `database.rs`. |
-| Custody records and transitions | `custody/` owns preparation, delivery, incarnation and policy records; `database/custody_store.rs` installs their durable effects. |
-| Database-side scheduling, events, gates and erasure | `database/cron.rs`, `event_bus.rs`, `trigger.rs`, `gate.rs`, `discard.rs`, `purge_predicate.rs`; `database/custody_store.rs` owns custody storage. |
-| Database policy and schema regression guards | `database/` holds policy admission, in-memory lineage, maintenance resource and received-schema replay tests beside its operation modules; the orchestration remains in `database.rs`. |
-| Durable repair, writer ownership and purge fencing | `persistence/transaction_repair.rs` repairs transaction ordering, `writer_file.rs` owns the physical writer file, and `purge_publication.rs` fences authoritative erasure across readers and crashes. |
-| Persistent reader presence, authenticated proofs and storage regression guards | `persistence/` owns `reader_presence.rs`, content identity, page/proof and generation tests, plus durable writer and repair modules; `persistence.rs` coordinates publication. |
-| Cross-store application and exported entry points | `composite_store.rs` composes write sets; `lib.rs` exports supported engine entry points. |
-| Sync request and reply flow | `sync_client.rs`, `sync_server.rs`; shared records and wire types live in `sync_types.rs`, `protocol.rs`. |
-| Work-ledger state and delivery | `work_ledger.rs`; server owns polling and flags. |
-| Memory charges and append-work observation | `memory_accounting.rs`, `append_work.rs`; database and persistence call these at admission and durable publication. |
-| Maintained count installation and query | `maintained_counts.rs`, `database.rs`, `persistence.rs`, `executor.rs`, `executor/bounded.rs`. |
-| Read image authentication and memory | `read_image.rs`, `read_image_memory.rs`, `direct_file_reader.rs`, `persistent_store.rs`; bounded execution remains in `executor/bounded.rs`. |
-| CLI rendering and status | `cli_render.rs`, `metadata_page.rs`; the CLI crate formats its own output. |
-| Test observations of content and read work | `read_content_test_adapter.rs`, `read_work_probe.rs`; do not add production read semantics there. |
-| Identity, sync bookkeeping and error adaptation | `identity.rs`, `sync_system_tables.rs`, `sync_types.rs`, `error.rs`, `read_contract.rs`; public refusal classes stay in core. |
-| Public API boundary fixture | `tests/fixtures/public_api_forbidden/src/` checks that private engine entry points remain unavailable to external callers. |
+| Scalar function | `executor.rs`: update both `eval_function` and `is_known_scalar_function`; test ORDER BY too. |
+| Read opening, routing, channel | `read_session.rs`, `direct_file_reader.rs`, `owner_read/`, `local_transport/`. |
+| Bounded execution, cursor pages, cache share | `executor/bounded.rs`, `read_session/`, `read_image_memory.rs`; physical page charges in persistence. |
+| DDL, synced author markers, callbacks | `database.rs`, `database/`; durable installation in `persistence.rs`. Never infer drop/rename from omission. |
+| Root witnesses, reader holds, compaction, erasure | `persistence/`: `history_root_witness.rs`, `reader_registration.rs`, `reader_presence.rs`, `purge_publication.rs`, `erasure_frontiers.rs`, `writer_file.rs`. |
+| Writer reads/history/overlay | `persistence/writer_*.rs`, `database/writer_read.rs`; store traits stay in relational, graph and tx. |
+| Counts and content totals | `maintained_counts.rs`, `persistence/content_size.rs`, `content_identity.rs`, executor; do not enumerate history during inspection. |
+| Vector declarations and lifecycle | `database.rs`, `database/vector_maintenance_inventory.rs`, `database/vector_source_page_admission.rs`, persistence; search belongs to vector. |
+| Custody, purge, discard | `custody/`, `database/custody_store.rs`, `database/discard.rs`, `database/purge_predicate.rs`. |
+| Sync, network, ledger | `sync_client.rs`, `sync_server.rs`, `sync_types.rs`, `protocol.rs`, `transport/iroh.rs`, `work_ledger.rs`; server re-exports rather than mirrors. |
+| Memory accounting / CLI documents | `memory_accounting.rs`; `cli_render.rs`, `metadata_page.rs`; CLI owns its rendering. |
 
 ## Fast tests
 
-```bash
-cargo test -p contextdb-engine --lib
-cargo test -p contextdb-engine --features test-seams --test sql_surface
-cargo test -p contextdb-engine --features test-seams,iroh --test sync --test sync_schema_transactions
-```
+`cargo test -p contextdb-engine --lib`
 
-Tests group under `tests/*.rs`; targets using private observation hooks need `test-seams`.
+`cargo test -p contextdb-engine --features test-seams --test sql_surface`
+
+For sync: `cargo test -p contextdb-engine --features test-seams,iroh --test sync --test sync_schema_transactions`.

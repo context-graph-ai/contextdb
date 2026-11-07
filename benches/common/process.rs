@@ -6,8 +6,16 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, server_throughput, sigterm_drain_in_flight_persistence"
+)]
 static BUILD_RELEASE_BINARIES: Once = Once::new();
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, server_throughput, sigterm_drain_in_flight_persistence"
+)]
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -16,10 +24,18 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, server_throughput, sigterm_drain_in_flight_persistence"
+)]
 pub fn target_dir() -> PathBuf {
     workspace_root().join("target").join("release")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, server_throughput, sigterm_drain_in_flight_persistence"
+)]
 pub fn cli_bin() -> PathBuf {
     let mut path = target_dir().join("contextdb");
     if cfg!(windows) {
@@ -28,6 +44,10 @@ pub fn cli_bin() -> PathBuf {
     path
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, server_throughput, sigterm_drain_in_flight_persistence"
+)]
 pub fn server_bin() -> PathBuf {
     let mut path = target_dir().join("contextdb-server");
     if cfg!(windows) {
@@ -36,6 +56,10 @@ pub fn server_bin() -> PathBuf {
     path
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, server_throughput, sigterm_drain_in_flight_persistence"
+)]
 pub fn ensure_release_binaries() {
     BUILD_RELEASE_BINARIES.call_once(|| {
         if cli_bin().is_file() && server_bin().is_file() {
@@ -57,6 +81,10 @@ pub fn ensure_release_binaries() {
     });
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, server_throughput"
+)]
 pub fn run_cli_script(db_path: &Path, args: &[&str], script: &str) -> Output {
     ensure_release_binaries();
     let mut child = Command::new(cli_bin())
@@ -76,6 +104,10 @@ pub fn run_cli_script(db_path: &Path, args: &[&str], script: &str) -> Output {
     child.wait_with_output().expect("CLI should finish")
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system"
+)]
 pub fn spawn_server(db_path: &Path, tenant_id: &str, bind_spec: &str) -> Child {
     ensure_release_binaries();
     let mut child = Command::new(server_bin())
@@ -96,12 +128,20 @@ pub fn spawn_server(db_path: &Path, tenant_id: &str, bind_spec: &str) -> Child {
     child
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system"
+)]
 pub fn stop_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sigterm_drain_in_flight_persistence"
+)]
 pub fn spawn_server_with_barrier(
     db_path: &Path,
     tenant_id: &str,
@@ -134,6 +174,10 @@ pub fn spawn_server_with_barrier(
     child
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, sigterm_drain_in_flight_persistence"
+)]
 fn wait_for_server_bound(child: &mut Child) {
     let stdout = child.stdout.take().expect("server stdout pipe");
     let (tx, rx) = mpsc::channel();
@@ -180,6 +224,10 @@ fn wait_for_server_bound(child: &mut Child) {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sigterm_drain_in_flight_persistence"
+)]
 pub fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
     let start = Instant::now();
     loop {

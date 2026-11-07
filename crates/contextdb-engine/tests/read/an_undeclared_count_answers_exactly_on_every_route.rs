@@ -89,7 +89,7 @@ fn every_route_answers(path: &Path, db: &Database, stage: &str) {
     for (sql, params, expected) in [(OVER_A, over_a(), 6i64), (OVER_AB, over_ab(), 2i64)] {
         let writable = db.execute(sql, &params).expect("writable-handle count");
         assert_eq!(
-            writable.rows[0][0],
+            writable.rows()[0][0],
             Value::Int64(expected),
             "{stage}: the writable handle answers `{sql}` exactly"
         );
@@ -99,7 +99,7 @@ fn every_route_answers(path: &Path, db: &Database, stage: &str) {
         assert_eq!(owner.route(), ReadRoute::Owner);
         let answered = owner.execute(sql, &params).expect("owner-route count");
         assert_eq!(
-            answered.rows[0][0],
+            answered.rows()[0][0],
             Value::Int64(expected),
             "{stage}: the owner route answers `{sql}` exactly"
         );
@@ -113,7 +113,7 @@ fn file_route_answers(path: &Path, stage: &str) {
     for (sql, params, expected) in [(OVER_A, over_a(), 6i64), (OVER_AB, over_ab(), 2i64)] {
         let answered = session.execute(sql, &params).expect("file-route count");
         assert_eq!(
-            answered.rows[0][0],
+            answered.rows()[0][0],
             Value::Int64(expected),
             "{stage}: the direct-file route answers `{sql}` exactly"
         );

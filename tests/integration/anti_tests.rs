@@ -22,5 +22,5 @@ fn anti_window_rejected() {
             &std::collections::HashMap::new(),
         )
         .unwrap_err();
-    assert!(matches!(err, Error::WindowFunctionNotSupported));
+    assert!(matches!(err, Error::WindowFunctionNotSupported { form: _ }));
 }

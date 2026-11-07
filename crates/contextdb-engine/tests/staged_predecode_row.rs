@@ -52,6 +52,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_file_backed_received_migration_refuses_an_oversized_row_before_decoding_it() {
     const ROW_BYTES: usize = 12 * 1024 * 1024;
     const HEADROOM: usize = 1024 * 1024;
@@ -73,7 +77,13 @@ fn a_file_backed_received_migration_refuses_an_oversized_row_before_decoding_it(
     author
         .execute("ALTER TABLE wide ADD COLUMN extra TEXT", &HashMap::new())
         .expect("author migration");
-    let unit = author.changes_since(before_unit);
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read or construct the declared fixture result");
+    let fixture_operation_reader_1 = author
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let provenance = author
         .outbound_ddl_provenance_for_test(
             &unit,
@@ -81,6 +91,7 @@ fn a_file_backed_received_migration_refuses_an_oversized_row_before_decoding_it(
             &identity.node_id(),
             INCARNATION,
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            fixture_operation_reader_1.clone(),
         )
         .expect("sign migration");
     author.close().expect("close author");
@@ -117,8 +128,22 @@ fn a_file_backed_received_migration_refuses_an_oversized_row_before_decoding_it(
 
     let before_heap = LIVE_BYTES.load(Ordering::Relaxed);
     PEAK_BYTES.store(before_heap, Ordering::Relaxed);
+    let fixture_operation_reader_2 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+
     let error = receiver
-        .apply_received_schema_for_test(unit, provenance, tenant, SOURCE, INCARNATION)
+        .apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            SOURCE,
+            INCARNATION,
+            &mut fixture_operation_copy_2,
+            fixture_operation_reader_2.clone(),
+        )
         .expect_err("the affected row exceeds the remaining memory limit");
     let peak_growth = PEAK_BYTES.load(Ordering::Relaxed) - before_heap;
     assert!(

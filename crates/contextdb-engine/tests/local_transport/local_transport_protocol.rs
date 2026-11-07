@@ -1,3 +1,5 @@
+use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::encode_message;
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, OwnerReadLimits, OwnerReadStatus, OwnerServiceTimeouts,
     OwnerServingReason, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
@@ -12,7 +14,6 @@ use contextdb_engine::local_transport::{
     LocalRequestEnvelope, LocalResponse, LocalResponseExpectation, LocalTransportError,
     MAX_FRAME_BYTES, MetadataResponse, OwnerAdmissionCounters, OwnerMemoryCounters,
     PayloadViolation, ResultChunk, TerminalSuccess, decode_handshake_exact, decode_message_exact,
-    encode_message,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -21,7 +22,7 @@ use std::num::NonZeroU64;
 
 const HANDSHAKE_FIXTURE: &[u8] = &[
     0x63, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x64, 0x62, 0x2d, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x2d,
-    0x72, 0x65, 0x61, 0x64, 0x04, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+    0x72, 0x65, 0x61, 0x64, 0x05, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
     0x11, 0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
     0x22, 0x22, 0x22, 0x22, 0x22, 0x07, 0x00,
 ];
@@ -65,11 +66,6 @@ const CUSTOM_BODY: &[u8] = &[7, 1, b'n', 2, 0x5a, 0x5b];
 const RESULT_CHUNK_FIXTURE: &[u8] = &[0, 2, 0xc1, 0xc2];
 const TERMINAL_SUCCESS_FIXTURE: &[u8] = &[1, 1, 0xc3];
 const CANONICAL_CURSOR_PAGE: &[u8] = &[2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
-const CURSOR_OPENED_FIXTURE: &[u8] = &[
-    2, 0, 0, 0, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
-    0x44, 0x44, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1,
-];
-const CURSOR_PAGE_FIXTURE: &[u8] = &[3, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
 const CURSOR_CLOSED_TRUE_FIXTURE: &[u8] = &[4, 1];
 const CURSOR_CLOSED_FALSE_FIXTURE: &[u8] = &[4, 0];
 const TABLE_METADATA_PAYLOAD: &[u8] = &[0, 1, 0, 1, b't', 1, 1, 1, b'n'];
@@ -86,55 +82,74 @@ const INVALID_CHANNEL_FAILURE_FIXTURE: &[u8] = &[9, 11, 0];
 const OPERATION_ALREADY_COMPLETED_FAILURE_FIXTURE: &[u8] = &[9, 21, 0];
 
 const OWNER_STATUS_DEFAULT_FIXTURE: &[u8] = &[
-    7, 0, 0, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03, 0,
-    0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb, 0xb0,
-    0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    7, 0, 0, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03,
+    0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb,
+    0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 // Three of this fixture's "overrides" are the shipped defaults -- result_rows
-// 500, concurrency 4, request_ms 10_000 -- so their source bytes (offsets 6,
-// 40 and 44) read Default. A source describes ITS OWN setting: configuring one
+// 500, concurrency 4, request_ms 10_000 -- so their source bytes (offsets 7,
+// 41 and 45) read Default. A source describes ITS OWN setting: configuring one
 // ceiling does not make the ones left alone into choices.
 const OWNER_STATUS_OVERRIDE_FIXTURE: &[u8] = &[
-    7, 0, 0, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 1, 0xfb, 0x88, 0x13, 1, 0xfb, 0xe8, 0x03, 1,
-    0xfb, 0x00, 0x20, 1, 0xfb, 0x2c, 0x01, 1, 0xfb, 0x00, 0x04, 1, 0xfb, 0x58, 0x02, 1, 0xfb, 0xb0,
-    0x04, 1, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 1, 4, 3, 15, 1, 16,
+    7, 0, 0, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 1, 0xfb, 0x88, 0x13, 1, 0xfb, 0xe8, 0x03,
+    1, 0xfb, 0x00, 0x20, 1, 0xfb, 0x2c, 0x01, 1, 0xfb, 0x00, 0x04, 1, 0xfb, 0x58, 0x02, 1, 0xfb,
+    0xb0, 0x04, 1, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 1, 4, 3, 15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 const OWNER_STATUS_NO_AVAILABLE_MEMORY_FIXTURE: &[u8] = &[
-    7, 0, 0, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03, 0,
-    0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb, 0xb0,
-    0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 0,
+    7, 0, 0, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03,
+    0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb,
+    0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 0,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 const OWNER_STATUS_AT_CAPACITY_FIXTURE: &[u8] = &[
-    7, 0, 0, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03, 0,
-    0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb, 0xb0,
-    0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 4, 15, 1, 16,
+    7, 0, 0, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03,
+    0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb,
+    0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 4, 15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 const OWNER_STATUS_SERVING_DISABLED_FIXTURE: &[u8] = &[
-    7, 1, 1, 0, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03, 0,
-    0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb, 0xb0,
-    0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    7, 1, 1, 0, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8,
+    0x03, 0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0,
+    0xfb, 0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 const OWNER_STATUS_STARTUP_FAILURE_FIXTURE: &[u8] = &[
-    7, 2, 1, 1, 3, b'b', b'a', b'd', 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0,
-    0xfb, 0xe8, 0x03, 0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58,
-    0x02, 0, 0xfb, 0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    7, 2, 1, 1, 3, b'b', b'a', b'd', 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88,
+    0x13, 0, 0xfb, 0xe8, 0x03, 0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0,
+    0xfb, 0x58, 0x02, 0, 0xfb, 0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3,
+    15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 const OWNER_STATUS_SHUTDOWN_DRAINING_FIXTURE: &[u8] = &[
-    7, 2, 1, 3, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03, 0,
-    0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb, 0xb0,
-    0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    7, 2, 1, 3, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8,
+    0x03, 0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0,
+    0xfb, 0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 const OWNER_STATUS_NOT_APPLICABLE_FIXTURE: &[u8] = &[
-    7, 3, 0, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03, 0,
-    0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb, 0xb0,
-    0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    7, 3, 0, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03,
+    0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb,
+    0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
 const OWNER_STATUS_PLATFORM_UNSUPPORTED_FIXTURE: &[u8] = &[
-    7, 3, 1, 2, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8, 0x03, 0,
-    0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0, 0xfb, 0xb0,
-    0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    7, 3, 1, 2, 44, 0xfb, 0xf4, 0x01, 0, 0xfb, 0x00, 0x10, 0, 0xfb, 0x88, 0x13, 0, 0xfb, 0xe8,
+    0x03, 0, 0xfb, 0x00, 0x20, 0, 0xfb, 0x2c, 0x01, 0, 0xfb, 0x00, 0x04, 0, 0xfb, 0x58, 0x02, 0,
+    0xfb, 0xb0, 0x04, 0, 4, 0, 0xfb, 0x10, 0x27, 0, 0xfb, 0xe0, 0x2e, 0, 4, 3, 15, 1, 16,
+    // Added serving observation fields: Some(1024), Some(128), Some(512), 4096, 15.
+    1, 0xfb, 0x00, 0x04, 1, 128, 1, 0xfb, 0x00, 0x02, 0xfb, 0x00, 0x10, 15,
 ];
-const OWNER_STATUS_SOURCE_OFFSETS: [usize; 12] = [6, 10, 14, 18, 22, 26, 30, 34, 38, 40, 44, 48];
+const OWNER_STATUS_SOURCE_OFFSETS: [usize; 12] = [7, 11, 15, 19, 23, 27, 31, 35, 39, 41, 45, 49];
 
 fn fixture_limits() -> ReadLimits {
     ReadLimits {
@@ -194,6 +209,12 @@ fn owner_status(
     .expect("convert owner timeouts through the production transport DTO");
     LocalOwnerStatusResponse {
         status,
+        serving_cache_capacity_bytes: Some(1024),
+        serving_cache_index_bytes: Some(128),
+        serving_cache_held_page_bytes: Some(512),
+        serving_cache_budget_bytes: 4096,
+        reader_charged_bytes: 15,
+        committed_lsn: contextdb_core::Lsn(44),
         effective_limits,
         timeouts,
         admission: OwnerAdmissionCounters {
@@ -300,7 +321,7 @@ fn assert_handshake_boundary(value: &LocalHandshake, fixture: &[u8]) {
     let boundary = protocol_boundary();
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Handshake(value))
+            .encode_fixture_frame(LocalOutboundMessage::Handshake(value))
             .expect("encode handshake through the production boundary"),
         literal_frame(fixture)
     );
@@ -318,7 +339,7 @@ fn assert_request_boundary(value: &LocalRequestEnvelope, fixture: &[u8]) {
     let boundary = protocol_boundary();
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Request(value))
+            .encode_fixture_frame(LocalOutboundMessage::Request(value))
             .expect("encode request through the production boundary"),
         literal_frame(fixture)
     );
@@ -340,7 +361,7 @@ fn assert_response_boundary(
     let boundary = protocol_boundary();
     assert_eq!(
         boundary
-            .encode_frame(LocalOutboundMessage::Response {
+            .encode_fixture_frame(LocalOutboundMessage::Response {
                 response: value,
                 expectation: &expectation,
             })
@@ -418,6 +439,15 @@ fn handshake_has_one_literal_encoding_and_rejects_partial_or_trailing_bytes() {
     );
     assert_truncated_and_trailing_are_rejected::<LocalHandshake>(HANDSHAKE_FIXTURE);
     assert_complete_payload_damage_is_invalid(LocalInboundKind::Handshake, HANDSHAKE_FIXTURE);
+    let mut previous_version = HANDSHAKE_FIXTURE.to_vec();
+    previous_version[20] = 4;
+    assert_eq!(
+        decode_handshake_exact(&previous_version),
+        Err(LocalTransportError::Refusal(failure(
+            ReadFailureKind::LocalProtocolMismatch,
+            ReadFailureDetail::None,
+        )))
+    );
 }
 
 #[test]
@@ -826,7 +856,7 @@ fn illegal_caller_limit_relationships_are_rejected_at_the_typed_boundary() {
             request: base_request.clone(),
         };
         assert_eq!(
-            protocol_boundary().encode_frame(LocalOutboundMessage::Request(&request)),
+            protocol_boundary().encode_fixture_frame(LocalOutboundMessage::Request(&request)),
             Err(invalid_channel_data())
         );
     }
@@ -875,7 +905,27 @@ fn illegal_caller_limit_relationships_are_rejected_at_the_typed_boundary() {
 
 #[test]
 fn every_response_envelope_has_checked_in_bytes() {
-    let cursor_id = [0x44; 16];
+    let payload = owner_cursor_payload();
+    assert_response_boundary(
+        &LocalResponse::CursorOpened {
+            opened: CursorOpenedResponse {
+                effective_limits: None,
+                storage_snapshot: None,
+                physical_identity: None,
+                cursor_id: [0x44; 16],
+                payload: payload.clone(),
+            },
+        },
+        LocalResponseExpectation::CursorOpen,
+        &owner_opened_fixture(),
+    );
+    assert_response_boundary(
+        &LocalResponse::CursorPage {
+            page: CursorPageResponse { payload },
+        },
+        LocalResponseExpectation::CursorFetch,
+        &owner_page_fixture(),
+    );
     let invalid_channel = failure(ReadFailureKind::InvalidChannelData, ReadFailureDetail::None);
     let operation_already_completed = failure(
         ReadFailureKind::OperationAlreadyCompleted,
@@ -899,28 +949,6 @@ fn every_response_envelope_has_checked_in_bytes() {
             },
             LocalResponseExpectation::OrdinaryResult,
             TERMINAL_SUCCESS_FIXTURE,
-        ),
-        (
-            LocalResponse::CursorOpened {
-                opened: CursorOpenedResponse {
-                    effective_limits: None,
-                    storage_snapshot: None,
-                    physical_identity: None,
-                    cursor_id,
-                    payload: CANONICAL_CURSOR_PAGE.to_vec(),
-                },
-            },
-            LocalResponseExpectation::CursorOpen,
-            CURSOR_OPENED_FIXTURE,
-        ),
-        (
-            LocalResponse::CursorPage {
-                page: CursorPageResponse {
-                    payload: CANONICAL_CURSOR_PAGE.to_vec(),
-                },
-            },
-            LocalResponseExpectation::CursorFetch,
-            CURSOR_PAGE_FIXTURE,
         ),
         (
             LocalResponse::CursorClosed {
@@ -1068,18 +1096,17 @@ fn every_success_response_field_changes_independent_literal_bytes() {
                 storage_snapshot: None,
                 physical_identity: None,
                 cursor_id,
-                payload: CANONICAL_CURSOR_PAGE.to_vec(),
+                payload: owner_cursor_payload(),
             },
         },
         LocalResponseExpectation::CursorOpen,
-        CURSOR_OPENED_FIXTURE,
+        &owner_opened_fixture(),
         4,
         0x45,
     );
-    for (payload_offset, fixture_offset, byte) in
-        [(2, 23, b'j'), (8, 29, 4), (10, 31, 43), (11, 32, 0)]
-    {
-        let mut payload = CANONICAL_CURSOR_PAGE.to_vec();
+    for (payload_offset, byte) in [(2, b'j'), (8, 4), (10, 43), (11, 0)] {
+        let mut payload = owner_cursor_payload();
+        let payload_len = payload.len();
         payload[payload_offset] = byte;
         assert_response_mutation(
             LocalResponse::CursorOpened {
@@ -1092,23 +1119,22 @@ fn every_success_response_field_changes_independent_literal_bytes() {
                 },
             },
             LocalResponseExpectation::CursorOpen,
-            CURSOR_OPENED_FIXTURE,
-            fixture_offset,
+            &owner_opened_fixture(),
+            owner_opened_fixture().len() - payload_len + payload_offset,
             byte,
         );
     }
-    for (payload_offset, fixture_offset, byte) in
-        [(2, 4, b'j'), (8, 10, 4), (10, 12, 43), (11, 13, 0)]
-    {
-        let mut payload = CANONICAL_CURSOR_PAGE.to_vec();
+    for (payload_offset, byte) in [(2, b'j'), (8, 4), (10, 43), (11, 0)] {
+        let mut payload = owner_cursor_payload();
+        let payload_len = payload.len();
         payload[payload_offset] = byte;
         assert_response_mutation(
             LocalResponse::CursorPage {
                 page: CursorPageResponse { payload },
             },
             LocalResponseExpectation::CursorFetch,
-            CURSOR_PAGE_FIXTURE,
-            fixture_offset,
+            &owner_page_fixture(),
+            owner_page_fixture().len() - payload_len + payload_offset,
             byte,
         );
     }
@@ -1296,7 +1322,7 @@ fn typed_boundary_admits_exactly_four_mebibytes_and_refuses_one_more() {
         payload: vec![0x5a; MAX_FRAME_BYTES - CUSTOM_RESPONSE_OVERHEAD],
     };
     let exact_frame = protocol_boundary()
-        .encode_frame(LocalOutboundMessage::Response {
+        .encode_fixture_frame(LocalOutboundMessage::Response {
             response: &exact,
             expectation: &expectation,
         })
@@ -1307,7 +1333,7 @@ fn typed_boundary_admits_exactly_four_mebibytes_and_refuses_one_more() {
         payload: vec![0x5a; MAX_FRAME_BYTES - CUSTOM_RESPONSE_OVERHEAD + 1],
     };
     assert_eq!(
-        protocol_boundary().encode_frame(LocalOutboundMessage::Response {
+        protocol_boundary().encode_fixture_frame(LocalOutboundMessage::Response {
             response: &oversized,
             expectation: &expectation,
         }),
@@ -1319,7 +1345,7 @@ fn typed_boundary_admits_exactly_four_mebibytes_and_refuses_one_more() {
 
 #[test]
 fn successful_response_variants_cannot_cross_operation_expectations() {
-    let cursor_page = CANONICAL_CURSOR_PAGE.to_vec();
+    let cursor_page = owner_cursor_payload();
     let mismatches = [
         (
             LocalResponse::ResultChunk {
@@ -1390,7 +1416,7 @@ fn successful_response_variants_cannot_cross_operation_expectations() {
     ];
     for (response, expectation) in mismatches {
         assert_eq!(
-            protocol_boundary().encode_frame(LocalOutboundMessage::Response {
+            protocol_boundary().encode_fixture_frame(LocalOutboundMessage::Response {
                 response: &response,
                 expectation: &expectation,
             }),
@@ -1512,51 +1538,54 @@ fn owner_status_carries_each_limit_and_timeout_source_plus_capacity_and_memory_s
     // non-overlapping wire byte.
     let mut value_mutations = Vec::new();
     let mut status = base.clone();
+    status.committed_lsn = contextdb_core::Lsn(45);
+    value_mutations.push((status, vec![(3, 45)]));
+    let mut status = base.clone();
     status.effective_limits.result_rows.value = 501;
-    value_mutations.push((status, vec![(4, 0xf5)]));
+    value_mutations.push((status, vec![(5, 0xf5)]));
     let mut status = base.clone();
     status.effective_limits.result_bytes.value = 4_097;
-    value_mutations.push((status, vec![(8, 0x01)]));
+    value_mutations.push((status, vec![(9, 0x01)]));
     let mut status = base.clone();
     status.effective_limits.work.value = 5_001;
-    value_mutations.push((status, vec![(12, 0x89)]));
+    value_mutations.push((status, vec![(13, 0x89)]));
     let mut status = base.clone();
     status.effective_limits.active_ms.value = 1_001;
-    value_mutations.push((status, vec![(16, 0xe9)]));
+    value_mutations.push((status, vec![(17, 0xe9)]));
     let mut status = base.clone();
     status.effective_limits.memory.value = 8_193;
-    value_mutations.push((status, vec![(20, 0x01)]));
+    value_mutations.push((status, vec![(21, 0x01)]));
     let mut status = base.clone();
     status.effective_limits.cursor_page_rows.value = 301;
-    value_mutations.push((status, vec![(24, 0x2d)]));
+    value_mutations.push((status, vec![(25, 0x2d)]));
     let mut status = base.clone();
     status.effective_limits.cursor_page_bytes.value = 1_025;
-    value_mutations.push((status, vec![(28, 0x01)]));
+    value_mutations.push((status, vec![(29, 0x01)]));
     let mut status = base.clone();
     status.effective_limits.cursor_idle_ms.value = 601;
-    value_mutations.push((status, vec![(32, 0x59)]));
+    value_mutations.push((status, vec![(33, 0x59)]));
     let mut status = base.clone();
     status.effective_limits.cursor_lifetime_ms.value = 1_201;
-    value_mutations.push((status, vec![(36, 0xb1)]));
+    value_mutations.push((status, vec![(37, 0xb1)]));
     let mut status = base.clone();
     status.effective_limits.concurrency.value = 5;
     status.admission.capacity = 5;
-    value_mutations.push((status, vec![(39, 5), (49, 5)]));
+    value_mutations.push((status, vec![(40, 5), (50, 5)]));
     let mut status = base.clone();
     status.timeouts.request_ms.value = 10_001;
-    value_mutations.push((status, vec![(42, 0x11)]));
+    value_mutations.push((status, vec![(43, 0x11)]));
     let mut status = base.clone();
     status.timeouts.shutdown_drain_ms.value = 12_001;
-    value_mutations.push((status, vec![(46, 0xe1)]));
+    value_mutations.push((status, vec![(47, 0xe1)]));
     let mut status = base.clone();
     status.admission.active_readers = 2;
-    value_mutations.push((status, vec![(50, 2)]));
+    value_mutations.push((status, vec![(51, 2)]));
     let mut status = base.clone();
     status.memory.used_bytes = 16;
-    value_mutations.push((status, vec![(51, 16)]));
+    value_mutations.push((status, vec![(52, 16)]));
     let mut status = base;
     status.memory.available_bytes = Some(17);
-    value_mutations.push((status, vec![(53, 17)]));
+    value_mutations.push((status, vec![(54, 17)]));
 
     for (status, offsets) in value_mutations {
         let mut expected = OWNER_STATUS_DEFAULT_FIXTURE.to_vec();
@@ -1633,7 +1662,7 @@ fn contradictory_owner_status_is_rejected_on_encode_and_complete_decode() {
     };
     let boundary = protocol_boundary();
     assert_eq!(
-        boundary.encode_frame(LocalOutboundMessage::Response {
+        boundary.encode_fixture_frame(LocalOutboundMessage::Response {
             response: &response,
             expectation: &LocalResponseExpectation::OwnerStatus,
         }),
@@ -1652,4 +1681,25 @@ fn contradictory_owner_status_is_rejected_on_encode_and_complete_decode() {
         ),
         Err(invalid_channel_data())
     );
+}
+
+use super::owner_cursor_test_support;
+
+fn owner_cursor_payload() -> Vec<u8> {
+    let page_bytes = CANONICAL_CURSOR_PAGE;
+    let payload = owner_cursor_test_support::with_empty_observation(page_bytes.to_vec());
+    let page = contextdb_engine::read_contract::decode_cursor_page(page_bytes)
+        .expect("decode the public page fixture");
+    owner_cursor_test_support::assert_empty_observation(&payload, &page);
+    payload
+}
+
+fn owner_opened_fixture() -> Vec<u8> {
+    let mut prefix = vec![2, 0, 0, 0];
+    prefix.extend([0x44; 16]);
+    owner_cursor_test_support::owner_response_fixture(&prefix, CANONICAL_CURSOR_PAGE)
+}
+
+fn owner_page_fixture() -> Vec<u8> {
+    owner_cursor_test_support::owner_response_fixture(&[3], CANONICAL_CURSOR_PAGE)
 }

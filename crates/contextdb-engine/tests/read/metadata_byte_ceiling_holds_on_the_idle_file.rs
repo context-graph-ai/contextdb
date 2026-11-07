@@ -132,7 +132,7 @@ fn the_same_store_answers_the_same_way_when_it_has_room() {
     let answered = session
         .metadata(MetadataRequest::Tables, None)
         .expect("with the shipped ceiling the inventory answers");
-    let DirectMetadataBody::Tables { items, has_more } = answered.body else {
+    let DirectMetadataBody::Tables { items, has_more } = answered.body.clone() else {
         panic!("the table inventory answers with tables");
     };
     assert!(
@@ -182,7 +182,7 @@ fn the_last_item_is_measured_in_the_shape_it_is_published_in_not_in_a_resumable_
         .expect("open the idle store at exactly the terminal page size")
         .metadata(MetadataRequest::Tables, None)
         .expect("a ceiling equal to the page that would be published carries it");
-    let DirectMetadataBody::Tables { items, has_more } = answered.body else {
+    let DirectMetadataBody::Tables { items, has_more } = answered.body.clone() else {
         panic!("the table inventory answers with tables");
     };
     assert!(!has_more, "one page holds this inventory");

@@ -1,9 +1,16 @@
 use super::common::*;
-use contextdb_core::{Error, Value, VectorIndexRef};
+#[cfg(feature = "test-seams")]
+use contextdb_core::VectorIndexRef;
+use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::{DatabaseOpenOptions, MaintenancePolicy};
 use std::fs;
+#[cfg(feature = "test-seams")]
 use std::path::Path;
+#[cfg(feature = "test-seams")]
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -216,6 +223,43 @@ fn f05c_vector_data_survives_persistence_reopen() {
     assert!(row.is_some());
 }
 
+/// I stored vectors, quit, reopened, and the first thing I did was look one row up by its key:
+/// the row came back with its stored vector, read through the reader's own memory, without any
+/// vector search having loaded the partition first.
+#[test]
+fn f05m_a_point_lookup_right_after_reopen_returns_the_row_and_its_vector() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05m.db");
+    let db = Database::open(&db_path).expect("open db");
+    setup_vector_table(&db, 384);
+    let target_id = Uuid::new_v4();
+    let mut target_vector = vec![0.0_f32; 384];
+    target_vector[3] = 1.0;
+    for idx in 0..5 {
+        let mut vector = vec![0.0_f32; 384];
+        vector[idx] = 1.0;
+        let id = if idx == 3 { target_id } else { Uuid::new_v4() };
+        insert_embedding(&db, id, vector);
+    }
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    let row = reopened
+        .point_lookup(
+            "embeddings",
+            "id",
+            &Value::Uuid(target_id),
+            reopened.snapshot(),
+        )
+        .expect("a point lookup is the first read after reopen and needs no vector search first")
+        .expect("the looked-up row exists");
+    assert_eq!(
+        row.values.get("embedding"),
+        Some(&Value::Vector(target_vector)),
+        "the row comes back with the vector it stored, not a missing or default one"
+    );
+}
+
 /// I created a state machine with draft->review->archived, inserted a draft row, quit, reopened, and an illegal draft->archived transition was still rejected.
 #[test]
 fn f05d_constraint_enforcement_survives_persistence_reopen() {
@@ -344,13 +388,13 @@ fn f05f_all_data_types_round_trip_through_persistence() {
     let result = reopened
         .execute("SELECT * FROM everything", &empty_params())
         .expect("select everything");
-    assert_eq!(result.rows.len(), 1, "expected exactly one row");
-    let row = &result.rows[0];
+    assert_eq!(result.rows().len(), 1, "expected exactly one row");
+    let row = &result.rows()[0];
 
     // Map columns to values for easier assertions
     let col_idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|c| c == name)
             .unwrap_or_else(|| panic!("column {name} not found"))
@@ -650,7 +694,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
         .execute("SELECT id, ts FROM t ORDER BY ts ASC", &Default::default())
         .expect("SELECT must succeed");
 
-    let ts_column: Vec<Value> = result.rows.iter().map(|row| row[1].clone()).collect();
+    let ts_column: Vec<Value> = result.rows().iter().map(|row| row[1].clone()).collect();
 
     let expected: Vec<Value> = recorded.iter().copied().map(Value::TxId).collect();
     assert_eq!(
@@ -658,7 +702,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
         "ORDER BY ts ASC must return engine-allocator order, not wall-clock order"
     );
 
-    let id_column: Vec<Value> = result.rows.iter().map(|row| row[0].clone()).collect();
+    let id_column: Vec<Value> = result.rows().iter().map(|row| row[0].clone()).collect();
     let expected_ids: Vec<Value> = ids.iter().copied().map(Value::Uuid).collect();
     assert_eq!(
         id_column, expected_ids,
@@ -668,6 +712,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
 
 // Named vector index tests: naming, isolation, and lifecycle coverage.
 
+#[cfg(feature = "test-seams")]
 fn persist_vector_rows_for_footprint(
     path: &Path,
     table: &str,
@@ -716,6 +761,7 @@ fn persist_vector_rows_for_footprint(
     reopened.close().expect("close reopened footprint db");
 }
 
+#[cfg(feature = "test-seams")]
 fn file_len(path: &Path) -> u64 {
     fs::metadata(path).expect("stat footprint db").len()
 }
@@ -813,41 +859,60 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
         "bytes",
     ] {
         assert!(
-            indexes.columns.iter().any(|c| c == *required),
+            indexes.columns().iter().any(|c| c == *required),
             "SHOW VECTOR_INDEXES must expose `{required}`; got columns {:?}",
-            indexes.columns
+            indexes.columns()
         );
     }
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let dim_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "dimension")
         .unwrap();
     let count_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_count")
         .unwrap();
-    let bytes_idx = indexes.columns.iter().position(|c| c == "bytes").unwrap();
+    let bytes_idx = indexes.columns().iter().position(|c| c == "bytes").unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
 
     let find = |col: &str, declared_dim: i64| {
-        let row = indexes.rows.iter().find(|r| {
+        let row = indexes.rows().iter().find(|r| {
             matches!(&r[column_idx], Value::Text(s) if s == col)
                 && matches!(&r[dim_idx], Value::Int64(n) if *n == declared_dim)
         });
         assert!(
             row.is_some(),
             "SHOW VECTOR_INDEXES must list `{col}` at dim {declared_dim}; got {:?}",
-            indexes.rows
+            indexes.rows()
         );
         row.unwrap()
     };
+    let durable_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "durable_vector_bytes")
+        .unwrap();
+    let charged_vector_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "charged_vector_bytes")
+        .unwrap();
+    let charged_index_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "charged_index_bytes")
+        .unwrap();
     let text_row = find("vector_text", 4);
     let vision_row = find("vector_vision", 8);
     // vector_count must reflect actual inserted rows, not hardcoded zero.
@@ -859,17 +924,34 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
             ),
             other => panic!("{label}.vector_count must be Int64; got {other:?}"),
         }
-        // bytes must be at least dim * count for f32 storage (4 bytes per dim per row); a hardcoded
-        // bytes=1 stub fails this lower bound.
+        // SHOW's compatibility bytes are actual charged owners. Dormant
+        // durable bodies have their own exact physical-payload field.
         let declared_dim = if label == "vector_text" { 4 } else { 8 };
-        let f32_floor = (row_count * declared_dim * std::mem::size_of::<f32>()) as i64;
-        match &row[bytes_idx] {
-            Value::Int64(n) => assert!(
-                *n >= f32_floor,
-                "{label}.bytes must be at least f32-floor {f32_floor}; got {n}"
-            ),
-            other => panic!("{label}.bytes must be Int64; got {other:?}"),
-        }
+        let durable_bytes = (row_count * declared_dim * std::mem::size_of::<f32>()) as i64;
+        assert_eq!(
+            row[charged_vector_idx],
+            Value::Int64(0),
+            "{label}: dormant bodies own no resident vector payload"
+        );
+        // An empty shared partition key retains its slice handle and the
+        // two-word Arc control. Dormant bodies own no resident payload.
+        let key_bytes = (std::mem::size_of::<contextdb_core::VectorPartitionKey>()
+            + 2 * std::mem::size_of::<usize>()) as i64;
+        assert_eq!(
+            row[charged_index_idx],
+            Value::Int64(key_bytes),
+            "{label}: exact index ownership"
+        );
+        assert_eq!(
+            row[bytes_idx],
+            Value::Int64(key_bytes),
+            "{label}: charged vector plus charged index bytes"
+        );
+        assert_eq!(
+            row[durable_idx],
+            Value::Int64(durable_bytes),
+            "{label}: exact durable F32 payload"
+        );
         // Quantization defaults to F32 when no clause is declared.
         assert!(
             matches!(&row[quant_idx], Value::Text(s) if s == "F32"),
@@ -882,6 +964,10 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
 /// I corrupted a 1.0 store's metadata table and got a distinct error — NOT LegacyVectorStoreDetected, so the operator
 /// can tell "missing marker" from "garbled marker".
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().join("corrupt.db");
@@ -931,7 +1017,7 @@ fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
                 error_path.contains("corrupt.db"),
                 "StoreCorrupted.path must identify the corrupt file; got: {error_path}"
             );
-            let lower = reason.to_lowercase();
+            let lower = reason.to_string().to_lowercase();
             assert!(
                 lower.contains("metadata")
                     || lower.contains("format")
@@ -948,7 +1034,32 @@ fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
 /// reopened the database, and probing each inserted vector recovered its own row at top-1 — recall@1 stayed
 /// ≥ 95/100, proving SQ8 storage preserves identity after fsync + reopen.
 #[test]
+#[cfg(feature = "test-seams")]
 fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
+    // Both fixtures are caller-driven, so no engine-owned maintenance races the
+    // one-row-per-commit inserts, and with no index there is nothing to settle.
+    fn caller_driven(path: &Path) -> Database {
+        Database::open_with_options(
+            path,
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..DatabaseOpenOptions::default()
+            },
+        )
+        .expect("open caller-driven fixture")
+    }
+    fn recall_index_row(db: &Database, column: &str) -> Value {
+        let shown = db
+            .execute("SHOW VECTOR_INDEXES", &empty_params())
+            .expect("show vector indexes");
+        let at = |name: &str| shown.columns().iter().position(|c| c == name).unwrap();
+        let row = shown
+            .rows()
+            .iter()
+            .find(|r| matches!(&r[at("table")], Value::Text(t) if t == "recall"))
+            .expect("recall.vec is listed");
+        row[at(column)].clone()
+    }
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("q.db");
     let dim: usize = 128;
@@ -975,7 +1086,7 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
 
     let mut inserted: Vec<(Uuid, Vec<f32>)> = Vec::with_capacity(count);
     {
-        let db = Database::open(&db_path).expect("open file db");
+        let db = caller_driven(&db_path);
         db.execute(
             &format!("CREATE TABLE recall (id UUID PRIMARY KEY, vec VECTOR({dim}) WITH (quantization = 'SQ8'))"),
             &empty_params(),
@@ -1006,26 +1117,30 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
     let indexes = reopened
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
     let bytes_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "durable_vector_bytes")
         .unwrap();
-    let recall_row = indexes.rows.iter().find(|r| {
+    let recall_row = indexes.rows().iter().find(|r| {
         matches!(&r[table_idx], Value::Text(t) if t == "recall")
             && matches!(&r[column_idx], Value::Text(c) if c == "vec")
     });
     assert!(
         recall_row.is_some(),
         "SHOW VECTOR_INDEXES must list recall.vec; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let recall_row = recall_row.unwrap();
     assert!(
@@ -1060,11 +1175,12 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
         "reopened SQ8 live storage must retain quantized payloads, not decoded f32 entries; got {storage_bytes:?}"
     );
     let f32_db_path = tmp.path().join("q_f32_baseline.db");
+    let f32_durable_vector_bytes;
     {
         // Match the SQ8 fixture's one-row-per-commit history. The shared
         // footprint helper uses one bulk transaction and compacts afterward,
         // which measures a different storage lifecycle.
-        let f32 = Database::open(&f32_db_path).expect("open F32 footprint db");
+        let f32 = caller_driven(&f32_db_path);
         f32.execute(
             &format!("CREATE TABLE recall (id UUID PRIMARY KEY, vec VECTOR({dim}))"),
             &empty_params(),
@@ -1080,8 +1196,19 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
             )
             .expect("insert F32 footprint row");
         }
+        f32_durable_vector_bytes = recall_index_row(&f32, "durable_vector_bytes");
         drop(f32);
     }
+    let (Value::Int64(sq8_durable), Value::Int64(f32_durable)) = (
+        recall_index_row(&reopened, "durable_vector_bytes"),
+        f32_durable_vector_bytes,
+    ) else {
+        panic!("durable_vector_bytes is Int64 on both stores");
+    };
+    assert!(
+        sq8_durable < f32_durable,
+        "SQ8 durable vector bytes must be smaller than the identical F32 store's; sq8={sq8_durable}, f32={f32_durable}"
+    );
     let sq8_file_bytes = file_len(&db_path);
     let f32_file_bytes = file_len(&f32_db_path);
     assert!(
@@ -1101,8 +1228,8 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
                 &params(vec![("q", Value::Vector(probe.clone()))]),
             )
             .expect("query");
-        let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
-        if result.rows.first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
+        let id_idx = result.columns().iter().position(|c| c == "id").unwrap();
+        if result.rows().first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
             hits += 1;
         }
     }
@@ -1121,6 +1248,7 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
 /// scale strategy that achieves this (per-vector min/max, per-shard, lazy rescale, etc.) is implementation
 /// choice; the product contract this test pins is "ANN recall remains correct after diverse batches arrive."
 #[test]
+#[cfg(feature = "test-seams")]
 fn f113b_sq8_cross_batch_recall_stability() {
     // The accountant charges two costs this fixture's table incurs: the PK's
     // exact-probe filter, reserved at
@@ -1216,26 +1344,30 @@ fn f113b_sq8_cross_batch_recall_stability() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
     let bytes_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "charged_vector_bytes")
         .unwrap();
-    let crossbatch_row = indexes.rows.iter().find(|r| {
+    let crossbatch_row = indexes.rows().iter().find(|r| {
         matches!(&r[table_idx], Value::Text(t) if t == "crossbatch")
             && matches!(&r[column_idx], Value::Text(c) if c == "vec")
     });
     assert!(
         crossbatch_row.is_some(),
         "SHOW VECTOR_INDEXES must list crossbatch.vec; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let crossbatch_row = crossbatch_row.unwrap();
     assert!(
@@ -1282,8 +1414,8 @@ fn f113b_sq8_cross_batch_recall_stability() {
                 &params(vec![("q", Value::Vector(probe.clone()))]),
             )
             .expect("probe");
-        let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
-        if result.rows.first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
+        let id_idx = result.columns().iter().position(|c| c == "id").unwrap();
+        if result.rows().first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
             hits += 1;
         }
     }
@@ -1300,6 +1432,7 @@ fn f113b_sq8_cross_batch_recall_stability() {
 /// ranges, and self-probes recovered each row at top-1. SQ4 packs two 4-bit values per byte and is the
 /// most memory-aggressive quantization; recall is more sensitive to scale strategy than SQ8.
 #[test]
+#[cfg(feature = "test-seams")]
 fn f113c_sq4_cross_batch_recall_stability() {
     // The accountant charges two costs this fixture's table incurs: the PK's
     // exact-probe filter, reserved at
@@ -1388,26 +1521,30 @@ fn f113c_sq4_cross_batch_recall_stability() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
     let bytes_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "charged_vector_bytes")
         .unwrap();
-    let crossbatch_row = indexes.rows.iter().find(|r| {
+    let crossbatch_row = indexes.rows().iter().find(|r| {
         matches!(&r[table_idx], Value::Text(t) if t == "crossbatch4")
             && matches!(&r[column_idx], Value::Text(c) if c == "vec")
     });
     assert!(
         crossbatch_row.is_some(),
         "SHOW VECTOR_INDEXES must list crossbatch4.vec; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let crossbatch_row = crossbatch_row.unwrap();
     assert!(
@@ -1471,8 +1608,8 @@ fn f113c_sq4_cross_batch_recall_stability() {
                 &params(vec![("q", Value::Vector(probe.clone()))]),
             )
             .expect("probe");
-        let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-        if r.rows.first().map(|row| &row[id_idx]) == Some(&Value::Uuid(*expected_id)) {
+        let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+        if r.rows().first().map(|row| &row[id_idx]) == Some(&Value::Uuid(*expected_id)) {
             hits += 1;
         }
     }

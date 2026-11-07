@@ -11,25 +11,60 @@ impl<'a> Reader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.offset.checked_add(n).ok_or_else(invalid)?;
         let value = self.bytes.get(self.offset..end).ok_or_else(invalid)?;
         self.offset = end;
         Ok(value)
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(
             self.take(4)?.try_into().map_err(|_| invalid())?,
         ))
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_be_bytes(
             self.take(8)?.try_into().map_err(|_| invalid())?,
         ))
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn count(&mut self) -> Result<usize> {
         let count = usize::try_from(self.u64()?).map_err(|_| invalid())?;
         if count > self.bytes.len() - self.offset {
@@ -37,13 +72,34 @@ impl<'a> Reader<'a> {
         }
         Ok(count)
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn bytes(&mut self) -> Result<&'a [u8]> {
         let n = self.count()?;
         self.take(n)
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn string(&mut self) -> Result<&'a str> {
         std::str::from_utf8(self.bytes()?).map_err(|_| invalid())
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn bool(&mut self) -> Result<bool> {
         match self.u8()? {
             0 => Ok(false),
@@ -51,9 +107,23 @@ impl<'a> Reader<'a> {
             _ => Err(invalid()),
         }
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn digest(&mut self) -> Result<[u8; 32]> {
         self.take(32)?.try_into().map_err(|_| invalid())
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn end(&self) -> Result<()> {
         if self.offset == self.bytes.len() {
             Ok(())
@@ -61,6 +131,13 @@ impl<'a> Reader<'a> {
             Err(invalid())
         }
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     fn json(&mut self) -> Result<()> {
         // The source byte slice bounds nesting and children. Keep traversal on
         // the heap rather than impose an undocumented depth policy or recurse.
@@ -112,6 +189,13 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn value(&mut self) -> Result<()> {
         match self.u8()? {
             0 => {}
@@ -136,6 +220,13 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn key(&mut self) -> Result<()> {
         let n = self.count()?;
         if n == 0 {
@@ -150,6 +241,13 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn reference(&mut self) -> Result<&'a str> {
         let table = self.string()?;
         self.key()?;
@@ -163,6 +261,13 @@ pub(crate) struct SealView<'a> {
     pub unit_digest: [u8; 32],
 }
 impl<'a> SealView<'a> {
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn read(bytes: &'a [u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let root_table = r.reference()?;
@@ -195,6 +300,13 @@ pub(crate) struct TerminalView<'a> {
     pub cause: Option<&'a str>,
 }
 impl<'a> TerminalView<'a> {
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
     pub fn read(bytes: &'a [u8]) -> Result<Self> {
         let mut signed = Reader::new(bytes);
         let core = signed.bytes()?;
@@ -251,6 +363,13 @@ impl<'a> TerminalView<'a> {
 
 /// Authenticate the exact core bytes separately from borrowed field inspection.
 #[cfg(feature = "test-seams")]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 pub(crate) fn verify_terminal_signature(node: &str, bytes: &[u8]) -> Result<()> {
     let mut signed = Reader::new(bytes);
     let core = signed.bytes()?;

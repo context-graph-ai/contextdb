@@ -12,6 +12,13 @@ pub enum StorageError {
     Corrupted(String),
     /// The value being inserted exceeds the maximum of 3GiB
     ValueTooLarge(usize),
+    /// Opaque caller admission refusal, distinct from device or file I/O.
+    #[doc(hidden)]
+    AdmissionRefused(Box<dyn std::error::Error + Send + Sync>),
+    /// Feature-internal scalar native producer transport; never constructs a Box.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    Native(crate::NativeColdReadError),
     Io(io::Error),
     PreviousIo,
     DatabaseClosed,
@@ -26,6 +33,23 @@ impl<T> From<PoisonError<T>> for StorageError {
 
 impl From<io::Error> for StorageError {
     fn from(err: io::Error) -> StorageError {
+        // A storage failure carried through an io::Result (the allocator
+        // pager's loaders) comes back as itself: a memory refusal stays a
+        // refusal, never an I/O failure of kind Other.
+        if err
+            .get_ref()
+            .is_some_and(|inner| inner.is::<StorageError>())
+        {
+            let kind = err.kind();
+            return match err
+                .into_inner()
+                .map(|inner| inner.downcast::<StorageError>())
+            {
+                Some(Ok(storage)) => *storage,
+                Some(Err(inner)) => StorageError::Io(io::Error::new(kind, inner)),
+                None => StorageError::Io(io::Error::from(kind)),
+            };
+        }
         StorageError::Io(err)
     }
 }
@@ -35,6 +59,9 @@ impl From<StorageError> for Error {
         match err {
             StorageError::Corrupted(msg) => Error::Corrupted(msg),
             StorageError::ValueTooLarge(x) => Error::ValueTooLarge(x),
+            StorageError::AdmissionRefused(error) => Error::AdmissionRefused(error),
+            #[cfg(feature = "contextdb-internal")]
+            StorageError::Native(error) => Error::Native(error),
             StorageError::Io(x) => Error::Io(x),
             StorageError::PreviousIo => Error::PreviousIo,
             StorageError::DatabaseClosed => Error::DatabaseClosed,
@@ -56,6 +83,9 @@ impl Display for StorageError {
                     MAX_VALUE_LENGTH / 1024 / 1024 / 1024
                 )
             }
+            StorageError::AdmissionRefused(error) => write!(f, "admission refused: {error}"),
+            #[cfg(feature = "contextdb-internal")]
+            StorageError::Native(error) => error.fmt(f),
             StorageError::Io(err) => {
                 write!(f, "I/O error: {err}")
             }
@@ -75,7 +105,15 @@ impl Display for StorageError {
     }
 }
 
-impl std::error::Error for StorageError {}
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Errors related to opening tables
 #[derive(Debug)]
@@ -553,6 +591,17 @@ pub enum Error {
     // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
     TableAlreadyOpen(String, &'static panic::Location<'static>),
+    /// Opaque caller admission refusal, distinct from device or file I/O.
+    #[doc(hidden)]
+    AdmissionRefused(Box<dyn std::error::Error + Send + Sync>),
+    /// Feature-internal scalar native producer transport; never constructs a Box.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    Native(crate::NativeColdReadError),
+    /// Feature-internal prepared diagnosis retaining the actual paid descriptor page.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    PreparedRead(crate::PreparedReadError),
     Io(io::Error),
     DatabaseClosed,
     /// A previous IO error occurred. The database must be closed and re-opened
@@ -629,6 +678,11 @@ impl Display for Error {
             Error::TableAlreadyOpen(name, location) => {
                 write!(f, "Table '{name}' already opened at: {location}")
             }
+            Error::AdmissionRefused(error) => write!(f, "admission refused: {error}"),
+            #[cfg(feature = "contextdb-internal")]
+            Error::Native(error) => error.fmt(f),
+            #[cfg(feature = "contextdb-internal")]
+            Error::PreparedRead(error) => error.fmt(f),
             Error::Io(err) => {
                 write!(f, "I/O error: {err}")
             }
@@ -690,4 +744,14 @@ impl Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(error) => Some(error),
+            #[cfg(feature = "contextdb-internal")]
+            Self::PreparedRead(error) => Some(error),
+            _ => None,
+        }
+    }
+}

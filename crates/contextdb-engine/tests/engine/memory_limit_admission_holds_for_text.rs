@@ -32,6 +32,10 @@ fn seeded(database: &Database) {
         .expect("create the fixture table");
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert(database: &Database, id: i64) -> contextdb_core::Result<()> {
     database
         .execute(
@@ -56,6 +60,9 @@ fn admission_stops_at_the_limit_and_never_holds_more_than_it() {
     database
         .execute("SET MEMORY_LIMIT '4M'", &HashMap::new())
         .expect("set the memory limit");
+    database
+        .execute("BEGIN", &HashMap::new())
+        .expect("begin the batch");
 
     let mut admitted = 0_i64;
     let refusal = loop {
@@ -200,6 +207,9 @@ fn indexed_text_is_held_to_the_same_limit() {
     database
         .execute("SET MEMORY_LIMIT '4M'", &HashMap::new())
         .expect("set the memory limit");
+    database
+        .execute("BEGIN", &HashMap::new())
+        .expect("begin the batch");
 
     let mut admitted = 0_i64;
     let refusal = loop {

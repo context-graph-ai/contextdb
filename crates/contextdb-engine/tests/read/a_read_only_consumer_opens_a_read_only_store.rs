@@ -68,6 +68,10 @@ fn sealed_store(name: &str) -> Sealed {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_back(sealed: &Sealed) -> contextdb_core::Result<Vec<Vec<Value>>> {
     ReadSession::with_runtime_directory_for_test(&sealed.runtime, || {
         let session = ReadSession::open_with_options(&sealed.store, ReadSessionOptions::default())?;
@@ -78,7 +82,8 @@ fn read_back(sealed: &Sealed) -> contextdb_core::Result<Vec<Vec<Value>>> {
         );
         Ok(session
             .execute("SELECT payload FROM sealed_rows", &HashMap::new())?
-            .rows)
+            .rows()
+            .to_vec())
     })
 }
 

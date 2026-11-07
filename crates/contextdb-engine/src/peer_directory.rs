@@ -22,24 +22,45 @@ pub(crate) const CREATE_PEER_DIRECTORY: &str = "CREATE TABLE peer_directory (\
 /// CURRENT ONLY, so the table is never observed keep-first while the
 /// declaration is in force) — matching `install_work_ledger_schema`'s
 /// reconciliation of `work_capabilities`.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn install_peer_directory_schema(db: &Database) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    install_peer_directory_schema_with_read_memory(db, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub fn install_peer_directory_schema_with_read_memory(
+    db: &Database,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<()> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     if !db.table_names().iter().any(|name| name == "peer_directory") {
-        db.execute(CREATE_PEER_DIRECTORY, &HashMap::new())?;
+        db.execute_with_read_memory(CREATE_PEER_DIRECTORY, &HashMap::new(), read_memory.clone())?;
         return Ok(());
     }
     let Some(meta) = db.table_meta("peer_directory") else {
         return Ok(());
     };
     if meta.conflict_policy != Some(contextdb_core::ConflictPolicy::KEEP_LATEST) {
-        db.execute(
+        db.execute_with_read_memory(
             "ALTER TABLE peer_directory SET SYNC CONFLICT KEEP LATEST",
             &HashMap::new(),
+            read_memory.clone(),
         )?;
     }
     if meta.history_policy != Some(contextdb_core::HistoryPolicy::CurrentOnly) {
-        db.execute(
+        db.execute_with_read_memory(
             "ALTER TABLE peer_directory SET HISTORY CURRENT ONLY",
             &HashMap::new(),
+            read_memory.clone(),
         )?;
     }
     Ok(())
@@ -82,42 +103,88 @@ pub(crate) fn apply_peer_directory_policy_overrides(policies: &mut ConflictPolic
 /// Upsert `node_id -> ticket`: a node's row is keyed on its own `node_id`, so
 /// a re-enrolling node (a rotated ticket) overwrites its prior row rather
 /// than accumulating history.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn register_peer_ticket(db: &Database, node_id: &str, ticket: &str, now_ms: i64) -> Result<()> {
+    let read_memory = db.declared_reader_memory()?;
+    register_peer_ticket_with_read_memory(db, node_id, ticket, now_ms, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub fn register_peer_ticket_with_read_memory(
+    db: &Database,
+    node_id: &str,
+    ticket: &str,
+    now_ms: i64,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<()> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));
     params.insert("ticket".to_string(), Value::Text(ticket.to_string()));
     params.insert("enrolled_at".to_string(), Value::Timestamp(now_ms));
-    db.execute(
+    db.execute_with_read_memory(
         "INSERT INTO peer_directory (node_id, ticket, enrolled_at) \
          VALUES ($node_id, $ticket, $enrolled_at) \
          ON CONFLICT (node_id) DO UPDATE SET ticket = $ticket, enrolled_at = $enrolled_at",
         &params,
+        read_memory.clone(),
     )?;
     Ok(())
 }
 
 /// Resolve `node_id` to its current dialable ticket, if enrolled.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn lookup_peer_ticket(db: &Database, node_id: &str) -> Result<Option<String>> {
+    let read_memory = db.declared_reader_memory()?;
+    lookup_peer_ticket_with_read_memory(db, node_id, read_memory)
+}
+
+/// Execute using the caller's existing operation read owner.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub fn lookup_peer_ticket_with_read_memory(
+    db: &Database,
+    node_id: &str,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> Result<Option<String>> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
     let mut params = HashMap::new();
     params.insert("node_id".to_string(), Value::Text(node_id.to_string()));
-    let result = db.execute(
+    let result = db.execute_with_read_memory(
         "SELECT ticket FROM peer_directory WHERE node_id = $node_id",
         &params,
+        read_memory.clone(),
     )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
     let ticket_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "ticket")
         .ok_or_else(|| {
-            contextdb_core::Error::Other("peer_directory: missing column ticket".to_string())
+            contextdb_core::Error::Other(
+                ("peer_directory: missing column ticket".to_string()).into(),
+            )
         })?;
     match &row[ticket_idx] {
         Value::Text(s) => Ok(Some(s.clone())),
-        other => Err(contextdb_core::Error::Other(format!(
-            "peer_directory: ticket must be TEXT, found {other:?}"
-        ))),
+        other => Err(contextdb_core::Error::Other(
+            (format!("peer_directory: ticket must be TEXT, found {other:?}")).into(),
+        )),
     }
 }

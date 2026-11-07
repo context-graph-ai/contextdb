@@ -13,12 +13,19 @@ pub(crate) struct HiddenPullScan {
     incarnation: Option<Incarnation>,
 }
 impl Database {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_pull_scan(
         &self,
         tenant: &TenantId,
         peer: Option<&str>,
         requested: Lsn,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<HiddenPullScan>> {
+        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
         let Some(peer) = peer else {
             return Ok(None);
         };
@@ -33,8 +40,17 @@ impl Database {
         }
         // The caller holds the outbound schema lease. A declaration change
         // invalidates hidden progress, so a newly pullable old row is revisited.
-        let schema = self.ddl_log.read().last().map(|(lsn, _)| *lsn);
-        let incarnation = self.existing_sync_incarnation(tenant)?;
+        let schema = if let Some(root) = self.writer_read_root()? {
+            let mut cursor = root.ddl_history_cursor_ordered(
+                crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()),
+                Lsn(0),
+                true,
+            )?;
+            cursor.next_ddl_history()?.map(|window| window.value.0)
+        } else {
+            self.ddl_log.read().last().map(|(lsn, _)| *lsn)
+        };
+        let incarnation = self.existing_sync_incarnation(tenant, read_memory.clone())?;
         let through = self.current_lsn();
         self.with_custody_store(|store| {
             let since = store
@@ -57,6 +73,10 @@ impl Database {
             }))
         })
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remember_hidden_custody_pull(&self, scan: HiddenPullScan) -> Result<()> {
         self.with_custody_store(|store| {
             // One entry per authenticated peer, independent of receipt history.

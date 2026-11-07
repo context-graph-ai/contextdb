@@ -5,40 +5,1358 @@
 
 use super::*;
 use crate::memory_accounting::MemoryAccountant;
+use crate::persistence::{OriginalMutationVector, OriginalPersistenceFrame};
 use serial_test::serial;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 struct MeasuredAllocator;
 // Measurement is scoped to the THREAD under test, not to the process. A
 // process-global switch measures every other test thread running beside this
 // one and reports their allocations as this subsystem's, which is exactly the
-// contamination that makes an allocator oracle meaningless. The flag is a
+// contamination that makes an allocator oracle meaningless. The window is a
 // const-initialised thread-local, so reading it inside the allocator neither
-// allocates nor runs a destructor; deallocation uses the flag recorded in the
+// allocates nor runs a destructor; deallocation uses the window recorded in the
 // allocation's own header, so a block freed on another thread still leaves the
-// measured total correct.
+// measured total correct. Earlier windows' surviving blocks must not subtract
+// from a later window's freshly reset total. The mutex makes checking window
+// identity and updating its counters atomic with starting/ending a window.
 thread_local! {
-    static MEASURING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MEASURING_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Existing oracle records the unmodified allocator request, independent
+    // of its measurement header. No extra allocator or allocating ledger.
+    static WATCH_PAYLOAD_FREE: std::cell::Cell<(usize, bool, bool)> = const { std::cell::Cell::new((0, false, false)) };
+    static WATCH_NODE_PROCESS_FREE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static WATCH_NODE_FREE: std::cell::Cell<(usize, usize, usize, usize, bool)> = const { std::cell::Cell::new((0, 0, 0, 0, false)) };
+    static LAST_REQUEST: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    static WATCH_PAYLOAD_ACCOUNTANT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PAYLOAD_FREE_CENSUS: std::cell::Cell<(usize, usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    static LAST_REQUEST_POINTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Narrow concrete-owner adoption of the existing exact physical-free watch.
+    static NEXT_EXACT_FREE: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+    static NATIVE_REQUESTS: std::cell::Cell<[(usize, usize, usize); 256]> = const { std::cell::Cell::new([(0, 0, 0); 256]) };
+    static DECLARATION_EPOCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The first declaration epoch the current funding census can contain. A
+    // declaration set built under one observation and freed under a later one
+    // of the same census leaves that census at its physical free.
+    static DECLARATION_CENSUS_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DECLARATION_CENSUS_INVALID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DECLARATION_OBSERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Own only the budget parent, never the selected payload or its credit.
+    // A const TLS slot and an atomic load keep allocator sampling allocation-free.
+    static FUNDING_READER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FUNDING_READER: std::cell::RefCell<Option<crate::vector_read_memory::DeclaredReadRoot>> = const { std::cell::RefCell::new(None) };
+    static FUNDING_CENSUS: std::cell::Cell<(usize, usize, usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0, 0, 0)) };
+    static READER_STANDING_FUNDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The actual PageAllocation producer supplies its payer before this one
+    // concrete allocator call. Scalar TLS neither pays nor retains the page.
+    static NEXT_PAGE_PAYMENT: std::cell::Cell<(usize, usize, u8, usize)> = const { std::cell::Cell::new((0,0,0,0)) };
+    static SOURCE_COUNTER_IS_READER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SOURCE_REQUEST_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LAST_SOURCE_REQUEST_CREDIT: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0,0,0)) };
+    static SOURCE_REQUEST_CREDIT: std::cell::Cell<[usize; 256]> = const { std::cell::Cell::new([0; 256]) };
+    static NATIVE_REQUEST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Scalar allocation ordinal only; never an index into the bounded arrays.
+    static NATIVE_REQUEST_TOTAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NATIVE_REQUEST_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NATIVE_REQUEST_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-static MEASURING: AtomicBool = AtomicBool::new(false);
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
 
-fn measuring_on_this_thread() -> bool {
-    MEASURING.load(AtomicOrdering::Relaxed)
-        && MEASURING_HERE
-            .try_with(std::cell::Cell::get)
-            .unwrap_or(false)
+// Static observation storage has no allocator footprint and survives concurrent
+// final-owner contenders. Counter-free observation never reads the freed counter.
+struct NativeFreeWatch {
+    pointer: AtomicUsize,
+    window: AtomicUsize,
+    counter: AtomicUsize,
+    before: AtomicUsize,
+    after: AtomicUsize,
+    count: AtomicUsize,
+    bytes: AtomicUsize,
+    live_at_free: AtomicUsize,
 }
+impl NativeFreeWatch {
+    const fn new() -> Self {
+        Self {
+            pointer: AtomicUsize::new(0),
+            window: AtomicUsize::new(0),
+            counter: AtomicUsize::new(0),
+            before: AtomicUsize::new(0),
+            after: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+            live_at_free: AtomicUsize::new(0),
+        }
+    }
+}
+static NATIVE_FREE: [NativeFreeWatch; 128] = [const { NativeFreeWatch::new() }; 128];
+
+// The public-answer bridge's first materialize_answer reservation funds the
+// prepaid charge Box, not a vector image. Observe that actual next request and
+// its physical free using the existing allocator; no allocating event ledger.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AnswerCopyControlReceipt {
+    counter: usize,
+    pub(crate) reservations: usize,
+    pub(crate) admitted: usize,
+    pub(crate) pointer: usize,
+    pub(crate) bytes: usize,
+    pub(crate) align: usize,
+    pub(crate) funded_at_allocation: usize,
+    pub(crate) funded_at_free: usize,
+    pub(crate) funded_after_free: usize,
+    pub(crate) frees: usize,
+    pub(crate) refund_after_free: Option<usize>,
+    pub(crate) funded_after_refund: Option<usize>,
+}
+thread_local! {
+    static ANSWER_COPY_CONTROL: std::cell::Cell<AnswerCopyControlReceipt> =
+        const { std::cell::Cell::new(AnswerCopyControlReceipt {
+            counter: 0, reservations: 0, admitted: 0, pointer: 0,
+            bytes: 0, align: 0, funded_at_allocation: 0, funded_at_free: 0,
+            funded_after_free: 0, frees: 0, refund_after_free: None, funded_after_refund: None,
+        }) };
+}
+pub(crate) struct AnswerCopyControlObservation<'a> {
+    _counter: &'a AtomicUsize,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+impl<'a> AnswerCopyControlObservation<'a> {
+    pub(crate) fn begin(counter: &'a AtomicUsize) -> Self {
+        ANSWER_COPY_CONTROL.with(|slot| {
+            assert_eq!(slot.get().counter, 0);
+            slot.set(AnswerCopyControlReceipt {
+                counter: counter as *const AtomicUsize as usize,
+                ..Default::default()
+            });
+        });
+        Self {
+            _counter: counter,
+            _thread: std::marker::PhantomData,
+        }
+    }
+    pub(crate) fn receipt(&self) -> AnswerCopyControlReceipt {
+        ANSWER_COPY_CONTROL.with(std::cell::Cell::get)
+    }
+}
+impl Drop for AnswerCopyControlObservation<'_> {
+    fn drop(&mut self) {
+        ANSWER_COPY_CONTROL.with(|slot| slot.set(Default::default()));
+    }
+}
+pub(crate) fn answer_copy_reservation(bytes: usize) {
+    ANSWER_COPY_CONTROL.with(|slot| {
+        let mut state = slot.get();
+        if state.counter == 0 {
+            return;
+        }
+        state.reservations += 1;
+        if state.reservations == 1 {
+            state.admitted = bytes;
+        }
+        slot.set(state);
+    });
+}
+pub(crate) fn answer_copy_refund(bytes: usize) {
+    ANSWER_COPY_CONTROL.with(|slot| {
+        let mut state = slot.get();
+        if state.counter != 0 && state.frees == 1 && state.refund_after_free.is_none() {
+            state.refund_after_free = Some(bytes);
+            state.funded_after_refund = Some(
+                unsafe { &*(state.counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst),
+            );
+            slot.set(state);
+        }
+    });
+}
+fn answer_copy_allocated(pointer: usize, layout: Layout) {
+    ANSWER_COPY_CONTROL.with(|slot| {
+        let mut state = slot.get();
+        if state.counter == 0 || state.reservations != 1 || state.pointer != 0 || state.frees != 0 {
+            return;
+        }
+        state.pointer = pointer;
+        state.bytes = layout.size();
+        state.align = layout.align();
+        // The observation guard borrows this exact owner's counter throughout.
+        state.funded_at_allocation =
+            unsafe { &*(state.counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
+        slot.set(state);
+    });
+}
+fn answer_copy_free(pointer: usize, after_system: bool) {
+    ANSWER_COPY_CONTROL.with(|slot| {
+        let mut state = slot.get();
+        if state.counter == 0 || state.pointer != pointer || state.frees != 0 {
+            return;
+        }
+        let funded =
+            unsafe { &*(state.counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
+        if after_system {
+            state.funded_after_free = funded;
+            state.frees += 1;
+            // The retained address is evidence only; frees disarms matching
+            // before any subsequent allocation can reuse it.
+        } else {
+            state.funded_at_free = funded;
+        }
+        slot.set(state);
+    });
+}
+
+static NEXT_DECLARATION_EPOCH: AtomicUsize = AtomicUsize::new(1);
+
+// Fixed evidence for the first positive declaration gap. Phase: 1 before
+// System.alloc, 2 before System.dealloc, 3 after System.dealloc, 4 explicit sample.
+// A request retains the original parent debit and baseline at allocation and
+// at physical free; observing never retains the payload or pays its invoice.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeclarationRequest {
+    generation: usize,
+    free_started: bool,
+    pointer: usize,
+    bytes: usize,
+    align: usize,
+    parent: usize,
+    baseline: usize,
+    used_at_alloc: usize,
+    used_before_free: usize,
+    used_after_free: usize,
+    frees: usize,
+    // Original writer counter address, standing debit, allocation debit,
+    // immediately-before-free debit, immediately-after-free debit.
+    writer: [usize; 5],
+    process: [usize; 3],
+}
+impl std::fmt::Debug for DeclarationRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeclarationRequest")
+            .field("generation", &self.generation)
+            .field("free_started", &self.free_started)
+            .field("pointer", &self.pointer)
+            .field("bytes", &self.bytes)
+            .field("align", &self.align)
+            .field("reader_parent", &self.parent)
+            .field("reader_standing", &self.baseline)
+            .field("reader_at_alloc", &self.used_at_alloc)
+            .field("reader_before_free", &self.used_before_free)
+            .field("reader_after_free", &self.used_after_free)
+            .field("frees", &self.frees)
+            .field("writer_counter_standing_alloc_before_after", &self.writer)
+            .field("process_alloc_before_after", &self.process)
+            .finish()
+    }
+}
+// The actual empty-selected-table fixture has at most eight declarations.
+// Each clone retains eight allocations: selected name, ColumnDef Vec, its two
+// names, primary-key IndexDecl Vec, index name, index-column Vec and its name.
+// The selected (String, TableMeta) Vec adds one: 1 + 8 * 8 = 65 simultaneously
+// live records. These are ACTIVE slots, reusable only after physical free;
+// later transient requests do not consume an unbounded historical ledger.
+const DECLARATION_ACTIVE_CAPACITY: usize = 1 + 8 * 8;
+#[derive(Clone, Copy)]
+pub(crate) struct DeclarationEvidence {
+    // pointer, bytes, align, phase, live overlap, used, baseline, parent
+    first_gap: Option<[usize; 8]>,
+    // Original writer counter/standing/current and process aggregate at gap.
+    first_gap_other_funding: [usize; 4],
+    requests: [DeclarationRequest; DECLARATION_ACTIVE_CAPACITY],
+    // Slots describe active allocations, not an ever-growing request history.
+    // Reuse only after the matching System.dealloc has returned. Generation is
+    // the monotonic allocation ordinal, so address reuse cannot merge owners.
+    count: usize,
+    freed: usize,
+    active: usize,
+    peak_active: usize,
+    pending: Option<usize>,
+    first_gap_request: Option<DeclarationRequest>,
+    first_invalid_event: Option<[usize; 4]>,
+    first_invalid_request: Option<DeclarationRequest>,
+    last_free: Option<DeclarationRequest>,
+    pub(crate) complete: bool,
+}
+// Const TLS owns the slots; no heap/backtrace or large historical stack ledger.
+// Keep every by-value receipt below 12 KiB as well. This bound is checked
+// by the compiler, not the allocator; initialization uses the same finite size.
+const _: () = assert!(std::mem::size_of::<DeclarationEvidence>() <= 12 * 1024);
+impl std::fmt::Debug for DeclarationEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeclarationEvidence")
+            .field("complete", &self.complete)
+            .field("count", &self.count)
+            .field("freed", &self.freed)
+            .field("active", &self.active)
+            .field("peak_active", &self.peak_active)
+            .field("pending", &self.pending)
+            .field("first_gap_request", &self.first_gap_request)
+            .field("first_invalid_event", &self.first_invalid_event)
+            .field("first_invalid_request", &self.first_invalid_request)
+            .field("last_free", &self.last_free)
+            .field(
+                "first_gap_pointer_size_align_phase_live_used_baseline_parent",
+                &self.first_gap,
+            )
+            .field(
+                "first_gap_writer_counter_standing_used_process",
+                &self.first_gap_other_funding,
+            )
+            .field("slots", &self.requests)
+            .finish()
+    }
+}
+impl DeclarationEvidence {
+    const fn new() -> Self {
+        Self {
+            first_gap: None,
+            first_gap_other_funding: [0; 4],
+            requests: [DeclarationRequest {
+                generation: 0,
+                free_started: false,
+                pointer: 0,
+                bytes: 0,
+                align: 0,
+                parent: 0,
+                baseline: 0,
+                used_at_alloc: 0,
+                used_before_free: 0,
+                used_after_free: 0,
+                frees: 0,
+                writer: [0; 5],
+                process: [0; 3],
+            }; DECLARATION_ACTIVE_CAPACITY],
+            count: 0,
+            freed: 0,
+            active: 0,
+            peak_active: 0,
+            pending: None,
+            first_gap_request: None,
+            first_invalid_event: None,
+            first_invalid_request: None,
+            last_free: None,
+            complete: true,
+        }
+    }
+    fn invalidate(&mut self, event: [usize; 4]) {
+        self.complete = false;
+        if self.first_invalid_event.is_none() {
+            self.first_invalid_event = Some(event);
+            self.first_invalid_request = self
+                .requests
+                .iter()
+                .find(|r| r.generation != 0 && r.pointer == event[0] && r.frees == 0)
+                .copied();
+        }
+    }
+    fn validate(&mut self, live: usize) {
+        let mut active = self
+            .requests
+            .iter()
+            .filter(|r| r.generation != 0 && r.frees == 0);
+        let slots = active.clone().count();
+        let bytes = active.try_fold(0usize, |sum, r| sum.checked_add(r.bytes));
+        if self.pending.is_some()
+            || slots != self.active
+            || bytes != Some(live)
+            || self.freed.checked_add(self.active) != Some(self.count)
+        {
+            self.invalidate([0, live, 0, 4]);
+        }
+    }
+}
+thread_local! {
+    static DECLARATION_WRITER: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    static DECLARATION_EVIDENCE: std::cell::RefCell<DeclarationEvidence> =
+        const { std::cell::RefCell::new(DeclarationEvidence::new()) };
+    static DECLARATION_EVENT: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
+}
+
+#[derive(Debug)]
+pub(crate) struct DeclarationObservation {
+    reset_counter: bool,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
+    writer: Option<crate::memory_accounting::AccountantHandle>,
+}
+impl DeclarationObservation {
+    // This parent is the one debited by the ordinary production child. Owning
+    // the parent makes sampling safe without keeping the tested copy alive.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from currency_version_compaction_tests.rs"
+        )
+    )]
+    pub(crate) fn funded_by_reader(
+        parent: crate::vector_read_memory::DeclaredReadRoot,
+        baseline: usize,
+    ) -> Self {
+        FUNDING_READER.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(parent);
+        });
+        FUNDING_READER_ACTIVE.with(|active| active.set(true));
+        FUNDING_CENSUS.with(|slot| slot.set((0, baseline, 0, 0, 0)));
+        DECLARATION_CENSUS_INVALID.with(|slot| slot.set(false));
+        DECLARATION_CENSUS_FROM
+            .with(|slot| slot.set(NEXT_DECLARATION_EPOCH.load(AtomicOrdering::SeqCst)));
+        let mut observation = declaration_observation();
+        observation.reset_counter = true;
+        observation
+    }
+
+    // Retain only the actual store's existing accountant; no reservation or
+    // producer control is created. Needed to distinguish an independent writer
+    // debit from this reader parent's standing and sibling credits.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from saved_search_and_append_work_ceiling.rs"
+        )
+    )]
+    pub(crate) fn observe_writer(&mut self, writer: crate::memory_accounting::AccountantHandle) {
+        DECLARATION_WRITER.with(|slot| {
+            slot.set((
+                writer.writer_registration_observation_for_test().4,
+                writer.usage().used,
+            ))
+        });
+        self.writer = Some(writer);
+    }
+
+    pub(crate) fn evidence(&self) -> DeclarationEvidence {
+        let live = FUNDING_CENSUS.with(|slot| slot.get().2);
+        DECLARATION_EVIDENCE.with(|slot| {
+            let mut evidence = slot.borrow_mut();
+            evidence.validate(live);
+            if DECLARATION_CENSUS_INVALID.with(std::cell::Cell::get) {
+                evidence.invalidate([0, live, 0, 4]);
+            }
+            *evidence
+        })
+    }
+
+    pub(crate) fn physical_receipt(&self) -> (usize, usize, usize) {
+        DECLARATION_EVENT.with(|slot| slot.set([0, 0, 0, 4]));
+        sample_declaration_funding(0, 0);
+        FUNDING_CENSUS.with(|slot| {
+            let (_, _, live, gap, peak) = slot.get();
+            // A census mismatch is a failed proof, reported outside allocator
+            // callbacks rather than panicking during an unrelated unwind.
+            let invalid = DECLARATION_CENSUS_INVALID.with(std::cell::Cell::get);
+            (live, if invalid { usize::MAX } else { gap }, peak)
+        })
+    }
+}
+pub(crate) fn declaration_observation() -> DeclarationObservation {
+    DECLARATION_WRITER.with(|slot| slot.set((0, 0)));
+    DECLARATION_EVIDENCE.with(|slot| *slot.borrow_mut() = DeclarationEvidence::new());
+    DECLARATION_EPOCH
+        .with(|slot| slot.set(NEXT_DECLARATION_EPOCH.fetch_add(1, AtomicOrdering::SeqCst)));
+    DECLARATION_OBSERVATION.with(|slot| slot.set(true));
+    DeclarationObservation {
+        reset_counter: false,
+        writer: None,
+    }
+}
+impl Drop for DeclarationObservation {
+    fn drop(&mut self) {
+        DECLARATION_OBSERVATION.with(|slot| slot.set(false));
+        DECLARATION_WRITER.with(|slot| slot.set((0, 0)));
+        DECLARATION_EPOCH.with(|slot| slot.set(0));
+        if self.reset_counter {
+            FUNDING_CENSUS.with(|slot| slot.set((0, 0, 0, 0, 0)));
+            DECLARATION_CENSUS_FROM.with(|slot| slot.set(0));
+            FUNDING_READER_ACTIVE.with(|active| active.set(false));
+            // Release the RefCell borrow before an Arc drop can reenter the allocator.
+            let parent = FUNDING_READER.with(|slot| slot.borrow_mut().take());
+            drop(parent);
+        }
+    }
+}
+
+// Sample with the old live count after System.dealloc, then retire its bytes.
+// The same helper checks admission before allocation and before physical free.
+fn sample_declaration_funding(allocated: usize, freed: usize) {
+    if !DECLARATION_OBSERVATION.with(std::cell::Cell::get) {
+        return;
+    }
+    FUNDING_CENSUS.with(|slot| {
+        let (writer, baseline, live, gap, peak) = slot.get();
+        // Do not initialise destructor-bearing TLS from an allocator callback.
+        // funded_by_reader initialises it before arming this const Cell flag.
+        let reader = if FUNDING_READER_ACTIVE.with(std::cell::Cell::get) {
+            FUNDING_READER
+                .try_with(|slot| {
+                    slot.try_borrow().ok().and_then(|parent| {
+                        parent
+                            .as_ref()
+                            .map(|parent| parent.retained_bytes_for_source_unit_test() as usize)
+                    })
+                })
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if FUNDING_READER_ACTIVE.with(std::cell::Cell::get) && reader.is_none() {
+            DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(true));
+        }
+        let used = reader.or_else(|| {
+            (writer != 0).then(|| {
+                // Existing writer oracle: funded_requests keeps its accountant alive.
+                unsafe { &*(writer as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+            })
+        });
+        if let Some(used) = used {
+            let Some(overlap) = live.checked_add(allocated) else {
+                DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(true));
+                return;
+            };
+            let Some(remaining) = overlap.checked_sub(freed) else {
+                DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(true));
+                return;
+            };
+            let admitted = used.saturating_sub(baseline);
+            let event = DECLARATION_EVENT.with(std::cell::Cell::get);
+            let parent = if writer != 0 {
+                writer
+            } else {
+                FUNDING_READER.with(|slot| {
+                    slot.borrow().as_ref().map_or(0, |parent| {
+                        parent.as_ref() as *const crate::vector_read_memory::DeclaredReadMemory
+                            as usize
+                    })
+                })
+            };
+            let (writer_counter, writer_standing) = DECLARATION_WRITER.with(std::cell::Cell::get);
+            let writer_used = if writer_counter == 0 {
+                0
+            } else {
+                // DeclarationObservation retains this exact accountant through
+                // every sample, including its final physical free.
+                unsafe { &*(writer_counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+            };
+            let process = crate::memory_accounting::process_aggregate_bytes_for_test();
+            DECLARATION_EVIDENCE.with(|evidence| {
+                let mut evidence = evidence.borrow_mut();
+                if overlap > admitted && evidence.first_gap.is_none() {
+                    evidence.first_gap = Some([
+                        event[0], event[1], event[2], event[3], overlap, used, baseline, parent,
+                    ]);
+                    evidence.first_gap_other_funding =
+                        [writer_counter, writer_standing, writer_used, process];
+                }
+                if event[3] == 1 && allocated != 0 {
+                    let next = evidence.count.checked_add(1);
+                    if let Some(next) = next {
+                        evidence.count = next;
+                    } else {
+                        evidence.invalidate(event);
+                    }
+                    if let Some(active) = evidence.active.checked_add(1) {
+                        evidence.active = active;
+                        evidence.peak_active = evidence.peak_active.max(active);
+                    } else {
+                        evidence.invalidate(event);
+                    }
+                    let index = evidence
+                        .requests
+                        .iter()
+                        .position(|r| r.generation == 0 || r.frees == 1);
+                    if let (Some(generation), Some(index)) = (next, index) {
+                        if evidence.pending.is_some() {
+                            evidence.invalidate(event);
+                        }
+                        evidence.requests[index] = DeclarationRequest {
+                            generation,
+                            bytes: event[1],
+                            align: event[2],
+                            parent,
+                            baseline,
+                            used_at_alloc: used,
+                            writer: [writer_counter, writer_standing, writer_used, 0, 0],
+                            process: [process, 0, 0],
+                            ..Default::default()
+                        };
+                        evidence.pending = Some(index);
+                        if evidence
+                            .first_gap
+                            .is_some_and(|gap| gap[0] == 0 && gap[3] == 1)
+                            && evidence.first_gap_request.is_none()
+                        {
+                            evidence.first_gap_request = Some(evidence.requests[index]);
+                        }
+                    } else {
+                        evidence.invalidate(event);
+                    }
+                } else if event[0] != 0 && (event[3] == 2 || event[3] == 3) {
+                    let index = evidence
+                        .requests
+                        .iter()
+                        .position(|r| r.generation != 0 && r.pointer == event[0] && r.frees == 0);
+                    if let Some(index) = index {
+                        let mut request = evidence.requests[index];
+                        if request.bytes != event[1]
+                            || request.align != event[2]
+                            || request.free_started != (event[3] == 3)
+                        {
+                            evidence.invalidate(event);
+                        } else if event[3] == 2 {
+                            request.free_started = true;
+                            request.used_before_free = used;
+                            request.writer[3] = writer_used;
+                            request.process[1] = process;
+                        } else {
+                            request.used_after_free = used;
+                            request.writer[4] = writer_used;
+                            request.process[2] = process;
+                            request.frees = 1;
+                            evidence.last_free = Some(request);
+                        }
+                        // Preserve the allocation origin even after this slot
+                        // is physically freed and reused by another generation.
+                        if evidence
+                            .first_gap
+                            .is_some_and(|gap| gap[0] == event[0] && gap[3] == event[3])
+                            && evidence.first_gap_request.is_none()
+                        {
+                            evidence.first_gap_request = Some(request);
+                        }
+                        evidence.requests[index] = request;
+                    } else {
+                        evidence.invalidate(event);
+                    }
+                    // Count physical events even on an overflowed census;
+                    // incomplete never becomes complete again after recycling.
+                    if event[3] == 3 {
+                        if let (Some(freed), Some(active)) = (
+                            evidence.freed.checked_add(1),
+                            evidence.active.checked_sub(1),
+                        ) {
+                            evidence.freed = freed;
+                            evidence.active = active;
+                        } else {
+                            evidence.invalidate(event);
+                        }
+                    }
+                } else if event[3] == 4 {
+                    if evidence.first_gap_request.is_none()
+                        && evidence.first_gap.is_some_and(|gap| gap[3] == 4)
+                    {
+                        evidence.first_gap_request = evidence
+                            .requests
+                            .iter()
+                            .find(|r| r.generation != 0 && r.frees == 0)
+                            .copied();
+                    }
+                    evidence.validate(remaining);
+                }
+            });
+            slot.set((
+                writer,
+                baseline,
+                remaining,
+                gap.max(overlap.saturating_sub(admitted)),
+                peak.max(overlap),
+            ));
+        }
+    });
+}
+
+// Native requested bytes, excluding the oracle's own headers, are compared
+// with the originating writer before System.alloc, including overlapping clones.
+pub(crate) fn funded_requests<T>(
+    writer: &MemoryAccountant,
+    operation: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FUNDING_CENSUS.with(|slot| slot.set((0, 0, 0, 0, 0)));
+            DECLARATION_CENSUS_FROM.with(|slot| slot.set(0));
+        }
+    }
+    FUNDING_CENSUS.with(|slot| {
+        slot.set((
+            writer.writer_registration_observation_for_test().4,
+            writer.usage().used,
+            0,
+            0,
+            0,
+        ));
+    });
+    DECLARATION_CENSUS_FROM
+        .with(|slot| slot.set(NEXT_DECLARATION_EPOCH.load(AtomicOrdering::SeqCst)));
+    let guard = Guard;
+    DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(false));
+    let (value, _, _) = measured(operation);
+    assert!(
+        !DECLARATION_CENSUS_INVALID.with(std::cell::Cell::get),
+        "declaration census mismatch invalidates the physical funding proof"
+    );
+    let gap = FUNDING_CENSUS.with(|slot| slot.get().3);
+    drop(guard);
+    (value, gap)
+}
+
+// Extend the mapped oracle's fixed storage; no allocating observation ledger.
+pub(crate) fn source_requests_for_test<T>(
+    counter: usize,
+    operation: impl FnOnce() -> T,
+) -> (T, [(usize, usize, usize); 256], usize) {
+    let receipt = source_request_prefix_for_test(counter, operation);
+    assert_native_request_receipt_complete();
+    receipt
+}
+
+// Copy construction can allocate and free a temporary admission control before
+// returning its retained body. Observe every allocation/free for funding, then
+// give the lifetime assertions only the blocks that are still physically live.
+pub(crate) fn retained_source_requests_for_test<T>(
+    owner: &MemoryAccountant,
+    operation: impl FnOnce() -> T,
+) -> (T, [(usize, usize, usize); 256], usize) {
+    let ((value, requests, credits, count), gap) = funded_requests(owner, || {
+        let observation = declaration_observation();
+        let value = operation();
+        let evidence = observation.evidence();
+        assert!(evidence.complete, "{evidence:?}");
+        let mut requests = [(0, 0, 0); 256];
+        let mut credits = [0; 256];
+        let mut count = 0;
+        for request in evidence
+            .requests
+            .iter()
+            .filter(|r| r.generation != 0 && r.frees == 0)
+        {
+            requests[count] = (request.pointer, request.bytes, request.align);
+            credits[count] = request.used_at_alloc;
+            count += 1;
+        }
+        assert_eq!(count, evidence.active);
+        (value, requests, credits, count)
+    });
+    assert_eq!(
+        gap, 0,
+        "every transient and retained copy allocation stays funded through physical free"
+    );
+    SOURCE_REQUEST_CREDIT.with(|slot| slot.set(credits));
+    (value, requests, count)
+}
+
+// Selected-constructor proofs check each consumed slot themselves. Later
+// query allocations do not belong to that prefix and are not a complete census.
+pub(crate) fn source_request_prefix_for_test<T>(
+    counter: usize,
+    operation: impl FnOnce() -> T,
+) -> (T, [(usize, usize, usize); 256], usize) {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SOURCE_REQUEST_COUNTER.with(|c| c.set(0));
+        }
+    }
+    SOURCE_REQUEST_CREDIT.with(|credits| credits.set([0; 256]));
+    SOURCE_REQUEST_COUNTER.with(|c| c.set(counter));
+    let guard = Guard;
+    let (value, _, count) = native_requests_for_test(operation);
+    drop(guard);
+    (value, NATIVE_REQUESTS.with(std::cell::Cell::get), count)
+}
+// Reuse the physical source oracle for the actual operation child's u64
+// counter. The caller keeps that child alive for the complete measurement.
+pub(crate) fn reader_requests_for_test<T>(counter: usize, action: impl FnOnce() -> T) -> T {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SOURCE_COUNTER_IS_READER.with(|slot| slot.set(false));
+        }
+    }
+    READER_STANDING_FUNDING.with(|slot| {
+        slot.set(
+            unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
+                .load(AtomicOrdering::SeqCst) as usize,
+        )
+    });
+    SOURCE_COUNTER_IS_READER.with(|slot| slot.set(true));
+    let guard = Guard;
+    // Funding is sampled for every actual allocation; this path consumes no
+    // request census and does not qualify the bounded request prefix.
+    let (value, _, _) = redb::page_payer_observation::observe(observe_real_page_payer, || {
+        source_request_prefix_for_test(counter, action)
+    });
+    drop(guard);
+    value
+}
+// Authenticate the real fixed reserve, rather than inferring a payer from
+// cache capacity or from the fact that a block will eventually enter a cache.
+fn genuine_cache_payment(event: redb::page_payer_observation::Observation) -> bool {
+    use redb::page_payer_observation::Payer;
+    event.payer == Payer::Cache
+        && event.fixed
+        && event.reserve_identity != 0
+        && event.counter_value != 0
+        && event.occupancy >= event.bytes
+        && event.fixed_occupancy >= event.bytes
+}
+fn note_cache_payer(
+    measurement: &mut Measurement,
+    event: redb::page_payer_observation::Observation,
+) {
+    if measurement.cache_counter_identity == 0 {
+        measurement.cache_counter_identity = event.counter_identity;
+        measurement.cache_reserve_identity = event.reserve_identity;
+    } else if measurement.cache_counter_identity != event.counter_identity
+        || measurement.cache_reserve_identity != event.reserve_identity
+    {
+        measurement.cache_payer_mismatch = true;
+    }
+}
+fn observe_real_page_payer(event: redb::page_payer_observation::Observation) {
+    use redb::page_payer_observation::{Payer, Phase};
+    if event.phase == Phase::BeforeAllocation {
+        let kind = if genuine_cache_payment(event) {
+            1
+        } else if matches!(event.payer, Payer::Source | Payer::SourceCounted) {
+            2
+        } else {
+            3
+        };
+        if kind == 1 {
+            let mut measurement = MEASUREMENT.lock().unwrap();
+            if measurement.active_window != 0 {
+                note_cache_payer(&mut measurement, event);
+            }
+        }
+        NEXT_PAGE_PAYMENT.with(|slot| {
+            slot.set((
+                event.bytes,
+                event.alignment,
+                kind,
+                if kind == 1 { event.counter_value } else { 0 },
+            ))
+        });
+    } else if event.phase == Phase::Handoff && event.pointer != 0 {
+        // The actual page is still held by this producer at the transition.
+        // The global allocator's header is outside its immutable body.
+        let header = unsafe {
+            &*((event.pointer as *const u8)
+                .sub(std::mem::size_of::<Header>())
+                .cast::<Header>())
+        };
+        let next = if genuine_cache_payment(event) {
+            event.counter_value
+        } else {
+            0
+        };
+        let previous = header.cache_funding.swap(next, AtomicOrdering::SeqCst);
+        let mut measurement = MEASUREMENT.lock().unwrap();
+        if header.window != 0 && header.window == measurement.active_window {
+            if next != 0 {
+                note_cache_payer(&mut measurement, event);
+            }
+            if previous == 0 && next != 0 {
+                measurement.cache_payload_live += event.bytes;
+                measurement.cache_payload_peak = measurement
+                    .cache_payload_peak
+                    .max(measurement.cache_payload_live);
+            } else if previous != 0 && next == 0 {
+                measurement.cache_payload_live -= event.bytes;
+            }
+        }
+    }
+}
+fn observed_source_funding(counter: usize) -> usize {
+    if SOURCE_COUNTER_IS_READER.with(std::cell::Cell::get) {
+        (unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }.load(AtomicOrdering::SeqCst)
+            as usize)
+            .saturating_sub(READER_STANDING_FUNDING.with(std::cell::Cell::get))
+    } else {
+        unsafe { &*(counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+    }
+}
+// Native payload only: measurement headers are oracle overhead. Observe
+// overlapping allocations and funding returned before their actual free.
+pub(crate) fn source_unfunded_peak_for_test() -> (usize, (usize, usize, usize, bool)) {
+    let measurement = MEASUREMENT.lock().unwrap();
+    (
+        measurement.source_unfunded_peak,
+        measurement.source_unfunded_request,
+    )
+}
+// Same original pre-System counter sample as the bounded prefix recorder,
+// retained for the actual latest constructor even beyond that prefix.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from ordinary_native_owner_tests.rs"
+    )
+)]
+pub(crate) fn last_source_request_credit_for_test() -> (usize, usize, usize) {
+    LAST_SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
+}
+pub(crate) fn source_request_overflow_for_test() -> bool {
+    NATIVE_REQUEST_OVERFLOW.with(std::cell::Cell::get)
+}
+fn assert_native_request_receipt_complete() {
+    assert!(
+        !source_request_overflow_for_test(),
+        "allocation recorder overflow: the fixed request receipt is incomplete"
+    );
+}
+pub(crate) fn source_request_credit_for_test() -> [usize; 256] {
+    SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
+}
+pub(crate) fn watch_source_free_for_test(requests: &[(usize, usize, usize)], counter: usize) {
+    for watch in &NATIVE_FREE {
+        watch.pointer.store(0, AtomicOrdering::SeqCst);
+        watch.count.store(0, AtomicOrdering::SeqCst);
+    }
+    append_source_free_for_test(requests, counter);
+}
+pub(crate) fn append_source_free_for_test(requests: &[(usize, usize, usize)], counter: usize) {
+    for request in requests {
+        let watch = NATIVE_FREE
+            .iter()
+            .find(|w| {
+                w.pointer.load(AtomicOrdering::SeqCst) == 0
+                    && w.count.load(AtomicOrdering::SeqCst) == 0
+            })
+            .expect("existing free watch has a vacant slot");
+
+        assert_ne!(request.0, 0);
+        let header = unsafe {
+            &*((request.0 as *const u8)
+                .sub(std::mem::size_of::<Header>())
+                .cast::<Header>())
+        };
+        assert_ne!(header.window, 0);
+        watch.bytes.store(request.1, AtomicOrdering::SeqCst);
+        watch.live_at_free.store(0, AtomicOrdering::SeqCst);
+        watch.window.store(header.window, AtomicOrdering::SeqCst);
+        watch.before.store(0, AtomicOrdering::SeqCst);
+        watch.after.store(0, AtomicOrdering::SeqCst);
+        watch.count.store(0, AtomicOrdering::SeqCst);
+        watch.counter.store(counter, AtomicOrdering::SeqCst);
+        watch.pointer.store(request.0, AtomicOrdering::SeqCst);
+    }
+}
+pub(crate) fn source_free_for_test(count: usize) -> [(usize, usize, usize); 128] {
+    assert!(count <= NATIVE_FREE.len());
+    std::array::from_fn(|index| {
+        let w = &NATIVE_FREE[index];
+        (
+            w.before.load(AtomicOrdering::SeqCst),
+            w.after.load(AtomicOrdering::SeqCst),
+            w.count.load(AtomicOrdering::SeqCst),
+        )
+    })
+}
+
+/// Independently recorded live allocator obligations on each watched counter.
+/// Reading them changes no watch, event, admission, free or existing tuple.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from ordinary_native_owner_tests.rs"
+    )
+)]
+pub(crate) fn source_live_at_free_for_test(count: usize) -> [usize; 128] {
+    assert!(count <= NATIVE_FREE.len());
+    std::array::from_fn(|index| NATIVE_FREE[index].live_at_free.load(AtomicOrdering::SeqCst))
+}
+
+// This three-request prefix qualifies selected constructors, not every later
+// allocation in the action. Whole-window proofs use source_requests_for_test.
+pub(crate) fn native_requests_for_test<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, [(usize, usize, usize); 3], usize) {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));
+        }
+    }
+    NATIVE_REQUESTS.with(|requests| requests.set([(0, 0, 0); 256]));
+    NATIVE_REQUEST_COUNT.with(|count| count.set(0));
+    NATIVE_REQUEST_TOTAL.with(|total| total.set(0));
+    NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(false));
+    NATIVE_REQUEST_ACTIVE.with(|active| active.set(true));
+    let guard = Guard;
+    let (value, _, _) = measured(operation);
+    drop(guard);
+    (
+        value,
+        NATIVE_REQUESTS.with(|requests| requests.get()[..3].try_into().unwrap()),
+        NATIVE_REQUEST_TOTAL.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn watch_native_free_for_test(requests: [(usize, usize, usize); 3], counter: usize) {
+    for (index, watch) in NATIVE_FREE.iter().take(3).enumerate() {
+        // This is our oracle's own header, read while the allocation is live.
+        // Pair address with its unique window so address reuse on a contender
+        // thread cannot manufacture an extra free for a previous owner.
+        let header = unsafe {
+            &*((requests[index].0 as *const u8)
+                .sub(std::mem::size_of::<Header>())
+                .cast::<Header>())
+        };
+        watch.window.store(header.window, AtomicOrdering::SeqCst);
+        watch.before.store(0, AtomicOrdering::SeqCst);
+        watch.after.store(0, AtomicOrdering::SeqCst);
+        watch.count.store(0, AtomicOrdering::SeqCst);
+        watch
+            .counter
+            .store(if index == 0 { 0 } else { counter }, AtomicOrdering::SeqCst);
+        watch
+            .pointer
+            .store(requests[index].0, AtomicOrdering::SeqCst);
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn native_free_observation_for_test() -> [(usize, usize, usize); 3] {
+    std::array::from_fn(|index| {
+        let watch = &NATIVE_FREE[index];
+        (
+            watch.before.load(AtomicOrdering::SeqCst),
+            watch.after.load(AtomicOrdering::SeqCst),
+            watch.count.load(AtomicOrdering::SeqCst),
+        )
+    })
+}
+// Borrowed producer identity travels beside the existing live census. It
+// never changes an allocator Layout, pays an invoice, or retains the payload.
+// The guard restores nested producer identity on both return and unwind.
+type PurgeProducer = (&'static str, &'static str);
+const UNKNOWN_PURGE_PRODUCER: PurgeProducer = ("unattributed", "");
+thread_local! {
+    static PURGE_PRODUCER: std::cell::Cell<PurgeProducer> =
+        const { std::cell::Cell::new(UNKNOWN_PURGE_PRODUCER) };
+}
+pub(crate) struct PurgeProducerGuard(PurgeProducer);
+impl PurgeProducerGuard {
+    pub(crate) fn new<T>(site: &'static str) -> Self {
+        Self(PURGE_PRODUCER.with(|slot| slot.replace((site, std::any::type_name::<T>()))))
+    }
+    // Function scopes supply only a borrowed site. A codec already on the
+    // stack remains the authority for the actual value type; no type is guessed.
+    pub(crate) fn site(site: &'static str) -> Self {
+        Self(PURGE_PRODUCER.with(|slot| {
+            let enclosing = slot.get();
+            slot.replace((site, enclosing.1))
+        }))
+    }
+}
+impl Drop for PurgeProducerGuard {
+    fn drop(&mut self) {
+        PURGE_PRODUCER.with(|slot| slot.set(self.0));
+    }
+}
+
+// Purge-only attribution of the existing header-inclusive peak. This is a
+// fixed live census, not an allocating trace. Overflow/missing frees invalidate
+// attribution; the existing peak and equality oracle are never adjusted.
+#[derive(Clone, Copy)]
+pub(crate) struct PurgePeakReceipt {
+    pub(crate) complete: bool,
+    pub(crate) payload_peak: usize,
+    publication_frontier: Option<u64>,
+    raw_peak: usize,
+    payload_at_raw_peak: usize,
+    header_at_raw_peak: usize,
+    padding_at_raw_peak: usize,
+    // Actual allocator pointer, requested size/alignment, private overhead.
+    request_at_raw_peak: (usize, usize, usize, usize),
+    producer_snapshot: PurgeProducerSnapshotHandle,
+}
+impl PurgePeakReceipt {
+    const fn new() -> Self {
+        Self {
+            complete: true,
+            payload_peak: 0,
+            publication_frontier: None,
+            raw_peak: 0,
+            payload_at_raw_peak: 0,
+            header_at_raw_peak: 0,
+            padding_at_raw_peak: 0,
+            request_at_raw_peak: (0, 0, 0, 0),
+            producer_snapshot: PurgeProducerSnapshotHandle::INVALID,
+        }
+    }
+}
+// Receipts copied through thread return values and assertion formatting carry
+// only scalars and a checked handle, never a 1024-entry census.
+const _: () = assert!(std::mem::size_of::<PurgePeakReceipt>() <= 128);
+// All callers are the two measurements in each of two schema-width rows.
+// Slots are reserved once, never recycled: receipts remain valid after the
+// measuring thread exits and while the parent retains all four receipts.
+// Static initialization and element-wise writes never materialize a producer
+// array on the stack or allocate one on the heap.
+#[derive(Clone, Copy)]
+struct PurgeProducerSnapshotHandle {
+    slot: usize,
+    generation: usize,
+}
+impl PurgeProducerSnapshotHandle {
+    const INVALID: Self = Self {
+        slot: usize::MAX,
+        generation: 0,
+    };
+}
+struct PurgeProducerSnapshot {
+    generation: usize,
+    producers: [PurgeProducer; 1024],
+    live_at_raw_peak: [(usize, usize, usize, usize); 1024],
+}
+impl PurgeProducerSnapshot {
+    const fn new() -> Self {
+        Self {
+            generation: 0,
+            producers: [UNKNOWN_PURGE_PRODUCER; 1024],
+            live_at_raw_peak: [(0, 0, 0, 0); 1024],
+        }
+    }
+}
+impl Measurement {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
+    fn reserve_purge_producer_snapshot(&mut self) -> PurgeProducerSnapshotHandle {
+        let index = self.purge_producer_snapshots_used;
+        let Some(generation) = index.checked_add(1) else {
+            return PurgeProducerSnapshotHandle::INVALID;
+        };
+        let Some(slot) = self.purge_producer_snapshots.get_mut(index) else {
+            return PurgeProducerSnapshotHandle::INVALID;
+        };
+        if slot.generation != 0 {
+            return PurgeProducerSnapshotHandle::INVALID;
+        }
+        slot.generation = generation;
+        self.purge_producer_snapshots_used = generation;
+        PurgeProducerSnapshotHandle {
+            slot: index,
+            generation,
+        }
+    }
+    fn purge_producer_snapshot(
+        &self,
+        handle: PurgeProducerSnapshotHandle,
+    ) -> Option<&PurgeProducerSnapshot> {
+        self.purge_producer_snapshots
+            .get(handle.slot)
+            .filter(|slot| handle.generation != 0 && slot.generation == handle.generation)
+    }
+    fn snapshot_purge_producers(&mut self) {
+        let handle = self.purge_receipt.producer_snapshot;
+        if self.purge_producer_snapshot(handle).is_none() {
+            self.purge_receipt.complete = false;
+            return;
+        }
+        for index in 0..self.purge_live_producers.len() {
+            self.purge_producer_snapshots[handle.slot].producers[index] =
+                self.purge_live_producers[index];
+            self.purge_producer_snapshots[handle.slot].live_at_raw_peak[index] =
+                self.purge_live[index];
+        }
+    }
+}
+impl std::fmt::Debug for PurgePeakReceipt {
+    #[expect(
+        clippy::collapsible_if,
+        reason = "The fixture keeps each observation precondition explicit."
+    )]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let complete = {
+            let measurement = MEASUREMENT.lock().unwrap();
+            self.complete
+                && measurement
+                    .purge_producer_snapshot(self.producer_snapshot)
+                    .is_some()
+        };
+        let mut report = f.debug_struct("PurgePeakReceipt");
+        report
+            .field("complete", &complete)
+            .field("payload_peak", &self.payload_peak)
+            .field("publication_frontier", &self.publication_frontier)
+            .field("raw_peak", &self.raw_peak)
+            .field("payload_at_raw_peak", &self.payload_at_raw_peak)
+            .field("header_at_raw_peak", &self.header_at_raw_peak)
+            .field("padding_at_raw_peak", &self.padding_at_raw_peak)
+            .field("request_at_raw_peak", &self.request_at_raw_peak);
+        for index in 0..1024 {
+            // Copy one request and its borrowed producer identity under a short
+            // lock; formatting happens only after the lock has been released.
+            let entry = {
+                let measurement = MEASUREMENT.lock().unwrap();
+                measurement
+                    .purge_producer_snapshot(self.producer_snapshot)
+                    .map(|slot| (slot.live_at_raw_peak[index], slot.producers[index]))
+            };
+            if let Some((request, producer)) = entry {
+                if request.0 != 0 {
+                    report
+                        .field("live_pointer_size_align_overhead", &request)
+                        .field("producer_site_and_value_type", &producer);
+                }
+            }
+        }
+        report.finish()
+    }
+}
+// Read the actual commit argument, not a guessed pre-test LSN or clock seed.
+pub(crate) fn note_purge_publication_frontier(frontier: u64) {
+    let mut measurement = MEASUREMENT.lock().unwrap();
+    if measurement.purge_active {
+        measurement.purge_receipt.publication_frontier = Some(frontier);
+    }
+}
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_public_contract_tests.rs"
+    )
+)]
+pub(crate) fn measured_purge<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, usize, usize, PurgePeakReceipt) {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            MEASUREMENT.lock().unwrap().purge_active = false;
+        }
+    }
+    {
+        let mut measurement = MEASUREMENT.lock().unwrap();
+        assert!(!measurement.purge_active);
+        measurement.purge_active = true;
+        // Reset in place: no 32 KiB array value is built on this thread's stack.
+        for request in &mut measurement.purge_live {
+            *request = (0, 0, 0, 0);
+        }
+        for producer in &mut measurement.purge_live_producers {
+            *producer = UNKNOWN_PURGE_PRODUCER;
+        }
+        let handle = measurement.reserve_purge_producer_snapshot();
+        measurement.purge_receipt = PurgePeakReceipt::new();
+        measurement.purge_receipt.producer_snapshot = handle;
+        if measurement.purge_producer_snapshot(handle).is_none() {
+            measurement.purge_receipt.complete = false;
+        }
+    }
+    let guard = Guard;
+    let (value, peak, live) = measured(operation);
+    let receipt = {
+        let mut measurement = MEASUREMENT.lock().unwrap();
+        if measurement
+            .purge_producer_snapshot(measurement.purge_receipt.producer_snapshot)
+            .is_none()
+        {
+            measurement.purge_receipt.complete = false;
+        }
+        measurement.purge_receipt
+    };
+    drop(guard);
+    // measured() and purge guards have both stopped; no observer lock is held.
+    // Each of the four real receipts is exported before its caller assertions.
+    eprintln!("PURGE_RAW_RECEIPT {receipt:?}");
+    (value, peak, live, receipt)
+}
+
+struct Measurement {
+    purge_active: bool,
+    purge_live: [(usize, usize, usize, usize); 1024],
+    purge_live_producers: [PurgeProducer; 1024],
+    purge_receipt: PurgePeakReceipt,
+    purge_producer_snapshots: [PurgeProducerSnapshot; 4],
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
+    purge_producer_snapshots_used: usize,
+    last_window: usize,
+    active_window: usize,
+    live: usize,
+    peak: usize,
+    payload_live: usize,
+    cache_payload_live: usize,
+    cache_payload_peak: usize,
+    cache_counter_identity: usize,
+    cache_reserve_identity: usize,
+    cache_payer_mismatch: bool,
+    unscoped_page_allocations: usize,
+    payload_peak: usize,
+    source_unfunded_peak: usize,
+    source_unfunded_request: (usize, usize, usize, bool),
+}
+static MEASUREMENT: Mutex<Measurement> = Mutex::new(Measurement {
+    purge_active: false,
+    purge_live: [(0, 0, 0, 0); 1024],
+    purge_live_producers: [UNKNOWN_PURGE_PRODUCER; 1024],
+    purge_receipt: PurgePeakReceipt::new(),
+    purge_producer_snapshots: [const { PurgeProducerSnapshot::new() }; 4],
+    purge_producer_snapshots_used: 0,
+    last_window: 0,
+    active_window: 0,
+    live: 0,
+    peak: 0,
+    payload_live: 0,
+    cache_payload_live: 0,
+    cache_payload_peak: 0,
+    cache_counter_identity: 0,
+    cache_reserve_identity: 0,
+    cache_payer_mismatch: false,
+    unscoped_page_allocations: 0,
+    payload_peak: 0,
+    source_unfunded_peak: 0,
+    source_unfunded_request: (0, 0, 0, false),
+});
 
 #[repr(C)]
 struct Header {
-    measured: bool,
+    #[cfg(feature = "test-seams")]
+    coordination_generation: u64,
+    // Membership in the narrower declaration observation, independent of the
+    // enclosing measured() window. Earlier blocks never debit this census.
+    declaration_epoch: usize,
+    window: usize,
     bytes: usize,
+    cache_funding: AtomicUsize,
 }
 
-fn allocation_layout(layout: Layout) -> (Layout, usize) {
+impl Header {
+    fn snapshot(&self) -> Self {
+        Self {
+            #[cfg(feature = "test-seams")]
+            coordination_generation: self.coordination_generation,
+            declaration_epoch: self.declaration_epoch,
+            window: self.window,
+            bytes: self.bytes,
+            cache_funding: AtomicUsize::new(self.cache_funding.load(AtomicOrdering::SeqCst)),
+        }
+    }
+}
+pub(crate) fn allocation_layout(layout: Layout) -> (Layout, usize) {
     let alignment = layout.align().max(std::mem::align_of::<Header>());
     let offset = std::mem::size_of::<Header>().next_multiple_of(alignment);
     (
@@ -49,43 +1367,475 @@ fn allocation_layout(layout: Layout) -> (Layout, usize) {
 
 unsafe impl GlobalAlloc for MeasuredAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let page_payment = NEXT_PAGE_PAYMENT
+            .try_with(|slot| slot.replace((0, 0, 0, 0)))
+            .unwrap_or((0, 0, 0, 0));
+        let page_kind = if page_payment.0 == layout.size() && page_payment.1 == layout.align() {
+            page_payment.2
+        } else if page_payment.2 != 0 {
+            3
+        } else {
+            0
+        };
+        let cache_funding = if page_kind == 1 { page_payment.3 } else { 0 };
+        crate::vector_read_memory::root_observations::install_physical_observer();
+        #[cfg(feature = "test-seams")]
+        let coordination_allocation =
+            contextdb_core::coordination_test_observation::allocation_enter(layout);
+        if NATIVE_REQUEST_ACTIVE
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(false)
+            && crate::vector_read_memory::native_ownership_proof::refuse_selected_live_layout(
+                layout,
+            )
+            || crate::vector_read_memory::native_ownership_proof::refuse_allocation(layout)
+        {
+            native_scan_producer_tests::allocator_null(layout);
+            #[cfg(feature = "test-seams")]
+            contextdb_core::coordination_test_observation::allocation_returned(
+                coordination_allocation,
+                0,
+                0,
+                0,
+                false,
+            );
+            return std::ptr::null_mut();
+        }
         let (allocation, offset) = allocation_layout(layout);
+        let source_counter = SOURCE_REQUEST_COUNTER
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
+        if source_counter != 0 {
+            let index = NATIVE_REQUEST_COUNT.with(std::cell::Cell::get);
+            let funding = observed_source_funding(source_counter);
+            let ordinal = NATIVE_REQUEST_TOTAL
+                .with(std::cell::Cell::get)
+                .saturating_add(1);
+            LAST_SOURCE_REQUEST_CREDIT.with(|slot| slot.set((source_counter, funding, ordinal)));
+            if index < 256 {
+                SOURCE_REQUEST_CREDIT.with(|credits| {
+                    let mut entries = credits.get();
+                    entries[index] = funding;
+                    credits.set(entries);
+                });
+            }
+        }
+        let declaration_epoch = DECLARATION_EPOCH
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
+        DECLARATION_EVENT.with(|slot| slot.set([0, layout.size(), layout.align(), 1]));
+        sample_declaration_funding(layout.size(), 0);
         let base = unsafe { System.alloc(allocation) };
         if base.is_null() {
+            // No physical block was produced; retire the attempted request.
+            if declaration_epoch != 0 {
+                DECLARATION_EVIDENCE.with(|slot| {
+                    let mut evidence = slot.borrow_mut();
+                    evidence.invalidate([0, layout.size(), layout.align(), 1]);
+                    evidence.pending = None;
+                });
+            }
+            sample_declaration_funding(0, layout.size());
+            #[cfg(feature = "test-seams")]
+            contextdb_core::coordination_test_observation::allocation_returned(
+                coordination_allocation,
+                0,
+                0,
+                0,
+                true,
+            );
             return base;
         }
         let pointer = unsafe { base.add(offset) };
-        let measured = measuring_on_this_thread();
+        if declaration_epoch != 0 {
+            DECLARATION_EVIDENCE.with(|slot| {
+                let mut evidence = slot.borrow_mut();
+                if let Some(index) = evidence.pending.take() {
+                    evidence.requests[index].pointer = pointer as usize;
+                }
+                if let Some(gap) = evidence.first_gap.as_mut()
+                    && gap[0] == 0
+                    && gap[3] == 1
+                {
+                    gap[0] = pointer as usize;
+                    if let Some(request) = evidence.first_gap_request.as_mut() {
+                        request.pointer = pointer as usize;
+                    }
+                }
+            });
+        }
+        let window = MEASURING_HERE.try_with(std::cell::Cell::get).unwrap_or(0);
+        if NATIVE_REQUEST_ACTIVE
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(false)
+        {
+            NATIVE_REQUEST_COUNT.with(|count| {
+                let index = count.get();
+                if index < 256 {
+                    NATIVE_REQUESTS.with(|requests| {
+                        let mut entries = requests.get();
+                        entries[index] = (pointer as usize, layout.size(), layout.align());
+                        requests.set(entries);
+                    });
+                }
+                if index >= 256 {
+                    NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(true));
+                }
+                count.set(index.saturating_add(1).min(256));
+                NATIVE_REQUEST_TOTAL.with(|total| total.set(total.get().saturating_add(1)));
+            });
+        }
         unsafe {
             pointer
                 .sub(std::mem::size_of::<Header>())
                 .cast::<Header>()
                 .write(Header {
-                    measured,
+                    #[cfg(feature = "test-seams")]
+                    coordination_generation:
+                        contextdb_core::coordination_test_observation::allocator_generation(
+                            coordination_allocation,
+                        ),
+                    declaration_epoch,
+                    window,
                     bytes: allocation.size(),
+                    cache_funding: AtomicUsize::new(cache_funding),
                 });
         }
-        if measured {
-            let live =
-                LIVE.fetch_add(allocation.size(), AtomicOrdering::SeqCst) + allocation.size();
-            PEAK.fetch_max(live, AtomicOrdering::SeqCst);
+        #[cfg(feature = "test-seams")]
+        contextdb_core::coordination_test_observation::allocation_returned(
+            coordination_allocation,
+            pointer as usize,
+            window,
+            contextdb_core::coordination_test_observation::allocator_generation(
+                coordination_allocation,
+            ),
+            true,
+        );
+        // The producer armed this immediately before its concrete constructor.
+        // Bind the real allocator pointer, never an erased-handle ABI or stack T.
+        NEXT_EXACT_FREE.with(|slot| {
+            let (bytes, align, counter) = slot.replace((0, 0, 0));
+            if bytes != 0 && bytes == layout.size() && align == layout.align() {
+                watch_exact_free_for_test((pointer as usize, bytes, align), counter);
+            }
+        });
+        if window != 0 {
+            LAST_REQUEST_POINTER.with(|last| last.set(pointer as usize));
+            LAST_REQUEST.with(|last| {
+                let (_, _, count) = last.get();
+                last.set((layout.size(), layout.align(), count + 1));
+            });
+            let mut measurement = MEASUREMENT.lock().unwrap();
+            if measurement.active_window == window {
+                measurement.live += allocation.size();
+                measurement.peak = measurement.peak.max(measurement.live);
+                measurement.payload_live += layout.size();
+                measurement.payload_peak = measurement.payload_peak.max(measurement.payload_live);
+                if cache_funding != 0 {
+                    measurement.cache_payload_live += layout.size();
+                    measurement.cache_payload_peak = measurement
+                        .cache_payload_peak
+                        .max(measurement.cache_payload_live);
+                }
+                if page_kind == 3 && source_counter != 0 {
+                    measurement.unscoped_page_allocations += 1;
+                    if layout.size() > measurement.source_unfunded_peak {
+                        measurement.source_unfunded_peak = layout.size();
+                        measurement.source_unfunded_request =
+                            (layout.size(), measurement.payload_live, 0, false);
+                    }
+                }
+                if measurement.purge_active {
+                    let request = (pointer as usize, layout.size(), layout.align(), offset);
+                    if let Some(index) = measurement.purge_live.iter().position(|slot| slot.0 == 0)
+                    {
+                        measurement.purge_live[index] = request;
+                        measurement.purge_live_producers[index] = PURGE_PRODUCER
+                            .try_with(std::cell::Cell::get)
+                            .unwrap_or(UNKNOWN_PURGE_PRODUCER);
+                    } else {
+                        measurement.purge_receipt.complete = false;
+                    }
+                    measurement.purge_receipt.payload_peak = measurement
+                        .purge_receipt
+                        .payload_peak
+                        .max(measurement.payload_live);
+                    if measurement.live > measurement.purge_receipt.raw_peak {
+                        measurement.purge_receipt.raw_peak = measurement.live;
+                        measurement.purge_receipt.payload_at_raw_peak = measurement.payload_live;
+                        measurement.purge_receipt.request_at_raw_peak = request;
+                        measurement.snapshot_purge_producers();
+                        let count = measurement
+                            .purge_live
+                            .iter()
+                            .filter(|slot| slot.0 != 0)
+                            .count();
+                        let overhead: usize =
+                            measurement.purge_live.iter().map(|slot| slot.3).sum();
+                        let headers = count * std::mem::size_of::<Header>();
+                        measurement.purge_receipt.header_at_raw_peak = headers;
+                        measurement.purge_receipt.padding_at_raw_peak = overhead - headers;
+                        let payload: usize = measurement.purge_live.iter().map(|slot| slot.1).sum();
+                        if payload != measurement.payload_live
+                            || payload + overhead != measurement.live
+                        {
+                            measurement.purge_receipt.complete = false;
+                        }
+                    }
+                }
+                if source_counter != 0 {
+                    let funded = observed_source_funding(source_counter);
+                    let gap = measurement
+                        .payload_live
+                        .saturating_sub(measurement.cache_payload_live)
+                        .saturating_sub(funded);
+                    if gap > measurement.source_unfunded_peak {
+                        measurement.source_unfunded_peak = gap;
+                        measurement.source_unfunded_request =
+                            (layout.size(), measurement.payload_live, funded, false);
+                    }
+                }
+            }
         }
+        selected_json_producer_rows::allocated(pointer as usize, layout);
+        answer_copy_allocated(pointer as usize, layout);
+        maintenance_payload_allocated(pointer as usize, layout.size());
+        super::super::writer_row_heads::staging_witness::allocated(pointer as usize, layout.size());
+        crate::vector_read_memory::native_ownership_proof::allocated(pointer, layout, window);
         pointer
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         let (allocation, offset) = allocation_layout(layout);
-        let header = unsafe {
-            pointer
-                .sub(std::mem::size_of::<Header>())
-                .cast::<Header>()
-                .read()
-        };
-        if header.measured {
-            LIVE.fetch_sub(header.bytes, AtomicOrdering::SeqCst);
+        let header =
+            unsafe { &*(pointer.sub(std::mem::size_of::<Header>()).cast::<Header>()) }.snapshot();
+        if header.window != 0 {
+            let mut measurement = MEASUREMENT.lock().unwrap();
+            if measurement.active_window == header.window {
+                let source_counter = SOURCE_REQUEST_COUNTER
+                    .try_with(std::cell::Cell::get)
+                    .unwrap_or(0);
+                if source_counter != 0 {
+                    let funded = observed_source_funding(source_counter);
+                    let gap = measurement
+                        .payload_live
+                        .saturating_sub(measurement.cache_payload_live)
+                        .saturating_sub(funded);
+                    if gap > measurement.source_unfunded_peak {
+                        measurement.source_unfunded_peak = gap;
+                        measurement.source_unfunded_request =
+                            (layout.size(), measurement.payload_live, funded, true);
+                    }
+                }
+                if measurement.purge_active {
+                    if let Some(index) = measurement
+                        .purge_live
+                        .iter()
+                        .position(|slot| slot.0 == pointer as usize)
+                    {
+                        let slot = measurement.purge_live[index];
+                        let matches = slot.1 == layout.size() && slot.2 == layout.align();
+                        measurement.purge_live[index] = (0, 0, 0, 0);
+                        measurement.purge_live_producers[index] = UNKNOWN_PURGE_PRODUCER;
+                        if !matches {
+                            measurement.purge_receipt.complete = false;
+                        }
+                    } else {
+                        measurement.purge_receipt.complete = false;
+                    }
+                }
+                if header.cache_funding.load(AtomicOrdering::SeqCst) != 0 {
+                    measurement.cache_payload_live -= layout.size();
+                }
+                measurement.payload_live -= layout.size();
+                measurement.live -= header.bytes;
+            }
         }
+        let payload_watch = WATCH_PAYLOAD_FREE.with(std::cell::Cell::get);
+        let watching_payload = payload_watch.0 == pointer as usize && payload_watch.0 != 0;
+        let watch = WATCH_NODE_FREE.with(std::cell::Cell::get);
+        let watching_node = watch.0 == pointer as usize && watch.0 != 0;
+        let process_before_free = if watching_node {
+            crate::memory_accounting::process_aggregate_bytes_for_test()
+        } else {
+            0
+        };
+        let used_before_free = if watching_node {
+            unsafe { &*(watch.1 as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+        } else {
+            0
+        };
+        let native_watch = NATIVE_FREE.iter().find(|watch| {
+            watch.pointer.load(AtomicOrdering::SeqCst) == pointer as usize
+                && watch.window.load(AtomicOrdering::SeqCst) == header.window
+        });
+        if let Some(watch) = native_watch {
+            let counter = watch.counter.load(AtomicOrdering::SeqCst);
+            let before = if counter == 0 {
+                crate::memory_accounting::process_aggregate_bytes_for_test()
+            } else {
+                unsafe { &*(counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+            };
+            let live = NATIVE_FREE
+                .iter()
+                .filter(|w| {
+                    w.pointer.load(AtomicOrdering::SeqCst) != 0
+                        && w.counter.load(AtomicOrdering::SeqCst) == counter
+                })
+                .map(|w| w.bytes.load(AtomicOrdering::SeqCst))
+                .sum();
+            watch.live_at_free.store(live, AtomicOrdering::SeqCst);
+            watch.before.store(before, AtomicOrdering::SeqCst);
+            #[cfg(feature = "test-seams")]
+            crate::database::ordinary_native_owner_tests::replacement_physical_cut(
+                (pointer as usize, layout.size(), layout.align()),
+                counter,
+                before,
+                false,
+            );
+            // capture969 begin
+            #[cfg(feature = "test-seams")]
+            crate::database::retained_trace_ownership_tests::ordered_cut(
+                "native-free-before",
+                [
+                    pointer as usize,
+                    layout.size(),
+                    layout.align(),
+                    header.window,
+                    watch as *const _ as usize,
+                    watch.window.load(AtomicOrdering::SeqCst),
+                    watch.bytes.load(AtomicOrdering::SeqCst),
+                    before,
+                ],
+            );
+            // capture969 end
+        }
+        super::super::writer_row_heads::staging_witness::freed(pointer as usize, layout.size());
+        crate::vector_read_memory::native_ownership_proof::before_free(
+            pointer,
+            layout,
+            header.window,
+        );
+        // Keep the complete live request, including this block, in the
+        // census until System has physically freed it. An early invoice
+        // release therefore appears as a gap at its real deallocation.
+        // A block allocated under any declaration observation of the current
+        // census leaves it here, including one freed under a later
+        // observation of the same census.
+        let current_epoch = DECLARATION_EPOCH
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
+        let census_from = DECLARATION_CENSUS_FROM
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
+        let declaration_free = header.declaration_epoch != 0
+            && (current_epoch == header.declaration_epoch
+                || (current_epoch != 0
+                    && census_from != 0
+                    && header.declaration_epoch >= census_from));
+        if declaration_free {
+            DECLARATION_EVENT
+                .with(|slot| slot.set([pointer as usize, layout.size(), layout.align(), 2]));
+            sample_declaration_funding(0, 0);
+        }
+        selected_json_producer_rows::freed(pointer as usize, layout, false);
+        answer_copy_free(pointer as usize, false);
+        let producer_free = crate::vector_read_memory::root_observations::before_physical_free(
+            pointer as usize,
+            layout,
+        );
+        #[cfg(feature = "test-seams")]
+        let coordination_free = contextdb_core::coordination_test_observation::before_free(
+            pointer as usize,
+            layout,
+            header.window,
+            header.coordination_generation,
+        );
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
+        }
+        #[cfg(feature = "test-seams")]
+        contextdb_core::coordination_test_observation::after_free(coordination_free);
+        crate::vector_read_memory::root_observations::after_physical_free(producer_free);
+        super::super::writer_row_heads::staging_witness::after_free(pointer as usize);
+        selected_json_producer_rows::freed(pointer as usize, layout, true);
+        answer_copy_free(pointer as usize, true);
+        if declaration_free {
+            DECLARATION_EVENT
+                .with(|slot| slot.set([pointer as usize, layout.size(), layout.align(), 3]));
+            sample_declaration_funding(0, layout.size());
+        }
+        crate::vector_read_memory::native_ownership_proof::after_free(pointer);
+        maintenance_payload_freed(pointer as usize);
+        if let Some(watch) = native_watch {
+            let counter = watch.counter.load(AtomicOrdering::SeqCst);
+            let after = if counter == 0 {
+                crate::memory_accounting::process_aggregate_bytes_for_test()
+            } else {
+                unsafe { &*(counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+            };
+            watch.after.store(after, AtomicOrdering::SeqCst);
+            #[cfg(feature = "test-seams")]
+            crate::database::ordinary_native_owner_tests::replacement_physical_cut(
+                (pointer as usize, layout.size(), layout.align()),
+                counter,
+                after,
+                true,
+            );
+            // capture969 begin
+            #[cfg(feature = "test-seams")]
+            crate::database::retained_trace_ownership_tests::ordered_cut(
+                "native-free-after",
+                [
+                    pointer as usize,
+                    layout.size(),
+                    layout.align(),
+                    header.window,
+                    watch as *const _ as usize,
+                    watch.window.load(AtomicOrdering::SeqCst),
+                    watch.bytes.load(AtomicOrdering::SeqCst),
+                    after,
+                ],
+            );
+            // capture969 end
+            watch.count.fetch_add(1, AtomicOrdering::SeqCst);
+            watch.pointer.store(0, AtomicOrdering::SeqCst);
+        }
+        graph_buffer_deallocated(pointer as usize);
+        if watching_payload {
+            WATCH_PAYLOAD_FREE.with(|slot| slot.set((payload_watch.0, true, false)));
+            let observer = WATCH_PAYLOAD_ACCOUNTANT.with(std::cell::Cell::get);
+            if observer != 0 {
+                // External observer Arc remains alive for this exact payload.
+                // The node pointer is never dereferenced after physical free.
+                let accountant = unsafe { &*(observer as *const MemoryAccountant) };
+                let registration = accountant.writer_registration_observation_for_test();
+                PAYLOAD_FREE_CENSUS.with(|slot| {
+                    slot.set((
+                        registration.2,
+                        registration.3,
+                        accountant.writer_fixed_ownership().2,
+                        accountant.usage().used,
+                    ))
+                });
+            }
+        }
+        if watching_node {
+            WATCH_NODE_PROCESS_FREE.with(|slot| {
+                slot.set((
+                    process_before_free,
+                    crate::memory_accounting::process_aggregate_bytes_for_test(),
+                ))
+            });
+            let payload_done = WATCH_PAYLOAD_FREE.with(std::cell::Cell::get);
+            if payload_done.0 != 0 {
+                WATCH_PAYLOAD_FREE
+                    .with(|slot| slot.set((payload_done.0, payload_done.1, payload_done.1)));
+            }
+            let used_after_free =
+                unsafe { &*(watch.1 as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
+            WATCH_NODE_FREE
+                .with(|slot| slot.set((watch.0, watch.1, used_before_free, used_after_free, true)));
         }
     }
 }
@@ -94,18 +1844,148 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
 static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
 
 /// Run `operation` with every allocation on this thread measured, returning
-/// its peak live bytes and what it still held when it ended.
+/// its header-inclusive peak live bytes and what it still held when it ended.
+// These totals include private Header and alignment padding. Declaration
+// funding uses native Layout bytes; measured_purge additionally attributes the
+// unchanged raw peak to native payload, private headers and padding.
 pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
-    LIVE.store(0, AtomicOrdering::SeqCst);
-    PEAK.store(0, AtomicOrdering::SeqCst);
-    MEASURING_HERE.with(|measuring| measuring.set(true));
-    MEASURING.store(true, AtomicOrdering::SeqCst);
-    let value = operation();
-    MEASURING.store(false, AtomicOrdering::SeqCst);
-    MEASURING_HERE.with(|measuring| measuring.set(false));
-    let peak = PEAK.load(AtomicOrdering::SeqCst);
-    let live = LIVE.load(AtomicOrdering::SeqCst);
+    let (value, peak, live, _, _) = measured_payload(operation);
     (value, peak, live)
+}
+
+/// Scalar physical measurement without the purge producer census. Payload
+/// counts actual allocator Layout bytes; raw counts also include our Header
+/// and alignment padding. Only allocations born in this window contribute.
+pub(crate) fn measured_payload<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, usize, usize, usize, usize) {
+    // All oracle callers are serial tests. Reject overlap without holding the
+    // allocator's mutex while constructing a panic.
+    let window = {
+        let mut measurement = MEASUREMENT.lock().unwrap();
+        if measurement.active_window != 0 {
+            None
+        } else {
+            measurement.last_window += 1;
+            measurement.active_window = measurement.last_window;
+            measurement.live = 0;
+            measurement.peak = 0;
+            measurement.payload_live = 0;
+            measurement.cache_payload_live = 0;
+            measurement.cache_payload_peak = 0;
+            measurement.cache_counter_identity = 0;
+            measurement.cache_reserve_identity = 0;
+            measurement.cache_payer_mismatch = false;
+            measurement.unscoped_page_allocations = 0;
+            measurement.payload_peak = 0;
+            measurement.source_unfunded_peak = 0;
+            measurement.source_unfunded_request = (0, 0, 0, false);
+            Some(measurement.active_window)
+        }
+    }
+    .expect("allocation measurement windows cannot overlap");
+    struct WindowGuard;
+    impl Drop for WindowGuard {
+        fn drop(&mut self) {
+            MEASURING_HERE.with(|measuring| measuring.set(0));
+            MEASUREMENT.lock().unwrap().active_window = 0;
+        }
+    }
+    let guard = WindowGuard;
+    MEASURING_HERE.with(|measuring| measuring.set(window));
+    let value = operation();
+    let (peak, live, payload_peak, payload_live) = {
+        let measurement = MEASUREMENT.lock().unwrap();
+        (
+            measurement.peak,
+            measurement.live,
+            measurement.payload_peak,
+            measurement.payload_live,
+        )
+    };
+    drop(guard);
+    (value, peak, live, payload_peak, payload_live)
+}
+
+#[test]
+#[serial]
+fn scalar_payload_measurement_has_no_pointer_census_ceiling() {
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let mut pointers = [std::ptr::null_mut(); 1050];
+    let (_, raw_peak, raw_live, payload_peak, payload_live) = measured_payload(|| {
+        for pointer in &mut pointers {
+            *pointer = unsafe { ALLOCATOR.alloc(layout) };
+            assert!(!pointer.is_null());
+        }
+        for pointer in pointers {
+            unsafe { ALLOCATOR.dealloc(pointer, layout) };
+        }
+    });
+    assert_eq!(payload_peak, pointers.len() * layout.size());
+    assert_eq!(
+        raw_peak,
+        pointers.len() * allocation_layout(layout).0.size()
+    );
+    assert_eq!((raw_live, payload_live), (0, 0));
+}
+
+#[test]
+#[serial]
+fn an_earlier_windows_delayed_free_does_not_change_the_next_window() {
+    let layout = Layout::from_size_align(4096, 1).unwrap();
+    let bytes = allocation_layout(layout).0.size();
+    let (old, first_peak, first_live) = measured(|| unsafe { ALLOCATOR.alloc(layout) });
+    assert!(!old.is_null());
+    assert_eq!((first_peak, first_live), (bytes, bytes));
+
+    let (current, peak, live) = measured(|| unsafe {
+        ALLOCATOR.dealloc(old, layout);
+        ALLOCATOR.alloc(layout)
+    });
+    assert!(!current.is_null());
+    assert_eq!((peak, live), (bytes, bytes));
+    unsafe { ALLOCATOR.dealloc(current, layout) };
+}
+
+#[test]
+#[serial]
+fn a_cross_thread_free_is_attributed_only_to_its_allocation_window() {
+    let layout = Layout::from_size_align(4096, 1).unwrap();
+    let bytes = allocation_layout(layout).0.size();
+    let (old, _, _) = measured(|| unsafe { ALLOCATOR.alloc(layout) });
+    assert!(!old.is_null());
+    let old = old as usize;
+    // Spawn outside measurement so the thread's own allocation lifetime is
+    // irrelevant; barriers drive both frees while the next window is active.
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let finished = Arc::new(std::sync::Barrier::new(2));
+    let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let neighbour = {
+        let ready = Arc::clone(&ready);
+        let finished = Arc::clone(&finished);
+        let current = Arc::clone(&current);
+        std::thread::spawn(move || {
+            ready.wait();
+            unsafe {
+                ALLOCATOR.dealloc(old as *mut u8, layout);
+                ALLOCATOR.dealloc(current.load(AtomicOrdering::SeqCst) as *mut u8, layout);
+            }
+            finished.wait();
+        })
+    };
+    let ((), peak, live) = measured(|| {
+        let pointer = unsafe { ALLOCATOR.alloc(layout) };
+        assert!(!pointer.is_null());
+        current.store(pointer as usize, AtomicOrdering::SeqCst);
+        ready.wait();
+        finished.wait();
+    });
+    neighbour.join().unwrap();
+    assert_eq!((peak, live), (bytes, 0));
+    // Destructive negative evidence must remain confined to its child. These
+    // original physical-free rows then run in the unchanged parent process.
+    crate::vector_read_memory::root_observations::installed_provenance_rejects_reuse_and_payer_changes();
+    crate::vector_read_memory::native_ownership_proof::run_native_rows();
 }
 
 /// The oracle measures this thread and no other. A neighbour allocating
@@ -114,26 +1994,30 @@ pub(crate) fn measured<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
 #[test]
 #[serial]
 fn the_allocation_oracle_measures_only_the_thread_under_test() {
-    let running = Arc::new(AtomicBool::new(true));
-    let neighbour = {
-        let running = Arc::clone(&running);
-        std::thread::spawn(move || {
-            let mut held: Vec<Vec<u8>> = Vec::new();
-            while running.load(AtomicOrdering::SeqCst) {
-                held.push(vec![0u8; 1024 * 1024]);
-                if held.len() > 8 {
-                    held.clear();
-                }
-                std::thread::yield_now();
-            }
-        })
-    };
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
+    let (allocated_tx, allocated_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let neighbour = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("measurement start never delivered");
+        let held = vec![0u8; 2 * 1024 * 1024];
+        std::hint::black_box(&held);
+        allocated_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("allocation release never delivered");
+        std::hint::black_box(&held);
+    });
     let ((), peak, _) = measured(|| {
         let small = vec![0u8; 4096];
         std::hint::black_box(&small);
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        start_tx.send(()).unwrap();
+        allocated_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("neighbour allocation never delivered");
+        release_tx.send(()).unwrap();
     });
-    running.store(false, AtomicOrdering::SeqCst);
     neighbour.join().expect("the neighbour thread finishes");
     assert!(
         peak < 1024 * 1024,
@@ -162,18 +2046,29 @@ fn accountant(limit: usize) -> Arc<MemoryAccountant> {
 /// back both.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
+    vector_identity_directory_refunds_only_after_its_buffer_is_freed();
+    vector_row_encoding_has_exact_writer_admission();
+    vector_identity_values_release_payloads_after_hashing();
     let root = tempfile::tempdir().unwrap();
-    let database = redb::Database::create(root.path().join("writer.db")).unwrap();
+    let database = ProofFixtureDatabase::create(root.path().join("writer.db")).unwrap();
     let records = (0..24_u64)
         .map(|row| wide_posting(row, 70 * 1024))
         .collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -196,9 +2091,8 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     let control_store = redb::Database::create(root.path().join("control.db")).unwrap();
     let control_write = control_store.begin_write().unwrap();
     let (_, control_peak, _) = measured(|| {
-        let mut table = control_write
-            .open_table(CONTENT_IDENTITY_NODES_TABLE)
-            .unwrap();
+        let mut table =
+            crate::persistence::content_identity::payloads::open(&control_write).unwrap();
         for record in &records {
             let blob = std::iter::once(0)
                 .chain(record.logical_key.iter().copied())
@@ -211,7 +2105,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
 
     let budget = accountant(64 * 1024 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget).into()));
     reset_work_for_test();
     let (result, peak, retained) = measured(|| {
         RedbPersistence::apply_content_identity_mutations_in_write(
@@ -262,7 +2156,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     // size of the admitted peak is enough to run it, and half of it is not.
     let exact = accountant(admitted + 64 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&exact)));
+    let mut admission = database.admission(Some(Arc::clone(&exact).into()));
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &replacements,
@@ -273,7 +2167,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     drop(write);
     let halved = accountant(admitted / 2);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&halved)));
+    let mut admission = database.admission(Some(Arc::clone(&halved).into()));
     assert!(
         matches!(
             RedbPersistence::apply_content_identity_mutations_in_write(
@@ -291,7 +2185,7 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
     // A refusal unwinds: nothing admitted and nothing still allocated.
     let tight = accountant(192 * 1024);
     let write = database.begin_write().unwrap();
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&tight)));
+    let mut admission = database.admission(Some(Arc::clone(&tight).into()));
     let (refused, refusal_peak, refusal_retained) = measured(|| {
         RedbPersistence::apply_content_identity_mutations_in_write(
             &write,
@@ -325,18 +2219,26 @@ fn a_wide_key_writer_allocates_no_more_than_it_admitted() {
 /// holding nothing.
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
     let root = tempfile::tempdir().unwrap();
-    let database = redb::Database::create(root.path().join("reader.db")).unwrap();
+    let database = ProofFixtureDatabase::create(root.path().join("reader.db")).unwrap();
     let records = (0..24_u64)
         .map(|row| wide_posting(row, 70 * 1024))
         .collect::<Vec<_>>();
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(None),
     )
     .unwrap();
     write.commit().unwrap();
@@ -346,12 +2248,12 @@ fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
     let verifier = ContentIdentityReadVerifier::open(
         &read,
         std::path::Path::new("reader.db"),
-        Some(Arc::clone(&budget)),
+        Some(Arc::clone(&budget).into()),
     )
     .unwrap();
     let baseline = budget.usage().used;
 
-    let proof = ProofMemory::admitted(Some(Arc::clone(&budget)), 8 * 1024 * 1024);
+    let proof = ProofMemory::admitted(Some(Arc::clone(&budget).into()), 8 * 1024 * 1024);
     let mut delivered = 0;
     let (visited, peak, retained) = measured(|| {
         verifier.visit_relational_index_postings::<Error>(
@@ -383,7 +2285,7 @@ fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
     // The other direction: the admission is not a phantom. Half the pool it
     // admitted cannot carry the same walk to the end, so those bytes stood for
     // memory the walk genuinely needed.
-    let halved = ProofMemory::admitted(Some(Arc::clone(&budget)), admitted / 2);
+    let halved = ProofMemory::admitted(Some(Arc::clone(&budget).into()), admitted / 2);
     let mut partial = 0;
     verifier
         .visit_relational_index_postings::<Error>(
@@ -423,26 +2325,44 @@ fn a_wide_key_reader_allocates_no_more_than_its_admitted_pool() {
 // grows with the store.
 // ---------------------------------------------------------------------------
 
-fn reset_family_fixture(path: &std::path::Path, nodes: u64) -> redb::Database {
-    let database = redb::Database::create(path).unwrap();
+fn reset_family_fixture(path: &std::path::Path, nodes: u64) -> ProofFixtureDatabase {
+    let database = ProofFixtureDatabase::create(path).unwrap();
     // The family this test resets, plus a second family that must survive it
     // untouched.
     let mut records = (0..nodes)
         .map(|row| wide_posting(row, 512))
         .collect::<Vec<_>>();
-    records.extend((0..16_u64).map(|row| {
-        ContentIdentityMutation::put(
-            LogicalFamily::Graph,
-            format!("edge-{row:08}").into_bytes(),
-            b"kept".to_vec(),
-        )
-    }));
+    let edges = (0..16_u64)
+        .map(|row| AdjEntry {
+            source: uuid::Uuid::from_u128(u128::from(row) + 1),
+            target: uuid::Uuid::from_u128(100),
+            edge_type: "kept".to_owned(),
+            properties: HashMap::from([("state".to_owned(), Value::Text("kept".to_owned()))]),
+            created_tx: TxId(1),
+            deleted_tx: None,
+            lsn: Lsn(row + 1),
+        })
+        .collect::<Vec<_>>();
+    records.extend(edges.iter().map(|edge| edge_mutation(edge).unwrap()));
     let write = database.begin_write().unwrap();
+    crate::persistence::erasure_frontiers::initialize(&write).unwrap();
     RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
+    {
+        let mut forward = write
+            .open_table(crate::persistence::GRAPH_FWD_TABLE)
+            .unwrap();
+        for edge in &edges {
+            let key = RedbPersistence::graph_fwd_key(edge);
+            let value = RedbPersistence::encode(edge).unwrap();
+            forward.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+
+    let payer = Arc::new(MemoryAccountant::with_budget(64 * 1024 * 1024));
     RedbPersistence::apply_content_identity_mutations_in_write(
         &write,
         &records,
-        &mut ProofAdmission::unaccounted(),
+        &mut database.admission(Some(payer.into())),
     )
     .unwrap();
     write.commit().unwrap();
@@ -462,7 +2382,7 @@ fn family_root(database: &redb::Database, family: LogicalFamily) -> Vec<u8> {
 
 fn family_node_count(database: &redb::Database, family: LogicalFamily) -> usize {
     let read = database.begin_read().unwrap();
-    let nodes = read.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let nodes = crate::persistence::content_identity::payloads::open(&read).unwrap();
     nodes
         .iter()
         .unwrap()
@@ -480,6 +2400,13 @@ fn family_node_count(database: &redb::Database, family: LogicalFamily) -> usize 
 
 #[test]
 #[serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn a_family_reset_admits_its_batches_and_its_peak_does_not_grow_with_the_store() {
     let mut measurements = Vec::new();
     for nodes in [256_u64, 1024] {
@@ -488,6 +2415,7 @@ fn a_family_reset_admits_its_batches_and_its_peak_does_not_grow_with_the_store()
         let selected = LogicalFamily::SchemaAndIndexes;
         let kept_root = family_root(&database, LogicalFamily::Graph);
         let kept_nodes = family_node_count(&database, LogicalFamily::Graph);
+        assert!(kept_nodes > 0);
         let selected_nodes = family_node_count(&database, selected);
         assert!(
             selected_nodes > 0,
@@ -495,7 +2423,7 @@ fn a_family_reset_admits_its_batches_and_its_peak_does_not_grow_with_the_store()
         );
 
         let budget = accountant(64 * 1024 * 1024);
-        let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+        let mut admission = database.admission(Some(Arc::clone(&budget).into()));
         let write = database.begin_write().unwrap();
         let (result, peak, _) = measured(|| {
             RedbPersistence::reset_content_identity_families_in_write(
@@ -579,7 +2507,7 @@ fn a_refused_family_reset_changes_no_stored_byte_and_leaves_nothing_admitted() {
     let before_nodes = family_node_count(&database, selected);
 
     let budget = accountant(64);
-    let mut admission = ProofAdmission::new(Some(Arc::clone(&budget)));
+    let mut admission = database.admission(Some(Arc::clone(&budget).into()));
     let write = database.begin_write().unwrap();
     let refused = RedbPersistence::reset_content_identity_families_in_write(
         &write,
@@ -600,3 +2528,2137 @@ fn a_refused_family_reset_changes_no_stored_byte_and_leaves_nothing_admitted() {
     assert_eq!(family_root(&database, selected), before_root);
     assert_eq!(family_node_count(&database, selected), before_nodes);
 }
+
+// Fixed inline address bookkeeping extends the existing allocator oracle.
+// Allocator callbacks do not allocate, borrow heap state, or synthesize frees.
+#[derive(Clone, Copy, Debug)]
+struct ExportIdentitySlot {
+    original: u64,
+    artifact: u64,
+    storage: u64,
+    is_base: bool,
+    digest: [u8; 32],
+    generation_key: [u8; 512],
+    generation_len: usize,
+    root_key: [u8; 512],
+    root_len: usize,
+}
+impl ExportIdentitySlot {
+    const EMPTY: Self = Self {
+        original: 0,
+        artifact: 0,
+        storage: 0,
+        is_base: false,
+        digest: [0; 32],
+        generation_key: [0; 512],
+        generation_len: 0,
+        root_key: [0; 512],
+        root_len: 0,
+    };
+}
+#[derive(Clone, Copy, Debug)]
+struct GraphAllocationState {
+    identities: [ExportIdentitySlot; 8],
+    identity_count: usize,
+    pointers: [usize; 8],
+    capacities: [usize; 8],
+    freed: [bool; 8],
+    count: usize,
+    originals: usize,
+    selected_base: usize,
+    selected_change: usize,
+    deallocations: usize,
+    normal: usize,
+    repair: usize,
+    retry: usize,
+    violation: bool,
+    overflow: bool,
+}
+impl GraphAllocationState {
+    const EMPTY: Self = Self {
+        identities: [ExportIdentitySlot::EMPTY; 8],
+        identity_count: 0,
+        pointers: [0; 8],
+        capacities: [0; 8],
+        freed: [false; 8],
+        count: 0,
+        originals: 0,
+        selected_base: 0,
+        selected_change: 0,
+        deallocations: 0,
+        normal: 0,
+        repair: 0,
+        retry: 0,
+        violation: false,
+        overflow: false,
+    };
+}
+thread_local! {
+    static GRAPH_ALLOCATIONS_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GRAPH_FREE_RECORD_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_ALLOCATIONS: std::cell::Cell<Option<GraphAllocationState>> = const { std::cell::Cell::new(None) };
+}
+fn graph_buffer_deallocated(pointer: usize) {
+    if GRAPH_ALLOCATIONS_ACTIVE
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+    {
+        graph_buffer_deallocated_active(pointer);
+    }
+}
+// Keep the large active record out of the allocator's inactive stack frame.
+#[cold]
+#[inline(never)]
+fn graph_buffer_deallocated_active(pointer: usize) {
+    let _ = GRAPH_FREE_RECORD_COPIES.try_with(|copies| copies.set(copies.get() + 1));
+    let _ = GRAPH_ALLOCATIONS.try_with(|slot| {
+        if let Some(mut state) = slot.get() {
+            let mut watched = false;
+            for index in 0..state.count {
+                if state.pointers[index] == pointer && !state.freed[index] {
+                    state.freed[index] = true;
+                    watched = true;
+                }
+            }
+            if watched {
+                state.deallocations += 1;
+            }
+            slot.set(Some(state));
+        }
+    });
+}
+pub(crate) struct GraphAllocationGuard(Option<GraphAllocationState>, bool);
+impl Drop for GraphAllocationGuard {
+    fn drop(&mut self) {
+        GRAPH_ALLOCATIONS.with(|slot| slot.set(self.0.take()));
+        GRAPH_ALLOCATIONS_ACTIVE.with(|active| active.set(self.1));
+    }
+}
+pub(crate) fn watch_graph_allocations() -> GraphAllocationGuard {
+    GraphAllocationGuard(
+        GRAPH_ALLOCATIONS.with(|slot| slot.replace(Some(GraphAllocationState::EMPTY))),
+        GRAPH_ALLOCATIONS_ACTIVE.with(|active| active.replace(true)),
+    )
+}
+pub(crate) fn graph_workspace_event(
+    event: &crate::vector_observations::VectorGraphWorkspaceEventForTest,
+) {
+    use crate::vector_observations::{
+        VectorGraphBufferKindForTest as Kind, VectorGraphWorkspaceEventForTest as Event,
+    };
+    GRAPH_ALLOCATIONS.with(|slot| {
+        let mut state = slot.get().expect("allocator observation scope");
+        match *event {
+            Event::GraphBuffers {
+                kind,
+                pointer,
+                capacity,
+            } => {
+                if state.count == state.pointers.len() {
+                    state.overflow = true;
+                } else {
+                    state.pointers[state.count] = pointer;
+                    state.capacities[state.count] = capacity;
+                    state.count += 1;
+                }
+                match kind {
+                    Kind::OriginalEnvelope => state.originals += 1,
+                    Kind::SelectedBase => state.selected_base += 1,
+                    Kind::SelectedChange => state.selected_change += 1,
+                }
+            }
+            Event::ExportIdentity {
+                original_generation_id,
+                artifact_generation_id,
+                storage_id,
+                is_base,
+                source_digest,
+                generation_key_pointer,
+                generation_key_len,
+                root_key_pointer,
+                root_key_len,
+            } => {
+                if state.identity_count == state.identities.len()
+                    || generation_key_len > 512
+                    || root_key_len > 512
+                {
+                    state.overflow = true;
+                } else {
+                    let mut identity = ExportIdentitySlot::EMPTY;
+                    identity.original = original_generation_id;
+                    identity.artifact = artifact_generation_id;
+                    identity.storage = storage_id;
+                    identity.is_base = is_base;
+                    identity.digest = source_digest;
+                    identity.generation_len = generation_key_len;
+                    identity.root_len = root_key_len;
+                    // The producer lends exact key bytes only for this synchronous callback.
+                    unsafe {
+                        identity.generation_key[..generation_key_len].copy_from_slice(
+                            std::slice::from_raw_parts(
+                                generation_key_pointer as *const u8,
+                                generation_key_len,
+                            ),
+                        );
+                        identity.root_key[..root_key_len].copy_from_slice(
+                            std::slice::from_raw_parts(root_key_pointer as *const u8, root_key_len),
+                        );
+                    }
+                    state.identities[state.identity_count] = identity;
+                    state.identity_count += 1;
+                }
+            }
+            Event::WorkspaceResize {
+                previous,
+                next,
+                operation,
+            } => {
+                if next >= previous {
+                    state.violation = true;
+                }
+                if state.freed[..state.count].iter().any(|freed| !freed) {
+                    state.violation = true;
+                }
+                match operation {
+                    "normal_cleanup" => state.normal += 1,
+                    "repair_cleanup" => state.repair += 1,
+                    "retry" => state.retry += 1,
+                    _ => state.violation = true,
+                }
+            }
+        }
+        slot.set(Some(state));
+    });
+}
+pub(crate) fn assert_graph_freed_before_workspace_refund(repair: bool) {
+    GRAPH_ALLOCATIONS.with(|slot| {
+        let state = slot.get().expect("allocator observation scope");
+        assert!(
+            !state.overflow,
+            "fixed oracle slots cover this smallest fixture: {state:?}"
+        );
+        assert!(
+            state.originals > 0 && state.selected_base > 0,
+            "actual graph addresses observed: {state:?}"
+        );
+        assert!(
+            state.capacities[..state.count]
+                .iter()
+                .all(|capacity| *capacity > 0)
+        );
+        assert!(
+            state.deallocations > 0 && state.freed[..state.count].iter().all(|freed| *freed),
+            "actual allocator retirements observed: {state:?}"
+        );
+        assert!(
+            if repair {
+                state.repair > 0
+            } else {
+                state.normal > 0
+            },
+            "requested cleanup branch reached its actual refund: {state:?}"
+        );
+        assert!(
+            !state.violation,
+            "every actual graph allocation retires BEFORE every reservation decrease: {state:?}"
+        );
+    });
+}
+
+pub(crate) fn last_request_for_test(reset: bool) -> (usize, usize, usize) {
+    let request = LAST_REQUEST.with(std::cell::Cell::get);
+    if reset {
+        LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
+    }
+    request
+}
+
+// Fixed, nonallocating metadata in the existing oracle. The caller selects
+// the sole actual allocation in a measured production operation; identity is
+// never selected by matching an expected layout.
+pub(crate) fn last_request_pointer_for_test() -> usize {
+    LAST_REQUEST_POINTER.with(std::cell::Cell::get)
+}
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn watch_registry_free_for_test(pointer: usize, counter: usize) {
+    WATCH_NODE_FREE.with(|slot| slot.set((pointer, counter, 0, 0, false)));
+}
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn registry_free_observation_for_test(clear: bool) -> (usize, usize, bool) {
+    let observed = WATCH_NODE_FREE.with(std::cell::Cell::get);
+    if clear {
+        WATCH_NODE_FREE.with(|slot| slot.set((0, 0, 0, 0, false)));
+    }
+    (observed.2, observed.3, observed.4)
+}
+
+// Production-dead observation through the existing allocator, keyed by the
+// initialized candidate Vec pointer, immediately after System.dealloc returns.
+pub(crate) fn watch_candidate_payload_for_test(pointer: usize, accountant: &MemoryAccountant) {
+    WATCH_PAYLOAD_FREE.with(|slot| slot.set((pointer, false, false)));
+    WATCH_PAYLOAD_ACCOUNTANT.with(|slot| slot.set(accountant as *const MemoryAccountant as usize));
+    PAYLOAD_FREE_CENSUS.with(|slot| slot.set((0, 0, 0, 0)));
+    let registration = accountant.writer_registration_observation_for_test();
+    WATCH_NODE_FREE.with(|slot| slot.set((registration.0, registration.4, 0, 0, false)));
+}
+pub(crate) fn candidate_payload_free_observation_for_test() -> (
+    (usize, usize, usize, usize),
+    (bool, bool),
+    (usize, usize, bool),
+) {
+    let census = PAYLOAD_FREE_CENSUS.with(std::cell::Cell::get);
+    let payload = WATCH_PAYLOAD_FREE.with(std::cell::Cell::get);
+    let node = WATCH_NODE_FREE.with(std::cell::Cell::get);
+    WATCH_PAYLOAD_FREE.with(|slot| slot.set((0, false, false)));
+    WATCH_PAYLOAD_ACCOUNTANT.with(|slot| slot.set(0));
+    WATCH_NODE_FREE.with(|slot| slot.set((0, 0, 0, 0, false)));
+    (census, (payload.1, payload.2), (node.2, node.3, node.4))
+}
+
+// A forwarding test capability, rather than a second accountant: every
+// invoice is paid by the native child supplied by the fixture. The existing
+// allocator oracle can read `used` while observing actual payload frees.
+#[derive(Debug)]
+pub(crate) struct MaintenanceReaderSpy {
+    pub(crate) source: contextdb_core::read_memory::ReadMemoryOwner,
+    pub(crate) writer: crate::memory_accounting::AccountantHandle,
+    pub(crate) used: AtomicUsize,
+    pub(crate) peak: AtomicUsize,
+    pub(crate) writer_peak: AtomicUsize,
+    pub(crate) requests: AtomicUsize,
+    pub(crate) decode_requests: AtomicUsize,
+    pub(crate) wrong_funder: AtomicUsize,
+    pub(crate) fail_at: AtomicUsize,
+    pub(crate) retained_at_failure: AtomicUsize,
+    pub(crate) live_payload_owners_at_failure: AtomicUsize,
+    pub(crate) payload_allocations: AtomicUsize,
+    pub(crate) payload_frees: AtomicUsize,
+    pub(crate) early_payload_refunds: AtomicUsize,
+    pub(crate) allocation_watch_overflow: AtomicUsize,
+    owners: parking_lot::Mutex<Vec<crate::read_image_memory::ImageMemoryObservation>>,
+}
+
+impl MaintenanceReaderSpy {
+    pub(crate) fn assert_payload_lifetime(&self) {
+        assert_eq!(
+            self.allocation_watch_overflow.load(AtomicOrdering::SeqCst),
+            0,
+            "the fixed native allocation observer never loses a live block"
+        );
+        assert!(
+            self.payload_allocations.load(AtomicOrdering::SeqCst) > 0,
+            "observe actual allocations paired with successful native-child invoices"
+        );
+        assert_eq!(
+            self.payload_allocations.load(AtomicOrdering::SeqCst),
+            self.payload_frees.load(AtomicOrdering::SeqCst),
+            "every observed temporary native allocation has physically freed"
+        );
+        assert_eq!(
+            self.early_payload_refunds.load(AtomicOrdering::SeqCst),
+            0,
+            "each image owner refunds its child only after its own observed payload allocations physically free"
+        );
+    }
+
+    pub(crate) fn new(
+        source: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        writer: crate::memory_accounting::AccountantHandle,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            source: source.into(),
+            writer,
+            used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            writer_peak: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            decode_requests: AtomicUsize::new(0),
+            wrong_funder: AtomicUsize::new(0),
+            fail_at: AtomicUsize::new(0),
+            retained_at_failure: AtomicUsize::new(0),
+            live_payload_owners_at_failure: AtomicUsize::new(0),
+            payload_allocations: AtomicUsize::new(0),
+            payload_frees: AtomicUsize::new(0),
+            early_payload_refunds: AtomicUsize::new(0),
+            allocation_watch_overflow: AtomicUsize::new(0),
+            owners: parking_lot::Mutex::new(Vec::with_capacity(64)),
+        })
+    }
+}
+
+impl contextdb_core::read_memory::ReadMemoryBudget for MaintenanceReaderSpy {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> contextdb_core::Result<()> {
+        let request = self.requests.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        self.writer_peak
+            .fetch_max(self.writer.usage().used, AtomicOrdering::SeqCst);
+        if subsystem == "reader" && operation == "query_decode" {
+            self.decode_requests.fetch_add(1, AtomicOrdering::SeqCst);
+            if crate::read_image_memory::current_reader_budget().is_some() {
+                let owner = crate::read_image_memory::active_owner()?;
+                let funder = owner.reader_budget().expect("reader-funded image");
+                if funder.accounting_identity() != self as *const Self as usize {
+                    self.wrong_funder.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                maintenance_owner_control(owner.as_ref() as *const _ as usize, self);
+                let mut owners = self.owners.lock();
+                owners.retain(|owner| owner.is_alive());
+                if !owners
+                    .iter()
+                    .any(|seen| seen.identity() == owner.as_ref() as *const _ as usize)
+                {
+                    assert!(
+                        owners.len() < owners.capacity(),
+                        "fixed spy slots cover live image owners"
+                    );
+                    owners.push(crate::read_image_memory::ImageMemoryObservation::new(
+                        &owner,
+                    ));
+                }
+            }
+        }
+        let live_payload_owners = self
+            .owners
+            .lock()
+            .iter()
+            .filter(|owner| owner.is_alive() && owner.retained_payload_bytes() != 0)
+            .count();
+        let fail_at = self.fail_at.load(AtomicOrdering::SeqCst);
+        if fail_at == request || (fail_at == usize::MAX && live_payload_owners >= 2) {
+            MAINTENANCE_INVOICES.with(|tickets| tickets.set([(0, 0, 0); 16]));
+            self.retained_at_failure.store(
+                self.used.load(AtomicOrdering::SeqCst),
+                AtomicOrdering::SeqCst,
+            );
+            self.live_payload_owners_at_failure
+                .store(live_payload_owners, AtomicOrdering::SeqCst);
+            return Err(contextdb_core::Error::Other(
+                "injected reader invoice failure".into(),
+            ));
+        }
+        // A failed invoice's typed error belongs to its caller, not to the
+        // decoded row. Do not identify those error strings as row payloads.
+        let pending_invoices =
+            MAINTENANCE_INVOICES.with(|tickets| tickets.replace([(0, 0, 0); 16]));
+        self.source.try_reserve(bytes, subsystem, operation, hint)?;
+        MAINTENANCE_INVOICES.with(|tickets| tickets.set(pending_invoices));
+        let used = self.used.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
+        self.peak.fetch_max(used, AtomicOrdering::SeqCst);
+        if subsystem == "reader"
+            && operation == "query_decode"
+            && crate::read_image_memory::current_reader_budget().is_some()
+        {
+            let owner = crate::read_image_memory::active_owner()?;
+            // The first reserve on an empty image is codec or image control,
+            // not payload. Later heap admissions are matched to actual native
+            // allocations, including a Vec allocated after its element strings.
+            if owner.retained_payload_bytes() != 0 {
+                MAINTENANCE_INVOICES.with(|tickets| {
+                    let mut pending = tickets.get();
+                    if let Some(ticket) = pending.iter_mut().find(|ticket| ticket.0 == 0) {
+                        *ticket = (
+                            owner.as_ref() as *const _ as usize,
+                            self as *const Self as usize,
+                            bytes,
+                        );
+                    } else {
+                        self.allocation_watch_overflow
+                            .fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    tickets.set(pending);
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn release(&self, bytes: usize) {
+        // Codec control returns when decoding finishes. Any unmatched
+        // conservative heap admission cannot tag later storage writes.
+        MAINTENANCE_INVOICES.with(|tickets| tickets.set([(0, 0, 0); 16]));
+        // During ImageMemory::drop its weak pointer has zero strong owners,
+        // but the spy and the native child are still alive. Check the actual
+        // allocation census BEFORE forwarding that owner's refund.
+        self.owners.lock().retain(|owner| {
+            if !owner.is_alive() {
+                maintenance_owner_refund(owner.identity(), self);
+                false
+            } else {
+                true
+            }
+        });
+        let before = self.used.fetch_sub(bytes, AtomicOrdering::SeqCst);
+        assert!(before >= bytes, "each actual reader invoice refunds once");
+        self.source.release(bytes);
+    }
+
+    fn funding_owner_handle_for_test(
+        &self,
+    ) -> Option<&contextdb_core::read_memory::ReadMemoryOwner> {
+        Some(&self.source)
+    }
+}
+
+// Extend this allocator's existing observation surface. A ticket pairs the
+// *actual successful native-child invoice* with an admitted native allocation
+// request. In these fixtures that identifies decoded strings and component Vecs;
+// it never tags later redb page buffers or guesses a native Arc layout.
+#[derive(Clone, Copy)]
+struct MaintenancePayloadSlot {
+    pointer: usize,
+    bytes: usize,
+    owner: usize,
+    funder: usize,
+}
+impl MaintenancePayloadSlot {
+    const EMPTY: Self = Self {
+        pointer: 0,
+        bytes: 0,
+        owner: 0,
+        funder: 0,
+    };
+}
+thread_local! {
+    static MAINTENANCE_INVOICES: std::cell::Cell<[(usize, usize, usize); 16]> = const { std::cell::Cell::new([(0, 0, 0); 16]) };
+    static MAINTENANCE_PAYLOADS: std::cell::Cell<[MaintenancePayloadSlot; 512]> = const { std::cell::Cell::new([MaintenancePayloadSlot::EMPTY; 512]) };
+}
+fn maintenance_payload_allocated(pointer: usize, bytes: usize) {
+    let ticket = MAINTENANCE_INVOICES
+        .try_with(|tickets| {
+            let mut pending = tickets.get();
+            // Exact owned-string invoices take precedence over a conservative Vec
+            // admission that precedes decoding those strings. Both comparisons use
+            // actual producer invoices and actual allocator requests, not layouts.
+            let chosen = pending
+                .iter()
+                .position(|ticket| ticket.0 != 0 && ticket.2 == bytes)
+                .or_else(|| {
+                    pending
+                        .iter()
+                        .position(|ticket| ticket.0 != 0 && bytes <= ticket.2)
+                });
+            let ticket = chosen
+                .map(|index| {
+                    let ticket = pending[index];
+                    pending[index] = (0, 0, 0);
+                    ticket
+                })
+                .unwrap_or((0, 0, 0));
+            tickets.set(pending);
+            ticket
+        })
+        .unwrap_or((0, 0, 0));
+    if ticket.0 == 0 {
+        return;
+    }
+    let spy = unsafe { &*(ticket.1 as *const MaintenanceReaderSpy) };
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        if let Some(slot) = entries
+            .as_slice_of_cells()
+            .iter()
+            .find(|slot| slot.get().pointer == 0)
+        {
+            slot.set(MaintenancePayloadSlot {
+                pointer,
+                bytes,
+                owner: ticket.0,
+                funder: ticket.1,
+            });
+            spy.payload_allocations.fetch_add(1, AtomicOrdering::SeqCst);
+        } else {
+            spy.allocation_watch_overflow
+                .fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    });
+}
+fn maintenance_owner_control(owner: usize, spy: &MaintenanceReaderSpy) {
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        if let Some(slot) = entries.as_slice_of_cells().iter().find(|slot| {
+            let slot = slot.get();
+            slot.pointer != 0
+                && slot.funder == spy as *const _ as usize
+                && slot.pointer <= owner
+                && owner < slot.pointer.saturating_add(slot.bytes)
+        }) {
+            slot.set(MaintenancePayloadSlot::EMPTY);
+            spy.payload_allocations.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+    });
+}
+fn maintenance_payload_freed(pointer: usize) {
+    let _ = MAINTENANCE_PAYLOADS.try_with(|slots| {
+        // This callback runs on deep engine stacks even with no observer.
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        if let Some(slot) = entries
+            .as_slice_of_cells()
+            .iter()
+            .find(|slot| slot.get().pointer == pointer && pointer != 0)
+        {
+            // System.dealloc has returned; the reader scope still retains the spy.
+            let spy = unsafe { &*(slot.get().funder as *const MaintenanceReaderSpy) };
+            spy.payload_frees.fetch_add(1, AtomicOrdering::SeqCst);
+            slot.set(MaintenancePayloadSlot::EMPTY);
+        }
+    });
+}
+fn maintenance_owner_refund(owner: usize, spy: &MaintenanceReaderSpy) {
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        let live = entries
+            .as_slice_of_cells()
+            .iter()
+            .filter(|slot| {
+                let slot = slot.get();
+                slot.pointer != 0 && slot.owner == owner && slot.funder == spy as *const _ as usize
+            })
+            .count();
+        spy.early_payload_refunds
+            .fetch_add(live, AtomicOrdering::SeqCst);
+    });
+}
+
+// Manager-authorized declaration: complete general frames and actual native
+// original/caller invoices cannot be represented by the adapter-layout row.
+#[test]
+#[serial]
+fn general_checkpoint_preserves_original_native_ownership() {
+    crate::memory_accounting::general_checkpoint_native_rows();
+}
+
+pub(crate) fn disarm_source_free_watch() {
+    for watch in &NATIVE_FREE {
+        watch.pointer.store(0, AtomicOrdering::SeqCst);
+        watch.counter.store(0, AtomicOrdering::SeqCst);
+    }
+}
+
+pub(crate) fn inverse_request_layouts_for_test() -> [(usize, usize); 256] {
+    NATIVE_REQUESTS.with(|requests| requests.get().map(|(_, bytes, align)| (bytes, align)))
+}
+
+pub(crate) fn arm_inverse_window() {
+    NATIVE_REQUEST_COUNT.with(|count| count.set(0));
+    NATIVE_REQUEST_TOTAL.with(|total| total.set(0));
+    NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(false));
+    NATIVE_REQUEST_ACTIVE.with(|active| {
+        assert!(!active.get());
+        active.set(true);
+    });
+}
+pub(crate) fn disarm_inverse_window() -> usize {
+    NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));
+    assert_native_request_receipt_complete();
+    NATIVE_REQUEST_COUNT.with(std::cell::Cell::get)
+}
+// The writer needs only family-tagged value digests after producing vector
+// identity mutations. Compare exact roots with the independent canonical-byte
+// control and use this existing allocator oracle for the retained ownership row.
+fn vector_identity_values_release_payloads_after_hashing() {
+    for quantization in [
+        VectorQuantization::F32,
+        VectorQuantization::SQ8,
+        VectorQuantization::SQ4,
+    ] {
+        let mut retained = Vec::new();
+        for dimensions in [768, 1536] {
+            let entry = VectorEntry {
+                index: VectorIndexRef::new("vectors", "embedding"),
+                row_id: RowId(7),
+                vector: (0..dimensions)
+                    .map(|axis| ((axis % 31) as f32 - 15.0) / 16.0)
+                    .collect(),
+                created_tx: TxId(11),
+                deleted_tx: None,
+                lsn: Lsn(13),
+            };
+            let ((current, historical), _, live) = measured(|| {
+                (
+                    vector_mutation(&entry, quantization),
+                    vector_version_mutation(&entry, quantization),
+                )
+            });
+            retained.push(live);
+            let stored = contextdb_vector::stored_vector_value(&entry.vector, quantization);
+            let mut canonical = (stored.len() as u64).to_le_bytes().to_vec();
+            for value in &stored {
+                canonical.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            let mut forged_bytes = canonical.clone();
+            forged_bytes[8] ^= 1;
+            let forged = ContentIdentityMutation::put(
+                vector_family(quantization),
+                vector_key(&entry.index, entry.row_id),
+                forged_bytes,
+            );
+            let encoded = [
+                ContentIdentityMutation::put(
+                    vector_family(quantization),
+                    vector_key(&entry.index, entry.row_id),
+                    canonical.clone(),
+                ),
+                ContentIdentityMutation::put(
+                    LogicalFamily::ChangeAndDdl,
+                    vector_version_key(
+                        &entry.index,
+                        entry.row_id,
+                        entry.created_tx,
+                        entry.lsn,
+                        quantization,
+                    ),
+                    canonical,
+                ),
+            ];
+            let root = tempfile::tempdir().unwrap();
+            let actual = ProofFixtureDatabase::create(root.path().join("actual.db")).unwrap();
+            let control = ProofFixtureDatabase::create(root.path().join("control.db")).unwrap();
+            let install = |database: &ProofFixtureDatabase,
+                           mutations: &[ContentIdentityMutation]| {
+                let write = database.begin_write().unwrap();
+                crate::persistence::erasure_frontiers::initialize(&write).unwrap();
+                RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
+                let digest = RedbPersistence::apply_content_identity_mutations_in_write(
+                    &write,
+                    mutations,
+                    &mut database.admission(None),
+                )
+                .unwrap();
+                write.commit().unwrap();
+                digest
+            };
+            let produced = [current, historical];
+            assert_eq!(
+                install(&actual, &produced),
+                install(&control, &encoded),
+                "canonical vector roots must remain exact for {quantization:?}"
+            );
+            let read = actual.begin_read().unwrap();
+            let verifier = ContentIdentityReadVerifier::open(&read, root.path(), None).unwrap();
+            for mutation in &encoded {
+                verifier.verify(mutation).unwrap();
+            }
+            assert!(
+                verifier.verify(&forged).is_err(),
+                "the selected body's bytes remain the read-authentication evidence"
+            );
+        }
+        assert_eq!(
+            retained[0], retained[1],
+            "retained vector identity ownership must not contain dimension-sized payloads ({quantization:?})"
+        );
+    }
+}
+
+// Existing serial allocation oracle: row-local does not mean uncharged.
+fn vector_row_encoding_has_exact_writer_admission() {
+    let row = VersionedRow {
+        row_id: RowId(7),
+        values: HashMap::from([
+            ("id".to_owned(), Value::Int64(7)),
+            ("embedding".to_owned(), Value::Vector(vec![0.25; 768])),
+        ]),
+        created_tx: TxId(11),
+        deleted_tx: None,
+        lsn: Lsn(13),
+        created_at: None,
+    };
+    let run = |limit| {
+        let funding = accountant(limit);
+        let owner = crate::read_image_memory::ImageMemory::operation_writer(funding.clone().into())
+            .unwrap();
+        let (result, native_peak, _) = measured(|| {
+            owner.scope(|| {
+                let mut encoded = Vec::new();
+                let result = RedbPersistence::encode_versioned_row_with_f32_overlay_into(
+                    &row,
+                    None,
+                    None,
+                    None,
+                    &mut encoded,
+                );
+                (result, encoded)
+            })
+        });
+        let high = funding.high_water_for_test();
+        let (result, encoded) = result;
+        if result.is_ok() {
+            let verifier = crate::read_image_memory::ImageMemory::operation_writer(
+                accountant(usize::MAX).into(),
+            )
+            .unwrap();
+            verifier.scope(|| {
+                let decoded = RedbPersistence::decode_versioned_row(&encoded, None).unwrap();
+                assert_eq!(decoded.values, row.values);
+            });
+        }
+        drop(encoded);
+        drop(owner);
+        assert_eq!(
+            funding.usage().used,
+            0,
+            "row scratch returns its credit after physical output destruction"
+        );
+        (result, high, native_peak)
+    };
+    let (result, high, native_peak) = run(usize::MAX);
+    result.unwrap();
+    assert!(
+        high >= 768 * std::mem::size_of::<f32>(),
+        "the F32 row body has a writer admission before allocation"
+    );
+    assert!(
+        native_peak <= high,
+        "row-native peak {native_peak} exceeds admitted peak {high}"
+    );
+    let (fit, fit_high, _) = run(high);
+    fit.unwrap();
+    assert_eq!(fit_high, high);
+    let (short, _, _) = run(high - 1);
+    match short {
+        Err(Error::MemoryBudgetExceeded {
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        }) => {
+            assert_eq!(budget_limit_bytes, high - 1);
+            assert_eq!(requested_bytes, available_bytes + 1);
+        }
+        other => panic!("one-byte-short row admission must refuse typed: {other:?}"),
+    }
+}
+
+// One native free observation covers each replaced mutation directory's credit.
+fn vector_identity_directory_refunds_only_after_its_buffer_is_freed() {
+    let invoice = std::mem::size_of::<ContentIdentityMutation>();
+    for short in [None, Some(false), Some(true)] {
+        let writer = MemoryAccountant::writer_budget(usize::MAX).unwrap();
+        let funding = writer.accountant();
+        let original = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            funding.clone(),
+            0,
+            "persistence",
+            "prepare_commit",
+            "test writer",
+        )
+        .unwrap();
+        let frame = OriginalPersistenceFrame::new(&original).unwrap();
+        let before = funding.usage().used;
+        if let Some(short) = short {
+            funding
+                .set_budget(Some(before + 12 * invoice - usize::from(short)))
+                .unwrap();
+        }
+        let mut directory = OriginalMutationVector::new(&frame);
+        for _ in 0..4 {
+            directory
+                .push(ContentIdentityMutation::remove(
+                    LogicalFamily::F32Vectors,
+                    [],
+                ))
+                .unwrap();
+        }
+        let prior_capacity = directory.values.capacity();
+        assert_eq!(prior_capacity, 4);
+        watch_candidate_payload_for_test(directory.values.as_ptr() as usize, &funding);
+        let result = directory.push(ContentIdentityMutation::remove(
+            LogicalFamily::F32Vectors,
+            [],
+        ));
+        let (at_free, (freed, _), _) = candidate_payload_free_observation_for_test();
+        if short == Some(true) {
+            match result {
+                Err(Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    ..
+                }) => {
+                    assert_eq!(requested_bytes, 8 * invoice);
+                    assert_eq!(available_bytes, requested_bytes - 1);
+                    assert_eq!(budget_limit_bytes, before + 12 * invoice - 1);
+                }
+                other => panic!("one-byte-short directory growth refuses typed: {other:?}"),
+            }
+            assert!(!freed, "a refused growth retains the original directory");
+            assert_eq!(directory.values.len(), 4);
+            assert_eq!(directory.values.capacity(), prior_capacity);
+            assert_eq!(frame.work.borrow().bytes(), 4 * invoice);
+        } else {
+            result.unwrap();
+            assert!(freed);
+            assert_eq!(
+                at_free.3,
+                before + 12 * invoice,
+                "old and successor storage remain funded at physical old-buffer free"
+            );
+            assert_eq!(directory.values.len(), 5);
+            assert_eq!(directory.values.capacity(), 8);
+            assert_eq!(
+                frame.work.borrow().bytes(),
+                8 * invoice,
+                "the old directory invoice is released after its storage disappears"
+            );
+        }
+        watch_candidate_payload_for_test(directory.values.as_ptr() as usize, &funding);
+        let held = funding.usage().used;
+        drop(directory);
+        let (at_free, (freed, _), _) = candidate_payload_free_observation_for_test();
+        assert!(freed);
+        assert_eq!(
+            at_free.3, held,
+            "the retained directory is still funded at physical free"
+        );
+        drop(frame);
+        assert_eq!(funding.usage().used, before);
+    }
+}
+
+/// Inspect the existing window at an admission boundary, without allocating
+/// another observation ledger or measuring another thread's allocations.
+#[cfg(feature = "test-seams")]
+pub(crate) fn measured_live_bytes_for_test() -> usize {
+    let window = MEASURING_HERE.with(std::cell::Cell::get);
+    let measurement = MEASUREMENT.lock().unwrap();
+    if window != 0 && measurement.active_window == window {
+        measurement.live
+    } else {
+        0
+    }
+}
+
+// Retired: failed_attempt_storage_observes_a_counter_refund_with_retained_storage.
+// This observer-specific negative control required the removed fork observer.
+// An accountant-only test cannot detect retained storage after an early refund;
+// Destruction-before-refund requires a source ownership proof.
+mod original_failure_contract {
+    use super::*;
+    struct FreeWatch;
+    impl Drop for FreeWatch {
+        fn drop(&mut self) {
+            disarm_source_free_watch();
+        }
+    }
+
+    // Original plugin storage stays application-owned; the callback and return
+    // must borrow/move the same backing, even when the message is large.
+    #[test]
+    #[serial]
+    fn plugin_failure_preserves_original_storage_through_callback_and_return() {
+        use crate::plugin::{CommitSource, DatabasePlugin};
+        use contextdb_tx::WriteSet;
+        struct Plugin {
+            pending: Mutex<Option<Error>>,
+            callback_pointer: AtomicUsize,
+            callbacks: AtomicUsize,
+        }
+        impl DatabasePlugin for Plugin {
+            fn pre_commit(&self, _: &WriteSet, _: CommitSource) -> contextdb_core::Result<()> {
+                match self.pending.lock().unwrap().take() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            }
+            fn commit_failed(&self, _: &WriteSet, _: CommitSource, error: &Error) {
+                if let Error::Other(message) = error {
+                    self.callback_pointer.store(
+                        message
+                            .as_text()
+                            .expect("original application text")
+                            .as_ptr() as usize,
+                        AtomicOrdering::SeqCst,
+                    );
+                }
+                self.callbacks.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+        for length in [32, 8192] {
+            let plugin = Arc::new(Plugin {
+                pending: Mutex::new(None),
+                callback_pointer: AtomicUsize::new(0),
+                callbacks: AtomicUsize::new(0),
+            });
+            let db = crate::Database::open_memory_with_plugin(plugin.clone()).unwrap();
+            db.set_maintenance_policy(crate::MaintenancePolicy::CallerDriven);
+            db.execute(
+                "CREATE TABLE error_identity (id INTEGER PRIMARY KEY)",
+                &HashMap::new(),
+            )
+            .unwrap();
+            db.execute("BEGIN", &HashMap::new()).unwrap();
+            db.execute("INSERT INTO error_identity VALUES (1)", &HashMap::new())
+                .unwrap();
+            let (message, requests, count) = native_requests_for_test(|| "x".repeat(length));
+            assert_eq!(count, 1);
+            let pointer = message.as_ptr() as usize;
+            *plugin.pending.lock().unwrap() = Some(Error::Other(message.into()));
+            // Counter zero observes physical free only. Application bytes are not
+            // certified as engine-funded by this test.
+            watch_source_free_for_test(&requests[..count], 0);
+            let _watch = FreeWatch;
+            let result = db.execute("COMMIT", &HashMap::new());
+            let free_before_return = source_free_for_test(1)[0].2;
+            let error = result.unwrap_err();
+            let Error::Other(ref message) = error else {
+                panic!("preserve plugin error variant");
+            };
+            assert_eq!(
+                message
+                    .as_text()
+                    .expect("original application text")
+                    .as_ptr() as usize,
+                pointer
+            );
+            assert_eq!(
+                message.as_text().expect("original application text").len(),
+                length
+            );
+            assert!(
+                message
+                    .as_text()
+                    .expect("original application text")
+                    .bytes()
+                    .all(|byte| byte == b'x')
+            );
+            assert_eq!(plugin.callbacks.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(
+                plugin.callback_pointer.load(AtomicOrdering::SeqCst),
+                pointer
+            );
+            assert_eq!(free_before_return, 0);
+            let moved = Some(error);
+            assert_eq!(source_free_for_test(1)[0].2, 0);
+            drop(moved);
+            let frees = source_free_for_test(1)[0].2;
+            disarm_source_free_watch();
+            assert_eq!(
+                frees, 1,
+                "caller destroys the original application backing once"
+            );
+            db.close().unwrap();
+        }
+    }
+
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    fn codec_adapter_terminal_refusal_rows() {
+        use serde::de::{Error as _, SeqAccess, Visitor};
+        static TEXT_VISITS: AtomicUsize = AtomicUsize::new(0);
+        static SECONDARY_FORMATS: AtomicUsize = AtomicUsize::new(0);
+        struct Secondary;
+        impl std::fmt::Display for Secondary {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                SECONDARY_FORMATS.fetch_add(1, AtomicOrdering::SeqCst);
+                f.write_str("secondary custom visitor error")
+            }
+        }
+        struct CountedText;
+        impl<'de> serde::Deserialize<'de> for CountedText {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                d: D,
+            ) -> std::result::Result<Self, D::Error> {
+                struct Text;
+                impl<'de> Visitor<'de> for Text {
+                    type Value = CountedText;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("text")
+                    }
+                    fn visit_str<E: serde::de::Error>(
+                        self,
+                        _: &str,
+                    ) -> std::result::Result<CountedText, E> {
+                        TEXT_VISITS.fetch_add(1, AtomicOrdering::SeqCst);
+                        Ok(CountedText)
+                    }
+                }
+                d.deserialize_str(Text)
+            }
+        }
+        struct Catching;
+        impl<'de> serde::Deserialize<'de> for Catching {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                d: D,
+            ) -> std::result::Result<Self, D::Error> {
+                struct Tuple;
+                impl<'de> Visitor<'de> for Tuple {
+                    type Value = Catching;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("one field")
+                    }
+                    fn visit_seq<A: SeqAccess<'de>>(
+                        self,
+                        mut a: A,
+                    ) -> std::result::Result<Catching, A::Error> {
+                        if a.next_element::<CountedText>().is_err() {
+                            // Attempt both a secondary allocating diagnosis and
+                            // a successful fallback after the genuine refusal.
+                            let _ = A::Error::custom(Secondary);
+                        }
+                        Ok(Catching)
+                    }
+                }
+                d.deserialize_tuple(1, Tuple)
+            }
+        }
+        let writer = MemoryAccountant::writer_no_limit().unwrap();
+        let owner = writer.accountant();
+        let funder = writer.prepare_source_funder().unwrap();
+        let original = writer.reserve_assembly_original(&funder).unwrap();
+        let baseline = owner.usage().used;
+        let counter = owner.writer_registration_observation_for_test().4;
+        for packed in [false, true] {
+            let empty = if packed {
+                rmp_serde::to_vec(&("",)).unwrap()
+            } else {
+                bincode::serde::encode_to_vec(("",), bincode::config::standard()).unwrap()
+            };
+            let text = "x".repeat(8192);
+            let large = if packed {
+                rmp_serde::to_vec(&(&text,)).unwrap()
+            } else {
+                bincode::serde::encode_to_vec((&text,), bincode::config::standard()).unwrap()
+            };
+            let decode = |bytes: &[u8]| {
+                if packed {
+                    crate::persistence::original_event_decode::decode_blob::<Catching>(
+                        &original, bytes,
+                    )
+                } else {
+                    crate::persistence::original_event_decode::decode::<Catching>(&original, bytes)
+                }
+            };
+            let (valid, controls, control_count) =
+                source_requests_for_test(counter, || decode(&empty));
+            assert!(valid.is_ok());
+            drop(valid);
+            let credits = source_request_credit_for_test();
+            assert!(control_count > 0 && control_count <= credits.len());
+            let cap = *credits[..control_count].iter().max().unwrap();
+            owner.set_budget(Some(cap)).unwrap();
+            TEXT_VISITS.store(0, AtomicOrdering::SeqCst);
+            SECONDARY_FORMATS.store(0, AtomicOrdering::SeqCst);
+            let (denied, requests, count) = source_requests_for_test(counter, || decode(&large));
+            assert!(
+                matches!(denied, Err(ref error) if crate::read_image_memory::is_memory_refusal(error)),
+                "a generic visitor cannot swallow the operation's actual memory refusal"
+            );
+            drop(denied);
+            assert_eq!(
+                TEXT_VISITS.load(AtomicOrdering::SeqCst),
+                0,
+                "denial precedes entry to the actual payload visitor"
+            );
+            assert_eq!(
+                SECONDARY_FORMATS.load(AtomicOrdering::SeqCst),
+                0,
+                "terminal refusal suppresses secondary custom Display"
+            );
+            assert_eq!(
+                count, control_count,
+                "denial allocates only the same entry controls, no owning marker"
+            );
+            for i in 0..count {
+                assert_eq!(
+                    (requests[i].1, requests[i].2),
+                    (controls[i].1, controls[i].2)
+                );
+            }
+            let ((), gap) = funded_requests(&owner, || {
+                let observation = declaration_observation();
+                let error = match decode(&large) {
+                    Err(error) => error,
+                    Ok(_) => panic!("refusal stays terminal"),
+                };
+                assert!(crate::read_image_memory::is_memory_refusal(&error));
+                drop(error);
+                assert_eq!(observation.physical_receipt().0, 0);
+                assert!(observation.evidence().complete);
+                drop(observation);
+            });
+            assert_eq!(gap, 0);
+            assert_eq!(owner.usage().used, baseline);
+            owner.set_budget(None).unwrap();
+        }
+    }
+
+    // Native codecs are the semantic baseline, including errors a legal
+    // generic visitor catches. These are rows of the existing decoder proof.
+    fn codec_adapter_parity_rows() {
+        use serde::{Deserialize, Serialize};
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum Choice {
+            Unit,
+            Newtype(String),
+            Tuple(bool, Vec<u16>),
+            Struct {
+                flag: bool,
+                values: std::collections::BTreeMap<String, Option<u64>>,
+            },
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Nested {
+            choices: Vec<Choice>,
+            pair: (u32, Option<String>),
+        }
+        let writer = MemoryAccountant::writer_no_limit().unwrap();
+        let owner = writer.accountant();
+        let funder = writer.prepare_source_funder().unwrap();
+        let original = writer.reserve_assembly_original(&funder).unwrap();
+        let baseline = owner.usage().used;
+        let value = Nested {
+            choices: vec![
+                Choice::Unit,
+                Choice::Newtype("nested".into()),
+                Choice::Tuple(true, vec![1, 256]),
+                Choice::Struct {
+                    flag: false,
+                    values: [("key".into(), Some(300))].into(),
+                },
+            ],
+            pair: (27, Some("tail".into())),
+        };
+        let binary = bincode::serde::encode_to_vec(&value, bincode::config::standard()).unwrap();
+        let packed = rmp_serde::to_vec_named(&value).unwrap();
+        let native: Nested =
+            bincode::serde::decode_from_slice(&binary, bincode::config::standard())
+                .unwrap()
+                .0;
+        let admitted = crate::persistence::original_event_decode::decode_funded::<Nested>(
+            &original, &binary, true,
+        )
+        .unwrap();
+        assert_eq!(admitted.value, native);
+        drop(admitted);
+        let native: Nested = rmp_serde::from_slice(&packed).unwrap();
+        let admitted =
+            crate::persistence::original_event_decode::decode_blob::<Nested>(&original, &packed)
+                .unwrap();
+        assert_eq!(admitted.value, native);
+        drop(admitted);
+        // Every truncated prefix crosses a genuine native error boundary;
+        // no test-constructed codec error is wrapped to stand in for decoding.
+        for end in 0..binary.len() {
+            let native = bincode::serde::decode_from_slice::<Nested, _>(
+                &binary[..end],
+                bincode::config::standard(),
+            )
+            .unwrap_err();
+            let admitted = match crate::persistence::original_event_decode::decode_funded::<Nested>(
+                &original,
+                &binary[..end],
+                true,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("truncated bincode must refuse"),
+            };
+            assert_eq!(
+                admitted.to_string(),
+                format!("bincode decode error: {native}")
+            );
+            assert!(!admitted.is_memory_refusal());
+            drop(admitted);
+        }
+        for end in 0..packed.len() {
+            let native = rmp_serde::from_slice::<Nested>(&packed[..end]).unwrap_err();
+            let admitted = match crate::persistence::original_event_decode::decode_blob::<Nested>(
+                &original,
+                &packed[..end],
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("truncated MessagePack must refuse"),
+            };
+            assert_eq!(
+                admitted.to_string(),
+                format!("decode blob repository record: {native}")
+            );
+            drop(admitted);
+        }
+        #[derive(Debug, PartialEq)]
+        struct Defaulted(bool, u8);
+        impl<'de> Deserialize<'de> for Defaulted {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                d: D,
+            ) -> std::result::Result<Self, D::Error> {
+                struct V;
+                impl<'de> serde::de::Visitor<'de> for V {
+                    type Value = Defaulted;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("two fields")
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut a: A,
+                    ) -> std::result::Result<Self::Value, A::Error> {
+                        // Both native codecs consumed the invalid scalar. A
+                        // consumer may legitimately default that one field.
+                        let flag = a
+                            .next_element::<bool>()
+                            .unwrap_or(Some(false))
+                            .unwrap_or(false);
+                        let tail = a.next_element::<u8>()?.unwrap_or_default();
+                        Ok(Defaulted(flag, tail))
+                    }
+                }
+                d.deserialize_tuple(2, V)
+            }
+        }
+        let binary =
+            bincode::serde::encode_to_vec((2u8, 7u8), bincode::config::standard()).unwrap();
+        let packed = rmp_serde::to_vec(&(2u8, 7u8)).unwrap();
+        let native: Defaulted =
+            bincode::serde::decode_from_slice(&binary, bincode::config::standard())
+                .unwrap()
+                .0;
+        let admitted = crate::persistence::original_event_decode::decode_funded::<Defaulted>(
+            &original, &binary, true,
+        )
+        .unwrap();
+        assert_eq!(admitted.value, native);
+        assert_eq!(admitted.value, Defaulted(false, 7));
+        drop(admitted);
+        let native: Defaulted = rmp_serde::from_slice(&packed).unwrap();
+        let admitted =
+            crate::persistence::original_event_decode::decode_blob::<Defaulted>(&original, &packed)
+                .unwrap();
+        assert_eq!(admitted.value, native);
+        assert_eq!(admitted.value, Defaulted(false, 7));
+        drop(admitted);
+        assert_eq!(owner.usage().used, baseline);
+    }
+
+    // Exercise the actual decoder, rather than constructing a diagnostic through
+    // its private carrier helpers. Successful decoding discovers its control floor.
+    #[test]
+    #[serial]
+    fn decoder_failure_preserves_diagnosis_when_error_text_cannot_be_admitted() {
+        use std::io::Write;
+        // Compare actual travelling layouts with the scalar bootstrap plus the
+        // minimum enum/pointer custody representation, including ABI padding.
+        #[allow(
+            dead_code,
+            reason = "LAYOUT-ONLY: never constructed; the size checks below measure this minimum representation"
+        )]
+        enum ScalarOrPointer {
+            Native(contextdb_core::read_memory::NativeRefusal),
+            Prepared(std::ptr::NonNull<()>),
+        }
+        #[allow(
+            dead_code,
+            reason = "LAYOUT-ONLY: never constructed; the size checks below measure this minimum representation"
+        )]
+        struct CompactCarrier {
+            diagnostic: ScalarOrPointer,
+            scope: Option<std::ptr::NonNull<()>>,
+        }
+        assert_eq!(
+            std::mem::size_of::<crate::funded_error::OriginalError>(),
+            std::mem::size_of::<CompactCarrier>()
+        );
+        assert_eq!(
+            std::mem::align_of::<crate::funded_error::OriginalError>(),
+            std::mem::align_of::<CompactCarrier>()
+        );
+        assert_eq!(
+            std::mem::size_of::<crate::funded_error::OriginalResult<()>>(),
+            std::mem::size_of::<std::result::Result<(), CompactCarrier>>()
+        );
+        let writer = MemoryAccountant::writer_no_limit().unwrap();
+        let owner = writer.accountant();
+        let funder = writer.prepare_source_funder().unwrap();
+        let original = writer.reserve_assembly_original(&funder).unwrap();
+        let baseline = owner.usage().used;
+        let counter = owner.writer_registration_observation_for_test().4;
+        let (valid, _, allocations) = source_requests_for_test(counter, || {
+            crate::persistence::original_event_decode::decode_funded::<bool>(&original, &[1], true)
+        });
+        assert!(valid.unwrap().value);
+        let credits = source_request_credit_for_test();
+        assert!(allocations > 0 && allocations <= credits.len());
+        // For bool there is no value backing. The real decoder admits its
+        // primary cell, control and marker before allocating its decode ledger.
+        // Sample ALL those requests, not the first producer cell alone.
+        let control_floor = *credits[..allocations].iter().max().unwrap();
+        assert!(control_floor > baseline);
+        assert_eq!(owner.usage().used, baseline);
+        owner.set_budget(Some(control_floor)).unwrap();
+        let ((), valid_gap) = funded_requests(&owner, || {
+            let _observation = declaration_observation();
+            let valid = crate::persistence::original_event_decode::decode_funded::<bool>(
+                &original,
+                &[1],
+                true,
+            )
+            .unwrap();
+            assert!(
+                valid.value,
+                "the complete prework floor must permit decoding"
+            );
+            drop(valid);
+        });
+        assert_eq!(valid_gap, 0);
+        assert_eq!(owner.usage().used, baseline);
+        let expected = format!(
+            "bincode decode error: {}",
+            bincode::serde::decode_from_slice::<bool, _>(&[2], bincode::config::standard())
+                .unwrap_err()
+        );
+        for cap in [baseline, control_floor - 1, control_floor, usize::MAX] {
+            owner.set_budget(Some(cap)).unwrap();
+            LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
+            let ((output, memory_refusal, requests, live_before_drop, live_after_drop), gap) =
+                funded_requests(&owner, || {
+                    let _observation = declaration_observation();
+                    let result = crate::persistence::original_event_decode::decode_funded::<bool>(
+                        &original,
+                        &[2],
+                        true,
+                    );
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => panic!("invalid bool must fail"),
+                    };
+                    let memory_refusal = error.is_memory_refusal();
+                    let mut output = std::io::Cursor::new([0u8; 512]);
+                    write!(&mut output, "{error}").unwrap();
+                    let live_before_drop = MEASUREMENT.lock().unwrap().payload_live;
+                    if cap < control_floor {
+                        drop(error);
+                    } else {
+                        assert!(
+                            !memory_refusal,
+                            "codec diagnosis must survive admission pressure"
+                        );
+                        assert!(error.source_is_qualified());
+                        assert!(
+                            live_before_drop > 0,
+                            "prepaid diagnostic custody remains live"
+                        );
+                        assert!(owner.usage().used - baseline >= live_before_drop);
+                        assert_eq!(
+                            &output.get_ref()[..output.position() as usize],
+                            expected.as_bytes(),
+                        );
+                        // Prework scratch has now gone away. Remove that released
+                        // headroom and cause a real later admission refusal while
+                        // the original diagnosis still owns its prepaid cell.
+                        owner.set_budget(Some(owner.usage().used)).unwrap();
+                        assert!(
+                            crate::memory_accounting::reserve_preparation_original_native(
+                                &original,
+                                1,
+                                "events",
+                                "decode_sink_queue_entry",
+                                "Reduce pending deliveries or raise MEMORY_LIMIT.",
+                            )
+                            .is_err()
+                        );
+                        let before_transfer = owner.usage().used;
+                        let before_requests = LAST_REQUEST.with(|slot| slot.get().2);
+                        let public = error.into_public_prepared();
+                        assert_eq!(LAST_REQUEST.with(|slot| slot.get().2), before_requests);
+                        assert_eq!(owner.usage().used, before_transfer);
+                        assert_eq!(MEASUREMENT.lock().unwrap().payload_live, live_before_drop);
+                        assert!(matches!(&public, Error::FundedEngine(source)
+                            if source.source_is_qualified()));
+                        assert!(!crate::read_image_memory::is_memory_refusal(&public));
+                        output.set_position(0);
+                        write!(&mut output, "{public}").unwrap();
+                        assert_eq!(
+                            &output.get_ref()[..output.position() as usize],
+                            expected.as_bytes(),
+                        );
+                        let moved = Some(public);
+                        assert_eq!(MEASUREMENT.lock().unwrap().payload_live, live_before_drop);
+                        drop(moved);
+                    }
+                    (
+                        output,
+                        memory_refusal,
+                        LAST_REQUEST.with(|slot| slot.get().2),
+                        live_before_drop,
+                        MEASUREMENT.lock().unwrap().payload_live,
+                    )
+                });
+            assert_eq!(
+                gap, 0,
+                "all producer controls and diagnostic bytes stay paid through physical free"
+            );
+            assert_eq!(live_after_drop, 0);
+            if cap < control_floor {
+                assert!(
+                    memory_refusal,
+                    "incomplete prework funding refuses before codec diagnosis"
+                );
+                if cap == baseline {
+                    assert_eq!(requests, 0, "prework refusal allocates no error carrier");
+                    assert_eq!(live_before_drop, 0);
+                }
+            } else {
+                assert!(!memory_refusal);
+                assert_eq!(
+                    &output.get_ref()[..output.position() as usize],
+                    expected.as_bytes(),
+                );
+                // Roomy decoding has identical semantics; it need not allocate
+                // diagnostic text after the producer has prepaid custody.
+            }
+            assert_eq!(owner.usage().used, baseline);
+        }
+
+        codec_adapter_parity_rows();
+        codec_adapter_terminal_refusal_rows();
+        crate::blob_repository::native_purge::codec_projection_contract_rows();
+
+        // A real foreign visitor's custom String has no original invoice.
+        // Prepaid custody must not certify that payload or conceal its gap.
+        struct Foreign;
+        static FOREIGN_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+        impl<'de> serde::Deserialize<'de> for Foreign {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                _: D,
+            ) -> std::result::Result<Self, D::Error> {
+                FOREIGN_ENTRIES.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(serde::de::Error::custom(
+                    "foreign decoder detail without producer funding",
+                ))
+            }
+        }
+        owner.set_budget(None).unwrap();
+        // Measure the real prepared cell, then deny that exact carrier by one
+        // byte at the actual decoder entry. The visitor must never run.
+        let (prepared, requests, count) = source_requests_for_test(counter, || {
+            crate::funded_error::OriginalError::prepare(
+                &original,
+                "events",
+                "decode_sink_queue_entry",
+                "Reduce pending deliveries or raise MEMORY_LIMIT.",
+            )
+            .unwrap()
+        });
+        assert_eq!(count, 1);
+        let carrier_bytes = requests[0].1;
+        assert_eq!(owner.usage().used - baseline, carrier_bytes);
+        assert_eq!(
+            source_request_credit_for_test()[0],
+            baseline + carrier_bytes
+        );
+        watch_source_free_for_test(&requests[..count], counter);
+        let _carrier_watch = FreeWatch;
+        drop(prepared);
+        let free = source_free_for_test(count)[0];
+        assert_eq!(free.2, 1);
+        assert_eq!(free.0, free.1, "carrier invoice survives physical free");
+        assert_eq!(free.0, baseline + carrier_bytes);
+        disarm_source_free_watch();
+        assert_eq!(owner.usage().used, baseline);
+        owner
+            .set_budget(Some(baseline + carrier_bytes - 1))
+            .unwrap();
+        FOREIGN_ENTRIES.store(0, AtomicOrdering::SeqCst);
+        LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
+        let (denied, denial_gap) = funded_requests(&owner, || {
+            let _observation = declaration_observation();
+            crate::persistence::original_event_decode::decode_funded::<Foreign>(
+                &original,
+                &[2],
+                true,
+            )
+        });
+        let allocations = LAST_REQUEST.with(|slot| slot.get().2);
+        let denied = match denied {
+            Err(error) => error,
+            Ok(_) => panic!("one byte short must refuse before the foreign producer"),
+        };
+        assert!(denied.is_memory_refusal());
+        assert!(
+            denied.source_is_qualified(),
+            "scalar pre-entry refusal has no foreign payload"
+        );
+        assert_eq!(FOREIGN_ENTRIES.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            allocations, 0,
+            "no carrier allocation after failed prepayment"
+        );
+        assert_eq!(denial_gap, 0);
+        drop(denied);
+        assert_eq!(owner.usage().used, baseline);
+        owner.set_budget(None).unwrap();
+        let ((), foreign_gap) = funded_requests(&owner, || {
+            let _observation = declaration_observation();
+            // This owning cell exists BEFORE the foreign visitor allocates its
+            // String. Paying the carrier must never qualify that source.
+            let prepared = crate::funded_error::OriginalError::prepare(
+                &original,
+                "events",
+                "decode_sink_queue_entry",
+                "Reduce pending deliveries or raise MEMORY_LIMIT.",
+            )
+            .unwrap();
+            let error = match crate::persistence::original_event_decode::decode_funded::<Foreign>(
+                &original,
+                &[2],
+                true,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("foreign visitor must fail"),
+            };
+            assert!(!error.source_is_qualified());
+            let public = error.into_public_prepared();
+            assert!(matches!(&public, Error::FundedEngine(source)
+                if !source.source_is_qualified()));
+            let mut raw = std::io::Cursor::new([0u8; 512]);
+            write!(&mut raw, "{public}").unwrap();
+            assert!(
+                std::str::from_utf8(&raw.get_ref()[..raw.position() as usize])
+                    .unwrap()
+                    .contains("foreign decoder detail without producer funding")
+            );
+            owner.set_budget(Some(owner.usage().used)).unwrap();
+            assert!(
+                crate::memory_accounting::reserve_preparation_original_native(
+                    &original,
+                    1,
+                    "events",
+                    "decode_sink_queue_entry",
+                    "Reduce pending deliveries or raise MEMORY_LIMIT."
+                )
+                .is_err()
+            );
+            let before_transfer = owner.usage().used;
+            let before_requests = LAST_REQUEST.with(|slot| slot.get().2);
+            let error = prepared.unqualified(public);
+            assert_eq!(
+                LAST_REQUEST.with(|slot| slot.get().2),
+                before_requests,
+                "already produced foreign primary moves into prepaid custody without allocation"
+            );
+            assert_eq!(owner.usage().used, before_transfer);
+            assert!(!error.source_is_qualified());
+            assert!(!error.is_memory_refusal());
+            let mut retained = std::io::Cursor::new([0u8; 512]);
+            write!(&mut retained, "{error}").unwrap();
+            assert_eq!(
+                &raw.get_ref()[..raw.position() as usize],
+                &retained.get_ref()[..retained.position() as usize]
+            );
+            assert_eq!(FOREIGN_ENTRIES.load(AtomicOrdering::SeqCst), 1);
+            drop(error);
+        });
+        assert!(
+            foreign_gap > 0,
+            "the physical oracle must detect genuinely unadmitted source bytes"
+        );
+        assert_eq!(owner.usage().used, baseline);
+    }
+
+    // Two real native storage failures overlap with an already-produced codec
+    // diagnosis. Retained scope clones make the actual last release observable.
+    #[test]
+    #[serial]
+    #[cfg_attr(
+        any(test, feature = "test-seams"),
+        expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )
+    )]
+    fn overlapping_storage_failures_keep_original_diagnosis_and_paid_last_release() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
+        use crate::funded_error::OriginalStoragePhase;
+        use crate::persistence::native_storage_admission::StorageAdmissionScope;
+        for inner_first in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("failure-custody.db");
+            // Opening an existing store is deliberately not a create operation.
+            drop(RedbPersistence::create_with_accountant(&path, None, 0).unwrap());
+            let persistence = RedbPersistence::open_with_cache(&path, 0).unwrap();
+            let writer = MemoryAccountant::writer_no_limit().unwrap();
+            let owner = writer.accountant();
+            let funder = writer.prepare_source_funder().unwrap();
+            let original = writer.reserve_assembly_original(&funder).unwrap();
+            let baseline = owner.usage().used;
+            let counter = owner.writer_registration_observation_for_test().4;
+            let (diagnosis, primary_requests, primary_count) =
+                source_requests_for_test(counter, || {
+                    crate::persistence::original_event_decode::decode_funded::<bool>(
+                        &original,
+                        &[2],
+                        true,
+                    )
+                });
+            assert!(primary_count > 0);
+            let diagnosis = match diagnosis {
+                Err(error) => error,
+                Ok(_) => panic!("invalid bool must fail"),
+            };
+            let expected = diagnosis.to_string();
+            let before_scopes = owner.usage().used;
+            let ((outer, inner), requests, count) = source_requests_for_test(counter, || {
+                (
+                    StorageAdmissionScope::writer_original(&original).unwrap(),
+                    StorageAdmissionScope::writer_original(&original).unwrap(),
+                )
+            });
+            assert!(count > 1 && count <= 32);
+            let credits = source_request_credit_for_test();
+            let mut live = 0;
+            for (index, request) in requests[..count].iter().enumerate() {
+                live += request.1;
+                assert!(
+                    credits[index] >= before_scopes + live,
+                    "each real scope allocation has incremental credit before System.alloc"
+                );
+            }
+            assert_eq!(source_unfunded_peak_for_test().0, 0);
+            watch_source_free_for_test(&requests[..count], counter);
+            // decode_funded prepares its escaping primary first. Unlike its
+            // later temporary controls, that exact allocation is still live.
+            append_source_free_for_test(&primary_requests[..1], counter);
+            let _watch = FreeWatch;
+            let ((outer_clone, inner_clone), _, clone_allocations) =
+                native_requests_for_test(|| (outer.retain_admission(), inner.retain_admission()));
+            assert_eq!(clone_allocations, 0);
+            // Real native views retain these exact scopes. Their guard/custody
+            // controls and clones must keep the scopes paid until the LAST view.
+            let before_views = owner.usage().used;
+            let ((outer_view, inner_view), _view_requests, view_count) = persistence
+                .with_db(|raw| {
+                    Ok(source_requests_for_test(counter, || {
+                        let outer_view =
+                            redb::with_native_storage_admission(outer_clone.clone(), || {
+                                raw.begin_native_read()
+                            })
+                            .unwrap();
+                        let inner_view =
+                            redb::with_native_storage_admission(inner_clone.clone(), || {
+                                raw.begin_native_read()
+                            })
+                            .unwrap();
+                        (outer_view, inner_view)
+                    }))
+                })
+                .unwrap();
+            assert!(view_count > 0 && view_count <= 32);
+            // The adapter prepares outside this window. Observe the scope
+            // cells themselves for retention by the actual live native views.
+            assert!(owner.usage().used > before_views);
+            assert_eq!(source_unfunded_peak_for_test().0, 0);
+            let ((outer_view_clone, inner_view_clone), _, view_clone_allocations) =
+                native_requests_for_test(|| (outer_view.clone(), inner_view.clone()));
+            assert_eq!(view_clone_allocations, 0);
+            assert_eq!(
+                outer_view.storage_snapshot_identity(),
+                outer_view_clone.storage_snapshot_identity()
+            );
+            assert_eq!(
+                inner_view.storage_snapshot_identity(),
+                inner_view_clone.storage_snapshot_identity()
+            );
+            let mut failed = [false; 2];
+            let (error, _, late_allocations) = native_requests_for_test(|| {
+                // The database adapter and BOTH run_original boundaries prepay
+                // before producer entry. Exhaust admission only after that work.
+                NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));
+                persistence
+                    .with_db_original_funded(&original, |raw| {
+                        outer.run_original(OriginalStoragePhase::ReceivedOuter, || {
+                            inner.run_original(OriginalStoragePhase::ReceivedBegin, || {
+                                owner.set_budget(Some(owner.usage().used)).unwrap();
+                                NATIVE_REQUEST_ACTIVE.with(|active| active.set(true));
+                                // Reinstall the genuine outer owner for its actual
+                                // native producer while the inner callback is live.
+                                failed[0] = redb::with_native_storage_admission(
+                                    outer_clone.clone(),
+                                    || raw.begin_native_read(),
+                                )
+                                .is_err();
+                                failed[1] = raw.begin_native_read().is_err();
+                                Err::<(), _>(diagnosis)
+                            })
+                        })
+                    })
+                    .unwrap_err()
+            });
+            assert_eq!(
+                failed,
+                [true, true],
+                "both genuine native producers must refuse"
+            );
+            assert_eq!(
+                late_allocations, 0,
+                "failure custody cannot box after admission has failed"
+            );
+            assert_eq!(error.to_string(), expected);
+            assert!(!error.is_memory_refusal());
+            assert!(
+                error.source_is_qualified(),
+                "scalar secondary refusals preserve funded primary"
+            );
+            assert!(
+                source_free_for_test(count)[..count]
+                    .iter()
+                    .all(|free| free.2 == 0)
+            );
+            assert_eq!(
+                source_free_for_test(count + 1)[count].2,
+                0,
+                "the actual decoded primary remains live through scope propagation"
+            );
+            drop(Some(error));
+            let primary_free = source_free_for_test(count + 1)[count];
+            assert_eq!(
+                primary_free.2, 1,
+                "dropping the error destroys its primary even while native views retain scopes"
+            );
+            assert_eq!(
+                primary_free.0, primary_free.1,
+                "primary invoice survives physical free"
+            );
+            assert!(primary_free.0.saturating_sub(baseline) >= primary_requests[0].1);
+            assert!(
+                source_free_for_test(count)[..count]
+                    .iter()
+                    .all(|free| free.2 == 0),
+                "retained admission clones still own both actual cells"
+            );
+            if inner_first {
+                drop(inner_clone);
+                drop(outer_clone);
+            } else {
+                drop(outer_clone);
+                drop(inner_clone);
+            }
+            assert!(
+                source_free_for_test(count)[..count]
+                    .iter()
+                    .all(|free| free.2 == 0),
+                "real native views retain both scopes after admission clones drop"
+            );
+            drop((outer_view, inner_view));
+            assert!(
+                source_free_for_test(count)[..count]
+                    .iter()
+                    .all(|free| free.2 == 0),
+                "cloned native views are now the last scope holders"
+            );
+            if inner_first {
+                drop(inner_view_clone);
+                drop(outer_view_clone);
+            } else {
+                drop(outer_view_clone);
+                drop(inner_view_clone);
+            }
+            let frees = source_free_for_test(count);
+            disarm_source_free_watch();
+            for (index, free) in frees[..count].iter().enumerate() {
+                assert_eq!(free.2, 1);
+                assert_eq!(free.0, free.1, "invoice survives System.dealloc");
+                assert!(
+                    free.0.saturating_sub(baseline)
+                        >= NATIVE_FREE[index].live_at_free.load(AtomicOrdering::SeqCst),
+                    "all overlapping scopes remain paid until each physical free"
+                );
+            }
+            assert_eq!(owner.usage().used, baseline);
+        }
+    }
+}
+
+#[path = "selected_json_producer_rows.rs"]
+pub(crate) mod selected_json_producer_rows;
+
+/// Register a live, producer-identified allocation without allocating a ledger.
+/// Caller retains the original accountant until the complete deallocation cut.
+pub(crate) fn watch_next_exact_free_for_test(layout: Layout, counter: usize) {
+    NEXT_EXACT_FREE.with(|slot| slot.set((layout.size(), layout.align(), counter)));
+}
+pub(crate) fn watch_exact_free_for_test(request: (usize, usize, usize), counter: usize) {
+    watch_exact_frees_for_test(&[request], counter);
+}
+pub(crate) fn watch_exact_frees_for_test(requests: &[(usize, usize, usize)], counter: usize) {
+    assert!(requests.len() <= NATIVE_FREE.len());
+    for watch in &NATIVE_FREE {
+        watch.pointer.store(0, AtomicOrdering::SeqCst);
+        watch.count.store(0, AtomicOrdering::SeqCst);
+    }
+    for (request, watch) in requests.iter().zip(NATIVE_FREE.iter()) {
+        assert_ne!(request.0, 0);
+        let header = unsafe {
+            &*((request.0 as *const u8)
+                .sub(std::mem::size_of::<Header>())
+                .cast::<Header>())
+        };
+        watch.window.store(header.window, AtomicOrdering::SeqCst);
+        watch.bytes.store(request.1, AtomicOrdering::SeqCst);
+        watch.before.store(0, AtomicOrdering::SeqCst);
+        watch.after.store(0, AtomicOrdering::SeqCst);
+        watch.counter.store(counter, AtomicOrdering::SeqCst);
+        watch.pointer.store(request.0, AtomicOrdering::SeqCst);
+        // capture969 begin
+        #[cfg(feature = "test-seams")]
+        crate::database::retained_trace_ownership_tests::ordered_cut(
+            "native-free-register",
+            [
+                request.0,
+                request.1,
+                request.2,
+                header.window,
+                watch as *const _ as usize,
+                counter,
+                0,
+                0,
+            ],
+        );
+        // capture969 end
+    }
+}
+
+#[path = "native_scan_producer_tests.rs"]
+mod native_scan_producer_tests;
+
+// A borrowed observation window for constructors whose original production
+// statements must stay intact. It uses this same allocator and fixed receipts.
+pub(crate) struct SourceRequestsWindow {
+    // Borrow a surrounding real-query measurement without resetting it.
+    owns_measurement: bool,
+}
+impl SourceRequestsWindow {
+    pub(crate) fn begin(counter: usize) -> Self {
+        let window = {
+            let mut measurement = MEASUREMENT.lock().unwrap();
+            if measurement.active_window != 0 {
+                assert_eq!(
+                    MEASURING_HERE.with(std::cell::Cell::get),
+                    measurement.active_window,
+                    "a source receipt may borrow only its own thread's measurement"
+                );
+                (measurement.active_window, false)
+            } else {
+                measurement.last_window += 1;
+                measurement.active_window = measurement.last_window;
+                measurement.live = 0;
+                measurement.peak = 0;
+                measurement.payload_live = 0;
+                measurement.cache_payload_live = 0;
+                measurement.cache_payload_peak = 0;
+                measurement.cache_counter_identity = 0;
+                measurement.cache_reserve_identity = 0;
+                measurement.cache_payer_mismatch = false;
+                measurement.unscoped_page_allocations = 0;
+                measurement.source_unfunded_peak = 0;
+                measurement.source_unfunded_request = (0, 0, 0, false);
+                (measurement.active_window, true)
+            }
+        };
+        assert!(
+            !NATIVE_REQUEST_ACTIVE.with(std::cell::Cell::get),
+            "source request receipts cannot overlap"
+        );
+        SOURCE_REQUEST_CREDIT.with(|slot| slot.set([0; 256]));
+        NATIVE_REQUESTS.with(|slot| slot.set([(0, 0, 0); 256]));
+        NATIVE_REQUEST_COUNT.with(|slot| slot.set(0));
+        NATIVE_REQUEST_TOTAL.with(|total| total.set(0));
+        NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(false));
+        SOURCE_REQUEST_COUNTER.with(|slot| slot.set(counter));
+        MEASURING_HERE.with(|slot| slot.set(window.0));
+        NATIVE_REQUEST_ACTIVE.with(|slot| slot.set(true));
+        Self {
+            owns_measurement: window.1,
+        }
+    }
+    pub(crate) fn receipt(&self) -> ([(usize, usize, usize); 256], [usize; 256], usize) {
+        (
+            NATIVE_REQUESTS.with(std::cell::Cell::get),
+            SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get),
+            NATIVE_REQUEST_COUNT.with(|count| count.get().min(256)),
+        )
+    }
+}
+impl Drop for SourceRequestsWindow {
+    fn drop(&mut self) {
+        NATIVE_REQUEST_ACTIVE.with(|slot| slot.set(false));
+        SOURCE_REQUEST_COUNTER.with(|slot| slot.set(0));
+        if self.owns_measurement {
+            MEASURING_HERE.with(|slot| slot.set(0));
+            MEASUREMENT.lock().unwrap().active_window = 0;
+        }
+    }
+}
+
+// These lib tests run in the existing engine test-seams lib CI tier.
+#[test]
+fn inactive_graph_allocator_observation_copies_no_record() {
+    assert!(!GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+    let before = GRAPH_FREE_RECORD_COPIES.with(std::cell::Cell::get);
+    let block = vec![42u8; std::hint::black_box(73)];
+    std::hint::black_box(&block);
+    drop(block);
+    assert_eq!(
+        GRAPH_FREE_RECORD_COPIES.with(std::cell::Cell::get),
+        before,
+        "inactive real allocator callbacks must never load the graph observation record"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::redundant_closure_call,
+    reason = "The immediately invoked fallible closure models an operation boundary with its local guards."
+)]
+fn graph_allocator_observation_restores_nested_error_and_panic_scopes() {
+    use crate::vector_observations::{
+        VectorGraphBufferKindForTest as Kind, VectorGraphWorkspaceEventForTest as Event,
+    };
+    assert!(!GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+    {
+        let _outer = watch_graph_allocations();
+        let original = vec![1u8; std::hint::black_box(81)];
+        graph_workspace_event(&Event::GraphBuffers {
+            kind: Kind::OriginalEnvelope,
+            pointer: original.as_ptr() as usize,
+            capacity: original.capacity(),
+        });
+        let error = (|| -> std::result::Result<(), ()> {
+            let _inner = watch_graph_allocations();
+            Err(())
+        })();
+        assert!(error.is_err());
+        let panic = std::panic::catch_unwind(|| {
+            let _inner = watch_graph_allocations();
+            panic!("scope unwind");
+        });
+        assert!(panic.is_err());
+        assert!(GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+        let selected = vec![2u8; std::hint::black_box(97)];
+        graph_workspace_event(&Event::GraphBuffers {
+            kind: Kind::SelectedBase,
+            pointer: selected.as_ptr() as usize,
+            capacity: selected.capacity(),
+        });
+        drop(original);
+        drop(selected);
+        graph_workspace_event(&Event::WorkspaceResize {
+            previous: 178,
+            next: 0,
+            operation: "normal_cleanup",
+        });
+        assert_graph_freed_before_workspace_refund(false);
+    }
+    assert!(!GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+    inactive_graph_allocator_observation_copies_no_record();
+}
+
+#[test]
+fn maintenance_allocator_observation_tracks_real_payload_before_refund() {
+    use contextdb_core::read_memory::ReadMemoryBudget;
+    let db = crate::Database::open_memory();
+    let spy = MaintenanceReaderSpy::new(
+        db.declared_reader_memory().unwrap(),
+        db.writer_accountant_for_test().clone(),
+    );
+    // A real prepaid child invoice and the real allocator request share this
+    // exact identity. No inferred native header or adapter layout is used.
+    let bytes = 83;
+    spy.source
+        .try_reserve(
+            bytes,
+            "reader",
+            "materialize_answer",
+            "bounded observer guard",
+        )
+        .unwrap();
+    let owner = &spy as *const _ as usize;
+    MAINTENANCE_INVOICES.with(|tickets| {
+        let mut entries = [(0, 0, 0); 16];
+        entries[0] = (owner, spy.as_ref() as *const _ as usize, bytes);
+        tickets.set(entries);
+    });
+    let layout = Layout::from_size_align(bytes, 8).unwrap();
+    let pointer = unsafe { std::alloc::alloc(layout) };
+    assert!(!pointer.is_null());
+    assert_eq!(spy.payload_allocations.load(AtomicOrdering::SeqCst), 1);
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        assert!(entries.as_slice_of_cells().iter().any(|slot| {
+            let slot = slot.get();
+            slot.pointer == pointer as usize
+                && slot.bytes == layout.size()
+                && slot.owner == owner
+                && slot.funder == spy.as_ref() as *const _ as usize
+        }));
+    });
+    unsafe {
+        std::alloc::dealloc(pointer, layout);
+    }
+    assert_eq!(spy.payload_frees.load(AtomicOrdering::SeqCst), 1);
+    maintenance_owner_refund(owner, &spy);
+    spy.source.release(bytes);
+    spy.assert_payload_lifetime();
+}
+
+// A fixed recorder must reject incomplete evidence after it stops observing,
+// so formatting the failure cannot recursively enter its allocator hook.
+#[test]
+#[serial]
+fn native_request_overflow_invalidates_the_receipt_after_recording_stops() {
+    let outcome = std::panic::catch_unwind(|| {
+        source_requests_for_test(0, || {
+            for _ in 0..257 {
+                let layout = Layout::new::<[u8; 17]>();
+                let pointer = unsafe { std::alloc::alloc(layout) };
+                assert!(!pointer.is_null());
+                std::hint::black_box(pointer);
+                unsafe { std::alloc::dealloc(pointer, layout) };
+            }
+        })
+    });
+    let panic = outcome.expect_err("overflow must invalidate the allocation receipt");
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    assert!(
+        message.contains("allocation recorder overflow"),
+        "{message}"
+    );
+    let (block, _, count) = native_requests_for_test(|| Box::new(17_u64));
+    assert_eq!(count, 1, "a new window starts with a complete recorder");
+    drop(block);
+    let window = SourceRequestsWindow::begin(0);
+    for _ in 0..257 {
+        let layout = Layout::new::<[u8; 17]>();
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        assert!(!pointer.is_null());
+        std::hint::black_box(pointer);
+        unsafe { std::alloc::dealloc(pointer, layout) };
+    }
+    let (_, _, recorded) = window.receipt();
+    let overflowed = source_request_overflow_for_test();
+    drop(window);
+    assert_eq!(recorded, 256, "borrowed receipts clamp to their storage");
+    assert!(
+        overflowed,
+        "the bounded prefix cannot qualify as a complete census"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[path = "coordination_recorder_support_tests.rs"]
+mod coordination_recorder_support_tests;

@@ -64,22 +64,32 @@ fi
 # A split shard runs only its listed targets (scripts/ci-shard-targets.txt);
 # examples and doctests run once, in the shard that lists `lib`.
 run_extras=true
+run_maintenance=false
+if [[ "$crate" == contextdb-engine && "$features" == *test-seams* ]]; then run_maintenance=true; fi
+maintenance_case=paged_initial_replacement_and_reclamation_progress_under_writes::paged_initial_replacement_and_reclamation_progress_under_writes
 skip_case=""
+aggregate_names=()
 manifest="$(dirname -- "${BASH_SOURCE[0]}")/ci-shard-targets.txt"
 while read -r name items; do
   [[ "$name" == "$shard:" ]] || continue
   targets=()
   run_extras=false
+  run_maintenance=false
   routing=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" shard-plan "$shard")
   items=${routing%%|*}
   skip_case=${routing#*|}
   for item in $items; do
+    if [[ "$item" == engine_seams ]]; then run_maintenance=true; fi
+    if [[ "$item" == custody || "$item" == vector || ( "$item" == custody_schema_replay_bounded_contract && "${CI_GATE_MODE:-full}" == full ) ]]; then
+      aggregate_names+=("$item")
+      continue
+    fi
     if [[ "$item" == lib ]]; then targets+=(--lib --bins); run_extras=true; else targets+=(--test "$item"); fi
   done
 done < <(grep -v '^#' "$manifest")
 # Reflect the actual libtest mode; the command-line seam override wins over env.
 thread_mode="${RUST_TEST_THREADS:-default-parallel}"
-if [[ "$features" == *test-seams* ]]; then thread_mode=1; fi
+if [[ "$crate" == contextdb-engine || "$features" == *test-seams* ]]; then thread_mode=1; fi
 # Exact exclusion is visible in receipts and remains executable in full mode.
 start=$(date +%s)
 # shellcheck disable=SC2329 # Invoked by the EXIT trap.
@@ -138,23 +148,51 @@ trap finish EXIT
 if [[ "$crate" == contextdb-engine || "$crate" == contextdb-server ]]; then
   timeout 30m cargo build --locked -p contextdb-cli -p contextdb-server
 fi
-# Test-hook builds run one test at a time, as scripts/verify does; default builds run in parallel.
+# Engine cfg(test) also installs process-wide proof observers and counters.
+# Keep their cases isolated, using the existing test-hook execution policy.
 threads=()
-if [[ "$features" == *test-seams* ]]; then threads=(--test-threads=1); fi
+if [[ "$crate" == contextdb-engine || "$features" == *test-seams* ]]; then threads=(--test-threads=1); fi
 if [[ -n "$skip_case" ]]; then threads+=(--skip "$skip_case"); fi
+if [[ "$run_maintenance" == true ]]; then threads+=(--skip "$maintenance_case"); fi
 set +e
 # Explicit libtest targets avoid forwarding libtest flags to Criterion benches.
 # Keep ignored tests ignored. Ordinary elapsed time is a receipt, not a threshold.
 if [[ "$crate" == contextdb-engine || "$crate" == contextdb-server ]]; then
   env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
       "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
-    timeout 300m cargo test --locked "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
+    timeout 300m cargo test --locked --no-fail-fast "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
 else
-  timeout 300m cargo test --locked "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
+  timeout 300m cargo test --locked --no-fail-fast "${args[@]}" "${targets[@]}" -- "${threads[@]}" 2>&1 | tee "$receipt_dir/$shard.log"
 fi
 statuses=("${PIPESTATUS[@]}")
 status=${statuses[0]}
 if [[ "$status" == 0 ]]; then status=${statuses[1]}; fi
+# The maintenance journey has its own runner limit; its body remains unchanged.
+if [[ "$run_maintenance" == true ]]; then
+  env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
+      "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/ci-maintenance-journey.sh" "$receipt_dir" "${args[@]}"
+  maintenance_status=$?
+  if [[ "$status" == 0 ]]; then status=$maintenance_status; fi
+fi
+# Each filter belongs only to its isolated binary, never its execution owner.
+for aggregate_name in "${aggregate_names[@]}"; do
+  if ! aggregate_plan=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" aggregate-skips "$aggregate_name" --aggregate-features "$features"); then
+    if [[ "$status" == 0 ]]; then status=2; fi
+    continue
+  fi
+  aggregate_flags=(--test-threads=1)
+  while IFS= read -r prefix; do
+    [[ -n "$prefix" ]] && aggregate_flags+=(--skip "$prefix")
+  done <<< "$aggregate_plan"
+  env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
+      "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
+    timeout 300m cargo test --locked --no-fail-fast "${args[@]}" --test "$aggregate_name" -- "${aggregate_flags[@]}" 2>&1 | tee "$receipt_dir/$shard.aggregate-$aggregate_name.log"
+  statuses=("${PIPESTATUS[@]}")
+  aggregate_status=${statuses[0]}
+  if [[ "$aggregate_status" == 0 ]]; then aggregate_status=${statuses[1]}; fi
+  if [[ "$status" == 0 ]]; then status=$aggregate_status; fi
+done
 set -e
 if [[ "$status" == 0 && "$run_extras" == true ]]; then
   # cargo test's default example compilation and doctests remain required.

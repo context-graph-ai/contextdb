@@ -75,7 +75,8 @@ fn submit_blob_job(db: &Database, job_id: &str, input_refs: Vec<InputRef>) {
 fn work_job_ids(db: &Database) -> Vec<Vec<Value>> {
     db.execute("SELECT job_id FROM work_jobs ORDER BY job_id", &params())
         .expect("read work-ledger job ids")
-        .rows
+        .rows()
+        .to_vec()
 }
 
 fn report_rows(mut pairs: Vec<(String, String)>) -> Vec<Vec<Value>> {
@@ -94,7 +95,8 @@ fn rows(db: &Database) -> Vec<Vec<Value>> {
         &params(),
     )
     .expect("read public purge fixture rows")
-    .rows
+    .rows()
+    .to_vec()
 }
 
 fn observable_state(db: &Database) -> ObservablePurgeState {
@@ -110,6 +112,7 @@ fn observable_state(db: &Database) -> ObservablePurgeState {
 
 fn table_history(db: &Database) -> Vec<RowChange> {
     db.changes_since(Lsn(0))
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| row.table == TABLE)
@@ -168,7 +171,87 @@ fn assert_successful_batch_history(db: &Database, survivor_history_before: &[Row
 }
 
 #[test]
+#[serial_test::serial]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen() {
+    // Extend the registered atomic-erasure proof with long unrelated column
+    // names. The frozen schema-width fixture has only short field names and
+    // does not combine copy observations with a failed durable publication.
+    {
+        use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+        let mut peaks = Vec::new();
+        let mut peak_origins = Vec::new();
+        for columns in [1, 17] {
+            // The production persistence fault is one-shot and thread-local;
+            // an early failure must not leave it armed in the parent proof.
+            let peak = std::thread::spawn(move || {
+                let fixture = file_fixture();
+                fixture.db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+                for table in 0..2 {
+                    let fields = (0..columns).map(|column|
+                        format!("field_{column}_{} TEXT", "x".repeat(1024)))
+                        .collect::<Vec<_>>().join(",");
+                    fixture.db.execute(&format!(
+                        "CREATE TABLE unrelated_{table} (id INT PRIMARY KEY,{fields}) HISTORY ALL SYNC OFF"), &params()).unwrap();
+                    fixture.db.execute(&format!(
+                        "INSERT INTO unrelated_{table} (id) VALUES (77)"), &params()).unwrap();
+                }
+                let before = observable_state(&fixture.db);
+                fixture.db.arm_authoritative_purge_point_remove_persistence_failure_for_test();
+                let (refused, refusal_peak, _, refusal_origin) = oracle::measured_purge(|| fixture.db.execute(
+                    "PURGE FROM purge_contract_rows WHERE cohort = 'selected'", &params()));
+                assert!(matches!(refused, Err(Error::Other(ref message))
+                    if message == "authoritative purge point-remove persistence failure injected"),
+                    "wide unrelated declarations must not mask the actual durable fault: {refused:?}");
+                assert_eq!(observable_state(&fixture.db), before,
+                    "failed erasure preserves both selected rows, survivor, history and deletion frontiers");
+                let history = table_history(&fixture.db);
+                let survivor_history = history_for_id(&history, 3);
+                let (result, success_peak, _, success_origin) = oracle::measured_purge(|| fixture.db.execute(
+                    "PURGE FROM purge_contract_rows WHERE cohort = 'selected'", &params()));
+                assert_eq!(result.unwrap().rows_affected(), 2);
+                assert_selected_absent_and_survivor_intact(&fixture.db);
+                assert_successful_batch_history(&fixture.db, &survivor_history);
+                for table in 0..2 {
+                    assert_eq!(fixture.db.execute(&format!(
+                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows(),
+                        vec![vec![Value::Int64(77)]]);
+                }
+                fixture.db.close().unwrap();
+                let reopened = Database::open(&fixture.path).unwrap();
+                assert_selected_absent_and_survivor_intact(&reopened);
+                assert_successful_batch_history(&reopened, &survivor_history);
+                for table in 0..2 {
+                    assert_eq!(reopened.execute(&format!(
+                        "SELECT id FROM unrelated_{table}"), &params()).unwrap().rows(),
+                        vec![vec![Value::Int64(77)]]);
+                }
+                reopened.close().unwrap();
+                ((refusal_peak, success_peak), (refusal_origin, success_origin))
+            }).join().expect("selected purge row completes without leaking its fault");
+            let (peak, origins) = peak;
+            assert!(
+                origins.0.complete && origins.1.complete,
+                "purge allocation census must be complete for width {columns}: {origins:?}"
+            );
+            assert!(
+                peak.0 > 0 && peak.1 > 0,
+                "both actual publication paths were measured"
+            );
+            peaks.push(peak);
+            peak_origins.push((columns, origins));
+        }
+        assert!(
+            peaks[1].0 <= peaks[0].0 && peaks[1].1 <= peaks[0].1,
+            "unrelated nested schema width must not increase physical purge workspace on refusal or success: {peaks:?}; actual native/header/padding origins: {peak_origins:?}"
+        );
+    }
     // The point-remove fault is thread-local and one-shot. Keep its run in an
     // owned thread so an early public-PURGE failure cannot arm the success
     // baseline below.
@@ -235,7 +318,7 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
             &params(),
         )
         .expect("one public predicate purge succeeds after the isolated failure run");
-    assert_eq!(result.rows_affected, 2);
+    assert_eq!(result.rows_affected(), 2);
     assert_selected_absent_and_survivor_intact(&fixture.db);
     assert_successful_batch_history(&fixture.db, &survivor_history_before);
     fixture
@@ -303,14 +386,18 @@ fn public_purge_reports_only_distinct_sorted_work_job_blob_survivors() {
         )
         .expect("purge the two selected work jobs");
 
-    assert_eq!(result.rows_affected, 2, "the selected count remains exact");
     assert_eq!(
-        result.columns,
+        result.rows_affected(),
+        2,
+        "the selected count remains exact"
+    );
+    assert_eq!(
+        result.columns(),
         vec!["blob_hash".to_string(), "remaining_job_id".to_string()],
         "the public survivor-report schema stays explicit"
     );
     assert_eq!(
-        result.rows,
+        result.rows(),
         report_rows(vec![
             (first_hash.to_hex(), "remaining-zeta".to_string()),
             (second_hash.to_hex(), "remaining-alpha".to_string()),
@@ -336,9 +423,9 @@ fn public_purge_reports_only_distinct_sorted_work_job_blob_survivors() {
             &params(),
         )
         .expect("purge every remaining referent for the selected blobs");
-    assert_eq!(all_selected.rows_affected, 2);
+    assert_eq!(all_selected.rows_affected(), 2);
     assert!(
-        all_selected.columns.is_empty() && all_selected.rows.is_empty(),
+        all_selected.columns().is_empty() && all_selected.rows().is_empty(),
         "when no remaining work job refers to a selected blob, PURGE returns no report rows"
     );
 }
@@ -379,7 +466,7 @@ fn public_purge_reports_blob_referent_from_a_superseded_selected_work_job_versio
                 &params(),
             )
             .expect("read selected work job's current input refs")
-            .rows,
+            .rows(),
         vec![vec![Value::Json(serde_json::json!([{
             "kind": "blob_ref",
             "detail": { "hash": current_hash.to_hex() }
@@ -392,13 +479,13 @@ fn public_purge_reports_blob_referent_from_a_superseded_selected_work_job_versio
         .execute("PURGE FROM work_jobs WHERE job_id = 'selected'", &params())
         .expect("purge destroys every version of the selected work job");
 
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec!["blob_hash".to_string(), "remaining_job_id".to_string()]
     );
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![
             Value::Text(historical_hash.to_hex()),
             Value::Text("survivor".to_string()),
@@ -413,7 +500,100 @@ fn public_purge_reports_blob_referent_from_a_superseded_selected_work_job_versio
 }
 
 #[test]
+#[cfg_attr(
+    any(test, feature = "test-seams"),
+    expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )
+)]
 fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
+    // Delivered erasure either removes the live selected copy or returns a
+    // typed failure before its purge metadata and delivery frontier advance.
+    {
+        let fixture = file_fixture();
+        let before = observable_state(&fixture.db);
+        let reader = fixture.db.declared_reader_memory().unwrap();
+        let selected = fixture
+            .db
+            .resolve_authoritative_purge_selection(
+                TABLE,
+                &NaturalKey::single("id".into(), Value::Int64(1)),
+                reader.clone(),
+            )
+            .unwrap();
+        let delivery = AuthoritativePurgeDeliveryItem {
+            node_local_predicate: None,
+            frontier: Lsn(fixture.db.current_lsn().0 + 1),
+            ordinal: 0,
+            table: TABLE.to_string(),
+            table_generation: selected.table_generation,
+            natural_key: selected.natural_key.clone(),
+            purged_lineage_roots: vec![selected.lineage_root.clone()],
+        };
+        let key = Database::durable_lineage_table_generation_key(TABLE);
+        let persistence = fixture.db.persistence.as_ref().unwrap();
+        fixture
+            .db
+            .publish_direct_metadata(|| {
+                persistence.flush_encoded_config_values(vec![(
+                    key.as_str(),
+                    RedbPersistence::encode_config_value(&0_u64)?,
+                )])
+            })
+            .unwrap();
+        let original = fixture
+            .db
+            .durable_lineage_table_generation(TABLE, reader.clone())
+            .unwrap_err();
+        let original_message = format!("{original:?}");
+        assert!(matches!(original, Error::StoreCorrupted { ref path, .. } if path == key.as_str()));
+        let mut copy = crate::vector_read_memory::admission(reader.clone());
+        let outcome = fixture
+            .db
+            .apply_incoming_authoritative_purge_batch_while_authoritative(
+                std::slice::from_ref(&delivery),
+                &mut copy,
+                reader.clone(),
+            );
+        let after_failed_delivery_lsn = fixture.db.current_lsn();
+        // Restore only the damaged generation record before reading the row
+        // and purge witnesses. A failed delivery has published none of them.
+        fixture
+            .db
+            .publish_direct_metadata(|| {
+                persistence.flush_encoded_config_values(vec![(
+                    key.as_str(),
+                    RedbPersistence::encode_config_value(&selected.table_generation)?,
+                )])
+            })
+            .unwrap();
+        assert_eq!(
+            outcome.as_ref().err().map(|error| format!("{error:?}")),
+            Some(original_message)
+        );
+        assert_eq!(after_failed_delivery_lsn, before.current_lsn);
+        assert_eq!(observable_state(&fixture.db), before);
+        fixture
+            .db
+            .apply_incoming_authoritative_purge_batch_while_authoritative(
+                std::slice::from_ref(&delivery),
+                &mut copy,
+                reader.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            rows(&fixture.db),
+            vec![
+                vec![Value::Int64(2), Value::Text("selected".into())],
+                vec![Value::Int64(3), Value::Text("survivor".into())]
+            ]
+        );
+        let erased = fixture
+            .db
+            .durable_deletion_state_for_test(TABLE, &Value::Int64(1));
+        assert!(erased.purge_frontier.is_some());
+    }
     let fixture = ledger_file_fixture();
     let selected_hash = BlobHash::of(b"inbound selected blob");
     submit_blob_job(
@@ -437,9 +617,18 @@ fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
 
     let selected_key =
         NaturalKey::single("job_id".to_string(), Value::Text("selected".to_string()));
+    let fixture_operation_reader_1 = fixture
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let selected = fixture
         .db
-        .resolve_authoritative_purge_selection("work_jobs", &selected_key)
+        .resolve_authoritative_purge_selection(
+            "work_jobs",
+            &selected_key,
+            fixture_operation_reader_1.clone(),
+        )
         .expect("resolve local selected work-job lineage for inbound purge");
     let delivery = AuthoritativePurgeDeliveryItem {
         node_local_predicate: None,
@@ -450,10 +639,20 @@ fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
         natural_key: selected.natural_key.clone(),
         purged_lineage_roots: vec![selected.lineage_root.clone()],
     };
+    let fixture_operation_reader_1 = fixture
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_1 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_1.clone());
 
     fixture
         .db
-        .apply_incoming_authoritative_purge_batch_while_authoritative(&[delivery])
+        .apply_incoming_authoritative_purge_batch_while_authoritative(
+            &[delivery],
+            &mut fixture_operation_copy_1,
+            fixture_operation_reader_1.clone(),
+        )
         .expect("inbound purge must not parse an unrelated local survivor report");
 
     assert_eq!(
@@ -469,7 +668,7 @@ fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
                 &params(),
             )
             .expect("read retained malformed survivor")
-            .rows,
+            .rows(),
         vec![vec![malformed_input_refs]],
         "the malformed unrelated survivor remains untouched by inbound delivery"
     );
@@ -512,9 +711,9 @@ fn public_purge_does_not_report_ordinary_lookalike_rows() {
             &params(),
         )
         .expect("purge ordinary lookalike row");
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
     assert!(
-        result.columns.is_empty() && result.rows.is_empty(),
+        result.columns().is_empty() && result.rows().is_empty(),
         "only the canonical work_jobs table receives a blob-survivor report"
     );
 }

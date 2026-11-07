@@ -69,6 +69,10 @@ fn persist_and_reopen(c: &mut Criterion) {
 }
 
 fn mixed_workflow_latency(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function("mixed_workflow/graph_relational_vector", |_| {});
+        return;
+    }
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE entities (id UUID PRIMARY KEY, entity_type TEXT, name TEXT)",

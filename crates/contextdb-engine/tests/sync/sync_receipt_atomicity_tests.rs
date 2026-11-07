@@ -47,7 +47,9 @@ struct RejectSyncedCommit;
 impl DatabasePlugin for RejectSyncedCommit {
     fn pre_commit(&self, _ws: &WriteSet, source: CommitSource) -> contextdb_core::Result<()> {
         if source == CommitSource::SyncPull {
-            return Err(Error::Other("injected synced-commit failure".to_string()));
+            return Err(Error::Other(
+                "injected synced-commit failure".to_string().into(),
+            ));
         }
         Ok(())
     }
@@ -69,7 +71,9 @@ fn failed_synced_commit_publishes_neither_row_nor_authenticated_receipt() {
     source
         .execute("INSERT INTO notes VALUES (1, 'from-edge')", &params)
         .expect("source row");
-    let changes = source.changes_since(Lsn(1));
+    let changes = source
+        .changes_since(Lsn(1))
+        .expect("read or construct the declared fixture result");
     let receipt_lsn = changes.max_lsn().expect("row carries a source LSN");
 
     let temp = tempfile::TempDir::new().expect("tempdir");
@@ -115,7 +119,7 @@ fn failed_synced_commit_publishes_neither_row_nor_authenticated_receipt() {
     assert_eq!(
         hub.execute("SELECT * FROM notes", &params)
             .expect("query hub after rejected sync")
-            .rows
+            .rows()
             .len(),
         0,
         "a failed sync commit must not publish its row either"
@@ -138,7 +142,7 @@ fn failed_synced_commit_publishes_neither_row_nor_authenticated_receipt() {
         reopened
             .execute("SELECT * FROM notes", &params)
             .expect("query reopened hub")
-            .rows
+            .rows()
             .len(),
         0,
         "the failed row must not appear after reopening the durable hub"
@@ -213,7 +217,7 @@ fn durable_table_drop_and_rewrite_cleanup_remove_both_sync_provenance_sidecars()
         reopened_cleanup
             .execute("SELECT * FROM notes", &params)
             .expect("query rewritten table")
-            .rows
+            .rows()
             .is_empty(),
         "the cleanup rewrite must remain applied after reopen"
     );
@@ -230,13 +234,16 @@ fn local_overwrite_clears_durable_accepted_local_provenance() {
         .expect("insert local row");
     let accepted = db
         .changes_since(Lsn(1))
+        .expect("read or construct the declared fixture result")
         .rows
         .into_iter()
         .next()
         .expect("local row change");
     db.record_hub_accepted_rows(std::slice::from_ref(&accepted), Lsn(800), Some("hub"))
         .expect("record hub acceptance");
-    let (_, accepted_arrivals) = db.changes_since_with_arrivals(Lsn(0));
+    let (_, accepted_arrivals) = db
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         accepted_arrivals.get(&accepted.lsn),
         Some(&Some(Lsn(800))),
@@ -248,7 +255,9 @@ fn local_overwrite_clears_durable_accepted_local_provenance() {
         &params,
     )
     .expect("local overwrite");
-    let (changes, arrivals) = db.changes_since_with_arrivals(Lsn(0));
+    let (changes, arrivals) = db
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     let current = changes
         .rows
         .iter()
@@ -286,6 +295,7 @@ fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgem
         .expect("insert lost local row");
     let local = db
         .changes_since(Lsn(1))
+        .expect("read or construct the declared fixture result")
         .rows
         .into_iter()
         .next()
@@ -294,7 +304,9 @@ fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgem
         .expect("record old hub acknowledgement");
     db.invalidate_accepted_local_ordering_after_hub_regression(Lsn(1))
         .expect("mark restored-hub row pending fresh ordering");
-    let (_, pending_arrivals) = db.changes_since_with_arrivals(Lsn(0));
+    let (_, pending_arrivals) = db
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         pending_arrivals.get(&local.lsn),
         Some(&None),
@@ -311,14 +323,16 @@ fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgem
     assert_eq!(
         db.execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query pending row")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("lost-local".to_string())]],
         "a continuing pull cannot overwrite local work while its hub order is pending"
     );
     db.close().expect("close pending edge");
 
     let reopened = Database::open(&path).expect("reopen pending edge");
-    let (_, reopened_arrivals) = reopened.changes_since_with_arrivals(Lsn(0));
+    let (_, reopened_arrivals) = reopened
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         reopened_arrivals.get(&local.lsn),
         Some(&None),
@@ -327,7 +341,9 @@ fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgem
     reopened
         .record_hub_accepted_rows(std::slice::from_ref(&local), Lsn(51), Some("hub"))
         .expect("fresh restored-hub acknowledgement");
-    let (_, refreshed_arrivals) = reopened.changes_since_with_arrivals(Lsn(0));
+    let (_, refreshed_arrivals) = reopened
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         refreshed_arrivals.get(&local.lsn),
         Some(&Some(Lsn(51))),
@@ -346,6 +362,7 @@ fn confirmed_identical_echo_stays_pending_across_reopen_until_refresh_commits() 
         .expect("local write");
     let local = db
         .changes_since(Lsn(1))
+        .expect("read or construct the declared fixture result")
         .rows
         .into_iter()
         .next()
@@ -365,7 +382,9 @@ fn confirmed_identical_echo_stays_pending_across_reopen_until_refresh_commits() 
         .expect("close at apply-to-refresh crash boundary");
 
     let reopened = Database::open(&path).expect("reopen after simulated crash");
-    let (_, arrivals) = reopened.changes_since_with_arrivals(Lsn(0));
+    let (_, arrivals) = reopened
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         arrivals.get(&local.lsn),
         Some(&None),
@@ -384,7 +403,7 @@ fn confirmed_identical_echo_stays_pending_across_reopen_until_refresh_commits() 
         reopened
             .execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query protected row")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("local".to_string())]],
         "a restored hub cannot overwrite the unrefreshed local row"
     );
@@ -399,6 +418,7 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
         .expect("insert row");
     let live = edge
         .changes_since(Lsn(1))
+        .expect("read or construct the declared fixture result")
         .rows
         .into_iter()
         .next()
@@ -408,6 +428,7 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
         .expect("delete row");
     let delete = edge
         .changes_since(live_lsn)
+        .expect("read or construct the declared fixture result")
         .rows
         .into_iter()
         .find(|row| row.deleted)
@@ -416,14 +437,18 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
         .expect("record old delete acknowledgement");
     edge.invalidate_accepted_local_ordering_after_hub_regression(Lsn(1))
         .expect("invalidate old delete order");
-    let (_, arrivals) = edge.changes_since_with_arrivals(Lsn(0));
+    let (_, arrivals) = edge
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         arrivals.get(&delete.lsn),
         Some(&None),
         "the lost delete resends without the discarded hub order"
     );
     assert!(
-        !edge.row_change_arrived_by_sync(&delete),
+        !edge
+            .row_change_arrived_by_sync(&delete)
+            .expect("read the actual fixture observation"),
         "an invalidated AcceptedLocal delete remains outbound work"
     );
     edge.apply_synced_changes(
@@ -439,7 +464,7 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
     assert!(
         edge.execute("SELECT * FROM notes", &params)
             .expect("query after stale live pull")
-            .rows
+            .rows()
             .is_empty(),
         "a stale pull cannot resurrect a delete before its fresh acknowledgement"
     );
@@ -448,7 +473,9 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
         &HashMap::from([(delete.lsn, Some(Lsn(901)))]),
     )
     .expect("confirmed delete echo refreshes its invalidated tombstone");
-    let (_, refreshed_arrivals) = edge.changes_since_with_arrivals(Lsn(0));
+    let (_, refreshed_arrivals) = edge
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         refreshed_arrivals.get(&delete.lsn),
         Some(&Some(Lsn(901))),
@@ -464,7 +491,7 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
     assert_eq!(
         edge.execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query after later hub edit")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("later-hub-edit".to_string())]],
         "a fresh delete acknowledgement must not suppress later hub truth"
     );
@@ -482,13 +509,16 @@ fn restored_before_pending_marks_a_fresh_local_delete_stampless_until_confirmed(
         .expect("fresh local delete");
     let delete = edge
         .changes_since(before_delete)
+        .expect("read or construct the declared fixture result")
         .rows
         .into_iter()
         .find(|row| row.deleted)
         .expect("current delete change");
     edge.mark_outbound_rows_pending(before_delete, Some(delete.lsn))
         .expect("mark fresh delete Pending before restored-hub pull");
-    let (_, arrivals) = edge.changes_since_with_arrivals(Lsn(0));
+    let (_, arrivals) = edge
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     assert_eq!(
         arrivals.get(&delete.lsn),
         Some(&None),
@@ -504,7 +534,7 @@ fn restored_before_pending_marks_a_fresh_local_delete_stampless_until_confirmed(
     assert!(
         edge.execute("SELECT * FROM notes", &params)
             .expect("query after stale pull")
-            .rows
+            .rows()
             .is_empty(),
         "the restored hub cannot resurrect a fresh local delete before confirmation"
     );
@@ -523,7 +553,7 @@ fn restored_before_pending_marks_a_fresh_local_delete_stampless_until_confirmed(
     assert_eq!(
         edge.execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query later edit")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("later-hub-edit".to_string())]],
         "the confirmed tombstone must release later hub truth"
     );

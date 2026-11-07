@@ -34,7 +34,7 @@ jobs:
     outputs:
       integration_required: ${{ steps.classify.outputs.integration_required }}
       impact_reason: ${{ steps.classify.outputs.impact_reason }}
-      path_classes: ${{ steps.classify.outputs.path_classes }}
+      path_classes_artifact: ci-impact-${{ github.run_id }}-${{ github.run_attempt }}
       performance_qualification: ${{ steps.classify.outputs.performance_qualification }}
       integration_matrix: ${{ steps.plan.outputs.matrix }}
       combined_matrix: ${{ steps.plan.outputs.combined_matrix }}
@@ -59,9 +59,16 @@ jobs:
           CI_INTEGRATION_ENABLED: ${{ steps.classify.outputs.integration_required }}
           CI_INTEGRATION_DEFAULT: "false"
           IMPACT_REASON: ${{ steps.classify.outputs.impact_reason }}
-          PATH_CLASSES: ${{ steps.classify.outputs.path_classes }}
+          PATH_CLASSES_FILE: ${{ steps.classify.outputs.path_classes_file }}
           PERFORMANCE_QUALIFICATION: ${{ steps.classify.outputs.performance_qualification }}
         run: python3 -B scripts/ci-integration.py plan
+      - name: Save complete path classifications
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-impact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.classify.outputs.path_classes_file }}
+          if-no-files-found: error
+          retention-days: 14
 
   integration:
     needs: [impact, test-bundles]
@@ -134,10 +141,6 @@ jobs:
     needs: impact
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
-      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
-      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.impact.outputs.bundle_matrix) }}
@@ -435,7 +438,7 @@ jobs:
         include:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-          # macOS targets set aside until CDB-153 (engine uses Linux-only pipe2/SOCK_CLOEXEC) is fixed
+          # macOS targets are disabled because the engine uses Linux-only pipe2/SOCK_CLOEXEC
     timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     steps:

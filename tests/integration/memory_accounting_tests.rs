@@ -6,6 +6,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn assert_posting_refusal(error: &Error, limit: usize) {
+    let attributed = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
+        if subsystem == "relational" && operation == "staged_index_posting"
+            && *requested_bytes == 457 && *available_bytes == 456 && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = error
+    {
+        assert!(!attributed(&Error::MemoryBudgetExceeded {
+            subsystem: "writer_source".to_owned().into(),
+            operation: operation.to_string().into(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.to_string().into()
+        }));
+    }
+}
+
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
 }
@@ -157,17 +185,24 @@ fn m02_insert_rejected_when_budget_exceeded() {
 #[test]
 fn m03_delete_reclaims_memory_for_insert() {
     let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
-    let (schema_bytes, row_bytes) = measure_schema_and_row(
-        &Database::open_memory_with_accountant(measured.clone()),
-        &measured,
-        "first",
-    );
+    let profile_db = Database::open_memory_with_accountant(measured.clone());
+    measured.reset_high_water_for_test();
+    let (schema_bytes, row_bytes) = measure_schema_and_row(&profile_db, &measured, "first");
 
-    // The live limit holds the schema, one row, and half a row of slack: one row
-    // fits, a second does not, and a row re-inserted after the DELETE fits again.
-    // The ceiling stays generous so the closing read-back can be paid for once the
-    // insert promises are settled.
-    let budget = schema_bytes + row_bytes + row_bytes / 2;
+    let first_peak = measured.high_water_for_test();
+    measured.reset_high_water_for_test();
+    profile_db
+        .execute(ITEMS_INSERT, &items_row("second"))
+        .unwrap();
+    let second_peak = measured.high_water_for_test();
+    let budget = second_peak - 1;
+    assert!(
+        first_peak <= budget,
+        "first insertion fits before the second's exact admitted peak"
+    );
+    eprintln!(
+        "m03 schema={schema_bytes} retained_row={row_bytes} first_peak={first_peak} second_peak={second_peak} limit={budget}"
+    );
     let accountant = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
     accountant
         .set_budget(Some(budget))
@@ -197,7 +232,14 @@ fn m03_delete_reclaims_memory_for_insert() {
             ("name", Value::Text("second".to_string())),
         ]),
     );
-    assert!(result2.is_err(), "second INSERT must fail — budget full");
+    let error = result2.expect_err("second INSERT must refuse at its admitted peak");
+    assert_posting_refusal(&error, budget);
+    eprintln!("m03 refusal={error:?}");
+    assert_eq!(
+        accountant.usage().used,
+        used_after_first,
+        "the refused second row releases every admission"
+    );
 
     // DELETE the first row to free memory.
     db.execute(
@@ -239,9 +281,9 @@ fn m03_delete_reclaims_memory_for_insert() {
             &make_params(vec![("id", Value::Uuid(id3))]),
         )
         .expect("SELECT after re-insert must succeed");
-    assert_eq!(select.rows.len(), 1, "must find exactly one row");
+    assert_eq!(select.rows().len(), 1, "must find exactly one row");
     assert_eq!(
-        select.rows[0][0],
+        select.rows()[0][0],
         Value::Text("third".to_string()),
         "row must contain 'third'"
     );
@@ -287,7 +329,7 @@ fn m04_vector_search_succeeds_under_budget() {
         result.is_ok(),
         "vector search under budget must succeed: {result:?}"
     );
-    assert_eq!(result.unwrap().rows.len(), 3);
+    assert_eq!(result.unwrap().rows().len(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,10 +377,10 @@ fn m05_vector_search_rejected_over_budget() {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[test]
-fn m06_hnsw_fallback_to_brute_force_under_budget() {
-    // Budget too small for HNSW index build but large enough for brute-force.
-    // HNSW requires significant memory for graph structure.
-    // We set budget to allow inserts but not the HNSW build.
+fn m06_indexed_fallback_to_brute_force_under_budget() {
+    // Budget too small for the index build but large enough for brute-force.
+    // The index requires significant memory.
+    // We set budget to allow inserts but not the index build.
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024)); // 256KB
     let db = Database::open_memory_with_accountant(accountant);
     db.execute(
@@ -347,7 +389,7 @@ fn m06_hnsw_fallback_to_brute_force_under_budget() {
     )
     .unwrap();
 
-    // Insert >= 1000 vectors to trigger HNSW build attempt.
+    // Insert >= 1000 vectors to trigger index build attempt.
     for i in 0..1000 {
         let mut vec = vec![0.0f32; 128];
         vec[0] = i as f32;
@@ -362,15 +404,15 @@ fn m06_hnsw_fallback_to_brute_force_under_budget() {
         );
     }
 
-    // EXPLAIN should show brute-force, not HNSW — budget prevented HNSW build.
+    // EXPLAIN should show brute-force, not index — budget prevented index build.
     let explain_output = db.explain("SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 5");
     assert!(explain_output.is_ok(), "explain must succeed");
     let explain_output = explain_output.unwrap();
-    // After implementation: tight budget prevents HNSW build → BruteForce scan.
-    // Without memory accounting: HNSW would build → HnswSearch.
+    // After implementation: tight budget prevents index build → BruteForce scan.
+    // Without memory accounting: index would build → VectorSearch.
     assert!(
         explain_output.contains("BruteForce"),
-        "tight budget should prevent HNSW, showing BruteForce: {explain_output}"
+        "tight budget should prevent index, showing BruteForce: {explain_output}"
     );
 }
 
@@ -428,7 +470,7 @@ fn m07_bfs_succeeds_under_budget() {
     );
     assert!(result.is_ok(), "BFS under budget must succeed: {result:?}");
     assert_eq!(
-        result.unwrap().rows.len(),
+        result.unwrap().rows().len(),
         2,
         "BFS from A must find exactly B and C"
     );
@@ -499,12 +541,18 @@ fn m09_set_and_show_memory_limit() {
     // SHOW MEMORY_LIMIT must reflect the set value.
     let show_result = db.execute("SHOW MEMORY_LIMIT", &empty()).unwrap();
     assert_eq!(
-        show_result.columns,
-        vec!["limit", "used", "available", "startup_ceiling"]
+        show_result.columns(),
+        vec![
+            "limit",
+            "used",
+            "available",
+            "startup_ceiling",
+            "ceiling_refresh_failures"
+        ]
     );
-    assert_eq!(show_result.rows.len(), 1);
+    assert_eq!(show_result.rows().len(), 1);
 
-    let limit_val = &show_result.rows[0][0];
+    let limit_val = &show_result.rows()[0][0];
     match limit_val {
         Value::Text(s) => assert_eq!(s, "536870912", "limit must be 512M in bytes"),
         Value::Int64(n) => assert_eq!(*n, 536870912, "limit must be 512M in bytes"),
@@ -524,7 +572,7 @@ fn m10_set_memory_limit_none_removes_limit() {
 
     // Verify it was set.
     let show1 = db.execute("SHOW MEMORY_LIMIT", &empty()).unwrap();
-    let limit1 = &show1.rows[0][0];
+    let limit1 = &show1.rows()[0][0];
     let is_set = match limit1 {
         Value::Text(s) => s != "none",
         Value::Int64(n) => *n > 0,
@@ -538,7 +586,7 @@ fn m10_set_memory_limit_none_removes_limit() {
 
     // Verify limit is removed.
     let show2 = db.execute("SHOW MEMORY_LIMIT", &empty()).unwrap();
-    let limit2 = &show2.rows[0][0];
+    let limit2 = &show2.rows()[0][0];
     match limit2 {
         Value::Text(s) => assert_eq!(s, "none", "limit must be 'none' after removal"),
         Value::Int64(n) => assert_eq!(*n, 0, "limit must be 0 after removal"),
@@ -580,83 +628,152 @@ fn m11_set_above_startup_ceiling_rejected() {
 #[test]
 fn m12_open_with_config_wires_accountant() {
     const NAME: &str = "a long enough string to exceed sixty four bytes of budget for sure";
+    use contextdb_engine::memory_accounting::{
+        take_budget_ledger_for_test, watch_budget_ledger_for_test,
+    };
+
+    // Profile the same logical keys and persisted time as the refusal arm:
+    // different identities can take different paths through the proof tree.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let row = make_params(vec![
+        ("id", Value::Uuid(Uuid::from_u128(12))),
+        ("name", Value::Text(NAME.to_owned())),
+    ]);
     let tmp = tempfile::TempDir::new().unwrap();
-
+    let reserve = |limit| {
+        contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(limit))
+    };
     let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
-    let (schema_bytes, row_bytes) = measure_schema_and_row(
-        &Database::open_with_config(
-            tmp.path().join("m12-measurement.db"),
-            Arc::new(contextdb_engine::plugin::CorePlugin),
-            measured.clone(),
-        )
-        .unwrap(),
-        &measured,
-        NAME,
-    );
-
-    // The writer's page-cache reserve charged at open (`redb_writer_cache_bytes_for_limit`)
-    // is sized from the declared budget itself, so the measurement db (opened under
-    // the large flat `MEASUREMENT_BUDGET`) and the real db below (opened under a much
-    // smaller, self-referential budget) are charged different reserves at open, even
-    // though the DDL and row costs measured on the measurement db are identical to
-    // what the real db pays. `schema_bytes` above is a TOTAL (`accountant.usage().used`
-    // right after CREATE TABLE), so it already has the measurement db's reserve baked
-    // in; pull that out to get the reserve-independent DDL charge, then size the real
-    // budget so it, in turn, pays exactly `ddl_charge + row_bytes / 2` over ITS OWN
-    // reserve. The real db's own reserve is a function of the budget being solved for,
-    // so resolve the two simultaneously with a fixed-point iteration — the reserve
-    // function is a bounded, monotonic share of the limit, so this converges in a few
-    // steps.
-    let measurement_reserve =
-        contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(
-            MEASUREMENT_BUDGET,
-        ));
-    let ddl_charge = schema_bytes - measurement_reserve;
-    let margin = row_bytes / 2;
-    // CREATE TABLE's own content-identity proof-maintenance step needs a small
-    // transient allowance ABOVE its final settled `ddl_charge`; at the fixed point with zero slack
-    // the DDL step itself is refused (observed: requested 228, available 127 —
-    // 101 bytes short) before the INSERT this test is calibrating for is ever
-    // reached. `ddl_transient_slack` covers that with headroom, and stays
-    // small enough that the margin the INSERT sees (`margin + ddl_transient_slack`)
-    // is still well under a full `row_bytes`, so a missing row charge fails
-    // this assertion.
-    let ddl_transient_slack: usize = 400;
-    assert!(
-        margin + ddl_transient_slack < row_bytes,
-        "the DDL transient slack must not swallow the INSERT margin: margin={margin} \
-         slack={ddl_transient_slack} row_bytes={row_bytes}"
-    );
-    let mut real_budget = schema_bytes + margin; // seed: the pre-fix formula
+    let profile = Database::open_with_config(
+        tmp.path().join("m12-profile.db"),
+        Arc::new(contextdb_engine::plugin::CorePlugin),
+        measured.clone(),
+    )
+    .unwrap();
+    measured.reset_high_water_for_test();
+    profile.execute(ITEMS_SCHEMA, &empty()).unwrap();
+    let measured_ddl_peak = measured.high_water_for_test();
+    let measured_schema = measured.usage().used;
+    measured.reset_high_water_for_test();
+    watch_budget_ledger_for_test();
+    profile.execute(ITEMS_INSERT, &row).unwrap();
+    let ledger = take_budget_ledger_for_test();
+    let row_peak = measured.high_water_for_test();
+    let position = ledger
+        .iter()
+        .position(|entry| {
+            entry.what == "content_identity/maintain_committed_proof"
+                && entry.bytes == 248
+                && entry.used_after == row_peak
+        })
+        .unwrap_or_else(|| panic!("the measured peak must belong to the proof owner: {ledger:?}"));
+    let owner = &ledger[position];
+    // Only the startup cache reserve depends on the configured limit. Solve
+    // that dependency from the funded admission, without running fresh,
+    // differently shaped writes at progressively underfunded limits.
+    let measured_reserve = reserve(MEASUREMENT_BUDGET);
+    let owner_without_reserve = owner.used_after - measured_reserve;
+    let mut real_budget = owner.used_after - 1;
+    let mut fixed_point = false;
     for _ in 0..16 {
-        let real_reserve =
-            contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(
-                real_budget,
-            ));
-        let next_budget = real_reserve + ddl_charge + margin + ddl_transient_slack;
-        if next_budget == real_budget {
+        let next = owner_without_reserve + reserve(real_budget) - 1;
+        eprintln!("m12 reserve fixed point limit={real_budget} next={next}");
+        if next == real_budget {
+            fixed_point = true;
             break;
         }
-        real_budget = next_budget;
+        assert!(next < real_budget);
+        real_budget = next;
     }
+    assert!(
+        fixed_point,
+        "the bounded cache share reaches its exact fixed point"
+    );
+    let adjusted = |bytes| bytes - measured_reserve + reserve(real_budget);
+    let schema_bytes = adjusted(measured_schema);
+    let ddl_peak = adjusted(measured_ddl_peak);
+    assert!(ddl_peak <= real_budget);
+    assert_eq!(adjusted(owner.used_after), real_budget + 1);
+    assert!(
+        ledger[..position]
+            .iter()
+            .all(|entry| adjusted(entry.used_after) <= real_budget),
+        "every prior real owner fits before the proof admission: {ledger:?}"
+    );
+    eprintln!(
+        "m12 funded reserve={measured_reserve} schema={measured_schema} ddl_peak={measured_ddl_peak} row_peak={row_peak} owner={owner:?}"
+    );
+    eprintln!(
+        "m12 refusal limit={real_budget} reserve={} schema={schema_bytes} ddl_peak={ddl_peak}",
+        reserve(real_budget)
+    );
+    profile.close().unwrap();
+
     let accountant = Arc::new(MemoryAccountant::with_budget(real_budget));
     let db = Database::open_with_config(
         tmp.path().join("m12.db"),
         Arc::new(contextdb_engine::plugin::CorePlugin),
-        accountant,
+        accountant.clone(),
     )
     .unwrap();
-
     db.execute(ITEMS_SCHEMA, &empty()).unwrap();
-
-    let result = db.execute(ITEMS_INSERT, &items_row(NAME));
-    assert!(
-        result.is_err(),
-        "INSERT must fail with tight budget via open_with_config"
+    assert_eq!(accountant.usage().used, schema_bytes);
+    assert_eq!(accountant.usage().limit, Some(real_budget));
+    assert_eq!(accountant.usage().startup_ceiling, Some(real_budget));
+    let before = accountant.usage().used;
+    watch_budget_ledger_for_test();
+    let error = db.execute(ITEMS_INSERT, &row).unwrap_err();
+    let refusal_ledger = take_budget_ledger_for_test();
+    eprintln!("m12 refusal ledger={refusal_ledger:?}");
+    let attributed = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
+        if subsystem == "content_identity" && operation == "maintain_committed_proof"
+            && *requested_bytes == 248 && *available_bytes == 247 && *budget_limit_bytes == real_budget)
+    };
+    assert!(attributed(&error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &error
+    {
+        assert!(!attributed(&Error::MemoryBudgetExceeded {
+            subsystem: "relational_index".to_owned().into(),
+            operation: operation.to_string().into(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.to_string().into()
+        }));
+    }
+    eprintln!("m12 refusal={error:?}");
+    assert_eq!(accountant.usage().used, before);
+    assert_eq!(
+        db.execute("SELECT * FROM items", &empty())
+            .unwrap()
+            .rows()
+            .len(),
+        0
     );
-    assert!(
-        matches!(result.unwrap_err(), Error::MemoryBudgetExceeded { .. }),
-        "error must be MemoryBudgetExceeded"
+    let retry = make_params(vec![
+        ("id", Value::Uuid(Uuid::from_u128(12))),
+        ("name", Value::Text("ok".to_owned())),
+    ]);
+    db.execute(ITEMS_INSERT, &retry).unwrap();
+    assert_eq!(accountant.usage().limit, Some(real_budget));
+    assert_eq!(accountant.usage().startup_ceiling, Some(real_budget));
+    db.close().unwrap();
+    let reader = contextdb_engine::ReadSession::open(tmp.path().join("m12.db")).unwrap();
+    assert_eq!(
+        reader
+            .execute("SELECT name FROM items", &empty())
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Text("ok".to_owned())]]
     );
 }
 
@@ -986,10 +1103,7 @@ fn mt1_drop_table_releases_accounting() {
 // ---------------------------------------------------------------------------
 #[test]
 fn mt2_update_rejection_leaves_accounting_unchanged() {
-    // Budget tight enough over the schema that the 4 KiB UPDATE below is
-    // rejected, and wide enough that the small row and the indexed read that
-    // locates it are not.
-    let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 4096)));
+    let accountant = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
     let db = Database::open_memory_with_accountant(accountant.clone());
 
     db.execute(
@@ -1008,7 +1122,34 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
     )
     .unwrap();
 
+    let profile_accountant = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
+    let profile = Database::open_memory_with_accountant(profile_accountant.clone());
+    profile.execute(ITEMS_SCHEMA, &empty()).unwrap();
+    profile
+        .execute(
+            ITEMS_INSERT,
+            &make_params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text("small".to_owned())),
+            ]),
+        )
+        .unwrap();
+    profile_accountant.reset_high_water_for_test();
+    profile
+        .execute(
+            "UPDATE items SET name = $name WHERE id = $id",
+            &make_params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text("x".repeat(4096))),
+            ]),
+        )
+        .unwrap();
+    let update_peak = profile_accountant.high_water_for_test();
+    let budget = update_peak - 1;
+    accountant.set_budget(Some(budget)).unwrap();
     let used_before_update = accountant.usage().used;
+    let old_snapshot = db.snapshot();
+    eprintln!("mt2 baseline={used_before_update} update_peak={update_peak} limit={budget}");
 
     // Attempt an UPDATE to a very large value — should fail.
     let result = db.execute(
@@ -1018,7 +1159,9 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
             ("name", Value::Text("x".repeat(4096))),
         ]),
     );
-    assert!(result.is_err(), "UPDATE exceeding budget must fail");
+    let error = result.expect_err("UPDATE exceeding its real admitted peak must refuse");
+    assert_posting_refusal(&error, budget);
+    eprintln!("mt2 refusal={error:?}");
 
     let used_after_update = accountant.usage().used;
     assert_eq!(
@@ -1033,11 +1176,28 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
             &make_params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(select.rows.len(), 1);
+    assert_eq!(select.rows().len(), 1);
     assert_eq!(
-        select.rows[0][0],
+        select.rows()[0][0],
         Value::Text("small".to_string()),
         "original row must be unchanged after failed UPDATE"
+    );
+    let old_rows = db.scan("items", old_snapshot).unwrap();
+    assert_eq!(old_rows.len(), 1);
+    assert_eq!(
+        old_rows[0].values.get("name"),
+        Some(&Value::Text("small".to_owned()))
+    );
+    db.execute(
+        "UPDATE items SET name = 'fits' WHERE id = $id",
+        &make_params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute("SELECT name FROM items", &empty())
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Text("fits".to_owned())]]
     );
 }
 
@@ -1127,11 +1287,11 @@ fn mt4_failed_vector_alloc_releases_row_bytes() {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[test]
-fn mt5_hnsw_build_failure_no_leaked_bytes() {
-    // Budget allows inserts but not the HNSW index build.
-    // HNSW needs ~entries * dim * 4 * 3 bytes.
-    // 1000 entries * 4 dims * 4 bytes * 3 = 48000 bytes for HNSW.
-    // Budget allows all rows but not the HNSW structure.
+fn mt5_indexed_build_failure_no_leaked_bytes() {
+    // Budget allows inserts but not the index build.
+    // The index needs ~entries * dim * 4 * 3 bytes.
+    // 1000 entries * 4 dims * 4 bytes * 3 = 48000 bytes for index.
+    // Budget allows all rows but not the index structure.
     let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 40_000)));
     let db = Database::open_memory_with_accountant(accountant.clone());
 
@@ -1141,7 +1301,7 @@ fn mt5_hnsw_build_failure_no_leaked_bytes() {
     )
     .unwrap();
 
-    // Insert enough vectors to trigger HNSW build attempt (>= 1000).
+    // Insert enough vectors to trigger index build attempt (>= 1000).
     let mut inserted = 0;
     for i in 0..1100 {
         let mut vec = vec![0.0f32; 4];
@@ -1161,23 +1321,23 @@ fn mt5_hnsw_build_failure_no_leaked_bytes() {
     // Some inserts must succeed.
     assert!(inserted > 0, "at least some inserts must succeed");
 
-    // HNSW build should have been skipped due to budget.
-    // Verify no phantom HNSW bytes leaked: usage should reflect only
-    // actual rows + vectors + metadata, not the HNSW structure.
+    // The index build should have been skipped due to budget.
+    // Verify no phantom index bytes leaked: usage should reflect only
+    // actual rows + vectors + metadata, not the index structure.
     let usage = accountant.usage();
     assert!(
         usage.used <= budget_over_schema(1, 40_000),
-        "usage must not exceed budget (no HNSW leak): used={} of {}",
+        "usage must not exceed budget (no index leak): used={} of {}",
         usage.used,
         budget_over_schema(1, 40_000),
     );
 
-    // EXPLAIN should show BruteForce, not Hnsw.
+    // EXPLAIN should show BruteForce, not Index.
     let explain = db.explain("SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 5");
     assert!(explain.is_ok(), "explain must succeed");
     let explain_text = explain.unwrap();
     assert!(
         explain_text.contains("BruteForce"),
-        "HNSW build must be skipped under budget: {explain_text}"
+        "index build must be skipped under budget: {explain_text}"
     );
 }

@@ -1,3 +1,4 @@
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame};
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, ReadFailure, ReadFailureDetail, ReadFailureKind,
     WriterRunNumber,
@@ -5,8 +6,7 @@ use contextdb_core::read_contract::{
 #[cfg(unix)]
 use contextdb_engine::local_transport::{
     AdmittedReader, DeadlineStage, ManualDeadlineClock, UnixLocalCarrier,
-    authenticate_framed_stream_handshake, encode_message, encode_payload_frame,
-    peer_user_from_stream,
+    authenticate_framed_stream_handshake, peer_user_from_stream,
 };
 use contextdb_engine::local_transport::{
     LocalHandshake, LocalTransportError, ReadPrincipal, authenticate_peer,
@@ -234,6 +234,10 @@ fn malformed_and_truncated_framed_handshakes_are_channel_data_refusals() {
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stalled_production_handshake_expires_at_the_exact_manual_boundary_without_peer_release() {
     use std::future::Future;
     use std::sync::Arc;

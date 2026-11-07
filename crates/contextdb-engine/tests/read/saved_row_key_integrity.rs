@@ -85,7 +85,7 @@ fn assert_refused_on_route(swap_body: bool, route: ReadRoute) {
         .execute(QUERY, &HashMap::new())
         .expect("both saved rows are selected before damage");
     assert_eq!(
-        clean_answer.rows,
+        clean_answer.rows(),
         vec![
             vec![Value::Int64(1), Value::Text("body-1".into())],
             vec![Value::Int64(2), Value::Text("body-2".into())],
@@ -162,7 +162,7 @@ fn an_identity_only_candidate_with_no_saved_version_resolves_its_visible_row() {
             &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0]))]),
         )
         .expect("synthetic identity cursor resolves the visible row");
-    assert_eq!(answer.rows, vec![vec![Value::Int64(7)]]);
+    assert_eq!(answer.rows(), vec![vec![Value::Int64(7)]]);
     drop(reader);
     owner.close().expect("close owner");
 }
@@ -202,11 +202,14 @@ fn a_filtered_identity_candidate_binds_the_saved_body_to_its_physical_key() {
         .execute(query, &params)
         .expect("intact filtered query");
     assert_eq!(
-        intact.rows.len(),
+        intact.rows().len(),
         2,
         "both matching identities are selected"
     );
-    assert_eq!(intact.trace.index_used.as_deref(), Some("candidates_label"));
+    assert_eq!(
+        intact.trace().index_used.as_deref(),
+        Some("candidates_label")
+    );
     owner
         .__damage_first_saved_row_for_test("candidates", true)
         .expect("swap the first saved body after owner open");
@@ -231,8 +234,8 @@ fn an_owner_physical_scan_refuses_a_missing_saved_version() {
         .expect("open owner route");
     let query = "SELECT id, payload FROM key_integrity";
     let intact = reader.execute(query, &HashMap::new()).expect("intact scan");
-    assert_eq!(intact.rows.len(), 2);
-    assert_eq!(intact.trace.physical_plan, "Scan");
+    assert_eq!(intact.rows().len(), 2);
+    assert_eq!(intact.trace().physical_plan, "Scan");
     owner
         .__damage_first_saved_row_for_test("key_integrity", false)
         .expect("remove saved body after owner directory loaded");
@@ -273,11 +276,11 @@ fn unchanged_foreign_key_posting_tracks_an_updated_row_and_retires_on_delete() {
         )
         .expect("unchanged FK posting resolves the current visible version");
     assert!(
-        answer.trace.index_used.is_some(),
+        answer.trace().index_used.is_some(),
         "the read must walk the maintained FK index"
     );
     assert_eq!(
-        answer.rows,
+        answer.rows(),
         vec![vec![Value::Int64(7), Value::Text("current".into())]]
     );
     drop(reader);
@@ -296,8 +299,8 @@ fn unchanged_foreign_key_posting_tracks_an_updated_row_and_retires_on_delete() {
         )
         .expect("retired FK posting does not name a deleted row");
     assert!(
-        answer.trace.index_used.is_some(),
+        answer.trace().index_used.is_some(),
         "the empty result must still probe the maintained FK index"
     );
-    assert!(answer.rows.is_empty());
+    assert!(answer.rows().is_empty());
 }

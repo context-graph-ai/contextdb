@@ -215,18 +215,18 @@ const CHUNK_SUM_ALIASED_SQL: &str =
 
 fn one_aggregate_row(what: &str, answer: &QueryResult) -> Value {
     assert_eq!(
-        answer.rows.len(),
+        answer.rows().len(),
         1,
         "{what} answers a total with exactly one row, and returned {:?}",
-        answer.rows
+        answer.rows()
     );
     assert_eq!(
-        answer.rows[0].len(),
+        answer.rows()[0].len(),
         1,
         "{what} answers a single total, and returned {:?}",
-        answer.rows[0]
+        answer.rows()[0]
     );
-    answer.rows[0][0].clone()
+    answer.rows()[0][0].clone()
 }
 
 /// A byte total is the same number, under the same column name, having
@@ -234,6 +234,10 @@ fn one_aggregate_row(what: &str, answer: &QueryResult) -> Value {
 /// executor, an in-process bounded view of the live store, or a direct read of
 /// the closed file.
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sum_of_a_byte_column_agrees_on_every_route() {
     let directory = tempfile::TempDir::new().expect("task-scoped chunk directory");
     let path = directory.path().join("chunk-totals.db");
@@ -269,7 +273,10 @@ fn sum_of_a_byte_column_agrees_on_every_route() {
     let expected = Value::Int64(seeded.expected_sum);
     println!(
         "OBSERVED byte total over {} chunks: executor {:?} | in-process {:?} | direct file {:?}",
-        seeded.expected_rows, eager.rows, embedded.rows, direct.rows
+        seeded.expected_rows,
+        eager.rows(),
+        embedded.rows(),
+        direct.rows()
     );
 
     for (what, answer) in [
@@ -285,21 +292,21 @@ fn sum_of_a_byte_column_agrees_on_every_route() {
             seeded.expected_rows
         );
         assert_eq!(
-            answer.columns.len(),
+            answer.columns().len(),
             1,
             "{what} names exactly the one column the statement projects, and named {:?}",
-            answer.columns
+            answer.columns()
         );
         assert!(
-            answer.columns[0].eq_ignore_ascii_case("sum"),
+            answer.columns()[0].eq_ignore_ascii_case("sum"),
             "{what} names an unaliased total after the aggregate that produced it, so a caller \
              can find the column without counting positions; it named {:?}",
-            answer.columns
+            answer.columns()
         );
     }
 
     assert_eq!(
-        aliased.columns,
+        aliased.columns(),
         vec!["total_bytes".to_owned()],
         "an explicit alias is the caller's name for the total and always wins"
     );
@@ -310,30 +317,36 @@ fn sum_of_a_byte_column_agrees_on_every_route() {
     );
 
     assert_eq!(
-        embedded.columns, eager.columns,
+        embedded.columns(),
+        eager.columns(),
         "the doors must not disagree about what the total is called"
     );
     assert_eq!(
-        direct.columns, eager.columns,
+        direct.columns(),
+        eager.columns(),
         "the doors must not disagree about what the total is called"
     );
 
     assert!(
-        eager.trace.rows_examined > 0,
+        eager.trace().rows_examined > 0,
         "a total over {CHUNK_ROWS} stored chunks examines rows; the executor reported none, so \
          the figure an operator reads to size a query is unusable"
     );
     assert_eq!(
-        embedded.trace.rows_examined, eager.trace.rows_examined,
+        embedded.trace().rows_examined,
+        eager.trace().rows_examined,
         "an in-process bounded read examined {} rows where the executor examined {} for the same \
          statement over the same committed rows",
-        embedded.trace.rows_examined, eager.trace.rows_examined
+        embedded.trace().rows_examined,
+        eager.trace().rows_examined
     );
     assert_eq!(
-        direct.trace.rows_examined, eager.trace.rows_examined,
+        direct.trace().rows_examined,
+        eager.trace().rows_examined,
         "a direct read of the closed file examined {} rows where the executor examined {} for the \
          same statement over the same committed rows",
-        direct.trace.rows_examined, eager.trace.rows_examined
+        direct.trace().rows_examined,
+        eager.trace().rows_examined
     );
 }
 
@@ -437,7 +450,7 @@ fn one_shot_oracle(database: &Arc<Database>, sql: &str) -> OneShotOracle {
         });
     OneShotOracle {
         value: one_aggregate_row("a bounded read with room to spare", &outcome.result),
-        rows_examined: outcome.result.trace.rows_examined,
+        rows_examined: outcome.result.trace().rows_examined,
         work_units: outcome.telemetry.work_units,
     }
 }
@@ -467,7 +480,7 @@ fn drain_cursor(
         .last()
         .expect("a cursor produces a page at open")
         .0
-        .has_more
+        .has_more()
     {
         assert!(
             pages.len() < page_ceiling,
@@ -486,7 +499,7 @@ fn drain_cursor(
                     pages.iter().map(|(_, t)| t.work_units).collect::<Vec<_>>(),
                     pages
                         .iter()
-                        .map(|(page, _)| page.rows.len())
+                        .map(|(page, _)| page.rows().len())
                         .collect::<Vec<_>>()
                 )
             });
@@ -539,14 +552,14 @@ fn assert_paged_total(
         );
         if index + 1 < drained.pages.len() {
             assert!(
-                page.rows.is_empty(),
+                page.rows().is_empty(),
                 "page {} of {what} is not the last, and a total is not a total until the input \
                  ends, so it must carry no rows; it carried {:?}",
                 index + 1,
-                page.rows
+                page.rows()
             );
             assert!(
-                page.has_more,
+                page.has_more(),
                 "page {} of {what} is not the last, so it must say there is more to fetch",
                 index + 1
             );
@@ -555,17 +568,17 @@ fn assert_paged_total(
 
     let (last_page, _) = drained.last();
     assert!(
-        !last_page.has_more,
+        !last_page.has_more(),
         "the page carrying the total of {what} is the end of the read"
     );
     assert_eq!(
-        last_page.rows.len(),
+        last_page.rows().len(),
         1,
         "{what} ends with exactly one row holding the whole answer, and ended with {:?}",
-        last_page.rows
+        last_page.rows()
     );
     assert_eq!(
-        last_page.rows[0],
+        last_page.rows()[0],
         vec![expected],
         "{what} must report the total of every row its predicate keeps"
     );
@@ -608,9 +621,9 @@ fn count_cursor_completes_over_a_store_larger_than_the_work_ceiling() {
         &oracle,
     );
     assert!(
-        drained.last().0.columns[0].eq_ignore_ascii_case("count"),
+        drained.last().0.columns()[0].eq_ignore_ascii_case("count"),
         "the paged count names its column after the aggregate that produced it, and named {:?}",
-        drained.last().0.columns
+        drained.last().0.columns()
     );
 }
 
@@ -632,9 +645,9 @@ fn sum_cursor_completes_over_a_filtered_store_larger_than_the_work_ceiling() {
         &oracle,
     );
     assert!(
-        drained.last().0.columns[0].eq_ignore_ascii_case("sum"),
+        drained.last().0.columns()[0].eq_ignore_ascii_case("sum"),
         "the paged total names its column after the aggregate that produced it, and named {:?}",
-        drained.last().0.columns
+        drained.last().0.columns()
     );
 }
 
@@ -694,7 +707,7 @@ fn one_shot_aggregate_over_the_work_ceiling_is_refused() {
 
 fn assert_plan_error(what: &str, result: contextdb_core::Result<QueryResult>) {
     match result {
-        Ok(answer) => panic!("{what} must be refused, and answered {:?}", answer.rows),
+        Ok(answer) => panic!("{what} must be refused, and answered {:?}", answer.rows()),
         Err(Error::PlanError(_)) => {}
         Err(other) => panic!(
             "{what} must be refused as a plan error a caller can read, and failed with {other}"
@@ -763,7 +776,7 @@ fn sum_of_ints_that_overflow_is_a_typed_failure() {
             Ok(answer) => panic!(
                 "{what} totalled two rows of the largest integer and answered {:?}; a total that \
                  wraps around reports a number that is not the sum",
-                answer.rows
+                answer.rows()
             ),
             Err(Error::PlanError(message)) => assert!(
                 message.contains("out of range"),
@@ -811,13 +824,13 @@ fn sum_of_an_empty_input_is_null_and_count_is_zero() {
         ),
     ] {
         assert_eq!(
-            answer.rows.len(),
+            answer.rows().len(),
             1,
             "{what} answers an aggregate over no rows with one row, and answered {:?}",
-            answer.rows
+            answer.rows()
         );
         assert_eq!(
-            answer.rows[0],
+            answer.rows()[0],
             vec![Value::Null, Value::Int64(0)],
             "{what} must report no total and a count of none for a context that has no chunks"
         );

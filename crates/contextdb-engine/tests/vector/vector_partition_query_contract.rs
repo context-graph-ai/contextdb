@@ -33,16 +33,16 @@ fn query_vector() -> Vec<f32> {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name || candidate.rsplit('.').next() == Some(name))
-        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns()))
 }
 
 fn result_ids(result: &QueryResult) -> Vec<Uuid> {
     let position = column(result, "id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(position) {
             Some(Value::Uuid(value)) => *value,
@@ -54,7 +54,7 @@ fn result_ids(result: &QueryResult) -> Vec<Uuid> {
 fn result_scores(result: &QueryResult) -> Vec<f64> {
     let position = column(result, "score");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(position) {
             Some(Value::Float64(value)) => *value,
@@ -579,7 +579,7 @@ fn missing_named_partition_tuple_is_an_empty_answer() {
         )
         .expect("a missing named tuple is a complete empty search");
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "a missing tuple never broadens scope"
     );
 }
@@ -762,16 +762,6 @@ fn secure_fixture_in_database(
             )
             .expect("insert a hidden-row fixture row");
     }
-    // Finite, caller-driven maintenance so an `INDEXED` declaration has a
-    // ready graph; this is not a timing wait (`MaintenancePolicy::CallerDriven`
-    // above disables the background maintenance thread `Database::open_memory`
-    // otherwise defaults to).
-    for _ in 0..32 {
-        admin
-            .run_maintenance_cycle()
-            .expect("one caller-driven maintenance batch succeeds");
-    }
-
     HiddenRowFixture {
         admin,
         allowed_context,
@@ -799,7 +789,7 @@ fn assert_empty_mode_query(sql: &str) {
         .execute(sql, &params([("query", Value::Vector(query_vector()))]))
         .expect("the query-level vector mode parses and executes");
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "an empty vector column is a complete empty answer under every mode"
     );
 }
@@ -822,9 +812,23 @@ fn use_vector_exact_parses_between_vector_ordering_and_limit() {
 
 #[test]
 fn use_vector_indexed_parses_between_vector_ordering_and_limit() {
-    assert_empty_mode_query(
-        "SELECT id FROM mode_docs \
-         ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+    // INDEXED still parses; this release refuses it by name, before the empty
+    // table could answer.
+    let database = empty_mode_fixture();
+    let refusal = database
+        .execute(
+            "SELECT id FROM mode_docs \
+             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+            &params([("query", Value::Vector(query_vector()))]),
+        )
+        .expect_err("the query-level vector mode parses and is refused");
+    assert!(matches!(
+        refusal,
+        Error::VectorIndexedRouteUnavailable { .. }
+    ));
+    assert_eq!(
+        refusal.to_string(),
+        "no vector index ships in this release; use EXACT or AUTO"
     );
 }
 
@@ -1237,7 +1241,7 @@ fn explain_names_the_same_one_partition_a_typed_literal_selects() {
         contextdb_engine::VectorSearchScopeShape::One
     );
     assert_eq!(
-        disclosure.partition_hnsw.len(),
+        disclosure.partitions.len(),
         1,
         "a UUID-typed literal scope must select the one stored partition it names, \
          not zero: {disclosure:?}"
@@ -1320,7 +1324,7 @@ fn a_text_partition_key_predicate_stays_case_exact() {
         )
         .expect("an uppercase spelling must explain as a provably empty scope, not an error");
     assert!(
-        upper.rows.is_empty(),
+        upper.rows().is_empty(),
         "the TEXT partition encoder must not lowercase: 'NOTE' must not reach the stored 'note' partition"
     );
     db.explain(
@@ -1338,7 +1342,7 @@ fn both_write_spellings_of_one_instant_land_in_one_partition() {
         .execute("SHOW VECTOR_PARTITIONS FOR ts_keyed.embedding", &empty())
         .expect("SHOW VECTOR_PARTITIONS is an admin inspection surface");
     assert_eq!(
-        partitions.rows.len(),
+        partitions.rows().len(),
         2,
         "the bound-Timestamp row and the integer-written row at the same instant must \
          collapse into ONE stored partition (alongside the second, distinct instant), \
@@ -1401,7 +1405,7 @@ fn a_key_value_of_the_wrong_declared_type_is_refused_not_silently_partitioned() 
     let after = db
         .execute("SELECT id FROM text_keyed_docs", &empty())
         .expect("select must still succeed");
-    assert!(after.rows.is_empty(), "the refused row must be absent");
+    assert!(after.rows().is_empty(), "the refused row must be absent");
     let partitions = db
         .execute(
             "SHOW VECTOR_PARTITIONS FOR text_keyed_docs.embedding",
@@ -1409,7 +1413,7 @@ fn a_key_value_of_the_wrong_declared_type_is_refused_not_silently_partitioned() 
         )
         .expect("partition inspection must still succeed");
     assert!(
-        partitions.rows.is_empty(),
+        partitions.rows().is_empty(),
         "no stray partition of the wrong component type may exist: {partitions:?}"
     );
 
@@ -1458,7 +1462,7 @@ fn a_key_value_of_the_wrong_declared_type_is_refused_not_silently_partitioned() 
         )
         .expect("partition inspection must still succeed");
     assert!(
-        partitions_2.rows.is_empty(),
+        partitions_2.rows().is_empty(),
         "no stray Uuid-typed partition may exist under a declared INTEGER key: {partitions_2:?}"
     );
 }
@@ -1512,7 +1516,7 @@ fn a_partition_key_value_of_the_wrong_type_gets_its_own_typed_refusal_naming_the
     let after = db
         .execute("SELECT id FROM bucket_typed_docs", &empty())
         .expect("select must still succeed");
-    assert!(after.rows.is_empty(), "the refused row must be absent");
+    assert!(after.rows().is_empty(), "the refused row must be absent");
     let partitions = db
         .execute(
             "SHOW VECTOR_PARTITIONS FOR bucket_typed_docs.embedding",
@@ -1520,7 +1524,7 @@ fn a_partition_key_value_of_the_wrong_type_gets_its_own_typed_refusal_naming_the
         )
         .expect("partition inspection must still succeed");
     assert!(
-        partitions.rows.is_empty(),
+        partitions.rows().is_empty(),
         "no stray partition of the wrong component type may exist: {partitions:?}"
     );
 }
@@ -1605,7 +1609,7 @@ fn a_partition_key_value_of_the_wrong_type_arriving_through_sync_gets_the_same_t
         .execute("SELECT id FROM synced_bucket_typed_docs", &empty())
         .expect("select must still succeed");
     assert!(
-        after.rows.is_empty(),
+        after.rows().is_empty(),
         "the refused synced row must be absent"
     );
 }
@@ -1741,7 +1745,7 @@ mod bounded_door {
                 "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
                 "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE EXACT",
                 "VECTOR(2) PARTITION_KEY (bucket) MAX_PARTITIONS 8 SEARCH_MODE EXACT",
-                "VECTOR(2) PARTITION_KEY (context_id, bucket, scope) MAX_PARTITIONS 8 SEARCH_MODE INDEXED",
+                "VECTOR(2) PARTITION_KEY (context_id, bucket, scope) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
             ] {
                 let fixture = secure_fixture_hidden_by(declaration, hidden_by);
                 if declaration.contains("INDEXED") {
@@ -1857,7 +1861,7 @@ mod bounded_door {
     #[test]
     fn restricted_indexed_reads_admit_their_own_staged_vectors_and_rollback_removes_them() {
         let fixture = super::secure_context_fixture(
-            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE INDEXED",
+            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
         );
         let scoped = fixture.scoped();
         let staged = super::id(0x912);
@@ -1873,15 +1877,8 @@ mod bounded_door {
         ).expect("stage an authorized nearest vector");
         let answer = scoped
             .execute_in_tx(tx, fixture.sql(), &fixture.query_params())
-            .expect("INDEXED merges the authorized staged delta with the maintained source");
+            .expect("AUTO merges the authorized staged delta with the committed rows");
         assert_eq!(result_ids(&answer), vec![staged]);
-        assert!(matches!(
-            answer.trace.vector_search.as_ref().unwrap().route,
-            Some(
-                contextdb_engine::VectorSearchRoute::Indexed
-                    | contextdb_engine::VectorSearchRoute::FilteredIndexed
-            )
-        ));
         scoped.rollback(tx).expect("rollback scoped transaction");
         assert_eq!(
             result_ids(
@@ -1896,29 +1893,29 @@ mod bounded_door {
     #[test]
     fn a_key_aligned_restricted_indexed_query_answers_with_no_relational_index() {
         let fixture = super::secure_context_fixture(
-            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE INDEXED",
+            "VECTOR(2) PARTITION_KEY (context_id, bucket) MAX_PARTITIONS 8 SEARCH_MODE AUTO",
         );
         let scoped = fixture.scoped();
 
         let ordinary = scoped
             .execute(fixture.sql(), &fixture.query_params())
             .unwrap_or_else(|error| {
-                panic!("a key-aligned restricted INDEXED query must answer, not refuse: {error}")
+                panic!("a key-aligned restricted AUTO query must answer, not refuse: {error}")
             });
         assert_eq!(
             result_ids(&ordinary),
             fixture.authorized_ids,
-            "ordinary door: key-aligned restricted INDEXED must answer the nearest VISIBLE row"
+            "ordinary door: key-aligned restricted AUTO must answer the nearest VISIBLE row"
         );
 
         let request = hidden_row_bounded_request(fixture.sql(), fixture.query_params());
         let bounded_result = bounded::execute(&scoped, &request).unwrap_or_else(|error| {
-            panic!("a key-aligned restricted INDEXED query must answer, not error: {error:?}")
+            panic!("a key-aligned restricted AUTO query must answer, not error: {error:?}")
         });
         assert_eq!(
             result_ids(&bounded_result.result),
             fixture.authorized_ids,
-            "bounded door: key-aligned restricted INDEXED must answer the nearest VISIBLE row"
+            "bounded door: key-aligned restricted AUTO must answer the nearest VISIBLE row"
         );
 
         // The restriction equivalence: an unrestricted admin handle asking
@@ -2104,6 +2101,7 @@ mod restricted_access_scan_accounting {
     }
 
     #[test]
+    #[ignore = "the vector index route is switched off in this release"]
     fn restricted_rust_indexed_without_predicate_refuses_before_sources_and_recovers() {
         let fixture = secure_fixture_hidden_by("VECTOR(2)", HiddenBy::Context);
         let scoped = fixture.scoped();
@@ -2150,7 +2148,7 @@ mod restricted_access_scan_accounting {
         assert_eq!(ids, fixture.authorized_ids);
         assert_eq!(scoped.__relational_scan_rows_touched(), 0);
         assert!(
-            scoped.__debug_last_query_vector_used_hnsw_for_test(),
+            scoped.__debug_last_query_vector_used_indexed_route_for_test(),
             "recovery must use the maintained graph"
         );
     }
@@ -2162,6 +2160,7 @@ mod restricted_access_scan_accounting {
     /// proves the aligned-answers arm; this proves the opposite starting
     /// point.
     #[test]
+    #[ignore = "the vector index route is switched off in this release"]
     fn indexed_refuses_naming_the_restriction_column_then_recovers_via_index() {
         let fixture = secure_fixture_hidden_by("VECTOR(2)", HiddenBy::Context);
         let scoped = fixture.scoped();
@@ -2220,7 +2219,7 @@ fn residual_acl_without_an_index_refuses_before_selected_partition_enumeration()
     let sql = fixture.sql();
     assert!(matches!(
         scoped.execute(sql, &fixture.query_params()),
-        Err(Error::VectorFilteredRouteUnavailable { .. })
+        Err(Error::VectorIndexedRouteUnavailable { .. })
     ));
     let mut query = SemanticQuery::new("hidden_row_docs", "embedding", query_vector(), 1);
     query.search_mode = Some(VectorSearchMode::Indexed);
@@ -2230,7 +2229,7 @@ fn residual_acl_without_an_index_refuses_before_selected_partition_enumeration()
     ));
     assert!(matches!(
         scoped.semantic_search(query),
-        Err(Error::VectorFilteredRouteUnavailable { .. })
+        Err(Error::VectorIndexedRouteUnavailable { .. })
     ));
     use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
     use contextdb_engine::executor::bounded_read_test_support as bounded;
@@ -2332,7 +2331,7 @@ fn candidate_intersection_matches_row_visibility_and_transaction_grant_changes()
             scoped
                 .execute_in_tx(tx, sql, &bound)
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
         let query = SemanticQuery::new("hidden_row_docs", "embedding", query_vector(), 10);
@@ -2385,7 +2384,7 @@ fn restricted_inspection_keeps_adaptive_partition_populations_private() {
             let explain = scoped.explain_output(sql).unwrap();
             let disclosure = explain.vector_search.unwrap();
             assert!(
-                disclosure.partition_hnsw.is_empty(),
+                disclosure.partitions.is_empty(),
                 "{hidden_by:?}: {disclosure:?}"
             );
             assert_eq!(
@@ -2399,6 +2398,10 @@ fn restricted_inspection_keeps_adaptive_partition_populations_private() {
 
 #[cfg(all(feature = "test-seams", unix))]
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
     use contextdb_core::read_contract::{OwnerReadCancellation, ReadLimits, ReadRoute};
     use contextdb_engine::{DatabaseOpenOptions, OwnerReadConfig, ReadSession, ReadSessionOptions};
@@ -2430,15 +2433,15 @@ fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
             limits: ReadLimits::default(),
             ..ReadSessionOptions::default()
         };
-        let check = |reader: &ReadSession, indexed: bool| {
+        let check = |reader: &ReadSession, _indexed: bool| {
             for mode in ["AUTO", "EXACT", "INDEXED"] {
                 let sql = fixture
                     .sql()
                     .replace("LIMIT 1", &format!("USE VECTOR {mode} LIMIT 1"));
                 let answer = reader.execute(&sql, &fixture.query_params());
-                if mode == "INDEXED" && !indexed {
+                if mode == "INDEXED" {
                     assert!(
-                        matches!(answer, Err(Error::VectorFilteredRouteUnavailable { .. })),
+                        matches!(answer, Err(Error::VectorIndexedRouteUnavailable { .. })),
                         "{hidden_by:?} {:?}: {answer:?}",
                         reader.route()
                     );
@@ -2451,7 +2454,7 @@ fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
                         reader.route()
                     );
                     let disclosure =
-                        answer.trace.vector_search.as_ref().expect(
+                        answer.trace().vector_search.as_ref().expect(
                             "the restricted executed read publishes a vector route receipt",
                         );
                     assert_eq!(
@@ -2461,7 +2464,7 @@ fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
                         reader.route()
                     );
                     assert!(
-                        disclosure.partition_hnsw.is_empty(),
+                        disclosure.partitions.is_empty(),
                         "{hidden_by:?} {:?} {mode}: per-partition adaptive facts stay redacted",
                         reader.route()
                     );

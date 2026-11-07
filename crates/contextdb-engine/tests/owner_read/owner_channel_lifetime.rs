@@ -8,14 +8,14 @@
 //! serving, and a reader that finds nobody listening concludes there is no
 //! owner and reads the file.
 
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame};
 use contextdb_core::read_contract::{
     OwnerReadCancellation, OwnerReadLimits, OwnerRequestHandler, OwnerServingState,
     ReadClientTimeouts, ReadFailureKind, ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Result, Value};
 use contextdb_engine::local_transport::{
-    LocalHandshake, ManualDeadlineClock, channel_filesystem_identity, encode_message,
-    encode_payload_frame,
+    LocalHandshake, ManualDeadlineClock, channel_filesystem_identity,
 };
 use contextdb_engine::persistence::read_persistence_test_scaffold;
 use contextdb_engine::read_session::{ReadSessionEvent, ReadSessionTestObserver};
@@ -72,71 +72,151 @@ fn short_route_options() -> ReadSessionOptions {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_against_silent_channel(path: &Path, runtime_root: &Path) -> Result<ReadSession> {
     open_against_silent_channel_after_first_waiter(path, runtime_root, || {})
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_against_silent_channel_after_first_waiter(
     path: &Path,
     runtime_root: &Path,
     after_first_waiter: impl FnOnce(),
 ) -> Result<ReadSession> {
+    type SharedResult = Arc<std::sync::Mutex<Option<Result<ReadSession>>>>;
+    enum OpeningEvent {
+        WaiterRegistered,
+        Finished(SharedResult),
+        LivenessExpired,
+    }
+    struct Watchdog {
+        cancel: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.cancel.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
     let clock = ManualDeadlineClock::at(1_000);
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    struct RegistrationRelay {
+        clock: ManualDeadlineClock,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for RegistrationRelay {
+        fn drop(&mut self) {
+            // Replacing the observer closes the relay's receiver before join.
+            drop(self.clock.observe_waiter_registrations());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let registrations = clock.observe_waiter_registrations();
+    let waiter_events = event_tx.clone();
+    let registration_relay = std::thread::spawn(move || {
+        while registrations.recv().is_ok() {
+            if waiter_events.send(OpeningEvent::WaiterRegistered).is_err() {
+                break;
+            }
+        }
+    });
+    let _registration_relay = RegistrationRelay {
+        clock: clock.clone(),
+        thread: Some(registration_relay),
+    };
+    let (cancel, cancel_rx) = std::sync::mpsc::channel();
+    let watchdog_events = event_tx.clone();
+    let watchdog = std::thread::spawn(move || {
+        if matches!(
+            cancel_rx.recv_timeout(std::time::Duration::from_secs(60)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = watchdog_events.send(OpeningEvent::LivenessExpired);
+        }
+    });
+    let _watchdog = Watchdog {
+        cancel,
+        thread: Some(watchdog),
+    };
     let opening_clock = clock.clone();
     let opening_path = path.to_path_buf();
     let opening_runtime_root = runtime_root.to_path_buf();
     let opening = std::thread::spawn(move || {
-        ReadSession::with_runtime_directory_for_test(&opening_runtime_root, || {
+        let result = ReadSession::with_runtime_directory_for_test(&opening_runtime_root, || {
             ReadSession::open_with_clock_for_test(
                 &opening_path,
                 short_route_options(),
                 Arc::new(opening_clock),
             )
-        })
+        });
+        let shared = Arc::new(std::sync::Mutex::new(Some(result)));
+        let _ = event_tx.send(OpeningEvent::Finished(shared.clone()));
+        shared
     });
 
-    // Between two deadlines route selection may do real work of any length --
-    // opening the idle file once the silent candidate has timed out -- so
-    // only the opener itself ends this wait, by registering its next deadline
-    // or by finishing. The patience never judges speed; it only turns an
-    // opener that does neither into a failure instead of a hang.
-    let patience = std::time::Duration::from_secs(60);
     let mut deadlines_driven = 0u64;
     let mut after_first_waiter = Some(after_first_waiter);
-    while deadlines_driven < 4 && !opening.is_finished() {
-        let waiting_since = std::time::Instant::now();
-        while clock.registered_waiter_count() != 1
-            && !opening.is_finished()
-            && waiting_since.elapsed() < patience
-        {
-            std::thread::yield_now();
+    let finished = loop {
+        match event_rx.recv().expect("owner route event channel closed") {
+            OpeningEvent::WaiterRegistered => {
+                if clock.registered_waiter_count() != 1 {
+                    continue;
+                }
+                if deadlines_driven >= 4 {
+                    break None;
+                }
+                if let Some(after_first_waiter) = after_first_waiter.take() {
+                    after_first_waiter();
+                }
+                deadlines_driven = deadlines_driven.saturating_add(1);
+                clock.advance_to(10_000u64.saturating_mul(deadlines_driven));
+            }
+            OpeningEvent::Finished(result) => break Some(result),
+            OpeningEvent::LivenessExpired => {
+                clock.advance_to(u64::MAX / 2);
+                opening.thread().unpark();
+                panic!("owner route event never delivered");
+            }
         }
-        if opening.is_finished() {
-            break;
-        }
-        if clock.registered_waiter_count() != 1 {
-            clock.advance_to(u64::MAX / 2);
-            opening.thread().unpark();
-            let _ = opening.join();
-            panic!(
-                "the silent owner candidate neither registered its response deadline nor finished"
-            );
-        }
-        if let Some(after_first_waiter) = after_first_waiter.take() {
-            after_first_waiter();
-        }
-        deadlines_driven = deadlines_driven.saturating_add(1);
-        clock.advance_to(10_000u64.saturating_mul(deadlines_driven));
-    }
+    };
     assert!(
         deadlines_driven > 0,
         "the silent owner candidate answered without reaching its response deadline"
     );
+    if finished.is_none() {
+        clock.advance_to(u64::MAX / 2);
+        opening.thread().unpark();
+    }
     assert!(
-        opening.is_finished(),
+        finished.is_some(),
         "route selection consumed more than the two sanctioned attempts"
     );
-    opening.join().expect("join the route-selection proof")
+    let carried = finished.expect("owner route completion never delivered");
+    let joined = opening.join().expect("join the route-selection proof");
+    assert!(
+        Arc::ptr_eq(&carried, &joined),
+        "Finished and join carry the same result"
+    );
+    let mut slot = carried.lock().expect("owner route result slot");
+    assert!(slot.is_some(), "owner route result must be present once");
+    let result = slot.take().expect("owner route result present");
+    assert!(
+        slot.is_none(),
+        "owner route result must be taken exactly once"
+    );
+    result
 }
 
 fn seed(database: &Database) {
@@ -192,6 +272,10 @@ fn a_writer_that_stops_serving_takes_its_channel_down() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_startup_never_unlinks_a_live_channel_merely_because_its_name_exists() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "startup-live-channel-runtime");
@@ -298,6 +382,10 @@ fn writer_startup_never_unlinks_a_live_channel_merely_because_its_name_exists() 
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_owner_is_still_the_route_a_reader_selects() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "live-owner-runtime");
@@ -313,13 +401,17 @@ fn a_live_owner_is_still_the_route_a_reader_selects() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the live owner answers");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
 
     drop(session);
     database.close().expect("the writer closes cleanly");
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_live_writer_whose_published_channel_is_missing_is_never_reported_absent_or_read_around() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "missing-live-channel-runtime");
@@ -397,6 +489,10 @@ impl ReadSessionTestObserver for DistrustCompanionAfterOwnerDiscovery {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_published_owner_whose_channel_and_companion_become_unavailable_is_never_read_around() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "missing-indeterminate-runtime");
@@ -446,41 +542,102 @@ fn a_published_owner_whose_channel_and_companion_become_unavailable_is_never_rea
 }
 
 #[test]
-fn an_owner_that_leaves_mid_session_is_answered_by_that_owner_not_by_the_file() {
+fn a_reader_keeps_saved_rows_and_returns_to_the_restarted_owner_without_reopening() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "mid-session-runtime");
     let path = directory.path().join("mid-session.db");
     let database = Database::open_with_options(&path, owner_options(runtime_root.clone()))
         .expect("open a writer that serves owner reads");
     seed(&database);
+    database
+        .execute(
+            "INSERT INTO channel_rows (id, payload) VALUES (2, 'continued')",
+            &HashMap::new(),
+        )
+        .expect("seed the second row needed to cross a cursor page boundary");
 
-    let session =
-        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
-            .expect("a live owner is reachable");
+    let session = ReadSession::open_in_runtime_dir(
+        &path,
+        ReadSessionOptions {
+            limits: ReadLimits {
+                cursor_page_rows: 1,
+                ..ReadLimits::default()
+            },
+            ..ReadSessionOptions::default()
+        },
+        Some(runtime_root.clone()),
+    )
+    .expect("a live owner is reachable");
     assert_eq!(session.route(), ReadRoute::Owner);
-
-    // The route was selected against an owner that really was there. Losing it
-    // now is that owner's answer, and this session reports it rather than
-    // quietly finding another way to the same bytes: a reader is never
-    // silently moved to a different view of the store mid-session.
-    database.close().expect("the owner goes away mid-session");
-    let refused = session
-        .execute("SELECT payload FROM channel_rows", &HashMap::new())
-        .expect_err("a session whose owner left does not answer from somewhere else");
-    let Error::ReadFailure(failure) = &refused else {
-        panic!("the session reported {refused:?}");
-    };
-    assert!(
-        matches!(
-            failure.kind(),
-            ReadFailureKind::OwnerNotServing | ReadFailureKind::OwnerDisconnected
-        ),
-        "an owner that stopped is reported as such, not routed around: {refused:?}"
+    let sql = "SELECT id, payload FROM channel_rows ORDER BY id";
+    let committed = session
+        .execute(sql, &HashMap::new())
+        .expect("read the committed rows from the live owner");
+    assert_eq!(
+        committed.rows(),
+        vec![
+            vec![Value::Int64(1), Value::Text("kept".to_owned())],
+            vec![Value::Int64(2), Value::Text("continued".to_owned())],
+        ]
     );
-    assert_eq!(session.route(), ReadRoute::Owner, "the route never changed");
+    let mut cursor = session
+        .open_cursor(sql, &HashMap::new())
+        .expect("open a cursor while the owner is running");
+    assert_eq!(cursor.route(), ReadRoute::Owner);
+    assert_eq!(cursor.first_page().rows(), &committed.rows()[..1]);
+    assert!(cursor.first_page().has_more());
+
+    // close() returns after the serving workers stop; no timing probe is needed.
+    database.close().expect("the owner goes away mid-session");
+    assert!(channels_under(&runtime_root).is_empty());
+    let saved = session
+        .execute(sql, &HashMap::new())
+        .expect("the same reader answers from the last saved state");
+    assert_eq!(saved.rows(), committed.rows());
+    assert_eq!(
+        session.route(),
+        ReadRoute::File,
+        "report saved-file service"
+    );
+    let continued = cursor
+        .fetch(None)
+        .expect("the cursor keeps its owner-opened results after shutdown");
+    assert_eq!(continued.rows(), &committed.rows()[1..]);
+    assert!(!continued.has_more());
+    cursor.close().expect("release the completed cursor");
+    drop(database);
+
+    let restarted = Database::open_with_options(&path, owner_options(runtime_root.clone()))
+        .expect("restart the serving owner");
+    restarted
+        .execute(
+            "UPDATE channel_rows SET payload = 'restarted' WHERE id = 1",
+            &HashMap::new(),
+        )
+        .expect("give the restarted owner a distinguishable committed answer");
+    let current = session
+        .execute(sql, &HashMap::new())
+        .expect("the same reader returns to the owner automatically");
+    assert_eq!(
+        current.rows(),
+        vec![
+            vec![Value::Int64(1), Value::Text("restarted".to_owned())],
+            committed.rows()[1].clone(),
+        ]
+    );
+    assert_eq!(
+        session.route(),
+        ReadRoute::Owner,
+        "report live-owner service"
+    );
+    restarted.close().expect("close the restarted owner");
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_reader_finding_nobody_listening_reads_the_idle_file() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "stale-channel-runtime");
@@ -526,7 +683,7 @@ fn a_reader_finding_nobody_listening_reads_the_idle_file() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the idle file answers");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
 
     assert!(
         !channel.exists(),
@@ -571,7 +728,7 @@ fn a_reader_finding_no_authenticated_owner_reads_the_idle_file() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the idle committed file answers");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
     drop(session);
 
     assert_eq!(
@@ -629,6 +786,10 @@ fn a_silent_channel_cannot_route_around_a_live_writer_through_an_alias() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn a_dangling_symlink_never_routes_through_its_alias_companion() {
     let directory = tempfile::TempDir::new().expect("task-scoped dangling-alias directory");
     let runtime_root = secure_runtime_root(directory.path(), "dangling-alias-runtime");
@@ -678,6 +839,10 @@ fn a_dangling_symlink_never_routes_through_its_alias_companion() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_unlinked_store_name_never_routes_to_the_old_live_owner() {
     let directory = tempfile::TempDir::new().expect("task-scoped unlinked-store directory");
     let runtime_root = secure_runtime_root(directory.path(), "unlinked-store-runtime");
@@ -708,6 +873,10 @@ fn an_unlinked_store_name_never_routes_to_the_old_live_owner() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn an_untrusted_idle_companion_does_not_hide_an_existing_idle_store() {
     let directory = tempfile::TempDir::new().expect("task-scoped idle-companion directory");
     let runtime_root = secure_runtime_root(directory.path(), "idle-companion-runtime");
@@ -731,7 +900,7 @@ fn an_untrusted_idle_companion_does_not_hide_an_existing_idle_store() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the existing idle file answers directly");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
     drop(session);
 
     std::fs::set_permissions(&companion, std::fs::Permissions::from_mode(0o600))
@@ -780,6 +949,10 @@ fn an_untrusted_companion_never_licenses_a_file_fallback() {
 }
 
 #[test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn selecting_a_route_against_a_draining_owner_takes_none_of_its_capacity() {
     let directory = tempfile::TempDir::new().expect("task-scoped channel-lifetime directory");
     let runtime_root = secure_runtime_root(directory.path(), "draining-capacity-runtime");
@@ -823,7 +996,7 @@ fn selecting_a_route_against_a_draining_owner_takes_none_of_its_capacity() {
     let answered = session
         .execute("SELECT payload FROM channel_rows", &HashMap::new())
         .expect("the one-slot owner answers after the earlier route selection");
-    assert_eq!(answered.rows.len(), 1);
+    assert_eq!(answered.rows().len(), 1);
 
     drop(session);
     database.close().expect("the writer closes cleanly");

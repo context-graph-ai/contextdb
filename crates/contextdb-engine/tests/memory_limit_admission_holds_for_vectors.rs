@@ -100,6 +100,10 @@ fn used(database: &Database) -> u64 {
     database.accountant().usage().used as u64
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert_edge(
     database: &Database,
     tx: contextdb_core::TxId,
@@ -341,7 +345,7 @@ fn delete_gives_back(payload: Payload) -> Vec<String> {
     // `admitted` by exactly that one commit's retained change-log charge,
     // computed the same way the commit path computes it.
     let expected_delete_commit_charge =
-        database.__change_log_commit_charge_since_for_test(pre_delete_lsn, 1);
+        database.__change_log_commit_charge_since_for_test(pre_delete_lsn);
     let expected_after = admitted.saturating_add(expected_delete_commit_charge as u64);
     println!(
         "MEASURED {} delete: before={before} admitted={admitted} after={after} \

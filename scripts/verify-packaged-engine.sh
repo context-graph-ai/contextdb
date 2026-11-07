@@ -17,7 +17,7 @@ printf 'Packaging temporary directory: %s\nBuild target: %s\n' "$package_root" "
 trap 'printf "Removing packaging temporary directory: %s\n" "$package_root"; rm -rf -- "$package_root"' EXIT
 
 packaged_crates=(
-  contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-hnsw
+  contextdb-core contextdb-tx contextdb-relational contextdb-graph
   contextdb-vector contextdb-parser contextdb-planner contextdb-engine contextdb-server
   contextdb-cli
 )
@@ -128,7 +128,7 @@ unpacked_root = pathlib.Path(sys.argv[3]).resolve()
 packages = {package["name"]: package for package in metadata["packages"]}
 expected = {
     "contextdb-redb", "contextdb-core", "contextdb-tx", "contextdb-relational",
-    "contextdb-graph", "contextdb-hnsw", "contextdb-vector", "contextdb-parser",
+    "contextdb-graph", "contextdb-vector", "contextdb-parser",
     "contextdb-planner", "contextdb-engine",
 }
 missing = expected - packages.keys()
@@ -146,14 +146,9 @@ for package in metadata["packages"]:
 nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
 engine = packages["contextdb-engine"]
 fork = packages["contextdb-redb"]
-vector = packages["contextdb-vector"]
-hnsw = packages["contextdb-hnsw"]
 engine_deps = {dependency["name"]: dependency["pkg"] for dependency in nodes[engine["id"]]["deps"]}
 if engine_deps.get("redb") != fork["id"]:
     raise SystemExit("packaged engine does not resolve its redb alias to contextdb-redb")
-vector_deps = {dependency["name"]: dependency["pkg"] for dependency in nodes[vector["id"]]["deps"]}
-if vector_deps.get("hnsw_rs") != hnsw["id"]:
-    raise SystemExit("packaged vector dependency does not resolve to contextdb-hnsw")
 print("Verified unpacked engine closure:")
 print(json.dumps({name: packages[name]["manifest_path"] for name in sorted(expected)}, indent=2))
 PY

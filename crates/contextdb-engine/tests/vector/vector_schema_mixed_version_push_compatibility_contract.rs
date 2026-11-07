@@ -39,10 +39,10 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn text_column(result: QueryResult) -> Vec<String> {
     result
-        .rows
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Text(value)) => value,
+        .rows()
+        .iter()
+        .map(|row| match row.iter().next() {
+            Some(Value::Text(value)) => value.clone(),
             value => panic!("expected one text value, got {value:?}"),
         })
         .collect()
@@ -72,7 +72,7 @@ const UNSUPPORTED_VECTOR_CLAUSES: [&str; 5] = [
     "MAX_PARTITIONS",
     "SEARCH_MODE",
     "AUTO_INDEX_AT",
-    "HNSW",
+    "IVF",
 ];
 
 /// `ALTER COLUMN` is a candidate-only `alter_action`
@@ -85,8 +85,8 @@ const UNSUPPORTED_ALTER_PHRASE: &str = "ALTER COLUMN";
 /// Split a rendered column-type string into grammar-shaped tokens: a bare run
 /// of non-whitespace, non-`(` characters, or one balanced parenthesised group
 /// (quote-aware, so a `'...'` value cannot desynchronize the paren count).
-/// This is what lets `RANK_POLICY (JOIN hnsw ON search_mode, ...)` stay one
-/// opaque token instead of exposing `hnsw` and `search_mode` as look-alike
+/// This is what lets `RANK_POLICY (JOIN ivf ON search_mode, ...)` stay one
+/// opaque token instead of exposing `ivf` and `search_mode` as look-alike
 /// keyword positions.
 fn tokenize_rendered_column_type(rendered_type: &str) -> Vec<&str> {
     let bytes = rendered_type.as_bytes();
@@ -233,6 +233,10 @@ struct RecordedPushRequest {
 
 /// Decode one outgoing push request envelope and append it to the witness.
 /// Shared by both transport methods a push can travel through.
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn record_push_request(
     requests: &Mutex<Vec<RecordedPushRequest>>,
     request_bytes: &[u8],
@@ -395,7 +399,8 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
             TenantId::from(TENANT),
             hub_node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -414,7 +419,8 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
         broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
 
     client
@@ -471,7 +477,7 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
     let vector_rows = hub
         .execute("SELECT id FROM partitioned_notes", &empty())
         .expect("the held row arrives with its declaration");
-    assert_eq!(vector_rows.rows, vec![vec![Value::Uuid(vector_id)]]);
+    assert_eq!(vector_rows.rows(), vec![vec![Value::Uuid(vector_id)]]);
     assert!(client.schema_sync_holdbacks().is_empty());
 
     drop(client);
@@ -480,6 +486,10 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
 }
 
 #[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
     let broker = InProcessBroker::new();
     let edge = Arc::new(Database::open_memory());
@@ -528,7 +538,8 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
             TenantId::from(REVERTED_PUSH_TENANT),
             hub_node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -552,7 +563,8 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
         transport.clone(),
         TenantId::from(REVERTED_PUSH_TENANT),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
 
     client
@@ -579,21 +591,28 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
         .await
         .expect("an upgraded hub receives exact authored history");
     assert!(client.schema_sync_holdbacks().is_empty());
-    let original = edge.changes_since(Lsn(0));
+    let original = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let schema = contextdb_engine::sync_types::ChangeSet {
         ddl: original.ddl,
         ddl_lsn: original.ddl_lsn,
         ..Default::default()
     };
-    let (_, provenance) = edge
-        .outbound_row_lineages_and_ddl_provenance_for_test(
+    let (_, provenance) = {
+        let seam_read_memory = edge
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        edge.outbound_row_lineages_and_ddl_provenance_for_test(
             &schema,
             &TenantId::from(REVERTED_PUSH_TENANT),
             &edge_node_id,
             contextdb_core::Incarnation::mint(),
             &|bytes| Ok(edge_identity.sign_for_test(bytes)),
+            seam_read_memory,
         )
-        .unwrap();
+    }
+    .unwrap();
     let expected = schema
         .ddl
         .into_iter()
@@ -630,7 +649,7 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
     assert_eq!(
         hub.execute("SELECT id FROM docs", &empty())
             .expect("the released vector row arrives")
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(doc)]]
     );
     assert_schema_converged(

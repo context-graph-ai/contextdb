@@ -1,6 +1,6 @@
 ---
 name: using-contextdb
-description: Open a contextdb database, define tables with enforced policy, run SQL including multi-line paste, read machine output with --json, and branch on exit codes.
+description: Open a contextdb store, run SQL, tune the reading session cache, count groups, rank rows within groups, and handle JSON results and refusals.
 ---
 
 # Using contextdb
@@ -18,7 +18,7 @@ schema to migrate to: you create your own tables (see the [README](../../README.
 ```bash
 contextdb ./demo.db              # read an existing store; never creates, never mutates
 contextdb ./demo.db --write      # create it if missing, and permit mutation
-contextdb :memory:               # ephemeral writable scratch, discarded on exit
+contextdb "$(mktemp -d)/scratch.db" --write  # task-scoped durable scratch
 ```
 
 A file-backed open without `--write` is a bounded read session; the refusals, owner-vs-file
@@ -40,7 +40,9 @@ echo "INSERT INTO decisions VALUES ('550e8400-e29b-41d4-a716-446655440000', 'dra
 # exit:   1
 ```
 
-`:memory:` is always writable and needs no flag; an explicit `--write` on it is an accepted no-op.
+There is no in-memory mode: `:memory:` is refused. A temporary file is still a durable store;
+use `--write` to create or mutate it, and retain its path to reopen it.
+<!-- enforced by: read_cli_journeys_invocation::memory_path_is_refused_because_contextdb_has_no_in_memory_mode, read_cli_journeys_invocation::write_flag_creates_the_store_a_read_refused_to_create -->
 
 When stdin is not a terminal the CLI runs in **pipe mode**: no banner, no prompt, results on
 stdout, every error and diagnostic on stderr, and the process exit code tells you what happened.
@@ -171,7 +173,7 @@ escape there. Details: [`docs/cli.md`](../../docs/cli.md#large-results-the-sessi
 A non-query statement is a small status object:
 
 ```bash
-echo "CREATE TABLE t (id UUID PRIMARY KEY);" | contextdb :memory: --json
+echo "CREATE TABLE t (id UUID PRIMARY KEY);" | contextdb "$(mktemp -d)/scratch.db" --write --json
 ```
 ```json
 {"rows_affected":0}
@@ -253,7 +255,7 @@ successful statements do not turn its exit status back into success.
 This small example isolates continuation without needing a machine-specific memory ceiling:
 
 ```bash
-contextdb :memory: --json <<'SQL'
+contextdb "$(mktemp -d)/scratch.db" --write --json <<'SQL'
 SELECT * FROM missing;
 SELECT 1 + 1;
 SQL
@@ -315,14 +317,17 @@ from an interactive session, because nobody can act on it once the process is go
 - **A meta-command is only a meta-command when no statement is open.** A line starting with `.`
   inside an unfinished statement is that statement's text.
 - **Budgets are SQL, not just flags.** `SET MEMORY_LIMIT '512M'` / `SET DISK_LIMIT '1G'` and their
-  `SHOW` forms. For a file-backed database `SET DISK_LIMIT` persists and survives reopen;
-  `:memory:` accepts and ignores it.
+  `SHOW` forms. `SET DISK_LIMIT` persists and survives reopen,
+  including on temporary-file stores.
 - **`LIMIT` is required on vector search.** Unbounded `ORDER BY <=>` is rejected. See the
   `vector-search` skill.
-- **Not supported, by design:** `GROUP BY`/`HAVING`, `UNION`/`INTERSECT`/`EXCEPT`,
-  `INSERT ... SELECT`, window functions, `WITH RECURSIVE`, subqueries outside `IN`, and aggregates
-  other than `COUNT` and `SUM` (`AVG`, `MIN` and `MAX` each refuse with
-  `plan error: unknown function`). Full list: [`docs/query-language.md`](../../docs/query-language.md#unsupported-features).
+- **Not supported, by design:** `HAVING`, `UNION`/`INTERSECT`/`EXCEPT`, `INSERT ... SELECT`,
+  `WITH RECURSIVE`, subqueries outside `IN`, and aggregates other than `COUNT` and `SUM` (`AVG`,
+  `MIN` and `MAX` each refuse with `plan error: unknown function`). `GROUP BY` works in one form
+  only — `COUNT(*)` grouped by a column list the table declares under `MAINTAIN COUNT` — and every
+  other grouped form is refused. The one window function is `ROW_NUMBER() OVER ([PARTITION BY
+  cols] ORDER BY cols)`; other window forms are refused by name. Full list:
+  [`docs/query-language.md`](../../docs/query-language.md#unsupported-features).
 - **Logs go to stderr** at level `ERROR` by default; raise with `RUST_LOG=debug`.
 
 ## Verify a store deterministically — run the script, don't hand-check
@@ -434,3 +439,135 @@ entitled to it, never scored or surfaced lower. Full recipe:
 - Distribute jobs and blobs → [`skills/work-fabric/SKILL.md`](../work-fabric/SKILL.md)
 - Retention, purge, backups, sync liveness → [`skills/operating-a-store/SKILL.md`](../operating-a-store/SKILL.md)
 - Routes, sinks, schedules → [`skills/running-triggers-and-schedules/SKILL.md`](../running-triggers-and-schedules/SKILL.md)
+
+## Tune a reading session's page cache
+
+Prerequisites: the `contextdb` binary installed above and an existing file store. Python 3
+is used only to select stable inspection fields in this example.
+
+1. Open without `--write`; declare `SET READ_CACHE_SHARE = 0` to disable file page caching,
+   or choose an integer percentage from 0 through 100 of the budget after fixed reservations.
+2. Inspect with `SHOW READ_CACHE_SHARE` in that same process. The setting belongs to the
+   session and is not persisted; `SET READ_CACHE_SHARE = DEFAULT` restores the derived default.
+3. Read `last_refusal` after a refusal. An out-of-range or non-integer declaration returns
+   `InvalidSetting`; a valid percentage can still fail memory admission. Both keep the previous
+   declaration.
+<!-- enforced by: read_cache_share_statements::a_declared_read_cache_share_is_inspected_as_declared_and_effective, read_cache_share_statements::a_read_cache_share_is_scoped_to_its_session_and_not_persisted, read_cache_share_statements::read_cache_shares_up_to_the_budget_are_accepted_and_100_and_above_refused, read_cache_share_inspection::cache_inspection_keeps_the_declaration_and_the_admitted_session_budget -->
+
+Runnable example (stdout below; route notices use stderr):
+
+```bash
+db="$(mktemp -d)/cache.db"
+printf 'CREATE TABLE t (id INTEGER PRIMARY KEY);\n' | contextdb "$db" --write --json > /dev/null
+printf 'SET READ_CACHE_SHARE = 0;\nSHOW READ_CACHE_SHARE;\n' | contextdb "$db" --json |
+  python3 -c 'import sys,json; docs=[json.loads(s) for s in sys.stdin]; row=docs[-1]["result"]["rows"][0]; print(json.dumps({k:row[k] for k in ("declared","effective_bytes")}))'
+```
+
+```text
+{"declared": 0, "effective_bytes": 0}
+```
+
+## Count groups and number rows within a group
+
+Prerequisite: the binary installed above; the example creates its own file store.
+
+1. For grouped `COUNT(*)`, create an index led by the count columns, then declare that list
+   with `ALTER TABLE ... SET MAINTAIN COUNT`. Pin a leading prefix with `=` or `IS NULL` and
+   group by the remaining columns. A missing declaration refuses with the required ALTER text.
+2. For row positions, use `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` and include
+   tie-breaking columns when deterministic selection matters. Filter the position in an outer query
+   to take a limited number per group. Other window forms, including a missing `ORDER BY`, return
+   `WindowFunctionNotSupported`.
+<!-- enforced by: consumer_declared_count_and_pending_seek_contract::grouped_event_counts_use_the_declared_context_stream_count_and_survive_reopen, grouped_session_top_n_contract::grouped_session_top_n_has_exact_context_ranks_and_fixed_declared_index_work -->
+
+```bash
+db="$(mktemp -d)/groups.db"
+contextdb "$db" --write --json > /dev/null <<'SQL'
+CREATE TABLE jobs (id INTEGER PRIMARY KEY, queue TEXT, state TEXT);
+CREATE INDEX jobs_queue_state ON jobs(queue, state);
+ALTER TABLE jobs SET MAINTAIN COUNT (queue, state);
+INSERT INTO jobs VALUES (1, 'local', 'ready');
+INSERT INTO jobs VALUES (2, 'local', 'ready');
+INSERT INTO jobs VALUES (3, 'local', 'done');
+SQL
+contextdb "$db" --write --json <<'SQL'
+SELECT state, COUNT(*) AS n FROM jobs WHERE queue = 'local' GROUP BY state;
+SELECT id, ROW_NUMBER() OVER (PARTITION BY queue ORDER BY id DESC) AS position FROM jobs ORDER BY id;
+SQL
+```
+
+```json
+{"result":{"columns":["state","n"],"rows":[{"n":1,"state":"done"},{"n":2,"state":"ready"}]}}
+{"result":{"columns":["id","position"],"rows":[{"id":1,"position":3},{"id":2,"position":2},{"id":3,"position":1}]}}
+```
+
+## Spell an inner join with JOIN
+
+Prerequisite: the `jobs` store from the previous example.
+
+1. Use `JOIN ... ON ...` wherever you would use `INNER JOIN ... ON ...`; the parser produces
+   the same join. `LEFT JOIN` retains its existing meaning.
+2. If parsing fails, check the table aliases and `ON` predicate against the runnable form below.
+<!-- enforced by: bare_join_keyword_contract::bare_join_parses_to_the_same_ast_as_inner_join, bare_join_keyword_contract::bare_join_without_any_alias_parses, bare_join_keyword_contract::left_join_still_parses_as_left -->
+
+```bash
+printf 'SELECT a.id AS left_id, b.id AS right_id FROM jobs a JOIN jobs b ON a.id = b.id WHERE a.id = 1;\n' |
+  contextdb "$db" --write --json
+```
+
+```json
+{"result":{"columns":["left_id","right_id"],"rows":[{"left_id":1,"right_id":1}]}}
+```
+
+## Keep a reading session open across writer restarts
+
+Prerequisites: the binary installed above and Python 3 for this two-process example.
+
+1. Open a reading session without `--write`. It reads the committed file when no writer is
+   active and follows a returning writer of that same store incarnation on later commands.
+2. Keep the reader open while the writer exits and restarts. A cursor already opened keeps its
+   captured snapshot; ordinary later commands select the current route. If an in-flight command
+   loses its owner and fails, handle that refusal before issuing the next command.
+<!-- enforced by: read_cli_journeys_route_changes::a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_returns, reader_continuity_contract::a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store -->
+
+This example drives ordinary statements through the same reader process throughout:
+
+```bash
+python3 - <<'PY'
+import json, pathlib, subprocess, tempfile
+path = str(pathlib.Path(tempfile.mkdtemp()) / "continuity.db")
+def shell(write=False):
+    return subprocess.Popen(["contextdb", path, "--json"] + (["--write"] if write else []),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+def statement(process, sql):
+    process.stdin.write(sql + "\n")
+    process.stdin.flush()
+    return json.loads(process.stdout.readline())
+def close(process):
+    process.stdin.close()
+    assert process.wait() == 0
+writer = shell(True)
+statement(writer, "CREATE TABLE items (id INTEGER PRIMARY KEY);")
+statement(writer, "INSERT INTO items VALUES (1);")
+reader = shell()
+query = "SELECT id FROM items ORDER BY id;"
+print(statement(reader, query)["result"]["rows"])
+close(writer)
+print(statement(reader, query)["result"]["rows"])
+writer = shell(True)
+statement(writer, "INSERT INTO items VALUES (2);")
+print(statement(reader, query)["result"]["rows"])
+close(reader)
+close(writer)
+PY
+```
+
+```text
+[{'id': 1}]
+[{'id': 1}]
+[{'id': 1}, {'id': 2}]
+```
+
+The example hides stderr to keep its stdout comparison fixed; retain stderr in a real script
+for the typed refusal and route notices.

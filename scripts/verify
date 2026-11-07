@@ -76,7 +76,7 @@ PY
     install_root=${CI_INSTALL_ROOT:-$(mktemp -d)}
     RUSTFLAGS='-D warnings' cargo install --locked --path crates/contextdb-cli --root "$install_root"
     RUSTFLAGS='-D warnings' cargo install --locked --path crates/contextdb-server --root "$install_root" --features production-smoke-driver --bins
-    CONTEXTDB_CLI="$install_root/bin/contextdb" CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" CONTEXTDB_SERVER="$install_root/bin/contextdb-server" scripts/installed-release-durable-sync-smoke.sh ;;
+    CONTEXTDB_CLI="$install_root/bin/contextdb" CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" CONTEXTDB_SERVER="$install_root/bin/contextdb-server" bash scripts/installed-release-durable-sync-smoke.sh ;;
   cross)
     case ${CI_TARGET:-} in
       aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;;

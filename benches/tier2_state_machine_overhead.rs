@@ -106,7 +106,7 @@ fn setup_seeded_db() -> (Database, Vec<Uuid>, Uuid) {
     assert_eq!(
         db.execute("SELECT id FROM jobs", &empty())
             .expect("count seeded jobs")
-            .rows
+            .rows()
             .len(),
         pre_gate_rows
     );
@@ -155,7 +155,7 @@ fn run_state_updates(
                         ]),
                     )
                     .expect("declared self-edge update");
-                assert_eq!(result.rows_affected, 1);
+                assert_eq!(result.rows_affected(), 1);
             }
             1 => {
                 let idx = cursor.accepted_distinct_cursor % ids.len();
@@ -180,7 +180,7 @@ fn run_state_updates(
                         ]),
                     )
                     .expect("declared distinct transition update");
-                assert_eq!(result.rows_affected, 1);
+                assert_eq!(result.rows_affected(), 1);
                 cursor.accepted_state_is_running[idx] = !cursor.accepted_state_is_running[idx];
             }
             2 => {
@@ -234,6 +234,13 @@ fn assert_report(report: &StateReport) {
 }
 
 fn bench(c: &mut Criterion) {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        c.bench_function(
+            "tier2_state_machine_overhead/100k_seeded_1k_mixed_state_machine_updates",
+            |_| {},
+        );
+        return;
+    }
     let (db, ids, strict_id) = setup_seeded_db();
     pre_gate_state_machine_semantics(&db, strict_id);
     let mut cursor = StateCursor {

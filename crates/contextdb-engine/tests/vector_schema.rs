@@ -1,5 +1,7 @@
 #![allow(clippy::duplicate_mod)] // Shared unchanged fixtures retain their original module paths.
 
+#[path = "fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
 #[path = "vector/vector_schema_mixed_version_compatibility_contract.rs"]
 mod vector_schema_mixed_version_compatibility_contract;
 #[path = "vector/vector_schema_mixed_version_erasure_frontier_contract.rs"]

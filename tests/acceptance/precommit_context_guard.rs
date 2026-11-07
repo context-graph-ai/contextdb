@@ -1,9 +1,16 @@
 use contextdb_core::types::ContextId;
 use contextdb_core::{Direction, Error, Lsn, Value, VectorIndexRef};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,
-};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::ChangeSet;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::DdlChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::NaturalKey;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::RowChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use tempfile::TempDir;
@@ -76,17 +83,17 @@ fn t4_01_select_excludes_other_contexts() {
         .execute("SELECT id, body FROM memos", &empty())
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "scoped handle must see exactly the ctx_a row"
     );
-    let body = match &result.rows[0][1] {
+    let body = match &result.rows()[0][1] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text body, got {other:?}"),
     };
     assert_eq!(body, "in-a", "ctx-a row must be visible");
     // Negative: ctx-b row must not appear.
-    for row in &result.rows {
+    for row in result.rows() {
         if let Value::Text(s) = &row[1] {
             assert_ne!(s, "in-b", "ctx-b row leaked into ctx-a-scoped handle");
         }
@@ -152,7 +159,8 @@ fn t4_03_update_other_context_rejected() {
         .execute("UPDATE memos SET body = $body WHERE id = $id", &p)
         .unwrap();
     assert_eq!(
-        result.rows_affected, 0,
+        result.rows_affected(),
+        0,
         "UPDATE predicate targeting a hidden ctx-b row must behave as no visible match"
     );
     drop(scoped);
@@ -164,7 +172,7 @@ fn t4_03_update_other_context_rejected() {
         )
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Text("original".into())]],
         "denied UPDATE must leave the ctx-b row unchanged"
     );
@@ -188,7 +196,8 @@ fn t4_04_delete_other_context_rejected() {
         )
         .unwrap();
     assert_eq!(
-        result.rows_affected, 0,
+        result.rows_affected(),
+        0,
         "DELETE predicate targeting a hidden ctx-b row must behave as no visible match"
     );
     drop(scoped);
@@ -273,12 +282,12 @@ fn t4_05_graph_traversal_excludes_other_contexts() {
     let n4 = Uuid::from_u128(4);
     // Positive: ctx-a node IS visible to the scoped handle (rules out vacuous "empty result" pass).
     let saw_a = result
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == n1));
     assert!(saw_a, "ctx-a node must be visible to ctx-a-scoped handle");
     let saw_allowed_neighbor = result
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == n4));
     assert!(
@@ -286,7 +295,7 @@ fn t4_05_graph_traversal_excludes_other_contexts() {
         "GRAPH_TABLE must traverse to the visible ctx-a neighbor, not only return the start node"
     );
     // Negative: ctx-b node never appears.
-    for row in &result.rows {
+    for row in result.rows() {
         if let Value::Uuid(u) = &row[0] {
             assert_ne!(*u, n2, "ctx-b node leaked into ctx-a graph traversal");
             assert_ne!(
@@ -431,12 +440,12 @@ fn t4_06_vector_query_excludes_other_contexts() {
         .unwrap();
     let ctx_a_nearest = Uuid::from_u128(12);
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "vector gating must happen before LIMIT so the nearest visible row is still returned"
     );
     let saw_nearest_a = result
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == ctx_a_nearest));
     assert!(
@@ -444,7 +453,7 @@ fn t4_06_vector_query_excludes_other_contexts() {
         "nearest visible ctx-a row must be present in ctx-a-scoped vector query result"
     );
     // Negative: ctx-b row never appears.
-    for row in &result.rows {
+    for row in result.rows() {
         if let Value::Uuid(u) = &row[0] {
             assert!(
                 !(2..12).contains(&u.as_u128()),
@@ -569,13 +578,13 @@ fn t4_07_multi_context_set_sees_subset_excludes_others() {
         .execute("SELECT id, body FROM memos", &empty())
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         2,
         "handle scoped to {{a,b}} must see exactly 2 rows; got {}",
-        result.rows.len()
+        result.rows().len()
     );
     let bodies: std::collections::HashSet<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| match &r[1] {
             Value::Text(s) => s.clone(),
@@ -605,14 +614,14 @@ fn t4_07b_scoped_view_over_open_handle_filters_without_second_open() {
     let visible = scoped
         .execute("SELECT id, body FROM memos", &empty())
         .unwrap();
-    assert_eq!(visible.rows.len(), 1);
-    assert!(matches!(&visible.rows[0][1], Value::Text(body) if body == "in-a"));
+    assert_eq!(visible.rows().len(), 1);
+    assert!(matches!(&visible.rows()[0][1], Value::Text(body) if body == "in-a"));
 
     let admin_visible = admin
         .execute("SELECT id, body FROM memos", &empty())
         .unwrap();
     assert_eq!(
-        admin_visible.rows.len(),
+        admin_visible.rows().len(),
         2,
         "scoped view must not narrow the owner handle"
     );
@@ -633,7 +642,7 @@ fn t4_07b_scoped_view_over_open_handle_filters_without_second_open() {
     scoped.close().unwrap();
     let after_view_close = admin.execute("SELECT id FROM memos", &empty()).unwrap();
     assert_eq!(
-        after_view_close.rows.len(),
+        after_view_close.rows().len(),
         2,
         "closing a scoped view must not close the owner resource"
     );
@@ -657,11 +666,11 @@ fn t4_07c_scoped_view_cannot_widen_or_clear_scope() {
         .execute("SELECT id, body FROM memos", &empty())
         .unwrap();
     assert_eq!(
-        visible.rows.len(),
+        visible.rows().len(),
         1,
         "clearing child constraints must preserve the parent scope"
     );
-    assert!(matches!(&visible.rows[0][1], Value::Text(body) if body == "in-a"));
+    assert!(matches!(&visible.rows()[0][1], Value::Text(body) if body == "in-a"));
 
     let attempted_widen = scoped_a.scoped_with_contexts(BTreeSet::from([
         ContextId::new(ctx_a),
@@ -671,11 +680,11 @@ fn t4_07c_scoped_view_cannot_widen_or_clear_scope() {
         .execute("SELECT id, body FROM memos", &empty())
         .unwrap();
     assert_eq!(
-        widened_visible.rows.len(),
+        widened_visible.rows().len(),
         1,
         "child contexts must intersect with the parent scope, not widen it"
     );
-    assert!(matches!(&widened_visible.rows[0][1], Value::Text(body) if body == "in-a"));
+    assert!(matches!(&widened_visible.rows()[0][1], Value::Text(body) if body == "in-a"));
 }
 
 /// RED — t4_07c: scoped views must stop using storage after the owner closes.
@@ -707,6 +716,7 @@ fn t4_07d_scoped_view_observes_owner_close() {
 /// synchronously, on the SAME thread, inside `execute` itself) rather than
 /// depending on a second thread ever winning a real race.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t4_07e_execute_returns_typed_error_when_close_races_the_snapshot_registration() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("race-window.redb");
@@ -759,7 +769,7 @@ fn t4_08_admin_handle_sees_all_contexts() {
     }
     let admin = Database::open(&path).unwrap();
     let r = admin.execute("SELECT id FROM memos", &empty()).unwrap();
-    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows().len(), 2);
 }
 
 /// REGRESSION GUARD — t4_09
@@ -795,8 +805,8 @@ fn t4_09_table_without_context_id_unaffected() {
     let r = scoped
         .execute("SELECT v, context_id FROM plain", &empty())
         .unwrap();
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0][1], Value::Uuid(Uuid::from_u128(0xB)));
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.rows()[0][1], Value::Uuid(Uuid::from_u128(0xB)));
 }
 
 /// RED — t4_10
@@ -818,9 +828,9 @@ fn t4_10_insert_context_id_omitted_handle_one_context_auto_stamps() {
     let r = scoped
         .execute("SELECT id, context_id FROM memos", &empty())
         .unwrap();
-    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows().len(), 1);
     assert_eq!(
-        r.rows[0][1],
+        r.rows()[0][1],
         Value::Uuid(ctx_a),
         "auto-stamped context_id must equal the handle's single context"
     );
@@ -923,7 +933,7 @@ fn t4_12_update_post_image_label_flip_rejected() {
         )
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Uuid(ctx_a)]],
         "denied context flip must leave the row in ctx-a"
     );
@@ -960,6 +970,7 @@ fn t4_13_scan_filter_predicate_sees_only_context_visible_rows() {
 
 /// RED — t4_14: sync apply's raw insert helper must not bypass context gates.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t4_14_sync_apply_does_not_insert_other_context_rows() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sync_apply.redb");
@@ -1090,12 +1101,12 @@ fn t4_15_state_propagation_respects_context_on_children() {
         .execute("SELECT status FROM children", &empty())
         .unwrap();
     assert_eq!(
-        parent_status.rows,
+        parent_status.rows(),
         vec![vec![Value::Text("active".into())]],
         "failed propagation must roll back the parent transition"
     );
     assert_eq!(
-        child_status.rows,
+        child_status.rows(),
         vec![vec![Value::Text("active".into())]],
         "failed propagation must leave the ctx-b child unchanged"
     );
@@ -1163,7 +1174,7 @@ fn t4_16_graph_edge_metadata_context_gate_hides_visible_endpoint_edge() {
         )
         .unwrap();
     assert_eq!(
-        graph_rows.rows.len(),
+        graph_rows.rows().len(),
         0,
         "GRAPH_TABLE must hide edge whose metadata row is ctx-b"
     );
@@ -1218,7 +1229,9 @@ fn t4_17_changes_since_filters_context_rows_and_schema() {
 
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
-    let changes = scoped.changes_since(Lsn(0));
+    let changes = scoped
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert!(
         changes.ddl.is_empty(),
         "constrained changes_since must not leak schema DDL"
@@ -1259,7 +1272,9 @@ fn t4_17b_changes_since_emits_delete_when_row_moves_out_of_context_after_ddl_lsn
 
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
-    let changes = scoped.changes_since(since);
+    let changes = scoped
+        .changes_since(since)
+        .expect("read the declared changes");
     assert!(
         changes.ddl.is_empty(),
         "scoped change streams must not expose schema DDL"
@@ -1278,6 +1293,7 @@ fn t4_17b_changes_since_emits_delete_when_row_moves_out_of_context_after_ddl_lsn
 
 /// RED — t4_18: sync DDL apply requires an admin handle.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t4_18_scoped_apply_changes_rejects_ddl() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sync_ddl.redb");
@@ -1356,7 +1372,7 @@ fn t4_19_scoped_raw_helpers_respect_context_boundary() {
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
     assert!(
-        scoped.ddl_log_since(Lsn(0)).is_empty(),
+        scoped.ddl_log_since(Lsn(0)).unwrap().is_empty(),
         "scoped raw DDL log helper must not expose schema"
     );
     let row_changes = scoped.change_log_rows_since(Lsn(0)).unwrap();
@@ -1371,12 +1387,15 @@ fn t4_19_scoped_raw_helpers_respect_context_boundary() {
         "raw row log helper leaked hidden context row"
     );
     assert!(
-        !scoped.has_live_vector(hidden_row_id, scoped.snapshot()),
+        !scoped
+            .has_live_vector(hidden_row_id, scoped.snapshot())
+            .expect("inspect the live vector"),
         "has_live_vector must hide vectors attached to hidden rows"
     );
     assert!(
         scoped
             .live_vector_entry(hidden_row_id, scoped.snapshot())
+            .expect("read the actual fixture observation")
             .is_none(),
         "live_vector_entry must not return hidden vector payloads"
     );

@@ -35,11 +35,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
         .expect("bind file-backed authoritative hub");
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -90,7 +89,8 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     edge.execute(
         "INSERT INTO push_only_notes (id, body) VALUES ($id, $body)",
@@ -113,7 +113,7 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
                 &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
             )
             .expect("read selected row at hub")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("selected edge-authored row".to_string())]],
         "the ordinary push-only path carries the edge-authored selected row to the hub"
     );
@@ -143,7 +143,7 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
                 &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
             )
             .expect("read selected row at hub after purge")
-            .rows
+            .rows()
             .is_empty(),
         "public standalone PURGE removes the selected lineage at the hub"
     );
@@ -154,7 +154,7 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
                 &HashMap::from([("id".to_string(), Value::Uuid(sentinel_id))]),
             )
             .expect("read unpurged sentinel at hub")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("hub-only unpurged sentinel".to_string())]],
         "the public purge leaves the unrelated hub-authored sentinel unpurged"
     );
@@ -177,7 +177,7 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
             &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
         )
         .expect("read selected row at edge before purge delivery")
-        .rows,
+        .rows(),
         vec![vec![Value::Text("selected edge-authored row".to_string())]],
         "ordinary push leaves the selected row present until the authoritative purge is pulled"
     );
@@ -191,7 +191,7 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
             &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
         )
         .expect("read selected row at edge after purge delivery")
-        .rows
+        .rows()
         .is_empty(),
         "authoritative delivery removes exactly the selected lineage from the edge"
     );
@@ -213,7 +213,7 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
             &HashMap::from([("id".to_string(), Value::Uuid(sentinel_id))]),
         )
         .expect("read hub-only sentinel at edge after purge delivery")
-        .rows
+        .rows()
         .is_empty(),
         "the authoritative purge arrives without pulling the ordinary hub-only row downward"
     );

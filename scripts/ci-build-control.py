@@ -168,7 +168,7 @@ def smoke(archive):
                 print(output)
                 if flag == '--version':
                     versions[binary] = output
-        output = command([str(Path(tmp, 'contextdb')), ':memory:', '--json'],
+        output = command([str(Path(tmp, 'contextdb')), str(Path(tmp, 'smoke.db')), '--write', '--json'],
                          input='SELECT 1 + 1;\n', env=clean)
         docs = [json.loads(line) for line in output.splitlines()]
         require(len(docs) == 1 and docs[0]['result']['rows'] == [{'expr': 2}], 'SQL smoke mismatch')

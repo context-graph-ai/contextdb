@@ -1,4 +1,11 @@
 #![allow(clippy::needless_update)] // Existing compatibility and test seam shape.
+#![cfg_attr(
+    not(feature = "iroh"),
+    expect(
+        dead_code,
+        reason = "Only the Iroh sync transport calls this; builds without that feature keep it for the shared wire, custody and blob types."
+    )
+)]
 use crate::error::SyncError;
 use contextdb_core::{
     CompositeForeignKey, Incarnation, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
@@ -149,6 +156,17 @@ pub enum WirePushError {
     ReplaysAcceptedDelete {
         table: String,
         key: Vec<(String, Value)>,
+    },
+    /// The hub's writer budget could not fund receiving this unit. Nothing
+    /// was applied; the unit stays pending at the sender and may be retried.
+    /// Additive variant, as above.
+    MemoryBudgetExceeded {
+        subsystem: String,
+        operation: String,
+        requested_bytes: u64,
+        available_bytes: u64,
+        budget_limit_bytes: u64,
+        hint: String,
     },
 }
 
@@ -578,6 +596,10 @@ pub struct WireApplyResult {
     pub applied_rows: usize,
     pub skipped_rows: usize,
     pub conflicts: Vec<WireConflict>,
+    /// The received unit's final acceptance position at this receiver.
+    /// A unit can contain several ordered replay positions but commits once;
+    /// interior positions are not committed snapshots. An identical retry
+    /// returns the original unit result rather than applying its effects again.
     pub new_lsn: Lsn,
 }
 
@@ -650,6 +672,139 @@ pub fn encode_for_version<T: Serialize>(
         payload,
     };
     rmp_serde::to_vec(&envelope).map_err(|e| SyncError::Serde(e.to_string()))
+}
+
+/// Count both MessagePack buffers without constructing either buffer. The
+/// payload stream is serialized as the same u8 sequence Envelope uses.
+fn serialized_size_for_version<T: Serialize>(
+    version: u8,
+    message_type: &MessageType,
+    message: &T,
+) -> Result<(usize, usize), SyncError> {
+    #[derive(Default)]
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("serialized request size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Payload<'a, T> {
+        message: &'a T,
+        bytes: usize,
+    }
+    impl<T: Serialize> Serialize for Payload<'_, T> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            struct SequenceWriter<'a, Q: SerializeSeq>(&'a mut Q);
+            impl<Q: SerializeSeq> std::io::Write for SequenceWriter<'_, Q> {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    for byte in bytes {
+                        self.0
+                            .serialize_element(byte)
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    }
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut sequence = serializer.serialize_seq(Some(self.bytes))?;
+            self.message
+                .serialize(&mut rmp_serde::Serializer::new(SequenceWriter(
+                    &mut sequence,
+                )))
+                .map_err(serde::ser::Error::custom)?;
+            sequence.end()
+        }
+    }
+    #[derive(Serialize)]
+    struct BorrowedEnvelope<'a, T> {
+        version: u8,
+        message_type: &'a MessageType,
+        payload: Payload<'a, T>,
+    }
+    let mut payload = Counter::default();
+    message
+        .serialize(&mut rmp_serde::Serializer::new(&mut payload))
+        .map_err(|error| SyncError::Serde(error.to_string()))?;
+    let mut envelope = Counter::default();
+    BorrowedEnvelope {
+        version,
+        message_type,
+        payload: Payload {
+            message,
+            bytes: payload.0,
+        },
+    }
+    .serialize(&mut rmp_serde::Serializer::new(&mut envelope))
+    .map_err(|error| SyncError::Serde(error.to_string()))?;
+    Ok((payload.0, envelope.0))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn encode_for_version_with_read_owner<T: Serialize>(
+    version: u8,
+    message_type: MessageType,
+    message: &T,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+) -> contextdb_core::Result<(Vec<u8>, contextdb_core::read_memory::ReadCredit)> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    if !supports_protocol_version(version) {
+        return Err(contextdb_core::Error::SyncError(
+            (SyncError::ProtocolVersionMismatch {
+                received: version,
+                oldest_supported: OLDEST_SUPPORTED_PROTOCOL_VERSION,
+                newest_supported: PROTOCOL_VERSION,
+            }
+            .to_string())
+            .into(),
+        ));
+    }
+    let (payload_bytes, envelope_bytes) =
+        serialized_size_for_version(version, &message_type, message)
+            .map_err(|error| contextdb_core::Error::SyncError((error.to_string()).into()))?;
+    let payload_credit = contextdb_core::read_memory::ReadCredit::try_new(
+        read_memory.clone(),
+        payload_bytes,
+        "sync_push",
+        "encode_payload",
+        "Reduce the request or raise the executing session's memory limit.",
+    )?;
+    let envelope_credit = contextdb_core::read_memory::ReadCredit::try_new(
+        read_memory,
+        envelope_bytes,
+        "sync_push",
+        "encode_envelope",
+        "Reduce the request or raise the executing session's memory limit.",
+    )?;
+    let mut payload = Vec::with_capacity(payload_bytes);
+    message
+        .serialize(&mut rmp_serde::Serializer::new(&mut payload))
+        .map_err(|error| contextdb_core::Error::SyncError((error.to_string()).into()))?;
+    let envelope = Envelope {
+        version,
+        message_type,
+        payload,
+    };
+    let mut encoded = Vec::with_capacity(envelope_bytes);
+    envelope
+        .serialize(&mut rmp_serde::Serializer::new(&mut encoded))
+        .map_err(|error| contextdb_core::Error::SyncError((error.to_string()).into()))?;
+    drop(envelope);
+    drop(payload_credit);
+    Ok((encoded, envelope_credit))
 }
 
 /// Encode an additive custody payload as a named MessagePack map inside the
@@ -1150,7 +1305,7 @@ pub(crate) fn received_ddl_error(error: SyncError) -> contextdb_core::Error {
                 reason: "the declaration arrived without its author's signature".to_string(),
             }
         }
-        error => contextdb_core::Error::SyncError(error.to_string()),
+        error => contextdb_core::Error::SyncError((error.to_string()).into()),
     }
 }
 
@@ -1808,6 +1963,8 @@ custody_request!(FetchDeliveryOutcomesRequest {
 #[serde(deny_unknown_fields)]
 pub struct DeliveryOutcomePage {
     pub outcomes: Vec<WireDeliveryOutcome>,
+    /// More outcomes follow the last one in this page; ask again with its cursor.
+    pub more: bool,
 }
 custody_response!(FetchDeliveryOutcomesResponse, DeliveryOutcomePage);
 
@@ -1878,6 +2035,22 @@ pub fn wire_changeset_with_arrivals_lineages_and_ddl_provenance(
 ) -> WireChangeSet {
     let mut wire: WireChangeSet = changes.into();
     wire.ddl_provenance = ddl_provenance;
+    #[cfg(feature = "test-seams")]
+    crate::outbound_ddl_test_seams::note_sent(
+        wire.ddl.len(),
+        wire.ddl_provenance
+            .iter()
+            .map(|provenance| crate::outbound_ddl_test_seams::SentDdl {
+                source: (provenance.source_ddl_lsn, provenance.ordinal),
+                author: provenance.author.as_ref().map(|author| {
+                    (
+                        author.node_id.clone(),
+                        author.source_ddl_lsn,
+                        author.ordinal,
+                    )
+                }),
+            }),
+    );
     for row in &mut wire.rows {
         if let Some(arrival) = arrivals.get(&row.lsn) {
             row.arrival = *arrival;

@@ -76,11 +76,10 @@ async fn start_hub(root: &Path, name: &str, tenant: &str) -> Hub {
     let ticket = endpoint.ticket();
     let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open the hub store"));
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct the authenticated sync endpoint"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -96,6 +95,10 @@ async fn start_hub(root: &Path, name: &str, tenant: &str) -> Hub {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn declare(db: &Database, table: &str, clauses: &str) -> contextdb_core::Result<()> {
     db.execute(
         &format!("DECLARE TENANT TABLE POLICY {table} {clauses}"),
@@ -110,6 +113,7 @@ fn edge_client(db: &Arc<Database>, ticket: &str, identity_path: &Path, tenant: &
         &peer_dial_spec(ticket, identity_path),
         TenantId::from(tenant),
     )
+    .expect("construct the authenticated sync endpoint")
 }
 
 fn expectation(pairs: &[(&str, &str)]) -> ApplicationTablePolicyExpectation {
@@ -129,11 +133,11 @@ fn shown(db: &Database, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
         .execute(sql, &p())
         .unwrap_or_else(|err| panic!("{sql} must answer: {err}"));
     let rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| row.iter().map(|cell| format!("{cell:?}")).collect())
         .collect();
-    (result.columns.clone(), rows)
+    (result.columns().to_vec(), rows)
 }
 
 fn named_cell<'a>(columns: &[String], row: &'a [Value], name: &str) -> &'a Value {
@@ -190,6 +194,10 @@ struct AdversarialBoundTablePull {
 }
 
 impl AdversarialBoundTablePull {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn alter_received_pull(&self, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
         let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
         // Adapter: the ordinary route may carry dependency-complete
@@ -340,6 +348,10 @@ impl ClientTransport for AdversarialBoundTablePull {
 
 // The hub declares durable table policy; an edge must be refused.
 #[tokio::test]
+#[expect(
+    clippy::needless_borrow,
+    reason = "The test keeps explicit borrows of query-result accessors while inspecting the retained answer."
+)]
 async fn a_declaration_persists_across_restart_and_restore_renders_with_version_and_digest_and_is_refused_on_an_edge()
  {
     let _clock = Wallclock::test_clock_guard(|| T0);
@@ -397,8 +409,8 @@ async fn a_declaration_persists_across_restart_and_restore_renders_with_version_
         .expect("the declared root policy answers");
     assert_eq!(
         named_cell(
-            &raw_root_policy.columns,
-            &raw_root_policy.rows[0],
+            &raw_root_policy.columns(),
+            &raw_root_policy.rows()[0],
             "manifest_tables",
         ),
         &Value::Json(serde_json::json!(["record_parts"])),
@@ -407,8 +419,8 @@ async fn a_declaration_persists_across_restart_and_restore_renders_with_version_
     );
     assert_eq!(
         named_cell(
-            &raw_root_policy.columns,
-            &raw_root_policy.rows[0],
+            &raw_root_policy.columns(),
+            &raw_root_policy.rows()[0],
             "edge_discard"
         ),
         &Value::Text("after_outcome".into()),
@@ -418,8 +430,8 @@ async fn a_declaration_persists_across_restart_and_restore_renders_with_version_
 
     assert_eq!(
         named_cell(
-            &raw_root_policy.columns,
-            &raw_root_policy.rows[0],
+            &raw_root_policy.columns(),
+            &raw_root_policy.rows()[0],
             "tenant_id"
         ),
         &Value::Text(tenant.into()),
@@ -746,7 +758,8 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
             TenantId::from(tenant),
             foreign_node_id.clone(),
             foreign_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let foreign_stop = Arc::new(AtomicBool::new(false));
     let foreign_task = tokio::spawn({
@@ -791,7 +804,8 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
         foreign_broker.client_as(&foreign_edge_identity.node_id()),
         TenantId::from(tenant),
         foreign_edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     assert!(
         foreign_broker.recorded_exchanges().is_empty(),
         "premise: no foreign exchange occurred before the refused bind"
@@ -884,10 +898,11 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
     let edge = Arc::new(Database::open(root.path().join("edge.db")).expect("open the edge store"));
     let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
     within(
-        client.__seed_application_table_policy_binding_for_test(expectation(&[
-            ("records", ROOT_CLAUSES),
-            ("record_parts", MEMBER_CLAUSES),
-        ])),
+        client.__seed_application_table_policy_binding_for_test(
+            expectation(&[("records", ROOT_CLAUSES), ("record_parts", MEMBER_CLAUSES)]),
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
     )
     .await
     .expect("the edge binds both tables");
@@ -996,7 +1011,8 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
             TenantId::from(tenant),
             hub.node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let routed_stop = Arc::new(AtomicBool::new(false));
     let routed_task = tokio::spawn({
@@ -1029,7 +1045,8 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
         }),
         TenantId::from(tenant),
         routed_edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let applied = within(adversarial_client.pull_default())
         .await
         .expect("a declaration refusal is per table, not a whole-batch failure");
@@ -1070,7 +1087,7 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
     assert_eq!(
         edge.execute("SELECT id FROM unrelated_notes", &p())
             .expect("the unbound table still answers")
-            .rows
+            .rows()
             .len(),
         1,
         "the unrelated row from the same received batch was committed"
@@ -1194,7 +1211,7 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
         hub.db
             .execute("SELECT body FROM notes", &p())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the held row did not install"
     );
@@ -1222,14 +1239,17 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
         Some(ConflictPolicy::KEEP_LATEST)
     );
     assert_eq!(
-        hub.db.execute("SELECT body FROM memos", &p()).unwrap().rows,
+        hub.db
+            .execute("SELECT body FROM memos", &p())
+            .unwrap()
+            .rows(),
         vec![vec![Value::Text("sender memo".into())]]
     );
     assert_eq!(
         relay_db
             .execute("SELECT body FROM memos", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("sender memo".into())]]
     );
     within(relay.shutdown()).await;
@@ -1344,7 +1364,7 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
         hub.db
             .execute("SELECT body FROM records", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("legitimate".into())]]
     );
     assert_eq!(
@@ -1370,7 +1390,9 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
 /// The receiver's schema as its durable DDL log holds it: every statement,
 /// with the commit position it installed at.
 fn hub_schema(db: &Database) -> Vec<(contextdb_core::Lsn, DdlChange)> {
-    let log = db.changes_since(contextdb_core::Lsn(0));
+    let log = db
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
     log.ddl_lsn.into_iter().zip(log.ddl).collect()
 }
 
@@ -1536,7 +1558,7 @@ async fn an_identical_restatement_of_a_declared_local_policy_installs_with_the_r
         hub.db
             .execute("SELECT body FROM sidecar", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("after the schema".into())]],
         "the sibling statement installed with its transaction and took its row"
     );
@@ -1702,7 +1724,7 @@ async fn a_differing_restatement_refuses_its_whole_transaction_leaving_no_schema
         hub.db
             .execute("SELECT body FROM unrelated", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("keeps moving".into())]],
         "an unrelated unit on the same connection installed"
     );
@@ -1715,7 +1737,7 @@ async fn a_differing_restatement_refuses_its_whole_transaction_leaving_no_schema
         hub.db
             .execute("SELECT body FROM notes", &p())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the held row is not installed before correction"
     );
@@ -1748,7 +1770,7 @@ async fn a_differing_restatement_refuses_its_whole_transaction_leaving_no_schema
         hub.db
             .execute("SELECT id, body FROM notes", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Uuid(held_note_id),
             Value::Text("waits behind the refusal".into()),
@@ -1763,6 +1785,10 @@ async fn a_differing_restatement_refuses_its_whole_transaction_leaving_no_schema
 // Conditions 2 and 4 through the pull door: many authored transactions in one
 // transport batch.
 #[tokio::test]
+#[expect(
+    clippy::useless_vec,
+    reason = "The expected rows retain their explicit Vec representation in this comparison."
+)]
 async fn a_refused_transaction_in_a_pulled_batch_leaves_its_unrelated_siblings_installing_and_holds_its_tables()
  {
     let _clock = Wallclock::test_clock_guard(|| T0);
@@ -1843,17 +1869,19 @@ async fn a_refused_transaction_in_a_pulled_batch_leaves_its_unrelated_siblings_i
         declared_before,
         "the receiver's declared policy stands"
     );
-    let mut memos = edge
+    let memos_answer = edge
         .execute("SELECT body FROM memos", &p())
-        .expect("the unrelated sibling transaction installed")
-        .rows;
+        .expect("the unrelated sibling transaction installed");
+    let mut memos = memos_answer.rows().iter().collect::<Vec<_>>();
     memos.sort_by_key(|row| format!("{row:?}"));
     assert_eq!(
         memos,
         vec![
             vec![Value::Text("first memo".into())],
             vec![Value::Text("second memo".into())],
-        ],
+        ]
+        .iter()
+        .collect::<Vec<_>>(),
         "every unrelated unit in the batch installed, including the one after the held unit"
     );
 
@@ -2008,13 +2036,13 @@ async fn a_refused_alteration_of_an_existing_table_holds_its_later_pages_across_
     assert!(
         edge.execute("SELECT body FROM notes", &p())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the row that depends on the refused alteration stays unapplied"
     );
     assert_eq!(columns(&edge), vec!["id", "body"]);
     assert_eq!(
-        edge.execute("SELECT body FROM memos", &p()).unwrap().rows,
+        edge.execute("SELECT body FROM memos", &p()).unwrap().rows(),
         vec![vec![Value::Text("unrelated".into())]],
         "the unrelated unit installs"
     );

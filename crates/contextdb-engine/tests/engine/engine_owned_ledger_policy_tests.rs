@@ -119,6 +119,10 @@ fn work_inputs_columns() -> Vec<(String, String)> {
     ]
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply_single_ddl(db: &Database, ddl: DdlChange) -> contextdb_core::Result<()> {
     let changes = ChangeSet {
         rows: Vec::new(),
@@ -1776,7 +1780,7 @@ fn schema_and_show_never_disagree_after_a_refused_alter_or_wire_attempt_on_a_hub
 
     let result = db.execute("SHOW SYNC_CONFLICT_POLICY", &p()).expect("show");
     let rows: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(t) => t.clone(),
@@ -2294,7 +2298,8 @@ fn two_jobs_sharing_a_work_class_both_insert_on_the_canonical_shape() {
         .execute(INSERT_WORK_JOB_SQL, &insert_job_params("j1", "shared"))
         .expect("first job must insert");
     assert_eq!(
-        insert1.rows_affected, 1,
+        insert1.rows_affected(),
+        1,
         "first job with work_class=shared must insert"
     );
 
@@ -2302,7 +2307,8 @@ fn two_jobs_sharing_a_work_class_both_insert_on_the_canonical_shape() {
         .execute(INSERT_WORK_JOB_SQL, &insert_job_params("j2", "shared"))
         .expect("second job must insert");
     assert_eq!(
-        insert2.rows_affected, 1,
+        insert2.rows_affected(),
+        1,
         "second job sharing the SAME work_class as the first must ALSO insert -- work_class \
          is not unique on the canonical work_jobs shape; a silent rows_affected:0 here is the \
          live-repro failure a hidden UNIQUE constraint on work_class causes"
@@ -3528,6 +3534,7 @@ fn arriving_alter_table_with_a_foreign_key_on_work_jobs_refuses() {
             child_column: "work_class".to_string(),
             parent_table: "operators".to_string(),
             parent_column: "id".to_string(),
+            follows_parent_purge: false,
         }],
         composite_foreign_keys: Vec::new(),
         composite_unique: Vec::new(),
@@ -3588,6 +3595,7 @@ fn arriving_fresh_create_table_of_work_jobs_with_a_foreign_key_reference_already
             child_column: "work_class".to_string(),
             parent_table: "operators".to_string(),
             parent_column: "id".to_string(),
+            follows_parent_purge: false,
         }],
         composite_foreign_keys: Vec::new(),
         composite_unique: Vec::new(),

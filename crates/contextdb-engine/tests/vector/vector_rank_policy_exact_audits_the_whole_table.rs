@@ -141,7 +141,7 @@ fn passage_table_with_a_buried_best_scoring_row() -> Database {
     db.execute(
         "CREATE TABLE passages (
             id UUID PRIMARY KEY,
-            embedding VECTOR(2) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 1500) RANK_POLICY (
+            embedding VECTOR(2) SEARCH_MODE INDEXED IVF (PROBES = 1500) RANK_POLICY (
                 JOIN passage_outcomes ON passage_id,
                 FORMULA 'coalesce({weight}, 0.0)',
                 SORT_KEY effective_confidence
@@ -189,12 +189,12 @@ fn ranked_query_params() -> HashMap<String, Value> {
 
 fn result_ids(result: &contextdb_engine::QueryResult) -> Vec<Uuid> {
     let id_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("the projection contains id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_idx) {
             Some(Value::Uuid(id)) => *id,

@@ -59,7 +59,7 @@ fn constant_parameter_negation_of_i64_min_returns_the_standard_sql_error() {
     assert!(
         db.execute("SELECT id FROM numbers", &params())
             .expect("connection remains usable")
-            .rows
+            .rows()
             .is_empty(),
         "a rejected constant expression must not partially insert a row"
     );
@@ -76,7 +76,7 @@ fn update_and_conflict_assignment_negation_preserve_the_old_value() {
     assert_eq!(
         db.execute("SELECT n FROM numbers WHERE id = 1", &params())
             .expect("connection remains usable")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(i64::MIN)]],
         "either rejected assignment must leave the existing row unchanged"
     );

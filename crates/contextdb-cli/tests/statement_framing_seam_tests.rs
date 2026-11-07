@@ -71,8 +71,15 @@ use std::sync::Arc;
 /// A writing session over a throwaway in-memory database — the mode
 /// `:memory:` always has, and the one these framing fixtures need.
 fn writing_session(database: &Arc<Database>) -> Session {
-    Session::writing(Arc::clone(database), ReadLimits::default())
-        .expect("a live database opens its own bounded read view")
+    Session::writing(
+        Arc::clone(database),
+        ReadLimits::default(),
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            ReadLimits::default().memory,
+        )
+        .expect("the declared read limit is admitted"),
+    )
+    .expect("a live database opens its own bounded read view")
 }
 
 // ============================================================================
@@ -341,7 +348,7 @@ fn scripted_and_interactive_drives_of_feed_line_leave_identical_database_state()
         .expect("interactive drive: final query");
 
     assert_eq!(
-        scripted_result.rows.len(),
+        scripted_result.rows().len(),
         3,
         "all three INSERTs (one multi-line, two on one physical line) must have run"
     );
@@ -421,9 +428,9 @@ fn interactive_readline_preprocessing_corrupts_a_multiline_quoted_value() {
             &HashMap::new(),
         )
         .expect("query the stored value");
-    assert_eq!(result.rows.len(), 1, "the INSERT must have run");
+    assert_eq!(result.rows().len(), 1, "the INSERT must have run");
 
-    let stored = match &result.rows[0][0] {
+    let stored = match &result.rows()[0][0] {
         contextdb_core::Value::Text(t) => t.clone(),
         other => panic!("expected a text value, got {other:?}"),
     };

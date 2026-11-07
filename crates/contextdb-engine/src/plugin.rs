@@ -29,20 +29,40 @@ pub enum PluginHealth {
 
 /// Lifecycle hooks for the database engine.
 pub trait DatabasePlugin: Send + Sync {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pre_commit(&self, _ws: &WriteSet, _source: CommitSource) -> Result<()> {
         Ok(())
     }
     fn post_commit(&self, _ws: &WriteSet, _source: CommitSource) {}
     fn commit_failed(&self, _ws: &WriteSet, _source: CommitSource, _error: &Error) {}
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn on_open(&self) -> Result<()> {
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn on_close(&self) -> Result<()> {
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn on_ddl(&self, _change: &DdlChange) -> Result<()> {
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn on_query(&self, _sql: &str) -> Result<()> {
         Ok(())
     }
@@ -53,9 +73,17 @@ pub trait DatabasePlugin: Send + Sync {
     fn describe(&self) -> serde_json::Value {
         serde_json::json!({})
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn on_sync_push(&self, _changeset: &mut ChangeSet) -> Result<()> {
         Ok(())
     }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn on_sync_pull(&self, _changeset: &mut ChangeSet) -> Result<()> {
         Ok(())
     }

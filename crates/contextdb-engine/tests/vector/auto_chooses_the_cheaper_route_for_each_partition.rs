@@ -82,7 +82,9 @@ fn fixture() -> Database {
 }
 
 fn partitioned_fixture(partitions: usize, rows_per_partition: usize, table: &str) -> Database {
-    let db = Database::open_memory();
+    let mut options = contextdb_engine::DatabaseOpenOptions::default();
+    options.owner_reads.limits.limits.memory = limits().memory;
+    let db = Database::open_with_options(":memory:", options).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         &format!(
@@ -120,11 +122,26 @@ fn partitioned_fixture(partitions: usize, rows_per_partition: usize, table: &str
     for _ in 0..2048 {
         db.run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = db
             .vector_store_for_test()
-            .partition_infos(&VectorIndexRef::new(table, "embedding"))
+            .partition_infos(
+                &VectorIndexRef::new(table, "embedding"),
+                &mut partition_observation_owner_1,
+            )
             .expect("inspect partition readiness");
-        if ready.len() == partitions && ready.iter().all(|partition| partition.graph_available) {
+        if ready.len() == partitions
+            && ready.iter().all(|partition| {
+                db.__debug_vector_partition_indexed_for_test(
+                    partition.partition.index.clone(),
+                    partition.partition.partition_key.clone(),
+                )
+            })
+        {
             return db;
         }
     }
@@ -181,14 +198,14 @@ fn run_over(
     let executed = bounded::execute(db, &request).expect("the bounded route arm succeeds");
     let route = executed
         .result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .and_then(|search| search.route);
     Answered {
         rows: executed
             .result
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -201,6 +218,7 @@ fn run_over(
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn in_memory_auto_accounts_for_comparison_and_admission_costs() {
     let db = fixture();
     let auto = run(&db, BUCKETS, None, 0);
@@ -224,6 +242,7 @@ fn in_memory_auto_accounts_for_comparison_and_admission_costs() {
 }
 
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn auto_never_costs_more_than_the_route_a_caller_could_have_asked_for() {
     let db = fixture();
     let mut failures = Vec::new();
@@ -284,6 +303,7 @@ fn auto_never_costs_more_than_the_route_a_caller_could_have_asked_for() {
 /// The same rows cost the same to search however many partitions they are split
 /// across: a statement asks for ten rows once, not ten per partition.
 #[test]
+#[ignore = "the vector index route is switched off in this release"]
 fn the_automatic_route_costs_the_same_however_the_scope_is_split() {
     const TOTAL: usize = 2_048;
     let mut failures = Vec::new();

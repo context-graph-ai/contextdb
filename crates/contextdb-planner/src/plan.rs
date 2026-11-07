@@ -1,10 +1,18 @@
 use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
-    AlterAction, ColumnDef, CompositeForeignKey, Cte, Expr, OnConflict, RetainOption,
-    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef, VectorSearchMode,
+    AlterAction, ColumnDef, ColumnRef, CompositeForeignKey, Cte, Expr, OnConflict, RetainOption,
+    RowNumberWindow, SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef,
+    StorageCompactionSetting, VectorSearchMode, WindowBindingId,
 };
 
+/// ROW_NUMBER produces SQL INTEGER values represented as Value::Int64.
+pub const ROW_NUMBER_OUTPUT_TYPE: contextdb_core::ColumnType = contextdb_core::ColumnType::Integer;
+
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public statement and plan types are matched by value across crates; boxing a variant would change that public layout."
+)]
 pub enum PhysicalPlan {
     CreateTable(CreateTablePlan),
     AlterTable(AlterTablePlan),
@@ -42,24 +50,30 @@ pub enum PhysicalPlan {
         candidates: Option<Box<PhysicalPlan>>,
         sort_key: Option<String>,
         search_mode: Option<VectorSearchMode>,
+        query_policy: Option<contextdb_parser::ast::VectorSearchOverride>,
         /// Columns whose row values the outer SELECT actually reads. `None`
         /// means `SELECT *`; an empty vector means the search answer needs no
         /// stored row value beyond its synthetic row id and score.
         materialized_columns: Option<Vec<String>>,
     },
-    HnswSearch {
-        table: String,
-        column: String,
-        query_expr: Expr,
-        k: u64,
-        candidates: Option<Box<PhysicalPlan>>,
-        sort_key: Option<String>,
-        search_mode: Option<VectorSearchMode>,
-        materialized_columns: Option<Vec<String>>,
+    /// Assigns one-based INT64 rank after its input predicates, before projection.
+    /// Runtime binds columns against input schema and selects the actual Sort/Index route.
+    WindowRank {
+        input: Box<PhysicalPlan>,
+        window: RowNumberWindow,
+        binding: WindowBindingId,
     },
     Filter {
         input: Box<PhysicalPlan>,
         predicate: Expr,
+    },
+    /// `COUNT(*)` per group of `group_by` over its input `Scan`, projected as
+    /// `columns` (grouped columns and `COUNT(*)` items only). Runtime decides
+    /// whether a declared maintained count answers it or refuses it.
+    GroupedCount {
+        input: Box<PhysicalPlan>,
+        group_by: Vec<ColumnRef>,
+        columns: Vec<ProjectColumn>,
     },
     Project {
         input: Box<PhysicalPlan>,
@@ -100,10 +114,13 @@ pub enum PhysicalPlan {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
+    ShowContentSize,
     SetMaintenancePollInterval(u64),
     ShowMaintenancePollInterval,
     SetVectorServingCache(Option<u64>),
     ShowVectorServingCache,
+    SetStorageCompaction(StorageCompactionSetting),
+    ShowStorageCompaction,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicyPlan),
@@ -173,22 +190,6 @@ impl PhysicalPlan {
                     query_source_suffix(query_expr)
                 )
             }
-            PhysicalPlan::HnswSearch {
-                table,
-                column,
-                query_expr,
-                k,
-                ..
-            } => {
-                format!(
-                    "HNSWSearch(table={}, column={}, k={}{}{})",
-                    table,
-                    column,
-                    k,
-                    query_source_prefix(query_expr),
-                    query_source_suffix(query_expr)
-                )
-            }
             PhysicalPlan::Scan { table, .. } => format!("Scan(table={})", table),
             PhysicalPlan::AlterTable(p) => format!("AlterTable(table={})", p.table),
             PhysicalPlan::Insert(p) => format!("Insert(table={})", p.table),
@@ -201,8 +202,29 @@ impl PhysicalPlan {
                 .map(Self::explain)
                 .collect::<Vec<_>>()
                 .join(" -> "),
+            PhysicalPlan::WindowRank { input, window, .. } => {
+                format!(
+                    "WindowRank(partitions={}, order_keys={}) -> {}",
+                    window.partition_by.len(),
+                    window.order_by.len(),
+                    input.explain()
+                )
+            }
             PhysicalPlan::Project { input, .. } => {
                 format!("Project -> {}", input.explain())
+            }
+            PhysicalPlan::GroupedCount {
+                input, group_by, ..
+            } => {
+                format!(
+                    "GroupedCount(columns={}) -> {}",
+                    group_by
+                        .iter()
+                        .map(|column| column.column.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    input.explain()
+                )
             }
             _ => format!("{:?}", self),
         }

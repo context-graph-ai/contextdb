@@ -51,7 +51,7 @@ fn schema_ddl_and_rows_in_one_transaction_are_still_refused() {
     assert!(
         db.execute("SELECT * FROM existing_rows", &empty())
             .expect("inspect rows after DDL-first rollback")
-            .rows
+            .rows()
             .is_empty(),
         "rollback after the DDL-first refusal must not publish the rejected row"
     );
@@ -81,7 +81,7 @@ fn schema_ddl_and_rows_in_one_transaction_are_still_refused() {
     assert!(
         db.execute("SELECT * FROM existing_rows", &empty())
             .expect("inspect rows after DML-first rollback")
-            .rows
+            .rows()
             .is_empty(),
         "rollback after the DML-first refusal must not publish the staged row"
     );
@@ -114,8 +114,11 @@ fn every_row_write_is_refused(ddl: &str) {
             let before_rows = db
                 .execute("SELECT * FROM mixed_rows ORDER BY id", &empty())
                 .unwrap()
-                .rows;
-            let before_changes = db.changes_since(contextdb_core::Lsn(0));
+                .rows()
+                .to_vec();
+            let before_changes = db
+                .changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes");
             let tx = db.begin().unwrap();
             let (first, second) = if ddl_first { (ddl, dml) } else { (dml, ddl) };
             db.execute_in_tx(tx, first, &empty()).unwrap_or_else(|error| panic!("newly admitted DDL prerequisite must execute, rather than manufacture a mixed-write rejection: {first}: {error}"));
@@ -135,15 +138,19 @@ fn every_row_write_is_refused(ddl: &str) {
             assert_eq!(
                 db.execute("SELECT * FROM mixed_rows ORDER BY id", &empty())
                     .unwrap()
-                    .rows,
+                    .rows(),
                 before_rows
             );
             assert_eq!(
-                db.changes_since(contextdb_core::Lsn(0)).ddl,
+                db.changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes")
+                    .ddl,
                 before_changes.ddl
             );
             assert_eq!(
-                db.changes_since(contextdb_core::Lsn(0)).max_lsn(),
+                db.changes_since(contextdb_core::Lsn(0))
+                    .expect("read the declared changes")
+                    .max_lsn(),
                 before_changes.max_lsn()
             );
         }

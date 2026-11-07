@@ -86,15 +86,15 @@ fn request(
 }
 
 fn column_index(page: &CursorPage, name: &str) -> usize {
-    page.columns
+    page.columns()
         .iter()
         .position(|column| column == name || column.ends_with(&format!(".{name}")))
-        .unwrap_or_else(|| panic!("cursor page contains {name}, got {:?}", page.columns))
+        .unwrap_or_else(|| panic!("cursor page contains {name}, got {:?}", page.columns()))
 }
 
 fn page_ids(page: &CursorPage) -> Vec<i64> {
     let id = column_index(page, "id");
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row[id] {
             Value::Int64(value) => value,
@@ -105,7 +105,7 @@ fn page_ids(page: &CursorPage) -> Vec<i64> {
 
 fn page_targets(page: &CursorPage) -> Vec<Uuid> {
     let target = column_index(page, "t");
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row[target] {
             Value::Uuid(value) => value,
@@ -121,12 +121,12 @@ fn committed_ids(db: &Database, table: &str) -> Vec<i64> {
         .execute(&format!("SELECT id FROM {table}"), &HashMap::new())
         .unwrap_or_else(|error| panic!("uncapped read of {table}: {error}"));
     let id = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id")
         .expect("uncapped read returns id");
     let mut ids = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[id] {
             Value::Int64(value) => value,
@@ -180,7 +180,7 @@ fn drain<T>(
                 )
             });
         collected.extend(read_page(&fetched.page));
-        has_more = fetched.page.has_more;
+        has_more = fetched.page.has_more();
     }
     collected
 }
@@ -229,7 +229,7 @@ fn an_ordered_cursor_paging_downward_survives_an_insert_into_the_key_it_is_readi
     )
     .expect("open an ordered cursor over the declared index");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
     let mut emitted = page_ids(&opened.first_page);
@@ -251,7 +251,7 @@ fn an_ordered_cursor_paging_downward_survives_an_insert_into_the_key_it_is_readi
     emitted.extend(drain(
         &mut opened.cursor,
         1,
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         page_ids,
         journey,
     ));
@@ -326,7 +326,7 @@ fn an_ordered_cursor_paging_upward_survives_an_update_that_keeps_the_key_it_is_r
     )
     .expect("open an ordered cursor over the declared index");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
     let mut emitted = page_ids(&opened.first_page);
@@ -351,12 +351,12 @@ fn an_ordered_cursor_paging_upward_survives_an_update_that_keeps_the_key_it_is_r
         )
         .expect("uncapped read of the updated row");
     assert_eq!(
-        updated_buckets.rows.len(),
+        updated_buckets.rows().len(),
         1,
         "{journey}: the concurrent update must really be committed before the cursor is judged"
     );
     assert_eq!(
-        updated_buckets.rows[0][0],
+        updated_buckets.rows()[0][0],
         Value::Int64(99),
         "{journey}: the concurrent update must really be committed before the cursor is judged"
     );
@@ -364,7 +364,7 @@ fn an_ordered_cursor_paging_upward_survives_an_update_that_keeps_the_key_it_is_r
     emitted.extend(drain(
         &mut opened.cursor,
         1,
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         page_ids,
         journey,
     ));
@@ -455,7 +455,7 @@ fn a_scanning_cursor_emits_every_visible_row_when_retention_reclaims_older_versi
     )
     .expect("open a scanning cursor over the retained table");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
     let mut emitted = page_ids(&opened.first_page);
@@ -465,7 +465,7 @@ fn a_scanning_cursor_emits_every_visible_row_when_retention_reclaims_older_versi
         .expect("page the scanning cursor a second time");
     emitted.extend(page_ids(&second.page));
     assert!(
-        second.page.has_more,
+        second.page.has_more(),
         "{journey}: the cursor must still be mid-table when retention runs"
     );
 
@@ -488,7 +488,7 @@ fn a_scanning_cursor_emits_every_visible_row_when_retention_reclaims_older_versi
     emitted.extend(drain(
         &mut opened.cursor,
         2,
-        second.page.has_more,
+        second.page.has_more(),
         page_ids,
         journey,
     ));
@@ -572,7 +572,7 @@ fn a_graph_edge_cursor_emits_every_surviving_edge_when_retention_reclaims_nodes(
     )
     .expect("open a bounded cursor over the whole edge set");
     assert!(
-        opened.first_page.has_more,
+        opened.first_page.has_more(),
         "{journey}: the fixture must leave the cursor open past its first page"
     );
     let mut emitted = page_targets(&opened.first_page);
@@ -582,7 +582,7 @@ fn a_graph_edge_cursor_emits_every_surviving_edge_when_retention_reclaims_nodes(
         .expect("page the graph cursor a second time");
     emitted.extend(page_targets(&second.page));
     assert!(
-        second.page.has_more,
+        second.page.has_more(),
         "{journey}: the cursor must still be mid-adjacency when retention runs"
     );
 
@@ -601,7 +601,7 @@ fn a_graph_edge_cursor_emits_every_surviving_edge_when_retention_reclaims_nodes(
     emitted.extend(drain(
         &mut opened.cursor,
         2,
-        second.page.has_more,
+        second.page.has_more(),
         page_targets,
         journey,
     ));

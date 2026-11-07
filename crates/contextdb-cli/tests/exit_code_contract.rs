@@ -50,7 +50,9 @@ fn run_cli_at(
 }
 
 fn run_cli(extra_args: &[&str], stdin_sql: &str) -> (Option<i32>, String, String) {
-    run_cli_at(":memory:", extra_args, stdin_sql)
+    let session_dir = tempfile::tempdir().expect("session directory");
+    let db_path = session_dir.path().join("session.db");
+    run_cli_at(&db_path.to_string_lossy(), extra_args, stdin_sql)
 }
 
 /// A fresh, unique temp directory under the OS temp root — built from the

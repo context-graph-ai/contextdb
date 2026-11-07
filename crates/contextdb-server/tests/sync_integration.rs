@@ -20,7 +20,8 @@ async fn start_server(db: Arc<Database>, fabric: &InProcessBroker, tenant: &str)
             contextdb_core::TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -47,6 +48,7 @@ fn sync_client(db: Arc<Database>, fabric: &InProcessBroker, tenant: &str) -> Syn
         contextdb_core::TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 async fn stop_server(server: RunningServer) {
@@ -1225,6 +1227,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo.bar"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "dot in tenant_id must panic");
 
@@ -1234,6 +1237,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo*"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "wildcard in tenant_id must panic");
 
@@ -1243,6 +1247,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo>"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "multi-level route wildcard must panic");
 
@@ -1252,6 +1257,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from(""),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "empty tenant_id must panic");
 
@@ -1261,6 +1267,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo bar"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "space in tenant_id must panic");
 
@@ -1271,6 +1278,7 @@ async fn a11_tenant_id_validation() {
             fabric.server_as("tenant-validation-hub"),
             contextdb_core::TenantId::from("foo.bar"),
         )
+        .expect("construct SyncServer fixture")
     }));
     assert!(r.is_err(), "SyncServer must also reject dots");
 
@@ -1279,17 +1287,20 @@ async fn a11_tenant_id_validation() {
         db.clone(),
         fabric.client_as("tenant-validation-edge"),
         contextdb_core::TenantId::from("valid-tenant"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     SyncClient::with_authenticated_transport_for_test(
         db.clone(),
         fabric.client_as("tenant-validation-edge"),
         contextdb_core::TenantId::from("tenant_123"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     SyncClient::with_authenticated_transport_for_test(
         db.clone(),
         fabric.client_as("tenant-validation-edge"),
         contextdb_core::TenantId::from("MyTenant"),
-    );
+    )
+    .expect("construct SyncClient fixture");
 }
 
 // A13: Pull pagination fetches all pages (exact test code from plan)
@@ -1521,14 +1532,18 @@ fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
     let result = edge_b
         .execute("SELECT x FROM t", &HashMap::new())
         .expect("SELECT must succeed");
-    assert_eq!(result.rows.len(), 1, "edge_b must have exactly 1 row in t");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "edge_b must have exactly 1 row in t"
+    );
     let x_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("result must have column \"x\"");
     assert_eq!(
-        result.rows[0][x_idx],
+        result.rows()[0][x_idx],
         Value::TxId(TxId(100)),
         "edge_b row cell must equal Value::TxId(TxId(100))"
     );
@@ -1620,7 +1635,8 @@ fn sync_apply_rejects_peer_txid_u64_max() {
     let count_rows = db
         .execute("SELECT COUNT(*) FROM t", &HashMap::new())
         .expect("SELECT COUNT(*) must succeed")
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(count_rows.len(), 1);
     assert_eq!(
         count_rows[0][0],
@@ -1710,7 +1726,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
     let count_rows = db
         .execute("SELECT COUNT(*) FROM t", &HashMap::new())
         .expect("SELECT COUNT(*) must succeed")
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(count_rows.len(), 1);
     assert_eq!(
         count_rows[0][0],
@@ -1731,7 +1748,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
     let first_rows = db
         .execute("SELECT x FROM t WHERE pk = $pk", &params_first)
         .expect("SELECT x WHERE pk = first must succeed")
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(
         first_rows.len(),
         1,
@@ -1748,7 +1766,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
     let last_rows = db
         .execute("SELECT x FROM t WHERE pk = $pk", &params_last)
         .expect("SELECT x WHERE pk = last must succeed")
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(
         last_rows.len(),
         1,

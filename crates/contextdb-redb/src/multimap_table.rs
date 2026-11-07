@@ -154,6 +154,11 @@ fn multimap_stats_helper(
 }
 
 // Verify all the checksums in the tree, including any Dynamic collection subtrees
+/// The value width a multimap leaf is checksummed with.
+pub(crate) fn multimap_leaf_value_width(value_width: Option<usize>) -> Option<usize> {
+    DynamicCollection::<()>::fixed_width_with(value_width)
+}
+
 pub(crate) fn verify_tree_and_subtree_checksums(
     root: Option<BtreeHeader>,
     key_size: Option<usize>,
@@ -1018,11 +1023,6 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
             mem,
             _value_type: Default::default(),
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        self.tree.print_debug(include_values)
     }
 
     /// Add the given value to the mapping of the key

@@ -1,3 +1,4 @@
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame};
 use contextdb_engine::local_transport::{
     ChannelFilesystemIdentity, LivenessEvidence, StaleChannelAction, StaleChannelEvidence,
     StaleFilesystemEvidence, StaleIdentityEvidence, decide_stale_channel_action,
@@ -29,8 +30,7 @@ use contextdb_core::read_contract::{
 #[cfg(unix)]
 use contextdb_engine::local_transport::{
     FinalStaleIdentityObservation, LocalHandshake, LocalTransportError, ManualDeadlineClock,
-    StaleRemovalInterlock, UnixLocalCarrier, channel_filesystem_identity, encode_message,
-    encode_payload_frame,
+    StaleRemovalInterlock, UnixLocalCarrier, channel_filesystem_identity,
 };
 
 fn filesystem() -> StaleFilesystemEvidence {
@@ -242,6 +242,10 @@ fn unverifiable_non_socket_path_is_preserved() {
 
 #[test]
 #[cfg(unix)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stalled_responder_finishes_at_the_manual_deadline_without_wall_clock_waiting() {
     let root = tempfile::tempdir().expect("temporary stalled-channel root");
     let path = root.path().join("stalled.sock");

@@ -161,7 +161,7 @@ fn advance_the_watermark(database: &Database) {
 }
 
 fn answer(result: &QueryResult) -> String {
-    let mut rows: Vec<String> = result.rows.iter().map(|row| format!("{row:?}")).collect();
+    let mut rows: Vec<String> = result.rows().iter().map(|row| format!("{row:?}")).collect();
     rows.sort();
     format!("{rows:?}")
 }
@@ -271,11 +271,11 @@ fn an_open_cursor_keeps_handing_out_the_version_it_opened_on() {
     // repeats.
     let mut handed_out: Vec<String> = cursor
         .first_page()
-        .rows
+        .rows()
         .iter()
         .map(|row| format!("{row:?}"))
         .collect();
-    let mut has_more = cursor.first_page().has_more;
+    let mut has_more = cursor.first_page().has_more();
 
     // Another writer rotates every ticket again, including rows this cursor
     // has not reached. The cursor was opened before any of it.
@@ -286,8 +286,8 @@ fn an_open_cursor_keeps_handing_out_the_version_it_opened_on() {
         let page = cursor
             .fetch(NonZeroUsize::new(1))
             .expect("the cursor hands out its remaining rows after the rotation");
-        handed_out.extend(page.rows.iter().map(|row| format!("{row:?}")));
-        has_more = page.has_more;
+        handed_out.extend(page.rows().iter().map(|row| format!("{row:?}")));
+        has_more = page.has_more();
     }
     cursor.close().expect("close the cursor");
     handed_out.sort();

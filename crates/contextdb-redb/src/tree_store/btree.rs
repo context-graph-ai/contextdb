@@ -7,8 +7,7 @@ use crate::tree_store::btree_iters::BtreeExtractIf;
 use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory};
 use crate::tree_store::{
-    AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
-    PageTrackerPolicy,
+    AccessGuardMutInPlace, BtreeRangeIter, PageHint, PageNumber, PageTrackerPolicy,
 };
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{AccessGuard, Result};
@@ -20,6 +19,84 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) type NativeRangeEntry = (
+    AccessGuard<'static, &'static [u8]>,
+    AccessGuard<'static, &'static [u8]>,
+);
+
+#[cfg(feature = "contextdb-internal")]
+fn singleton_u64_at(
+    mem: &TransactionalMemory,
+    handle: [u8; 24],
+    key: u64,
+    value_len: usize,
+    hint: PageHint,
+) -> Result<AccessGuard<'static, &'static [u8]>> {
+    let number = PageNumber::validated_from_le_bytes(handle[..8].try_into().unwrap())
+        .filter(|number| number.to_le_bytes() == handle[..8])
+        .ok_or_else(|| crate::StorageError::Corrupted("invalid singleton page handle".into()))?;
+    if value_len > super::MAX_VALUE_LENGTH {
+        return Err(crate::StorageError::Corrupted(
+            "singleton value exceeds native limits".into(),
+        ));
+    }
+    let framing = super::btree_base::RawLeafBuilder::required_bytes(
+        1,
+        8usize
+            .checked_add(value_len)
+            .ok_or_else(|| crate::StorageError::Corrupted("singleton length overflow".into()))?,
+        Some(8),
+        None,
+    );
+    let expected = framing
+        .max(mem.get_page_size())
+        .checked_next_power_of_two()
+        .ok_or_else(|| crate::StorageError::Corrupted("singleton extent overflow".into()))?;
+    if number.page_size_bytes(mem.get_page_size().try_into().unwrap()) != expected as u64 {
+        return Err(crate::StorageError::Corrupted(
+            "singleton extent differs from its producer quote".into(),
+        ));
+    }
+    let page = mem.get_page(number, hint)?;
+    let range = super::btree_base::singleton_u64_range(&page, key)?;
+    if range.len() != value_len {
+        return Err(crate::StorageError::Corrupted(
+            "singleton value differs from its producer quote".into(),
+        ));
+    }
+    let expected = u128::from_le_bytes(handle[8..].try_into().unwrap());
+    if page_checksum(&page, Some(8), None)? != expected {
+        return Err(crate::StorageError::Corrupted(
+            "singleton payload checksum mismatch".into(),
+        ));
+    }
+    Ok(AccessGuard::with_page(page, range))
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl BtreeMut<'_, u64, &'static [u8]> {
+    pub(crate) fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'_, &'static [u8]>> {
+        singleton_u64_at(&self.mem, handle, key, value_len, PageHint::Transient)
+    }
+}
+#[cfg(feature = "contextdb-internal")]
+impl Btree<u64, &'static [u8]> {
+    pub(crate) fn singleton_u64_at(
+        &self,
+        handle: [u8; 24],
+        key: u64,
+        value_len: usize,
+    ) -> Result<AccessGuard<'static, &'static [u8]>> {
+        singleton_u64_at(&self.mem, handle, key, value_len, PageHint::None)
+    }
+}
 
 pub(super) fn page_checksum<T: Page>(
     page: &T,
@@ -33,6 +110,104 @@ pub(super) fn page_checksum<T: Page>(
             "page {:?} has an invalid btree node type",
             page.get_page_number()
         ))),
+    }
+}
+
+/// Locate a fixed-key byte value without loading its payload. Allocator bitmap
+/// sources use this descriptor only while their saved tree is protected.
+pub(crate) fn fixed_key_value_location<K: Key>(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+    hint: PageHint,
+    key: &K::SelfType<'_>,
+) -> Result<Option<(PageNumber, std::ops::Range<usize>)>> {
+    let Some(mut header) = root else {
+        return Ok(None);
+    };
+    let width = K::fixed_width().ok_or_else(|| {
+        crate::StorageError::Corrupted("windowed allocator lookup requires fixed keys".into())
+    })?;
+    let query = K::as_bytes(key);
+    let corrupt = || crate::StorageError::Corrupted("invalid windowed allocator node".into());
+    let mut ancestors = Vec::new();
+    loop {
+        if ancestors.contains(&header.root) {
+            return Err(corrupt());
+        }
+        let prefix = mem.get_page_window(header.root, 0..4, hint)?;
+        let count = usize::from(u16::from_le_bytes(prefix[2..4].try_into().unwrap()));
+        if count == 0 {
+            return Err(corrupt());
+        }
+        if prefix[0] == LEAF && !hint.verifies_path() {
+            // Fixed keys follow the value-end offsets. No selected or unrelated
+            // allocator payload enters the page cache during navigation.
+            let keys_start = 4 + count * 4;
+            let values_start = keys_start + count * width;
+            let extent = usize::try_from(
+                header
+                    .root
+                    .page_size_bytes(mem.get_page_size().try_into().unwrap()),
+            )
+            .map_err(|_| corrupt())?;
+            if values_start > extent {
+                return Err(corrupt());
+            }
+            let mut low = 0;
+            let mut high = count;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let offset = keys_start + mid * width;
+                let stored = mem.get_page_window(header.root, offset..offset + width, hint)?;
+                match K::compare(query.as_ref(), &stored) {
+                    std::cmp::Ordering::Less => high = mid,
+                    std::cmp::Ordering::Greater => low = mid + 1,
+                    std::cmp::Ordering::Equal => {
+                        let field = 4 + mid * 4;
+                        let offsets = mem.get_page_window(
+                            header.root,
+                            field.saturating_sub(4).max(4)..field + 4,
+                            hint,
+                        )?;
+                        let end =
+                            u32::from_le_bytes(offsets[offsets.len() - 4..].try_into().unwrap())
+                                as usize;
+                        let start = if mid == 0 {
+                            values_start
+                        } else {
+                            u32::from_le_bytes(offsets[..4].try_into().unwrap()) as usize
+                        };
+                        if start < values_start || end < start || end > extent {
+                            return Err(corrupt());
+                        }
+                        return Ok(Some((header.root, start..end)));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        let page = mem.get_page(header.root, hint)?;
+        if hint.verifies_path() && page_checksum(&page, Some(width), None)? != header.checksum {
+            return Err(crate::StorageError::Corrupted(
+                "allocator source checksum failed".into(),
+            ));
+        }
+        match page.memory()[0] {
+            LEAF => {
+                let leaf = LeafAccessor::new(page.memory(), Some(width), None);
+                return Ok(leaf.find_key::<K>(query.as_ref()).map(|index| {
+                    let (start, end) = leaf.value_range(index).unwrap();
+                    (header.root, start..end)
+                }));
+            }
+            BRANCH => {
+                ancestors.push(header.root);
+                let branch = BranchAccessor::new(&page, Some(width));
+                let (index, child) = branch.child_for_key::<K>(query.as_ref());
+                header = BtreeHeader::new(child, branch.child_checksum(index).unwrap(), 0);
+            }
+            _ => return Err(corrupt()),
+        }
     }
 }
 
@@ -125,28 +300,88 @@ impl UntypedBtree {
         resume: &[usize],
         maximum: usize,
         multimap: bool,
-    ) -> Result<(Vec<PagePath>, Option<Vec<usize>>, usize)> {
+    ) -> Result<SelectedPages> {
         let mut batch = PageBatch {
             resume,
             maximum,
             pages: Vec::new(),
             next: None,
             examined: 0,
+            source_refused: false,
         };
         if let Some(root) = self.root {
             self.page_batch_helper(
                 PagePath::new_root(root.root),
+                root.checksum,
                 &mut Vec::new(),
                 multimap,
                 &mut batch,
             )?;
         }
-        Ok((batch.pages, batch.next, batch.examined))
+        Ok(SelectedPages {
+            pages: batch.pages,
+            next: batch.next,
+            examined: batch.examined,
+            source_refused: batch.source_refused,
+        })
+    }
+
+    /// A page's bytes against the checksum its parent or header holds, before
+    /// its offsets or children are used. Relocation recomputes checksums over
+    /// what it copies, so a page moved unchecked would come out looking valid.
+    /// DEFERRED is only a number: it excuses the comparison solely for a page
+    /// this transaction still owns, and that page's layout must still read.
+    fn source_page_intact(&self, page: &PageImpl, expected: Checksum, multimap: bool) -> bool {
+        let value_width = if multimap {
+            crate::multimap_table::multimap_leaf_value_width(self.value_width)
+        } else {
+            self.value_width
+        };
+        let computed = match page.memory().first().copied() {
+            Some(LEAF) => leaf_checksum(page, self.key_width, value_width),
+            Some(BRANCH) => branch_checksum(page, self.key_width),
+            _ => return false,
+        };
+        if expected == DEFERRED && self.mem.uncommitted(page.get_page_number()) {
+            return computed.is_ok();
+        }
+        computed.is_ok_and(|computed| computed == expected)
+    }
+
+    /// Every page from the root to the leaf that holds `query`, each against
+    /// the checksum its parent or header holds: the pages an ordinary update
+    /// of that key copies. Bounded by the tree's height.
+    #[allow(
+        dead_code,
+        reason = "used only by the contextdb-internal transactions path, transactions.rs:1409-1430"
+    )]
+    pub(crate) fn source_path_intact<K: Key>(&self, query: &[u8]) -> Result<bool> {
+        let Some(root) = self.root else {
+            return Ok(true);
+        };
+        let (mut number, mut expected) = (root.root, root.checksum);
+        loop {
+            let page = self.mem.get_page(number, self.hint)?;
+            if !self.source_page_intact(&page, expected, false) {
+                return Ok(false);
+            }
+            match page.memory()[0] {
+                LEAF => return Ok(true),
+                BRANCH => {
+                    let accessor = BranchAccessor::new(&page, self.key_width);
+                    let (child, page_number) = accessor.child_for_key::<K>(query);
+                    expected = accessor.child_checksum(child).unwrap();
+                    number = page_number;
+                }
+                _ => return Ok(false),
+            }
+        }
     }
 
     fn page_batch_helper(
         &self,
         path: PagePath,
+        expected: Checksum,
         position: &mut Vec<usize>,
         multimap: bool,
         batch: &mut PageBatch<'_>,
@@ -163,6 +398,10 @@ impl UntypedBtree {
         }
         batch.examined += 1;
         let page = self.mem.get_page(path.page_number(), self.hint)?;
+        if !self.source_page_intact(&page, expected, multimap) {
+            batch.source_refused = true;
+            return Ok(false);
+        }
         match page.memory()[0] {
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.key_width);
@@ -170,6 +409,7 @@ impl UntypedBtree {
                     position.push(i);
                     let complete = self.page_batch_helper(
                         path.with_child(accessor.child_page(i).unwrap()),
+                        accessor.child_checksum(i).unwrap(),
                         position,
                         multimap,
                         batch,
@@ -199,6 +439,7 @@ impl UntypedBtree {
                     position.push(i);
                     let complete = subtree.page_batch_helper(
                         path.with_child(header.root),
+                        header.checksum,
                         position,
                         false,
                         batch,
@@ -241,12 +482,21 @@ impl UntypedBtree {
     }
 }
 
+/// One finite page selection: where to resume, and whether a page failed its checksum.
+pub(crate) struct SelectedPages {
+    pub(crate) pages: Vec<PagePath>,
+    pub(crate) next: Option<Vec<usize>>,
+    pub(crate) examined: usize,
+    pub(crate) source_refused: bool,
+}
+
 struct PageBatch<'a> {
     resume: &'a [usize],
     maximum: usize,
     pages: Vec<PagePath>,
     next: Option<Vec<usize>>,
     examined: usize,
+    source_refused: bool,
 }
 
 pub(crate) struct UntypedBtreeMut {
@@ -302,6 +552,13 @@ impl UntypedBtreeMut {
     fn finalize_dirty_checksums_helper(&mut self, page_number: PageNumber) -> Result<Checksum> {
         assert!(self.mem.uncommitted(page_number));
         let mut page = self.mem.get_page_mut(page_number)?;
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_root_work(
+            crate::commit_work::RootWorkKindForTest::ChecksumPage,
+            None,
+            Some(page_number.to_le_bytes()),
+            page.memory().len(),
+        )?;
 
         match page.memory()[0] {
             LEAF => leaf_checksum(&page, self.key_width, self.value_width),
@@ -432,6 +689,7 @@ impl UntypedBtreeMut {
             _ => unreachable!(),
         }
 
+        drop(old_page);
         let mut freed_pages = self.freed_pages.lock().unwrap();
         // No need to track allocations, because this method is only called during compaction when
         // there can't be any savepoints
@@ -487,21 +745,6 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
         );
         self.root = tree.finalize_dirty_checksums()?;
         Ok(self.root)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn all_pages_iter(&self) -> Result<Option<AllPageNumbersBtreeIter>> {
-        if let Some(root) = self.root.map(|x| x.root) {
-            Ok(Some(AllPageNumbersBtreeIter::new(
-                root,
-                K::fixed_width(),
-                V::fixed_width(),
-                self.mem.clone(),
-                PageHint::None,
-            )?))
-        } else {
-            Ok(None)
-        }
     }
 
     pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
@@ -579,7 +822,10 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
             fake_allocated_pages,
         );
         operation.insert_inplace(key, value)?;
-        assert!(fake_freed_pages.is_empty());
+        assert_eq!(
+            fake_freed_pages,
+            Vec::<crate::tree_store::PageNumber>::new()
+        );
         Ok(())
     }
 
@@ -595,11 +841,6 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
         );
         let result = operation.delete(key)?;
         Ok(result)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        self.read_tree()?.print_debug(include_values)
     }
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
@@ -842,6 +1083,40 @@ impl<'a, K: Key + 'a, V: MutInPlaceValue + 'a> BtreeMut<'a, K, V> {
     }
 }
 
+impl<K: Key + 'static> BtreeMut<'_, K, &'static [u8]> {
+    /// Reserve an allocator-table value without building a value-sized heap buffer.
+    /// A length-only source zero-fills the allocated B-tree destination. The
+    /// returned guard borrows that destination; no source buffer or mapping exists.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.mem
+            .get_page_size()
+            .saturating_sub(super::btree_base::RawLeafBuilder::required_bytes(
+                1,
+                key_bytes,
+                K::fixed_width(),
+                None,
+            ))
+    }
+
+    pub(crate) fn insert_zeroed_reserve(
+        &mut self,
+        key: &K::SelfType<'_>,
+        value_length: usize,
+    ) -> Result<AccessGuardMutInPlace<'_, &'static [u8]>> {
+        let mut freed_pages = self.freed_pages.lock().unwrap();
+        let mut operation: MutateHelper<'_, '_, K, &'static [u8]> = MutateHelper::new(
+            &mut self.root,
+            self.mem.clone(),
+            freed_pages.as_mut(),
+            self.allocated_pages.clone(),
+        );
+        let (_, guard) =
+            operation.insert_value(key, super::btree_base::LeafValue::Zeroes(value_length))?;
+        Ok(guard)
+    }
+}
+
 pub(crate) struct RawBtree {
     mem: Arc<TransactionalMemory>,
     root: Option<BtreeHeader>,
@@ -962,6 +1237,23 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
 }
 
 impl<K: Key, V: Value> Btree<K, V> {
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn inline_value_capacity(&self, key_bytes: usize) -> usize {
+        self.mem
+            .get_page_size()
+            .saturating_sub(super::btree_base::RawLeafBuilder::required_bytes(
+                1,
+                key_bytes,
+                K::fixed_width(),
+                None,
+            ))
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(super) fn release_cached_root(&mut self) {
+        self.cached_root = None;
+    }
+
     pub(crate) fn new(
         root: Option<BtreeHeader>,
         hint: PageHint,
@@ -1225,42 +1517,6 @@ impl<K: Key, V: Value> Btree<K, V> {
             self.hint,
         )
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        if let Some(p) = self.root.map(|x| x.root) {
-            let mut pages = vec![self.mem.get_page(p, self.hint)?];
-            while !pages.is_empty() {
-                let mut next_children = vec![];
-                for page in pages.drain(..) {
-                    let node_mem = page.memory();
-                    match node_mem[0] {
-                        LEAF => {
-                            eprint!("Leaf[ (page={:?})", page.get_page_number());
-                            LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width())
-                                .print_node::<K, V>(include_values);
-                            eprint!("]");
-                        }
-                        BRANCH => {
-                            let accessor = BranchAccessor::new(&page, K::fixed_width());
-                            for i in 0..accessor.count_children() {
-                                let child = accessor.child_page(i).unwrap();
-                                next_children.push(self.mem.get_page(child, self.hint)?);
-                            }
-                            accessor.print_node::<K>();
-                        }
-                        _ => unreachable!(),
-                    }
-                    eprint!("  ");
-                }
-                eprintln!();
-
-                pages = next_children;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl<K: Key, V: Value> Drop for Btree<K, V> {
@@ -1345,5 +1601,523 @@ fn stats_helper(
             })
         }
         _ => unreachable!(),
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+struct NativeBorrowedPage<'a> {
+    memory: &'a super::page_store::PageMemory,
+    number: PageNumber,
+}
+#[cfg(feature = "contextdb-internal")]
+impl Page for NativeBorrowedPage<'_> {
+    fn memory(&self) -> &[u8] {
+        self.memory
+    }
+    fn get_page_number(&self) -> PageNumber {
+        self.number
+    }
+}
+
+/// Validate every offset, ordered key and child encoding before ordinary
+/// accessors can index the bytes. Returns the exact checksummed node end.
+#[cfg(feature = "contextdb-internal")]
+fn native_validate_byte_node(
+    bytes: &[u8],
+    number: PageNumber,
+    directory: bool,
+) -> std::result::Result<usize, crate::NativeColdReadError> {
+    native_validate_key_node(bytes, number, directory, false)
+}
+#[cfg(feature = "contextdb-internal")]
+fn native_validate_key_node(
+    bytes: &[u8],
+    number: PageNumber,
+    directory: bool,
+    u8_key: bool,
+) -> std::result::Result<usize, crate::NativeColdReadError> {
+    use crate::{NativeColdFault, NativeColdReadError};
+    let corrupt = || {
+        let mut fault = NativeColdFault::new("invalid native byte node layout");
+        fault.page = number.to_le_bytes();
+        NativeColdReadError::Corrupt(fault)
+    };
+    let header = bytes.get(..4).ok_or_else(corrupt)?;
+    let count = usize::from(u16::from_le_bytes(header[2..4].try_into().unwrap()));
+    if count == 0 {
+        return Err(corrupt());
+    }
+    let (offset_start, data_start, offset_count) = match header[0] {
+        LEAF => (
+            4,
+            4 + count * if u8_key { 4 } else { 8 },
+            count * if u8_key { 1 } else { 2 },
+        ),
+        BRANCH => {
+            let children = count + 1;
+            let page_start = 8 + size_of::<Checksum>() * children;
+            let offset_start = page_start + PageNumber::serialized_size() * children;
+            let data_start = offset_start + if u8_key { 0 } else { 4 * count };
+            let pages = bytes.get(page_start..offset_start).ok_or_else(corrupt)?;
+            for page in pages.as_chunks::<{ PageNumber::serialized_size() }>().0 {
+                if PageNumber::validated_from_le_bytes(*page).is_none() {
+                    return Err(corrupt());
+                }
+            }
+            (offset_start, data_start, if u8_key { 0 } else { count })
+        }
+        _ => return Err(corrupt()),
+    };
+    let offsets = bytes.get(offset_start..data_start).ok_or_else(corrupt)?;
+    if offsets.len() != offset_count * 4 {
+        return Err(corrupt());
+    }
+    let mut start = data_start;
+    if u8_key {
+        let keys = bytes.get(start..start + count).ok_or_else(corrupt)?;
+        if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(corrupt());
+        }
+        start += count;
+    }
+    let mut previous: Option<&[u8]> = None;
+    for (index, offset) in offsets.as_chunks::<4>().0.iter().enumerate() {
+        let end = u32::from_le_bytes(*offset) as usize;
+        let value = bytes.get(start..end).ok_or_else(corrupt)?;
+        if !u8_key && index < count {
+            if previous.is_some_and(|prior| prior >= value)
+                || (directory && std::str::from_utf8(value).is_err())
+            {
+                return Err(corrupt());
+            }
+            previous = Some(value);
+        }
+        start = end;
+    }
+    Ok(start)
+}
+
+/// Exact variable-byte descent over one captured root. Does not open a table,
+/// decode owned metadata, construct iterator parents, or call `get_page`.
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn native_byte_get(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+    key: &[u8],
+    directory: bool,
+) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
+    native_key_get(root, mem, key, directory, false)
+}
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn native_key_get(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+    key: &[u8],
+    directory: bool,
+    u8_key: bool,
+) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
+    native_key_get_with(root, key, directory, u8_key, None, |page| {
+        mem.get_native_page_memory(page)
+    })
+}
+
+#[cfg(feature = "contextdb-internal")]
+#[allow(
+    clippy::result_large_err,
+    reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+)]
+pub(crate) fn prepared_byte_get(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+    key: &[u8],
+    directory: bool,
+    first_page: Option<&super::page_store::PageMemory>,
+) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::PreparedReadError> {
+    native_key_get_with(root, key, directory, false, first_page, |page| {
+        mem.get_prepared_page_memory(page)
+    })
+}
+
+/// Eagerly verify and retain the actual sealed directory root. Validation uses
+/// borrowed bytes and stack scalars; no `PageImpl`/debug map or `TypeName` is built.
+#[cfg(feature = "contextdb-internal")]
+#[allow(
+    clippy::result_large_err,
+    reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+)]
+pub(crate) fn prepared_directory_root(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+) -> std::result::Result<Option<super::page_store::PageMemory>, crate::PreparedReadError> {
+    let Some(header) = root else {
+        return Ok(None);
+    };
+    let page = mem.get_prepared_page_memory(header.root)?;
+    let end = native_validate_byte_node(&page, header.root, true)?;
+    let actual = super::page_store::xxh3_checksum(&page[..end]);
+    if actual != header.checksum {
+        return Err(crate::NativeColdReadError::Corrupt(crate::NativeColdFault {
+            reason: "retained snapshot root page failed checksum verification",
+            page: header.root.to_le_bytes(),
+            offset: end,
+            expected: header.checksum,
+            actual,
+        })
+        .into());
+    }
+    Ok(Some(page))
+}
+
+#[cfg(feature = "contextdb-internal")]
+fn native_key_get_with<E: From<crate::NativeColdReadError>>(
+    root: Option<BtreeHeader>,
+    key: &[u8],
+    directory: bool,
+    u8_key: bool,
+    mut first_page: Option<&super::page_store::PageMemory>,
+    read: impl Fn(PageNumber) -> std::result::Result<super::page_store::PageMemory, E>,
+) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, E> {
+    use crate::native_storage_admission::NativeStorageBuffer;
+    use crate::{NativeColdFault, NativeColdReadError};
+    if !crate::native_storage_admission::native_storage_active() {
+        return Err(NativeColdReadError::AdmissionRefused.into());
+    }
+    let Some(mut header) = root else {
+        return Ok(None);
+    };
+    let mut ancestors = NativeStorageBuffer::<PageNumber>::new();
+    loop {
+        if ancestors.as_slice().contains(&header.root) {
+            let mut fault = NativeColdFault::new("cycle in native exact byte descent");
+            fault.page = header.root.to_le_bytes();
+            return Err(NativeColdReadError::Corrupt(fault).into());
+        }
+        // Admit navigation growth before reading the corresponding page.
+        ancestors.push(header.root)?;
+        let memory = match first_page.take() {
+            Some(page) => page.clone(),
+            None => read(header.root)?,
+        };
+        let end = native_validate_key_node(&memory, header.root, directory, u8_key)?;
+        let actual = super::page_store::xxh3_checksum(&memory[..end]);
+        if actual != header.checksum {
+            return Err(NativeColdReadError::Corrupt(NativeColdFault {
+                reason: "captured native byte page failed checksum verification",
+                page: header.root.to_le_bytes(),
+                offset: end,
+                expected: header.checksum,
+                actual,
+            })
+            .into());
+        }
+        match memory[0] {
+            LEAF => {
+                let leaf = LeafAccessor::new(&memory, u8_key.then_some(1), None);
+                let found = if u8_key {
+                    leaf.find_key::<u8>(key)
+                } else {
+                    leaf.find_key::<&[u8]>(key)
+                };
+                let range = found.map(|index| {
+                    let (start, end) = leaf
+                        .value_range(index)
+                        .expect("validated native leaf range");
+                    start..end
+                });
+                return Ok(range.map(|range| AccessGuard::with_arc_page(memory, range)));
+            }
+            BRANCH => {
+                let page = NativeBorrowedPage {
+                    memory: &memory,
+                    number: header.root,
+                };
+                let branch = BranchAccessor::new(&page, u8_key.then_some(1));
+                let (index, child) = if u8_key {
+                    branch.child_for_key::<u8>(key)
+                } else {
+                    branch.child_for_key::<&[u8]>(key)
+                };
+                header = BtreeHeader::new(
+                    child,
+                    branch
+                        .child_checksum(index)
+                        .expect("validated child checksum"),
+                    0,
+                );
+            }
+            _ => unreachable!("validated native node kind"),
+        }
+    }
+}
+
+/// Internal variable text-key range successor. The endpoint is raw bytes so
+/// a prefix's exclusive successor need not itself be valid UTF-8. Every node
+/// is fully validated/checksummed, and navigation/page/header storage is prepaid.
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn native_text_range_next(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+    lower: &[u8],
+    exclusive: bool,
+    upper: Option<&[u8]>,
+    text_keys: bool,
+    before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
+    use crate::native_storage_admission::NativeStorageBuffer;
+    use crate::{NativeColdFault, NativeColdReadError};
+    if !crate::native_storage_admission::native_storage_active() {
+        return Err(NativeColdReadError::AdmissionRefused);
+    }
+    let Some(mut header) = root else {
+        return Ok(None);
+    };
+    let mut parents = NativeStorageBuffer::<BtreeHeader>::new();
+    // A monotone seek visits only the boundary descent and the next sibling's
+    // left descent. Retaining visited identities also detects cross-sibling cycles.
+    let mut visited = NativeStorageBuffer::<PageNumber>::new();
+    let mut leftmost = false;
+    loop {
+        if visited.as_slice().contains(&header.root) {
+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
+                "cycle in native text range descent",
+            )));
+        }
+        before_page()?;
+        visited.push(header.root)?;
+        let memory = mem.get_native_page_memory(header.root)?;
+        let end = native_validate_byte_node(&memory, header.root, text_keys)?;
+        let actual = super::page_store::xxh3_checksum(&memory[..end]);
+        if actual != header.checksum {
+            return Err(NativeColdReadError::Corrupt(NativeColdFault {
+                reason: "captured native text range page failed checksum verification",
+                page: header.root.to_le_bytes(),
+                offset: end,
+                expected: header.checksum,
+                actual,
+            }));
+        }
+        if memory[0] == BRANCH {
+            let page = NativeBorrowedPage {
+                memory: &memory,
+                number: header.root,
+            };
+            let branch = BranchAccessor::new(&page, None);
+            let index = if leftmost {
+                0
+            } else {
+                branch.child_for_key::<&[u8]>(lower).0
+            };
+            let child = branch.child_page(index).expect("validated child");
+            let checksum = branch
+                .child_checksum(index)
+                .expect("validated child checksum");
+            // Save the next sibling as scalar metadata before any child fetch.
+            if index + 1 < branch.count_children() {
+                let sibling = BtreeHeader::new(
+                    branch.child_page(index + 1).expect("validated sibling"),
+                    branch
+                        .child_checksum(index + 1)
+                        .expect("validated sibling checksum"),
+                    0,
+                );
+                parents.push(sibling)?;
+            }
+            header = BtreeHeader::new(child, checksum, 0);
+            continue;
+        }
+        let leaf = LeafAccessor::new(&memory, None, None);
+        let (position, found) = if leftmost {
+            (0, false)
+        } else {
+            leaf.position::<&[u8]>(lower)
+        };
+        let index = position + usize::from(found && exclusive && !leftmost);
+        if let Some((key_range, value_range)) = leaf.entry_ranges(index) {
+            let key = &memory[key_range.clone()];
+            if upper.is_some_and(|end| key >= end) {
+                return Ok(None);
+            }
+            // UTF-8 for all node keys was checked before indexing. Both guards
+            // share the actual admitted complete page, never an owned record.
+            return Ok(Some((
+                AccessGuard::with_arc_page(memory.clone(), key_range),
+                AccessGuard::with_arc_page(memory, value_range),
+            )));
+        }
+        drop(memory);
+        let Some(sibling) = parents.pop() else {
+            return Ok(None);
+        };
+        header = sibling;
+        leftmost = true;
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+fn native_validate_u64_node(
+    bytes: &[u8],
+    number: PageNumber,
+) -> std::result::Result<usize, crate::NativeColdReadError> {
+    use crate::{NativeColdFault, NativeColdReadError};
+    let corrupt = || {
+        let mut fault = NativeColdFault::new("invalid native byte node layout");
+        fault.page = number.to_le_bytes();
+        NativeColdReadError::Corrupt(fault)
+    };
+    let header = bytes.get(..4).ok_or_else(corrupt)?;
+    let count = usize::from(u16::from_le_bytes(header[2..4].try_into().unwrap()));
+    if count == 0 {
+        return Err(corrupt());
+    }
+    let (offset_start, data_start, offset_count) = match header[0] {
+        LEAF => (4, 4 + count * 4, count),
+        BRANCH => {
+            let children = count + 1;
+            let page_start = 8 + size_of::<Checksum>() * children;
+            let offset_start = page_start + PageNumber::serialized_size() * children;
+            let data_start = offset_start;
+            let pages = bytes.get(page_start..offset_start).ok_or_else(corrupt)?;
+            for page in pages.as_chunks::<{ PageNumber::serialized_size() }>().0 {
+                if PageNumber::validated_from_le_bytes(*page).is_none() {
+                    return Err(corrupt());
+                }
+            }
+            (offset_start, data_start, 0)
+        }
+        _ => return Err(corrupt()),
+    };
+    let offsets = bytes.get(offset_start..data_start).ok_or_else(corrupt)?;
+    if offsets.len() != offset_count * 4 {
+        return Err(corrupt());
+    }
+    let mut start = data_start;
+    {
+        let keys = bytes.get(start..start + count * 8).ok_or_else(corrupt)?;
+        if keys
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|key| u64::from_le_bytes(*key))
+            .try_fold(None, |prior, next| {
+                if prior.is_some_and(|p| p >= next) {
+                    Err(())
+                } else {
+                    Ok(Some(next))
+                }
+            })
+            .is_err()
+        {
+            return Err(corrupt());
+        }
+        start += count * 8;
+    }
+    for offset in offsets.as_chunks::<4>().0 {
+        let end = u32::from_le_bytes(*offset) as usize;
+        bytes.get(start..end).ok_or_else(corrupt)?;
+        start = end;
+    }
+    Ok(start)
+}
+
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn native_u64_range_next(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+    lower: &[u8],
+    exclusive: bool,
+    upper: Option<&[u8]>,
+    before_page: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
+    use crate::native_storage_admission::NativeStorageBuffer;
+    use crate::{NativeColdFault, NativeColdReadError};
+    if !crate::native_storage_admission::native_storage_active() {
+        return Err(NativeColdReadError::AdmissionRefused);
+    }
+    let Some(mut header) = root else {
+        return Ok(None);
+    };
+    let mut parents = NativeStorageBuffer::<BtreeHeader>::new();
+    // A monotone seek visits only the boundary descent and the next sibling's
+    // left descent. Retaining visited identities also detects cross-sibling cycles.
+    let mut visited = NativeStorageBuffer::<PageNumber>::new();
+    let mut leftmost = false;
+    loop {
+        if visited.as_slice().contains(&header.root) {
+            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
+                "cycle in native text range descent",
+            )));
+        }
+        before_page()?;
+        visited.push(header.root)?;
+        let memory = mem.get_native_page_memory(header.root)?;
+        let end = native_validate_u64_node(&memory, header.root)?;
+        let actual = super::page_store::xxh3_checksum(&memory[..end]);
+        if actual != header.checksum {
+            return Err(NativeColdReadError::Corrupt(NativeColdFault {
+                reason: "captured native text range page failed checksum verification",
+                page: header.root.to_le_bytes(),
+                offset: end,
+                expected: header.checksum,
+                actual,
+            }));
+        }
+        if memory[0] == BRANCH {
+            let page = NativeBorrowedPage {
+                memory: &memory,
+                number: header.root,
+            };
+            let branch = BranchAccessor::new(&page, Some(8));
+            let index = if leftmost {
+                0
+            } else {
+                branch.child_for_key::<u64>(lower).0
+            };
+            let child = branch.child_page(index).expect("validated child");
+            let checksum = branch
+                .child_checksum(index)
+                .expect("validated child checksum");
+            // Save the next sibling as scalar metadata before any child fetch.
+            if index + 1 < branch.count_children() {
+                let sibling = BtreeHeader::new(
+                    branch.child_page(index + 1).expect("validated sibling"),
+                    branch
+                        .child_checksum(index + 1)
+                        .expect("validated sibling checksum"),
+                    0,
+                );
+                parents.push(sibling)?;
+            }
+            header = BtreeHeader::new(child, checksum, 0);
+            continue;
+        }
+        let leaf = LeafAccessor::new(&memory, Some(8), None);
+        let (position, found) = if leftmost {
+            (0, false)
+        } else {
+            leaf.position::<u64>(lower)
+        };
+        let index = position + usize::from(found && exclusive && !leftmost);
+        if let Some((key_range, value_range)) = leaf.entry_ranges(index) {
+            let key = &memory[key_range.clone()];
+            if upper.is_some_and(|end| {
+                u64::from_le_bytes(key.try_into().unwrap())
+                    >= u64::from_le_bytes(end.try_into().unwrap())
+            }) {
+                return Ok(None);
+            }
+            // UTF-8 for all node keys was checked before indexing. Both guards
+            // share the actual admitted complete page, never an owned record.
+            return Ok(Some((
+                AccessGuard::with_arc_page(memory.clone(), key_range),
+                AccessGuard::with_arc_page(memory, value_range),
+            )));
+        }
+        drop(memory);
+        let Some(sibling) = parents.pop() else {
+            return Ok(None);
+        };
+        header = sibling;
+        leftmost = true;
     }
 }

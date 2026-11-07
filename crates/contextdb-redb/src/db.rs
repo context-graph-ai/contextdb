@@ -27,6 +27,37 @@ use crate::tree_store::file_backend::FileBackend;
 #[cfg(feature = "logging")]
 use log::{debug, info, warn};
 
+#[cfg(feature = "test-seams")]
+pub(crate) mod allocator_metadata_test_seams;
+
+/// How the next allocator-state save treats the free totals, for recovery
+/// tests. Production-dead.
+/// What a plant made at an allocator save's entry did.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocatorSaveEntryPlant {
+    /// `(region, order, height, entry)` of the inverted summary bit, or
+    /// `None` when order 0 has no summary level.
+    pub planted: Option<(u32, u8, u32, u32)>,
+    /// Whether, at the save's entry, that bit disagreed with its word.
+    pub mismatch_at_entry: bool,
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum FreeTotalsSaveForTest {
+    /// Save without the free-totals key, as a store written before it existed.
+    Omit,
+    /// Save these bytes as the free-totals value instead of the real encoding.
+    Write(Vec<u8>),
+    /// Fail the save before the free totals are encoded.
+    FailBeforeEncode,
+    /// Fail the save after the free totals are encoded, before publication.
+    FailAfterEncode,
+}
+
 #[allow(clippy::len_without_is_empty)]
 /// Implements persistent storage for a database.
 pub trait StorageBackend: 'static + Debug + Send + Sync {
@@ -49,6 +80,12 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
     /// Writes the specified array to the storage.
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
 
+    /// Create non-durable allocator scratch storage beside this backend's file.
+    /// Backends without a file may retain the in-memory allocator instead.
+    fn scratch_backend(&self) -> std::result::Result<Option<Box<dyn ScratchBackend>>, io::Error> {
+        Ok(None)
+    }
+
     /// Release any resources held by the backend
     ///
     /// Note: redb will not access the backend after calling this method and will call it exactly
@@ -56,6 +93,179 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
     fn close(&self) -> std::result::Result<(), io::Error> {
         Ok(())
     }
+}
+
+/// Original construction capability. Legacy or wrapped backends never acquire it implicitly.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub trait NativeStorageBackend: StorageBackend {
+    fn native_len(&self) -> Result<u64, crate::NativeBackendError>;
+    fn native_read(&self, offset: u64, out: &mut [u8]) -> Result<(), crate::NativeBackendError>;
+    fn native_write(&self, offset: u64, data: &[u8]) -> Result<(), crate::NativeBackendError>;
+    fn native_set_len(&self, len: u64) -> Result<(), crate::NativeBackendError>;
+    fn native_sync_data(&self) -> Result<(), crate::NativeBackendError>;
+}
+
+pub(crate) enum Backend {
+    Legacy(Box<dyn StorageBackend>),
+    #[cfg(feature = "contextdb-internal")]
+    Native(Box<dyn NativeStorageBackend>),
+}
+impl Debug for Backend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(file) => Debug::fmt(file, f),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => Debug::fmt(file, f),
+        }
+    }
+}
+impl<T: StorageBackend> From<Box<T>> for Backend {
+    fn from(file: Box<T>) -> Self {
+        Self::Legacy(file)
+    }
+}
+impl From<Box<dyn StorageBackend>> for Backend {
+    fn from(file: Box<dyn StorageBackend>) -> Self {
+        Self::Legacy(file)
+    }
+}
+impl Backend {
+    pub(crate) fn scratch_backend(&self) -> std::io::Result<Option<Box<dyn ScratchBackend>>> {
+        match self {
+            Self::Legacy(file) => file.scratch_backend(),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.scratch_backend(),
+        }
+    }
+    pub(crate) fn close(&self) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.close().map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.close().map_err(StorageError::from),
+        }
+    }
+    pub(crate) fn len(&self) -> Result<u64, StorageError> {
+        match self {
+            Self::Legacy(file) => file.len().map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_len().map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
+        }
+    }
+    pub(crate) fn read_cause(
+        &self,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<(), crate::NativeBackendError> {
+        match self {
+            Self::Legacy(file) => file.read(offset, out).map_err(Into::into),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_read(offset, out),
+        }
+    }
+    pub(crate) fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), StorageError> {
+        self.read_cause(offset, out).map_err(|error| {
+            crate::native_storage_admission::native_storage_error(error.into_native())
+        })
+    }
+    pub(crate) fn write(&self, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.write(offset, data).map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_write(offset, data).map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
+        }
+    }
+    pub(crate) fn set_len(&self, len: u64) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.set_len(len).map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_set_len(len).map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
+        }
+    }
+    pub(crate) fn sync_data(&self) -> Result<(), StorageError> {
+        match self {
+            Self::Legacy(file) => file.sync_data().map_err(StorageError::from),
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(file) => file.native_sync_data().map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
+        }
+    }
+}
+
+pub(crate) fn backend_quota_refused(error: &StorageError) -> bool {
+    match error {
+        StorageError::Io(error) => error.kind() == std::io::ErrorKind::QuotaExceeded,
+        #[cfg(feature = "contextdb-internal")]
+        StorageError::Native(crate::NativeColdReadError::BackendIo(
+            crate::NativeIoCause::DiskGrowthRefused { .. },
+        )) => true,
+        _ => false,
+    }
+}
+
+/// Seekable, non-durable backing for allocator working state. Its contents are
+/// discarded when the database closes or reopens; committed system tables stay
+/// the durable authority.
+#[allow(clippy::len_without_is_empty)]
+pub trait ScratchBackend: Debug + Send + Sync {
+    fn len(&self) -> io::Result<u64>;
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()>;
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+    fn set_len(&self, len: u64) -> io::Result<()>;
+}
+
+#[derive(Debug)]
+struct TemporaryScratch(std::sync::Mutex<File>);
+
+impl ScratchBackend for TemporaryScratch {
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.0.lock().unwrap().metadata()?.len())
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = self.0.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(out)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut file = self.0.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.0.lock().unwrap().set_len(len)
+    }
+}
+
+/// Exact requested heap bytes for the concrete boxed backend returned by
+/// [`scratch_backend_in_directory`]. This does not create a file or allocate.
+/// File contents and operating-system file resources are not heap payload bytes.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn scratch_backend_allocation_size() -> usize {
+    std::mem::size_of::<TemporaryScratch>()
+}
+
+/// Create an allocator scratch file in the database file's directory.
+/// The directory entry is removed immediately. An open handle keeps the
+/// scratch usable, and process death cannot leave a named orphan behind.
+pub fn scratch_backend_in_directory(directory: &Path) -> io::Result<Box<dyn ScratchBackend>> {
+    Ok(Box::new(TemporaryScratch(std::sync::Mutex::new(
+        tempfile::tempfile_in(directory)?,
+    ))))
 }
 
 pub trait TableHandle: Sealed {
@@ -275,6 +485,10 @@ pub(crate) struct TransactionGuard {
     transaction_tracker: Option<Arc<TransactionTracker>>,
     transaction_id: Option<TransactionId>,
     write_transaction: bool,
+    #[cfg(feature = "contextdb-internal")]
+    prepared: bool,
+    #[cfg(feature = "contextdb-internal")]
+    prepared_active: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl TransactionGuard {
@@ -286,7 +500,44 @@ impl TransactionGuard {
             transaction_tracker: Some(tracker),
             transaction_id: Some(transaction_id),
             write_transaction: false,
+            #[cfg(feature = "contextdb-internal")]
+            prepared: false,
+            #[cfg(feature = "contextdb-internal")]
+            prepared_active: None,
         }
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn new_prepared(
+        transaction_id: TransactionId,
+        tracker: Arc<TransactionTracker>,
+    ) -> Self {
+        let mut guard = Self::new_read(transaction_id, tracker);
+        guard.prepared = true;
+        guard.prepared_active = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        guard
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn activate_prepared(&self) {
+        if let Some(active) = &self.prepared_active {
+            active.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn prepared_active(&self) -> bool {
+        self.prepared_active
+            .as_ref()
+            .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn prepared_activation(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.prepared_active
+            .as_ref()
+            .expect("prepared guard")
+            .clone()
     }
 
     pub(crate) fn new_write(
@@ -297,6 +548,10 @@ impl TransactionGuard {
             transaction_tracker: Some(tracker),
             transaction_id: Some(transaction_id),
             write_transaction: true,
+            #[cfg(feature = "contextdb-internal")]
+            prepared: false,
+            #[cfg(feature = "contextdb-internal")]
+            prepared_active: None,
         }
     }
 
@@ -306,6 +561,10 @@ impl TransactionGuard {
             transaction_tracker: None,
             transaction_id: None,
             write_transaction: false,
+            #[cfg(feature = "contextdb-internal")]
+            prepared: false,
+            #[cfg(feature = "contextdb-internal")]
+            prepared_active: None,
         }
     }
 
@@ -314,6 +573,10 @@ impl TransactionGuard {
             transaction_tracker: None,
             transaction_id: Some(transaction_id),
             write_transaction: false,
+            #[cfg(feature = "contextdb-internal")]
+            prepared: false,
+            #[cfg(feature = "contextdb-internal")]
+            prepared_active: None,
         }
     }
 
@@ -329,6 +592,14 @@ impl TransactionGuard {
 impl Drop for TransactionGuard {
     fn drop(&mut self) {
         if self.transaction_tracker.is_none() {
+            return;
+        }
+        #[cfg(feature = "contextdb-internal")]
+        if self.prepared {
+            self.transaction_tracker
+                .as_ref()
+                .unwrap()
+                .remove_prepared_pin(self.id());
             return;
         }
         if let Some(transaction_id) = self.transaction_id {
@@ -427,9 +698,297 @@ impl ReadableDatabase for ReadOnlyDatabase {
 }
 
 impl ReadOnlyDatabase {
+    /// Select page capacity within the read cache's already prepaid index.
+    /// Snapshot identity is unchanged. Detached pinned pages keep their source
+    /// funding until their last physical holder releases them.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn set_read_cache_capacity(&self, bytes: usize) -> Result<usize, StorageError> {
+        self.mem.set_read_cache_capacity(bytes)
+    }
+
+    /// Settle funding at the serialized capacity boundary. The callback may
+    /// inspect atomic occupancy but must not read or modify cached pages.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn with_read_cache_capacity<R>(
+        &self,
+        bytes: usize,
+        settle: impl FnOnce() -> R,
+    ) -> Result<R, StorageError> {
+        self.mem.with_read_cache_capacity(bytes, settle)
+    }
+
+    /// Actual prepaid shared read-cache index storage, independent of page capacity.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_index_bytes(&self) -> usize {
+        self.mem.cache_index_bytes()
+    }
+
+    /// Physically held cache-paid pages, including detached cursor aliases.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_held_bytes(&self) -> usize {
+        self.mem.read_cache_held_bytes()
+    }
+    /// Fraction of the supplied opaque page identifiers currently in the shared read cache.
+    /// Identifiers use the existing eight-byte root-page encoding. Each supplied
+    /// identifier contributes one observation; invalid identifiers count as absent,
+    /// and an empty input returns zero. This advisory observation may change during
+    /// concurrent reads/eviction and cannot establish snapshot validity.
+    ///
+    /// Performs one indexed lookup per identifier, locks only its stripe, allocates
+    /// nothing, performs no I/O, and does not change eviction priority. Dirty write
+    /// pages and detached page holders are not entries in the shared read cache.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
+        self.mem.read_cache_resident_fraction(page_ids)
+    }
+
+    /// Observe a bounded set of this statement's distinct page identifiers.
+    /// The live prepaid arena stores at most min(capacity/page_size, arena_slots/2) IDs.
+    /// Larger statements keep the first such set; the estimate is advisory.
+    /// No I/O or allocation is performed by observation or the final probe.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn with_read_cache_page_window<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> (R, Option<f64>) {
+        let (result, window) = self.mem.with_page_window(operation);
+        let mut resident = 0.0;
+        let mut count = 0.0;
+        let measured = window.visit(|id| {
+            resident += self.read_cache_resident_fraction(&[id]);
+            count += 1.0;
+        });
+        (result, (measured && count > 0.0).then(|| resident / count))
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {
+        self.mem.write_control_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cached_header_for_test(&self) -> Result<crate::CachePageForTest> {
+        self.mem.cached_header_for_test()
+    }
+
+    /// Number of recorded entries examined by the most recent window visit.
+    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn page_window_entries_visited_for_test(&self) -> usize {
+        self.mem.page_window_entries_visited_for_test()
+    }
+
+    /// Capture one internally funded retained root without ordinary table controls.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn begin_native_read(&self) -> Result<crate::NativeReadView> {
+        use crate::native_storage_admission::{
+            NativeStorageAdmission, NativeStorageShared, native_storage_error,
+        };
+        let admission = NativeStorageAdmission::retain_current()?;
+        let (id, root) = self.transaction_tracker.capture_native_read(&self.mem)?;
+        // Stack rollback owns this count before any fallible guard admission.
+        // capture_native_read has released tracker_state before construction.
+        let rollback = TransactionGuard::new_read(id, self.transaction_tracker.clone());
+        let guard = NativeStorageShared::new(rollback).map_err(native_storage_error)?;
+        Ok(crate::NativeReadView::new(
+            self.mem.clone(),
+            root,
+            id,
+            guard,
+            admission,
+        ))
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cache_allocations_for_test(
+        &self,
+        visit: &mut dyn FnMut((usize, usize, usize)),
+    ) -> usize {
+        self.mem.cache_allocations_for_test(visit)
+    }
+
+    /// Exact fixed cache-index allocation, separate from the configured page cap.
+    #[doc(hidden)]
+    pub fn cache_index_bytes(&self) -> usize {
+        self.mem.cache_index_bytes()
+    }
+
+    /// Retain the reader's original fixed source reserve through every native
+    /// cache alias. No new admission or writer registration occurs here.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn retain_cache_reserve(
+        &self,
+        reserve: crate::native_storage_admission::NativeStorageCredit,
+    ) -> crate::CacheReserveOwner {
+        self.mem.retain_cache_reserve(reserve)
+    }
+
     /// Opens an existing redb database.
     pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
         Builder::new().open_read_only(path)
+    }
+
+    /// Whether this handle's header says a writer died mid-run. Such a store
+    /// is read at its last verified commit through
+    /// [`ReadOnlyDatabase::crashed_snapshot_for_registration`].
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn writer_crashed(&self) -> bool {
+        self.mem.storage_failure()
+    }
+
+    /// The committed root an externally opened reader may register, judged
+    /// by exactly the clean-state predicates a native read-only open applies
+    /// -- header recovery flag, header length against the file, two-phase
+    /// commit, and an allocator-state table current for the last commit --
+    /// without loading any region's allocator. The caller must hold the
+    /// store's data lock so no writer can move the header while this reads it.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn committed_snapshot_for_registration(
+        &self,
+    ) -> Result<crate::StorageSnapshotIdentity, DatabaseError> {
+        if self.mem.storage_failure() {
+            return Err(DatabaseError::RepairAborted);
+        }
+        // One header page was read to open this handle; the two lookups below
+        // get the rest of the format-wide allowance, charged before each read.
+        #[cfg(feature = "test-seams")]
+        let budget = BUDGET_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(ADMISSION_PAGE_BUDGET);
+        #[cfg(not(feature = "test-seams"))]
+        let budget = ADMISSION_PAGE_BUDGET;
+        let (answer, spent) = self.mem.with_read_budget(budget.saturating_sub(1), || {
+            if allocator_state_is_current(&self.mem)? {
+                Ok(())
+            } else {
+                Err(DatabaseError::RepairAborted)
+            }
+        })?;
+        // Recorded whether the capture was answered or refused: a refused
+        // capture's receipt shows it stopped inside its budget.
+        LAST_ADMISSION_READ.with(|cell| {
+            cell.set(Some(AdmissionReadReceipt {
+                charged_pages: spent.charged_pages.saturating_add(1),
+                requests: spent.requests.saturating_add(1),
+            }));
+        });
+        answer?;
+        let transaction_id = self.mem.get_last_committed_transaction_id()?.raw_id();
+        let user_root = self
+            .mem
+            .get_data_root()
+            .map(|root| crate::StorageUserRootIdentity {
+                page: root.root.to_le_bytes(),
+                checksum: root.checksum,
+                length: root.length,
+            });
+        Ok(crate::StorageSnapshotIdentity {
+            transaction_id,
+            user_root,
+        })
+    }
+
+    /// The committed root a registered reader may read on a store whose writer
+    /// died, at the same fixed admission work as
+    /// [`Self::committed_snapshot_for_registration`] and without allocator
+    /// state, a tree walk or any write. The slot is the one a writer's repair
+    /// keeps: repair's own slot rule picks it from a fresh read of the header,
+    /// and only its user and system root pages are verified. A checksum
+    /// mismatch there falls back to the other slot exactly as repair does; a
+    /// refused budget, an I/O error or any other failure is returned as it is.
+    ///
+    /// That the root pages decide it rests on the writer's publication order:
+    /// every page of a commit reaches the file before a header naming it. The
+    /// caller must have established that the store's writer died on this boot
+    /// -- a machine crash can tear a commit below its roots -- and must hold
+    /// the store's data lock.
+    ///
+    /// `checkpoint` runs before the header and before every root read; an
+    /// error it returns stops the capture there, before that read, and is
+    /// returned as it is -- never mistaken for a checksum mismatch.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn crashed_snapshot_for_registration(
+        &self,
+        checkpoint: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> Result<crate::StorageSnapshotIdentity, DatabaseError> {
+        if !self.mem.storage_failure() {
+            return self.committed_snapshot_for_registration();
+        }
+        #[cfg(feature = "test-seams")]
+        let budget = BUDGET_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(ADMISSION_PAGE_BUDGET);
+        #[cfg(not(feature = "test-seams"))]
+        let budget = ADMISSION_PAGE_BUDGET;
+        let roots_verify = |stop: &mut dyn FnMut() -> Result<(), DatabaseError>,
+                            user: Option<BtreeHeader>,
+                            system: Option<BtreeHeader>| {
+            for root in [user, system].into_iter().flatten() {
+                stop()?;
+                let tree = TableTree::new(
+                    Some(root),
+                    PageHint::None,
+                    Arc::new(TransactionGuard::fake()),
+                    self.mem.clone(),
+                )?;
+                if !tree.verify_root_checksum()? {
+                    return Ok::<bool, DatabaseError>(false);
+                }
+            }
+            Ok(true)
+        };
+        let (answer, spent) = self.mem.with_read_budget(budget.saturating_sub(1), || {
+            let mut stop =
+                || checkpoint().map_err(|error| DatabaseError::Storage(StorageError::Io(error)));
+            stop()?;
+            let candidates = self.mem.crashed_commit_candidates()?;
+            let chosen = candidates.chosen;
+            if roots_verify(&mut stop, chosen.user_root, chosen.system_root)? {
+                return Ok(chosen);
+            }
+            if candidates.two_phase {
+                return Err(DatabaseError::Storage(StorageError::Corrupted(
+                    "Primary is corrupted despite 2-phase commit".to_string(),
+                )));
+            }
+            let alternate = candidates.alternate;
+            if roots_verify(&mut stop, alternate.user_root, alternate.system_root)? {
+                return Ok(alternate);
+            }
+            Err(DatabaseError::Storage(StorageError::Corrupted(
+                "Failed to read database. All roots are corrupted".to_string(),
+            )))
+        })?;
+        LAST_ADMISSION_READ.with(|cell| {
+            cell.set(Some(AdmissionReadReceipt {
+                charged_pages: spent.charged_pages.saturating_add(1),
+                requests: spent.requests.saturating_add(1),
+            }));
+        });
+        let slot = answer?;
+        Ok(crate::StorageSnapshotIdentity {
+            transaction_id: slot.transaction_id.raw_id(),
+            user_root: slot.user_root.map(|root| crate::StorageUserRootIdentity {
+                page: root.root.to_le_bytes(),
+                checksum: root.checksum,
+                length: root.length,
+            }),
+        })
     }
 
     /// Begin a checksum-verifying read at the exact user root captured when
@@ -470,7 +1029,7 @@ impl ReadOnlyDatabase {
         region_size: Option<u64>,
         cache_size: usize,
     ) -> Result<Self, DatabaseError> {
-        Self::new_inner(file, page_size, region_size, cache_size, false)
+        Self::new_inner(file, page_size, region_size, cache_size, false, false)
     }
 
     fn new_inner(
@@ -479,6 +1038,7 @@ impl ReadOnlyDatabase {
         region_size: Option<u64>,
         cache_size: usize,
         external_read: bool,
+        allocator_free: bool,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -492,11 +1052,13 @@ impl ReadOnlyDatabase {
             cache_size,
             true,
             external_read,
+            allocator_free,
         )?;
         let mem = Arc::new(mem);
         // External readers use a registered user root. Allocator state may
         // belong to a concurrently committing writer and is never consulted.
-        if !external_read {
+        // A reader never allocates, so an allocator-free handle loads none.
+        if !external_read && !allocator_free {
             if let Some(tree) = Database::get_allocator_state_table(&mem)? {
                 mem.load_allocator_state(&tree)?;
             } else {
@@ -516,6 +1078,358 @@ impl ReadOnlyDatabase {
         };
 
         Ok(db)
+    }
+}
+
+/// The most base pages a registered reader's root capture may read, header
+/// included: one header page, at most 4 system-tree pages (6 fixed system
+/// tables), at most 33 allocator-state branches at 2 requests each (a prefix
+/// window and the page), and at most 1 + 17x2 + 2 + 2 leaf window pages (a
+/// u16 entry count binary-searched by fixed-width key windows that may each
+/// straddle one page boundary, then the offsets and the 8-byte value).
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub const ADMISSION_PAGE_BUDGET: u64 = 1 + 4 + 66 + 1 + 34 + 2 + 2;
+
+/// What one root capture read, header included.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionReadReceipt {
+    pub charged_pages: u64,
+    pub requests: u64,
+}
+
+#[cfg(feature = "contextdb-internal")]
+thread_local! {
+    static LAST_ADMISSION_READ: std::cell::Cell<Option<AdmissionReadReceipt>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+thread_local! {
+    static BUDGET_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// While held, this thread's root captures use `pages` instead of the
+/// format-wide budget, so a proof can show a capture refused before it reads.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub struct AdmissionBudgetOverride(());
+
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub fn override_admission_page_budget_for_test(pages: u64) -> AdmissionBudgetOverride {
+    BUDGET_OVERRIDE.with(|cell| cell.set(Some(pages)));
+    AdmissionBudgetOverride(())
+}
+
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+impl Drop for AdmissionBudgetOverride {
+    fn drop(&mut self) {
+        BUDGET_OVERRIDE.with(|cell| cell.set(None));
+    }
+}
+
+/// Damage a CLOSED store in place, for proofs of the reader's clean-state
+/// verdict and its bounded root capture.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreDamage {
+    /// The header says a writer died mid-run.
+    RecoveryRequired,
+    /// The file is longer than the header's layout.
+    LayoutLengthMismatch,
+    /// The header says the primary was not written by two-phase commit.
+    TwoPhaseCommitUsed,
+    /// The system tree no longer names the allocator-state table.
+    AllocatorStateTableMissing,
+    /// The allocator state names a different transaction than the last commit.
+    AllocatorStateInvalid,
+    /// The allocator-state table's root pointer names the largest page order.
+    OversizedExtentPointer,
+    /// One region's saved allocator bitmap is garbage.
+    RegionPayloadMalformed,
+}
+
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+fn open_for_test(path: &Path) -> std::io::Result<ReadOnlyDatabase> {
+    let file = File::open(path)?;
+    Builder::new()
+        .open_read_only_external_with_backend(
+            crate::backends::FileBackend::new(file)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+fn allocator_state_table_root_for_test(
+    mem: &Arc<TransactionalMemory>,
+) -> std::io::Result<Option<crate::tree_store::BtreeHeader>> {
+    let tree = TableTree::new(
+        mem.get_system_root(),
+        PageHint::None,
+        Arc::new(TransactionGuard::fake()),
+        mem.clone(),
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let Some(definition) = tree
+        .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let InternalTableDefinition::Normal { table_root, .. } = definition else {
+        return Ok(None);
+    };
+    Ok(table_root)
+}
+
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+fn write_at_for_test(path: &Path, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.write_all_at(bytes, offset)?;
+    file.sync_all()
+}
+
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub fn damage_store_for_test(path: &Path, damage: StoreDamage) -> std::io::Result<()> {
+    use crate::tree_store::Page as _;
+    use crate::tree_store::rewrite_header_for_test;
+    match damage {
+        StoreDamage::RecoveryRequired => return rewrite_header_for_test(path, Some(true), None),
+        StoreDamage::TwoPhaseCommitUsed => return rewrite_header_for_test(path, None, Some(false)),
+        StoreDamage::LayoutLengthMismatch => {
+            let file = OpenOptions::new().write(true).open(path)?;
+            let len = file.metadata()?.len();
+            file.set_len(len + 4096)?;
+            return file.sync_all();
+        }
+        _ => {}
+    }
+    let db = open_for_test(path)?;
+    let mem = db.mem.clone();
+    let root = allocator_state_table_root_for_test(&mem)?
+        .ok_or_else(|| std::io::Error::other("the store has no allocator-state table"))?;
+    let other = |error: StorageError| std::io::Error::other(error.to_string());
+    let edit: (u64, Vec<u8>) = match damage {
+        StoreDamage::AllocatorStateInvalid | StoreDamage::RegionPayloadMalformed => {
+            let key = if damage == StoreDamage::AllocatorStateInvalid {
+                AllocatorStateKey::TransactionId
+            } else {
+                AllocatorStateKey::Region(0)
+            };
+            let (page, range) = crate::tree_store::fixed_key_value_location::<AllocatorStateKey>(
+                Some(root),
+                &mem,
+                PageHint::None,
+                &key,
+            )
+            .map_err(other)?
+            .ok_or_else(|| std::io::Error::other("the allocator-state key is absent"))?;
+            let start = mem.page_address_for_test(page).start + range.start as u64;
+            let bytes = if damage == StoreDamage::AllocatorStateInvalid {
+                let current = mem
+                    .get_last_committed_transaction_id()
+                    .map_err(other)?
+                    .raw_id();
+                current.wrapping_add(1).to_le_bytes().to_vec()
+            } else {
+                vec![0xFF; range.len()]
+            };
+            (start, bytes)
+        }
+        StoreDamage::AllocatorStateTableMissing | StoreDamage::OversizedExtentPointer => {
+            let system = mem
+                .get_system_root()
+                .ok_or_else(|| std::io::Error::other("the store has no system tree"))?;
+            let address = mem.page_address_for_test(system.root);
+            let page = mem.get_page(system.root, PageHint::None).map_err(other)?;
+            let bytes = page.memory();
+            let (needle, replacement): (Vec<u8>, Vec<u8>) =
+                if damage == StoreDamage::AllocatorStateTableMissing {
+                    let name = ALLOCATOR_STATE_TABLE_NAME.as_bytes().to_vec();
+                    let mut renamed = name.clone();
+                    *renamed.last_mut().expect("a name") ^= 0x20;
+                    (name, renamed)
+                } else {
+                    let current = root.root.to_le_bytes();
+                    let mut widened = u64::from_le_bytes(current);
+                    widened |= 0b0001_1111 << 59;
+                    (current.to_vec(), widened.to_le_bytes().to_vec())
+                };
+            let at = bytes
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+                .ok_or_else(|| {
+                    std::io::Error::other("the system tree root is not a leaf holding the table")
+                })?;
+            (address.start + at as u64, replacement)
+        }
+        _ => unreachable!("header damages returned above"),
+    };
+    drop(db);
+    write_at_for_test(path, edit.0, &edit.1)
+}
+
+/// Flips the last checksummed byte of a named table's root page in a closed
+/// store. The directory's header and checksum for that table stay as they were.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub fn damage_table_root_for_test(path: &Path, name: &str) -> std::io::Result<()> {
+    let db = open_for_test(path)?;
+    let mem = db.mem.clone();
+    let read = db
+        .begin_read()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let (page, at) = read
+        .table_root_damage_site_for_test(name)
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .ok_or_else(|| std::io::Error::other("the table has no root page"))?;
+    let offset = mem.page_address_for_test(page).start + at as u64;
+    let byte = crate::tree_store::Page::memory(
+        &mem.get_page(page, PageHint::None)
+            .map_err(|error| std::io::Error::other(error.to_string()))?,
+    )[at];
+    drop(read);
+    drop(db);
+    write_at_for_test(path, offset, &[byte ^ 0xFF])
+}
+
+/// The windowed and the full-page answers, in that order.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub type AllocatorStateLookups = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// The allocator-state `TransactionId` value as the windowed lookup and as
+/// the full-page lookup each find it, for equivalence proofs.
+#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+#[doc(hidden)]
+pub fn allocator_state_lookups_for_test(
+    path: &Path,
+) -> std::result::Result<AllocatorStateLookups, String> {
+    let db = open_for_test(path).map_err(|error| error.to_string())?;
+    let mem = db.mem.clone();
+    let Some(root) =
+        allocator_state_table_root_for_test(&mem).map_err(|error| error.to_string())?
+    else {
+        return Ok((None, None));
+    };
+    let windowed = match crate::tree_store::fixed_key_value_location::<AllocatorStateKey>(
+        Some(root),
+        &mem,
+        PageHint::None,
+        &AllocatorStateKey::TransactionId,
+    )
+    .map_err(|error| error.to_string())?
+    {
+        Some((page, range)) => Some(
+            mem.get_page_window(page, range, PageHint::None)
+                .map_err(|error| error.to_string())?
+                .to_vec(),
+        ),
+        None => None,
+    };
+    let tree = AllocatorStateTree::new(
+        Some(root),
+        PageHint::None,
+        Arc::new(TransactionGuard::fake()),
+        mem.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let full = tree
+        .get(&AllocatorStateKey::TransactionId)
+        .map_err(|error| error.to_string())?
+        .map(|value| value.value().to_vec());
+    Ok((windowed, full))
+}
+
+/// The receipt of this thread's last root capture.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub fn last_admission_read_receipt() -> Option<AdmissionReadReceipt> {
+    LAST_ADMISSION_READ.with(std::cell::Cell::get)
+}
+
+/// The native open's allocator-state verdict -- present, written by two-phase
+/// commit, and current for the last commit -- asked of the system tree and
+/// of the one `TransactionId` value through fixed-key windows, so no region
+/// bitmap or tracker value beside it is ever read.
+#[cfg(feature = "contextdb-internal")]
+fn allocator_state_is_current(mem: &Arc<TransactionalMemory>) -> Result<bool, DatabaseError> {
+    if !mem.used_two_phase_commit() {
+        return Ok(false);
+    }
+    let system_table_tree = TableTree::new(
+        mem.get_system_root(),
+        PageHint::None,
+        Arc::new(TransactionGuard::fake()),
+        mem.clone(),
+    )?;
+    let Some(allocator_state_table) = system_table_tree
+        .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+        .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?
+    else {
+        return Ok(false);
+    };
+    let InternalTableDefinition::Normal { table_root, .. } = allocator_state_table else {
+        unreachable!();
+    };
+    let Some((page, range)) = crate::tree_store::fixed_key_value_location::<AllocatorStateKey>(
+        table_root,
+        mem,
+        PageHint::None,
+        &AllocatorStateKey::TransactionId,
+    )?
+    else {
+        return Ok(false);
+    };
+    if range.len() != std::mem::size_of::<u64>() {
+        return Err(StorageError::Corrupted(
+            "allocator-state transaction value is not 8 bytes".to_owned(),
+        )
+        .into());
+    }
+    let value = mem.get_page_window(page, range, PageHint::None)?;
+    let recorded =
+        u64::from_le_bytes(<[u8; 8]>::try_from(&value[..]).map_err(|_| {
+            StorageError::Corrupted("allocator-state transaction value".to_owned())
+        })?);
+    Ok(recorded == mem.get_last_committed_transaction_id()?.raw_id())
+}
+
+/// An observation lease on the actual serving page cache. Cloning the existing
+/// memory owner allocates no control block. Callers release database handle
+/// locks before execution; page windows observe only this cache's identities.
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub struct ReadCacheObservation {
+    memory: Arc<TransactionalMemory>,
+}
+#[cfg(feature = "contextdb-internal")]
+impl ReadCacheObservation {
+    pub fn installed_capacity(&self) -> usize {
+        self.memory.installed_cache_capacity()
+    }
+    pub fn index_bytes(&self) -> usize {
+        self.memory.cache_index_bytes()
+    }
+    pub fn held_page_bytes(&self) -> usize {
+        self.memory.read_cache_held_bytes()
+    }
+    pub fn with_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, Option<f64>) {
+        let (result, window) = self.memory.with_page_window(operation);
+        let mut resident = 0.0;
+        let mut count = 0.0;
+        let measured = window.visit(|id| {
+            resident += self.memory.read_cache_resident_fraction(&[id]);
+            count += 1.0;
+        });
+        (result, (measured && count > 0.0).then(|| resident / count))
     }
 }
 
@@ -574,6 +1488,201 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn installed_cache_capacity_for_test(&self) -> usize {
+        self.mem.installed_cache_capacity_for_test()
+    }
+
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn with_read_cache_page_window_for_test<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> (R, Option<f64>) {
+        let (result, window) = self.mem.with_page_window(operation);
+        let mut resident = 0.0;
+        let mut count = 0.0;
+        let measured = window.visit_latest_for_test(|id| {
+            resident += self.read_cache_resident_fraction(&[id]);
+            count += 1.0;
+        });
+        (result, (measured && count > 0.0).then(|| resident / count))
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cached_header_for_test(&self) -> Result<crate::CachePageForTest> {
+        self.mem.cached_header_for_test()
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_observation(&self) -> ReadCacheObservation {
+        ReadCacheObservation {
+            memory: self.mem.clone(),
+        }
+    }
+
+    /// Exact live reader-registry backing plus its receipt, for one payer.
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
+        self.transaction_tracker
+            .reader_registry_charge_for_test(accountant)
+    }
+
+    /// Fraction of the supplied opaque page identifiers currently in the shared read cache.
+    /// Identifiers use the existing eight-byte root-page encoding. Each supplied
+    /// identifier contributes one observation; invalid identifiers count as absent,
+    /// and an empty input returns zero. This advisory observation may change during
+    /// concurrent reads/eviction and cannot establish snapshot validity.
+    ///
+    /// Performs one indexed lookup per identifier, locks only its stripe, allocates
+    /// nothing, performs no I/O, and does not change eviction priority. Dirty write
+    /// pages and detached page holders are not entries in the shared read cache.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
+        self.mem.read_cache_resident_fraction(page_ids)
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cache_controls_for_test(&self) -> [(usize, usize); 2] {
+        self.mem.controls_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn lifetime_aliases_for_test(
+        &self,
+    ) -> Result<(
+        crate::CachePageForTest,
+        crate::CachePageForTest,
+        crate::CacheWriteForTest,
+    )> {
+        self.mem.lifetime_aliases_for_test()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn detach_cached_guard_for_test<V: Value + 'static>(
+        &self,
+        guard: &crate::AccessGuard<'_, V>,
+    ) -> (u64, usize, usize, bool) {
+        self.mem.detach_cached_memory_for_test(
+            guard
+                .cached_memory_for_test()
+                .expect("fixture must retain a page"),
+        )
+    }
+
+    /// Capture a native retained read that authenticates every consumed page.
+    /// The ordinary native transaction guard remains responsible for retention.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn begin_verified_read(&self) -> Result<ReadTransaction, TransactionError> {
+        ReadTransaction::new_verified(self.get_memory(), self.allocate_read_transaction()?)
+    }
+
+    /// Capture one internally funded retained root without ordinary table controls.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn begin_native_read(&self) -> Result<crate::NativeReadView> {
+        self.begin_native_read_inner(false)
+    }
+
+    /// Borrow an existing retained root slot for short publication controls.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn begin_native_publication_read(&self) -> Result<crate::NativeReadView> {
+        self.begin_native_read_inner(true)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    fn begin_native_read_inner(&self, publication: bool) -> Result<crate::NativeReadView> {
+        use crate::native_storage_admission::{
+            NativeStorageAdmission, NativeStorageShared, native_storage_error,
+        };
+        let admission = NativeStorageAdmission::retain_current()?;
+        let (id, root) = if publication {
+            self.transaction_tracker
+                .capture_native_publication_read(&self.mem)?
+        } else {
+            self.transaction_tracker.capture_native_read(&self.mem)?
+        };
+        // Stack rollback owns this count before any fallible guard admission.
+        // capture_native_read has released tracker_state before construction.
+        let rollback = TransactionGuard::new_read(id, self.transaction_tracker.clone());
+        let guard = NativeStorageShared::new(rollback).map_err(native_storage_error)?;
+        Ok(crate::NativeReadView::new(
+            self.mem.clone(),
+            root,
+            id,
+            guard,
+            admission,
+        ))
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn cache_allocations_for_test(
+        &self,
+        visit: &mut dyn FnMut((usize, usize, usize)),
+    ) -> usize {
+        self.mem.cache_allocations_for_test(visit)
+    }
+
+    /// Exact fixed cache-index allocation, separate from the configured page cap.
+    #[doc(hidden)]
+    pub fn cache_index_bytes(&self) -> usize {
+        self.mem.cache_index_bytes()
+    }
+
+    /// The constant per-stripe lock controls within `cache_index_bytes`.
+    #[doc(hidden)]
+    pub fn cache_stripe_control_bytes(&self) -> usize {
+        self.mem.cache_stripe_control_bytes()
+    }
+
+    /// Settle a writer cache share before exposing its first reader root.
+    /// The caller must exclude concurrent database operations during startup.
+    /// The returned reserve covers the capacity and any still-held pages.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize, StorageError> {
+        self.mem.settle_startup_cache_budget(bytes)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn retire_read_cache_request(&self, request: u64) {
+        self.mem.retire_read_cache_request(request);
+    }
+
+    /// Retain the engine's original fixed cache invoice through physical free.
+    /// Call once at quiescent startup; the owner also seeds handle recycling.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn retain_cache_reserve(
+        &self,
+        reserve: crate::native_storage_admission::NativeStorageCredit,
+    ) -> crate::CacheReserveOwner {
+        self.mem.retain_cache_reserve(reserve)
+    }
+
+    /// Upper bound on the allocator's resident heap owner. Paged file
+    /// backends have a fixed envelope regardless of durable region count.
+    pub fn allocator_resident_bytes(&self) -> usize {
+        self.mem.allocator_resident_bytes()
+    }
+
+    /// Return `(loaded_regions, total_regions)` for allocator state.
+    pub fn allocator_region_counts(&self) -> (usize, usize) {
+        self.mem.allocator_region_counts()
+    }
+
     /// Opens the specified file as a redb database.
     /// * if the file does not exist, or is an empty file, a new database will be initialized in it
     /// * if the file is a valid redb database, it will be opened
@@ -627,9 +1736,19 @@ impl Database {
     /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
     /// alive when this method is called.
     pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
-        let allocator_hash = self.mem.allocator_hash();
+        // This repairs, so it refuses on a failed handle. Reopening repairs.
+        self.mem.check_io_errors()?;
+        if Arc::strong_count(&self.mem) != 1 {
+            return Err(DatabaseError::TransactionInProgress);
+        }
+        // The lazy allocator source holds a weak reference to this memory.
+        // Materialize it before Arc::get_mut, which requires no weak owners.
+        self.mem.materialize_allocator_source()?;
         let mem = Arc::get_mut(&mut self.mem).ok_or(DatabaseError::TransactionInProgress)?;
         let mut was_clean = mem.clear_cache_and_reload()?;
+        // The committed header may be smaller than a free tail left by an
+        // aborted write. Compare allocator states at committed geometry.
+        let allocator_hash = self.mem.allocator_hash();
 
         let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
 
@@ -787,6 +1906,119 @@ impl Database {
         move || tracker.has_waiting_write_transactions()
     }
 
+    /// The allocator's maintained `(free pages, region pages)` and the free
+    /// pages that end the last region, which a trim gives back without
+    /// relocation. Reads the maintained totals and the bounded tail run under
+    /// the allocator state lock, never a page or the full bitmap. `None` while
+    /// the totals are untrusted (repair in progress, a poisoned allocator
+    /// pager, or a failed rebuild), when no decision may use them.
+    #[doc(hidden)]
+    pub fn allocator_free_totals(&self) -> Option<(u64, u64, u64)> {
+        self.mem.allocator_free_totals()
+    }
+
+    /// Independent recount of every region's free bits, for agreement tests.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn allocator_free_totals_recount_for_test(&self) -> Result<(u64, u64, u64)> {
+        self.mem.recount_free_totals_for_test()
+    }
+
+    /// Per region: `(length, free pages, trailing free pages, highest free
+    /// order)`, from every region's bitmap. Test diagnostics only.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn region_free_pages_for_test(&self) -> Vec<(u32, u32, u32, Option<u8>)> {
+        self.mem.region_free_pages_for_test()
+    }
+
+    /// Whether a saved allocator-state table is still the lazy allocator
+    /// source, and the last page (region, page index) that table occupies.
+    /// Test diagnostics only.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn allocator_state_placement_for_test(&self) -> Result<(bool, Option<(u32, u32)>)> {
+        let saved_source = self.mem.has_saved_allocator_source();
+        let mut highest = None;
+        if let Some(tree) = Self::get_allocator_state_table(&self.mem)?
+            && let Some(root) = tree.get_root()
+        {
+            let pages = crate::tree_store::AllPageNumbersBtreeIter::new(
+                root.root,
+                <crate::transactions::AllocatorStateKey as Value>::fixed_width(),
+                <&[u8] as Value>::fixed_width(),
+                self.mem.clone(),
+                PageHint::None,
+            )?;
+            for page in pages {
+                let page = page?;
+                let last = ((page.page_index + 1) << page.page_order) - 1;
+                highest = highest.max(Some((page.region, last)));
+            }
+        }
+        Ok((saved_source, highest))
+    }
+
+    /// Drop trust in the maintained totals: the next save writes none, so the
+    /// next open rebuilds them.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn distrust_allocator_free_totals_for_test(&self) {
+        self.mem.distrust_free_totals_for_test();
+    }
+
+    /// At the entry of the next allocator save on the calling thread, after
+    /// that commit's last allocation and before anything is checked or
+    /// encoded, make region 0's allocator summary disagree with its own
+    /// words: invert one order-0 summary bit over a leaf word, leaving every
+    /// leaf as it is. The returned slot is filled when that save starts.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn plant_allocator_summary_mismatch_at_next_save_for_test()
+    -> Arc<std::sync::Mutex<Option<AllocatorSaveEntryPlant>>> {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&slot);
+        TransactionalMemory::before_next_allocator_save_for_test(Box::new(move |mem| {
+            let planted = mem.plant_allocator_summary_mismatch_for_test();
+            *record.lock().unwrap() = Some(AllocatorSaveEntryPlant {
+                planted: planted.map(|(at, _)| at),
+                mismatch_at_entry: planted.is_some_and(|(_, disagrees)| disagrees),
+            });
+        }));
+        slot
+    }
+
+    /// Change how the next allocator-state save on this thread treats the
+    /// free totals; the mode is consumed by that save.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn set_free_totals_save_for_test(mode: Option<FreeTotalsSaveForTest>) {
+        TransactionalMemory::set_free_totals_save_for_test(mode);
+    }
+
+    /// Install (or clear) a callback that runs on this thread as each
+    /// free-total rebuild begins, before any bitmap word is counted.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn set_free_total_recount_start_hook_for_test(hook: Option<Box<dyn Fn()>>) {
+        TransactionalMemory::set_free_total_recount_start_hook_for_test(hook);
+    }
+
+    /// Regions visited on the calling thread to compute free-total geometry,
+    /// cumulatively. Ordinary opens, saves, trims and resizes visit none.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn free_total_geometry_region_visits_for_test() -> u64 {
+        TransactionalMemory::free_total_geometry_region_visits_for_test()
+    }
+
+    /// Completed free-total rebuilds on the calling thread, cumulatively.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn free_total_recounts_for_test() -> u64 {
+        TransactionalMemory::free_total_recounts_for_test()
+    }
+
     #[doc(hidden)]
     pub fn storage_statistics_snapshot(&self) -> Result<crate::StorageStatisticsSnapshot> {
         let write = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -859,6 +2091,15 @@ impl Database {
         drop(system_tree);
         write.abort()?;
         Ok(counts)
+    }
+
+    /// Install the engine's process-local exact-root leases. Newly supplied
+    /// roots require a native pin, like authenticated external registrations.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn install_local_snapshot_provider(&self, provider: ExternalSnapshotProvider) {
+        self.transaction_tracker
+            .install_local_snapshot_provider(provider);
     }
 
     /// Begin a read at one root currently supplied by the authenticated
@@ -942,7 +2183,13 @@ impl Database {
             .is_allocated(crate::tree_store::PageNumber::from_le_bytes(page))
     }
 
-    #[cfg_attr(not(debug_assertions), expect(dead_code))]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(
+            dead_code,
+            reason = "KEEP-FEATURE: called only by debug-assertion checks"
+        )
+    )]
     fn check_repaired_allocated_pages_table(
         system_root: Option<BtreeHeader>,
         mem: Arc<TransactionalMemory>,
@@ -1157,7 +2404,7 @@ impl Database {
 
     #[allow(clippy::too_many_arguments)]
     fn new(
-        file: Box<dyn StorageBackend>,
+        file: impl Into<Backend>,
         allow_initialize: bool,
         page_size: usize,
         region_size: Option<u64>,
@@ -1165,7 +2412,9 @@ impl Database {
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
         external_snapshot_provider: Option<ExternalSnapshotProvider>,
         deferred_free_budget: (usize, usize),
+        keep_pace_reclaim: bool,
     ) -> Result<Self, DatabaseError> {
+        let file: Backend = file.into();
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
         #[cfg(feature = "logging")]
@@ -1178,6 +2427,7 @@ impl Database {
             cache_size,
             false,
             false,
+            false,
         )?;
         let mut mem = Arc::new(mem);
         // If the last transaction used 2-phase commit and updated the allocator state table, then
@@ -1187,7 +2437,12 @@ impl Database {
             info!("Found valid allocator state, full repair not needed");
             mem.load_allocator_state(&tree)?;
             #[cfg(debug_assertions)]
-            Self::mark_allocated_page_for_debug(&mut mem)?;
+            // Unit tests exercise the legacy exact-extent debug inventory.
+            // Normal file-backed writers keep that inventory empty so it
+            // cannot grow with the durable page count.
+            if cfg!(test) || !mem.uses_paged_allocator() {
+                Self::mark_allocated_page_for_debug(&mut mem)?;
+            }
         } else {
             #[cfg(feature = "logging")]
             warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
@@ -1216,6 +2471,7 @@ impl Database {
                 next_transaction_id,
                 external_snapshot_provider,
                 deferred_free_budget,
+                keep_pace_reclaim,
             )),
             read_only_handoff_prepared: false,
             #[cfg(feature = "test-seams")]
@@ -1322,18 +2578,30 @@ impl Database {
             );
             return Err(TransactionError::Storage(StorageError::DatabaseClosed));
         }
+        #[cfg(feature = "contextdb-internal")]
+        self.mem.check_publication_recovery()?;
         // Fail early if there has been an I/O error -- nothing can be committed in that case
         self.mem.check_io_errors()?;
         let guard = TransactionGuard::new_write(
             self.transaction_tracker.start_write_transaction(),
             self.transaction_tracker.clone(),
         );
+        // A writer that waited for the previous transaction must check again
+        // after taking exclusive ownership and before touching the live header.
+        #[cfg(feature = "contextdb-internal")]
+        self.mem.check_publication_recovery()?;
+        // The commit this writer queued behind may have failed during the wait.
+        self.mem.check_io_errors()?;
         self.transaction_tracker
             .refresh_external_snapshots(&self.mem)?;
         WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
             .map_err(|e| e.into())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
         // Make a new quick-repair commit to update the allocator state table
         #[cfg(feature = "logging")]
@@ -1351,16 +2619,16 @@ impl Database {
     /// extent and entry limits; a live snapshot leaves its protected backlog
     /// for a later writer instead of making shutdown wait for that reader.
     #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub fn drain_deferred_frees(&self) -> Result<(), Error> {
         loop {
             let mut tx = self.begin_write()?;
-            if self
-                .transaction_tracker
-                .oldest_live_read_transaction()
-                .is_some()
-                || self.transaction_tracker.any_savepoint_exists()
+            if self.transaction_tracker.any_savepoint_exists()
                 || tx.list_persistent_savepoints()?.next().is_some()
-                || !tx.pending_free_pages()?
+                || !tx.eligible_pending_free_pages()?
             {
                 tx.abort()?;
                 return Ok(());
@@ -1380,6 +2648,85 @@ impl Database {
         }
     }
 
+    /// Whether another writer is waiting for the write slot.
+    #[doc(hidden)]
+    pub fn has_waiting_write_transactions(&self) -> bool {
+        self.transaction_tracker.has_waiting_write_transactions()
+    }
+
+    /// One bounded maintenance reclaim step: an ordinary durable write transaction that frees at
+    /// most `extents` allocation extents and visits at most `entries` deferred-free entries, all
+    /// freed by transactions before both the reader floor and `boundary`.
+    ///
+    /// The first step of a cycle passes `None` and samples the boundary as its own write
+    /// transaction id, so every entry freed by an already committed transaction — including the
+    /// last one — is included, and every later commit's frees, including these steps' own
+    /// bookkeeping, are not. Later steps of the cycle pass the returned boundary back. Savepoints
+    /// block reclamation exactly as in `drain_deferred_frees`.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
+    pub fn reclaim_deferred_step(
+        &self,
+        boundary: Option<ReclaimBoundary>,
+        extents: usize,
+        entries: usize,
+    ) -> Result<ReclaimStep, Error> {
+        self.reclaim_deferred_step_with_hook(boundary, extents, entries, |_, _| Ok(false))
+    }
+
+    /// Join finite caller-owned garbage reclamation to the same durable step.
+    /// The hook must honor its own finite work bound and changes no reader floor.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Native refusals retain inline diagnostics."
+    )]
+    pub fn reclaim_deferred_step_with_hook(
+        &self,
+        boundary: Option<ReclaimBoundary>,
+        extents: usize,
+        entries: usize,
+        hook: impl FnOnce(&WriteTransaction, u64) -> Result<bool, StorageError>,
+    ) -> Result<ReclaimStep, Error> {
+        let mut tx = self.begin_write()?;
+        if self.transaction_tracker.any_savepoint_exists()
+            || tx.list_persistent_savepoints()?.next().is_some()
+        {
+            tx.abort()?;
+            return Ok(ReclaimStep::Blocked);
+        }
+        let boundary = boundary.map_or_else(|| tx.transaction_id(), |boundary| boundary.0);
+        let floor = self
+            .transaction_tracker
+            .oldest_live_read_transaction()
+            .map_or(tx.transaction_id(), |id| id.next());
+        let caller_progress = hook(&tx, boundary.raw_id())?;
+        if !tx.pending_free_pages_before(TransactionId::min(floor, boundary))? {
+            let held = tx.pending_free_pages_before(boundary)?;
+            if caller_progress {
+                tx.set_deferred_free_budget(extents, entries);
+                tx.set_reclaim_ceiling(boundary);
+                tx.commit()?;
+                return Ok(ReclaimStep::Progressed(ReclaimBoundary(boundary)));
+            }
+            tx.abort()?;
+            return Ok(if held {
+                ReclaimStep::ReaderHeld
+            } else {
+                ReclaimStep::Drained
+            });
+        }
+        tx.set_deferred_free_budget(extents, entries);
+        tx.set_reclaim_ceiling(boundary);
+        tx.commit()?;
+        Ok(ReclaimStep::Progressed(ReclaimBoundary(boundary)))
+    }
+
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn fail_next_deferred_free_commit_for_test(&self) {
@@ -1387,10 +2734,60 @@ impl Database {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Cap every later growth of the file at `ratio` of its usable size at
+    /// that moment, rounded down to whole bytes and never up, and never less
+    /// than twice the allocation that needs it. The ratio is kept exactly; a
+    /// ratio that is not positive restores upstream's doubling, and one above
+    /// 1 is held at 1. The caller derives the ratio from its own declared
+    /// policy. A storage quota refusal still retries at the allocation's
+    /// minimum.
+    #[cfg(feature = "contextdb-internal")]
+    pub fn set_growth_step_ratio(&self, ratio: f64) {
+        self.mem.set_growth_step_ratio(ratio);
+    }
+
+    /// The growth step ratio this handle applies, exactly as set, or `None`
+    /// for upstream's doubling.
+    #[cfg(feature = "contextdb-internal")]
+    pub fn growth_step_ratio(&self) -> Option<f64> {
+        self.mem.growth_step_ratio()
+    }
+
+    /// Test-only: the most one growth of `usable` bytes may add for a
+    /// request of `required` bytes under the installed step, or `None` for
+    /// upstream's growth.
+    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn growth_step_for_test(&self, usable: u64, required: u64) -> Option<u64> {
+        self.mem.growth_step(usable, required)
+    }
+
+    /// Observe the actual allocator's minimum retry layout without allocating.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn allocation_plan_for_test(
+        &self,
+        allocation_size: usize,
+        withhold_reusable_space: bool,
+    ) -> Result<crate::allocation_observation::AllocationPlanForTest, StorageError> {
+        self.mem
+            .allocation_plan_for_test(allocation_size, withhold_reusable_space)
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __commit_failure_latched_for_test(&self) -> bool {
+        self.mem.commit_failure_latched()
+    }
+
     /// Finish writable housekeeping while the caller still owns its writer
     /// lock, then allow read-only opens over the committed root during a
     /// graceful drain. The caller must prevent all later writes. Drop releases
     /// this handle without another housekeeping or header write.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub fn prepare_read_only_handoff(&mut self) -> Result<(), Error> {
         if !self.read_only_handoff_prepared {
             self.ensure_allocator_state_table_and_trim()?;
@@ -1399,6 +2796,25 @@ impl Database {
         }
         Ok(())
     }
+}
+
+/// The exclusive freeing-transaction boundary a maintenance reclaim cycle sampled on its first step.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimBoundary(TransactionId);
+
+/// What one bounded maintenance reclaim step did.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimStep {
+    /// Reclaimed eligible entries below the boundary and committed.
+    Progressed(ReclaimBoundary),
+    /// Nothing remains below the boundary.
+    Drained,
+    /// Entries remain below the boundary, but a live reader or snapshot still protects all of them.
+    ReaderHeld,
+    /// A savepoint exists, so nothing may be reclaimed.
+    Blocked,
 }
 
 impl Drop for Database {
@@ -1458,6 +2874,7 @@ pub struct Builder {
     cache_size: usize,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
     deferred_free_budget: (usize, usize),
+    keep_pace_reclaim: bool,
 }
 
 impl Builder {
@@ -1478,6 +2895,7 @@ impl Builder {
             cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
             deferred_free_budget: (usize::MAX, usize::MAX),
+            keep_pace_reclaim: false,
         }
     }
 
@@ -1524,13 +2942,23 @@ impl Builder {
         self
     }
 
+    /// Let each durable commit reclaim at least as many deferred extents (and entries) as it
+    /// freed itself, above the configured budget, so an active writer's backlog cannot grow while
+    /// eligible work exists. Reclamation still never passes the reader floor.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn set_keep_pace_reclaim(&mut self, keep_pace: bool) -> &mut Self {
+        self.keep_pace_reclaim = keep_pace;
+        self
+    }
+
     /// Set the amount of memory (in bytes) used for caching data
     pub fn set_cache_size(&mut self, bytes: usize) -> &mut Self {
         self.cache_size = bytes;
         self
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, fuzzing, feature = "test-seams"))]
     pub fn set_region_size(&mut self, size: u64) -> &mut Self {
         assert!(size.is_power_of_two());
         self.region_size = Some(size);
@@ -1542,6 +2970,7 @@ impl Builder {
     /// * if the file is a valid redb database, it will be opened
     /// * otherwise this function will return an error
     pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
+        let path = path.as_ref();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1550,7 +2979,7 @@ impl Builder {
             .open(path)?;
 
         Database::new(
-            Box::new(FileBackend::new(file)?),
+            Box::new(FileBackend::new_with_path(file, path)?),
             true,
             self.page_size,
             self.region_size,
@@ -1558,15 +2987,17 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
     /// Opens an existing redb database.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
+        let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         Database::new(
-            Box::new(FileBackend::new(file)?),
+            Box::new(FileBackend::new_with_path(file, path)?),
             false,
             self.page_size,
             None,
@@ -1574,6 +3005,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1594,6 +3026,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1614,6 +3047,7 @@ impl Builder {
             &self.repair_callback,
             Some(provider),
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1663,6 +3097,28 @@ impl Builder {
             None,
             self.cache_size,
             true,
+            false,
+        )
+    }
+
+    /// Like [`Self::open_read_only_with_backend`], without building or
+    /// loading any allocator state: a reader never allocates. A file whose
+    /// writer died is refused with [`DatabaseError::RepairAborted`], as by
+    /// every read-only open; a registered reader reads such a file through
+    /// [`ReadOnlyDatabase::crashed_snapshot_for_registration`].
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_read_only_allocator_free_with_backend(
+        &self,
+        backend: impl StorageBackend,
+    ) -> Result<ReadOnlyDatabase, DatabaseError> {
+        ReadOnlyDatabase::new_inner(
+            Box::new(backend),
+            self.page_size,
+            None,
+            self.cache_size,
+            false,
+            true,
         )
     }
 
@@ -1679,6 +3135,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1700,6 +3157,46 @@ impl Builder {
             &self.repair_callback,
             Some(provider),
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
+        )
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn create_with_native_backend_and_external_snapshots(
+        &self,
+        backend: impl NativeStorageBackend,
+        provider: ExternalSnapshotProvider,
+    ) -> Result<Database, DatabaseError> {
+        Database::new(
+            Backend::Native(Box::new(backend)),
+            true,
+            self.page_size,
+            self.region_size,
+            self.cache_size,
+            &self.repair_callback,
+            Some(provider),
+            self.deferred_free_budget,
+            self.keep_pace_reclaim,
+        )
+    }
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_with_native_backend_and_external_snapshots(
+        &self,
+        backend: impl NativeStorageBackend,
+        provider: ExternalSnapshotProvider,
+    ) -> Result<Database, DatabaseError> {
+        Database::new(
+            Backend::Native(Box::new(backend)),
+            false,
+            self.page_size,
+            None,
+            self.cache_size,
+            &self.repair_callback,
+            Some(provider),
+            self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 
@@ -1717,6 +3214,7 @@ impl Builder {
             &self.repair_callback,
             None,
             self.deferred_free_budget,
+            self.keep_pace_reclaim,
         )
     }
 }
@@ -1733,6 +3231,7 @@ mod open_with_backend_region_override_tests;
 
 #[cfg(test)]
 mod test {
+    use crate::atomic_compat::AtomicUpdate as _;
     use crate::backends::FileBackend;
     use crate::{
         CommitError, Database, DatabaseError, Durability, ReadableDatabase, ReadableTable,
@@ -1961,7 +3460,7 @@ mod test {
         fn decrement_countdown(&self) -> Result<(), std::io::Error> {
             if self
                 .countdown
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                .fetch_update_compat(Ordering::SeqCst, Ordering::SeqCst, |x| {
                     if x > 0 { Some(x - 1) } else { None }
                 })
                 .is_err()
@@ -2355,5 +3854,492 @@ mod test {
                 if err.kind() == ErrorKind::InvalidData => {}
             err => panic!("Unexpected error for empty file: {err}"),
         }
+    }
+}
+
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+impl ReadCacheObservation {
+    pub fn native_cache_occupancy_for_test(
+        &self,
+    ) -> crate::native_page_observations::NativeCacheOccupancyForTest {
+        self.memory.native_cache_occupancy_for_test()
+    }
+    pub fn evict_unpinned_clean_pages_for_test(
+        &self,
+    ) -> (
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+        crate::native_page_observations::NativeCacheOccupancyForTest,
+    ) {
+        self.memory.evict_unpinned_clean_pages_for_test()
+    }
+}
+
+/// An allocator whose regional summary disagrees with its own words
+/// is never saved. The quick-repair commit that finds it publishes no
+/// allocator table, the handle keeps refusing through later commits, Drop and
+/// a read-only handoff, the next open takes the full repair, and the running
+/// writer reaches the free space the summary hid without growing the file.
+#[cfg(test)]
+mod allocator_save_check_contract {
+    use super::{Builder, Database, ReadOnlyDatabase, TransactionGuard};
+    use crate::transactions::{
+        ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTreeMut,
+    };
+    use crate::tree_store::{
+        BtreeMut, PageHint, PageTrackerPolicy, TableTree, TableType, TransactionalMemory,
+    };
+    use crate::{DatabaseError, ReadableDatabase, TableDefinition};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const ROWS: TableDefinition<u64, &[u8]> = TableDefinition::new("save_check_rows");
+    /// One row per leaf page, so freeing rows frees single pages.
+    const VALUE_BYTES: usize = 3000;
+    /// Enough rows that region 0's order-0 bitmap has two leaf-parent words.
+    const ROW_COUNT: u64 = 5000;
+
+    fn value(key: u64) -> Vec<u8> {
+        vec![(key % 251) as u8; VALUE_BYTES]
+    }
+
+    /// Opens an existing store; reports whether the open ran the full repair
+    /// instead of loading a saved allocator table. Only reopens are counted:
+    /// a fresh `create` has no allocator table and always takes that path.
+    fn reopen(path: &Path) -> (Database, bool) {
+        let repaired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&repaired);
+        let mut builder = Builder::new();
+        builder.set_repair_callback(move |_| flag.store(true, Ordering::SeqCst));
+        let db = builder.open(path).expect("reopen");
+        (db, repaired.load(Ordering::SeqCst))
+    }
+
+    /// Rows `0..ROW_COUNT` in one region, then the rows `removed` deleted
+    /// and their pages reclaimed, so region 0 holds free single pages where
+    /// those rows were.
+    fn fixture(path: &Path, removed: impl Iterator<Item = u64>) -> Database {
+        let db = build_fixture(Builder::new(), path, ROW_COUNT, removed);
+        assert_eq!(
+            db.mem.region_count_for_test(),
+            1,
+            "fixture must stay in one region"
+        );
+        db
+    }
+
+    /// Rows `0..rows` in stores made by `builder`, then the rows `removed`
+    /// deleted and their pages reclaimed; every summary starts exact.
+    fn build_fixture(
+        builder: Builder,
+        path: &Path,
+        rows: u64,
+        removed: impl Iterator<Item = u64>,
+    ) -> Database {
+        let db = builder.create(path).expect("create fixture");
+        for batch in 0..rows / 500 {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(ROWS).unwrap();
+                for key in batch * 500..(batch + 1) * 500 {
+                    table.insert(key, value(key).as_slice()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(ROWS).unwrap();
+            for key in removed {
+                table.remove(key).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        db.drain_deferred_frees().unwrap();
+        #[cfg(debug_assertions)]
+        assert!(
+            db.mem.uses_paged_allocator(),
+            "fixture must use the paged allocator"
+        );
+        assert!(
+            db.mem.summary_mismatches_for_test().is_empty(),
+            "fixture must start exact: {:?}",
+            db.mem.summary_mismatches_for_test()
+        );
+        db
+    }
+
+    fn removed_low() -> impl Iterator<Item = u64> {
+        (100..1200).step_by(2)
+    }
+
+    fn removed_high() -> impl Iterator<Item = u64> {
+        (4600..4900).step_by(2)
+    }
+
+    /// Whether the committed system directory holds an allocator table at
+    /// all, read from the system root without the staleness check.
+    fn allocator_table_present(mem: &Arc<TransactionalMemory>) -> bool {
+        TableTree::new(
+            mem.get_system_root(),
+            PageHint::None,
+            Arc::new(TransactionGuard::fake()),
+            mem.clone(),
+        )
+        .unwrap()
+        .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+        .unwrap()
+        .is_some()
+    }
+
+    fn quick_repair_commit(db: &Database, key: u64) {
+        let mut write = db.begin_write().unwrap();
+        write.set_quick_repair(true);
+        write
+            .open_table(ROWS)
+            .unwrap()
+            .insert(key, value(key).as_slice())
+            .unwrap();
+        write
+            .commit()
+            .expect("a refused allocator save is not a failed commit");
+    }
+
+    fn assert_rows(db: &Database, present: impl Iterator<Item = u64>) {
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(ROWS).unwrap();
+        for key in present {
+            let row = table
+                .get(key)
+                .unwrap()
+                .unwrap_or_else(|| panic!("row {key} lost"));
+            assert_eq!(row.value(), value(key).as_slice(), "row {key} changed");
+        }
+    }
+
+    /// The order-0 summary level a plant targets.
+    #[derive(Clone, Copy, Debug)]
+    enum Level {
+        /// The level directly above the leaf words.
+        LeafParent,
+        /// The level above that.
+        Upper,
+    }
+
+    /// Plant one wrong order-0 summary bit, away from each level's last word:
+    /// `full` over a word that is not full, or not-full over a full word.
+    fn plant(mem: &TransactionalMemory, level: Level, full: bool) -> (u32, u32) {
+        let levels = mem.summary_levels_for_test(0, 0);
+        assert!(levels.len() >= 3, "order 0 needs three levels: {levels:?}");
+        let child_height = match level {
+            Level::LeafParent => u32::try_from(levels.len()).unwrap() - 1,
+            Level::Upper => u32::try_from(levels.len()).unwrap() - 2,
+        };
+        let height = child_height - 1;
+        let child_words = levels[child_height as usize].div_ceil(64);
+        assert!(
+            child_words >= 2,
+            "{level:?}: the child level needs two words: {levels:?}"
+        );
+        let entry = (0..child_words - 1)
+            .find(|&word| (mem.summary_word_for_test(0, 0, child_height, word) == u64::MAX) != full)
+            .unwrap_or_else(|| panic!("{level:?}: no non-last word to plant full={full} over"));
+        mem.plant_summary_bit_for_test(0, 0, height, entry, full);
+        assert!(
+            mem.summary_mismatches_for_test()
+                .contains(&(0, 0, height, entry)),
+            "the plant at height {height} entry {entry} did not take"
+        );
+        (height, entry)
+    }
+
+    /// Plant at the entry of the quick-repair commit's allocator save, after
+    /// the commit's last allocation, so nothing the commit allocates can
+    /// clear it; then refuse, keep refusing, close, and repair on reopen.
+    /// `handoff` closes through `prepare_read_only_handoff` instead of plain
+    /// Drop.
+    fn refusal_lifecycle(
+        level: Level,
+        full: bool,
+        removed: fn() -> Box<dyn Iterator<Item = u64>>,
+        handoff: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latched.redb");
+        let context = format!("{level:?} full={full} handoff={handoff}");
+        {
+            let mut db = fixture(&path, removed());
+            let at_save = Arc::new(Mutex::new(None));
+            {
+                let at_save = Arc::clone(&at_save);
+                TransactionalMemory::before_next_allocator_save_for_test(Box::new(move |mem| {
+                    let planted = plant(mem, level, full);
+                    *at_save.lock().unwrap() = Some((planted, mem.summary_mismatches_for_test()));
+                }));
+            }
+            quick_repair_commit(&db, ROW_COUNT);
+            let (planted, at_entry) = at_save.lock().unwrap().take().unwrap_or_else(|| {
+                panic!("{context}: the quick-repair commit never reached the allocator save")
+            });
+            assert!(
+                at_entry.contains(&(0, 0, planted.0, planted.1)),
+                "{context}: the plant at {planted:?} was not present at the allocator save's entry: {at_entry:?}"
+            );
+            assert!(
+                !allocator_table_present(&db.mem),
+                "{context}: the quick-repair commit after the plant at {planted:?} published an allocator table"
+            );
+            quick_repair_commit(&db, ROW_COUNT + 1);
+            assert!(
+                !allocator_table_present(&db.mem),
+                "{context}: a later quick-repair commit on the refusing handle published an allocator table"
+            );
+
+            // A healthy database open in the same process still saves.
+            let other_path = dir.path().join("healthy.redb");
+            let other = fixture(&other_path, removed_low());
+            quick_repair_commit(&other, ROW_COUNT);
+            assert!(
+                allocator_table_present(&other.mem),
+                "{context}: one database's refusal stopped another database's allocator save"
+            );
+            drop(other);
+
+            if handoff {
+                db.prepare_read_only_handoff().unwrap();
+            }
+        }
+        assert!(
+            matches!(
+                ReadOnlyDatabase::open(&path),
+                Err(DatabaseError::RepairAborted)
+            ),
+            "{context}: the closed refusing store still carries an allocator table a reader trusts"
+        );
+        let (mut reopened, repaired) = reopen(&path);
+        assert!(
+            repaired,
+            "{context}: the reopen of a refusing store must take the full repair"
+        );
+        let removed: std::collections::HashSet<u64> = removed().collect();
+        assert_rows(
+            &reopened,
+            (0..ROW_COUNT + 2).filter(|key| !removed.contains(key)),
+        );
+        assert!(
+            reopened.check_integrity().unwrap(),
+            "{context}: repaired store fails its integrity check"
+        );
+        assert!(
+            reopened.mem.summary_mismatches_for_test().is_empty(),
+            "{context}: the repaired allocator is not exact"
+        );
+    }
+
+    #[test]
+    fn full_over_free_at_a_leaf_parent_refuses_the_save_through_drop_and_repairs() {
+        refusal_lifecycle(Level::LeafParent, true, || Box::new(removed_low()), false);
+    }
+
+    #[test]
+    fn not_full_over_full_at_a_leaf_parent_refuses_the_save_through_handoff_and_repairs() {
+        refusal_lifecycle(Level::LeafParent, false, || Box::new(removed_low()), true);
+    }
+
+    #[test]
+    fn full_over_free_at_an_upper_level_refuses_the_save_and_repairs() {
+        refusal_lifecycle(Level::Upper, true, || Box::new(removed_low()), false);
+    }
+
+    #[test]
+    fn not_full_over_full_at_an_upper_level_refuses_the_save_and_repairs() {
+        refusal_lifecycle(Level::Upper, false, || Box::new(removed_high()), false);
+    }
+
+    /// Control: an exact allocator saves its table on every quick-repair
+    /// commit and reopens without repair.
+    #[test]
+    fn an_exact_allocator_saves_and_reopens_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.redb");
+        {
+            let db = fixture(&path, removed_low());
+            quick_repair_commit(&db, ROW_COUNT);
+            assert!(
+                allocator_table_present(&db.mem),
+                "an exact allocator must be saved"
+            );
+        }
+        assert!(
+            ReadOnlyDatabase::open(&path).is_ok(),
+            "a cleanly closed exact store must open read-only"
+        );
+        let (reopened, repaired) = reopen(&path);
+        assert!(!repaired, "an exact store must reopen without repair");
+        // Drop trimmed the file after the save, so this open installed the
+        // saved allocator under a shorter geometry: the production install.
+        let mismatches = reopened.mem.summary_mismatches_for_test();
+        assert!(
+            mismatches.is_empty(),
+            "the reopen installed an inexact allocator at (region, order, height, entry) {mismatches:?}"
+        );
+    }
+
+    /// Region size of the running-writer store: 4 MiB, 1,024 pages, so its
+    /// rows span several regions and region 0 is not the last one.
+    const SMALL_REGION_BYTES: u64 = 4 << 20;
+    /// Rows the reuse write adds; each needs at least one new leaf page.
+    const REUSED_ROWS: u64 = 200;
+
+    /// The running writer: region 0, which is not the last region, holds
+    /// free pages its summary hides. A write cannot allocate there, so the
+    /// writer learns region 0 as full and allocates elsewhere. A reader held
+    /// throughout keeps every later free pending, so nothing frees a page
+    /// into region 0, and growth of the last region never re-marks it. The
+    /// next quick-repair commit refuses the save and rebuilds. That commit
+    /// may itself grow the file: it allocates before its save finds the
+    /// hidden summary. After it, the next write on the same handle must take
+    /// its pages from region 0's recovered space, without growing the file
+    /// and without a reopen.
+    #[test]
+    fn the_running_writer_reuses_space_a_refused_save_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("running.redb");
+        let mut builder = Builder::new();
+        builder.set_region_size(SMALL_REGION_BYTES);
+        let db = build_fixture(builder, &path, ROW_COUNT, (100..900).step_by(2));
+        let regions = db.mem.region_count_for_test();
+        assert!(
+            regions >= 2,
+            "fixture: region 0 must not be the last region ({regions} regions)"
+        );
+        let hidden = db.mem.region_counted_free_pages_for_test(0);
+        assert!(
+            u64::from(hidden) >= REUSED_ROWS + 100,
+            "fixture: region 0 must hold the freed pages: {hidden}"
+        );
+        // Every free from here on stays pending while this reader is open.
+        let reader = db.begin_read().unwrap();
+
+        // Hide every word of region 0 that holds a free block, at every order.
+        for order in 0..=db.mem.region_max_order_for_test(0) {
+            let levels = db.mem.summary_levels_for_test(0, order);
+            if levels.len() < 2 {
+                continue;
+            }
+            let leaf = u32::try_from(levels.len()).unwrap() - 1;
+            for word in 0..levels[leaf as usize].div_ceil(64) {
+                if db.mem.summary_word_for_test(0, order, leaf, word) != u64::MAX {
+                    db.mem
+                        .plant_summary_bit_for_test(0, order, leaf - 1, word, true);
+                }
+            }
+        }
+
+        // The writer finds no free page in region 0 and learns it as full.
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(ROWS)
+            .unwrap()
+            .insert(ROW_COUNT, value(ROW_COUNT).as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            db.mem.region_counted_free_pages_for_test(0),
+            hidden,
+            "fixture: the write allocated from the hidden region"
+        );
+        assert!(
+            db.mem.region_marked_full_for_test(0, 0),
+            "fixture: the writer did not learn region 0 as full"
+        );
+
+        // The quick-repair commit refuses the save and rebuilds.
+        quick_repair_commit(&db, ROW_COUNT + 1);
+        assert!(
+            !allocator_table_present(&db.mem),
+            "the hiding summary was saved"
+        );
+        assert!(
+            db.mem.summary_mismatches_for_test().is_empty(),
+            "the refused save left region summaries inexact: {:?}",
+            db.mem.summary_mismatches_for_test()
+        );
+
+        // The next write takes its new pages from region 0's recovered
+        // space, measured from the end of the refusing commit.
+        let after_refusal = db.mem.layout_len_for_test();
+        let free_after_refusal = db.mem.region_counted_free_pages_for_test(0);
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(ROWS).unwrap();
+            for key in ROW_COUNT + 2..ROW_COUNT + 2 + REUSED_ROWS {
+                table.insert(key, value(key).as_slice()).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        let reused = free_after_refusal - db.mem.region_counted_free_pages_for_test(0);
+        assert!(
+            u64::from(reused) >= REUSED_ROWS,
+            "after the refused save, the running writer took {reused} of region 0's \
+             {free_after_refusal} recovered pages for {REUSED_ROWS} new rows: region 0 is \
+             still learned as full"
+        );
+        assert!(
+            db.mem.layout_len_for_test() <= after_refusal,
+            "the writer grew the file from {after_refusal} to {} bytes while region 0 held \
+             {free_after_refusal} recovered free pages",
+            db.mem.layout_len_for_test()
+        );
+        assert!(db.mem.summary_mismatches_for_test().is_empty());
+        drop(reader);
+    }
+
+    /// Rows of the save-cost store: about 60,000 pages in one region.
+    const MEASURED_ROWS: u64 = 60_000;
+
+    /// A measurement, not a gate: allocator window loads and word reads of
+    /// the production allocator save, `try_save_allocator_state` with its
+    /// summary check, on a fragmented one-region store at the minimum
+    /// window budget. The save must report success, so the check passed.
+    /// Run with `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "allocator paging measurement runs only when explicitly requested"]
+    fn measure_the_checked_allocator_save_at_the_minimum_window_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("measured.redb");
+        let db = build_fixture(
+            Builder::new(),
+            &path,
+            MEASURED_ROWS,
+            (0..MEASURED_ROWS).filter(|key| key % 7 == 3),
+        );
+        db.mem.set_allocator_window_budget_for_test(0);
+        let mut tree: AllocatorStateTreeMut = BtreeMut::new(
+            None,
+            Arc::new(TransactionGuard::fake()),
+            db.mem.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(PageTrackerPolicy::Ignore)),
+        );
+        let transaction_id = db.mem.get_last_committed_transaction_id().unwrap().next();
+        let regions = db
+            .mem
+            .reserve_allocator_state(&mut tree, transaction_id)
+            .unwrap();
+        let before = db.mem.allocator_paging_counters_for_test();
+        let outcome = format!("{:?}", db.mem.try_save_allocator_state(&mut tree, regions));
+        let after = db.mem.allocator_paging_counters_for_test();
+        assert!(
+            matches!(outcome.as_str(), "Ok(true)" | "Ok(Saved)"),
+            "the checked save of an exact allocator did not save: {outcome}"
+        );
+        println!(
+            "ALLOCATOR-SAVE regions={regions} layout_len={} free_pages={} outcome={outcome} (word_reads, window_loads, scratch_reads): save={:?}",
+            db.mem.layout_len_for_test(),
+            db.mem.region_counted_free_pages_for_test(0),
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+        );
+        drop(tree);
     }
 }

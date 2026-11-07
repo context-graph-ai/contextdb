@@ -43,8 +43,7 @@ cargo build --release -p contextdb-cli
 contextdb ./my.db --write
 ```
 
-`--write` creates the store if it is missing and authorizes mutation. `:memory:` is always
-writable with no flag; a file-backed store is different — see
+`--write` creates the store if it is missing and authorizes mutation — see
 [`docs/cli.md`](cli.md#cli-client-contextdb). Example tables such as `decisions` are yours to
 define; see the [README](https://github.com/context-graph-ai/contextdb/blob/dev/README.md).
 
@@ -177,11 +176,6 @@ and let the two copies drift, three sentences and where each one is spelled out 
   [Exit Codes](cli.md#exit-codes).
   <!-- enforced by: read_cli_journeys_session_shape::a_piped_session_is_a_full_session_including_the_cursor -->
 
-### 3. Scratch space
-
-`contextdb :memory:` is a disposable, always-writable playground — no file, no `--write`
-needed, gone on exit. <!-- enforced by: read_cli_journeys_invocation::memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op -->
-
 ## Indexes and Scale
 
 contextdb is designed for agents holding tens of thousands of entities with
@@ -219,6 +213,9 @@ the first column of any declared or auto-index reports `Scan`.
 
 ## Rank Vector Search by Outcomes
 
+This release ships exact vector search: `AUTO` searches exactly and `INDEXED` is unavailable.
+<!-- enforced by: a_search_is_exact_with_no_index_built::an_auto_find_answers_exactly_after_commit_with_no_maintenance, a_search_is_exact_with_no_index_built::indexed_is_refused_at_every_door -->
+
 Vector search does not have to rank by cosine similarity alone. Declare a `RANK_POLICY` on the
 vector column and every caller asking for the same `SORT_KEY` gets the same outcome-weighted
 ordering — resolved at DDL time, stored with the schema, and replicated through sync — so the row
@@ -228,7 +225,7 @@ application copies formula text into its queries.
 - Grammar — `RANK_POLICY`, `JOIN`, the `FORMULA` placeholders, `SORT_KEY`, `USE RANK`:
   [`docs/query-language.md`](query-language.md#rank-policies).
 - Runnable walkthrough with the expected ordering, the same query without `USE RANK` for
-  contrast, the join-index requirement, the HNSW/ANN caveat, and how to change a policy:
+  contrast, the join-index requirement, the approximate-search caveat, and how to change a policy:
   [`skills/vector-search/SKILL.md`](../skills/vector-search/SKILL.md).
 
 ## Use as a Library

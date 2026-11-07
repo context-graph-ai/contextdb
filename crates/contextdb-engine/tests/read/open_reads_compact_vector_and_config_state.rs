@@ -127,7 +127,7 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
     .expect("declare final table trigger");
     schema_wall::largest::prepare_existing_rows_and_vectors(&db);
     db.execute(
-        "CREATE TABLE generation_probe (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED AUTO_INDEX_AT 1) SYNC OFF",
+        "CREATE TABLE generation_probe (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE EXACT) SYNC OFF",
         &HashMap::new(),
     )
     .expect("declare generation control");
@@ -136,39 +136,32 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
         &HashMap::from([("embedding".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
     )
     .expect("insert generation control");
-    for _ in 0..8 {
-        db.run_maintenance_cycle()
-            .expect("build maintained generation");
-        if db
-            .vector_store_for_test()
-            .hnsw_maintenance_status()
-            .ready_partitions
-            > 0
-        {
-            break;
-        }
-    }
-    let expected_catalog = db.vector_store_for_test().hnsw_maintenance_status();
-    assert!(
-        expected_catalog.ready_partitions > 0,
-        "catalog has a ready generation"
-    );
+    let report = db
+        .run_maintenance_cycle()
+        .expect("drive exact-only maintenance")
+        .vector;
+    assert_eq!(report.ready_partitions, 0);
+    assert_eq!(report.remaining_partitions, 0);
     let mut expected_tables = db.table_names();
     expected_tables.sort();
     let expected_rows = schema_wall::largest::rows_and_vectors(&db);
     db.close().expect("seal schema wall");
 
     let reader = ReadSession::open(&path).expect("open largest committed schema wall");
-    let catalog = reader
-        .file_vector_store_for_test()
-        .expect("file route has a vector catalog")
-        .hnsw_maintenance_status();
-    assert_eq!(catalog.nonempty_indexes, expected_catalog.nonempty_indexes);
-    assert_eq!(
-        catalog.nonempty_partitions,
-        expected_catalog.nonempty_partitions
-    );
-    assert_eq!(catalog.ready_partitions, expected_catalog.ready_partitions);
+    assert!(matches!(
+        reader.execute(
+            "SELECT id FROM generation_probe ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        ),
+        Err(contextdb_core::Error::VectorIndexedRouteUnavailable { .. })
+    ));
+    let served = reader
+        .execute(
+            "SELECT id FROM generation_probe ORDER BY embedding <=> $q USE VECTOR AUTO LIMIT 1",
+            &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        )
+        .expect("the opened reader serves committed raw vectors");
+    assert_eq!(served.rows(), vec![vec![Value::Int64(1)]]);
     for (ordinal, expected) in expected_rows.iter().enumerate() {
         let table = format!("schema_{ordinal:03}");
         let actual = reader
@@ -177,7 +170,11 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
                 &HashMap::new(),
             )
             .expect("read authored vector row");
-        assert_eq!(&actual.rows, expected, "{table} row and vector membership");
+        assert_eq!(
+            &actual.rows(),
+            expected,
+            "{table} row and vector membership"
+        );
     }
     let schemas = reader
         .metadata(MetadataRequest::Tables, None)
@@ -185,7 +182,7 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
     let DirectMetadataBody::Tables {
         mut items,
         has_more,
-    } = schemas.body
+    } = schemas.body.clone()
     else {
         panic!("schema directory has a table inventory");
     };
@@ -202,7 +199,7 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
         .expect("read committed configuration");
     let DirectMetadataBody::ImageState {
         state: DirectImageState::Configuration(configuration),
-    } = configuration.body
+    } = configuration.body.clone()
     else {
         panic!("configuration is a typed committed image");
     };
@@ -210,11 +207,11 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
     assert_eq!(
         reader
             .execute(
-                "SELECT id FROM generation_probe ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                "SELECT id FROM generation_probe ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
             )
-            .expect("read authenticated generation")
-            .rows,
+            .expect("read authenticated raw vectors")
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
 }
@@ -393,6 +390,10 @@ fn change_copied_vector_visibility(path: &Path) {
     );
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_match_ids(path: &Path) -> contextdb_core::Result<Vec<Vec<Value>>> {
     ReadSession::open(path)?
         .execute(
@@ -406,7 +407,7 @@ fn vector_match_ids(path: &Path) -> contextdb_core::Result<Vec<Vec<Value>>> {
                 }),
             )]),
         )
-        .map(|answer| answer.rows)
+        .map(|answer| answer.rows().to_vec())
 }
 
 #[test]
@@ -630,7 +631,7 @@ fn a_custody_copy_missing_one_policy_cannot_return_a_shortened_show_list() {
         healthy
             .execute("SHOW TENANT TABLE POLICY", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         2,
         "the committed set contains both policy records"

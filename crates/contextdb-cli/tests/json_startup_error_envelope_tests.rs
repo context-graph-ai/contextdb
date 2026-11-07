@@ -69,6 +69,14 @@ fn first_stderr_envelope(stderr: &str) -> serde_json::Value {
         })
 }
 
+/// A database path in a fresh directory. The directory lives as long as the
+/// returned guard.
+fn session_db() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("session directory");
+    let path = dir.path().join("session.db").to_string_lossy().into_owned();
+    (dir, path)
+}
+
 fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -83,7 +91,8 @@ fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
 // nothing ran); under --json it must still be one envelope on stderr.
 #[test]
 fn json_invalid_memory_limit_emits_usage_envelope() {
-    let (code, stdout, stderr) = run(&["--json", "--memory-limit", "12Q", ":memory:"]);
+    let (_dir, db) = session_db();
+    let (code, stdout, stderr) = run(&["--json", "--memory-limit", "12Q", &db, "--write"]);
     assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.trim().is_empty(),
@@ -107,7 +116,8 @@ fn json_invalid_memory_limit_emits_usage_envelope() {
 // (a usage error); under --json it must be one envelope on stderr.
 #[test]
 fn json_tenant_id_without_endpoint_emits_usage_envelope() {
-    let (code, stdout, stderr) = run(&["--json", "--tenant-id", "acme", ":memory:"]);
+    let (_dir, db) = session_db();
+    let (code, stdout, stderr) = run(&["--json", "--tenant-id", "acme", &db, "--write"]);
     assert_eq!(code, Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.trim().is_empty(),
@@ -182,6 +192,7 @@ fn json_final_sync_push_failure_emits_error_envelope() {
     let sql = "CREATE TABLE t (id UUID PRIMARY KEY);\n\
                INSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000001');\n\
                .quit\n";
+    let (_dir, db) = session_db();
     let (code, stdout, stderr) = run_with_stdin(
         &[
             "--json",
@@ -189,7 +200,8 @@ fn json_final_sync_push_failure_emits_error_envelope() {
             "acme",
             "--sync-endpoint",
             "not-a-real-endpoint",
-            ":memory:",
+            &db,
+            "--write",
         ],
         sql,
     );

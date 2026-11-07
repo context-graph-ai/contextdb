@@ -275,9 +275,9 @@ fn an_owner_only_open_serves_a_live_owner_exactly_as_an_ordinary_open_does() {
             .expect("the owner-only session reaches the same handler");
 
         assert_eq!(owner_only.route(), ReadRoute::Owner);
-        assert_eq!(owner_only_result.columns, ordinary_result.columns);
-        assert_eq!(owner_only_result.rows, ordinary_result.rows);
-        assert_eq!(owner_only_result.rows.len(), row_count);
+        assert_eq!(owner_only_result.columns(), ordinary_result.columns());
+        assert_eq!(owner_only_result.rows(), ordinary_result.rows());
+        assert_eq!(owner_only_result.rows().len(), row_count);
         assert_eq!(owner_only_response, expected_response);
         assert_eq!(owner_only_response, ordinary_response);
         assert_eq!(
@@ -354,7 +354,7 @@ fn an_owner_only_open_with_no_owner_leaves_the_committed_file_alone() {
 /// store, and must not read the store's file behind its back.
 ///
 /// This journey once also ratified "while the writer is starting, the only
-/// answer is owner-absent." That sentence was the defect the owner ruled on
+/// answer is owner-absent." That behavior incorrectly crossed the owner-only route boundary on
 /// (2026-08-27): a writer that has CLAIMED the store but not yet published its
 /// serving decision is never reported absent, so owner-absent inside that
 /// window is a settled verdict about a store somebody is holding, and it

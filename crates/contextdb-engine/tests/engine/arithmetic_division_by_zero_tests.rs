@@ -93,8 +93,8 @@ fn indexed_equality_predicate_with_valid_division_works() {
     let result = db
         .execute("SELECT id FROM nums WHERE value = $a / $b", &params)
         .expect("valid division should work");
-    assert_eq!(result.rows.len(), 1, "should find one matching row");
-    let id = match &result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1, "should find one matching row");
+    let id = match &result.rows()[0][0] {
         Value::Int64(n) => *n,
         other => panic!("expected int64, got {other:?}"),
     };

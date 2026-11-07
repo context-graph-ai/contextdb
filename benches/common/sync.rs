@@ -9,12 +9,20 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, sigterm_drain_in_flight_persistence"
+)]
 pub struct SyncFixture {
     _root: TempDir,
     pub bind_spec: String,
     pub ticket: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by server_sync_system, sigterm_drain_in_flight_persistence"
+)]
 pub async fn start_sync_fixture() -> SyncFixture {
     let root = TempDir::new().expect("sync fixture tempdir");
     let identity = root.path().join("hub-identity.key");
@@ -31,6 +39,10 @@ pub async fn start_sync_fixture() -> SyncFixture {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sigterm_drain_in_flight_persistence"
+)]
 async fn wait_for_path(path: &Path, timeout: Duration) {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -42,10 +54,18 @@ async fn wait_for_path(path: &Path, timeout: Duration) {
     panic!("timed out waiting for path to exist: {}", path.display());
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sigterm_drain_in_flight_persistence"
+)]
 fn empty_params() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sigterm_drain_in_flight_persistence"
+)]
 fn values(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs
         .into_iter()
@@ -53,6 +73,10 @@ fn values(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sigterm_drain_in_flight_persistence"
+)]
 pub async fn push_change_through_server(
     ticket: &str,
     tenant: &str,
@@ -87,10 +111,15 @@ pub async fn push_change_through_server(
 
     let identity = PathBuf::from(format!("{}.fabric-identity.key", edge_path.display()));
     let dial_spec = contextdb_server::peer_dial_spec(ticket, &identity);
-    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant));
+    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant))
+        .expect("construct the authenticated sync endpoint");
     client.push().await.expect("push change through server");
 }
 
+#[allow(
+    dead_code,
+    reason = "KEEP-SHARED: shared test helper used by sigterm_drain_in_flight_persistence"
+)]
 pub async fn push_many_changes_through_server(
     ticket: &str,
     tenant: &str,
@@ -130,7 +159,8 @@ pub async fn push_many_changes_through_server(
 
     let identity = PathBuf::from(format!("{}.fabric-identity.key", edge_path.display()));
     let dial_spec = contextdb_server::peer_dial_spec(ticket, &identity);
-    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant));
+    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant))
+        .expect("construct the authenticated sync endpoint");
     let push_task = tokio::spawn(async move { client.push().await });
 
     if let Some(started) = started {
